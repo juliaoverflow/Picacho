@@ -1,0 +1,903 @@
+use crate::{
+    model::*,
+    store::{self, Store},
+};
+use anyhow::{Context, Result, bail, ensure};
+use mailparse::MailHeaderMap;
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpStream, ToSocketAddrs},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+const MAX_MESSAGE: usize = 25 * 1024 * 1024;
+#[cfg(test)]
+#[path = "protocol_tests.rs"]
+mod protocol_tests;
+type ImapSession = imap::Session<native_tls::TlsStream<TcpStream>>;
+#[derive(Clone, Copy)]
+pub enum Change {
+    Read(bool),
+    Star(bool),
+    Move(Folder),
+}
+pub struct Backend {
+    pub store: Arc<Store>,
+    operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    #[cfg(test)]
+    test_certificate: Option<Vec<u8>>,
+    #[cfg(test)]
+    test_secret: Option<Secret>,
+}
+impl Backend {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            operations: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_certificate: None,
+            #[cfg(test)]
+            test_secret: None,
+        }
+    }
+    fn account_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        self.operations
+            .lock()
+            .unwrap()
+            .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+    fn tls_connector(&self) -> Result<native_tls::TlsConnector> {
+        #[cfg(test)]
+        if let Some(cert) = &self.test_certificate {
+            return Ok(native_tls::TlsConnector::builder()
+                .add_root_certificate(native_tls::Certificate::from_pem(cert)?)
+                .build()?);
+        }
+        Ok(native_tls::TlsConnector::new()?)
+    }
+    fn imap_login(&self, a: &Account, s: &Secret) -> Result<ImapSession> {
+        imap_login(a, s, &self.tls_connector()?)
+    }
+    fn pop_login(
+        &self,
+        a: &Account,
+        password: &str,
+    ) -> Result<PopSession<native_tls::TlsStream<TcpStream>>> {
+        pop_login(a, password, &self.tls_connector()?)
+    }
+    pub fn connect(
+        &self,
+        account: &Account,
+        password: String,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<()> {
+        account.validate()?;
+        let lock = self.account_lock(&account.id);
+        let _operation = lock.lock().unwrap();
+        let mut secret = if account.oauth {
+            crate::oauth::authorize(account, cancel.clone())?
+        } else {
+            ensure!(!password.is_empty(), "Enter your password or app password.");
+            Secret {
+                password,
+                ..Default::default()
+            }
+        };
+        secret.client_secret = account.client_secret.clone();
+        if account.provider == Provider::Pop3 {
+            let mut pop = self.pop_login(account, &secret.password)?;
+            pop.command("QUIT")?;
+        } else {
+            let mut session = self.imap_login(account, &secret)?;
+            session.logout()?;
+        }
+        ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+        store::write_secret(&account.id, &secret)?;
+        self.store.save_account(account)?;
+        Ok(())
+    }
+    fn credentials(&self, a: &Account) -> Result<Secret> {
+        #[cfg(test)]
+        if let Some(secret) = &self.test_secret {
+            return Ok(secret.clone());
+        }
+        let mut s = store::read_secret(&a.id)?;
+        crate::oauth::refresh(a, &mut s)?;
+        Ok(s)
+    }
+    pub fn sync(&self, a: &Account, folder: Folder, limit: usize) -> Result<Vec<Mail>> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let secret = self.credentials(a)?;
+        if a.provider == Provider::Pop3 {
+            return self.sync_pop(a, folder, limit, &secret.password);
+        }
+        if folder == Folder::Drafts {
+            return Ok(vec![]);
+        }
+        let mut session = self.imap_login(a, &secret)?;
+        let mut result = Vec::new();
+        if folder == Folder::Starred {
+            let folders = if a.provider == Provider::Gmail {
+                vec![Folder::Archive]
+            } else {
+                vec![
+                    Folder::Inbox,
+                    Folder::Sent,
+                    Folder::Archive,
+                    Folder::Junk,
+                    Folder::Trash,
+                ]
+            };
+            let mut visited = std::collections::HashSet::new();
+            for source in folders {
+                let remote = match resolve_folder(&mut session, a.provider, source) {
+                    Ok(remote) => remote,
+                    Err(_) if source != Folder::Inbox => continue,
+                    Err(e) => return Err(e),
+                };
+                if visited.insert(remote.clone()) {
+                    result.extend(self.fetch_mailbox(
+                        &mut session,
+                        a,
+                        source,
+                        &remote,
+                        true,
+                        limit,
+                    )?);
+                }
+            }
+            result.sort_by_key(|m| std::cmp::Reverse(m.date));
+            let mut seen = std::collections::HashSet::new();
+            result.retain(|m| {
+                seen.insert(if m.message_id.is_empty() {
+                    m.id.clone()
+                } else {
+                    m.message_id.clone()
+                })
+            });
+            result.truncate(limit);
+        } else {
+            let remote = resolve_folder(&mut session, a.provider, folder)?;
+            result = self.fetch_mailbox(&mut session, a, folder, &remote, false, limit)?;
+        }
+        session.logout()?;
+        Ok(result)
+    }
+    fn fetch_mailbox(
+        &self,
+        session: &mut ImapSession,
+        a: &Account,
+        folder: Folder,
+        remote: &str,
+        starred_only: bool,
+        limit: usize,
+    ) -> Result<Vec<Mail>> {
+        let mailbox = session.select(remote)?;
+        let validity = mailbox.uid_validity.unwrap_or(0);
+        let query = if starred_only { "FLAGGED" } else { "ALL" };
+        let mut uids: Vec<_> = session.uid_search(query)?.into_iter().collect();
+        uids.sort_unstable();
+        let all_ids: Vec<_> = uids
+            .iter()
+            .map(|uid| format!("{}:{remote}:{validity}:{uid}", a.id))
+            .collect();
+        let start = uids.len().saturating_sub(limit);
+        let uids = &uids[start..];
+        let cached: HashMap<_, _> = self
+            .store
+            .messages(&a.id, folder, 5000)?
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+        let mut result = Vec::new();
+        // Batch headers; message bodies and attachments are fetched only when opened.
+        for chunk in uids.chunks(100) {
+            let set = chunk
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            for f in session
+                .uid_fetch(
+                    set,
+                    "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])",
+                )?
+                .iter()
+            {
+                let Some(uid) = f.uid else {
+                    continue;
+                };
+                let id = format!("{}:{remote}:{validity}:{uid}", a.id);
+                let mut m = if let Some(old) = cached.get(&id) {
+                    old.clone()
+                } else {
+                    parse_message(f.header().unwrap_or_default(), a, &id, folder, remote, uid)?
+                };
+                m.unread = !f
+                    .flags()
+                    .iter()
+                    .any(|v| matches!(v, imap::types::Flag::Seen));
+                m.starred = f
+                    .flags()
+                    .iter()
+                    .any(|v| matches!(v, imap::types::Flag::Flagged));
+                m.size = f.size.unwrap_or(0);
+                if m.date == 0 {
+                    m.date = f.internal_date().map(|d| d.timestamp()).unwrap_or_default();
+                }
+                result.push(m);
+            }
+        }
+        self.store.save_messages(&result)?;
+        if starred_only {
+            let keep: std::collections::HashSet<_> = all_ids.iter().collect();
+            let cleared: Vec<_> = cached
+                .into_values()
+                .filter(|m| m.starred && m.remote_folder == remote && !keep.contains(&m.id))
+                .map(|mut m| {
+                    m.starred = false;
+                    m
+                })
+                .collect();
+            self.store.save_messages(&cleared)?;
+        } else {
+            self.store.reconcile(&a.id, folder, &all_ids)?;
+        }
+        result.sort_by_key(|m| std::cmp::Reverse(m.date));
+        Ok(result)
+    }
+    fn sync_pop(
+        &self,
+        a: &Account,
+        folder: Folder,
+        limit: usize,
+        password: &str,
+    ) -> Result<Vec<Mail>> {
+        if folder != Folder::Inbox && folder != Folder::Starred {
+            return self.store.messages(&a.id, folder, limit);
+        }
+        let mut pop = self.pop_login(a, password)?;
+        let ids = pop.uidl()?;
+        let mut messages = Vec::new();
+        for (number, uid) in ids.iter().rev().take(limit) {
+            let id = format!("{}:pop:{uid}", a.id);
+            let mail = if let Some(m) = self.store.message(&id)? {
+                m
+            } else {
+                pop.command(&format!("RETR {number}"))?;
+                let raw = pop.multiline(MAX_MESSAGE)?;
+                let mut m = parse_message(&raw, a, &id, Folder::Inbox, "INBOX", *number)?;
+                m.size = raw.len() as u32;
+                self.store.save_messages(&[m.clone()])?;
+                self.store.save_raw(&id, &raw)?;
+                m
+            };
+            messages.push(mail);
+        }
+        pop.command("QUIT")?;
+        self.store.save_messages(&messages)?;
+        // POP3 has no folders. Keep local moves and messages removed from the
+        // remote server; UIDL identities prevent duplicate downloads.
+        messages = self.store.messages(&a.id, folder, limit)?;
+        messages.sort_by_key(|m| std::cmp::Reverse(m.date));
+        if folder == Folder::Starred {
+            messages.retain(|m| m.starred);
+        }
+        Ok(messages)
+    }
+    pub fn read(&self, a: &Account, m: &Mail) -> Result<Mail> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let latest = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
+        let m = &latest;
+        let raw = if let Some(raw) = self.store.raw(&m.id)? {
+            raw
+        } else {
+            ensure!(
+                m.size as usize <= MAX_MESSAGE,
+                "This message exceeds the 25 MB download limit."
+            );
+            ensure!(
+                a.provider != Provider::Pop3,
+                "Message is not cached. Refresh the mailbox."
+            );
+            let secret = self.credentials(a)?;
+            let mut session = self.imap_login(a, &secret)?;
+            select_message_mailbox(&mut session, m)?;
+            let fetched = session.uid_fetch(m.uid.to_string(), "BODY.PEEK[]")?;
+            let raw = fetched
+                .iter()
+                .next()
+                .and_then(|f| f.body())
+                .context("Message no longer exists on the server")?
+                .to_vec();
+            ensure!(raw.len() <= MAX_MESSAGE, "Message exceeds the 25 MB limit.");
+            session.logout()?;
+            self.store.save_raw(&m.id, &raw)?;
+            raw
+        };
+        let mut next = parse_message(&raw, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
+        next.unread = m.unread;
+        next.starred = m.starred;
+        next.size = m.size;
+        self.store.save_messages(&[next.clone()])?;
+        Ok(next)
+    }
+    pub fn change(&self, a: &Account, m: &Mail, change: Change) -> Result<Mail> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let mut next = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
+        if let Change::Move(folder) = change
+            && next.folder == folder
+        {
+            return Ok(next);
+        }
+        if a.provider != Provider::Pop3 {
+            let secret = self.credentials(a)?;
+            let mut session = self.imap_login(a, &secret)?;
+            select_message_mailbox(&mut session, m)?;
+            match change {
+                Change::Read(read) => {
+                    session.uid_store(
+                        m.uid.to_string(),
+                        if read {
+                            "+FLAGS.SILENT (\\Seen)"
+                        } else {
+                            "-FLAGS.SILENT (\\Seen)"
+                        },
+                    )?;
+                }
+                Change::Star(star) => {
+                    session.uid_store(
+                        m.uid.to_string(),
+                        if star {
+                            "+FLAGS.SILENT (\\Flagged)"
+                        } else {
+                            "-FLAGS.SILENT (\\Flagged)"
+                        },
+                    )?;
+                }
+                Change::Move(folder) => {
+                    let remote = resolve_folder(&mut session, a.provider, folder)?;
+                    // UID MOVE is atomic and does not expunge unrelated deleted messages.
+                    let caps = session.capabilities()?;
+                    ensure!(
+                        caps.has_str("MOVE"),
+                        "This server does not support safe message moves (IMAP MOVE)."
+                    );
+                    let escaped = remote.replace('\\', "\\\\").replace('"', "\\\"");
+                    session
+                        .run_command_and_check_ok(format!("UID MOVE {} \"{escaped}\"", m.uid))?;
+                }
+            }
+            session.logout()?;
+        }
+        match change {
+            Change::Read(read) => next.unread = !read,
+            Change::Star(star) => next.starred = star,
+            Change::Move(folder) => next.folder = folder,
+        }
+        if matches!(change, Change::Move(_)) && a.provider != Provider::Pop3 {
+            self.store.delete_mail(&m.id)?;
+        } else {
+            self.store.save_messages(&[next.clone()])?;
+        }
+        Ok(next)
+    }
+    pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        use lettre::{
+            Message, Transport,
+            message::{Attachment, Mailbox, MultiPart, SinglePart},
+            transport::smtp::{
+                authentication::{Credentials, Mechanism},
+                client::{Tls, TlsParameters},
+            },
+        };
+        let mut builder = Message::builder()
+            .from(Mailbox::new(Some(a.name.clone()), a.email.parse()?))
+            .subject(&d.subject);
+        let recipients = mailparse::addrparse(&d.to)
+            .context("Enter valid recipient email addresses, separated by commas")?;
+        let mut count = 0;
+        for address in recipients.iter() {
+            match address {
+                mailparse::MailAddr::Single(s) => {
+                    builder = builder.to(Mailbox::new(s.display_name.clone(), s.addr.parse()?));
+                    count += 1;
+                }
+                mailparse::MailAddr::Group(g) => {
+                    for s in &g.addrs {
+                        builder = builder.to(Mailbox::new(s.display_name.clone(), s.addr.parse()?));
+                        count += 1;
+                    }
+                }
+            }
+        }
+        ensure!(count > 0, "Add at least one recipient.");
+        if !d.reply_id.is_empty() {
+            builder = builder.in_reply_to(d.reply_id.clone());
+        }
+        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(d.body.clone()));
+        let mut total = d.body.len();
+        for path in &d.attachments {
+            let meta = std::fs::metadata(path)?;
+            total += meta.len() as usize;
+            ensure!(
+                total < 18 * 1024 * 1024,
+                "Attachments exceed the 18 MB sending limit."
+            );
+            let bytes = std::fs::read(path)?;
+            multipart = multipart.singlepart(
+                Attachment::new(
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .body(bytes, "application/octet-stream".parse()?),
+            );
+        }
+        let message = builder.multipart(multipart)?;
+        let secret = self.credentials(a)?;
+        let tls = TlsParameters::new(a.smtp_host.clone())?;
+        #[cfg(test)]
+        let tls = if let Some(cert) = &self.test_certificate {
+            TlsParameters::builder(a.smtp_host.clone())
+                .add_root_certificate(lettre::transport::smtp::client::Certificate::from_pem(
+                    cert,
+                )?)
+                .build()?
+        } else {
+            tls
+        };
+        let transport = lettre::SmtpTransport::builder_dangerous(&a.smtp_host)
+            .port(a.smtp_port)
+            .tls(if a.smtp_port == 465 {
+                Tls::Wrapper(tls)
+            } else {
+                Tls::Required(tls)
+            })
+            .timeout(Some(Duration::from_secs(45)))
+            .credentials(Credentials::new(
+                a.email.clone(),
+                if a.oauth {
+                    secret.access_token.clone()
+                } else {
+                    secret.password.clone()
+                },
+            ))
+            .authentication(if a.oauth {
+                vec![Mechanism::Xoauth2]
+            } else {
+                vec![Mechanism::Plain, Mechanism::Login]
+            })
+            .build();
+        transport.send(&message).context("SMTP delivery failed. Your draft has been kept; check the server and account settings.")?;
+        // Gmail and Outlook save sent messages themselves. Custom IMAP servers do not.
+        if a.provider == Provider::Imap
+            && let Ok(mut session) = self.imap_login(a, &secret)
+        {
+            if let Ok(sent) = resolve_folder(&mut session, a.provider, Folder::Sent) {
+                let _ = session.append_with_flags(
+                    sent,
+                    message.formatted(),
+                    &[imap::types::Flag::Seen],
+                );
+            }
+            let _ = session.logout();
+        }
+        // SMTP acceptance is the delivery boundary. Do not report a send failure
+        // after this point, which could encourage a duplicate transmission.
+        if a.provider == Provider::Pop3 {
+            let raw = message.formatted();
+            let id = format!("{}:sent:{}", a.id, d.id);
+            if let Ok(mut sent) = parse_message(&raw, a, &id, Folder::Sent, "Sent", 0) {
+                sent.unread = false;
+                let _ = self.store.save_messages(&[sent]);
+                let _ = self.store.save_raw(&id, &raw);
+            }
+        }
+        let _ = self.store.delete_draft(&d.id);
+        Ok(())
+    }
+    pub fn attachment(&self, m: &Mail, part: usize) -> Result<Vec<u8>> {
+        let raw = self.store.raw(&m.id)?.context("Open this message first")?;
+        let parsed = mailparse::parse_mail(&raw)?;
+        let mut leaves = Vec::new();
+        collect_leaves(&parsed, &mut leaves);
+        leaves
+            .get(part)
+            .context("Attachment not found")?
+            .get_body_raw()
+            .map_err(Into::into)
+    }
+}
+fn tcp(host: &str, port: u16) -> Result<TcpStream> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .context("Server hostname could not be resolved")?;
+    let mut last = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(12)) {
+            Ok(s) => {
+                s.set_read_timeout(Some(Duration::from_secs(30)))?;
+                s.set_write_timeout(Some(Duration::from_secs(30)))?;
+                return Ok(s);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    bail!(
+        "Could not connect to {host}:{port}: {}",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    )
+}
+fn imap_login(a: &Account, s: &Secret, tls: &native_tls::TlsConnector) -> Result<ImapSession> {
+    let socket = tcp(&a.incoming_host, a.incoming_port)?;
+    let stream = tls
+        .connect(&a.incoming_host, socket)
+        .context("IMAP TLS handshake failed")?;
+    let mut client = imap::Client::new(stream);
+    client.read_greeting()?;
+    let session = if a.oauth {
+        client.authenticate(
+            "XOAUTH2",
+            &Xoauth {
+                user: a.email.clone(),
+                token: s.access_token.clone(),
+            },
+        )
+    } else {
+        client.login(&a.email, &s.password)
+    };
+    session.map_err(|(e, _)| anyhow::anyhow!("IMAP authentication failed: {e}"))
+}
+struct Xoauth {
+    user: String,
+    token: String,
+}
+fn select_message_mailbox(session: &mut ImapSession, mail: &Mail) -> Result<()> {
+    let mailbox = session.select(&mail.remote_folder)?;
+    let expected = mail
+        .id
+        .rsplit(':')
+        .nth(1)
+        .and_then(|s| s.parse::<u32>().ok())
+        .context("Cached message identity is invalid. Refresh this mailbox.")?;
+    ensure!(
+        mailbox.uid_validity.unwrap_or(0) == expected,
+        "The server reset this mailbox's message identities. Refresh before opening or changing this message."
+    );
+    Ok(())
+}
+impl imap::Authenticator for Xoauth {
+    type Response = String;
+    fn process(&self, _: &[u8]) -> String {
+        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
+    }
+}
+fn resolve_folder(session: &mut ImapSession, provider: Provider, folder: Folder) -> Result<String> {
+    if folder == Folder::Inbox {
+        return Ok("INBOX".into());
+    }
+    let names = session.list(None, Some("*"))?;
+    let special = match folder {
+        Folder::Sent => "\\Sent",
+        Folder::Drafts => "\\Drafts",
+        Folder::Trash => "\\Trash",
+        Folder::Junk => "\\Junk",
+        Folder::Archive => {
+            if provider == Provider::Gmail {
+                "\\All"
+            } else {
+                "\\Archive"
+            }
+        }
+        _ => "",
+    };
+    for name in names.iter() {
+        if name
+            .attributes()
+            .iter()
+            .any(|a| format!("{a:?}").contains(special.trim_start_matches('\\')))
+        {
+            return Ok(name.name().into());
+        }
+    }
+    let candidates: &[&str] = match folder {
+        Folder::Sent => &["[Gmail]/Sent Mail", "Sent", "Sent Items", "INBOX.Sent"],
+        Folder::Drafts => &["[Gmail]/Drafts", "Drafts", "INBOX.Drafts"],
+        Folder::Trash => &[
+            "[Gmail]/Trash",
+            "Trash",
+            "Deleted Items",
+            "Deleted",
+            "INBOX.Trash",
+        ],
+        Folder::Junk => &["[Gmail]/Spam", "Junk", "Junk Email", "Spam", "INBOX.Junk"],
+        Folder::Archive => &["[Gmail]/All Mail", "Archive", "Archives", "INBOX.Archive"],
+        _ => &["INBOX"],
+    };
+    for c in candidates {
+        if let Some(n) = names.iter().find(|n| n.name().eq_ignore_ascii_case(c)) {
+            return Ok(n.name().into());
+        }
+    }
+    bail!("The server has no {} folder.", folder.label())
+}
+
+pub fn parse_message(
+    raw: &[u8],
+    account: &Account,
+    id: &str,
+    folder: Folder,
+    remote: &str,
+    uid: u32,
+) -> Result<Mail> {
+    let p = mailparse::parse_mail(raw)?;
+    let header = |name: &str| p.headers.get_first_value(name).unwrap_or_default();
+    let from_header = header("From");
+    let (sender, from) = mailparse::addrparse(&from_header)
+        .ok()
+        .and_then(|v| v.extract_single_info())
+        .map(|s| (s.display_name.unwrap_or_else(|| s.addr.clone()), s.addr))
+        .unwrap_or_else(|| (from_header.clone(), from_header));
+    let mut body = String::new();
+    let mut attachments = Vec::new();
+    let mut leaves = Vec::new();
+    collect_leaves(&p, &mut leaves);
+    for (index, part) in leaves.iter().enumerate() {
+        let disposition = part.get_content_disposition();
+        let filename = disposition
+            .params
+            .get("filename")
+            .or_else(|| part.ctype.params.get("name"));
+        if filename.is_some() || disposition.disposition == mailparse::DispositionType::Attachment {
+            attachments.push(Attachment {
+                name: filename.cloned().unwrap_or_else(|| "attachment".into()),
+                size: part.get_body_raw().map(|b| b.len()).unwrap_or_default(),
+                mime: part.ctype.mimetype.clone(),
+                part: index,
+            });
+        } else if part.ctype.mimetype == "text/plain" && body.is_empty() {
+            body = part.get_body().unwrap_or_default();
+        }
+    }
+    if body.is_empty()
+        && let Some(html) = leaves.iter().find(|p| p.ctype.mimetype == "text/html")
+    {
+        body = html_to_text(&html.get_body().unwrap_or_default());
+    }
+    let snippet = body
+        .split_whitespace()
+        .take(45)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let date = mailparse::dateparse(&header("Date")).unwrap_or_default();
+    let subject = header("Subject");
+    Ok(Mail {
+        id: id.into(),
+        account: account.id.clone(),
+        folder,
+        remote_folder: remote.into(),
+        uid,
+        from,
+        sender,
+        to: header("To"),
+        subject: if subject.is_empty() {
+            "(No subject)".into()
+        } else {
+            subject
+        },
+        snippet,
+        date,
+        unread: true,
+        starred: false,
+        size: raw.len() as u32,
+        body: if body.is_empty() { None } else { Some(body) },
+        attachments,
+        message_id: header("Message-ID"),
+    })
+}
+fn collect_leaves<'a>(
+    p: &'a mailparse::ParsedMail<'a>,
+    out: &mut Vec<&'a mailparse::ParsedMail<'a>>,
+) {
+    if p.subparts.is_empty() {
+        out.push(p);
+    } else {
+        for part in &p.subparts {
+            collect_leaves(part, out);
+        }
+    }
+}
+fn html_to_text(html: &str) -> String {
+    // Email is displayed as native text. No remote images, scripts, or web engine.
+    let mut text = String::new();
+    let mut tag = String::new();
+    let mut inside = false;
+    let mut hidden = 0;
+    for ch in html.chars() {
+        if ch == '<' {
+            inside = true;
+            tag.clear();
+        } else if ch == '>' && inside {
+            inside = false;
+            let t = tag.to_lowercase();
+            let t = t.trim();
+            if t.starts_with("script") || t.starts_with("style") {
+                hidden += 1;
+            } else if t.starts_with("/script") || t.starts_with("/style") {
+                hidden = 0;
+            } else if hidden == 0
+                && ["br", "/p", "/div", "/tr", "/h1", "/h2", "/li"]
+                    .iter()
+                    .any(|s| t.starts_with(s))
+            {
+                text.push('\n');
+            }
+        } else if inside {
+            tag.push(ch);
+        } else if hidden == 0 {
+            text.push(ch);
+        }
+    }
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .trim()
+        .to_string()
+}
+
+pub struct PopSession<T: Read + Write> {
+    reader: BufReader<T>,
+}
+impl<T: Read + Write> PopSession<T> {
+    fn new(stream: T) -> Result<Self> {
+        let mut s = Self {
+            reader: BufReader::new(stream),
+        };
+        s.status()?;
+        Ok(s)
+    }
+    fn status(&mut self) -> Result<String> {
+        let mut line = String::new();
+        self.reader.by_ref().take(8192).read_line(&mut line)?;
+        ensure!(line.starts_with("+OK"), "POP3 server rejected the request.");
+        Ok(line)
+    }
+    fn command(&mut self, command: &str) -> Result<String> {
+        ensure!(!command.contains(['\r', '\n']), "Invalid POP3 command");
+        write!(self.reader.get_mut(), "{command}\r\n")?;
+        self.reader.get_mut().flush()?;
+        self.status()
+    }
+    fn multiline(&mut self, max: usize) -> Result<Vec<u8>> {
+        let mut result = Vec::new();
+        loop {
+            let mut line = Vec::new();
+            let n = self
+                .reader
+                .by_ref()
+                .take((max + 1) as u64)
+                .read_until(b'\n', &mut line)?;
+            ensure!(n > 0, "POP3 connection closed unexpectedly");
+            if line == b".\r\n" || line == b".\n" {
+                break;
+            }
+            if line.starts_with(b"..") {
+                line.remove(0);
+            }
+            ensure!(
+                result.len() + line.len() <= max,
+                "POP3 response exceeds the download limit"
+            );
+            result.extend(line);
+        }
+        Ok(result)
+    }
+    fn uidl(&mut self) -> Result<Vec<(u32, String)>> {
+        self.command("UIDL")?;
+        let bytes = self.multiline(4 * 1024 * 1024)?;
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(|l| {
+                let mut parts = l.split_whitespace();
+                let n = parts.next().context("Invalid POP3 UIDL")?.parse()?;
+                let uid = parts.next().context("Invalid POP3 UIDL")?.to_string();
+                Ok((n, uid))
+            })
+            .collect()
+    }
+}
+fn pop_login(
+    a: &Account,
+    password: &str,
+    tls: &native_tls::TlsConnector,
+) -> Result<PopSession<native_tls::TlsStream<TcpStream>>> {
+    let tcp = tcp(&a.incoming_host, a.incoming_port)?;
+    let stream = tls.connect(&a.incoming_host, tcp)?;
+    let mut s = PopSession::new(stream)?;
+    s.command(&format!("USER {}", a.email))?;
+    s.command(&format!("PASS {password}"))?;
+    Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_mime_body_and_attachment() -> Result<()> {
+        let raw=b"From: =?UTF-8?Q?Sophie_Chen?= <sophie@example.com>\r\nTo: me@example.com\r\nSubject: =?UTF-8?Q?Hello_=E2=9C=93?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHi there!\r\n--x\r\nContent-Type: text/plain; name=hello.txt\r\nContent-Disposition: attachment; filename=hello.txt\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--x--\r\n";
+        let m = parse_message(
+            raw,
+            &Account::new(Provider::Imap),
+            "id",
+            Folder::Inbox,
+            "INBOX",
+            1,
+        )?;
+        assert_eq!(m.sender, "Sophie Chen");
+        assert_eq!(m.subject, "Hello ✓");
+        assert!(m.body.unwrap().contains("Hi there!"));
+        assert_eq!(m.attachments[0].name, "hello.txt");
+        assert_eq!(m.attachments[0].size, 5);
+        Ok(())
+    }
+    #[test]
+    fn html_does_not_display_script() {
+        assert_eq!(
+            html_to_text(
+                "<p>Hello &amp; welcome</p><script>bad()</script><style>css</style><p>World</p>"
+            ),
+            "Hello & welcome\nWorld"
+        );
+    }
+    #[test]
+    fn pop3_loopback_uidl_and_dot_unstuffing() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(b"+OK ready\r\n").unwrap();
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(line, "UIDL\r\n");
+            r.get_mut()
+                .write_all(b"+OK\r\n1 abc\r\n2 def\r\n.\r\n")
+                .unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            assert_eq!(line, "RETR 2\r\n");
+            r.get_mut()
+                .write_all(b"+OK\r\nSubject: Test\r\n\r\n..hello\r\n.\r\n")
+                .unwrap();
+        });
+        let mut p = PopSession::new(TcpStream::connect(address)?)?;
+        assert_eq!(p.uidl()?, vec![(1, "abc".into()), (2, "def".into())]);
+        p.command("RETR 2")?;
+        assert!(String::from_utf8(p.multiline(1024)?)?.contains("\r\n.hello\r\n"));
+        server.join().unwrap();
+        Ok(())
+    }
+    #[test]
+    fn rejects_pop_command_injection() -> Result<()> {
+        let mut p = PopSession::new(std::io::Cursor::new(b"+OK\r\n".to_vec()))?;
+        assert!(p.command("USER a\r\nDELE 1").is_err());
+        Ok(())
+    }
+}
