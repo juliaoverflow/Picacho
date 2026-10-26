@@ -566,6 +566,15 @@ fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
     let cached = backend.store.message("enc-1")?.unwrap();
     assert!(cached.body.is_none() && cached.snippet.is_empty() && cached.attachments.is_empty());
     assert_eq!(backend.store.raw("enc-1")?.unwrap(), stored);
+    // A reload from the disk cache gets the body back from memory.
+    let reloaded = backend.with_readable(vec![cached]);
+    assert!(
+        reloaded[0]
+            .body
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Picacho reads this")
+    );
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }

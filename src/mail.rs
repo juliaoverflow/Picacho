@@ -32,6 +32,9 @@ pub struct Backend {
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Opened Pinal mail keys by account, held in memory only.
     mail_keys: Mutex<HashMap<String, Arc<Vec<pgp::composed::SignedSecretKey>>>>,
+    /// Decrypted Pinal messages by id. Memory only: the cache on disk keeps
+    /// them encrypted, so reloads from it get their bodies back from here.
+    readable: Mutex<HashMap<String, Mail>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -43,6 +46,7 @@ impl Backend {
             store,
             operations: Mutex::new(HashMap::new()),
             mail_keys: Mutex::new(HashMap::new()),
+            readable: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -187,10 +191,27 @@ impl Backend {
     /// Forgets the mail key on this device; the password unlocks it again.
     pub fn lock_mail(&self, a: &Account) -> Result<()> {
         self.mail_keys.lock().unwrap().remove(&a.id);
+        self.readable
+            .lock()
+            .unwrap()
+            .retain(|_, m| m.account != a.id);
         let mut s = store::read_secret(&a.id)?;
         s.mail_key.zeroize();
         s.mail_key.clear();
         store::write_secret(&a.id, &s)
+    }
+    /// Puts decrypted bodies back on messages reloaded from the disk cache.
+    pub fn with_readable(&self, mut messages: Vec<Mail>) -> Vec<Mail> {
+        let readable = self.readable.lock().unwrap();
+        for m in messages.iter_mut().filter(|m| m.body.is_none()) {
+            if let Some(r) = readable.get(&m.id) {
+                m.body = r.body.clone();
+                m.snippet = r.snippet.clone();
+                m.attachments = r.attachments.clone();
+                m.has_attachments = r.has_attachments;
+            }
+        }
+        messages
     }
     fn keys(&self, a: &Account) -> Result<Option<Arc<Vec<pgp::composed::SignedSecretKey>>>> {
         if let Some(keys) = self.mail_keys.lock().unwrap().get(&a.id) {
@@ -213,7 +234,15 @@ impl Backend {
         if crate::crypto::encrypted_part(raw).is_none() {
             return crate::crypto::open_message(raw, &[]);
         }
-        let keys = self.keys(a)?.ok_or(crate::crypto::Locked)?;
+        let Some(keys) = self.keys(a)? else {
+            // Accounts added before encryption existed have no key bundle.
+            ensure!(
+                a.service != Service::Pinal || !self.credentials(a)?.mail_bundle.is_empty(),
+                "This message is encrypted. Remove this Pinal account and add it again so \
+                 Picacho receives your encryption keys."
+            );
+            return Err(crate::crypto::Locked.into());
+        };
         crate::crypto::open_message(raw, &keys)
     }
     pub fn sync(
@@ -465,6 +494,10 @@ impl Backend {
             kept.snippet.clear();
             kept.attachments.clear();
             self.store.save_messages(&[kept])?;
+            self.readable
+                .lock()
+                .unwrap()
+                .insert(next.id.clone(), next.clone());
         } else {
             self.store.save_messages(&[next.clone()])?;
         }

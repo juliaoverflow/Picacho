@@ -1193,7 +1193,7 @@ impl MailApp {
                 this.syncing = false;
                 match result {
                     Ok((messages, _)) => {
-                        this.messages = messages;
+                        this.messages = this.backend.with_readable(messages);
                         this.filter(cx);
                         if this.error && this.modal.is_none() {
                             this.status.clear();
@@ -1261,7 +1261,7 @@ impl MailApp {
                         return;
                     }
                     if let Ok(ms) = result {
-                        this.messages = ms;
+                        this.messages = this.backend.with_readable(ms);
                         this.filter(cx);
                     }
                     this.refresh(cx);
