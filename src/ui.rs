@@ -384,6 +384,8 @@ enum Action {
     Attach,
     RemoveAttachment(usize),
     SaveAttachment(usize),
+    UnlockMail,
+    LockMail(String),
     LoadMore,
     OpenDraft(String),
     DiscardDraft,
@@ -458,6 +460,11 @@ pub struct MailApp {
     anim: u64,
     list_scroll: UniformListScrollHandle,
     reader_scroll: ScrollHandle,
+    /// Pinal Mail's password (or recovery key) prompt for encrypted mail.
+    unlock_input: Entity<InputState>,
+    /// Pinal accounts whose mail is encrypted, and those not unlocked here yet.
+    encrypted: HashSet<String>,
+    locked: HashSet<String>,
 }
 fn input(
     placeholder: &str,
@@ -524,6 +531,19 @@ impl MailApp {
                 cx.notify();
             }
         })]);
+        let unlock_input = input("Pinal password or recovery key", false, true, window, cx);
+        subscriptions.push(
+            cx.subscribe_in(&unlock_input, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.handle(Action::UnlockMail, w, cx);
+                }
+            }),
+        );
+        let encrypted = accounts
+            .iter()
+            .filter(|a| a.service == Service::Pinal && backend.encrypted(a))
+            .map(|a| a.id.clone())
+            .collect();
         for state in [&compose_to, &compose_subject, &compose_body] {
             subscriptions.push(cx.subscribe(state, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -634,6 +654,9 @@ impl MailApp {
             anim: 0,
             list_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
+            unlock_input,
+            encrypted,
+            locked: HashSet::new(),
         };
         this.filter(cx);
         this.apply_theme(window, cx);
@@ -656,6 +679,9 @@ impl MailApp {
     }
     fn colors(&self) -> Colors {
         Colors::new(self.dark, self.accent)
+    }
+    fn account_of(&self, m: &Mail) -> Option<Account> {
+        self.accounts.iter().find(|a| a.id == m.account).cloned()
     }
     fn current_account(&self) -> Option<Account> {
         self.accounts
@@ -1335,7 +1361,13 @@ impl MailApp {
                         this.refresh_counts(cx);
                     }
                     Err(e) => {
-                        if this.read_generation == generation {
+                        if e.downcast_ref::<crate::crypto::Locked>().is_some() {
+                            // The reader asks for the password instead.
+                            if let Some(m) = this.messages.iter().find(|m| m.id == id2) {
+                                this.locked.insert(m.account.clone());
+                                this.encrypted.insert(m.account.clone());
+                            }
+                        } else if this.read_generation == generation {
                             this.notice(format!("{e:#}"), true, cx);
                         }
                     }
@@ -1812,6 +1844,9 @@ impl MailApp {
                 this.connecting = false;
                 match result {
                     Ok(saved) => {
+                        if saved.service == Service::Pinal && this.backend.encrypted(&saved) {
+                            this.encrypted.insert(saved.id.clone());
+                        }
                         this.accounts.push(saved.clone());
                         this.account = Some(saved.id.clone());
                         if this.onboarding {
@@ -1905,6 +1940,9 @@ impl MailApp {
         let Some(a) = m.attachments.get(index).cloned() else {
             return;
         };
+        let Some(account) = self.account_of(&m) else {
+            return;
+        };
         let name = std::path::Path::new(&a.name)
             .file_name()
             .unwrap_or_default()
@@ -1917,7 +1955,7 @@ impl MailApp {
                     this.task(
                         cx,
                         move |b| {
-                            let bytes = b.attachment(&m, a.part)?;
+                            let bytes = b.attachment(&account, &m, a.part)?;
                             std::fs::write(&path, bytes)?;
                             Ok(())
                         },
@@ -2171,6 +2209,53 @@ impl MailApp {
                 self.load_folder(Folder::Inbox, w, cx);
             }
 
+            Action::UnlockMail => {
+                let Some(m) = self.selected_mail() else {
+                    return;
+                };
+                let Some(a) = self.account_of(&m) else {
+                    return;
+                };
+                let secret = Self::value(&self.unlock_input, cx);
+                if secret.is_empty() {
+                    return;
+                }
+                Self::set(&self.unlock_input, "", w, cx);
+                let id = m.id.clone();
+                self.task(
+                    cx,
+                    move |b| b.unlock(&a, &secret),
+                    move |this, result, cx| match result {
+                        Ok(()) => {
+                            this.locked.remove(&m.account);
+                            this.notice("Encrypted mail unlocked on this computer", false, cx);
+                            if this.selected.as_deref() == Some(id.as_str()) {
+                                this.select(id, cx);
+                            }
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
+            Action::LockMail(account) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
+                    return;
+                };
+                self.locked.insert(account);
+                for m in self.messages.iter_mut().filter(|m| m.account == a.id) {
+                    if self.encrypted.contains(&m.account) {
+                        m.body = None;
+                    }
+                }
+                self.task(
+                    cx,
+                    move |b| b.lock_mail(&a),
+                    |this, result, cx| match result {
+                        Ok(()) => this.notice("This computer forgot your mail key", false, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
             Action::Settings => {
                 if self.modal != Some(Modal::Settings) {
                     self.page = Page::General;
@@ -3824,6 +3909,64 @@ impl MailApp {
                     ),
             )
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
+        if m.body.is_none() && self.locked.contains(&m.account) {
+            return content
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .mt_6()
+                        .max_w(px(340.))
+                        .mx_auto()
+                        .child(
+                            div()
+                                .size(px(52.))
+                                .rounded(px(16.))
+                                .bg(rgb(c.soft))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon_el("lock", 22., c.accent)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("This message is encrypted"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .text_center()
+                                .child(
+                                    "Enter your Pinal password to read encrypted mail on this \
+                                     computer. After a password reset, use your previous password \
+                                     or your recovery key.",
+                                ),
+                        )
+                        .child(
+                            Input::new(&self.unlock_input)
+                                .w_full()
+                                .h(px(39.))
+                                .text_size(px(13.)),
+                        )
+                        .child(
+                            self.button(
+                                "unlock-mail",
+                                "Unlock",
+                                "lock",
+                                Action::UnlockMail,
+                                true,
+                                cx,
+                            )
+                            .w_full(),
+                        ),
+                )
+                .into_any_element();
+        }
         let body = m.body.unwrap_or_else(|| {
             if self.busy > 0 {
                 "Loading message…".into()
@@ -4564,6 +4707,32 @@ impl MailApp {
                             ),
                     ),
             )
+            .when(self.encrypted.contains(&a.id), |page| {
+                let locked = self.locked.contains(&a.id);
+                page.child(self.section("Encryption")).child(self.setting(
+                    "Zero-access encryption",
+                    if locked {
+                        "Your mail is stored encrypted. Open an encrypted message and enter your Pinal password to read it here."
+                    } else {
+                        "Your mail is stored encrypted and decrypted on this computer. The key stays in the system keychain until you remove it."
+                    },
+                    if locked {
+                        div().into_any_element()
+                    } else {
+                        self.button(
+                            format!("lock-{}", a.id),
+                            "Forget key",
+                            "lock",
+                            Action::LockMail(a.id.clone()),
+                            false,
+                            cx,
+                        )
+                        .border_1()
+                        .border_color(rgb(c.border))
+                        .into_any_element()
+                    },
+                ))
+            })
             .child(self.section("Sync"));
         if a.provider != Provider::Pop3 {
             page = page.child(

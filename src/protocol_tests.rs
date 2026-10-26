@@ -517,3 +517,55 @@ fn imap_starttls_and_sync_window() -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
+
+/// Pinal mail Stalwart encrypted at rest: readable in memory once unlocked,
+/// never stored readable in the local cache, and locked without the key.
+#[test]
+fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        password: String,
+        bundle: crate::crypto::KeyBundle,
+        stored: String,
+    }
+    use base64::Engine as _;
+    let f: Fixture = serde_json::from_str(include_str!("../tests/fixtures/pinal-encryption.json"))?;
+    let stored = base64::engine::general_purpose::STANDARD.decode(&f.stored)?;
+    let path = std::env::temp_dir().join(format!("pinal-enc-{}", uuid::Uuid::new_v4()));
+    let mut backend = Backend::new(Arc::new(Store::open(&path)?));
+    let account = crate::model::Service::Pinal
+        .account("jdoe@sonoran.exchange")
+        .unwrap();
+    backend.test_secret = Some(Secret {
+        password: "app-password".into(),
+        mail_bundle: serde_json::to_string(&f.bundle)?,
+        ..Default::default()
+    });
+    let mail = parse_message(&stored, &account, "enc-1", Folder::Inbox, "INBOX", 1)?;
+    backend.store.save_messages(std::slice::from_ref(&mail))?;
+    backend.store.save_raw("enc-1", &stored)?;
+    assert!(backend.encrypted(&account));
+
+    let locked = backend.read(&account, &mail).unwrap_err();
+    assert!(locked.downcast_ref::<crate::crypto::Locked>().is_some());
+    assert!(backend.unlock(&account, "wrong password").is_err());
+    backend.unlock(&account, &f.password)?;
+
+    let read = backend.read(&account, &mail)?;
+    assert!(
+        read.body
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Picacho reads this")
+    );
+    assert_eq!(read.attachments.len(), 1);
+    assert_eq!(
+        backend.attachment(&account, &read, read.attachments[0].part)?,
+        b"%PDF secret"
+    );
+    let cached = backend.store.message("enc-1")?.unwrap();
+    assert!(cached.body.is_none() && cached.snippet.is_empty() && cached.attachments.is_empty());
+    assert_eq!(backend.store.raw("enc-1")?.unwrap(), stored);
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}

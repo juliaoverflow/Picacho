@@ -416,6 +416,13 @@ pub struct Secret {
     pub expires_at: i64,
     #[serde(default)]
     pub client_secret: String,
+    /// Pinal Mail's key bundle (JSON). Every secret in it is ciphertext.
+    #[serde(default)]
+    pub mail_bundle: String,
+    /// The unwrapped Pinal mail key once this device was unlocked; it can
+    /// always be rebuilt from the password, so the keychain is only a cache.
+    #[serde(default)]
+    pub mail_key: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Draft {

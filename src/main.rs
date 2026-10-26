@@ -1,4 +1,5 @@
 mod assets;
+mod crypto;
 mod discover;
 mod mail;
 mod model;

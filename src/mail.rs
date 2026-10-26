@@ -14,6 +14,7 @@ use std::{
     },
     time::Duration,
 };
+use zeroize::Zeroize;
 
 pub const MAX_MESSAGE: usize = 25 * 1024 * 1024;
 #[cfg(test)]
@@ -29,6 +30,8 @@ pub enum Change {
 pub struct Backend {
     pub store: Arc<Store>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Opened Pinal mail keys by account, held in memory only.
+    mail_keys: Mutex<HashMap<String, Arc<Vec<pgp::composed::SignedSecretKey>>>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -39,6 +42,7 @@ impl Backend {
         Self {
             store,
             operations: Mutex::new(HashMap::new()),
+            mail_keys: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -91,6 +95,12 @@ impl Backend {
             };
             Secret {
                 password: mailbox.password,
+                mail_bundle: mailbox
+                    .encryption
+                    .and_then(|e| e.bundle)
+                    .map(|b| serde_json::to_string(&b))
+                    .transpose()?
+                    .unwrap_or_default(),
                 ..Default::default()
             }
         } else if account.oauth {
@@ -142,6 +152,69 @@ impl Backend {
         let mut s = store::read_secret(&a.id)?;
         crate::oauth::refresh(a, &mut s)?;
         Ok(s)
+    }
+    /// Whether this account's mail is encrypted with a Pinal key bundle.
+    pub fn encrypted(&self, a: &Account) -> bool {
+        self.credentials(a)
+            .map(|s| !s.mail_bundle.is_empty())
+            .unwrap_or(false)
+    }
+    /// Opens the key bundle with the Pinal password (or the recovery key) and
+    /// keeps the mail key in the keychain, so later launches need no password.
+    pub fn unlock(&self, a: &Account, secret: &str) -> Result<()> {
+        let mut s = self.credentials(a)?;
+        ensure!(
+            !s.mail_bundle.is_empty(),
+            "This account's mail is not encrypted."
+        );
+        let bundle: crate::crypto::KeyBundle = serde_json::from_str(&s.mail_bundle)?;
+        let secret = secret.trim_end_matches(['\r', '\n']);
+        let mk = if crate::crypto::looks_like_recovery_key(secret) {
+            crate::crypto::unlock_with_recovery_key(&bundle, secret)?
+        } else {
+            crate::crypto::unlock_with_password(&bundle, secret)?
+        };
+        let keys = crate::crypto::open_keys(&bundle, &mk)?;
+        s.mail_key = crate::crypto::encode_master_key(&mk);
+        #[cfg(not(test))]
+        store::write_secret(&a.id, &s)?;
+        self.mail_keys
+            .lock()
+            .unwrap()
+            .insert(a.id.clone(), Arc::new(keys));
+        Ok(())
+    }
+    /// Forgets the mail key on this device; the password unlocks it again.
+    pub fn lock_mail(&self, a: &Account) -> Result<()> {
+        self.mail_keys.lock().unwrap().remove(&a.id);
+        let mut s = store::read_secret(&a.id)?;
+        s.mail_key.zeroize();
+        s.mail_key.clear();
+        store::write_secret(&a.id, &s)
+    }
+    fn keys(&self, a: &Account) -> Result<Option<Arc<Vec<pgp::composed::SignedSecretKey>>>> {
+        if let Some(keys) = self.mail_keys.lock().unwrap().get(&a.id) {
+            return Ok(Some(keys.clone()));
+        }
+        let s = self.credentials(a)?;
+        let Some(mk) = crate::crypto::decode_master_key(&s.mail_key) else {
+            return Ok(None);
+        };
+        let bundle: crate::crypto::KeyBundle = serde_json::from_str(&s.mail_bundle)?;
+        let keys = Arc::new(crate::crypto::open_keys(&bundle, &mk)?);
+        self.mail_keys
+            .lock()
+            .unwrap()
+            .insert(a.id.clone(), keys.clone());
+        Ok(Some(keys))
+    }
+    /// The readable message: decrypted here when Pinal stored it encrypted.
+    fn plaintext(&self, a: &Account, raw: &[u8]) -> Result<(crate::crypto::Protection, Vec<u8>)> {
+        if crate::crypto::encrypted_part(raw).is_none() {
+            return crate::crypto::open_message(raw, &[]);
+        }
+        let keys = self.keys(a)?.ok_or(crate::crypto::Locked)?;
+        crate::crypto::open_message(raw, &keys)
     }
     pub fn sync(
         &self,
@@ -379,11 +452,22 @@ impl Backend {
             self.store.save_raw(&m.id, &raw)?;
             raw
         };
-        let mut next = parse_message(&raw, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
+        let (protection, plain) = self.plaintext(a, &raw)?;
+        let mut next = parse_message(&plain, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         next.unread = m.unread;
         next.starred = m.starred;
         next.size = m.size;
-        self.store.save_messages(&[next.clone()])?;
+        if protection == crate::crypto::Protection::Pinal {
+            // Zero-access: keep only what the server could already see in the
+            // local cache. The body stays in memory and is decrypted again later.
+            let mut kept = next.clone();
+            kept.body = None;
+            kept.snippet.clear();
+            kept.attachments.clear();
+            self.store.save_messages(&[kept])?;
+        } else {
+            self.store.save_messages(&[next.clone()])?;
+        }
         Ok(next)
     }
     pub fn change(&self, a: &Account, m: &Mail, change: Change) -> Result<Mail> {
@@ -563,6 +647,11 @@ impl Backend {
                         continue;
                     }
                     self.store.save_raw(&m.id, raw)?;
+                    // Encrypted mail stays ciphertext on disk; it is read on open.
+                    if crate::crypto::encrypted_part(raw).is_some() {
+                        stored += 1;
+                        continue;
+                    }
                     // Keep summaries small: list views load every row's JSON.
                     if let Ok(parsed) =
                         parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid)
@@ -700,8 +789,9 @@ impl Backend {
         let _ = self.store.delete_draft(&d.id);
         Ok(())
     }
-    pub fn attachment(&self, m: &Mail, part: usize) -> Result<Vec<u8>> {
+    pub fn attachment(&self, a: &Account, m: &Mail, part: usize) -> Result<Vec<u8>> {
         let raw = self.store.raw(&m.id)?.context("Open this message first")?;
+        let (_, raw) = self.plaintext(a, &raw)?;
         let parsed = mailparse::parse_mail(&raw)?;
         let mut leaves = Vec::new();
         collect_leaves(&parsed, &mut leaves);

@@ -321,6 +321,15 @@ pub struct PinalMailbox {
     pub password: String,
     pub imap: PinalServer,
     pub smtp: PinalServer,
+    #[serde(default)]
+    pub encryption: Option<PinalEncryption>,
+}
+/// Zero-access encryption: the bundle is ciphertext that only the person's
+/// password (or recovery key) opens, on this device.
+#[derive(Debug, serde::Deserialize)]
+pub struct PinalEncryption {
+    #[serde(default)]
+    pub bundle: Option<crate::crypto::KeyBundle>,
 }
 #[derive(Debug, serde::Deserialize)]
 pub struct PinalServer {
