@@ -22,10 +22,14 @@ The suite exercises real TCP/TLS protocol exchanges with local servers. Test roo
 
 ## Native UI walkthrough
 
-The application is launched as a macOS `.app` and inspected through its actual rendered window. The walkthrough checks initial layout, typing/search, message selection, compose fields, draft saving and reopening, folder navigation, account forms, validation, light/dark appearance, and keyboard shortcuts. It uses a separate `PINAL_MAIL_DATA_DIR` so test drafts and preferences do not enter the user's normal profile.
+The application is launched as a macOS `.app` and inspected through its actual rendered window. The walkthrough checks initial layout, typing/search, message selection, compose fields, draft saving and reopening, folder navigation, account forms, validation, light/dark appearance, and keyboard shortcuts. It uses a separate data directory (now `PICACHO_DATA_DIR`) so test drafts and preferences do not enter the user's normal profile.
 
 The saved draft was confirmed after restarting the application, with its recipient, subject, and body preserved. The account form rejected a missing email address before attempting any network connection. Both appearance modes were inspected in the running release app.
 
 ## Limits of verification
 
 Local protocol tests cannot validate a particular provider's tenant policies, consent configuration, password, or OAuth registration. Live Gmail and Outlook OAuth consent/token refresh require the user's credentials and registered client. No real mailbox was connected and no external email was sent during development.
+
+## Picacho update (October 24, 2026)
+
+Rename to Picacho, provider list, Pinal sign-in, Settings, and menu bar. `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked` pass (18 tests, 1 ignored live test). New tests cover the provider list and discovery fallback, the Add Account dialog, theme color and per-mailbox settings persistence, ID-token addresses, the loopback callback rejecting a forged state, and IMAP STARTTLS with a date-limited sync window. The release `.app` builds and launches. The redesigned screens were not inspected visually in this pass, and browser sign-in was not run against live Google, Microsoft, or Pinal servers.

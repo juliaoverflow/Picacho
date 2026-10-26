@@ -2,6 +2,7 @@ use crate::model::*;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -50,6 +51,10 @@ impl Store {
     pub fn remove_account(&self, id: &str) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM preferences WHERE key=?1",
+            [format!("folders:{id}")],
+        )?;
         for table in ["accounts", "messages", "drafts"] {
             tx.execute(
                 &format!(
@@ -62,13 +67,20 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    pub fn messages(&self, account: &str, folder: Folder, limit: usize) -> Result<Vec<Mail>> {
+    pub fn messages(
+        &self,
+        account: &str,
+        mailbox: impl Into<Mailbox>,
+        limit: usize,
+    ) -> Result<Vec<Mail>> {
+        let mailbox = mailbox.into();
+        let folder = mailbox.folder();
         let db = self.db.lock().unwrap();
         let mut q = db.prepare("SELECT data FROM messages WHERE account=?1 AND (folder=?2 OR ?2='starred') ORDER BY date DESC LIMIT ?3")?;
         let rows = q.query_map(
             params![
                 account,
-                folder.key(),
+                mailbox.key(),
                 if folder == Folder::Starred {
                     5000
                 } else {
@@ -101,7 +113,7 @@ impl Store {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         for m in messages {
-            tx.execute("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data",params![m.id,m.account,m.folder.key(),m.date,serde_json::to_string(m)?])?;
+            tx.execute("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data",params![m.id,m.account,m.mailbox().key(),m.date,serde_json::to_string(m)?])?;
         }
         tx.commit()?;
         Ok(())
@@ -117,12 +129,18 @@ impl Store {
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
     }
-    pub fn reconcile(&self, account: &str, folder: Folder, ids: &[String]) -> Result<()> {
+    pub fn reconcile(
+        &self,
+        account: &str,
+        mailbox: impl Into<Mailbox>,
+        ids: &[String],
+    ) -> Result<()> {
+        let key = mailbox.into().key();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let old: Vec<String> = {
             let mut q = tx.prepare("SELECT id FROM messages WHERE account=?1 AND folder=?2")?;
-            q.query_map(params![account, folder.key()], |r| r.get(0))?
+            q.query_map(params![account, key], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
         let keep: std::collections::HashSet<_> = ids.iter().collect();
@@ -157,6 +175,53 @@ impl Store {
             .unwrap()
             .execute("DELETE FROM messages WHERE id=?1", [id])?;
         Ok(())
+    }
+    /// Messages whose full content has not been downloaded yet, newest first.
+    pub fn missing(&self, account: &str, max_size: usize, limit: usize) -> Result<Vec<Mail>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT data FROM messages WHERE account=?1 AND raw IS NULL
+             AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC LIMIT ?3",
+        )?;
+        q.query_map(params![account, max_size, limit], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .collect()
+    }
+    /// Total and not-yet-downloaded message counts across all accounts.
+    pub fn download_counts(&self, max_size: usize) -> Result<(usize, usize)> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(raw IS NULL),0) FROM messages
+             WHERE json_extract(data,'$.size') <= ?1",
+            [max_size],
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+        )?)
+    }
+    /// Unread counts keyed by (account, mailbox key).
+    pub fn unread_counts(&self) -> Result<HashMap<(String, String), usize>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT account, folder, COUNT(*) FROM messages
+             WHERE json_extract(data,'$.unread') GROUP BY account, folder",
+        )?;
+        q.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)? as usize,
+            ))
+        })?
+        .map(|r| Ok(r?))
+        .collect()
+    }
+    pub fn folders(&self, account: &str) -> Vec<RemoteFolder> {
+        self.preference(&format!("folders:{account}"))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    pub fn save_folders(&self, account: &str, folders: &[RemoteFolder]) -> Result<()> {
+        self.set_preference(
+            &format!("folders:{account}"),
+            &serde_json::to_string(folders)?,
+        )
     }
     pub fn save_draft(&self, d: &Draft) -> Result<()> {
         self.db.lock().unwrap().execute(
@@ -197,19 +262,21 @@ impl Store {
     }
 }
 pub fn secret_entry(id: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new("com.pinal.native-mail", id).context("Cannot access macOS Keychain")
+    // The service name predates the Picacho name; keep it so saved
+    // credentials stay readable.
+    keyring::Entry::new("com.pinal.native-mail", id).context("Cannot access the system keychain")
 }
 pub fn read_secret(id: &str) -> Result<Secret> {
     Ok(serde_json::from_str(
         &secret_entry(id)?
             .get_password()
-            .context("Credentials missing from Keychain. Reconnect this account.")?,
+            .context("Credentials missing from the system keychain. Reconnect this account.")?,
     )?)
 }
 pub fn write_secret(id: &str, s: &Secret) -> Result<()> {
     secret_entry(id)?
         .set_password(&serde_json::to_string(s)?)
-        .context("Could not securely save credentials to macOS Keychain")
+        .context("Could not securely save credentials to the system keychain")
 }
 
 #[cfg(test)]
@@ -228,6 +295,24 @@ mod tests {
         s.save_raw(&ms[0].id, b"raw")?;
         assert_eq!(s.raw(&ms[0].id)?, Some(b"raw".to_vec()));
         assert_eq!(s.messages("demo", Folder::Starred, 300)?.len(), 2);
+        assert_eq!(s.download_counts(1 << 20)?, (10, 9));
+        assert_eq!(s.missing("demo", 1 << 20, 100)?.len(), 9);
+        assert_eq!(s.unread_counts()?[&("demo".into(), "inbox".into())], 2);
+        let mut other = ms[1].clone();
+        other.id = "remote-1".into();
+        other.folder = Folder::Other;
+        other.remote_folder = "Projects/2026".into();
+        s.save_messages(&[other])?;
+        let remote = Mailbox::Remote("Projects/2026".into());
+        assert_eq!(s.messages("demo", &remote, 300)?.len(), 1);
+        assert_eq!(s.messages("demo", Folder::Inbox, 300)?.len(), 10);
+        let folders = vec![RemoteFolder {
+            name: "Projects/2026".into(),
+            label: "2026".into(),
+            depth: 1,
+        }];
+        s.save_folders("demo", &folders)?;
+        assert_eq!(s.folders("demo"), folders);
         s.reconcile("demo", Folder::Inbox, &[ms[0].id.clone()])?;
         assert_eq!(s.messages("demo", Folder::Inbox, 300)?.len(), 1);
         let d = Draft {

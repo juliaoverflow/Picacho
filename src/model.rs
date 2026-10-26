@@ -17,6 +17,160 @@ impl Provider {
         }
     }
 }
+/// The mail services offered when adding an account. `Provider` is the
+/// protocol behaviour; a service picks one along with its servers and the
+/// simplest way to sign in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Service {
+    Pinal,
+    Gmail,
+    Outlook,
+    ICloud,
+    Fastmail,
+    Zoho,
+    ProtonBridge,
+    /// Any other server, found by autoconfiguration or entered by hand.
+    #[default]
+    Other,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignIn {
+    /// Pinal Accounts in the browser; the server issues an app password.
+    Pinal,
+    /// The provider's OAuth consent in the browser.
+    Browser,
+    /// A password made for mail apps, as named by `password_label`.
+    Password,
+}
+impl Service {
+    pub const PICKER: [Self; 7] = [
+        Self::Pinal,
+        Self::Gmail,
+        Self::Outlook,
+        Self::ICloud,
+        Self::Fastmail,
+        Self::Zoho,
+        Self::ProtonBridge,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinal => "Pinal Mail",
+            Self::Gmail => "Gmail",
+            Self::Outlook => "Outlook",
+            Self::ICloud => "iCloud Mail",
+            Self::Fastmail => "Fastmail",
+            Self::Zoho => "Zoho Mail",
+            Self::ProtonBridge => "Proton Mail",
+            Self::Other => "Other",
+        }
+    }
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::Gmail => Provider::Gmail,
+            Self::Outlook => Provider::Outlook,
+            _ => Provider::Imap,
+        }
+    }
+    pub fn sign_in(self) -> SignIn {
+        match self {
+            Self::Pinal => SignIn::Pinal,
+            Self::Gmail | Self::Outlook if crate::oauth::configured(self.provider()) => {
+                SignIn::Browser
+            }
+            _ => SignIn::Password,
+        }
+    }
+    pub fn password_label(self) -> &'static str {
+        match self {
+            Self::Gmail | Self::Fastmail | Self::Zoho => "App password",
+            Self::ICloud => "App-specific password",
+            Self::ProtonBridge => "Bridge password",
+            _ => "Password",
+        }
+    }
+    /// One sentence on where the password comes from, with a page that makes one.
+    pub fn password_help(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Gmail => Some((
+                "Gmail needs an app password, made in your Google Account.",
+                "https://myaccount.google.com/apppasswords",
+            )),
+            Self::ICloud => Some((
+                "iCloud needs an app-specific password, made in your Apple Account.",
+                "https://account.apple.com/account/manage",
+            )),
+            Self::Fastmail => Some((
+                "Fastmail needs an app password with IMAP and SMTP access.",
+                "https://www.fastmail.help/hc/en-us/search?query=app+passwords",
+            )),
+            Self::Zoho => Some((
+                "Turn on IMAP in Zoho Mail settings, then make an app password.",
+                "https://accounts.zoho.com/home#security/app_password",
+            )),
+            Self::ProtonBridge => Some((
+                "Open Proton Mail Bridge, choose your account and copy its mailbox password. Bridge must be running, with its certificate trusted.",
+                "https://proton.me/support/apple-mail-certificate",
+            )),
+            Self::Outlook => Some((
+                "Microsoft sign-in isn't set up in this build. Use an app password if your account allows one.",
+                "https://account.live.com/proofs/AppPassword",
+            )),
+            _ => None,
+        }
+    }
+    /// Fixed server settings. `None` means look them up from the address.
+    pub fn account(self, email: &str) -> Option<Account> {
+        let mut a = Account::new(self.provider());
+        a.service = self;
+        a.email = email.into();
+        let (host, port, smtp, smtp_port) = match self {
+            Self::Gmail | Self::Outlook => return Some(a),
+            Self::Pinal => ("mail.sonoran.exchange", 993, "mail.sonoran.exchange", 465),
+            Self::ICloud => ("imap.mail.me.com", 993, "smtp.mail.me.com", 587),
+            Self::Fastmail => ("imap.fastmail.com", 993, "smtp.fastmail.com", 465),
+            Self::Zoho => {
+                // Zoho keeps each region's mail on its own servers.
+                let domain = crate::discover::domain(email).unwrap_or_default();
+                let region = ["eu", "in", "com.au", "jp", "ca", "sa", "com.cn"]
+                    .into_iter()
+                    .find(|r| domain == format!("zoho.{r}") || domain == format!("zohomail.{r}"))
+                    .unwrap_or("com");
+                a.incoming_host = format!("imap.zoho.{region}");
+                a.smtp_host = format!("smtp.zoho.{region}");
+                a.smtp_port = 465;
+                return Some(a);
+            }
+            Self::ProtonBridge => {
+                a.incoming_starttls = true;
+                ("127.0.0.1", 1143, "127.0.0.1", 1025)
+            }
+            Self::Other => return None,
+        };
+        a.incoming_host = host.into();
+        a.incoming_port = port;
+        a.smtp_host = smtp.into();
+        a.smtp_port = smtp_port;
+        Some(a)
+    }
+}
+/// Per-mailbox sync preferences, edited in Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSettings {
+    /// Only mail received in the last this many days is synced; 0 syncs all.
+    pub days: u32,
+    /// Minutes between checks for new mail; 0 checks only on request.
+    pub refresh_minutes: u32,
+    pub notify: bool,
+}
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            days: 0,
+            refresh_minutes: 5,
+            notify: true,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -30,6 +184,14 @@ pub struct Account {
     pub oauth: bool,
     pub client_id: String,
     pub client_secret: String,
+    #[serde(default)]
+    pub service: Service,
+    /// Upgrade a plain IMAP connection with STARTTLS instead of connecting
+    /// with TLS. Only Proton Mail Bridge, on this computer, needs it.
+    #[serde(default)]
+    pub incoming_starttls: bool,
+    #[serde(default)]
+    pub sync: SyncSettings,
 }
 impl Account {
     pub fn new(provider: Provider) -> Self {
@@ -50,6 +212,20 @@ impl Account {
             oauth: provider == Provider::Outlook,
             client_id: String::new(),
             client_secret: String::new(),
+            service: match provider {
+                Provider::Gmail => Service::Gmail,
+                Provider::Outlook => Service::Outlook,
+                _ => Service::Other,
+            },
+            incoming_starttls: false,
+            sync: SyncSettings::default(),
+        }
+    }
+    /// How the account appears in Settings, e.g. "iCloud Mail · IMAP".
+    pub fn service_label(&self) -> &'static str {
+        match self.service {
+            Service::Other => self.provider.label(),
+            s => s.label(),
         }
     }
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -69,17 +245,25 @@ impl Account {
         );
         anyhow::ensure!(
             !self.oauth || !self.client_id.is_empty(),
-            "OAuth requires your provider's desktop application client ID."
+            "Browser sign-in isn't set up for {} in this build.",
+            self.provider.label()
         );
         anyhow::ensure!(
             !self.oauth || matches!(self.provider, Provider::Gmail | Provider::Outlook),
             "OAuth is available for Gmail and Outlook."
         );
+        // STARTTLS is only accepted from Bridge on this computer, where the
+        // first, unencrypted exchange never leaves the machine.
+        anyhow::ensure!(
+            !self.incoming_starttls
+                || matches!(self.incoming_host.as_str(), "127.0.0.1" | "localhost"),
+            "STARTTLS is only used with Proton Mail Bridge on this computer."
+        );
         Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Folder {
     Inbox,
     Starred,
@@ -88,6 +272,8 @@ pub enum Folder {
     Archive,
     Junk,
     Trash,
+    /// A server folder outside the standard set. `Mail::remote_folder` names it.
+    Other,
 }
 impl Folder {
     pub const ALL: [Self; 7] = [
@@ -108,6 +294,7 @@ impl Folder {
             Self::Archive => "Archive",
             Self::Junk => "Spam",
             Self::Trash => "Trash",
+            Self::Other => "Folder",
         }
     }
     pub fn key(self) -> &'static str {
@@ -119,8 +306,48 @@ impl Folder {
             Self::Archive => "archive",
             Self::Junk => "junk",
             Self::Trash => "trash",
+            Self::Other => "other",
         }
     }
+}
+
+/// A mailbox view: one of the standard folders, or a server folder by name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mailbox {
+    Standard(Folder),
+    Remote(String),
+}
+impl Mailbox {
+    pub fn key(&self) -> String {
+        match self {
+            Self::Standard(f) => f.key().into(),
+            Self::Remote(name) => format!("remote:{name}"),
+        }
+    }
+    pub fn folder(&self) -> Folder {
+        match self {
+            Self::Standard(f) => *f,
+            Self::Remote(_) => Folder::Other,
+        }
+    }
+}
+impl From<Folder> for Mailbox {
+    fn from(f: Folder) -> Self {
+        Self::Standard(f)
+    }
+}
+impl From<&Mailbox> for Mailbox {
+    fn from(m: &Mailbox) -> Self {
+        m.clone()
+    }
+}
+
+/// A server folder that is not one of the standard mailboxes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteFolder {
+    pub name: String,
+    pub label: String,
+    pub depth: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attachment {
@@ -148,16 +375,29 @@ pub struct Mail {
     pub body: Option<String>,
     pub attachments: Vec<Attachment>,
     pub message_id: String,
+    #[serde(default)]
+    pub has_attachments: bool,
 }
 impl Mail {
+    pub fn mailbox(&self) -> Mailbox {
+        if self.folder == Folder::Other {
+            Mailbox::Remote(self.remote_folder.clone())
+        } else {
+            Mailbox::Standard(self.folder)
+        }
+    }
+    pub fn has_attachments(&self) -> bool {
+        self.has_attachments || !self.attachments.is_empty()
+    }
     pub fn initials(&self) -> String {
         initials(&self.sender)
     }
+    /// `query` must already be lowercase.
     pub fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        [&self.sender, &self.from, &self.subject, &self.snippet]
-            .iter()
-            .any(|s| s.to_lowercase().contains(&query))
+        query.is_empty()
+            || [&self.sender, &self.from, &self.subject, &self.snippet]
+                .iter()
+                .any(|s| s.to_lowercase().contains(query))
     }
 }
 pub fn initials(name: &str) -> String {
@@ -188,6 +428,7 @@ pub struct Draft {
     pub attachments: Vec<std::path::PathBuf>,
 }
 
+#[cfg(any(test, feature = "sample-data"))]
 pub fn demo_mail() -> Vec<Mail> {
     let examples = [
         (
@@ -286,6 +527,7 @@ pub fn demo_mail() -> Vec<Mail> {
             body: Some((*body).into()),
             attachments: vec![],
             message_id: String::new(),
+            has_attachments: i == 2,
         })
         .collect()
 }

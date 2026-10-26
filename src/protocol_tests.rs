@@ -166,7 +166,10 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
                     }
                     String::new()
                 } else if upper.starts_with("LIST ") {
-                    "* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n"
+                    "* LIST (\\Archive) \"/\" \"Archive\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n\
+                      * LIST (\\HasChildren) \"/\" \"Projects\"\r\n\
+                      * LIST (\\HasNoChildren) \"/\" \"Projects/2026\"\r\n\
+                      * LIST (\\Noselect) \"/\" \"[Gmail]\"\r\n* LIST () \"/\" \"Trash\"\r\n"
                         .into()
                 } else if upper == "CAPABILITY" {
                     "* CAPABILITY IMAP4rev1 MOVE\r\n".into()
@@ -208,6 +211,35 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
         let synced = b.sync(&a, Folder::Inbox, 300)?;
         assert!(!synced[0].unread);
         assert!(synced[0].starred);
+        assert_eq!(
+            b.store.folders(&a.id),
+            vec![
+                RemoteFolder {
+                    name: "Projects".into(),
+                    label: "Projects".into(),
+                    depth: 0
+                },
+                RemoteFolder {
+                    name: "Projects/2026".into(),
+                    label: "2026".into(),
+                    depth: 1
+                },
+            ],
+            "Standard and non-selectable mailboxes are not listed as folders"
+        );
+        let project = Mailbox::Remote("Projects/2026".into());
+        let in_project = b.sync(&a, &project, 300)?;
+        assert_eq!(in_project.len(), 1);
+        assert_eq!(in_project[0].folder, Folder::Other);
+        assert_eq!(in_project[0].mailbox(), project);
+        assert_eq!(b.store.download_counts(MAX_MESSAGE)?, (2, 1));
+        assert_eq!(b.download_batch(&a, 25)?, 1);
+        assert_eq!(b.store.download_counts(MAX_MESSAGE)?, (2, 0));
+        assert!(b.store.raw(&in_project[0].id)?.is_some());
+        assert!(b.store.message(&in_project[0].id)?.unwrap().body.is_none());
+        b.change_many(&a, &in_project, Change::Star(false))?;
+        b.change_many(&a, &in_project, Change::Star(true))?;
+        b.mark_all_read(&a, &project)?;
         let starred = b.sync(&a, Folder::Starred, 300)?;
         assert_eq!(
             starred.len(),
@@ -419,5 +451,69 @@ fn pop3_tls_download_is_deduplicated_and_local_moves_survive_sync() -> Result<()
     );
     drop(b);
     std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Proton Mail Bridge style: a plain greeting upgraded with STARTTLS, and a
+/// sync window that limits the server search by date.
+#[test]
+fn imap_starttls_and_sync_window() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || -> Vec<String> {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"* OK Bridge ready\r\n").unwrap();
+        let mut plain = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        plain.read_line(&mut line).unwrap();
+        let (tag, command) = line.trim_end().split_once(' ').unwrap();
+        assert_eq!(command, "STARTTLS", "nothing is sent before encryption");
+        socket
+            .write_all(format!("{tag} OK begin TLS\r\n").as_bytes())
+            .unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        let mut seen = vec![];
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            seen.push(command.to_owned());
+            let payload = if command.starts_with("SELECT") {
+                "* 0 EXISTS\r\n* OK [UIDVALIDITY 9] ok\r\n"
+            } else if command.starts_with("LIST") {
+                "* LIST () \"/\" INBOX\r\n"
+            } else if command.starts_with("UID SEARCH") {
+                "* SEARCH\r\n"
+            } else {
+                ""
+            };
+            let done = command.starts_with("LOGOUT");
+            r.get_mut()
+                .write_all(format!("{payload}{tag} OK done\r\n").as_bytes())
+                .unwrap();
+            if done {
+                break;
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.service = crate::model::Service::ProtonBridge;
+    a.incoming_starttls = true;
+    a.incoming_port = port;
+    a.sync.days = 30;
+    a.validate()?;
+    assert!(b.sync(&a, Folder::Inbox, 300)?.is_empty());
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c.starts_with("LOGIN")));
+    let search = seen.iter().find(|c| c.starts_with("UID SEARCH")).unwrap();
+    let since = (chrono::Utc::now() - chrono::Duration::days(30))
+        .format("%-d-%b-%Y")
+        .to_string();
+    assert_eq!(search, &format!("UID SEARCH ALL SINCE {since}"));
+    let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
