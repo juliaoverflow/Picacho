@@ -2,9 +2,18 @@
 use super::*;
 
 impl MailApp {
+    pub(super) fn reading_options(&self, mail: &Mail) -> ReadingOptions {
+        self.backend
+            .store
+            .preference(&message_key(&mail.account, &mail.id))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(self.reading_defaults)
+    }
+
     pub(super) fn reader(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors();
         let Some(m) = self.selected_mail() else {
+            self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()
                 .flex_1()
                 .min_w_0()
@@ -190,27 +199,78 @@ impl MailApp {
             )
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
         if m.body.is_none() && self.locked.contains(&m.account) {
+            self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
         } else {
-            let body = m.body.unwrap_or_else(|| {
-                if self.busy > 0 {
-                    "Loading message…".into()
-                } else {
-                    "This message has no text body.".into()
-                }
-            });
-            // Native selectable text preserves paragraphs without running untrusted HTML.
+            let options = self.reading_options(&m);
             content = content.child(
-                gpui_component::text::TextView::markdown(
-                    SharedString::from(format!("body-{}", m.id)),
-                    plain_markdown(&body),
-                    window,
-                    cx,
-                )
-                .selectable(true)
-                .text_size(px(14.))
-                .line_height(relative(1.8)),
+                div()
+                    .id("email-rendering-controls")
+                    .debug_selector(|| "email-rendering-controls".into())
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .mb_4()
+                    .p_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.bg))
+                    .child(
+                        self.button(
+                            "toggle-email-html",
+                            if options.html { "HTML on" } else { "HTML off" },
+                            "",
+                            Action::ToggleHtml,
+                            options.html,
+                            cx,
+                        )
+                        .debug_selector(|| "toggle-email-html".into()),
+                    )
+                    .child(
+                        self.button(
+                            "toggle-email-remote",
+                            if options.block_remote {
+                                "Remote blocked"
+                            } else {
+                                "Remote allowed"
+                            },
+                            "",
+                            Action::ToggleRemote,
+                            !options.block_remote,
+                            cx,
+                        )
+                        .debug_selector(|| "toggle-email-remote".into()),
+                    ),
             );
+            if options.html
+                && let Some(html) = &m.html
+            {
+                self.html_view.update(cx, |view, cx| {
+                    view.set_content(html, options.block_remote, cx)
+                });
+                content = content.child(self.html_view.clone());
+            } else {
+                self.html_view.update(cx, |view, cx| view.clear(cx));
+                let body = m.body.clone().unwrap_or_else(|| {
+                    if self.busy > 0 {
+                        "Loading message…".into()
+                    } else {
+                        "This message has no text body.".into()
+                    }
+                });
+                content = content.child(
+                    gpui_component::text::TextView::markdown(
+                        SharedString::from(format!("body-{}", m.id)),
+                        plain_markdown(&body),
+                        window,
+                        cx,
+                    )
+                    .selectable(true)
+                    .text_size(px(14.))
+                    .line_height(relative(1.8)),
+                );
+            }
             for (i, a) in m.attachments.iter().enumerate() {
                 content = content.child(
                     div()

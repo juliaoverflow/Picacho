@@ -75,3 +75,35 @@ Keychain ACL prompts, and live browser reauthentication cannot be exercised in
 this Linux environment. The bundle script accepts a stable signing identity;
 the README documents why ad-hoc rebuilds can change Keychain access identity and
 how to verify the remaining macOS behavior.
+
+## Interactive HTML email (October 26, 2026)
+
+Linux x86_64, Rust 1.96.0: default and `sample-data` builds and full suites pass
+(57 passed, 2 existing opt-in checks ignored in each configuration). Formatting
+and strict all-target/all-feature Clippy pass. The unchanged ignored checks need
+live discovery or a separate Dovecot installation.
+
+New coverage exercises decoded HTML/plain alternatives, attachment exclusion,
+old-cache compatibility, actual Blitz CSS painting, pointer-driven disclosure
+expansion, long-message/HiDPI visible-tile rendering, per-email toggle clicks,
+independent account/message choices, persisted defaults and overrides after
+reopening, and narrow-window settings/controls. A loopback HTTP server verifies
+that blocked HTML makes zero requests, enabling remote content loads CSS imports,
+fonts/background/image resources, and requests carry no cookies or referrer.
+Filesystem/unsafe URL schemes are refused; embedded data resources remain local.
+The existing Pinal encryption test now also encrypts and opens HTML, verifies that
+SQLite retains only encrypted raw mail and no readable HTML, restores HTML from
+memory on reload, and discards it on locking even with a denied Keychain entry.
+
+The native GPUI client ran under Xvfb/Mesa with an isolated synthetic profile.
+HTML formatting/tables, disclosure expansion, plain-text switching, per-message
+remote loading and the global Reading tab were visually inspected. The loopback
+server received no request while blocked, then received the SVG request when
+remote content was enabled. Reading settings and reader scrolling were checked
+at 1440×1000, 640×480 and 360×320. No real mail account was connected. Native
+macOS/Windows builds and OS browser/Keychain integration were not exercised here.
+
+The renderer embeds Blitz 0.3.0-beta.4's DOM/HTML/paint crates without its standalone
+shell or unrestricted network client. The scoped Stylo derive patch needed to
+compile alongside GPUI is documented in `vendor/stylo_derive/README.md`; Linux's
+Fontconfig API features are aligned in Cargo.toml.

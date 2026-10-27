@@ -20,6 +20,7 @@ pub fn parse_message(
         .map(|s| (s.display_name.unwrap_or_else(|| s.addr.clone()), s.addr))
         .unwrap_or_else(|| (from_header.clone(), from_header));
     let mut body = String::new();
+    let mut html = None;
     let mut attachments = Vec::new();
     let mut leaves = Vec::new();
     collect_leaves(&p, &mut leaves);
@@ -36,14 +37,16 @@ pub fn parse_message(
                 mime: part.ctype.mimetype.clone(),
                 part: index,
             });
+        } else if part.ctype.mimetype == "text/html" && html.is_none() {
+            html = part.get_body().ok();
         } else if part.ctype.mimetype == "text/plain" && body.is_empty() {
             body = part.get_body().unwrap_or_default();
         }
     }
     if body.is_empty()
-        && let Some(html) = leaves.iter().find(|p| p.ctype.mimetype == "text/html")
+        && let Some(html) = &html
     {
-        body = html_to_text(&html.get_body().unwrap_or_default());
+        body = html_to_text(html);
     }
     let snippet = body
         .split_whitespace()
@@ -73,6 +76,7 @@ pub fn parse_message(
         starred: false,
         size: raw.len() as u32,
         body: if body.is_empty() { None } else { Some(body) },
+        html,
         attachments,
         message_id: header("Message-ID"),
         has_attachments,
@@ -91,7 +95,7 @@ pub(crate) fn collect_leaves<'a>(
     }
 }
 pub(crate) fn html_to_text(html: &str) -> String {
-    // Email is displayed as native text. No remote images, scripts, or web engine.
+    // Search, snippets, replies and the plain-text reader use this fallback.
     let mut text = String::new();
     let mut tag = String::new();
     let mut inside = false;
@@ -129,4 +133,34 @@ pub(crate) fn html_to_text(html: &str) -> String {
         .replace("&#39;", "'")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retains_html_alternative_without_treating_html_attachments_as_body() {
+        let raw = b"Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain alternative\r\n--a\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nPGI+UmljaCBhbHRlcm5hdGl2ZTwvYj4=\r\n--a--\r\n--m\r\nContent-Type: text/html; name=attachment.html\r\nContent-Disposition: attachment; filename=attachment.html\r\n\r\n<script>attachment</script>\r\n--m--\r\n";
+        let a = Account::new(Provider::Imap);
+        let m = parse_message(raw, &a, "id", Folder::Inbox, "INBOX", 1).unwrap();
+        assert_eq!(m.body.as_deref(), Some("Plain alternative"));
+        assert_eq!(m.html.as_deref(), Some("<b>Rich alternative</b>"));
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].part, 2);
+        assert!(!m.snippet.contains("<b>"));
+        let html_only = parse_message(
+            b"Content-Type: text/html; charset=utf-8\r\n\r\n<h1>HTML only</h1>",
+            &a,
+            "id",
+            Folder::Inbox,
+            "INBOX",
+            1,
+        )
+        .unwrap();
+        assert!(html_only.html.is_some());
+        assert!(html_only.body.unwrap().contains("HTML only"));
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("html");
+        assert!(serde_json::from_value::<Mail>(old).unwrap().html.is_none());
+    }
 }

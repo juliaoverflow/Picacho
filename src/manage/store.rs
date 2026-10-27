@@ -55,6 +55,9 @@ impl Store {
             "DELETE FROM preferences WHERE key=?1",
             [format!("folders:{id}")],
         )?;
+        tx.execute(
+            "DELETE FROM preferences WHERE substr(key,1,8)='reading:' AND json_valid(substr(key,9)) AND json_extract(substr(key,9),'$[0]')=?1", [id],
+        )?;
         for table in ["accounts", "messages", "drafts"] {
             tx.execute(
                 &format!(
@@ -406,6 +409,15 @@ mod tests {
         s.save_draft(&d)?;
         assert_eq!(s.drafts("demo")?[0].body, "unsent");
         s.delete_draft("draft")?;
+        let reading = crate::manage::reading::message_key("demo", "demo-0");
+        let other_reading = crate::manage::reading::message_key("other", "demo-0");
+        s.set_preference(&reading, "{}")?;
+        s.set_preference(&other_reading, "{}")?;
+        s.set_preference("reading_defaults", "{}")?;
+        s.remove_account("demo")?;
+        assert!(s.preference(&reading).is_none());
+        assert!(s.preference(&other_reading).is_some());
+        assert!(s.preference("reading_defaults").is_some());
         drop(s);
         std::fs::remove_dir_all(p)?;
         Ok(())

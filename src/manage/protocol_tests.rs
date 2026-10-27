@@ -582,6 +582,41 @@ fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
             .unwrap_or_default()
             .contains("Picacho reads this")
     );
+    // Exercise HTML through real encryption/decryption as well: it must never
+    // enter SQLite, including when a readable message is reloaded or locked.
+    use pgp::{
+        composed::{Deserializable, MessageBuilder, SignedPublicKey},
+        crypto::sym::SymmetricKeyAlgorithm,
+    };
+    let (public, _) = SignedPublicKey::from_string(&f.bundle.keys[0].public_key)?;
+    let html = "<h1>Secret HTML</h1><p>Only in memory</p>";
+    let inner = format!("Content-Type: text/html; charset=utf-8\r\n\r\n{html}");
+    let mut builder = MessageBuilder::from_bytes("", inner.into_bytes())
+        .seipd_v1(rand08::thread_rng(), SymmetricKeyAlgorithm::AES256);
+    builder.encrypt_to_key(rand08::thread_rng(), &public.public_subkeys[0])?;
+    let armored = builder.to_armored_string(rand08::thread_rng(), Default::default())?;
+    let raw = format!("From: Bill <bill@example.org>\r\nSubject: Encrypted HTML\r\nMIME-Version: 1.0\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=enc\r\n\r\n--enc\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--enc\r\nContent-Type: application/octet-stream\r\n\r\n{armored}\r\n--enc--\r\n").into_bytes();
+    let encrypted = parse_message(&raw, &account, "enc-html", Folder::Inbox, "INBOX", 2)?;
+    backend.store.save_download(&encrypted, &raw)?;
+    let read = backend.read(&account, &encrypted)?;
+    assert_eq!(read.html.as_deref(), Some(html));
+    let cached = backend.store.message("enc-html")?.unwrap();
+    assert!(cached.html.is_none() && cached.body.is_none());
+    assert_eq!(backend.store.raw("enc-html")?.unwrap(), raw);
+    assert_eq!(
+        backend.with_readable(vec![cached.clone()])[0]
+            .html
+            .as_deref(),
+        Some(html)
+    );
+    // Even a denied Keychain write must discard decrypted HTML immediately.
+    assert!(
+        backend
+            .load_credentials(&account.id, || anyhow::bail!("fixture keychain denied"))
+            .is_err()
+    );
+    assert!(backend.lock_mail(&account).is_err());
+    assert!(backend.with_readable(vec![cached])[0].html.is_none());
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }

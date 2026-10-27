@@ -6,10 +6,15 @@ mod error_tests;
 #[path = "reader.rs"]
 mod reader;
 #[cfg(test)]
+#[path = "reading_tests.rs"]
+mod reading_tests;
+#[cfg(test)]
 #[path = "responsive_tests.rs"]
 mod responsive_tests;
 #[path = "settings.rs"]
 mod settings;
+use super::html::HtmlView;
+use crate::manage::reading::{ReadingOptions, message_key};
 use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
 use crate::{
     manage::{
@@ -333,6 +338,7 @@ enum Step {
 #[derive(Clone, Debug, PartialEq)]
 enum Page {
     General,
+    Reading,
     Account(String),
 }
 #[derive(Clone)]
@@ -376,6 +382,9 @@ enum Action {
     SetAppearance(Appearance),
     SetAccent(Accent),
     SetSync(String, SyncSettings),
+    SetReadingDefaults(ReadingOptions),
+    ToggleHtml,
+    ToggleRemote,
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -477,6 +486,8 @@ pub struct MailApp {
     anim: u64,
     list_scroll: UniformListScrollHandle,
     reader_scroll: ScrollHandle,
+    reading_defaults: ReadingOptions,
+    html_view: Entity<HtmlView>,
     settings_scroll: ScrollHandle,
     /// Pinal Mail's password (or recovery key) prompt for encrypted mail.
     unlock_input: Entity<InputState>,
@@ -606,6 +617,12 @@ impl MailApp {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let sidebar_collapsed = backend.store.preference("sidebar").as_deref() == Some("collapsed");
+        let reading_defaults = backend
+            .store
+            .preference("reading_defaults")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let html_view = cx.new(HtmlView::new);
         let mut this = Self {
             backend,
             accounts,
@@ -676,6 +693,8 @@ impl MailApp {
             anim: 0,
             list_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
+            reading_defaults,
+            html_view,
             settings_scroll: ScrollHandle::new(),
             unlock_input,
             encrypted,
@@ -1234,6 +1253,7 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.html_view.update(cx, |view, cx| view.clear(cx));
         Self::set(&self.unlock_input, "", w, cx);
         self.account = account;
         self.folder = mailbox.folder();
@@ -1353,6 +1373,7 @@ impl MailApp {
                                 starred: false,
                                 size: 0,
                                 body: Some(d.body.clone()),
+                                html: None,
                                 attachments: vec![],
                                 message_id: String::new(),
                                 has_attachments: !d.attachments.is_empty(),
@@ -1366,6 +1387,7 @@ impl MailApp {
         );
     }
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
+        self.html_view.update(cx, |view, cx| view.clear(cx));
         self.selected = Some(id.clone());
         self.anim += 1;
         self.read_generation += 1;
@@ -2277,6 +2299,7 @@ impl MailApp {
             }
 
             Action::BackToList => {
+                self.html_view.update(cx, |view, cx| view.clear(cx));
                 self.selected = None;
                 self.read_generation += 1;
                 Self::set(&self.unlock_input, "", w, cx);
@@ -2335,10 +2358,12 @@ impl MailApp {
                 let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
                     return;
                 };
+                self.html_view.update(cx, |view, cx| view.clear(cx));
                 self.locked.insert(account);
                 for m in self.messages.iter_mut().filter(|m| m.account == a.id) {
                     if self.encrypted.contains(&m.account) {
                         m.body = None;
+                        m.html = None;
                     }
                 }
                 self.task(
@@ -2402,6 +2427,32 @@ impl MailApp {
                 let _ = self.backend.store.set_preference("accent", accent.key());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
+            Action::SetReadingDefaults(options) => {
+                match self.backend.store.set_preference(
+                    "reading_defaults",
+                    &serde_json::to_string(&options).unwrap(),
+                ) {
+                    Ok(()) => self.reading_defaults = options,
+                    Err(e) => self.notice(e.to_string(), true, cx),
+                }
+            }
+            Action::ToggleHtml | Action::ToggleRemote => {
+                if let Some(m) = self.selected_mail() {
+                    let mut options = self.reading_options(&m);
+                    match action {
+                        Action::ToggleHtml => options.html = !options.html,
+                        _ => options.block_remote = !options.block_remote,
+                    }
+                    if let Err(e) = self.backend.store.set_preference(
+                        &message_key(&m.account, &m.id),
+                        &serde_json::to_string(&options).unwrap(),
+                    ) {
+                        self.notice(e.to_string(), true, cx);
+                    }
+                    self.html_view.update(cx, |view, cx| view.clear(cx));
+                }
+            }
+
             Action::Help => {
                 self.modal = Some(Modal::Help);
                 self.anim += 1;

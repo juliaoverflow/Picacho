@@ -10,8 +10,19 @@ aes-gcm = "0.10"
 anyhow = "1"
 argon2 = "0.5"
 base64 = "0.22"
+# Embed Blitz without its standalone window/event loop or unrestricted network client.
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff"] }
+blitz-html = { version = "=0.3.0-beta.4", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
+blitz-traits = "=0.3.0-beta.4"
+anyrender = "0.14"
+anyrender_vello_cpu = { version = "0.18", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
+data-url = "0.3"
+keyboard-types = "0.8"
+kurbo = "0.13"
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
@@ -36,6 +47,7 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [dev-dependencies]
+rand08 = { package = "rand", version = "0.8" }
 gpui = { version = "=0.2.2", features = ["test-support"] }
 
 [features]
@@ -50,3 +62,10 @@ strip = true
 [profile.dev]
 debug = 0
 
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+# GPUI enables Fontconfig's dlopen API; select the matching API in Blitz's font backend.
+fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
+
+[patch.crates-io]
+# ToCss error inference with GPUI's log/serde feature; see the patch README.
+stylo_derive = { path = "vendor/stylo_derive" }

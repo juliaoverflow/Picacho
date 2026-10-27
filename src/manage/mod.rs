@@ -5,3 +5,5 @@ pub mod crypto;
 pub mod model;
 pub mod status;
 pub mod store;
+
+pub mod reading;

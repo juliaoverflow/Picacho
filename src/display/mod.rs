@@ -3,3 +3,5 @@ mod assets;
 mod notify;
 mod ui;
 pub use ui::run;
+
+mod html;

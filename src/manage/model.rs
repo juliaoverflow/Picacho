@@ -373,6 +373,9 @@ pub struct Mail {
     pub starred: bool,
     pub size: u32,
     pub body: Option<String>,
+    /// Original decoded HTML; absent in header-only and older cache entries.
+    #[serde(default)]
+    pub html: Option<String>,
     pub attachments: Vec<Attachment>,
     pub message_id: String,
     #[serde(default)]
@@ -532,6 +535,7 @@ pub fn demo_mail() -> Vec<Mail> {
             starred: i == 0 || i == 4,
             size: body.len() as u32,
             body: Some((*body).into()),
+            html: None,
             attachments: vec![],
             message_id: String::new(),
             has_attachments: i == 2,

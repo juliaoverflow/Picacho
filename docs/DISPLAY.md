@@ -29,3 +29,18 @@ their short actionable messages.
 `responsive_tests.rs` runs GPUI's layout engine at 1440×1000, 1180×700, 960×600, 899×600, 700×480, 640×480, 480×420 and 360×320. It checks viewport bounds, wrapping choices, scroll reachability, locked-reader controls, focus feedback and narrow-window navigation. Separate checks cover bulk selection, compose, onboarding and Add Account.
 
 These are layout/interaction checks rather than pixel snapshots. Native Linux settings were also inspected under Xvfb with Mesa software rendering at 1440×1000, 640×480 and 360×320, using synthetic accounts in an isolated profile. The encrypted-reader layout is covered by GPUI tests; live Pinal sign-in and native password unlocking require a real account/keychain and were not performed. macOS/Windows rendering needs platform-specific follow-up when changing GPUI or fonts.
+
+### HTML email component
+
+The reader calls `html::HtmlView` with decoded HTML and a remote-content policy.
+Blitz owns CSS layout and DOM interaction; GPUI owns the surrounding reader,
+scrolling, controls and settings. The renderer has no mailbox or Store dependency.
+It paints only the visible strip, applies DPI scaling to vector commands, caches
+the resulting tile and retires replaced atlas images. Leaving a message, turning
+HTML off or blocking remote content discards the document and cancels queued
+resource work. Clicks, hover, drag selection/copy, Tab and Enter/Space are bridged
+to the document; scripts, forms and embedded frames are disabled.
+
+The wrapping controls above each body save choices for that account/message.
+Global Reading settings supply HTML-on/remote-blocked defaults to emails without
+an override. Messages without an HTML part retain the selectable plain reader.

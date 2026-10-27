@@ -310,6 +310,7 @@ impl Backend {
         for m in messages.iter_mut().filter(|m| m.body.is_none()) {
             if let Some(r) = readable.get(&m.id) {
                 m.body = r.body.clone();
+                m.html = r.html.clone();
                 m.snippet = r.snippet.clone();
                 m.attachments = r.attachments.clone();
                 m.has_attachments = r.has_attachments;
@@ -651,6 +652,7 @@ impl Backend {
             // local cache. The body stays in memory and is decrypted again later.
             let mut kept = next.clone();
             kept.body = None;
+            kept.html = None;
             kept.snippet.clear();
             kept.attachments.clear();
             self.store.save_messages(&[kept])?;

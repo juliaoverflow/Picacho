@@ -196,6 +196,13 @@ impl MailApp {
                 Page::General,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-reading".into(),
+                "Reading".into(),
+                icon_el("mail", 15., c.muted).into_any_element(),
+                Page::Reading,
+                cx,
+            ))
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -241,6 +248,7 @@ impl MailApp {
                 None => self.general_page(cx),
             },
             Page::General => self.general_page(cx),
+            Page::Reading => self.reading_page(cx),
         };
         div()
             .size_full()
@@ -449,6 +457,42 @@ impl MailApp {
                         cx,
                     )),
             )
+            .into_any_element()
+    }
+    pub(super) fn reading_page(&self, cx: &Context<Self>) -> AnyElement {
+        let options = self.reading_defaults;
+        let html = self
+            .switch(
+                "default-html".into(),
+                options.html,
+                Action::SetReadingDefaults(ReadingOptions {
+                    html: !options.html,
+                    ..options
+                }),
+                cx,
+            )
+            .debug_selector(|| "default-html".into());
+        let remote = self
+            .switch(
+                "default-remote".into(),
+                options.block_remote,
+                Action::SetReadingDefaults(ReadingOptions {
+                    block_remote: !options.block_remote,
+                    ..options
+                }),
+                cx,
+            )
+            .debug_selector(|| "default-remote".into());
+        div().flex().flex_col().gap_5()
+            .child(self.section("Reading"))
+            .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted))
+                .child("Defaults for all accounts. Each email has its own controls above the message. Emails with saved choices keep those choices."))
+            .child(self.setting(
+                "Render HTML", "Show the email's original formatting and interactive content.", html,
+            ))
+            .child(self.setting(
+                "Block remote content", "Prevent images, stylesheets and fonts from contacting remote servers. Loading them may reveal that you opened an email.", remote,
+            ))
             .into_any_element()
     }
     pub(super) fn account_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
