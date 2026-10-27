@@ -1,4 +1,5 @@
 //! Account operations serialize protocol work and commit results to the local cache.
+use crate::manage::status::AccessFailure;
 use crate::manage::{
     model::*,
     store::{self, Store},
@@ -32,6 +33,7 @@ pub enum Change {
 pub struct Backend {
     pub store: Arc<Store>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    credentials: Mutex<HashMap<String, Result<Secret, String>>>,
     /// Opened Pinal mail keys by account, held in memory only.
     mail_keys: Mutex<HashMap<String, Arc<Vec<pgp::composed::SignedSecretKey>>>>,
     /// Decrypted Pinal messages by id. Memory only: the cache on disk keeps
@@ -47,6 +49,7 @@ impl Backend {
         Self {
             store,
             operations: Mutex::new(HashMap::new()),
+            credentials: Mutex::new(HashMap::new()),
             mail_keys: Mutex::new(HashMap::new()),
             readable: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -95,9 +98,20 @@ impl Backend {
         let mut account = account.clone();
         let mut secret = if account.service == crate::manage::model::Service::Pinal {
             let mailbox = crate::sync::oauth::pinal(cancel.clone())?;
+            let issued = mailbox.account();
+            ensure!(
+                account.email.is_empty() || account.email.eq_ignore_ascii_case(&issued.email),
+                "Choose the same email address to reconnect this mailbox."
+            );
             account = Account {
                 id: account.id.clone(),
-                ..mailbox.account()
+                sync: account.sync,
+                name: if account.name.is_empty() {
+                    issued.name.clone()
+                } else {
+                    account.name.clone()
+                },
+                ..issued
             };
             Secret {
                 password: mailbox.password,
@@ -111,6 +125,10 @@ impl Backend {
             }
         } else if account.oauth {
             let (secret, who) = crate::sync::oauth::authorize(&account, cancel.clone())?;
+            ensure!(
+                account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
+                "Choose the same email address to reconnect this mailbox."
+            );
             if account.email.is_empty() {
                 account.email = who.email;
             }
@@ -146,7 +164,7 @@ impl Backend {
             let _ = session.logout();
         }
         ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
-        store::write_secret(&account.id, &secret)?;
+        self.save_credentials(&account.id, &secret)?;
         self.store.save_account(&account)?;
         Ok(account)
     }
@@ -155,19 +173,101 @@ impl Backend {
         if let Some(secret) = &self.test_secret {
             return Ok(secret.clone());
         }
-        let mut s = store::read_secret(&a.id)?;
-        crate::sync::oauth::refresh(a, &mut s)?;
+        let mut s = self.saved_credentials(&a.id)?;
+        if crate::sync::oauth::refresh(a, &mut s)? {
+            self.save_credentials(&a.id, &s)?;
+        }
         Ok(s)
+    }
+    // Callers serialize by account. Cache failures too: a denied Keychain read
+    // must not reopen system dialogs for every sync, body, or encryption check.
+    fn saved_credentials(&self, id: &str) -> Result<Secret> {
+        self.load_credentials(id, || store::read_secret(id))
+    }
+    fn load_credentials(&self, id: &str, read: impl FnOnce() -> Result<Secret>) -> Result<Secret> {
+        if let Some(saved) = self.credentials.lock().unwrap().get(id).cloned() {
+            return saved.map_err(|e| anyhow::anyhow!(e).context(AccessFailure::Keychain));
+        }
+        let saved = read().map_err(|e| format!("{e:#}"));
+        self.credentials
+            .lock()
+            .unwrap()
+            .insert(id.into(), saved.clone());
+        saved.map_err(|e| anyhow::anyhow!(e).context(AccessFailure::Keychain))
+    }
+    fn save_credentials(&self, id: &str, secret: &Secret) -> Result<()> {
+        if let Err(error) = store::write_secret(id, secret) {
+            self.credentials
+                .lock()
+                .unwrap()
+                .insert(id.into(), Err(format!("{error:#}")));
+            return Err(error.context(AccessFailure::Keychain));
+        }
+        self.credentials
+            .lock()
+            .unwrap()
+            .insert(id.into(), Ok(secret.clone()));
+        Ok(())
+    }
+    /// Only an explicit user retry reopens denied/missing Keychain entries.
+    pub fn retry_credentials(&self, id: &str) {
+        let lock = self.account_lock(id);
+        let _operation = lock.lock().unwrap();
+        let mut saved = self.credentials.lock().unwrap();
+        if saved.get(id).is_some_and(Result::is_err) {
+            saved.remove(id);
+        }
+    }
+    pub fn remove_account(&self, id: &str) -> Result<()> {
+        let lock = self.account_lock(id);
+        let _operation = lock.lock().unwrap();
+        self.store.remove_account(id)?;
+        self.credentials.lock().unwrap().remove(id);
+        self.mail_keys.lock().unwrap().remove(id);
+        self.readable.lock().unwrap().retain(|_, m| m.account != id);
+        // A missing/inaccessible keychain must not prevent removing local mail.
+        let _ = store::secret_entry(id).and_then(|e| e.delete_credential().map_err(Into::into));
+        Ok(())
+    }
+    /// Replaces credentials while preserving the account, cache, and preferences.
+    pub fn reconnect(
+        &self,
+        account: &Account,
+        password: String,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Account> {
+        let mut next = account.clone();
+        if next.oauth && next.client_secret.is_empty() {
+            let registration = crate::sync::oauth::client(next.provider);
+            if !registration.id.is_empty() {
+                next.client_id = registration.id;
+                next.client_secret = registration.secret;
+            } else if next.provider == Provider::Gmail {
+                // Client secrets deliberately never live in the account row.
+                let lock = self.account_lock(&next.id);
+                let _operation = lock.lock().unwrap();
+                next.client_secret = self.saved_credentials(&next.id)?.client_secret;
+            }
+        }
+        self.connect(&next, password, &[], cancel)
     }
     /// Whether this account's mail is encrypted with a Pinal key bundle.
     pub fn encrypted(&self, a: &Account) -> bool {
-        self.credentials(a)
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        #[cfg(test)]
+        if let Some(secret) = &self.test_secret {
+            return !secret.mail_bundle.is_empty();
+        }
+        self.saved_credentials(&a.id)
             .map(|s| !s.mail_bundle.is_empty())
             .unwrap_or(false)
     }
     /// Opens the key bundle with the Pinal password (or the recovery key) and
     /// keeps the mail key in the keychain, so later launches need no password.
     pub fn unlock(&self, a: &Account, secret: &str) -> Result<()> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
         let mut s = self.credentials(a)?;
         ensure!(
             !s.mail_bundle.is_empty(),
@@ -183,7 +283,7 @@ impl Backend {
         let keys = crate::manage::crypto::open_keys(&bundle, &mk)?;
         s.mail_key = crate::manage::crypto::encode_master_key(&mk);
         #[cfg(not(test))]
-        store::write_secret(&a.id, &s)?;
+        self.save_credentials(&a.id, &s)?;
         self.mail_keys
             .lock()
             .unwrap()
@@ -192,15 +292,17 @@ impl Backend {
     }
     /// Forgets the mail key on this device; the password unlocks it again.
     pub fn lock_mail(&self, a: &Account) -> Result<()> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
         self.mail_keys.lock().unwrap().remove(&a.id);
         self.readable
             .lock()
             .unwrap()
             .retain(|_, m| m.account != a.id);
-        let mut s = store::read_secret(&a.id)?;
+        let mut s = self.saved_credentials(&a.id)?;
         s.mail_key.zeroize();
         s.mail_key.clear();
-        store::write_secret(&a.id, &s)
+        self.save_credentials(&a.id, &s)
     }
     /// Puts decrypted bodies back on messages reloaded from the disk cache.
     pub fn with_readable(&self, mut messages: Vec<Mail>) -> Vec<Mail> {
@@ -740,9 +842,9 @@ impl Backend {
         }
         let mut stored = 0;
         for group in groups {
-            if select_message_mailbox(&mut session, group[0]).is_err() {
-                continue;
-            }
+            select_message_mailbox(&mut session, group[0]).context(
+                "Could not download messages from their mailbox. Refresh that mailbox first.",
+            )?;
             let uids: Vec<u32> = group.iter().map(|m| m.uid).collect();
             for chunk in uids.chunks(10) {
                 for f in session
@@ -828,6 +930,8 @@ impl Backend {
         Ok(())
     }
     pub fn attachment(&self, a: &Account, m: &Mail, part: usize) -> Result<Vec<u8>> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
         let raw = self.store.raw(&m.id)?.context("Open this message first")?;
         let (_, raw) = self.plaintext(a, &raw)?;
         let parsed = mailparse::parse_mail(&raw)?;

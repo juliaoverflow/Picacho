@@ -433,10 +433,20 @@ fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_js
     let status = response.status();
     let value: serde_json::Value = response.json()?;
     // Do not include the provider response: it can contain credentials or codes.
-    ensure!(
-        status.is_success(),
-        "Sign-in failed at the token step ({status}). Please try again."
-    );
+    if !status.is_success() {
+        let error =
+            anyhow::anyhow!("Sign-in failed at the token step ({status}). Please try again.");
+        return Err(
+            if matches!(
+                value["error"].as_str(),
+                Some("invalid_grant" | "invalid_client" | "unauthorized_client")
+            ) {
+                error.context(crate::manage::status::AccessFailure::Authentication)
+            } else {
+                error
+            },
+        );
+    }
     let access_token = value["access_token"]
         .as_str()
         .context("Provider did not return an access token")?
@@ -449,14 +459,16 @@ fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_js
     };
     Ok((secret, value))
 }
-pub fn refresh(account: &Account, secret: &mut Secret) -> Result<()> {
+pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
     if !account.oauth || secret.expires_at > chrono::Utc::now().timestamp() + 120 {
-        return Ok(());
+        return Ok(false);
     }
-    ensure!(
-        !secret.refresh_token.is_empty(),
-        "Your sign-in expired. Reconnect the account."
-    );
+    if secret.refresh_token.is_empty() {
+        return Err(
+            anyhow::anyhow!("Your sign-in expired. Reconnect the account.")
+                .context(crate::manage::status::AccessFailure::Authentication),
+        );
+    }
     let (_, token, scope) = endpoints(account.provider);
     let mut fields = vec![
         ("client_id", account.client_id.as_str()),
@@ -475,8 +487,7 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<()> {
     if !next.refresh_token.is_empty() {
         secret.refresh_token = next.refresh_token;
     }
-    crate::manage::store::write_secret(&account.id, secret)?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

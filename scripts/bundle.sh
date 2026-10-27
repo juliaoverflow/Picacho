@@ -17,5 +17,15 @@ cp packaging/Info.plist "$bundle/Contents/Info.plist"
 if [ -f assets/AppIcon.icns ]; then
     cp assets/AppIcon.icns "$bundle/Contents/Resources/AppIcon.icns"
 fi
-codesign --force --deep --sign - "$bundle"
+# Ad-hoc signatures change identity on rebuild and can invalidate Keychain ACLs.
+# A stable Apple Development/Developer ID identity preserves access across builds.
+identity="${PICACHO_CODESIGN_IDENTITY:--}"
+if [ "$identity" = - ]; then
+    echo "Using ad-hoc signing; macOS may request Keychain access again after rebuilds."
+    echo "Set PICACHO_CODESIGN_IDENTITY to a stable signing identity to preserve access."
+    codesign --force --sign - "$bundle"
+else
+    codesign --force --options runtime --timestamp --sign "$identity" "$bundle"
+fi
+codesign --verify --strict "$bundle"
 echo "Built $bundle"

@@ -51,3 +51,27 @@ Formatting, strict all-target/all-feature Clippy, normal and sample-data builds 
 Four new GPUI tests cover eight viewport sizes from 1440×1000 to 360×320: settings bounds, wrapping synchronization choices, scrolling to account controls, locked-reader toolbar/password sizing, scrolling to Unlock, inline blank-input feedback and focus, narrow-reader Back navigation, bulk-selection controls, compose footer actions, onboarding and Add Account. Existing UI interaction tests also pass.
 
 The native Linux GPUI application launched under Xvfb/Mesa; general and account settings were visually inspected at 1440×1000, 640×480 and 360×320. Long account names, horizontal account navigation and wrapping controls were checked using an isolated profile with synthetic accounts. Native encrypted-message unlocking was not exercised against a live Pinal account; its pane layout/interaction is covered by the headless GPUI tests. See [docs/DISPLAY.md](docs/DISPLAY.md).
+
+## Mailbox errors and independent synchronization (October 26, 2026)
+
+Linux x86_64, Rust 1.96.0: formatting, strict all-target/all-feature Clippy,
+default and `sample-data` builds pass. Both complete test configurations pass:
+50 passed, 2 existing opt-in checks ignored. Protocol tests require local socket
+access; they use verified loopback TLS and do not contact real mail providers.
+
+New tests cover cached Keychain denial and explicit retry, account isolation,
+actionable IMAP authentication rejection without automatic replay, preservation
+of cached mail/drafts after failed reauthentication, sidebar warning clicks in
+expanded/collapsed modes, account-only details, clearing resolved failures without
+losing unrelated SMTP/change failures, and coalesced polling while other UI work
+is busy. Existing snapshot, protocol, encryption, responsive-layout and bulk
+rollback checks continue to pass.
+
+The native client was built and launched under Xvfb/Mesa with isolated profiles.
+First-run onboarding, a mailbox with unavailable Keychain credentials, its red
+sidebar warning and account-details/recovery panel, and General settings were
+inspected. No real account was connected or external email sent. macOS signing,
+Keychain ACL prompts, and live browser reauthentication cannot be exercised in
+this Linux environment. The bundle script accepts a stable signing identity;
+the README documents why ad-hoc rebuilds can change Keychain access identity and
+how to verify the remaining macOS behavior.

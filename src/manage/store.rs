@@ -348,11 +348,12 @@ pub fn secret_entry(id: &str) -> Result<keyring::Entry> {
     keyring::Entry::new("com.pinal.native-mail", id).context("Cannot access the system keychain")
 }
 pub fn read_secret(id: &str) -> Result<Secret> {
-    Ok(serde_json::from_str(
+    serde_json::from_str(
         &secret_entry(id)?
             .get_password()
-            .context("Credentials missing from the system keychain. Reconnect this account.")?,
-    )?)
+            .context("The keychain entry is missing, locked, or access was denied")?,
+    )
+    .context("Saved credentials could not be read")
 }
 pub fn write_secret(id: &str, s: &Secret) -> Result<()> {
     secret_entry(id)?

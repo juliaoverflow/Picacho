@@ -414,3 +414,109 @@ fn read_only_sync_reconnects_once_after_a_transient_disconnect() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+#[test]
+fn credentials_cache_denial_until_explicit_retry_and_isolate_accounts() -> Result<()> {
+    let (b, _, path) = backend(&[])?;
+    let calls = std::cell::Cell::new(0);
+    let read = || -> Result<Secret> {
+        calls.set(calls.get() + 1);
+        anyhow::bail!("Keychain access denied (fixture)")
+    };
+    for _ in 0..5 {
+        let error = b.load_credentials("blocked", read).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<AccessFailure>(),
+            Some(&AccessFailure::Keychain)
+        );
+        assert!(format!("{error:#}").contains("Keychain access denied"));
+    }
+    assert_eq!(
+        calls.get(),
+        1,
+        "background tasks must not repeat system prompts"
+    );
+    let available = || {
+        Ok(Secret {
+            password: "fixture".into(),
+            ..Default::default()
+        })
+    };
+    assert_eq!(
+        b.load_credentials("healthy", available)?.password,
+        "fixture"
+    );
+    b.retry_credentials("blocked");
+    assert_eq!(
+        b.load_credentials("blocked", available)?.password,
+        "fixture"
+    );
+    b.retry_credentials("healthy");
+    assert_eq!(b.load_credentials("healthy", read)?.password, "fixture");
+    assert_eq!(
+        calls.get(),
+        1,
+        "a refresh keeps already accessible credentials"
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+#[test]
+fn rejected_imap_login_is_actionable_and_failed_reconnect_keeps_local_data() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = attempts.clone();
+    let server = Server::new(move |socket| {
+        count.fetch_add(1, Ordering::Relaxed);
+        let Ok(stream) = acceptor.accept(socket) else {
+            return;
+        };
+        let mut r = BufReader::new(stream);
+        r.get_mut().write_all(b"* OK fixture\r\n").unwrap();
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let tag = line.split_whitespace().next().unwrap();
+        write!(
+            r.get_mut(),
+            "{tag} NO [AUTHENTICATIONFAILED] Invalid app password\r\n"
+        )
+        .unwrap();
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = server.port;
+    b.store.save_account(&a)?;
+    let mut cached = crate::manage::model::demo_mail().remove(0);
+    cached.account = a.id.clone();
+    b.store.save_messages(&[cached])?;
+    let draft = Draft {
+        id: "unsent".into(),
+        account: a.id.clone(),
+        body: "Keep me".into(),
+        ..Default::default()
+    };
+    b.store.save_draft(&draft)?;
+    let error = b.sync(&a, Folder::Inbox, 300).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<AccessFailure>(),
+        Some(&AccessFailure::Authentication)
+    );
+    assert!(!crate::sync::retry::transient(&error));
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        1,
+        "do not replay rejected authentication"
+    );
+    assert!(format!("{error:#}").contains("Invalid app password"));
+    assert!(
+        b.reconnect(&a, "invalid".into(), Arc::new(AtomicBool::new(false)))
+            .is_err()
+    );
+    assert_eq!(b.store.accounts()?.len(), 1);
+    assert_eq!(b.store.messages(&a.id, Folder::Inbox, 300)?.len(), 1);
+    assert_eq!(b.store.drafts(&a.id)?[0].body, "Keep me");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

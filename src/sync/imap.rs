@@ -62,7 +62,15 @@ pub(crate) fn imap_login(
     } else {
         client.login(&a.email, &s.password)
     };
-    session.map_err(|(e, _)| anyhow::Error::new(e).context("IMAP authentication failed"))
+    session.map_err(|(e, _)| {
+        let rejected = matches!(e, imap::Error::No(_) | imap::Error::Bad(_));
+        let error = anyhow::Error::new(e).context("IMAP authentication failed");
+        if rejected {
+            error.context(crate::manage::status::AccessFailure::Authentication)
+        } else {
+            error
+        }
+    })
 }
 struct Xoauth {
     user: String,

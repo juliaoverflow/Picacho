@@ -4,6 +4,14 @@ use crate::manage::model::*;
 use anyhow::{Context, Result, ensure};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
+#[derive(Debug)]
+struct Rejected;
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("POP3 server rejected the request")
+    }
+}
+impl std::error::Error for Rejected {}
 pub struct PopSession<T: Read + Write> {
     reader: BufReader<T>,
 }
@@ -23,9 +31,12 @@ impl<T: Read + Write> PopSession<T> {
             "Incomplete or oversized POP3 status"
         );
         let status = line.trim_end_matches(['\r', '\n']);
+        if status.starts_with("-ERR") {
+            return Err(Rejected.into());
+        }
         ensure!(
             status == "+OK" || status.starts_with("+OK "),
-            "POP3 server rejected the request."
+            "Invalid POP3 status"
         );
         Ok(line)
     }
@@ -101,8 +112,15 @@ pub(crate) fn pop_login(
     let tcp = tcp(&a.incoming_host, a.incoming_port)?;
     let stream = tls.connect(&a.incoming_host, tcp)?;
     let mut s = PopSession::new(stream)?;
-    s.command(&format!("USER {}", a.email))?;
-    s.command(&format!("PASS {password}"))?;
+    for command in [format!("USER {}", a.email), format!("PASS {password}")] {
+        s.command(&command).map_err(|error| {
+            if error.is::<Rejected>() {
+                error.context(crate::manage::status::AccessFailure::Authentication)
+            } else {
+                error
+            }
+        })?;
+    }
     Ok(s)
 }
 

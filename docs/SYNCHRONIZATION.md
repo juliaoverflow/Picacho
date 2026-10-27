@@ -14,6 +14,33 @@ POP3 uses `(account, UIDL)`, never the session's message number. Validate the en
 
 ## Failure and retry boundaries
 
+Display tracks failures per account and operation (each synchronized mailbox,
+body downloads, reading, changes, and sending). A sidebar warning opens the
+account's settings with the full error chain, time, and recovery controls.
+Successful work clears its own failure; incoming synchronization also resolves
+earlier incoming access failures, while an SMTP or rejected message change is
+kept until its corresponding operation succeeds. Removed-account completions
+cannot restore warnings. Account failures are session state, never credentials
+or provider responses persisted to SQLite.
+
+Rejected IMAP/POP3 logins, rejected OAuth grants, and Keychain failures have
+typed access errors. Automatic incoming checks/downloads pause for those access
+failures, while transient/protocol failures retain the mailbox's polling schedule.
+Explicit retry reopens a previously denied Keychain entry; sign-in replacement
+checks the same email address and preserves the account/cache/drafts/preferences.
+Credentials and Keychain failures are cached per account in memory, and token
+refresh, credential writes, and encryption-key updates share account serialization.
+No Keychain read or browser-token refresh runs on the UI thread.
+
+Polling coalesces in-flight requests by account and mailbox, independently of
+global UI busy state. A larger visible-message request is refreshed after a
+smaller background result, so navigation/Load More cannot be replaced with a
+shorter result. Inbox polling timestamps only advance for inbox checks; refreshing
+other folders cannot postpone inbox checks indefinitely. Each account has its
+own body-download worker, with account locks released between small batches.
+Download errors retain their account/cause; selecting a stale or inaccessible
+mailbox no longer silently pauses the downloader.
+
 - Account operations serialize, including token refresh and local changes. Separate accounts can continue independently.
 - Read-only mailbox synchronization retries once on a fresh connection after a transient I/O failure, with a 250 ms delay. Protocol rejection, malformed responses, authentication rejection and certificate failures are not automatically replayed. The normal polling schedule or an explicit refresh can try again later.
 - UID STORE/MOVE are never automatically replayed. Bulk changes use at most 200 UIDs per command; each acknowledged chunk commits immediately. If a later command fails, earlier confirmed changes remain. Display reloads confirmed cache state after a failed bulk operation.

@@ -39,6 +39,9 @@ impl AssetSource for Assets {
                 Some("<path d='m12 2 9 4v6c0 5-9 10-9 10S3 17 3 12V6Z'/><path d='m8 12 3 3 5-6'/>")
             }
             "mail/spam.svg" => Some("<path d='m8 2-6 6v8l6 6h8l6-6V8l-6-6Z M12 7v6M12 17h.01'/>"),
+            "mail/warning.svg" => Some(
+                "<path d='m10.3 3.8-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3.2l-8-14a2 2 0 0 0-3.4 0Z'/><path d='M12 9v4M12 17h.01'/>",
+            ),
             "mail/download.svg" => Some("<path d='M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5'/>"),
             "mail/star-filled.svg" => Some(
                 "<path fill='currentColor' d='m12 2.8 2.8 5.7 6.3.9-4.55 4.43 1.07 6.27L12 17.13 6.38 20.1l1.07-6.27L2.9 9.4l6.3-.9Z'/>",

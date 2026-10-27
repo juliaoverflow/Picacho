@@ -17,7 +17,12 @@ Dialogs stay inside the viewport, with a fixed close/header region and scrollabl
 
 Locked and readable messages share the same reader shell: toolbar, flex sizing, scroll handle and background. Add content inside that shell rather than returning early from a locked-message branch. The password panel has an explicit width bounded by the reader, an input label, inline errors and a per-account unlock-in-progress state. Enter submits; blank input gives feedback and focuses the field. Duplicate submissions are ignored while an unlock runs. Clear the input on submission, mailbox navigation and Back navigation, and zeroize the worker's password string when it is finished.
 
-User-facing failures show the top-level actionable message. The underlying error chain remains available to callers in Manage/Sync; database driver paths and platform error chains should not crowd a dialog.
+Background mailbox failures appear as a red sidebar warning; the account settings
+page contains operation-specific details and recovery actions. General settings
+and global notices do not repeat those failures. Explicit sign-in/send validation
+stays in its form, and closing a form clears its feedback. The mailbox details
+view exposes the underlying error chain for diagnosis; ordinary controls keep
+their short actionable messages.
 
 ## Verification
 

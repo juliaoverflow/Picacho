@@ -359,6 +359,98 @@ impl MailApp {
             )
             .into_any_element()
     }
+    fn account_error_details(&self, a: &Account, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let mut issues: Vec<_> = self
+            .account_issues
+            .get(&a.id)
+            .into_iter()
+            .flat_map(|issues| issues.iter())
+            .collect();
+        issues.sort_by(|(left_source, left), (right_source, right)| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| left_source.label().cmp(right_source.label()))
+        });
+        let busy =
+            self.retrying.contains(&a.id) || self.sync_requests.iter().any(|(id, _)| id == &a.id);
+        div()
+            .id("account-error-details")
+            .debug_selector(|| "account-error-details".into())
+            .w_full()
+            .min_w_0()
+            .p_3()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(c.danger))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(13.))
+                    .text_color(rgb(c.danger))
+                    .child(icon_el("warning", 16., c.danger))
+                    .child("Mailbox needs attention"),
+            )
+            .children(issues.into_iter().map(|(source, issue)| {
+                let label = match source {
+                    IssueSource::Sync(mailbox) => format!("{} · {mailbox}", source.label()),
+                    _ => source.label().into(),
+                };
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(px(12.))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                    .child(
+                        div()
+                            .text_color(rgb(c.muted))
+                            .child(date_full(issue.occurred_at)),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("issue-{}", source.label())))
+                            .w_full()
+                            .overflow_x_hidden()
+                            .child(issue.details.clone()),
+                    )
+                    .child(div().text_color(rgb(c.muted)).child(issue.guidance(source)))
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        self.button(
+                            "account-retry",
+                            if busy { "Checking…" } else { "Try Again" },
+                            "refresh",
+                            Action::RetryAccount(a.id.clone()),
+                            false,
+                            cx,
+                        )
+                        .when(busy, |d| d.opacity(0.6)),
+                    )
+                    .child(self.button(
+                        "account-reconnect",
+                        "Sign In Again",
+                        "",
+                        Action::Reconnect(a.id.clone()),
+                        false,
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
     pub(super) fn account_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let a = &self.accounts[index];
@@ -409,6 +501,9 @@ impl MailApp {
                             ),
                     ),
             )
+            .when(self.account_issues.get(&a.id).is_some_and(|issues| !issues.is_empty()), |page| {
+                page.child(self.account_error_details(a, cx))
+            })
             .when(self.encrypted.contains(&a.id), |page| {
                 let locked = self.locked.contains(&a.id);
                 page.child(self.section("Encryption")).child(self.setting(

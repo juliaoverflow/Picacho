@@ -1,3 +1,8 @@
+#[path = "accounts.rs"]
+mod accounts;
+#[cfg(test)]
+#[path = "error_tests.rs"]
+mod error_tests;
 #[path = "reader.rs"]
 mod reader;
 #[cfg(test)]
@@ -5,7 +10,7 @@ mod reader;
 mod responsive_tests;
 #[path = "settings.rs"]
 mod settings;
-use crate::manage::status::DownloadStatus as Download;
+use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
 use crate::{
     manage::{
         backend::{Backend, Change},
@@ -254,6 +259,7 @@ enum Modal {
     Compose,
     Help,
     RemoveAccount(String),
+    Reconnect(String),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -363,6 +369,9 @@ enum Action {
     Connect,
     Settings,
     AccountSettings(String),
+    RetryAccount(String),
+    Reconnect(String),
+    SubmitReconnect(String),
     SettingsPage(Page),
     SetAppearance(Appearance),
     SetAccent(Accent),
@@ -433,6 +442,10 @@ pub struct MailApp {
     /// Whether the window is frontmost; new mail is announced only when not.
     active: bool,
     last_check: HashMap<String, std::time::Instant>,
+    account_issues: HashMap<String, HashMap<IssueSource, AccountIssue>>,
+    sync_requests: HashSet<(String, String)>,
+    downloading: HashSet<String>,
+    retrying: HashSet<String>,
     /// Unread inbox messages already seen per account, to spot new mail.
     known: HashMap<String, HashSet<String>>,
     busy: usize,
@@ -523,7 +536,9 @@ impl MailApp {
         for state in &form {
             subscriptions.push(cx.subscribe_in(state, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    let action = if this.step == Step::Email {
+                    let action = if let Some(Modal::Reconnect(id)) = &this.modal {
+                        Action::SubmitReconnect(id.clone())
+                    } else if this.step == Step::Email {
                         Action::Discover
                     } else {
                         Action::SubmitAccount
@@ -546,11 +561,7 @@ impl MailApp {
                 }
             }),
         );
-        let encrypted = accounts
-            .iter()
-            .filter(|a| a.service == Service::Pinal && backend.encrypted(a))
-            .map(|a| a.id.clone())
-            .collect();
+        let encrypted = HashSet::new();
         for state in [&compose_to, &compose_subject, &compose_body] {
             subscriptions.push(cx.subscribe(state, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -631,6 +642,10 @@ impl MailApp {
             page: Page::General,
             active: true,
             last_check: HashMap::new(),
+            account_issues: HashMap::new(),
+            sync_requests: HashSet::new(),
+            downloading: HashSet::new(),
+            retrying: HashSet::new(),
             known: HashMap::new(),
             busy: 0,
             syncing: false,
@@ -775,18 +790,21 @@ impl MailApp {
                     this.unread = unread;
                     this.download.total = total;
                     this.download.missing = missing;
+                    this.download.paused = missing > 0 && !this.download.active;
                     cx.notify();
                 });
             }
         })
         .detach();
     }
-    /// Checks each account for new mail on the schedule set in Settings.
+    /// Each account and mailbox has its own in-flight request. UI work and
+    /// another account's slow server never suppress a due inbox check.
     fn check_due(&mut self, cx: &mut Context<Self>) {
         let now = std::time::Instant::now();
         for a in self.accounts.clone() {
             let every = Duration::from_secs(u64::from(a.sync.refresh_minutes) * 60);
             if a.sync.refresh_minutes == 0
+                || self.account_blocked(&a.id)
                 || self
                     .last_check
                     .get(&a.id)
@@ -795,31 +813,16 @@ impl MailApp {
                 continue;
             }
             if self.account.as_ref() == Some(&a.id) && self.folder != Folder::Drafts {
-                if self.busy > 0 || self.syncing {
-                    continue;
-                }
-                // Refreshing the open mailbox also notes new inbox mail.
                 self.refresh(cx);
                 if self.folder == Folder::Inbox {
                     continue;
                 }
             }
-            self.last_check.insert(a.id.clone(), now);
             self.check_inbox(a, cx);
         }
     }
     fn check_inbox(&mut self, a: Account, cx: &mut Context<Self>) {
-        let id = a.id.clone();
-        self.task(
-            cx,
-            move |b| b.sync(&a, Folder::Inbox, 100),
-            move |this, result, cx| {
-                if let Ok(messages) = result {
-                    this.note_inbox(&id, &messages);
-                    this.refresh_counts(cx);
-                }
-            },
-        );
+        self.sync_mailbox(a, Folder::Inbox.into(), 100, cx);
     }
     /// Remembers unread inbox mail and announces any that is new since the
     /// last check. The first check after launch only records what is there.
@@ -848,57 +851,38 @@ impl MailApp {
             );
         }
     }
-    /// Downloads full messages in small batches so other mail operations on
-    /// the same account can run between them.
+    /// One worker per account avoids starving healthy accounts behind a slow
+    /// server. Batches release the account lock between network operations.
     fn download(&mut self, cx: &mut Context<Self>) {
-        if self.download.active || self.accounts.is_empty() {
+        for a in self.accounts.clone() {
+            self.download_account(a, cx);
+        }
+    }
+    fn download_account(&mut self, a: Account, cx: &mut Context<Self>) {
+        if self.account_blocked(&a.id) || !self.downloading.insert(a.id.clone()) {
             return;
         }
         self.download.active = true;
         self.download.paused = false;
-        let accounts = self.accounts.clone();
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
             loop {
-                let (b, accounts) = (backend.clone(), accounts.clone());
+                let (b, account) = (backend.clone(), a.clone());
                 let result = cx
                     .background_executor()
-                    .spawn(async move {
-                        let (mut stored, mut error) = (0, None);
-                        for a in &accounts {
-                            match b.download_batch(a, 25) {
-                                Ok(0) => {}
-                                Ok(n) => {
-                                    stored = n;
-                                    break;
-                                }
-                                Err(e) => error = Some(e),
-                            }
-                        }
-                        let counts = b
-                            .store
-                            .download_counts(crate::sync::transport::MAX_MESSAGE)?;
-                        match error {
-                            Some(e) if stored == 0 => Err(e),
-                            _ => Ok((stored, counts)),
-                        }
-                    })
+                    .spawn(async move { b.download_batch(&account, 25) })
                     .await;
                 let more = this
                     .update(cx, |this, cx| {
-                        let more = match result {
-                            Ok((stored, (total, missing))) => {
-                                this.download.total = total;
-                                this.download.missing = missing;
-                                stored > 0 && missing > 0
-                            }
-                            Err(_) => false,
-                        };
+                        this.account_result(&a.id, IssueSource::Download, &result);
+                        let more = matches!(result, Ok(n) if n > 0)
+                            && this.accounts.iter().any(|account| account.id == a.id)
+                            && !this.account_blocked(&a.id);
                         if !more {
-                            this.download.active = false;
-                            this.download.paused = this.download.missing > 0;
-                            this.refresh_counts(cx);
+                            this.downloading.remove(&a.id);
+                            this.download.active = !this.downloading.is_empty();
                         }
+                        this.refresh_counts(cx);
                         cx.notify();
                         more
                     })
@@ -906,6 +890,8 @@ impl MailApp {
                 if !more {
                     break;
                 }
+                // Yield to interactive operations between batches.
+                Timer::after(Duration::from_millis(25)).await;
             }
         })
         .detach();
@@ -1171,9 +1157,6 @@ impl MailApp {
         theme.colors.accent = rgb(c.soft).into();
     }
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.syncing {
-            return;
-        }
         let Some(a) = self.current_account() else {
             return;
         };
@@ -1181,48 +1164,68 @@ impl MailApp {
             self.load_drafts(cx);
             return;
         }
-        let mailbox = self.mailbox();
-        let limit = self.limit;
-        let generation = self.load_generation;
+        if self.account_blocked(&a.id) {
+            return;
+        }
+        self.sync_mailbox(a, self.mailbox(), self.limit, cx);
+    }
+    fn sync_mailbox(&mut self, a: Account, mailbox: Mailbox, limit: usize, cx: &mut Context<Self>) {
         let id = a.id.clone();
-        self.last_check
-            .insert(id.clone(), std::time::Instant::now());
+        let key = mailbox.key();
+        if !self.sync_requests.insert((id.clone(), key.clone())) {
+            return;
+        }
         let inbox = mailbox == Mailbox::Standard(Folder::Inbox);
-        self.syncing = true;
+        if inbox {
+            self.last_check
+                .insert(id.clone(), std::time::Instant::now());
+        }
+        let visible = self.account.as_ref() == Some(&id) && self.mailbox() == mailbox;
+        if visible {
+            self.syncing = true;
+        }
         self.task(
             cx,
             move |b| {
                 let messages = b.sync(&a, mailbox, limit)?;
-                Ok((messages, b.store.folders(&a.id)))
+                let encrypted = a.service == Service::Pinal && b.encrypted(&a);
+                Ok((messages, b.store.folders(&a.id), encrypted))
             },
             move |this, result, cx| {
-                if let Ok((messages, folders)) = &result {
-                    this.folders.insert(id.clone(), folders.clone());
+                this.sync_requests.remove(&(id.clone(), key.clone()));
+                this.account_result(&id, IssueSource::Sync(key.clone()), &result);
+                let visible = this.account.as_ref() == Some(&id) && this.mailbox().key() == key;
+                if visible {
+                    this.syncing = false;
+                }
+                if let Ok((messages, folders, encrypted)) = result {
+                    if !this.accounts.iter().any(|a| a.id == id) {
+                        return;
+                    }
+                    this.folders.insert(id.clone(), folders);
+                    if encrypted {
+                        this.encrypted.insert(id.clone());
+                    }
                     if inbox {
-                        this.note_inbox(&id, messages);
+                        this.note_inbox(&id, &messages);
+                    }
+                    if visible {
+                        if limit == this.limit {
+                            this.messages = this.backend.with_readable(messages);
+                            this.filter(cx);
+                        } else {
+                            // A background/older smaller request cannot replace Load More.
+                            this.reload_cached(cx);
+                            this.refresh(cx);
+                        }
+                    }
+                    if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
+                        this.download_account(a, cx);
                     }
                 }
                 this.refresh_counts(cx);
-                if generation != this.load_generation {
-                    return;
-                }
-                this.syncing = false;
-                match result {
-                    Ok((messages, _)) => {
-                        this.messages = this.backend.with_readable(messages);
-                        this.filter(cx);
-                        if this.error && this.modal.is_none() {
-                            this.status.clear();
-                        }
-                        this.download(cx);
-                    }
-                    Err(e) => this.notice(e.to_string(), true, cx),
-                }
             },
         );
-    }
-    fn load_folder(&mut self, folder: Folder, w: &mut Window, cx: &mut Context<Self>) {
-        self.open_mailbox(self.account.clone(), folder.into(), w, cx);
     }
     fn open_mailbox(
         &mut self,
@@ -1380,7 +1383,7 @@ impl MailApp {
             m.unread = false;
         }
         if let Some(a) = self.current_account() {
-            let generation = self.read_generation;
+            let account_id = a.id.clone();
             let id2 = id.clone();
             self.task(
                 cx,
@@ -1391,23 +1394,26 @@ impl MailApp {
                     }
                     Ok(m)
                 },
-                move |this, result, cx| match result {
-                    Ok(mail) => {
-                        if let Some(old) = this.messages.iter_mut().find(|m| m.id == id2) {
-                            *old = mail;
-                        }
-                        this.filter(cx);
-                        this.refresh_counts(cx);
-                    }
-                    Err(e) => {
-                        if e.downcast_ref::<crate::manage::crypto::Locked>().is_some() {
-                            // The reader asks for the password instead.
-                            if let Some(m) = this.messages.iter().find(|m| m.id == id2) {
-                                this.locked.insert(m.account.clone());
-                                this.encrypted.insert(m.account.clone());
+                move |this, result, cx| {
+                    this.account_result(&account_id, IssueSource::Read, &result);
+                    match result {
+                        Ok(mail) => {
+                            if let Some(old) = this.messages.iter_mut().find(|m| m.id == id2) {
+                                *old = mail;
                             }
-                        } else if this.read_generation == generation {
-                            this.notice(e.to_string(), true, cx);
+                            this.filter(cx);
+                            this.refresh_counts(cx);
+                        }
+                        Err(e) => {
+                            if e.downcast_ref::<crate::manage::crypto::Locked>().is_some() {
+                                // The reader asks for the password instead.
+                                if let Some(m) = this.messages.iter().find(|m| m.id == id2) {
+                                    this.locked.insert(m.account.clone());
+                                    this.encrypted.insert(m.account.clone());
+                                }
+                            } else {
+                                this.reload_cached(cx);
+                            }
                         }
                     }
                 },
@@ -1459,11 +1465,13 @@ impl MailApp {
         let generation = self.load_generation;
         let count = before.len();
         let sent = before.clone();
+        let account_id = a.id.clone();
         self.task(
             cx,
             move |b| b.change_many(&a, &sent, change),
             move |this, result, cx| {
                 this.refresh_counts(cx);
+                this.account_result(&account_id, IssueSource::Change, &result);
                 match result {
                     Ok(()) => {
                         if let Change::Move(folder) = change {
@@ -1478,7 +1486,7 @@ impl MailApp {
                             );
                         }
                     }
-                    Err(e) => {
+                    Err(_) => {
                         if generation == this.load_generation {
                             for old in before {
                                 match this.messages.iter_mut().find(|m| m.id == old.id) {
@@ -1490,7 +1498,6 @@ impl MailApp {
                             this.filter(cx);
                         }
                         this.reload_cached(cx);
-                        this.notice(e.to_string(), true, cx);
                     }
                 }
             },
@@ -1506,15 +1513,15 @@ impl MailApp {
             }
             self.filter(cx);
         }
-        self.unread.remove(&(id, mailbox.key()));
+        self.unread.remove(&(id.clone(), mailbox.key()));
         self.task(
             cx,
             move |b| b.mark_all_read(&a, &mailbox),
-            |this, result, cx| {
+            move |this, result, cx| {
                 this.refresh_counts(cx);
-                if let Err(e) = result {
+                this.account_result(&id, IssueSource::Change, &result);
+                if result.is_err() {
                     this.reload_cached(cx);
-                    this.notice(e.to_string(), true, cx);
                 }
             },
         );
@@ -1639,6 +1646,9 @@ impl MailApp {
         self.setup_generation += 1;
         self.persist_draft(cx);
         self.modal = None;
+        self.status.clear();
+        self.error = false;
+        Self::set(&self.form[PASSWORD], "", w, cx);
         self.focus.focus(w);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
@@ -1880,15 +1890,19 @@ impl MailApp {
         self.error = false;
         self.task(
             cx,
-            move |b| b.connect(&a, password, &taken, cancel),
+            move |b| {
+                let saved = b.connect(&a, password, &taken, cancel)?;
+                let encrypted = saved.service == Service::Pinal && b.encrypted(&saved);
+                Ok((saved, encrypted))
+            },
             move |this, result, cx| {
                 if cancelled.load(Ordering::Relaxed) {
                     return;
                 }
                 this.connecting = false;
                 match result {
-                    Ok(saved) => {
-                        if saved.service == Service::Pinal && this.backend.encrypted(&saved) {
+                    Ok((saved, encrypted)) => {
+                        if encrypted {
                             this.encrypted.insert(saved.id.clone());
                         }
                         this.accounts.push(saved.clone());
@@ -1938,11 +1952,13 @@ impl MailApp {
             return;
         }
         self.sending = true;
+        let id = a.id.clone();
         self.task(
             cx,
             move |b| b.send(&a, &d),
-            |this, result, cx| {
+            move |this, result, cx| {
                 this.sending = false;
+                this.account_result(&id, IssueSource::Send, &result);
                 match result {
                     Ok(()) => {
                         this.modal = None;
@@ -1952,7 +1968,7 @@ impl MailApp {
                             this.load_drafts(cx);
                         }
                     }
-                    Err(e) => this.notice(e.to_string(), true, cx),
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }
             },
         );
@@ -2052,7 +2068,11 @@ impl MailApp {
             Action::Compose => self.new_compose(0, w, cx),
             Action::Reply(all) => self.new_compose(if all { 2 } else { 1 }, w, cx),
             Action::Forward => self.new_compose(3, w, cx),
-            Action::Refresh => self.refresh(cx),
+            Action::Refresh => {
+                if let Some(id) = self.account.clone() {
+                    self.retry_account(id, cx);
+                }
+            }
             Action::Select(id) => {
                 if self.folder == Folder::Drafts {
                     self.handle(Action::OpenDraft(id), w, cx);
@@ -2111,9 +2131,12 @@ impl MailApp {
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
             Action::RefreshAccount(id) => {
                 if self.account.as_ref() == Some(&id) {
-                    self.refresh(cx);
+                    self.retry_account(id, cx);
                 } else {
-                    self.open_mailbox(Some(id), Folder::Inbox.into(), w, cx);
+                    self.open_mailbox(Some(id.clone()), Folder::Inbox.into(), w, cx);
+                    if self.account_blocked(&id) {
+                        self.retry_account(id, cx);
+                    }
                 }
             }
             Action::ToggleAccount(id) => {
@@ -2250,7 +2273,7 @@ impl MailApp {
             #[cfg(feature = "sample-data")]
             Action::Sample => {
                 self.onboarding = false;
-                self.load_folder(Folder::Inbox, w, cx);
+                self.open_mailbox(self.account.clone(), Folder::Inbox.into(), w, cx);
             }
 
             Action::BackToList => {
@@ -2335,6 +2358,19 @@ impl MailApp {
                     self.anim += 1;
                 }
             }
+            Action::RetryAccount(id) => self.retry_account(id, cx),
+            Action::Reconnect(id) => {
+                if self.retrying.contains(&id) {
+                    return;
+                }
+                self.cancel.store(true, Ordering::Relaxed);
+                self.connecting = false;
+                self.status.clear();
+                Self::set(&self.form[PASSWORD], "", w, cx);
+                self.modal = Some(Modal::Reconnect(id));
+                self.anim += 1;
+            }
+            Action::SubmitReconnect(id) => self.reconnect(id, w, cx),
             Action::AccountSettings(id) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
                 self.page = Page::Account(id);
@@ -2399,32 +2435,44 @@ impl MailApp {
                 }
             }
             Action::Remove(id) => {
-                if self.busy > 0 {
+                if self.busy > 0 || self.downloading.contains(&id) {
                     self.notice("Wait for the current mail operation to finish before removing this account.",true,cx);
                     return;
                 }
-                let _ = crate::manage::store::secret_entry(&id)
-                    .and_then(|e| e.delete_credential().map_err(Into::into));
-                match self.backend.store.remove_account(&id) {
-                    Ok(()) => {
-                        self.accounts.retain(|a| a.id != id);
-                        if self.account.as_ref() == Some(&id) {
-                            self.account = self.accounts.first().map(|a| a.id.clone());
-                            self.load_folder(Folder::Inbox, w, cx);
+                self.retrying.insert(id.clone());
+                let removed = id.clone();
+                self.task(
+                    cx,
+                    move |b| b.remove_account(&removed),
+                    move |this, result, cx| {
+                        this.retrying.remove(&id);
+                        match result {
+                            Ok(()) => {
+                                this.accounts.retain(|a| a.id != id);
+                                this.account_issues.remove(&id);
+                                this.folders.remove(&id);
+                                this.known.remove(&id);
+                                this.last_check.remove(&id);
+                                this.modal = None;
+                                if this.account.as_ref() == Some(&id) {
+                                    this.account = this.accounts.first().map(|a| a.id.clone());
+                                    this.messages.clear();
+                                    this.selected = None;
+                                    this.load_generation += 1;
+                                    this.filter(cx);
+                                    this.reload_cached(cx);
+                                    this.refresh(cx);
+                                }
+                                if this.accounts.is_empty() {
+                                    this.onboarding = true;
+                                    this.step = Step::Welcome;
+                                }
+                                this.refresh_counts(cx);
+                            }
+                            Err(e) => this.notice(e.to_string(), true, cx),
                         }
-                        self.folders.remove(&id);
-                        self.refresh_counts(cx);
-                        if self.modal == Some(Modal::RemoveAccount(id.clone())) {
-                            self.modal = None;
-                        }
-                        if self.accounts.is_empty() {
-                            self.modal = None;
-                            self.onboarding = true;
-                            self.begin_setup(Step::Welcome, w, cx);
-                        }
-                    }
-                    Err(e) => self.notice(e.to_string(), true, cx),
-                }
+                    },
+                );
             }
             Action::Send => self.send(cx),
             Action::Attach => self.attach(cx),
@@ -2779,6 +2827,12 @@ impl MailApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(a.name.clone()),
                     )
+                    .when(
+                        self.account_issues
+                            .get(&a.id)
+                            .is_some_and(|issues| !issues.is_empty()),
+                        |d| d.child(self.account_warning(&a.id, cx)),
+                    )
                     .when(!open && inbox_unread > 0, |d| {
                         d.child(
                             div()
@@ -2978,7 +3032,21 @@ impl MailApp {
                         .rounded_full()
                         .border_2()
                         .border_color(rgb(if current { c.accent } else { c.bg }))
+                        .relative()
                         .child(avatar(&initials(&a.name), 24., i, c))
+                        .when(
+                            self.account_issues
+                                .get(&a.id)
+                                .is_some_and(|issues| !issues.is_empty()),
+                            |d| {
+                                d.child(
+                                    self.account_warning(&a.id, cx)
+                                        .absolute()
+                                        .top(px(-7.))
+                                        .right(px(-8.)),
+                                )
+                            },
+                        )
                         .into_any_element(),
                     false,
                     Action::OpenMailbox(a.id.clone(), Folder::Inbox.into()),
@@ -4718,6 +4786,7 @@ impl MailApp {
         let modal = self.modal.as_ref().unwrap();
         let title = match modal {
             Modal::Connect => "Add Account",
+            Modal::Reconnect(_) => "Sign In Again",
             Modal::Settings => "Settings",
             Modal::About => "About Picacho",
             Modal::Compose => "New Message",
@@ -4726,6 +4795,7 @@ impl MailApp {
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
+            Modal::Reconnect(id) => self.reconnect_form(id),
             Modal::Settings => self.settings_modal(window, cx),
             Modal::About => self.about_modal(),
             Modal::Compose => self.compose_modal(cx),
@@ -4743,7 +4813,7 @@ impl MailApp {
                 Modal::Compose => 720.,
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
-                Modal::RemoveAccount(_) | Modal::About => 400.,
+                Modal::RemoveAccount(_) | Modal::Reconnect(_) | Modal::About => 400.,
                 Modal::Settings => 820.,
             }))
             .max_w(available_width)
@@ -4852,6 +4922,19 @@ impl MailApp {
                     )
                     .bg(rgb(c.danger)),
                 );
+        } else if let Modal::Reconnect(id) = modal {
+            footer = footer.child(div().flex_1()).child(self.button(
+                "reconnect-submit",
+                if self.connecting {
+                    "Signing in…"
+                } else {
+                    "Sign In"
+                },
+                "",
+                Action::SubmitReconnect(id.clone()),
+                true,
+                cx,
+            ));
         } else if *modal == Modal::Compose {
             footer = footer
                 .child(self.button(
@@ -4942,7 +5025,7 @@ impl Render for MailApp {
             .on_action(
                 cx.listener(|this, _: &ShowAccounts, w, cx| this.handle(Action::Settings, w, cx)),
             )
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .on_action(cx.listener(|this, _: &Refresh, w, cx| this.handle(Action::Refresh, w, cx)))
             .on_action(cx.listener(|this, _: &Search, w, cx| {
                 this.handle(Action::OpenSearch, w, cx);
             }))
@@ -5074,6 +5157,8 @@ impl MailApp {
             .when(self.modal.is_none() && !self.status.is_empty(), |d| {
                 d.child(
                     div()
+                        .id("notice-toast")
+                        .debug_selector(|| "notice-toast".into())
                         .absolute()
                         .bottom_5()
                         .right_5()
@@ -5202,6 +5287,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "select",
         "monitor",
         "lock",
+        "warning",
     ]
     .contains(&name)
     {
@@ -5808,7 +5894,8 @@ mod tests {
         // and it is rolled back.
         cx.run_until_parked();
         view.read_with(cx, |this, _| {
-            assert!(this.error);
+            assert!(!this.error && this.status.is_empty());
+            assert!(this.account_issues[&this.accounts[0].id].contains_key(&IssueSource::Change));
             assert!(!this.messages[1].starred);
         });
         // Clearing the selection leaves selection mode; then a checkbox click
