@@ -5,5 +5,7 @@ mod imap;
 mod mime;
 pub mod oauth;
 mod pop;
+pub(crate) mod retry;
 pub(crate) mod smtp;
 pub(crate) mod transport;
+pub(crate) mod wire;

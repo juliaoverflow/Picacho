@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MESSAGE:&[u8]=b"From: Sophie Chen <sophie@example.com>\r\nTo: qa@example.com\r\nSubject: A message over real TLS\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\nMessage-ID: <test@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello from the local IMAP fixture.\r\n";
 
-fn tls_fixture() -> Result<(Vec<u8>, native_tls::TlsAcceptor)> {
+pub(super) fn tls_fixture() -> Result<(Vec<u8>, native_tls::TlsAcceptor)> {
     let dir = std::env::temp_dir().join(format!("pinal-test-tls-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir)?;
     let run = |args: &[&str]| -> Result<()> {
@@ -64,7 +64,7 @@ fn tls_fixture() -> Result<(Vec<u8>, native_tls::TlsAcceptor)> {
     std::fs::remove_dir_all(dir)?;
     Ok((cert, native_tls::TlsAcceptor::new(identity)?))
 }
-fn backend(cert: &[u8]) -> Result<(Backend, Account, PathBuf)> {
+pub(super) fn backend(cert: &[u8]) -> Result<(Backend, Account, PathBuf)> {
     let path = std::env::temp_dir().join(format!("pinal-protocol-{}", uuid::Uuid::new_v4()));
     let store = Arc::new(Store::open(&path)?);
     let mut backend = Backend::new(store);

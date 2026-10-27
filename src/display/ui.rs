@@ -1277,6 +1277,28 @@ impl MailApp {
         self.anim += 1;
         cx.notify();
     }
+    /// Reload confirmed cache state after a failed or partly applied operation.
+    /// A generation check prevents an old request from replacing a newer view.
+    fn reload_cached(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.account.clone() else {
+            return;
+        };
+        let mailbox = self.mailbox();
+        let limit = self.limit;
+        let generation = self.load_generation;
+        self.task(
+            cx,
+            move |b| b.store.messages(&id, mailbox, limit),
+            move |this, result, cx| {
+                if generation == this.load_generation
+                    && let Ok(messages) = result
+                {
+                    this.messages = this.backend.with_readable(messages);
+                    this.filter(cx);
+                }
+            },
+        );
+    }
     fn load_drafts(&mut self, cx: &mut Context<Self>) {
         let id = self.account.clone().unwrap_or_else(|| "demo".into());
         let generation = self.load_generation;
@@ -1456,6 +1478,7 @@ impl MailApp {
                             this.messages.sort_by_key(|m| std::cmp::Reverse(m.date));
                             this.filter(cx);
                         }
+                        this.reload_cached(cx);
                         this.notice(format!("{e:#}"), true, cx);
                     }
                 }
@@ -1479,6 +1502,7 @@ impl MailApp {
             |this, result, cx| {
                 this.refresh_counts(cx);
                 if let Err(e) = result {
+                    this.reload_cached(cx);
                     this.notice(format!("{e:#}"), true, cx);
                 }
             },

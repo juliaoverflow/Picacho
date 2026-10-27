@@ -37,3 +37,9 @@ Rename to Picacho, provider list, Pinal sign-in, Settings, and menu bar. `cargo 
 ## Three-unit reorganization (October 26, 2026)
 
 Verified on Linux x86_64 with Rust 1.96.0. `cargo fmt --check`, strict Clippy for all targets, `cargo build --locked`, and `cargo test --locked -- --test-threads=1` pass: 27 passed, 1 opt-in discovery test ignored. The protocol tests used real loopback sockets and verified TLS certificates. The Linux GPUI dependency compatibility fix is recorded in ARCHITECTURE.md; no third-party source files were patched. The refactor preserves the existing database format, cache identities, and GPUI action namespace.
+
+## Synchronization reliability (October 26, 2026)
+
+Linux x86_64, Rust 1.96.0: formatting, strict all-target Clippy, and the full suite pass (41 tests passed, 2 opt-in checks ignored). Local fault coverage includes incomplete/failed IMAP snapshots, transient reconnect, expunge races, missing/reset UIDVALIDITY, unsolicited flags, cleanup disconnects, partially accepted bulk changes, invalid/duplicate POP3 UIDL rows, interrupted RETR, repair of a summary without raw data, transactional database failures, dot unstuffing, response-size limits and command deadlines.
+
+The opt-in Dovecot comparison also passes: Dovecot 2.4.1-4 (7d8c0e5759), verified loopback TLS, isolated Maildir, Picacho versus Python imaplib/poplib UID/flag/body-hash results. IMAP moves, POP3 deduplication and local-folder preservation were exercised. Thunderbird and NeoMutt source reviews and exact reproduction instructions are recorded in [docs/SYNCHRONIZATION.md](docs/SYNCHRONIZATION.md). Full desktop clients were not run against real user accounts.

@@ -1,22 +1,27 @@
 //! Verified IMAP connections, stable identities, and remote folder resolution.
+use super::wire::Wire;
 use crate::manage::model::*;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     net::{TcpStream, ToSocketAddrs},
-    time::Duration,
+    time::{Duration, Instant},
 };
-pub(crate) type ImapSession = imap::Session<native_tls::TlsStream<TcpStream>>;
-pub(crate) fn tcp(host: &str, port: u16) -> Result<TcpStream> {
+pub(crate) type ImapSession = imap::Session<native_tls::TlsStream<Wire>>;
+pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
     let addrs = (host, port)
         .to_socket_addrs()
         .context("Server hostname could not be resolved")?;
     let mut last = None;
+    let deadline = Instant::now() + Duration::from_secs(12);
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(12)) {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match TcpStream::connect_timeout(&addr, remaining.min(Duration::from_secs(3))) {
             Ok(s) => {
                 s.set_read_timeout(Some(Duration::from_secs(30)))?;
                 s.set_write_timeout(Some(Duration::from_secs(30)))?;
-                return Ok(s);
+                return Ok(Wire::new(s));
             }
             Err(e) => last = Some(e),
         }
@@ -31,21 +36,21 @@ pub(crate) fn imap_login(
     s: &Secret,
     tls: &native_tls::TlsConnector,
 ) -> Result<ImapSession> {
-    let socket = tcp(&a.incoming_host, a.incoming_port)?;
-    let client = if a.incoming_starttls {
-        let mut plain = imap::Client::new(socket);
-        plain.read_greeting()?;
-        plain
-            .secure(&a.incoming_host, tls)
-            .context("IMAP STARTTLS failed. Check that Proton Mail Bridge is running and its certificate is trusted.")?
+    let mut socket = tcp(&a.incoming_host, a.incoming_port)?;
+    if a.incoming_starttls {
+        // The imap crate's secure() only accepts TcpStream. Perform the small
+        // plaintext upgrade here so bounded I/O also covers STARTTLS sessions.
+        starttls(&mut socket)?;
+    }
+    let stream = tls
+        .connect(&a.incoming_host, socket)
+        .map_err(|e| anyhow::anyhow!("IMAP TLS handshake failed: {e}"))?;
+    let mut client = imap::Client::new(stream);
+    if a.incoming_starttls {
+        client.greeting_read = true; // IMAP sends no second greeting after STARTTLS.
     } else {
-        let stream = tls
-            .connect(&a.incoming_host, socket)
-            .context("IMAP TLS handshake failed")?;
-        let mut client = imap::Client::new(stream);
         client.read_greeting()?;
-        client
-    };
+    }
     let session = if a.oauth {
         client.authenticate(
             "XOAUTH2",
@@ -57,7 +62,7 @@ pub(crate) fn imap_login(
     } else {
         client.login(&a.email, &s.password)
     };
-    session.map_err(|(e, _)| anyhow::anyhow!("IMAP authentication failed: {e}"))
+    session.map_err(|(e, _)| anyhow::Error::new(e).context("IMAP authentication failed"))
 }
 struct Xoauth {
     user: String,
@@ -72,7 +77,7 @@ pub(crate) fn select_message_mailbox(session: &mut ImapSession, mail: &Mail) -> 
         .and_then(|s| s.parse::<u32>().ok())
         .context("Cached message identity is invalid. Refresh this mailbox.")?;
     ensure!(
-        mailbox.uid_validity.unwrap_or(0) == expected,
+        expected > 0 && mailbox.uid_validity == Some(expected),
         "The server reset this mailbox's message identities. Refresh before opening or changing this message."
     );
     Ok(())
@@ -224,4 +229,43 @@ pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> 
         }
     }
     bail!("The server has no {} folder.", folder.label())
+}
+
+fn starttls(socket: &mut Wire) -> Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(socket);
+    let line = |reader: &mut BufReader<&mut Wire>| -> Result<String> {
+        let mut line = String::new();
+        reader.take(8193).read_line(&mut line)?;
+        ensure!(
+            line.len() <= 8192 && line.ends_with("\r\n"),
+            "Invalid IMAP STARTTLS response"
+        );
+        Ok(line)
+    };
+    let greeting = line(&mut reader)?;
+    ensure!(
+        greeting.starts_with("* OK ") || greeting == "* OK\r\n",
+        "IMAP server rejected connection"
+    );
+    reader.get_mut().write_all(b"p1 STARTTLS\r\n")?;
+    reader.get_mut().flush()?;
+    loop {
+        let response = line(&mut reader)?;
+        if response.starts_with("p1 ") {
+            ensure!(
+                response.starts_with("p1 OK ") || response == "p1 OK\r\n",
+                "IMAP STARTTLS was rejected; credentials were not sent"
+            );
+            ensure!(
+                reader.buffer().is_empty(),
+                "Unexpected data following STARTTLS"
+            );
+            return Ok(());
+        }
+        ensure!(
+            response.starts_with("* ") && !response.starts_with("* BYE"),
+            "Invalid IMAP STARTTLS response"
+        );
+    }
 }

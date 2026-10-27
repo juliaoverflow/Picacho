@@ -6,7 +6,6 @@ use crate::manage::{
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::HashMap,
-    net::TcpStream,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -16,8 +15,14 @@ use zeroize::Zeroize;
 
 use crate::sync::transport::*;
 #[cfg(test)]
+#[path = "dovecot_tests.rs"]
+mod dovecot_tests;
+#[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
+#[cfg(test)]
+#[path = "reliability_tests.rs"]
+mod reliability_tests;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Change {
     Read(bool),
@@ -74,7 +79,7 @@ impl Backend {
         &self,
         a: &Account,
         password: &str,
-    ) -> Result<PopSession<native_tls::TlsStream<TcpStream>>> {
+    ) -> Result<PopSession<native_tls::TlsStream<crate::sync::wire::Wire>>> {
         pop_login(a, password, &self.tls_connector()?)
     }
     /// Signs in and checks the incoming server, then saves the account. For
@@ -135,10 +140,10 @@ impl Backend {
         secret.client_secret = account.client_secret.clone();
         if account.provider == Provider::Pop3 {
             let mut pop = self.pop_login(&account, &secret.password)?;
-            pop.command("QUIT")?;
+            let _ = pop.command("QUIT");
         } else {
             let mut session = self.imap_login(&account, &secret)?;
-            session.logout()?;
+            let _ = session.logout();
         }
         ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
         store::write_secret(&account.id, &secret)?;
@@ -253,9 +258,19 @@ impl Backend {
         limit: usize,
     ) -> Result<Vec<Mail>> {
         let mailbox = mailbox.into();
-        let folder = mailbox.folder();
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        match self.sync_once(a, &mailbox, limit) {
+            Err(error) if crate::sync::retry::transient(&error) => {
+                // Only downloads/snapshots are replayed, never MOVE or SMTP.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                self.sync_once(a, &mailbox, limit)
+            }
+            result => result,
+        }
+    }
+    fn sync_once(&self, a: &Account, mailbox: &Mailbox, limit: usize) -> Result<Vec<Mail>> {
+        let folder = mailbox.folder();
         let secret = self.credentials(a)?;
         if a.provider == Provider::Pop3 {
             return self.sync_pop(a, folder, limit, &secret.password);
@@ -318,9 +333,9 @@ impl Backend {
                 }
                 Mailbox::Standard(folder) => resolve_in(&names, a.provider, *folder)?,
             };
-            result = self.fetch_mailbox(&mut session, a, &mailbox, &remote, false, limit)?;
+            result = self.fetch_mailbox(&mut session, a, mailbox, &remote, false, limit)?;
         }
-        session.logout()?;
+        let _ = session.logout();
         Ok(result)
     }
     fn fetch_mailbox(
@@ -334,7 +349,10 @@ impl Backend {
     ) -> Result<Vec<Mail>> {
         let folder = mailbox.folder();
         let selected = session.select(remote)?;
-        let validity = selected.uid_validity.unwrap_or(0);
+        let validity = selected
+            .uid_validity
+            .filter(|v| *v > 0)
+            .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
         let mut query = if starred_only { "FLAGGED" } else { "ALL" }.to_owned();
         if a.sync.days > 0 {
             // Older mail stays on the server; reconciling drops it from the cache.
@@ -342,8 +360,12 @@ impl Backend {
             query = format!("{query} SINCE {}", since.format("%-d-%b-%Y"));
         }
         let mut uids: Vec<_> = session.uid_search(&query)?.into_iter().collect();
+        ensure!(
+            uids.iter().all(|uid| *uid > 0),
+            "Invalid IMAP UID in search response"
+        );
         uids.sort_unstable();
-        let all_ids: Vec<_> = uids
+        let mut all_ids: Vec<_> = uids
             .iter()
             .map(|uid| format!("{}:{remote}:{validity}:{uid}", a.id))
             .collect();
@@ -373,6 +395,15 @@ impl Backend {
                 let Some(uid) = f.uid else {
                     continue;
                 };
+                // Unsolicited flag updates are legal during FETCH. They are
+                // not downloaded headers and must not create or replace mail.
+                if !chunk.contains(&uid) || f.header().is_none() {
+                    continue;
+                }
+                ensure!(
+                    !result.iter().any(|m: &Mail| m.uid == uid),
+                    "Duplicate IMAP header response"
+                );
                 let id = format!("{}:{remote}:{validity}:{uid}", a.id);
                 let mut m = if let Some(old) = cached.get(&id) {
                     old.clone()
@@ -394,21 +425,41 @@ impl Backend {
                 result.push(m);
             }
         }
-        self.store.save_messages(&result)?;
-        if starred_only {
-            let keep: std::collections::HashSet<_> = all_ids.iter().collect();
-            let cleared: Vec<_> = cached
-                .into_values()
-                .filter(|m| m.starred && m.remote_folder == remote && !keep.contains(&m.id))
-                .map(|mut m| {
-                    m.starred = false;
-                    m
-                })
-                .collect();
-            self.store.save_messages(&cleared)?;
-        } else {
-            self.store.reconcile(&a.id, mailbox, &all_ids)?;
+        if result.len() != uids.len() {
+            // An expunge can race SEARCH/FETCH. Confirm vanished UIDs before
+            // removing them; an incomplete successful FETCH is not a snapshot.
+            let current = session.uid_search(&query)?;
+            ensure!(
+                uids.iter()
+                    .all(|uid| !current.contains(uid) || result.iter().any(|m| m.uid == *uid)),
+                "The server omitted requested headers; cached mail has been kept. Refresh to retry."
+            );
+            all_ids.retain(|id| {
+                id.rsplit(':')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .is_some_and(|uid| current.contains(&uid))
+            });
+            result.retain(|m| current.contains(&m.uid));
         }
+        self.store.apply_snapshot(
+            &store::MailboxSnapshot {
+                account: &a.id,
+                mailbox,
+                remote,
+                validity,
+                ids: &all_ids,
+                starred_only,
+            },
+            &result,
+        )?;
+        let keep: std::collections::HashSet<_> = all_ids.iter().collect();
+        let prefix = format!("{}:{remote}:{validity}:", a.id);
+        self.readable.lock().unwrap().retain(|id, m| {
+            m.account != a.id
+                || m.remote_folder != remote
+                || (id.starts_with(&prefix) && (starred_only || keep.contains(id)))
+        });
         result.sort_by_key(|m| std::cmp::Reverse(m.date));
         Ok(result)
     }
@@ -427,20 +478,26 @@ impl Backend {
         let mut messages = Vec::new();
         for (number, uid) in ids.iter().rev().take(limit) {
             let id = format!("{}:pop:{uid}", a.id);
-            let mail = if let Some(m) = self.store.message(&id)? {
-                m
+            let cached = self.store.message(&id)?;
+            let complete = cached.is_some() && self.store.raw(&id)?.is_some();
+            let mail = if let Some(m) = cached.as_ref().filter(|_| complete) {
+                m.clone()
             } else {
                 pop.command(&format!("RETR {number}"))?;
                 let raw = pop.multiline(MAX_MESSAGE)?;
                 let mut m = parse_message(&raw, a, &id, Folder::Inbox, "INBOX", *number)?;
                 m.size = raw.len() as u32;
-                self.store.save_messages(&[m.clone()])?;
-                self.store.save_raw(&id, &raw)?;
+                if let Some(old) = cached {
+                    m.folder = old.folder;
+                    m.unread = old.unread;
+                    m.starred = old.starred;
+                }
+                self.store.save_download(&m, &raw)?;
                 m
             };
             messages.push(mail);
         }
-        pop.command("QUIT")?;
+        let _ = pop.command("QUIT");
         self.store.save_messages(&messages)?;
         // POP3 has no folders. Keep local moves and messages removed from the
         // remote server; UIDL identities prevent duplicate downloads.
@@ -470,15 +527,15 @@ impl Backend {
             let secret = self.credentials(a)?;
             let mut session = self.imap_login(a, &secret)?;
             select_message_mailbox(&mut session, m)?;
-            let fetched = session.uid_fetch(m.uid.to_string(), "BODY.PEEK[]")?;
+            let fetched = session.uid_fetch(m.uid.to_string(), "(UID BODY.PEEK[])")?;
             let raw = fetched
                 .iter()
-                .next()
-                .and_then(|f| f.body())
+                .filter(|f| f.uid == Some(m.uid))
+                .find_map(|f| f.body())
                 .context("Message no longer exists on the server")?
                 .to_vec();
             ensure!(raw.len() <= MAX_MESSAGE, "Message exceeds the 25 MB limit.");
-            session.logout()?;
+            let _ = session.logout();
             self.store.save_raw(&m.id, &raw)?;
             raw
         };
@@ -518,6 +575,7 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         let mut current = Vec::new();
         for m in mails {
+            ensure!(m.account == a.id, "Message belongs to another account");
             let next = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
             if !matches!(change, Change::Move(folder) if next.folder == folder) {
                 current.push(next);
@@ -552,59 +610,79 @@ impl Backend {
             }
             for (first, uids) in groups {
                 select_message_mailbox(&mut session, first)?;
-                let set = uid_set(&uids);
-                match change {
-                    Change::Read(read) => {
-                        session.uid_store(
-                            &set,
-                            if read {
-                                "+FLAGS.SILENT (\\Seen)"
-                            } else {
-                                "-FLAGS.SILENT (\\Seen)"
-                            },
-                        )?;
+                for chunk in uids.chunks(200) {
+                    let set = uid_set(chunk);
+                    match change {
+                        Change::Read(read) => {
+                            session.uid_store(
+                                &set,
+                                if read {
+                                    "+FLAGS.SILENT (\\Seen)"
+                                } else {
+                                    "-FLAGS.SILENT (\\Seen)"
+                                },
+                            )?;
+                        }
+                        Change::Star(star) => {
+                            session.uid_store(
+                                &set,
+                                if star {
+                                    "+FLAGS.SILENT (\\Flagged)"
+                                } else {
+                                    "-FLAGS.SILENT (\\Flagged)"
+                                },
+                            )?;
+                        }
+                        Change::Move(_) => {
+                            let escaped = target
+                                .as_deref()
+                                .unwrap_or_default()
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"");
+                            session.run_command_and_check_ok(format!(
+                                "UID MOVE {set} \"{escaped}\""
+                            ))?;
+                        }
                     }
-                    Change::Star(star) => {
-                        session.uid_store(
-                            &set,
-                            if star {
-                                "+FLAGS.SILENT (\\Flagged)"
-                            } else {
-                                "-FLAGS.SILENT (\\Flagged)"
-                            },
-                        )?;
-                    }
-                    Change::Move(_) => {
-                        let escaped = target
-                            .as_deref()
-                            .unwrap_or_default()
-                            .replace('\\', "\\\\")
-                            .replace('"', "\\\"");
-                        session
-                            .run_command_and_check_ok(format!("UID MOVE {set} \"{escaped}\""))?;
-                    }
+                    let confirmed: Vec<_> = current
+                        .iter()
+                        .filter(|m| {
+                            m.remote_folder == first.remote_folder
+                                && same_validity(m, first)
+                                && chunk.contains(&m.uid)
+                        })
+                        .cloned()
+                        .collect();
+                    self.commit_change(&confirmed, change, true)?;
                 }
             }
-            session.logout()?;
+            let _ = session.logout();
+            return Ok(());
         }
-        let mut updated = Vec::new();
-        for mut next in current {
-            match change {
-                Change::Read(read) => next.unread = !read,
-                Change::Star(star) => next.starred = star,
-                Change::Move(folder) => next.folder = folder,
-            }
-            if matches!(change, Change::Move(_)) && a.provider != Provider::Pop3 {
-                self.store.delete_mail(&next.id)?;
-            } else {
-                updated.push(next);
-            }
-        }
-        self.store.save_messages(&updated)?;
-        Ok(())
+        self.commit_change(&current, change, false)
+    }
+    fn commit_change(&self, current: &[Mail], change: Change, remote: bool) -> Result<()> {
+        let updated: Vec<_> = current
+            .iter()
+            .cloned()
+            .map(|mut next| {
+                match change {
+                    Change::Read(read) => next.unread = !read,
+                    Change::Star(star) => next.starred = star,
+                    Change::Move(folder) => next.folder = folder,
+                }
+                next
+            })
+            .collect();
+        self.store
+            .commit_changes(&updated, remote && matches!(change, Change::Move(_)))
     }
     /// Marks every message in a mailbox read, on the server and in the cache.
     pub fn mark_all_read(&self, a: &Account, mailbox: &Mailbox) -> Result<()> {
+        if mailbox.folder() == Folder::Starred {
+            let starred = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
+            return self.change_many(a, &starred, Change::Read(true));
+        }
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         if a.provider != Provider::Pop3 && mailbox.folder() != Folder::Drafts {
@@ -619,7 +697,7 @@ impl Backend {
             if !unseen.is_empty() {
                 session.uid_store(uid_set(&unseen), "+FLAGS.SILENT (\\Seen)")?;
             }
-            session.logout()?;
+            let _ = session.logout();
         }
         let mut cached = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
         cached.retain(|m| m.unread);
@@ -702,7 +780,7 @@ impl Backend {
                 }
             }
         }
-        session.logout()?;
+        let _ = session.logout();
         Ok(stored)
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
