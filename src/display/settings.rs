@@ -11,8 +11,10 @@ impl MailApp {
         let c = self.colors();
         div()
             .w_full()
+            .min_w_0()
             .p(px(3.))
             .flex()
+            .flex_wrap()
             .gap(px(3.))
             .rounded(px(10.))
             .bg(rgb(c.bg))
@@ -23,9 +25,12 @@ impl MailApp {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (label, action, active))| {
+                        let selector = format!("{id}-{i}");
                         div()
-                            .id(SharedString::from(format!("{id}-{i}")))
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector)
                             .flex_1()
+                            .min_w(px(76.))
                             .h(px(28.))
                             .px_2()
                             .flex()
@@ -133,7 +138,9 @@ impl MailApp {
         div()
             .id(SharedString::from(id))
             .debug_selector(move || selector)
+            .max_w(px(180.))
             .h(px(32.))
+            .flex_shrink_0()
             .px_2()
             .flex()
             .items_center()
@@ -152,18 +159,33 @@ impl MailApp {
                 this.handle(Action::SettingsPage(page.clone()), w, cx)
             }))
     }
-    pub(super) fn settings_modal(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn settings_modal(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
+        let narrow = window.viewport_size().width < px(700.);
         let mut nav = div()
             .id("settings-nav")
+            .debug_selector(|| "settings-nav".into())
             .w(px(210.))
             .flex_shrink_0()
             .h_full()
+            .min_h_0()
             .overflow_y_scroll()
             .p_3()
             .flex()
             .flex_col()
             .gap(px(2.))
+            .when(narrow, |d| {
+                d.w_full()
+                    .h(px(56.))
+                    .min_w_0()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .overflow_y_hidden()
+                    .overflow_x_scroll()
+                    .border_r_0()
+                    .border_b_1()
+            })
             .bg(rgb(c.bg))
             .border_r_1()
             .border_color(rgb(c.border))
@@ -174,16 +196,18 @@ impl MailApp {
                 Page::General,
                 cx,
             ))
-            .child(
-                div()
-                    .mt_3()
-                    .mb_1()
-                    .px_2()
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(c.muted))
-                    .child("MAILBOXES"),
-            );
+            .when(!narrow, |nav| {
+                nav.child(
+                    div()
+                        .mt_3()
+                        .mb_1()
+                        .px_2()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(c.muted))
+                        .child("MAILBOXES"),
+                )
+            });
         for (i, a) in self.accounts.iter().enumerate() {
             nav = nav.child(self.settings_nav(
                 format!("settings-account-{}", a.id),
@@ -196,6 +220,7 @@ impl MailApp {
         nav = nav.child(
             div()
                 .id("settings-add-account")
+                .flex_shrink_0()
                 .h(px(32.))
                 .px_2()
                 .flex()
@@ -218,16 +243,22 @@ impl MailApp {
             Page::General => self.general_page(cx),
         };
         div()
+            .size_full()
+            .min_h_0()
             .flex()
-            .h(px(540.))
+            .when(narrow, |d| d.flex_col())
             .child(nav)
             .child(
                 div()
                     .id("settings-page")
+                    .track_scroll(&self.settings_scroll)
+                    .debug_selector(|| "settings-page".into())
                     .flex_1()
+                    .min_h_0()
                     .min_w_0()
                     .overflow_y_scroll()
                     .p_6()
+                    .when(narrow, |d| d.p_4())
                     .child(page),
             )
             .into_any_element()
@@ -252,8 +283,11 @@ impl MailApp {
             .collect(),
             cx,
         );
-        let swatches =
-            div().flex().gap_3().children(Accent::ALL.map(|accent| {
+        let swatches = div()
+            .flex()
+            .flex_wrap()
+            .gap_3()
+            .children(Accent::ALL.map(|accent| {
                 let (color, ..) = accent.colors(self.dark);
                 let active = self.accent == accent;
                 div()
@@ -303,6 +337,7 @@ impl MailApp {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         self.button(
@@ -488,10 +523,12 @@ impl MailApp {
                 div()
                     .flex()
                     .items_center()
+                    .flex_wrap()
                     .gap_3()
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(160.))
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
                             .child("Removing this account deletes its mail and drafts from this computer. Mail on the server is kept."),

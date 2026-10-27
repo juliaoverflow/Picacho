@@ -1,5 +1,8 @@
 #[path = "reader.rs"]
 mod reader;
+#[cfg(test)]
+#[path = "responsive_tests.rs"]
+mod responsive_tests;
 #[path = "settings.rs"]
 mod settings;
 use crate::manage::status::DownloadStatus as Download;
@@ -385,6 +388,7 @@ enum Action {
     RemoveAttachment(usize),
     SaveAttachment(usize),
     UnlockMail,
+    BackToList,
     LockMail(String),
     LoadMore,
     OpenDraft(String),
@@ -460,11 +464,14 @@ pub struct MailApp {
     anim: u64,
     list_scroll: UniformListScrollHandle,
     reader_scroll: ScrollHandle,
+    settings_scroll: ScrollHandle,
     /// Pinal Mail's password (or recovery key) prompt for encrypted mail.
     unlock_input: Entity<InputState>,
     /// Pinal accounts whose mail is encrypted, and those not unlocked here yet.
     encrypted: HashSet<String>,
     locked: HashSet<String>,
+    unlocking: HashSet<String>,
+    unlock_errors: HashMap<String, String>,
 }
 fn input(
     placeholder: &str,
@@ -654,9 +661,12 @@ impl MailApp {
             anim: 0,
             list_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
             unlock_input,
             encrypted,
             locked: HashSet::new(),
+            unlocking: HashSet::new(),
+            unlock_errors: HashMap::new(),
         };
         this.filter(cx);
         this.apply_theme(window, cx);
@@ -1206,7 +1216,7 @@ impl MailApp {
                         }
                         this.download(cx);
                     }
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    Err(e) => this.notice(e.to_string(), true, cx),
                 }
             },
         );
@@ -1221,6 +1231,7 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        Self::set(&self.unlock_input, "", w, cx);
         self.account = account;
         self.folder = mailbox.folder();
         self.remote = match &mailbox {
@@ -1396,7 +1407,7 @@ impl MailApp {
                                 this.encrypted.insert(m.account.clone());
                             }
                         } else if this.read_generation == generation {
-                            this.notice(format!("{e:#}"), true, cx);
+                            this.notice(e.to_string(), true, cx);
                         }
                     }
                 },
@@ -1479,7 +1490,7 @@ impl MailApp {
                             this.filter(cx);
                         }
                         this.reload_cached(cx);
-                        this.notice(format!("{e:#}"), true, cx);
+                        this.notice(e.to_string(), true, cx);
                     }
                 }
             },
@@ -1503,7 +1514,7 @@ impl MailApp {
                 this.refresh_counts(cx);
                 if let Err(e) = result {
                     this.reload_cached(cx);
-                    this.notice(format!("{e:#}"), true, cx);
+                    this.notice(e.to_string(), true, cx);
                 }
             },
         );
@@ -1615,6 +1626,9 @@ impl MailApp {
                 self.sync_selecting();
             } else if self.search_open {
                 self.close_search(w, cx);
+            } else if w.viewport_size().width < px(900.) {
+                self.selected = None;
+                self.read_generation += 1;
             }
             cx.notify();
             return;
@@ -1896,7 +1910,7 @@ impl MailApp {
                         }
                         this.refresh(cx);
                     }
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    Err(e) => this.notice(e.to_string(), true, cx),
                 }
             },
         );
@@ -1938,7 +1952,7 @@ impl MailApp {
                             this.load_drafts(cx);
                         }
                     }
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    Err(e) => this.notice(e.to_string(), true, cx),
                 }
             },
         );
@@ -2239,6 +2253,12 @@ impl MailApp {
                 self.load_folder(Folder::Inbox, w, cx);
             }
 
+            Action::BackToList => {
+                self.selected = None;
+                self.read_generation += 1;
+                Self::set(&self.unlock_input, "", w, cx);
+                self.focus.focus(w);
+            }
             Action::UnlockMail => {
                 let Some(m) = self.selected_mail() else {
                     return;
@@ -2246,26 +2266,47 @@ impl MailApp {
                 let Some(a) = self.account_of(&m) else {
                     return;
                 };
-                let secret = Self::value(&self.unlock_input, cx);
-                if secret.is_empty() {
+                if self.unlocking.contains(&a.id) {
                     return;
                 }
-                Self::set(&self.unlock_input, "", w, cx);
-                let id = m.id.clone();
-                self.task(
-                    cx,
-                    move |b| b.unlock(&a, &secret),
-                    move |this, result, cx| match result {
-                        Ok(()) => {
-                            this.locked.remove(&m.account);
-                            this.notice("Encrypted mail unlocked on this computer", false, cx);
-                            if this.selected.as_deref() == Some(id.as_str()) {
-                                this.select(id, cx);
+                let secret = Self::value(&self.unlock_input, cx);
+                if secret.is_empty() {
+                    self.unlock_errors
+                        .insert(a.id, "Enter your password or recovery key.".into());
+                    self.unlock_input.update(cx, |s, cx| s.focus(w, cx));
+                } else {
+                    Self::set(&self.unlock_input, "", w, cx);
+                    self.unlocking.insert(a.id.clone());
+                    self.unlock_errors.remove(&a.id);
+                    let id = m.id.clone();
+                    self.task(
+                        cx,
+                        move |b| {
+                            let secret = zeroize::Zeroizing::new(secret);
+                            b.unlock(&a, &secret)
+                        },
+                        move |this, result, cx| {
+                            this.unlocking.remove(&m.account);
+                            match result {
+                                Ok(()) => {
+                                    this.locked.remove(&m.account);
+                                    this.unlock_errors.remove(&m.account);
+                                    this.notice(
+                                        "Encrypted mail unlocked on this computer",
+                                        false,
+                                        cx,
+                                    );
+                                    if this.selected.as_deref() == Some(id.as_str()) {
+                                        this.select(id, cx);
+                                    }
+                                }
+                                Err(e) => {
+                                    this.unlock_errors.insert(m.account, e.to_string());
+                                }
                             }
-                        }
-                        Err(e) => this.notice(format!("{e:#}"), true, cx),
-                    },
-                );
+                        },
+                    );
+                }
             }
             Action::LockMail(account) => {
                 let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
@@ -2282,25 +2323,30 @@ impl MailApp {
                     move |b| b.lock_mail(&a),
                     |this, result, cx| match result {
                         Ok(()) => this.notice("This computer forgot your mail key", false, cx),
-                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                        Err(e) => this.notice(e.to_string(), true, cx),
                     },
                 );
             }
             Action::Settings => {
                 if self.modal != Some(Modal::Settings) {
+                    self.settings_scroll.set_offset(point(px(0.), px(0.)));
                     self.page = Page::General;
                     self.modal = Some(Modal::Settings);
                     self.anim += 1;
                 }
             }
             Action::AccountSettings(id) => {
+                self.settings_scroll.set_offset(point(px(0.), px(0.)));
                 self.page = Page::Account(id);
                 if self.modal != Some(Modal::Settings) {
                     self.modal = Some(Modal::Settings);
                     self.anim += 1;
                 }
             }
-            Action::SettingsPage(page) => self.page = page,
+            Action::SettingsPage(page) => {
+                self.settings_scroll.set_offset(point(px(0.), px(0.)));
+                self.page = page;
+            }
             Action::About => {
                 self.modal = Some(Modal::About);
                 self.anim += 1;
@@ -2478,8 +2524,12 @@ impl MailApp {
         };
         let tooltip = keys(label.trim_start_matches('@'));
         let label = label.to_string();
+        let id = id.into();
+        let selector = id.to_string();
         let el = div()
-            .id(id.into())
+            .id(id)
+            .debug_selector(move || selector)
+            .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
@@ -2571,9 +2621,9 @@ impl MailApp {
                 cx,
             )))
     }
-    fn sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, compact: bool, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
-        let collapsed = self.sidebar_collapsed;
+        let collapsed = compact || self.sidebar_collapsed;
         let (from, to) = if collapsed {
             (SIDEBAR_WIDTH, SIDEBAR_RAIL)
         } else {
@@ -2591,10 +2641,10 @@ impl MailApp {
             .h_full()
             .overflow_hidden()
             .child(content)
-            .child(self.download_status(cx))
+            .child(self.download_status(collapsed, cx))
             .border_r_1()
             .border_color(rgb(c.border));
-        if self.sidebar_anim == 0 {
+        if self.sidebar_anim == 0 || compact {
             return sidebar.w(px(to)).into_any_element();
         }
         sidebar
@@ -2998,7 +3048,7 @@ impl MailApp {
             cx,
         ))
     }
-    fn download_status(&self, cx: &Context<Self>) -> AnyElement {
+    fn download_status(&self, collapsed: bool, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let d = &self.download;
         if d.total == 0 {
@@ -3006,7 +3056,7 @@ impl MailApp {
         }
         let done = d.total - d.missing;
         let progress = done as f32 / d.total as f32;
-        if self.sidebar_collapsed {
+        if collapsed {
             let tooltip = if d.missing == 0 {
                 format!("All {} messages downloaded", fmt_count(d.total))
             } else {
@@ -3128,15 +3178,18 @@ impl MailApp {
             );
         panel.into_any_element()
     }
-    fn message_list(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn message_list(&self, width: Option<f32>, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
         let entity = cx.entity();
         let count = self.visible.len();
         div()
             .flex()
             .flex_col()
-            .w(px(380.))
+            .id("message-list")
+            .debug_selector(|| "message-list".into())
+            .w(px(width.unwrap_or(380.)))
             .flex_shrink_0()
+            .when(width.is_none(), |d| d.w_full().flex_1().min_w_0())
             .min_h_0()
             .h_full()
             .bg(rgb(c.surface))
@@ -3450,13 +3503,15 @@ impl MailApp {
             .filter(|m| self.selection.contains(&m.id))
             .all(|m| m.starred);
         div()
-            .h(px(38.))
+            .min_h(px(38.))
+            .py_1()
             .rounded(px(10.))
             .bg(rgb(c.soft))
             .pl_3()
             .pr_1()
             .flex()
             .items_center()
+            .flex_wrap()
             .gap(px(2.))
             .child(
                 div()
@@ -3881,6 +3936,7 @@ impl MailApp {
                         div()
                             .flex()
                             .items_center()
+                            .flex_wrap()
                             .gap_2()
                             .child(
                                 div()
@@ -4313,7 +4369,9 @@ impl MailApp {
             400.
         };
         let mut card = div()
-            .w(px(width))
+            .w_full()
+            .max_w(px(width))
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .items_center()
@@ -4476,9 +4534,17 @@ impl MailApp {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .justify_center()
+                    .px_4()
                     .py_8()
-                    .child(self.setup_view(cx)),
+                    .child(
+                        div()
+                            .my_auto()
+                            .w_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .justify_center()
+                            .child(self.setup_view(cx)),
+                    ),
             )
             .child(div().h(px(56.)).flex().items_center().child(dots))
             .into_any_element()
@@ -4647,7 +4713,7 @@ impl MailApp {
             .when(busy, |d| d.bg(rgb(c.accent)))
             .into_any_element()
     }
-    fn modal(&self, cx: &Context<Self>) -> AnyElement {
+    fn modal(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let modal = self.modal.as_ref().unwrap();
         let title = match modal {
@@ -4660,13 +4726,17 @@ impl MailApp {
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
-            Modal::Settings => self.settings_modal(cx),
+            Modal::Settings => self.settings_modal(window, cx),
             Modal::About => self.about_modal(),
             Modal::Compose => self.compose_modal(cx),
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
         };
+        let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
+        let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
         let mut panel = div()
+            .id("modal-panel")
+            .debug_selector(|| "modal-panel".into())
             .flex()
             .flex_col()
             .w(px(match modal {
@@ -4676,8 +4746,11 @@ impl MailApp {
                 Modal::RemoveAccount(_) | Modal::About => 400.,
                 Modal::Settings => 820.,
             }))
-            .when(*modal == Modal::Connect, |d| d.min_h(px(560.)))
-            .max_h(relative(0.9))
+            .max_w(available_width)
+            .when(*modal == Modal::Settings, |d| {
+                d.h(px(600.).min(available_height))
+            })
+            .max_h(available_height)
             .rounded(px(18.))
             .border_1()
             .border_color(rgb(c.border))
@@ -4690,6 +4763,7 @@ impl MailApp {
                     .items_center()
                     .px_5()
                     .py_3()
+                    .flex_shrink_0()
                     .border_b_1()
                     .border_color(rgb(c.border))
                     .child(
@@ -4710,22 +4784,26 @@ impl MailApp {
             )
             .child(match modal {
                 // Settings scrolls its own sections beside a fixed sidebar.
-                Modal::Settings => div().min_h_0().child(content).into_any_element(),
+                Modal::Settings => div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(content)
+                    .into_any_element(),
                 Modal::Connect => div()
                     .id("modal-content")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px_8()
-                    .py_8()
+                    .p_4()
                     .flex()
                     .flex_col()
                     .items_center()
-                    .justify_center()
                     .child(content)
                     .into_any_element(),
                 _ => div()
                     .id("modal-content")
+                    .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_5()
@@ -4735,6 +4813,10 @@ impl MailApp {
         if !self.status.is_empty() && *modal != Modal::Connect {
             panel = panel.child(
                 div()
+                    .id("modal-status")
+                    .max_h(px(48.))
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
                     .px_5()
                     .pb_3()
                     .text_size(px(12.))
@@ -4743,6 +4825,8 @@ impl MailApp {
             );
         }
         let mut footer = div()
+            .flex_shrink_0()
+            .flex_wrap()
             .border_t_1()
             .border_color(rgb(c.border))
             .px_5()
@@ -4804,7 +4888,7 @@ impl MailApp {
         panel = panel.child(footer);
         self.modal_frame(panel, cx)
     }
-    fn modal_frame(&self, panel: Div, _cx: &Context<Self>) -> AnyElement {
+    fn modal_frame(&self, panel: Stateful<Div>, _cx: &Context<Self>) -> AnyElement {
         div()
             .occlude()
             .absolute()
@@ -4813,7 +4897,7 @@ impl MailApp {
             .flex()
             .items_center()
             .justify_center()
-            .p_6()
+            .p_4()
             .child(panel.with_animation(
                 ("modal-enter", self.anim),
                 Animation::new(Duration::from_millis(180)).with_easing(|t| 1. - (1. - t).powi(3)),
@@ -4950,22 +5034,42 @@ impl Render for MailApp {
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
             .when(self.onboarding, |d| d.child(self.onboarding(cx)))
             .when(!self.onboarding, |d| self.main(d, window, cx))
-            .when(self.modal.is_some(), |d| d.child(self.modal(cx)))
+            .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
             .when(self.menu.is_some(), |d| d.child(self.popup_menu(cx)))
     }
 }
 impl MailApp {
     fn main(&self, d: Stateful<Div>, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        let width = window.viewport_size().width;
+        let single = width < px(900.);
+        let compact = width < px(1180.);
         d.child(self.topbar(cx))
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.sidebar(cx))
-                    .child(self.message_list(cx))
-                    .child(self.reader(window, cx)),
+                    .min_w_0()
+                    .when(
+                        !(single && self.selected.is_some() && width < px(480.)),
+                        |d| d.child(self.sidebar(compact, cx)),
+                    )
+                    .when(!single || self.selected.is_none(), |d| {
+                        d.child(self.message_list(
+                            if single {
+                                None
+                            } else if compact {
+                                Some(320.)
+                            } else {
+                                Some(380.)
+                            },
+                            cx,
+                        ))
+                    })
+                    .when(!single || self.selected.is_some(), |d| {
+                        d.child(self.reader(window, cx))
+                    }),
             )
             .when(self.modal.is_none() && !self.status.is_empty(), |d| {
                 d.child(
@@ -4973,7 +5077,7 @@ impl MailApp {
                         .absolute()
                         .bottom_5()
                         .right_5()
-                        .max_w(px(500.))
+                        .max_w(px(500.).min((width - px(40.)).max(px(0.))))
                         .flex()
                         .items_center()
                         .gap_3()
@@ -5215,7 +5319,7 @@ pub fn run(store: Arc<Store>) {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(960.), px(600.))),
+                window_min_size: Some(size(px(360.), px(320.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Picacho".into()),
                     // macOS draws the window buttons over the app's own bar.
@@ -5394,7 +5498,7 @@ mod tests {
     // `gpui::*` exports a `test` macro that would shadow the built-in one.
     use std::prelude::v1::test;
 
-    fn open(
+    pub(super) fn open(
         store: Arc<Store>,
         cx: &mut TestAppContext,
     ) -> (Entity<MailApp>, &mut VisualTestContext) {
@@ -5409,11 +5513,11 @@ mod tests {
         cx.run_until_parked();
         (app.unwrap(), cx)
     }
-    fn store() -> Arc<Store> {
+    pub(super) fn store() -> Arc<Store> {
         let dir = std::env::temp_dir().join(format!("mail-ui-{}", uuid::Uuid::new_v4()));
         Arc::new(Store::open(&dir).unwrap())
     }
-    fn act(view: &Entity<MailApp>, action: Action, cx: &mut VisualTestContext) {
+    pub(super) fn act(view: &Entity<MailApp>, action: Action, cx: &mut VisualTestContext) {
         view.update_in(cx, |this, w, cx| this.handle(action, w, cx));
         cx.run_until_parked();
     }
@@ -5540,7 +5644,7 @@ mod tests {
         assert!(cx.debug_bounds("service-Pinal").is_some());
     }
 
-    fn two_accounts(
+    pub(super) fn two_accounts(
         cx: &mut TestAppContext,
     ) -> (Entity<MailApp>, &mut VisualTestContext, Arc<Store>) {
         let store = store();
@@ -5571,7 +5675,7 @@ mod tests {
     }
     /// Test windows draw before dispatching input, so a no-op mouse move
     /// brings the rendered frame up to date.
-    fn frame(cx: &mut VisualTestContext) {
+    pub(super) fn frame(cx: &mut VisualTestContext) {
         cx.simulate_event(MouseMoveEvent {
             position: point(px(1.), px(1.)),
             pressed_button: None,

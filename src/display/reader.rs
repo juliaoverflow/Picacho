@@ -20,25 +20,53 @@ impl MailApp {
                 .child("No message selected")
                 .into_any_element();
         };
+        let compact = window.viewport_size().width < px(1180.);
+        let single = window.viewport_size().width < px(900.);
         let toolbar = div()
+            .id("reader-toolbar")
+            .debug_selector(|| "reader-toolbar".into())
             .h(px(57.))
             .flex_shrink_0()
-            .px_3()
+            .px_2()
             .flex()
             .items_center()
             .gap_1()
             .border_b_1()
             .border_color(rgb(c.border))
-            .child(self.button("reply", "Reply", "reply", Action::Reply(false), false, cx))
+            .when(single, |d| {
+                d.child(self.button(
+                    "reader-back",
+                    "@Back to messages",
+                    "arrow-left",
+                    Action::BackToList,
+                    false,
+                    cx,
+                ))
+            })
+            .child(self.button(
+                "reply",
+                if compact { "@Reply" } else { "Reply" },
+                "reply",
+                Action::Reply(false),
+                false,
+                cx,
+            ))
             .child(self.button(
                 "reply-all",
-                "Reply all",
+                if compact { "@Reply all" } else { "Reply all" },
                 "reply-all",
                 Action::Reply(true),
                 false,
                 cx,
             ))
-            .child(self.button("forward", "Forward", "forward", Action::Forward, false, cx))
+            .child(self.button(
+                "forward",
+                if compact { "@Forward" } else { "Forward" },
+                "forward",
+                Action::Forward,
+                false,
+                cx,
+            ))
             .child(div().flex_1())
             .child(self.button(
                 "archive",
@@ -70,7 +98,9 @@ impl MailApp {
             .overflow_y_scroll()
             .flex_1()
             .min_h_0()
-            .px(px(32.))
+            .min_w_0()
+            .w_full()
+            .px(px(if compact { 20. } else { 32. }))
             .pt_6()
             .pb_10()
             .child(
@@ -113,6 +143,7 @@ impl MailApp {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .flex_wrap()
                     .mb_6()
                     .child(avatar(&m.initials(), 40., 0, c))
                     .child(
@@ -125,6 +156,7 @@ impl MailApp {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .gap_2()
                                     .items_center()
                                     .child(
@@ -158,146 +190,94 @@ impl MailApp {
             )
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
         if m.body.is_none() && self.locked.contains(&m.account) {
-            return content
-                .child(
+            content = content.child(self.unlock_panel(&m.account, cx));
+        } else {
+            let body = m.body.unwrap_or_else(|| {
+                if self.busy > 0 {
+                    "Loading message…".into()
+                } else {
+                    "This message has no text body.".into()
+                }
+            });
+            // Native selectable text preserves paragraphs without running untrusted HTML.
+            content = content.child(
+                gpui_component::text::TextView::markdown(
+                    SharedString::from(format!("body-{}", m.id)),
+                    plain_markdown(&body),
+                    window,
+                    cx,
+                )
+                .selectable(true)
+                .text_size(px(14.))
+                .line_height(relative(1.8)),
+            );
+            for (i, a) in m.attachments.iter().enumerate() {
+                content = content.child(
                     div()
+                        .mt_3()
+                        .border_1()
+                        .border_color(rgb(c.border))
+                        .rounded_lg()
+                        .p_3()
                         .flex()
-                        .flex_col()
                         .items_center()
                         .gap_3()
-                        .mt_6()
-                        .max_w(px(340.))
-                        .mx_auto()
+                        .child(icon_el("paperclip", 20., c.muted))
                         .child(
                             div()
-                                .size(px(52.))
-                                .rounded(px(16.))
-                                .bg(rgb(c.soft))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(icon_el("lock", 22., c.accent)),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("This message is encrypted"),
-                        )
-                        .child(
-                            div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .text_center()
-                                .child(
-                                    "Enter your Pinal password to read encrypted mail on this \
-                                     computer. After a password reset, use your previous password \
-                                     or your recovery key.",
-                                ),
+                                .truncate()
+                                .child(format!("{}  ·  {} KB", a.name, a.size / 1024)),
                         )
-                        .child(
-                            Input::new(&self.unlock_input)
-                                .w_full()
-                                .h(px(39.))
-                                .text_size(px(13.)),
-                        )
-                        .child(
-                            self.button(
-                                "unlock-mail",
-                                "Unlock",
-                                "lock",
-                                Action::UnlockMail,
-                                true,
-                                cx,
-                            )
-                            .w_full(),
-                        ),
-                )
-                .into_any_element();
-        }
-        let body = m.body.unwrap_or_else(|| {
-            if self.busy > 0 {
-                "Loading message…".into()
-            } else {
-                "This message has no text body.".into()
+                        .child(self.button(
+                            format!("attachment-{i}"),
+                            "Save",
+                            "download",
+                            Action::SaveAttachment(i),
+                            false,
+                            cx,
+                        )),
+                );
             }
-        });
-        // Native selectable text preserves paragraphs without running untrusted HTML.
-        content = content.child(
-            gpui_component::text::TextView::markdown(
-                SharedString::from(format!("body-{}", m.id)),
-                plain_markdown(&body),
-                window,
-                cx,
-            )
-            .selectable(true)
-            .text_size(px(14.))
-            .line_height(relative(1.8)),
-        );
-        for (i, a) in m.attachments.iter().enumerate() {
             content = content.child(
                 div()
-                    .mt_3()
-                    .border_1()
+                    .mt_10()
+                    .pt_5()
+                    .border_t_1()
                     .border_color(rgb(c.border))
-                    .rounded_lg()
-                    .p_3()
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(icon_el("paperclip", 20., c.muted))
+                    .gap_2()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .truncate()
-                            .child(format!("{}  ·  {} KB", a.name, a.size / 1024)),
+                        self.button(
+                            "reply-bottom",
+                            "Reply",
+                            "reply",
+                            Action::Reply(false),
+                            false,
+                            cx,
+                        )
+                        .border_1()
+                        .border_color(rgb(c.border)),
                     )
-                    .child(self.button(
-                        format!("attachment-{i}"),
-                        "Save",
-                        "download",
-                        Action::SaveAttachment(i),
-                        false,
-                        cx,
-                    )),
+                    .child(
+                        self.button(
+                            "forward-bottom",
+                            "Forward",
+                            "forward",
+                            Action::Forward,
+                            false,
+                            cx,
+                        )
+                        .border_1()
+                        .border_color(rgb(c.border)),
+                    ),
             );
         }
-        content = content.child(
-            div()
-                .mt_10()
-                .pt_5()
-                .border_t_1()
-                .border_color(rgb(c.border))
-                .flex()
-                .gap_2()
-                .child(
-                    self.button(
-                        "reply-bottom",
-                        "Reply",
-                        "reply",
-                        Action::Reply(false),
-                        false,
-                        cx,
-                    )
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                )
-                .child(
-                    self.button(
-                        "forward-bottom",
-                        "Forward",
-                        "forward",
-                        Action::Forward,
-                        false,
-                        cx,
-                    )
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                ),
-        );
         div()
+            .id("reader-pane")
+            .debug_selector(|| "reader-pane".into())
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -310,6 +290,35 @@ impl MailApp {
                 Animation::new(Duration::from_millis(220)).with_easing(|t| 1. - (1. - t).powi(3)),
                 |d, t| d.opacity(t).top(px((1. - t) * 5.)),
             ))
+            .into_any_element()
+    }
+}
+
+impl MailApp {
+    /// Locked messages use the same toolbar, scrolling region and pane sizing
+    /// as readable mail. Keeping the shell shared prevents layout drift.
+    fn unlock_panel(&self, account: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let unlocking = self.unlocking.contains(account);
+        div()
+            .id("unlock-panel")
+            .debug_selector(|| "unlock-panel".into())
+            .w_full()
+            .min_w_0()
+            .max_w(px(340.))
+            .mx_auto()
+            .mt_6()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_3()
+            .child(div().size(px(52.)).flex_shrink_0().rounded(px(16.)).bg(rgb(c.soft)).flex().items_center().justify_center().child(icon_el("lock",22.,c.accent)))
+            .child(div().w_full().text_center().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("This message is encrypted"))
+            .child(div().w_full().text_size(px(12.)).text_color(rgb(c.muted)).text_center().child("Enter your Pinal password to read encrypted mail on this computer. After a password reset, use your previous password or your recovery key."))
+            .child(div().w_full().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Password or recovery key"))
+            .child(div().id("unlock-field").debug_selector(|| "unlock-field".into()).w_full().min_w_0().child(Input::new(&self.unlock_input).disabled(unlocking).w_full().h(px(39.)).text_size(px(13.))))
+            .when_some(self.unlock_errors.get(account), |panel, error| panel.child(div().id("unlock-error").debug_selector(|| "unlock-error".into()).w_full().text_size(px(12.)).text_color(rgb(c.danger)).child(error.clone())))
+            .child(self.button("unlock-mail", if unlocking { "Unlocking…" } else { "Unlock" }, "lock", Action::UnlockMail, true, cx).w_full().flex_shrink_0().when(unlocking, |d| d.opacity(0.7)))
             .into_any_element()
     }
 }
