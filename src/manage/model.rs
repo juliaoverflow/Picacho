@@ -74,7 +74,7 @@ impl Service {
     pub fn sign_in(self) -> SignIn {
         match self {
             Self::Pinal => SignIn::Pinal,
-            Self::Gmail | Self::Outlook if crate::oauth::configured(self.provider()) => {
+            Self::Gmail | Self::Outlook if crate::sync::oauth::configured(self.provider()) => {
                 SignIn::Browser
             }
             _ => SignIn::Password,
@@ -130,7 +130,7 @@ impl Service {
             Self::Fastmail => ("imap.fastmail.com", 993, "smtp.fastmail.com", 465),
             Self::Zoho => {
                 // Zoho keeps each region's mail on its own servers.
-                let domain = crate::discover::domain(email).unwrap_or_default();
+                let domain = crate::sync::discover::domain(email).unwrap_or_default();
                 let region = ["eu", "in", "com.au", "jp", "ca", "sa", "com.cn"]
                     .into_iter()
                     .find(|r| domain == format!("zoho.{r}") || domain == format!("zohomail.{r}"))

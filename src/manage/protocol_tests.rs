@@ -1,4 +1,6 @@
-//! Local TLS fixtures exercise the production backend without real mail accounts.
+use std::io::{BufRead, BufReader, Write};
+use std::time::Duration;
+// Local TLS fixtures exercise the production backend without real mail accounts.
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -501,7 +503,7 @@ fn imap_starttls_and_sync_window() -> Result<()> {
         seen
     });
     let (b, mut a, path) = backend(&cert)?;
-    a.service = crate::model::Service::ProtonBridge;
+    a.service = crate::manage::model::Service::ProtonBridge;
     a.incoming_starttls = true;
     a.incoming_port = port;
     a.sync.days = 30;
@@ -525,15 +527,16 @@ fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Fixture {
         password: String,
-        bundle: crate::crypto::KeyBundle,
+        bundle: crate::manage::crypto::KeyBundle,
         stored: String,
     }
     use base64::Engine as _;
-    let f: Fixture = serde_json::from_str(include_str!("../tests/fixtures/pinal-encryption.json"))?;
+    let f: Fixture =
+        serde_json::from_str(include_str!("../../tests/fixtures/pinal-encryption.json"))?;
     let stored = base64::engine::general_purpose::STANDARD.decode(&f.stored)?;
     let path = std::env::temp_dir().join(format!("pinal-enc-{}", uuid::Uuid::new_v4()));
     let mut backend = Backend::new(Arc::new(Store::open(&path)?));
-    let account = crate::model::Service::Pinal
+    let account = crate::manage::model::Service::Pinal
         .account("jdoe@sonoran.exchange")
         .unwrap();
     backend.test_secret = Some(Secret {
@@ -547,7 +550,11 @@ fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
     assert!(backend.encrypted(&account));
 
     let locked = backend.read(&account, &mail).unwrap_err();
-    assert!(locked.downcast_ref::<crate::crypto::Locked>().is_some());
+    assert!(
+        locked
+            .downcast_ref::<crate::manage::crypto::Locked>()
+            .is_some()
+    );
     assert!(backend.unlock(&account, "wrong password").is_err());
     backend.unlock(&account, &f.password)?;
 

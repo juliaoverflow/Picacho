@@ -1,4 +1,4 @@
-use crate::model::{Account, Provider, Secret, Service};
+use crate::manage::model::{Account, Provider, Secret, Service};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{
     Engine,
@@ -329,7 +329,7 @@ pub struct PinalMailbox {
 #[derive(Debug, serde::Deserialize)]
 pub struct PinalEncryption {
     #[serde(default)]
-    pub bundle: Option<crate::crypto::KeyBundle>,
+    pub bundle: Option<crate::manage::crypto::KeyBundle>,
 }
 #[derive(Debug, serde::Deserialize)]
 pub struct PinalServer {
@@ -475,7 +475,7 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<()> {
     if !next.refresh_token.is_empty() {
         secret.refresh_token = next.refresh_token;
     }
-    crate::store::write_secret(&account.id, secret)?;
+    crate::manage::store::write_secret(&account.id, secret)?;
     Ok(())
 }
 

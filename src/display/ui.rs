@@ -1,8 +1,15 @@
+#[path = "reader.rs"]
+mod reader;
+#[path = "settings.rs"]
+mod settings;
+use crate::manage::status::DownloadStatus as Download;
 use crate::{
-    discover,
-    mail::{Backend, Change},
-    model::*,
-    store::Store,
+    manage::{
+        backend::{Backend, Change},
+        model::*,
+        store::Store,
+    },
+    sync::discover,
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -304,13 +311,6 @@ struct PopupMenu {
     position: Point<Pixels>,
     entries: Vec<Entry>,
     key: u64,
-}
-#[derive(Default)]
-struct Download {
-    total: usize,
-    missing: usize,
-    active: bool,
-    paused: bool,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
@@ -756,7 +756,7 @@ impl MailApp {
                 .spawn(async move {
                     Ok::<_, anyhow::Error>((
                         store.unread_counts()?,
-                        store.download_counts(crate::mail::MAX_MESSAGE)?,
+                        store.download_counts(crate::sync::transport::MAX_MESSAGE)?,
                     ))
                 })
                 .await;
@@ -831,7 +831,11 @@ impl MailApp {
             return;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
-            crate::notify::new_mail(&a.email, (&latest.sender, &latest.subject), fresh.len());
+            crate::display::notify::new_mail(
+                &a.email,
+                (&latest.sender, &latest.subject),
+                fresh.len(),
+            );
         }
     }
     /// Downloads full messages in small batches so other mail operations on
@@ -861,7 +865,9 @@ impl MailApp {
                                 Err(e) => error = Some(e),
                             }
                         }
-                        let counts = b.store.download_counts(crate::mail::MAX_MESSAGE)?;
+                        let counts = b
+                            .store
+                            .download_counts(crate::sync::transport::MAX_MESSAGE)?;
                         match error {
                             Some(e) if stored == 0 => Err(e),
                             _ => Ok((stored, counts)),
@@ -1361,7 +1367,7 @@ impl MailApp {
                         this.refresh_counts(cx);
                     }
                     Err(e) => {
-                        if e.downcast_ref::<crate::crypto::Locked>().is_some() {
+                        if e.downcast_ref::<crate::manage::crypto::Locked>().is_some() {
                             // The reader asks for the password instead.
                             if let Some(m) = this.messages.iter().find(|m| m.id == id2) {
                                 this.locked.insert(m.account.clone());
@@ -1760,7 +1766,7 @@ impl MailApp {
             SignIn::Pinal => Service::Pinal.account("").unwrap(),
             SignIn::Browser => {
                 let mut a = Account::new(self.service.provider());
-                let client = crate::oauth::client(a.provider);
+                let client = crate::sync::oauth::client(a.provider);
                 a.oauth = true;
                 a.client_id = client.id;
                 a.client_secret = client.secret;
@@ -2327,7 +2333,7 @@ impl MailApp {
                     self.notice("Wait for the current mail operation to finish before removing this account.",true,cx);
                     return;
                 }
-                let _ = crate::store::secret_entry(&id)
+                let _ = crate::manage::store::secret_entry(&id)
                     .and_then(|e| e.delete_credential().map_err(Into::into));
                 match self.backend.store.remove_account(&id) {
                     Ok(()) => {
@@ -3754,317 +3760,6 @@ impl MailApp {
         self.sync_selecting();
         cx.notify();
     }
-    fn reader(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let c = self.colors();
-        let Some(m) = self.selected_mail() else {
-            return div()
-                .flex_1()
-                .min_w_0()
-                .bg(rgb(c.surface))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .text_size(px(13.))
-                .text_color(rgb(c.muted))
-                .child(icon_el("mail", 36., c.border))
-                .child("No message selected")
-                .into_any_element();
-        };
-        let toolbar = div()
-            .h(px(57.))
-            .flex_shrink_0()
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_1()
-            .border_b_1()
-            .border_color(rgb(c.border))
-            .child(self.button("reply", "Reply", "reply", Action::Reply(false), false, cx))
-            .child(self.button(
-                "reply-all",
-                "Reply all",
-                "reply-all",
-                Action::Reply(true),
-                false,
-                cx,
-            ))
-            .child(self.button("forward", "Forward", "forward", Action::Forward, false, cx))
-            .child(div().flex_1())
-            .child(self.button(
-                "archive",
-                "@Archive message",
-                "archive",
-                Action::Move(Folder::Archive),
-                false,
-                cx,
-            ))
-            .child(self.button(
-                "read",
-                "@Mark read / unread",
-                "mail",
-                Action::Read(m.id.clone()),
-                false,
-                cx,
-            ))
-            .child(self.button(
-                "trash",
-                "@Move to trash",
-                "trash",
-                Action::Move(Folder::Trash),
-                false,
-                cx,
-            ));
-        let mut content = div()
-            .id(SharedString::from(format!("reader-{}", m.id)))
-            .track_scroll(&self.reader_scroll)
-            .overflow_y_scroll()
-            .flex_1()
-            .min_h_0()
-            .px(px(32.))
-            .pt_6()
-            .pb_10()
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .mb_5()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(23.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(relative(1.35))
-                            .child(m.subject.clone()),
-                    )
-                    .child(
-                        self.button(
-                            "reader-star",
-                            if m.starred {
-                                "@Unstar · ⌘⇧S"
-                            } else {
-                                "@Star · ⌘⇧S"
-                            },
-                            "",
-                            Action::Star(m.id.clone()),
-                            false,
-                            cx,
-                        )
-                        .child(if m.starred {
-                            icon_el("star-filled", 17., STAR)
-                        } else {
-                            icon_el("star", 17., c.muted)
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .mb_6()
-                    .child(avatar(&m.initials(), 40., 0, c))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(m.sender.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(c.muted))
-                                            .truncate()
-                                            .child(format!("<{}>", m.from)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(c.muted))
-                                    .truncate()
-                                    .child(format!("to {}", m.to)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(c.muted))
-                            .child(date_full(m.date)),
-                    ),
-            )
-            .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
-        if m.body.is_none() && self.locked.contains(&m.account) {
-            return content
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_3()
-                        .mt_6()
-                        .max_w(px(340.))
-                        .mx_auto()
-                        .child(
-                            div()
-                                .size(px(52.))
-                                .rounded(px(16.))
-                                .bg(rgb(c.soft))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(icon_el("lock", 22., c.accent)),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("This message is encrypted"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .text_center()
-                                .child(
-                                    "Enter your Pinal password to read encrypted mail on this \
-                                     computer. After a password reset, use your previous password \
-                                     or your recovery key.",
-                                ),
-                        )
-                        .child(
-                            Input::new(&self.unlock_input)
-                                .w_full()
-                                .h(px(39.))
-                                .text_size(px(13.)),
-                        )
-                        .child(
-                            self.button(
-                                "unlock-mail",
-                                "Unlock",
-                                "lock",
-                                Action::UnlockMail,
-                                true,
-                                cx,
-                            )
-                            .w_full(),
-                        ),
-                )
-                .into_any_element();
-        }
-        let body = m.body.unwrap_or_else(|| {
-            if self.busy > 0 {
-                "Loading message…".into()
-            } else {
-                "This message has no text body.".into()
-            }
-        });
-        // Native selectable text preserves paragraphs without running untrusted HTML.
-        content = content.child(
-            gpui_component::text::TextView::markdown(
-                SharedString::from(format!("body-{}", m.id)),
-                plain_markdown(&body),
-                window,
-                cx,
-            )
-            .selectable(true)
-            .text_size(px(14.))
-            .line_height(relative(1.8)),
-        );
-        for (i, a) in m.attachments.iter().enumerate() {
-            content = content.child(
-                div()
-                    .mt_3()
-                    .border_1()
-                    .border_color(rgb(c.border))
-                    .rounded_lg()
-                    .p_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(icon_el("paperclip", 20., c.muted))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .truncate()
-                            .child(format!("{}  ·  {} KB", a.name, a.size / 1024)),
-                    )
-                    .child(self.button(
-                        format!("attachment-{i}"),
-                        "Save",
-                        "download",
-                        Action::SaveAttachment(i),
-                        false,
-                        cx,
-                    )),
-            );
-        }
-        content = content.child(
-            div()
-                .mt_10()
-                .pt_5()
-                .border_t_1()
-                .border_color(rgb(c.border))
-                .flex()
-                .gap_2()
-                .child(
-                    self.button(
-                        "reply-bottom",
-                        "Reply",
-                        "reply",
-                        Action::Reply(false),
-                        false,
-                        cx,
-                    )
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                )
-                .child(
-                    self.button(
-                        "forward-bottom",
-                        "Forward",
-                        "forward",
-                        Action::Forward,
-                        false,
-                        cx,
-                    )
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                ),
-        );
-        div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .bg(rgb(c.surface))
-            .flex()
-            .flex_col()
-            .child(toolbar)
-            .child(content.with_animation(
-                ("reader-enter", self.anim),
-                Animation::new(Duration::from_millis(220)).with_easing(|t| 1. - (1. - t).powi(3)),
-                |d, t| d.opacity(t).top(px((1. - t) * 5.)),
-            ))
-            .into_any_element()
-    }
-
     fn field(&self, label: &str, index: usize) -> impl IntoElement {
         let c = self.colors();
         div()
@@ -4346,505 +4041,6 @@ impl MailApp {
         content.into_any_element()
     }
     /// A row of mutually exclusive choices.
-    fn segmented(&self, id: &str, options: Vec<(String, Action, bool)>, cx: &Context<Self>) -> Div {
-        let c = self.colors();
-        div()
-            .w_full()
-            .p(px(3.))
-            .flex()
-            .gap(px(3.))
-            .rounded(px(10.))
-            .bg(rgb(c.bg))
-            .border_1()
-            .border_color(rgb(c.border))
-            .children(
-                options
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (label, action, active))| {
-                        div()
-                            .id(SharedString::from(format!("{id}-{i}")))
-                            .flex_1()
-                            .h(px(28.))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(7.))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .cursor_pointer()
-                            .when(active, |d| {
-                                d.bg(rgb(c.raised)).text_color(rgb(c.text)).shadow_sm()
-                            })
-                            .when(!active, |d| {
-                                d.text_color(rgb(c.muted))
-                                    .hover(move |s| s.text_color(rgb(c.text)))
-                            })
-                            .child(label)
-                            .on_click(
-                                cx.listener(move |this, _, w, cx| {
-                                    this.handle(action.clone(), w, cx)
-                                }),
-                            )
-                    }),
-            )
-    }
-    fn switch(&self, id: String, on: bool, action: Action, cx: &Context<Self>) -> Stateful<Div> {
-        let c = self.colors();
-        div()
-            .id(SharedString::from(id))
-            .w(px(38.))
-            .h(px(22.))
-            .flex_shrink_0()
-            .rounded_full()
-            .p(px(3.))
-            .flex()
-            .when(on, |d| d.justify_end())
-            .bg(rgb(if on { c.accent } else { c.border }))
-            .cursor_pointer()
-            .child(
-                div()
-                    .size(px(16.))
-                    .rounded_full()
-                    .bg(rgb(0xffffff))
-                    .shadow_sm(),
-            )
-            .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
-    }
-    fn setting(&self, title: &str, caption: &str, control: impl IntoElement) -> Div {
-        let c = self.colors();
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title.to_owned()),
-                    )
-                    .when(!caption.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(caption.to_owned()),
-                        )
-                    }),
-            )
-            .child(control)
-    }
-    fn section(&self, title: &str) -> Div {
-        let c = self.colors();
-        div()
-            .pt_2()
-            .pb_1()
-            .border_b_1()
-            .border_color(rgb(c.border))
-            .text_size(px(11.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(c.muted))
-            .child(title.to_uppercase())
-    }
-    fn settings_nav(
-        &self,
-        id: String,
-        label: String,
-        lead: AnyElement,
-        page: Page,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let c = self.colors();
-        let active = self.page == page;
-        let selector = id.clone();
-        div()
-            .id(SharedString::from(id))
-            .debug_selector(move || selector)
-            .h(px(32.))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(7.))
-            .cursor_pointer()
-            .text_size(px(13.))
-            .when(active, |d| d.bg(rgb(c.soft)).text_color(rgb(c.text)))
-            .when(!active, |d| {
-                d.text_color(rgb(c.muted))
-                    .hover(move |s| s.bg(rgb(c.surface)).text_color(rgb(c.text)))
-            })
-            .child(lead)
-            .child(div().flex_1().min_w_0().truncate().child(label))
-            .on_click(cx.listener(move |this, _, w, cx| {
-                this.handle(Action::SettingsPage(page.clone()), w, cx)
-            }))
-    }
-    fn settings_modal(&self, cx: &Context<Self>) -> AnyElement {
-        let c = self.colors();
-        let mut nav = div()
-            .id("settings-nav")
-            .w(px(210.))
-            .flex_shrink_0()
-            .h_full()
-            .overflow_y_scroll()
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .bg(rgb(c.bg))
-            .border_r_1()
-            .border_color(rgb(c.border))
-            .child(self.settings_nav(
-                "settings-general".into(),
-                "General".into(),
-                icon_el("settings", 15., c.muted).into_any_element(),
-                Page::General,
-                cx,
-            ))
-            .child(
-                div()
-                    .mt_3()
-                    .mb_1()
-                    .px_2()
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(c.muted))
-                    .child("MAILBOXES"),
-            );
-        for (i, a) in self.accounts.iter().enumerate() {
-            nav = nav.child(self.settings_nav(
-                format!("settings-account-{}", a.id),
-                a.name.clone(),
-                avatar(&initials(&a.name), 20., i, c).into_any_element(),
-                Page::Account(a.id.clone()),
-                cx,
-            ));
-        }
-        nav = nav.child(
-            div()
-                .id("settings-add-account")
-                .h(px(32.))
-                .px_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded(px(7.))
-                .cursor_pointer()
-                .text_size(px(13.))
-                .text_color(rgb(c.muted))
-                .hover(move |s| s.bg(rgb(c.surface)).text_color(rgb(c.text)))
-                .child(icon_el("plus", 15., c.muted))
-                .child("Add Account")
-                .on_click(cx.listener(|this, _, w, cx| this.handle(Action::Connect, w, cx))),
-        );
-        let page = match &self.page {
-            Page::Account(id) => match self.accounts.iter().position(|a| &a.id == id) {
-                Some(i) => self.account_page(i, cx),
-                None => self.general_page(cx),
-            },
-            Page::General => self.general_page(cx),
-        };
-        div()
-            .flex()
-            .h(px(540.))
-            .child(nav)
-            .child(
-                div()
-                    .id("settings-page")
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_y_scroll()
-                    .p_6()
-                    .child(page),
-            )
-            .into_any_element()
-    }
-    fn general_page(&self, cx: &Context<Self>) -> AnyElement {
-        let c = self.colors();
-        let appearance = self.segmented(
-            "appearance",
-            [
-                (Appearance::System, "Automatic"),
-                (Appearance::Light, "Light"),
-                (Appearance::Dark, "Dark"),
-            ]
-            .into_iter()
-            .map(|(a, label)| {
-                (
-                    label.to_owned(),
-                    Action::SetAppearance(a),
-                    self.appearance == a,
-                )
-            })
-            .collect(),
-            cx,
-        );
-        let swatches =
-            div().flex().gap_3().children(Accent::ALL.map(|accent| {
-                let (color, ..) = accent.colors(self.dark);
-                let active = self.accent == accent;
-                div()
-                    .id(SharedString::from(format!("accent-{}", accent.key())))
-                    .size(px(30.))
-                    .rounded_full()
-                    .p(px(3.))
-                    .border_2()
-                    .border_color(rgb(if active { color } else { c.surface }))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .size_full()
-                            .rounded_full()
-                            .bg(rgb(color))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(active, |d| {
-                                d.child(icon_el("check", 12., accent.colors(self.dark).3))
-                            }),
-                    )
-                    .tooltip(move |w, cx| Tooltip::new(accent.label()).build(w, cx))
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        this.handle(Action::SetAccent(accent), w, cx)
-                    }))
-            }));
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section("Appearance"))
-            .child(self.setting(
-                "Theme",
-                "Automatic follows your system's light and dark setting.",
-                appearance,
-            ))
-            .child(self.setting(
-                "Theme color",
-                &format!(
-                    "Used for buttons, selection and highlights. {}",
-                    self.accent.label()
-                ),
-                swatches,
-            ))
-            .child(self.section("Picacho"))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        self.button(
-                            "open-shortcuts",
-                            "Keyboard Shortcuts",
-                            "info",
-                            Action::Help,
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border)),
-                    )
-                    .child(
-                        self.button("open-about", "About Picacho", "", Action::About, false, cx)
-                            .border_1()
-                            .border_color(rgb(c.border)),
-                    ),
-            )
-            .into_any_element()
-    }
-    fn account_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
-        let c = self.colors();
-        let a = &self.accounts[index];
-        let sync = a.sync;
-        let set = |next: SyncSettings| Action::SetSync(a.id.clone(), next);
-        let auth = if a.service == Service::Pinal {
-            "Signed in with Pinal"
-        } else if a.oauth {
-            "Browser sign-in"
-        } else {
-            a.service.password_label()
-        };
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        self.service_tile(a.service, 44.)
-                            .when(a.service == Service::Other, |_| {
-                                avatar(&initials(&a.name), 44., index, c)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(a.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(c.muted))
-                                    .truncate()
-                                    .child(format!("{} · {} · {auth}", a.email, a.service_label())),
-                            ),
-                    ),
-            )
-            .when(self.encrypted.contains(&a.id), |page| {
-                let locked = self.locked.contains(&a.id);
-                page.child(self.section("Encryption")).child(self.setting(
-                    "Zero-access encryption",
-                    if locked {
-                        "Your mail is stored encrypted. Open an encrypted message and enter your Pinal password to read it here."
-                    } else {
-                        "Your mail is stored encrypted and decrypted on this computer. The key stays in the system keychain until you remove it."
-                    },
-                    if locked {
-                        div().into_any_element()
-                    } else {
-                        self.button(
-                            format!("lock-{}", a.id),
-                            "Forget key",
-                            "lock",
-                            Action::LockMail(a.id.clone()),
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border))
-                        .into_any_element()
-                    },
-                ))
-            })
-            .child(self.section("Sync"));
-        if a.provider != Provider::Pop3 {
-            page = page.child(
-                self.setting(
-                    "Keep mail from",
-                    "Older mail stays on the server and is removed from this computer.",
-                    self.segmented(
-                        &format!("days-{}", a.id),
-                        [
-                            (14, "2 weeks"),
-                            (30, "1 month"),
-                            (90, "3 months"),
-                            (365, "1 year"),
-                            (0, "All"),
-                        ]
-                        .into_iter()
-                        .map(|(days, label)| {
-                            (
-                                label.to_owned(),
-                                set(SyncSettings { days, ..sync }),
-                                sync.days == days,
-                            )
-                        })
-                        .collect(),
-                        cx,
-                    ),
-                ),
-            );
-        }
-        page = page
-            .child(self.setting(
-                "Check for new mail",
-                "",
-                self.segmented(
-                    &format!("refresh-{}", a.id),
-                    [(1, "1 min"), (5, "5 min"), (15, "15 min"), (30, "30 min"), (60, "1 hour"), (0, "Manually")]
-                        .into_iter()
-                        .map(|(minutes, label)| {
-                            (
-                                label.to_owned(),
-                                set(SyncSettings { refresh_minutes: minutes, ..sync }),
-                                sync.refresh_minutes == minutes,
-                            )
-                        })
-                        .collect(),
-                    cx,
-                ),
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Notifications"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(c.muted))
-                                    .child(if sync.refresh_minutes == 0 {
-                                        "Announce new inbox mail. Only works while Picacho checks for mail."
-                                    } else {
-                                        "Announce new inbox mail while Picacho is in the background."
-                                    }),
-                            ),
-                    )
-                    .child(self.switch(
-                        format!("notify-{}", a.id),
-                        sync.notify,
-                        set(SyncSettings { notify: !sync.notify, ..sync }),
-                        cx,
-                    )),
-            )
-            .child(self.section("Account"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Removing this account deletes its mail and drafts from this computer. Mail on the server is kept."),
-                    )
-                    .child(
-                        self.button(
-                            format!("remove-{}", a.id),
-                            "Remove Account",
-                            "trash",
-                            Action::ConfirmRemove(a.id.clone()),
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border))
-                        .text_color(rgb(c.danger)),
-                    ),
-            );
-        page.into_any_element()
-    }
     fn about_modal(&self) -> AnyElement {
         let c = self.colors();
         div()
@@ -5941,8 +5137,8 @@ fn date_full(ts: i64) -> String {
 }
 
 pub fn run(store: Arc<Store>) {
-    let app = Application::new().with_assets(crate::assets::Assets);
-    app.on_open_urls(crate::oauth::opened);
+    let app = Application::new().with_assets(crate::display::assets::Assets);
+    app.on_open_urls(crate::sync::oauth::opened);
     app.run(move |cx| {
         gpui_component::init(cx);
         cx.on_action(|_: &Hide, cx| cx.hide());

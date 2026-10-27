@@ -33,3 +33,7 @@ Local protocol tests cannot validate a particular provider's tenant policies, co
 ## Picacho update (October 24, 2026)
 
 Rename to Picacho, provider list, Pinal sign-in, Settings, and menu bar. `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked` pass (18 tests, 1 ignored live test). New tests cover the provider list and discovery fallback, the Add Account dialog, theme color and per-mailbox settings persistence, ID-token addresses, the loopback callback rejecting a forged state, and IMAP STARTTLS with a date-limited sync window. The release `.app` builds and launches. The redesigned screens were not inspected visually in this pass, and browser sign-in was not run against live Google, Microsoft, or Pinal servers.
+
+## Three-unit reorganization (October 26, 2026)
+
+Verified on Linux x86_64 with Rust 1.96.0. `cargo fmt --check`, strict Clippy for all targets, `cargo build --locked`, and `cargo test --locked -- --test-threads=1` pass: 27 passed, 1 opt-in discovery test ignored. The protocol tests used real loopback sockets and verified TLS certificates. The Linux GPUI dependency compatibility fix is recorded in ARCHITECTURE.md; no third-party source files were patched. The refactor preserves the existing database format, cache identities, and GPUI action namespace.

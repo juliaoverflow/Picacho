@@ -1,7 +1,7 @@
 //! Finds server settings from an email address, following the order used by
 //! Thunderbird: the provider's own autoconfig file, the public ISPDB, the
 //! domain's MX records, and finally well-known hostnames.
-use crate::model::{Account, Provider};
+use crate::manage::model::{Account, Provider};
 use std::{
     io::Read,
     net::{TcpStream, ToSocketAddrs},

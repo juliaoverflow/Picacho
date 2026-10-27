@@ -1,4 +1,4 @@
-use crate::model::*;
+use crate::manage::model::*;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::{

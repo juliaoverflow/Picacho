@@ -1,12 +1,6 @@
-mod assets;
-mod crypto;
-mod discover;
-mod mail;
-mod model;
-mod notify;
-mod oauth;
-mod store;
-mod ui;
+mod display;
+mod manage;
+mod sync;
 
 fn main() -> anyhow::Result<()> {
     let project = directories::ProjectDirs::from("com", "pinal", "Picacho")
@@ -25,7 +19,7 @@ fn main() -> anyhow::Result<()> {
             }
             path
         });
-    let store = std::sync::Arc::new(store::Store::open(&path)?);
-    ui::run(store);
+    let store = std::sync::Arc::new(manage::store::Store::open(&path)?);
+    display::run(store);
     Ok(())
 }

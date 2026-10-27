@@ -14,7 +14,7 @@ struct Fixture {
     foreign: String,
 }
 fn fixture() -> Fixture {
-    serde_json::from_str(include_str!("../tests/fixtures/pinal-encryption.json")).unwrap()
+    serde_json::from_str(include_str!("../../tests/fixtures/pinal-encryption.json")).unwrap()
 }
 fn bytes(b64: &str) -> Vec<u8> {
     B64.decode(b64).unwrap()
@@ -137,7 +137,7 @@ fn private_keys_must_match_their_listed_public_keys() {
     let mk = unlock_with_password(&f.bundle, &f.password).unwrap();
     let mut swapped = f.bundle.clone();
     // Another key's armored public key under this fingerprint.
-    swapped.keys[0].public_key = include_str!("../tests/fixtures/other-public-key.asc").into();
+    swapped.keys[0].public_key = include_str!("../../tests/fixtures/other-public-key.asc").into();
     assert!(open_keys(&swapped, &mk).is_err());
     let mut tampered = f.bundle.clone();
     let mut sealed = bytes(&tampered.keys[0].sealed_private_key);

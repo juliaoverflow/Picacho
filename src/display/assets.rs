@@ -74,8 +74,8 @@ impl AssetSource for Assets {
 /// each mail service in the provider list.
 fn brand(name: &str) -> Option<&'static [u8]> {
     let svg: &'static str = match name {
-        "picacho.svg" => return Some(include_bytes!("../assets/brand/picacho.svg")),
-        "pinal.svg" => return Some(include_bytes!("../assets/brand/pinal.svg")),
+        "picacho.svg" => return Some(include_bytes!("../../assets/brand/picacho.svg")),
+        "pinal.svg" => return Some(include_bytes!("../../assets/brand/pinal.svg")),
         "gmail.svg" => {
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#fff'/><rect x='.5' y='.5' width='47' height='47' rx='11.5' fill='none' stroke='#dadce0'/><path d='M11 35V17' stroke='#4285F4' stroke-width='5' stroke-linecap='round'/><path d='M37 35V17' stroke='#34A853' stroke-width='5' stroke-linecap='round'/><path d='M11 17l13 10 13-10' fill='none' stroke='#EA4335' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/></svg>"
         }
