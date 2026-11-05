@@ -10,7 +10,12 @@ impl MailApp {
             .unwrap_or(self.reading_defaults)
     }
 
-    pub(super) fn reader(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn reader(
+        &self,
+        corners: Corners<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let c = self.colors();
         let Some(m) = self.selected_mail() else {
             self.html_view.update(cx, |view, cx| view.clear(cx));
@@ -18,6 +23,8 @@ impl MailApp {
                 .flex_1()
                 .min_w_0()
                 .bg(rgb(c.surface))
+                .rounded_bl(corners.bottom_left)
+                .rounded_br(corners.bottom_right)
                 .flex()
                 .flex_col()
                 .items_center()
@@ -342,6 +349,8 @@ impl MailApp {
             .min_w_0()
             .min_h_0()
             .bg(rgb(c.surface))
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
             .flex()
             .flex_col()
             .child(toolbar)
@@ -376,7 +385,7 @@ impl MailApp {
             .child(div().w_full().text_center().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("This message is encrypted"))
             .child(div().w_full().text_size(px(12.)).text_color(rgb(c.muted)).text_center().child("Enter your Pinal password to read encrypted mail on this computer. After a password reset, use your previous password or your recovery key."))
             .child(div().w_full().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child("Password or recovery key"))
-            .child(div().id("unlock-field").debug_selector(|| "unlock-field".into()).w_full().min_w_0().child(Input::new(&self.unlock_input).disabled(unlocking).w_full().h(px(39.)).text_size(px(13.))))
+            .child(div().id("unlock-field").debug_selector(|| "unlock-field".into()).w_full().min_w_0().child(field(Input::new(&self.unlock_input), c, unlocking).disabled(unlocking).w_full().h(px(39.)).text_size(px(13.))))
             .when_some(self.unlock_errors.get(account), |panel, error| panel.child(div().id("unlock-error").debug_selector(|| "unlock-error".into()).w_full().text_size(px(12.)).text_color(rgb(c.danger)).child(error.clone())))
             .child(self.button("unlock-mail", if unlocking { "Unlocking…" } else { "Unlock" }, "lock", Action::UnlockMail, true, cx).w_full().flex_shrink_0().when(unlocking, |d| d.opacity(0.7)))
             .into_any_element()

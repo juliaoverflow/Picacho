@@ -13,6 +13,8 @@ mod reading_tests;
 mod responsive_tests;
 #[path = "settings.rs"]
 mod settings;
+#[path = "window.rs"]
+mod window;
 use super::html::HtmlView;
 use crate::manage::reading::{ReadingOptions, message_key};
 use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
@@ -1174,6 +1176,13 @@ impl MailApp {
         theme.colors.ring = rgb(c.accent).into();
         theme.colors.muted_foreground = rgb(c.muted).into();
         theme.colors.accent = rgb(c.soft).into();
+        // The app root draws its own rounded window outline and background
+        // (`window::window_frame`); `Root`'s square fill would show past its
+        // corners. Text fields set their background through `field`.
+        theme.colors.window_border = transparent_black();
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            theme.colors.background = transparent_black();
+        }
     }
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(a) = self.current_account() else {
@@ -2657,26 +2666,23 @@ impl MailApp {
             el.child(label)
         }
     }
-    fn topbar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn topbar(&self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors();
-        let small = |el: Stateful<Div>| el.h(px(28.)).w(px(28.)).rounded(px(7.));
-        div()
+        let small = |el: Stateful<Div>| window::no_drag(el.h(px(28.)).w(px(28.)).rounded(px(7.)));
+        let bar = div()
             .id("topbar")
             .flex()
             .items_center()
             .h(px(TITLEBAR_HEIGHT))
             .flex_shrink_0()
-            // Room for the macOS window buttons; elsewhere the system draws a title bar.
+            // Room for the macOS window buttons; on Linux the window controls
+            // are appended by `client_titlebar`.
             .pl(px(if cfg!(target_os = "macos") { 80. } else { 12. }))
             .pr_3()
             .border_b_1()
             .border_color(rgb(c.border))
             .gap_1()
-            .on_click(|event, w, _| {
-                if event.click_count() == 2 {
-                    w.titlebar_double_click();
-                }
-            })
+            .on_click(window::on_titlebar_double_click)
             .child(small(self.button(
                 "toggle-sidebar",
                 "@Toggle sidebar · ⌃⌘S",
@@ -2719,6 +2725,27 @@ impl MailApp {
                 false,
                 cx,
             )))
+            .when(window::is_client_decorated(w), |bar| {
+                bar.child(div().w(px(1.)).h(px(18.)).mx_1().bg(rgb(c.border)))
+            });
+        let close = self.close_listener(cx);
+        window::client_titlebar(bar, c, true, close, w, cx)
+    }
+    /// The close control of a client-decorated title bar: the same rules as
+    /// the compositor's close request, so a message that is sending is never
+    /// interrupted and the draft is kept.
+    fn close_listener(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        cx.listener(|this, _: &ClickEvent, w, cx| {
+            if this.sending {
+                this.notice("Wait for the current message to finish sending.", true, cx);
+            } else {
+                this.persist_draft(cx);
+                w.remove_window();
+            }
+        })
     }
     fn sidebar(&self, compact: bool, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
@@ -3297,7 +3324,12 @@ impl MailApp {
             );
         panel.into_any_element()
     }
-    fn message_list(&self, width: Option<f32>, cx: &Context<Self>) -> impl IntoElement {
+    fn message_list(
+        &self,
+        width: Option<f32>,
+        corners: Corners<Pixels>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let c = self.colors();
         let entity = cx.entity();
         let count = self.visible.len();
@@ -3312,6 +3344,8 @@ impl MailApp {
             .min_h_0()
             .h_full()
             .bg(rgb(c.surface))
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
             .border_r_1()
             .border_color(rgb(c.border))
             .child(self.list_header(count, cx))
@@ -3546,7 +3580,7 @@ impl MailApp {
                     .overflow_hidden()
                     .child(
                         div().pt_2().child(
-                            Input::new(&self.search)
+                            field(Input::new(&self.search), c, false)
                                 .prefix(icon_el("search", 14., c.muted))
                                 .suffix(
                                     div()
@@ -3974,7 +4008,7 @@ impl MailApp {
                     .child(label.to_string()),
             )
             .child(
-                Input::new(&self.form[index])
+                field(Input::new(&self.form[index]), c, self.connecting)
                     .disabled(self.connecting)
                     .h(px(39.))
                     .text_size(px(13.)),
@@ -4288,7 +4322,7 @@ impl MailApp {
                 )
             })
             .child(
-                Input::new(&self.compose_to)
+                field(Input::new(&self.compose_to), c, false)
                     .prefix(
                         div()
                             .w(px(44.))
@@ -4300,7 +4334,7 @@ impl MailApp {
                     .h(px(40.)),
             )
             .child(
-                Input::new(&self.compose_subject)
+                field(Input::new(&self.compose_subject), c, false)
                     .prefix(
                         div()
                             .w(px(44.))
@@ -4312,7 +4346,7 @@ impl MailApp {
                     .h(px(40.)),
             )
             .child(
-                Input::new(&self.compose_body)
+                field(Input::new(&self.compose_body), c, self.sending)
                     .disabled(self.sending)
                     .h(px(260.))
                     .text_size(px(14.)),
@@ -4609,8 +4643,9 @@ impl MailApp {
             )
             .into_any_element()
     }
-    fn onboarding(&self, cx: &Context<Self>) -> AnyElement {
+    fn onboarding(&self, w: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let c = self.colors();
+        let close = self.close_listener(cx);
         let current = match self.step {
             Step::Welcome => 0,
             Step::Provider => 1,
@@ -4631,18 +4666,31 @@ impl MailApp {
             .flex_col()
             .items_center()
             .bg(rgb(c.bg))
-            .child(
+            .map(|d| {
+                let r = window::window_corners(w);
+                d.rounded_tl(r.top_left)
+                    .rounded_tr(r.top_right)
+                    .rounded_bl(r.bottom_left)
+                    .rounded_br(r.bottom_right)
+            })
+            .child(window::client_titlebar(
                 div()
                     .id("onboarding-titlebar")
                     .h(px(TITLEBAR_HEIGHT))
                     .w_full()
                     .flex_shrink_0()
-                    .on_click(|event, w, _| {
-                        if event.click_count() == 2 {
-                            w.titlebar_double_click();
-                        }
-                    }),
-            )
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .pr_3()
+                    .gap_1()
+                    .on_click(window::on_titlebar_double_click),
+                c,
+                true,
+                close,
+                w,
+                cx,
+            ))
             .child(
                 div()
                     .id("onboarding-body")
@@ -4957,7 +5005,7 @@ impl MailApp {
             .gap_2();
         if matches!(modal, Modal::Connect | Modal::Settings) {
             // These carry their own buttons.
-            return self.modal_frame(panel, cx);
+            return self.modal_frame(panel, window);
         } else if let Modal::RemoveAccount(id) = modal {
             footer = footer
                 .child(div().flex_1())
@@ -5020,13 +5068,18 @@ impl MailApp {
             ));
         }
         panel = panel.child(footer);
-        self.modal_frame(panel, cx)
+        self.modal_frame(panel, window)
     }
-    fn modal_frame(&self, panel: Stateful<Div>, _cx: &Context<Self>) -> AnyElement {
+    fn modal_frame(&self, panel: Stateful<Div>, window: &Window) -> AnyElement {
+        let corners = window::window_corners(window);
         div()
             .occlude()
             .absolute()
             .inset_0()
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
             .bg(rgba(0x101c2c66))
             .flex()
             .items_center()
@@ -5052,6 +5105,7 @@ impl Render for MailApp {
             .flex()
             .flex_col()
             .bg(rgb(c.bg))
+            .map(|d| window::window_frame(d, c, window))
             .text_color(rgb(c.text))
             .font_family(".SystemUIFont")
             .text_size(px(14.))
@@ -5166,7 +5220,7 @@ impl Render for MailApp {
             }))
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
-            .when(self.onboarding, |d| d.child(self.onboarding(cx)))
+            .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
             .when(!self.onboarding, |d| self.main(d, window, cx))
             .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
             .when(self.menu.is_some(), |d| d.child(self.popup_menu(cx)))
@@ -5178,18 +5232,43 @@ impl MailApp {
         let width = window.viewport_size().width;
         let single = width < px(900.);
         let compact = width < px(1180.);
-        d.child(self.topbar(cx))
+        // Panes that paint their own background round the window's lower
+        // corners they touch; GPUI clips children only to rectangles.
+        let corners = window::window_corners(window);
+        let show_sidebar = !(single && self.selected.is_some() && width < px(480.));
+        let show_list = !single || self.selected.is_none();
+        let show_reader = !single || self.selected.is_some();
+        let list_corners = Corners {
+            bottom_left: if show_sidebar {
+                px(0.)
+            } else {
+                corners.bottom_left
+            },
+            bottom_right: if show_reader {
+                px(0.)
+            } else {
+                corners.bottom_right
+            },
+            ..Corners::default()
+        };
+        let reader_corners = Corners {
+            bottom_left: if show_sidebar || show_list {
+                px(0.)
+            } else {
+                corners.bottom_left
+            },
+            bottom_right: corners.bottom_right,
+            ..Corners::default()
+        };
+        d.child(self.topbar(window, cx))
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .when(
-                        !(single && self.selected.is_some() && width < px(480.)),
-                        |d| d.child(self.sidebar(compact, cx)),
-                    )
-                    .when(!single || self.selected.is_none(), |d| {
+                    .when(show_sidebar, |d| d.child(self.sidebar(compact, cx)))
+                    .when(show_list, |d| {
                         d.child(self.message_list(
                             if single {
                                 None
@@ -5198,11 +5277,12 @@ impl MailApp {
                             } else {
                                 Some(380.)
                             },
+                            list_corners,
                             cx,
                         ))
                     })
-                    .when(!single || self.selected.is_some(), |d| {
-                        d.child(self.reader(window, cx))
+                    .when(show_reader, |d| {
+                        d.child(self.reader(reader_corners, window, cx))
                     }),
             )
             .when(self.modal.is_none() && !self.status.is_empty(), |d| {
@@ -5315,6 +5395,13 @@ fn folder_icon(f: Folder) -> &'static str {
         Folder::Trash => "trash",
         Folder::Other => "folder",
     }
+}
+/// A text field on the app's background. Inputs otherwise take the theme's
+/// background, which is transparent on Linux so `Root` does not paint square
+/// corners under the rounded window frame. Disabled fields keep the theme's
+/// muted fill.
+fn field(input: Input, c: Colors, disabled: bool) -> Input {
+    input.when(!disabled, |i| i.bg(rgb(c.bg)))
 }
 fn icon_el(name: &str, size: f32, color: u32) -> Div {
     let path = if [
@@ -5463,6 +5550,10 @@ pub fn run(store: Arc<Store>) {
                     appears_transparent: cfg!(target_os = "macos"),
                     traffic_light_position: Some(point(px(13.), px(12.))),
                 }),
+                // Draw the title bar ourselves on Linux so the topbar is the
+                // window's title bar (GNOME never offers server decorations).
+                window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
+                    .then_some(WindowDecorations::Client),
                 ..Default::default()
             },
             move |window, cx| {
