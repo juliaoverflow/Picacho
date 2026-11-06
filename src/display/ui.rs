@@ -3,6 +3,8 @@ mod accounts;
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
+#[path = "panes.rs"]
+mod panes;
 #[path = "reader.rs"]
 mod reader;
 #[cfg(test)]
@@ -93,6 +95,10 @@ actions!(
 const TITLEBAR_HEIGHT: f32 = 38.;
 const SIDEBAR_WIDTH: f32 = 228.;
 const SIDEBAR_RAIL: f32 = 60.;
+const SIDEBAR_MIN: f32 = 190.;
+const SIDEBAR_MAX: f32 = 420.;
+/// Sidebar and reader panes animate collapsing and expanding for this long.
+const PANE_ANIMATION: Duration = Duration::from_millis(240);
 const STAR: u32 = 0xe0a526;
 const ROW_HEIGHT: f32 = 86.;
 /// Setup form inputs.
@@ -431,6 +437,15 @@ pub struct MailApp {
     collapsed: HashSet<String>,
     sidebar_collapsed: bool,
     sidebar_anim: u64,
+    /// The sidebar's width when its current animation started.
+    sidebar_from: f32,
+    sidebar_since: Option<std::time::Instant>,
+    /// The width the sidebar was last laid out at.
+    sidebar_shown: Cell<f32>,
+    /// The expanded sidebar's width, which the person can drag.
+    sidebar_width: f32,
+    /// Whether the window is too narrow for the expanded sidebar.
+    compact: Cell<bool>,
     menu: Option<PopupMenu>,
     filter_anchor: Rc<Cell<Bounds<Pixels>>>,
     selecting: bool,
@@ -619,6 +634,11 @@ impl MailApp {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let sidebar_collapsed = backend.store.preference("sidebar").as_deref() == Some("collapsed");
+        let sidebar_width = backend
+            .store
+            .preference("sidebar_width")
+            .and_then(|w| w.parse::<f32>().ok())
+            .map_or(SIDEBAR_WIDTH, |w| w.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
         let reading_defaults = backend
             .store
             .preference("reading_defaults")
@@ -640,6 +660,11 @@ impl MailApp {
             collapsed,
             sidebar_collapsed,
             sidebar_anim: 0,
+            sidebar_from: 0.,
+            sidebar_since: None,
+            sidebar_shown: Cell::new(0.),
+            sidebar_width,
+            compact: Cell::new(false),
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
             selecting: false,
@@ -2187,18 +2212,7 @@ impl MailApp {
                 self.modal = Some(Modal::RemoveAccount(id));
                 self.anim += 1;
             }
-            Action::ToggleSidebar => {
-                self.sidebar_collapsed = !self.sidebar_collapsed;
-                self.sidebar_anim += 1;
-                let _ = self.backend.store.set_preference(
-                    "sidebar",
-                    if self.sidebar_collapsed {
-                        "collapsed"
-                    } else {
-                        "expanded"
-                    },
-                );
-            }
+            Action::ToggleSidebar => self.set_sidebar_collapsed(!self.sidebar_collapsed, cx),
             Action::StartSelecting(id) => {
                 self.selection.insert(id.clone());
                 self.select_anchor = Some(id);
@@ -2683,15 +2697,6 @@ impl MailApp {
             .border_color(rgb(c.border))
             .gap_1()
             .on_click(window::on_titlebar_double_click)
-            .child(small(self.button(
-                "toggle-sidebar",
-                "@Toggle sidebar · ⌃⌘S",
-                "panel-left",
-                Action::ToggleSidebar,
-                false,
-                cx,
-            )))
-            .child(div().w(px(6.)))
             .child(img("brand/picacho.svg").w(px(20.)).h(px(17.)))
             .child(
                 div()
@@ -2746,40 +2751,6 @@ impl MailApp {
                 w.remove_window();
             }
         })
-    }
-    fn sidebar(&self, compact: bool, cx: &Context<Self>) -> impl IntoElement {
-        let c = self.colors();
-        let collapsed = compact || self.sidebar_collapsed;
-        let (from, to) = if collapsed {
-            (SIDEBAR_WIDTH, SIDEBAR_RAIL)
-        } else {
-            (SIDEBAR_RAIL, SIDEBAR_WIDTH)
-        };
-        let content = if collapsed {
-            self.sidebar_rail(cx).into_any_element()
-        } else {
-            self.sidebar_tree(cx).into_any_element()
-        };
-        let sidebar = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .h_full()
-            .overflow_hidden()
-            .child(content)
-            .child(self.download_status(collapsed, cx))
-            .border_r_1()
-            .border_color(rgb(c.border));
-        if self.sidebar_anim == 0 || compact {
-            return sidebar.w(px(to)).into_any_element();
-        }
-        sidebar
-            .with_animation(
-                ("sidebar", self.sidebar_anim),
-                Animation::new(Duration::from_millis(200)).with_easing(|t| 1. - (1. - t).powi(3)),
-                move |d, t| d.w(px(from + (to - from) * t)),
-            )
-            .into_any_element()
     }
     fn unread_for(&self, account: &str, mailbox: &Mailbox) -> usize {
         if mailbox == &Mailbox::Standard(Folder::Starred) {
@@ -2862,77 +2833,114 @@ impl MailApp {
             .gap(px(2.))
             .px_2()
             .pb_2();
+        let mut row_index = 0;
+        let mut next_row = || {
+            row_index += 1;
+            row_index - 1
+        };
         for (i, a) in self.accounts.iter().enumerate() {
             let id = a.id.clone();
             let open = !self.collapsed.contains(&a.id);
             let entries = self.account_entries(&a.id);
             let inbox_unread = self.unread_for(&a.id, &Folder::Inbox.into());
+            let current = self.account.as_deref() == Some(a.id.as_str());
+            let row = next_row();
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("account-{}", a.id)))
-                    .mt(px(if i == 0 { 2. } else { 8. }))
-                    .h(px(32.))
-                    .px_2()
-                    .rounded(px(7.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(c.surface)))
-                    .child(
-                        div()
-                            .size(px(12.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon_el(
-                                if open {
-                                    "chevron-down"
-                                } else {
-                                    "chevron-right"
-                                },
-                                12.,
-                                c.muted,
-                            )),
-                    )
-                    .child(avatar(&initials(&a.name), 22., i, c))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(a.name.clone()),
-                    )
-                    .when(
-                        self.account_issues
-                            .get(&a.id)
-                            .is_some_and(|issues| !issues.is_empty()),
-                        |d| d.child(self.account_warning(&a.id, cx)),
-                    )
-                    .when(!open && inbox_unread > 0, |d| {
-                        d.child(
+                self.stagger(
+                    div()
+                        .id(SharedString::from(format!("account-{}", a.id)))
+                        .debug_selector({
+                            let id = a.id.clone();
+                            move || format!("account-{id}")
+                        })
+                        .relative()
+                        .mt(px(if i == 0 { 2. } else { 8. }))
+                        .h(px(34.))
+                        .px_2()
+                        .rounded(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        // The current account stays highlighted, open or closed.
+                        .when(current, |d| {
+                            d.bg(rgb(if open { c.surface } else { c.soft })).child(
+                                div()
+                                    .absolute()
+                                    .left(px(-6.))
+                                    .top(px(9.))
+                                    .w(px(3.))
+                                    .h(px(16.))
+                                    .rounded_full()
+                                    .bg(rgb(c.accent)),
+                            )
+                        })
+                        .hover(move |s| s.bg(rgb(if current { c.soft } else { c.surface })))
+                        .child(
                             div()
-                                .text_size(px(11.))
-                                .text_color(rgb(c.muted))
-                                .child(fmt_count(inbox_unread)),
+                                .size(px(12.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon_el(
+                                    if open {
+                                        "chevron-down"
+                                    } else {
+                                        "chevron-right"
+                                    },
+                                    12.,
+                                    c.muted,
+                                )),
                         )
-                    })
-                    .tooltip({
-                        let email = a.email.clone();
-                        move |w, cx| Tooltip::new(email.clone()).build(w, cx)
-                    })
-                    .on_click(cx.listener({
-                        let id = id.clone();
-                        move |this, _, w, cx| this.handle(Action::ToggleAccount(id.clone()), w, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            this.open_menu(e.position, entries.clone(), cx)
-                        }),
-                    ),
+                        .child(
+                            div()
+                                .rounded_full()
+                                .border_2()
+                                .border_color(rgb(if current { c.accent } else { c.bg }))
+                                .child(self.account_avatar(a, i, 20.)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if current { c.text } else { c.muted }))
+                                .child(a.name.clone()),
+                        )
+                        .when(
+                            self.account_issues
+                                .get(&a.id)
+                                .is_some_and(|issues| !issues.is_empty()),
+                            |d| d.child(self.account_warning(&a.id, cx)),
+                        )
+                        .when(!open && inbox_unread > 0, |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(c.muted))
+                                    .child(fmt_count(inbox_unread)),
+                            )
+                        })
+                        .tooltip({
+                            let email = a.email.clone();
+                            move |w, cx| Tooltip::new(email.clone()).build(w, cx)
+                        })
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, w, cx| {
+                                this.handle(Action::ToggleAccount(id.clone()), w, cx)
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                this.open_menu(e.position, entries.clone(), cx)
+                            }),
+                        ),
+                    row,
+                ),
             );
             if !open {
                 continue;
@@ -2975,17 +2983,18 @@ impl MailApp {
                             })),
                     );
                 }
-                list = list.child(row);
+                list = list.child(self.stagger(row, next_row()));
                 if folder == Folder::Inbox && sub_open {
                     for f in &folders {
-                        list = list.child(self.nav_row(
+                        let row = self.nav_row(
                             &a.id,
                             Mailbox::Remote(f.name.clone()),
                             f.label.clone(),
                             "folder",
                             14. + f.depth as f32 * 14.,
                             cx,
-                        ));
+                        );
+                        list = list.child(self.stagger(row, next_row()));
                     }
                 }
             }
@@ -3035,16 +3044,29 @@ impl MailApp {
         div()
             .flex_1()
             .min_h_0()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .flex()
             .flex_col()
             .child(
-                div().px_3().pt_3().pb_2().child(
-                    self.button("compose", "Compose", "compose", Action::Compose, true, cx)
-                        .w_full()
-                        .h(px(38.))
-                        .rounded(px(10.)),
-                ),
+                div()
+                    .px_3()
+                    .pt_3()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        self.button("compose", "Compose", "compose", Action::Compose, true, cx)
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(38.))
+                            .rounded(px(10.)),
+                    )
+                    .child(
+                        self.sidebar_toggle(false, cx)
+                            .size(px(38.))
+                            .rounded(px(10.)),
+                    ),
             )
             .child(list)
     }
@@ -3086,6 +3108,9 @@ impl MailApp {
             .items_center()
             .gap_1()
             .pt_3()
+            .when(!self.compact.get(), |d| {
+                d.child(self.sidebar_toggle(true, cx).size(px(36.)).rounded(px(10.)))
+            })
             .child(
                 self.button(
                     "compose",
@@ -3099,42 +3124,51 @@ impl MailApp {
                 .rounded(px(10.)),
             )
             .child(div().h(px(1.)).w(px(28.)).my_1().bg(rgb(c.border)));
+        let mut row = 0;
         for (i, a) in self.accounts.iter().enumerate() {
             let current = self.account.as_ref() == Some(&a.id);
             let entries = self.account_entries(&a.id);
+            row += 1;
             rail = rail.child(
-                self.rail_button(
-                    format!("rail-account-{}", a.id),
-                    a.email.clone(),
-                    div()
-                        .rounded_full()
-                        .border_2()
-                        .border_color(rgb(if current { c.accent } else { c.bg }))
-                        .relative()
-                        .child(avatar(&initials(&a.name), 24., i, c))
-                        .when(
-                            self.account_issues
-                                .get(&a.id)
-                                .is_some_and(|issues| !issues.is_empty()),
-                            |d| {
-                                d.child(
-                                    self.account_warning(&a.id, cx)
-                                        .absolute()
-                                        .top(px(-7.))
-                                        .right(px(-8.)),
-                                )
-                            },
-                        )
-                        .into_any_element(),
-                    false,
-                    Action::OpenMailbox(a.id.clone(), Folder::Inbox.into()),
-                    cx,
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                        this.open_menu(e.position, entries.clone(), cx)
-                    }),
+                self.stagger(
+                    self.rail_button(
+                        format!("rail-account-{}", a.id),
+                        a.email.clone(),
+                        div()
+                            .rounded_full()
+                            .border_2()
+                            .border_color(rgb(if current { c.accent } else { c.bg }))
+                            .relative()
+                            .child(self.account_avatar(a, i, 24.))
+                            .when(
+                                self.account_issues
+                                    .get(&a.id)
+                                    .is_some_and(|issues| !issues.is_empty()),
+                                |d| {
+                                    d.child(
+                                        self.account_warning(&a.id, cx)
+                                            .absolute()
+                                            .top(px(-7.))
+                                            .right(px(-8.)),
+                                    )
+                                },
+                            )
+                            .into_any_element(),
+                        current,
+                        Action::OpenMailbox(a.id.clone(), Folder::Inbox.into()),
+                        cx,
+                    )
+                    .debug_selector({
+                        let id = a.id.clone();
+                        move || format!("rail-account-{id}")
+                    })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            this.open_menu(e.position, entries.clone(), cx)
+                        }),
+                    ),
+                    row,
                 ),
             );
             if !current {
@@ -3145,42 +3179,46 @@ impl MailApp {
                 let active = self.mailbox() == mailbox;
                 let count = self.unread_for(&a.id, &mailbox);
                 let entries = self.mailbox_entries(&a.id, mailbox.clone());
+                row += 1;
                 rail = rail.child(
-                    self.rail_button(
-                        format!("rail-{}-{}", a.id, folder.key()),
-                        if count > 0 {
-                            format!("{} · {} unread", folder.label(), fmt_count(count))
-                        } else {
-                            folder.label().into()
-                        },
-                        div()
-                            .relative()
-                            .child(icon_el(
-                                folder_icon(folder),
-                                17.,
-                                if active { c.accent } else { c.muted },
-                            ))
-                            .when(count > 0, |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(-2.))
-                                        .right(px(-3.))
-                                        .size(px(7.))
-                                        .rounded_full()
-                                        .bg(rgb(c.accent)),
-                                )
-                            })
-                            .into_any_element(),
-                        active,
-                        Action::OpenMailbox(a.id.clone(), mailbox),
-                        cx,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            this.open_menu(e.position, entries.clone(), cx)
-                        }),
+                    self.stagger(
+                        self.rail_button(
+                            format!("rail-{}-{}", a.id, folder.key()),
+                            if count > 0 {
+                                format!("{} · {} unread", folder.label(), fmt_count(count))
+                            } else {
+                                folder.label().into()
+                            },
+                            div()
+                                .relative()
+                                .child(icon_el(
+                                    folder_icon(folder),
+                                    17.,
+                                    if active { c.accent } else { c.muted },
+                                ))
+                                .when(count > 0, |d| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-2.))
+                                            .right(px(-3.))
+                                            .size(px(7.))
+                                            .rounded_full()
+                                            .bg(rgb(c.accent)),
+                                    )
+                                })
+                                .into_any_element(),
+                            active,
+                            Action::OpenMailbox(a.id.clone(), mailbox),
+                            cx,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                this.open_menu(e.position, entries.clone(), cx)
+                            }),
+                        ),
+                        row,
                     ),
                 );
             }
@@ -3255,7 +3293,7 @@ impl MailApp {
         let mut panel = div()
             .id("download-status")
             .flex_shrink_0()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .px_4()
             .py_3()
             .flex()
@@ -5232,6 +5270,7 @@ impl MailApp {
         let width = window.viewport_size().width;
         let single = width < px(900.);
         let compact = width < px(1180.);
+        self.compact.set(compact);
         // Panes that paint their own background round the window's lower
         // corners they touch; GPUI clips children only to rectangles.
         let corners = window::window_corners(window);
@@ -5267,7 +5306,15 @@ impl MailApp {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .when(show_sidebar, |d| d.child(self.sidebar(compact, cx)))
+                    .when(show_sidebar, |d| {
+                        let collapsed = compact || self.sidebar_collapsed;
+                        let width = if collapsed {
+                            SIDEBAR_RAIL
+                        } else {
+                            self.sidebar_width
+                        };
+                        d.child(self.sidebar(width, collapsed, cx))
+                    })
                     .when(show_list, |d| {
                         d.child(self.message_list(
                             if single {
