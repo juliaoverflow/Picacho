@@ -1,5 +1,7 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[path = "catalog.rs"]
+mod catalog;
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[path = "devdriver.rs"]
 mod devdriver;
@@ -106,6 +108,8 @@ const SIDEBAR_MAX: f32 = 420.;
 const PANE_ANIMATION: Duration = Duration::from_millis(240);
 const STAR: u32 = 0xe0a526;
 const ROW_HEIGHT: f32 = 86.;
+/// The newest messages a sync keeps current; the catalog lists the rest.
+const SYNC_WINDOW: usize = 300;
 /// Setup form inputs.
 const EMAIL: usize = 0;
 const PASSWORD: usize = 1;
@@ -424,7 +428,6 @@ enum Action {
     UnlockMail,
     BackToList,
     LockMail(String),
-    LoadMore,
     OpenDraft(String),
     DiscardDraft,
     Dismiss,
@@ -479,7 +482,9 @@ pub struct MailApp {
     filter_by: Filter,
     oldest_first: bool,
     download: Download,
-    limit: usize,
+    /// Catalog progress per (account, mailbox), and catalogs running now.
+    catalogs: HashMap<(String, String), crate::manage::backend::Catalog>,
+    cataloging: HashSet<(String, String)>,
     search: Entity<InputState>,
     focus: FocusHandle,
     modal: Option<Modal>,
@@ -644,7 +649,7 @@ impl MailApp {
         let messages = if let Some(id) = &account {
             backend
                 .store
-                .messages(id, Folder::Inbox, 300)
+                .summaries(id, Folder::Inbox)
                 .unwrap_or_default()
         } else {
             vec![]
@@ -718,7 +723,8 @@ impl MailApp {
             filter_by: Filter::All,
             oldest_first: false,
             download: Download::default(),
-            limit: 300,
+            catalogs: HashMap::new(),
+            cataloging: HashSet::new(),
             search,
             focus: cx.focus_handle(),
             modal: None,
@@ -1276,7 +1282,7 @@ impl MailApp {
         if self.account_blocked(&a.id) {
             return;
         }
-        self.sync_mailbox(a, self.mailbox(), self.limit, cx);
+        self.sync_mailbox(a, self.mailbox(), SYNC_WINDOW, cx);
     }
     fn sync_mailbox(&mut self, a: Account, mailbox: Mailbox, limit: usize, cx: &mut Context<Self>) {
         let id = a.id.clone();
@@ -1293,6 +1299,7 @@ impl MailApp {
         if visible {
             self.syncing = true;
         }
+        let catalog = mailbox.clone();
         self.task(
             cx,
             move |b| {
@@ -1319,13 +1326,9 @@ impl MailApp {
                         this.note_inbox(&id, &messages);
                     }
                     if visible {
-                        if limit == this.limit {
-                            this.messages = this.backend.with_readable(messages);
-                            this.filter(cx);
-                        } else {
-                            // A background/older smaller request cannot replace Load More.
-                            this.reload_cached(cx);
-                            this.refresh(cx);
+                        this.reload_cached(cx);
+                        if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
+                            this.catalog_mailbox(a, catalog, cx);
                         }
                     }
                     if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
@@ -1351,7 +1354,6 @@ impl MailApp {
             Mailbox::Remote(name) => name.clone(),
             Mailbox::Standard(_) => String::new(),
         };
-        self.limit = 300;
         self.selected = None;
         self.selecting = false;
         self.selection.clear();
@@ -1385,14 +1387,13 @@ impl MailApp {
             let gen_ = self.load_generation;
             self.task(
                 cx,
-                move |b| b.store.messages(&id, mailbox, 300),
+                move |b| b.store.summaries(&id, mailbox),
                 move |this, result, cx| {
                     if gen_ != this.load_generation {
                         return;
                     }
                     if let Ok(ms) = result {
-                        this.messages = this.backend.with_readable(ms);
-                        this.filter(cx);
+                        this.set_messages(ms, cx);
                     }
                     this.refresh(cx);
                 },
@@ -1408,17 +1409,15 @@ impl MailApp {
             return;
         };
         let mailbox = self.mailbox();
-        let limit = self.limit;
         let generation = self.load_generation;
         self.task(
             cx,
-            move |b| b.store.messages(&id, mailbox, limit),
+            move |b| b.store.summaries(&id, mailbox),
             move |this, result, cx| {
                 if generation == this.load_generation
                     && let Ok(messages) = result
                 {
-                    this.messages = this.backend.with_readable(messages);
-                    this.filter(cx);
+                    this.set_messages(messages, cx);
                 }
             },
         );
@@ -2623,10 +2622,6 @@ impl MailApp {
             }
             Action::SaveAttachment(i) => self.save_attachment(i, cx),
 
-            Action::LoadMore => {
-                self.limit = (self.limit + 300).min(5000);
-                self.refresh(cx);
-            }
             Action::OpenDraft(id) => {
                 if let Some(d) = self.drafts.iter().find(|d| d.id == id).cloned() {
                     self.draft = d.clone();
@@ -3512,36 +3507,33 @@ impl MailApp {
                 .map(|list| panes::scroll_frame(list, &self.list_scroll))
                 .into_any_element()
             })
-            .when(
-                self.account.is_some()
-                    && self.folder != Folder::Drafts
-                    && self.messages.len() >= self.limit
-                    && self.limit < 5000,
-                |d| {
-                    d.child(
-                        div()
-                            .h(px(40.))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .border_t_1()
-                            .border_color(rgb(c.border))
-                            .child(
-                                self.button(
-                                    "load-more",
-                                    "Load more",
-                                    "",
-                                    Action::LoadMore,
-                                    false,
-                                    cx,
-                                )
-                                .h(px(28.))
-                                .text_size(px(12.)),
-                            ),
-                    )
-                },
-            )
+            .when_some(self.catalog_progress(), |d, progress| {
+                d.child(
+                    div()
+                        .id("catalog-progress")
+                        .debug_selector(|| "catalog-progress".into())
+                        .h(px(34.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .text_size(px(11.))
+                        .text_color(rgb(c.muted))
+                        .child(spinner(12., c.muted))
+                        .child(if progress.total == 0 {
+                            "Listing mail…".to_owned()
+                        } else {
+                            format!(
+                                "Listing mail · {} of {}",
+                                fmt_count(progress.cataloged),
+                                fmt_count(progress.total)
+                            )
+                        }),
+                )
+            })
     }
     /// Unread messages in the open mailbox: exact from the loaded list when it
     /// holds the whole mailbox, otherwise from the cache's counts.
@@ -3551,7 +3543,7 @@ impl MailApp {
         }
         let loaded = self.messages.iter().filter(|m| m.unread).count();
         match &self.account {
-            Some(id) if self.messages.len() >= self.limit && self.folder != Folder::Starred => {
+            Some(id) if self.folder != Folder::Starred => {
                 self.unread_for(id, &self.mailbox()).max(loaded)
             }
             _ => loaded,

@@ -76,10 +76,44 @@ impl Store {
         mailbox: impl Into<Mailbox>,
         limit: usize,
     ) -> Result<Vec<Mail>> {
-        let mailbox = mailbox.into();
+        self.query_messages(account, mailbox.into(), limit, false)
+    }
+    /// Every cached message in a mailbox, newest first, without bodies: the
+    /// catalog a message list shows. Opening a message reads its body.
+    pub fn summaries(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<Vec<Mail>> {
+        self.query_messages(account, mailbox.into(), usize::MAX >> 1, true)
+    }
+    /// Cached message identities that start with `prefix`.
+    pub fn cached_ids(
+        &self,
+        account: &str,
+        prefix: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let db = self.db.lock().unwrap();
+        let mut q =
+            db.prepare("SELECT id FROM messages WHERE account=?1 AND substr(id,1,?2)=?3")?;
+        let ids = q
+            .query_map(params![account, prefix.chars().count(), prefix], |r| {
+                r.get(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+    fn query_messages(
+        &self,
+        account: &str,
+        mailbox: Mailbox,
+        limit: usize,
+        summaries: bool,
+    ) -> Result<Vec<Mail>> {
         let folder = mailbox.folder();
         let db = self.db.lock().unwrap();
-        let mut q = db.prepare("SELECT data FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred'))) ORDER BY date DESC LIMIT ?3")?;
+        let data = if summaries {
+            "json_remove(data,'$.body','$.html')"
+        } else {
+            "data"
+        };
+        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred'))) ORDER BY date DESC LIMIT ?3"))?;
         let rows = q.query_map(
             params![
                 account,

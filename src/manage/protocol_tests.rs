@@ -620,3 +620,129 @@ fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
+
+#[test]
+fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()> {
+    let (cert, tls_acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let requested = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let server_requested = requested.clone();
+    let server = std::thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            let (socket, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let stream = tls_acceptor.accept(socket).unwrap();
+            let mut r = BufReader::new(stream);
+            r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                let upper = command.to_uppercase();
+                let payload = if upper.starts_with("LOGIN ") || upper.starts_with("UID STORE ") {
+                    String::new()
+                } else if upper.starts_with("SELECT ") {
+                    "* 12 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n".to_string()
+                } else if upper.starts_with("UID SEARCH ") {
+                    format!(
+                        "* SEARCH {}\r\n",
+                        (1..=12)
+                            .map(|u: u32| u.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                } else if upper.starts_with("UID FETCH ") {
+                    let set = command.split_whitespace().nth(2).unwrap();
+                    let mut out = String::new();
+                    for uid in set.split(',').map(|u| u.parse::<u32>().unwrap()) {
+                        server_requested.lock().unwrap().push(uid);
+                        let header = format!(
+                            "From: Sender {uid} <s{uid}@example.com>\r\nSubject: Message {uid}\r\n\
+                             Date: Mon, {uid} Nov 2026 10:00:00 +0000\r\n\r\n"
+                        );
+                        out.push_str(&format!(
+                            "* {uid} FETCH (UID {uid} FLAGS () RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                            header.len()
+                        ));
+                    }
+                    out
+                } else if upper.starts_with("LIST ") {
+                    "* LIST () \"/\" \"INBOX\"\r\n".into()
+                } else if upper == "LOGOUT" {
+                    r.get_mut()
+                        .write_all(format!("* BYE goodbye\r\n{tag} OK done\r\n").as_bytes())
+                        .unwrap();
+                    break;
+                } else {
+                    panic!("Unexpected IMAP command: {command}")
+                };
+                r.get_mut()
+                    .write_all(format!("{payload}{tag} OK done\r\n").as_bytes())
+                    .unwrap();
+            }
+        }
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let result = (|| -> Result<()> {
+        // A sync keeps the newest mail current; the catalog fills in the rest.
+        assert_eq!(b.sync(&a, Folder::Inbox, 3)?.len(), 3);
+        requested.lock().unwrap().clear();
+        let mut progress = Vec::new();
+        loop {
+            let step = b.catalog(&a, Folder::Inbox, 4)?;
+            progress.push(step);
+            if step.complete() {
+                break;
+            }
+        }
+        assert_eq!(
+            progress,
+            [
+                Catalog {
+                    cataloged: 7,
+                    total: 12
+                },
+                Catalog {
+                    cataloged: 11,
+                    total: 12
+                },
+                Catalog {
+                    cataloged: 12,
+                    total: 12
+                },
+            ]
+        );
+        // Newest missing mail first, and nothing already cached again.
+        assert_eq!(*requested.lock().unwrap(), [6, 7, 8, 9, 2, 3, 4, 5, 1]);
+        let all = b.store.summaries(&a.id, Folder::Inbox)?;
+        assert_eq!(all.len(), 12);
+        assert_eq!(all[0].subject, "Message 12");
+        assert_eq!(all[11].subject, "Message 1");
+        assert!(all.iter().all(|m| m.body.is_none() && m.html.is_none()));
+        // Once complete, cataloging asks for no headers.
+        assert!(b.catalog(&a, Folder::Inbox, 4)?.complete());
+        assert_eq!(requested.lock().unwrap().len(), 9);
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    std::fs::remove_dir_all(path)?;
+    result
+}

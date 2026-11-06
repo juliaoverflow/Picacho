@@ -33,9 +33,22 @@ refresh, credential writes, and encryption-key updates share account serializati
 No Keychain read or browser-token refresh runs on the UI thread.
 
 Polling coalesces in-flight requests by account and mailbox, independently of
-global UI busy state. A larger visible-message request is refreshed after a
-smaller background result, so navigation/Load More cannot be replaced with a
-shorter result. Inbox polling timestamps only advance for inbox checks; refreshing
+global UI busy state. A sync keeps the newest 300 messages' flags current; the
+list always shows every cached message in the mailbox.
+
+## Catalog
+
+There is no "Load more" step. After a mailbox syncs, `Backend::catalog` lists
+the rest of it in the background, 500 headers per request, newest first: it
+searches the mailbox (within the account's sync window), fetches headers only
+for UIDs that are not cached yet, and commits them through the same snapshot
+transaction, so expunged mail is still reconciled. Each batch reports
+`cataloged`/`total`, the list shows that progress at its foot, and the next
+batch starts until the catalog is complete. One catalog runs per mailbox and
+shares the account's serialization. POP3 has no header-only listing, so older
+messages are downloaded whole, 25 at a time. The list loads cached messages
+without bodies (`Store::summaries`); opening a message reads its body. When
+the list reloads, its scroll position stays on the same message. Inbox polling timestamps only advance for inbox checks; refreshing
 other folders cannot postpone inbox checks indefinitely. Each account has its
 own body-download worker, with account locks released between small batches.
 Download errors retain their account/cause; selecting a stale or inaccessible

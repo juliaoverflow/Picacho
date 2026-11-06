@@ -30,6 +30,18 @@ pub enum Change {
     Star(bool),
     Move(Folder),
 }
+/// How much of a mailbox has been listed on this computer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Catalog {
+    pub cataloged: usize,
+    pub total: usize,
+}
+impl Catalog {
+    pub fn complete(&self) -> bool {
+        self.cataloged >= self.total
+    }
+}
+
 pub struct Backend {
     pub store: Arc<Store>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -426,20 +438,140 @@ impl Backend {
             });
             result.truncate(limit);
         } else {
-            let remote = match &mailbox {
-                Mailbox::Remote(name) => {
-                    ensure!(
-                        names.iter().any(|n| &n.name == name),
-                        "The folder “{name}” no longer exists on the server."
-                    );
-                    name.clone()
-                }
-                Mailbox::Standard(folder) => resolve_in(&names, a.provider, *folder)?,
-            };
+            let remote = remote_name(&names, a, mailbox)?;
             result = self.fetch_mailbox(&mut session, a, mailbox, &remote, false, limit)?;
         }
         let _ = session.logout();
         Ok(result)
+    }
+    /// Catalogs up to `batch` more of a mailbox's headers, newest first,
+    /// alongside the newest mail that `sync` keeps current. Repeated calls
+    /// list the whole mailbox (within its sync window) without any manual
+    /// paging. Bodies still download separately.
+    pub fn catalog(
+        &self,
+        a: &Account,
+        mailbox: impl Into<Mailbox>,
+        batch: usize,
+    ) -> Result<Catalog> {
+        let mailbox = mailbox.into();
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        match self.catalog_once(a, &mailbox, batch) {
+            Err(error) if crate::sync::retry::transient(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                self.catalog_once(a, &mailbox, batch)
+            }
+            result => result,
+        }
+    }
+    fn catalog_once(&self, a: &Account, mailbox: &Mailbox, batch: usize) -> Result<Catalog> {
+        let folder = mailbox.folder();
+        // Drafts are local; Starred is assembled from the other mailboxes.
+        if matches!(folder, Folder::Drafts | Folder::Starred) {
+            return Ok(Catalog::default());
+        }
+        let secret = self.credentials(a)?;
+        if a.provider == Provider::Pop3 {
+            return self.catalog_pop(a, folder, batch, &secret.password);
+        }
+        let mut session = self.imap_login(a, &secret)?;
+        let names = list(&mut session)?;
+        let remote = remote_name(&names, a, mailbox)?;
+        let selected = session.select(&remote)?;
+        let validity = selected
+            .uid_validity
+            .filter(|v| *v > 0)
+            .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
+        let mut query = "ALL".to_owned();
+        if a.sync.days > 0 {
+            let since = chrono::Utc::now() - chrono::Duration::days(a.sync.days.into());
+            query = format!("{query} SINCE {}", since.format("%-d-%b-%Y"));
+        }
+        let mut uids: Vec<_> = session.uid_search(&query)?.into_iter().collect();
+        ensure!(
+            uids.iter().all(|uid| *uid > 0),
+            "Invalid IMAP UID in search response"
+        );
+        uids.sort_unstable();
+        let prefix = format!("{}:{remote}:{validity}:", a.id);
+        let cached = self.store.cached_ids(&a.id, &prefix)?;
+        let all_ids: Vec<String> = uids.iter().map(|uid| format!("{prefix}{uid}")).collect();
+        let missing: Vec<u32> = uids
+            .iter()
+            .zip(&all_ids)
+            .filter(|(_, id)| !cached.contains(*id))
+            .map(|(uid, _)| *uid)
+            .collect();
+        let next = &missing[missing.len().saturating_sub(batch)..];
+        let result = fetch_headers(
+            &mut session,
+            a,
+            folder,
+            &remote,
+            validity,
+            next,
+            &HashMap::new(),
+        )?;
+        // UIDs expunged since SEARCH have no headers; the next search drops
+        // them. A batch with no headers at all would never finish.
+        ensure!(
+            next.is_empty() || !result.is_empty(),
+            "The server omitted requested headers; cached mail has been kept. Refresh to retry."
+        );
+        self.store.apply_snapshot(
+            &store::MailboxSnapshot {
+                account: &a.id,
+                mailbox,
+                remote: &remote,
+                validity,
+                ids: &all_ids,
+                starred_only: false,
+            },
+            &result,
+        )?;
+        let _ = session.logout();
+        Ok(Catalog {
+            cataloged: uids.len() - missing.len() + result.len(),
+            total: uids.len(),
+        })
+    }
+    /// POP3 has no headers-only listing, so older messages are downloaded
+    /// whole, a small batch at a time. Originals stay on the server.
+    fn catalog_pop(
+        &self,
+        a: &Account,
+        folder: Folder,
+        batch: usize,
+        password: &str,
+    ) -> Result<Catalog> {
+        if folder != Folder::Inbox {
+            return Ok(Catalog::default());
+        }
+        let mut pop = self.pop_login(a, password)?;
+        let ids = pop.uidl()?;
+        let prefix = format!("{}:pop:", a.id);
+        let cached = self.store.cached_ids(&a.id, &prefix)?;
+        let missing: Vec<&(u32, String)> = ids
+            .iter()
+            .rev()
+            .filter(|(_, uid)| !cached.contains(&format!("{prefix}{uid}")))
+            .collect();
+        let mut fetched = 0;
+        for (number, uid) in missing.iter().take(batch.min(25)) {
+            let id = format!("{prefix}{uid}");
+            pop.command(&format!("RETR {number}"))?;
+            let raw = pop.multiline(MAX_MESSAGE)?;
+            let mut m = parse_message(&raw, a, &id, Folder::Inbox, "INBOX", *number)?;
+            m.size = raw.len() as u32;
+            self.store.save_download(&m, &raw)?;
+            fetched += 1;
+        }
+        let _ = pop.command("QUIT");
+        Ok(Catalog {
+            cataloged: ids.len() - missing.len() + fetched,
+            total: ids.len(),
+        })
     }
     fn fetch_mailbox(
         &self,
@@ -480,54 +612,8 @@ impl Backend {
             .into_iter()
             .map(|m| (m.id.clone(), m))
             .collect();
-        let mut result = Vec::new();
-        // Batch headers; message bodies and attachments are fetched only when opened.
-        for chunk in uids.chunks(100) {
-            let set = chunk
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            for f in session
-                .uid_fetch(
-                    set,
-                    "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])",
-                )?
-                .iter()
-            {
-                let Some(uid) = f.uid else {
-                    continue;
-                };
-                // Unsolicited flag updates are legal during FETCH. They are
-                // not downloaded headers and must not create or replace mail.
-                if !chunk.contains(&uid) || f.header().is_none() {
-                    continue;
-                }
-                ensure!(
-                    !result.iter().any(|m: &Mail| m.uid == uid),
-                    "Duplicate IMAP header response"
-                );
-                let id = format!("{}:{remote}:{validity}:{uid}", a.id);
-                let mut m = if let Some(old) = cached.get(&id) {
-                    old.clone()
-                } else {
-                    parse_message(f.header().unwrap_or_default(), a, &id, folder, remote, uid)?
-                };
-                m.unread = !f
-                    .flags()
-                    .iter()
-                    .any(|v| matches!(v, imap::types::Flag::Seen));
-                m.starred = f
-                    .flags()
-                    .iter()
-                    .any(|v| matches!(v, imap::types::Flag::Flagged));
-                m.size = f.size.unwrap_or(0);
-                if m.date == 0 {
-                    m.date = f.internal_date().map(|d| d.timestamp()).unwrap_or_default();
-                }
-                result.push(m);
-            }
-        }
+        let result = fetch_headers(session, a, folder, remote, validity, uids, &cached)?;
+        let mut result = result;
         if result.len() != uids.len() {
             // An expunge can race SEARCH/FETCH. Confirm vanished UIDs before
             // removing them; an incomplete successful FETCH is not a snapshot.
@@ -945,4 +1031,80 @@ impl Backend {
             .get_body_raw()
             .map_err(Into::into)
     }
+}
+
+/// Headers, flags and sizes for `uids` in the selected mailbox. Messages
+/// already cached keep their parsed fields; bodies are fetched when opened.
+fn fetch_headers(
+    session: &mut ImapSession,
+    a: &Account,
+    folder: Folder,
+    remote: &str,
+    validity: u32,
+    uids: &[u32],
+    cached: &HashMap<String, Mail>,
+) -> Result<Vec<Mail>> {
+    let mut result = Vec::new();
+    // Batch headers; message bodies and attachments are fetched only when opened.
+    for chunk in uids.chunks(100) {
+        let set = chunk
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        for f in session
+            .uid_fetch(
+                set,
+                "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])",
+            )?
+            .iter()
+        {
+            let Some(uid) = f.uid else {
+                continue;
+            };
+            // Unsolicited flag updates are legal during FETCH. They are
+            // not downloaded headers and must not create or replace mail.
+            if !chunk.contains(&uid) || f.header().is_none() {
+                continue;
+            }
+            ensure!(
+                !result.iter().any(|m: &Mail| m.uid == uid),
+                "Duplicate IMAP header response"
+            );
+            let id = format!("{}:{remote}:{validity}:{uid}", a.id);
+            let mut m = if let Some(old) = cached.get(&id) {
+                old.clone()
+            } else {
+                parse_message(f.header().unwrap_or_default(), a, &id, folder, remote, uid)?
+            };
+            m.unread = !f
+                .flags()
+                .iter()
+                .any(|v| matches!(v, imap::types::Flag::Seen));
+            m.starred = f
+                .flags()
+                .iter()
+                .any(|v| matches!(v, imap::types::Flag::Flagged));
+            m.size = f.size.unwrap_or(0);
+            if m.date == 0 {
+                m.date = f.internal_date().map(|d| d.timestamp()).unwrap_or_default();
+            }
+            result.push(m);
+        }
+    }
+    Ok(result)
+}
+
+/// The server mailbox behind a mailbox view.
+fn remote_name(names: &[Name], a: &Account, mailbox: &Mailbox) -> Result<String> {
+    Ok(match mailbox {
+        Mailbox::Remote(name) => {
+            ensure!(
+                names.iter().any(|n| &n.name == name),
+                "The folder “{name}” no longer exists on the server."
+            );
+            name.clone()
+        }
+        Mailbox::Standard(folder) => resolve_in(names, a.provider, *folder)?,
+    })
 }

@@ -27,7 +27,7 @@ impl MailApp {
                 } else {
                     Folder::Inbox.into()
                 };
-                let limit = if visible { this.limit } else { 100 };
+                let limit = if visible { SYNC_WINDOW } else { 100 };
                 this.sync_mailbox(a, mailbox, limit, cx);
             },
         );
