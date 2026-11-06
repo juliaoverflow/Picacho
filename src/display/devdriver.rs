@@ -3,7 +3,8 @@
 //! Set `PICACHO_DEV_DIR` to a folder, then append lines to `<dir>/cmd`:
 //! `snap <name> <window-number>` saves `<dir>/<name>.png` of this window,
 //! `size <w> <h>`, `action <name>`, `select <index>`, `scroll <index>`,
-//! `drag <sidebar|reader> <from-x> <to-x>` and `catalog`. Capturing its own window needs no
+//! `drag <sidebar|reader> <from-x> <to-x>` and `log <name>`. End a line with
+//! ` &` to run the next one without waiting. Capturing its own window needs no
 //! screen-recording permission. Release builds do not include this module.
 use super::*;
 
@@ -20,13 +21,18 @@ pub(super) fn start(window: &mut Window, cx: &mut Context<MailApp>) {
             };
             let _ = std::fs::remove_file(&path);
             for line in text.lines() {
-                let words: Vec<&str> = line.split_whitespace().collect();
+                let words: Vec<&str> = line.split_whitespace().filter(|w| *w != "&").collect();
                 let dir = dir.clone();
                 let result = this.update_in(cx, |this, w, cx| run(this, &words, &dir, w, cx));
                 if result.is_err() {
                     return;
                 }
-                Timer::after(Duration::from_millis(400)).await;
+                // A trailing `&` runs the next line right away (mid-animation).
+                if !line.trim_end().ends_with('&') {
+                    Timer::after(Duration::from_millis(400)).await;
+                } else {
+                    Timer::after(Duration::from_millis(90)).await;
+                }
             }
         }
     })

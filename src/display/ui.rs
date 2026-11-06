@@ -1491,6 +1491,27 @@ impl MailApp {
         self.anim += 1;
         self.read_generation += 1;
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
+        // The list holds messages without bodies; show the cached body at
+        // once (also offline) while the message is read below.
+        if let Some(full) = self
+            .messages
+            .iter()
+            .any(|m| m.id == id && m.body.is_none())
+            .then(|| self.backend.store.message(&id).ok().flatten())
+            .flatten()
+            .filter(|m| m.body.is_some())
+            && let Some(m) = self.messages.iter_mut().find(|m| m.id == id)
+        {
+            *m = self
+                .backend
+                .with_readable(vec![Mail {
+                    unread: m.unread,
+                    starred: m.starred,
+                    folder: m.folder,
+                    ..full
+                }])
+                .remove(0);
+        }
         let Some(m) = self.selected_mail() else {
             return;
         };

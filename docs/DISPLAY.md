@@ -13,6 +13,21 @@ The native window minimum is 360 × 320 logical pixels. Layout adapts to the win
 
 Dialogs stay inside the viewport, with a fixed close/header region and scrollable content. Sync choices wrap into rows, while bulk controls and compose actions wrap when needed. Onboarding uses a full-width card with a maximum width and scrolls on short windows.
 
+## Panes
+
+From 900 pixels up, the sidebar and reader edges can be dragged. The message
+list keeps at least 300 pixels; widths are saved. Dragging a pane past half
+of its smallest useful width (190 for the sidebar, 420 for the reader) snaps
+it into a 60-pixel rail, and dragging back out reopens it. The sidebar toggle
+sits beside Compose (above it in the rail); the reader's toggle is at the
+left of its toolbar. Collapsing crossfades the full pane and its rail while
+the width animates. The reader's ribbon offers message actions above a
+blurred swatch of the email's own HTML colors (or the sender's tones).
+
+Debug macOS builds include a driver for visual checks: run with
+`PICACHO_DEV_DIR=<dir>` and append commands to `<dir>/cmd` (see
+`devdriver.rs`). It captures only the app's own window.
+
 ## Locked messages
 
 Locked and readable messages share the same reader shell: toolbar, flex sizing, scroll handle and background. Add content inside that shell rather than returning early from a locked-message branch. The password panel has an explicit width bounded by the reader, an input label, inline errors and a per-account unlock-in-progress state. Enter submits; blank input gives feedback and focuses the field. Duplicate submissions are ignored while an unlock runs. Clear the input on submission, mailbox navigation and Back navigation, and zeroize the worker's password string when it is finished.
