@@ -53,6 +53,14 @@ fn run(
             let result = capture(id, &dir.join(format!("{name}.png")));
             let _ = std::fs::write(dir.join(format!("{name}.log")), format!("{result:?}"));
         }
+        Some("log") => {
+            let name = words.get(1).copied().unwrap_or("log");
+            let offset = this.list_scroll.0.borrow().base_handle.offset();
+            let _ = std::fs::write(
+                dir.join(format!("{name}.txt")),
+                format!("offset={offset:?} selected={:?}", this.selected),
+            );
+        }
         Some("size") => w.resize(size(px(number(1)), px(number(2)))),
         Some("select") => {
             if let Some(i) = this.visible.get(number(1) as usize) {

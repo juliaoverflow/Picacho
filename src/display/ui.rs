@@ -852,16 +852,26 @@ impl MailApp {
             .map(|f| f.label.clone())
             .unwrap_or_else(|| self.remote.clone())
     }
+    /// Recomputes the visible list, keeping the scroll on the same message.
     fn filter(&mut self, cx: &App) {
+        let anchor = self.scroll_anchor();
+        self.apply_filter(cx);
+        if let Some(anchor) = anchor {
+            self.restore_scroll(anchor);
+        }
+    }
+    fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
         let filter = self.filter_by;
+        let open = self.selected.clone();
         self.visible = self
             .messages
             .iter()
             .enumerate()
             .filter(|(_, m)| match filter {
                 Filter::All => true,
-                Filter::Unread => m.unread,
+                // Opening a message reads it; it stays listed while it is open.
+                Filter::Unread => m.unread || open.as_ref() == Some(&m.id),
                 Filter::Starred => m.starred,
                 Filter::Attachments => m.has_attachments(),
             })

@@ -70,13 +70,13 @@ impl MailApp {
         }
         let anchor = self.scroll_anchor();
         self.messages = messages;
-        self.filter(cx);
+        self.apply_filter(cx);
         if let Some(anchor) = anchor {
             self.restore_scroll(anchor);
         }
     }
     /// The first visible message and how far it is scrolled past.
-    fn scroll_anchor(&self) -> Option<(String, Pixels)> {
+    pub(super) fn scroll_anchor(&self) -> Option<(String, Pixels)> {
         let offset = -self.list_scroll.0.borrow().base_handle.offset().y;
         if offset <= px(0.) {
             return None;
@@ -85,7 +85,7 @@ impl MailApp {
         let id = self.messages.get(*self.visible.get(index)?)?.id.clone();
         Some((id, offset - px(ROW_HEIGHT) * index as f32))
     }
-    fn restore_scroll(&self, (id, within): (String, Pixels)) {
+    pub(super) fn restore_scroll(&self, (id, within): (String, Pixels)) {
         if let Some(index) = self.visible.iter().position(|i| self.messages[*i].id == id) {
             let y = px(ROW_HEIGHT) * index as f32 + within;
             self.list_scroll

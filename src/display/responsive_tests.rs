@@ -233,3 +233,65 @@ fn dragging_panes_keeps_the_list_readable_and_snaps_into_rails(cx: &mut TestAppC
         assert!(this.sidebar_width >= SIDEBAR_MIN);
     });
 }
+#[gpui::test]
+fn opening_a_message_keeps_the_list_scroll_and_the_message_listed(cx: &mut TestAppContext) {
+    let store = store();
+    let mut a = Account::new(Provider::Imap);
+    a.name = "Scroll".into();
+    a.email = "scroll@example.com".into();
+    store.save_account(&a).unwrap();
+    let template = demo_mail().remove(0);
+    let mails: Vec<Mail> = (0..80)
+        .map(|i| Mail {
+            id: format!("{}:INBOX:1:{i}", a.id),
+            account: a.id.clone(),
+            folder: Folder::Inbox,
+            unread: true,
+            date: 1_800_000_000 - i * 60,
+            ..template.clone()
+        })
+        .collect();
+    store.save_messages(&mails).unwrap();
+    let (view, cx) = open(store, cx);
+    resize(cx, 1440., 900.);
+    act(&view, Action::SetFilter(Filter::Unread), cx);
+    let offset = point(px(0.), px(-ROW_HEIGHT * 30. - 20.));
+    let opened = view.update(cx, |this, _| {
+        assert_eq!(this.visible.len(), 80);
+        this.list_scroll.0.borrow().base_handle.set_offset(offset);
+        this.messages[this.visible[32]].id.clone()
+    });
+    frame(cx);
+    // Opening reads the message; under the Unread filter it stays listed and
+    // the list does not move.
+    view.update(cx, |this, cx| {
+        this.selected = Some(opened.clone());
+        for m in this.messages.iter_mut().filter(|m| m.id == opened) {
+            m.unread = false;
+        }
+        this.filter(cx);
+    });
+    frame(cx);
+    view.read_with(cx, |this, cx| {
+        assert!(this.visible.iter().any(|i| this.messages[*i].id == opened));
+        assert_eq!(this.list_scroll.0.borrow().base_handle.offset(), offset);
+        let _ = cx;
+    });
+    // New mail arriving above keeps the same messages in view.
+    view.update(cx, |this, cx| {
+        let mut next = this.messages.clone();
+        next.insert(
+            0,
+            Mail {
+                id: "new".into(),
+                date: 1_900_000_000,
+                ..next[0].clone()
+            },
+        );
+        this.set_messages(next, cx);
+    });
+    view.read_with(cx, |this, _| {
+        let y = this.list_scroll.0.borrow().base_handle.offset().y;
+        assert_eq!(y, offset.y - px(ROW_HEIGHT));
+    });
+}
