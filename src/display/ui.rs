@@ -36,6 +36,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Root, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
+    scroll::{Scrollbar, ScrollbarShow},
     tooltip::Tooltip,
 };
 use std::{
@@ -527,6 +528,10 @@ pub struct MailApp {
     reading_defaults: ReadingOptions,
     html_view: Entity<HtmlView>,
     settings_scroll: ScrollHandle,
+    sidebar_scroll: ScrollHandle,
+    rail_scroll: ScrollHandle,
+    onboarding_scroll: ScrollHandle,
+    modal_scroll: ScrollHandle,
     /// Pinal Mail's password (or recovery key) prompt for encrypted mail.
     unlock_input: Entity<InputState>,
     /// Pinal accounts whose mail is encrypted, and those not unlocked here yet.
@@ -760,6 +765,10 @@ impl MailApp {
             reading_defaults,
             html_view,
             settings_scroll: ScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
+            rail_scroll: ScrollHandle::new(),
+            onboarding_scroll: ScrollHandle::new(),
+            modal_scroll: ScrollHandle::new(),
             unlock_input,
             encrypted,
             locked: HashSet::new(),
@@ -1247,6 +1256,11 @@ impl MailApp {
         // (`window::window_frame`); `Root`'s square fill would show past its
         // corners. Text fields set their background through `field`.
         theme.colors.window_border = transparent_black();
+        // Scrollable areas always show a slim, quiet scrollbar.
+        theme.scrollbar_show = ScrollbarShow::Always;
+        theme.colors.scrollbar = transparent_black();
+        theme.colors.scrollbar_thumb = rgba((c.muted << 8) | 0x55).into();
+        theme.colors.scrollbar_thumb_hover = rgba((c.muted << 8) | 0xa0).into();
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             theme.colors.background = transparent_black();
         }
@@ -2876,6 +2890,7 @@ impl MailApp {
         let c = self.colors();
         let mut list = div()
             .id("sidebar-accounts")
+            .track_scroll(&self.sidebar_scroll)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -3119,7 +3134,7 @@ impl MailApp {
                             .rounded(px(10.)),
                     ),
             )
-            .child(list)
+            .child(panes::scroll_frame(list, &self.sidebar_scroll))
     }
     fn rail_button(
         &self,
@@ -3150,6 +3165,7 @@ impl MailApp {
         let c = self.colors();
         let mut rail = div()
             .id("sidebar-rail")
+            .track_scroll(&self.rail_scroll)
             .flex_1()
             .min_h_0()
             .w(px(SIDEBAR_RAIL))
@@ -3274,14 +3290,18 @@ impl MailApp {
                 );
             }
         }
-        rail.child(self.rail_button(
-            "rail-add-account".into(),
-            "Add Account".into(),
-            icon_el("plus", 16., c.muted).into_any_element(),
-            false,
-            Action::Connect,
-            cx,
-        ))
+        panes::scroll_frame(
+            rail.child(self.rail_button(
+                "rail-add-account".into(),
+                "Add Account".into(),
+                icon_el("plus", 16., c.muted).into_any_element(),
+                false,
+                Action::Connect,
+                cx,
+            )),
+            &self.rail_scroll,
+        )
+        .w(px(SIDEBAR_RAIL))
     }
     fn download_status(&self, collapsed: bool, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -3489,6 +3509,7 @@ impl MailApp {
                 .track_scroll(self.list_scroll.clone())
                 .flex_1()
                 .min_h_0()
+                .map(|list| panes::scroll_frame(list, &self.list_scroll))
                 .into_any_element()
             })
             .when(
@@ -3906,7 +3927,8 @@ impl MailApp {
             .h(px(ROW_HEIGHT))
             .w_full()
             .pl(px(14.))
-            .pr(px(10.))
+            // Room for the list's scrollbar.
+            .pr(px(18.))
             .py(px(11.))
             .border_b_1()
             .border_color(rgb(c.border))
@@ -4750,6 +4772,7 @@ impl MailApp {
         }));
         div()
             .id("onboarding")
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -4783,6 +4806,7 @@ impl MailApp {
             .child(
                 div()
                     .id("onboarding-body")
+                    .track_scroll(&self.onboarding_scroll)
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -4802,6 +4826,18 @@ impl MailApp {
                             .child(self.setup_view(cx)),
                     ),
             )
+            .map(|d| {
+                // The scrollbar sits over the body only, above the page dots.
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(TITLEBAR_HEIGHT))
+                        .left_0()
+                        .right_0()
+                        .bottom(px(56.))
+                        .child(Scrollbar::vertical(&self.onboarding_scroll)),
+                )
+            })
             .child(div().h(px(56.)).flex().items_center().child(dots))
             .into_any_element()
     }
@@ -5048,25 +5084,33 @@ impl MailApp {
                     .flex()
                     .child(content)
                     .into_any_element(),
-                Modal::Connect => div()
-                    .id("modal-content")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .child(content)
-                    .into_any_element(),
-                _ => div()
-                    .id("modal-content")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_5()
-                    .child(content)
-                    .into_any_element(),
+                Modal::Connect => panes::scroll_frame(
+                    div()
+                        .id("modal-content")
+                        .track_scroll(&self.modal_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(content),
+                    &self.modal_scroll,
+                )
+                .into_any_element(),
+                _ => panes::scroll_frame(
+                    div()
+                        .id("modal-content")
+                        .track_scroll(&self.modal_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_5()
+                        .child(content),
+                    &self.modal_scroll,
+                )
+                .into_any_element(),
             });
         if !self.status.is_empty() && *modal != Modal::Connect {
             panel = panel.child(

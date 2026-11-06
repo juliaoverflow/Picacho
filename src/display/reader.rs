@@ -371,11 +371,18 @@ impl MailApp {
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(content.with_animation(
-                ("reader-enter", self.anim),
-                Animation::new(Duration::from_millis(220)).with_easing(|t| 1. - (1. - t).powi(3)),
-                |d, t| d.opacity(t).top(px((1. - t) * 5.)),
-            ))
+            .child(
+                super::panes::scroll_frame(
+                    content.with_animation(
+                        ("reader-enter", self.anim),
+                        Animation::new(Duration::from_millis(220))
+                            .with_easing(|t| 1. - (1. - t).powi(3)),
+                        |d, t| d.opacity(t).top(px((1. - t) * 5.)),
+                    ),
+                    &self.reader_scroll,
+                )
+                .w_full(),
+            )
             .into_any_element()
     }
 }

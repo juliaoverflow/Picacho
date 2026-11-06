@@ -763,6 +763,28 @@ pub(super) fn email_palette(html: Option<&str>, sender: &str) -> Vec<u32> {
     palette
 }
 
+/// A vertically scrolling area with a scrollbar over its right edge. The
+/// content tracks `handle` and keeps its own layout inside the frame.
+pub(super) fn scroll_frame(
+    content: impl IntoElement,
+    handle: &(impl gpui_component::scroll::ScrollbarHandle + Clone),
+) -> Div {
+    div()
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .child(content)
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .child(gpui_component::scroll::Scrollbar::vertical(handle)),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::email_palette;

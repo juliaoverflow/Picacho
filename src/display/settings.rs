@@ -267,7 +267,8 @@ impl MailApp {
                     .overflow_y_scroll()
                     .p_6()
                     .when(narrow, |d| d.p_4())
-                    .child(page),
+                    .child(page)
+                    .map(|page| super::panes::scroll_frame(page, &self.settings_scroll)),
             )
             .into_any_element()
     }
