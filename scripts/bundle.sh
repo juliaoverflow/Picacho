@@ -5,10 +5,23 @@ profile="${1:-release}"
 # Optional built-in sign-in registrations (see README, "Connect email"):
 # PICACHO_GOOGLE_CLIENT_ID, PICACHO_GOOGLE_CLIENT_SECRET,
 # PICACHO_MICROSOFT_CLIENT_ID, PICACHO_PINAL_ACCOUNTS, PICACHO_PINAL_CLIENT_ID.
+# They are compiled in, so load them from .env (if present) before building.
+if [ -f .env ]; then
+    set -a
+    . ./.env
+    set +a
+fi
 if [ "$profile" = release ]; then
     cargo build --release --locked
 else
     cargo build --locked
+fi
+if [ "$(uname -s)" != Darwin ]; then
+    # Linux (and other Unix): no app bundle or code signing, just the binary.
+    mkdir -p dist
+    cp "target/$profile/picacho" dist/picacho
+    echo "Built dist/picacho"
+    exit 0
 fi
 bundle="dist/Picacho.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
