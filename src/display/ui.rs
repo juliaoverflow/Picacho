@@ -375,6 +375,8 @@ enum Action {
     ConfirmRemove(String),
     ToggleSidebar,
     ToggleReader,
+    ChooseAvatar(String),
+    RemoveAvatar(String),
     StartSelecting(String),
     ToggleSelected(String),
     SelectAll,
@@ -463,6 +465,8 @@ pub struct MailApp {
     reader_shown: Cell<f32>,
     /// The collapsed reader's colors, for the message they were taken from.
     palette: RefCell<(String, Vec<u32>)>,
+    /// Account pictures saved on this computer.
+    avatars: HashMap<String, std::path::PathBuf>,
     menu: Option<PopupMenu>,
     filter_anchor: Rc<Cell<Bounds<Pixels>>>,
     selecting: bool,
@@ -697,6 +701,7 @@ impl MailApp {
             reader_since: None,
             reader_shown: Cell::new(0.),
             palette: RefCell::new((String::new(), Vec::new())),
+            avatars: HashMap::new(),
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
             selecting: false,
@@ -770,6 +775,9 @@ impl MailApp {
                 this.refresh_counts(cx);
                 this.refresh(cx);
             });
+        }
+        for a in this.accounts.clone() {
+            this.load_avatar(a, cx);
         }
         cx.spawn(async move |this, cx| {
             loop {
@@ -1996,6 +2004,7 @@ impl MailApp {
                             this.encrypted.insert(saved.id.clone());
                         }
                         this.accounts.push(saved.clone());
+                        this.load_avatar(saved.clone(), cx);
                         this.account = Some(saved.id.clone());
                         if this.onboarding {
                             this.step = Step::Done;
@@ -2248,6 +2257,13 @@ impl MailApp {
             }
             Action::ToggleSidebar => self.set_sidebar_collapsed(!self.sidebar_collapsed, cx),
             Action::ToggleReader => self.set_reader_collapsed(!self.reader_collapsed, cx),
+            Action::ChooseAvatar(id) => self.choose_avatar(id, cx),
+            Action::RemoveAvatar(id) => match self.backend.remove_avatar(&id) {
+                Ok(()) => {
+                    self.avatars.remove(&id);
+                }
+                Err(e) => self.notice(format!("{e:#}"), true, cx),
+            },
             Action::StartSelecting(id) => {
                 self.selection.insert(id.clone());
                 self.select_anchor = Some(id);

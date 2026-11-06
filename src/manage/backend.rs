@@ -58,7 +58,7 @@ impl Backend {
             test_secret: None,
         }
     }
-    fn account_lock(&self, id: &str) -> Arc<Mutex<()>> {
+    pub(super) fn account_lock(&self, id: &str) -> Arc<Mutex<()>> {
         self.operations
             .lock()
             .unwrap()
@@ -168,7 +168,7 @@ impl Backend {
         self.store.save_account(&account)?;
         Ok(account)
     }
-    fn credentials(&self, a: &Account) -> Result<Secret> {
+    pub(super) fn credentials(&self, a: &Account) -> Result<Secret> {
         #[cfg(test)]
         if let Some(secret) = &self.test_secret {
             return Ok(secret.clone());

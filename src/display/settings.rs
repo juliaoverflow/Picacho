@@ -219,7 +219,7 @@ impl MailApp {
             nav = nav.child(self.settings_nav(
                 format!("settings-account-{}", a.id),
                 a.name.clone(),
-                avatar(&initials(&a.name), 20., i, c).into_any_element(),
+                self.account_avatar(a, i, 20.),
                 Page::Account(a.id.clone()),
                 cx,
             ));
@@ -516,12 +516,15 @@ impl MailApp {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(
+                    .child(if self.avatars.contains_key(&a.id) {
+                        self.account_avatar(a, index, 44.)
+                    } else {
                         self.service_tile(a.service, 44.)
                             .when(a.service == Service::Other, |_| {
                                 avatar(&initials(&a.name), 44., index, c)
-                            }),
-                    )
+                            })
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -548,6 +551,47 @@ impl MailApp {
             .when(self.account_issues.get(&a.id).is_some_and(|issues| !issues.is_empty()), |page| {
                 page.child(self.account_error_details(a, cx))
             })
+            .child(self.section("Profile picture"))
+            .child(self.setting(
+                "Picture",
+                if a.provider == Provider::Gmail && a.oauth {
+                    "Shown beside this mailbox. Your Google profile picture is used until you choose another."
+                } else {
+                    "Shown beside this mailbox in the sidebar."
+                },
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
+                    .child(self.account_avatar(a, index, 48.))
+                    .child(
+                        self.button(
+                            format!("choose-avatar-{}", a.id),
+                            "Choose Picture…",
+                            "user",
+                            Action::ChooseAvatar(a.id.clone()),
+                            false,
+                            cx,
+                        )
+                        .border_1()
+                        .border_color(rgb(c.border)),
+                    )
+                    .when(self.avatars.contains_key(&a.id), |row| {
+                        row.child(
+                            self.button(
+                                format!("remove-avatar-{}", a.id),
+                                "Remove",
+                                "",
+                                Action::RemoveAvatar(a.id.clone()),
+                                false,
+                                cx,
+                            )
+                            .border_1()
+                            .border_color(rgb(c.border)),
+                        )
+                    }),
+            ))
             .when(self.encrypted.contains(&a.id), |page| {
                 let locked = self.locked.contains(&a.id);
                 page.child(self.section("Encryption")).child(self.setting(

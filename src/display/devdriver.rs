@@ -78,6 +78,10 @@ fn run(
                 Some("sidebar") => Action::ToggleSidebar,
                 Some("reader") => Action::ToggleReader,
                 Some("settings") => Action::Settings,
+                Some("account") => match this.accounts.first() {
+                    Some(a) => Action::AccountSettings(a.id.clone()),
+                    None => return,
+                },
                 Some("close") => Action::Close,
                 Some("theme") => Action::Theme,
                 _ => return,

@@ -104,6 +104,47 @@ fn http() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
+/// The Google account's profile picture, if it has one. The sign-in's
+/// `profile` scope covers the OpenID userinfo endpoint; the image itself is
+/// only fetched from Google's own content host.
+pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let info: serde_json::Value = client
+        .get("https://openidconnect.googleapis.com/v1/userinfo")
+        .bearer_auth(access_token)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let Some(picture) = info["picture"].as_str().filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let mut url = url::Url::parse(picture)?;
+    ensure!(
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|h| h.ends_with(".googleusercontent.com")),
+        "Unexpected profile picture address"
+    );
+    // Google sizes pictures with a path suffix such as `=s96-c`.
+    if let Some((path, _)) = url.path().rsplit_once('=') {
+        let path = format!("{path}=s256-c");
+        url.set_path(&path);
+    }
+    let mut bytes = Vec::new();
+    client
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .take(5 << 20)
+        .read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 /// `picacho://` URLs macOS handed the app, waiting for a sign-in to claim them.
 static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub fn opened(urls: Vec<String>) {

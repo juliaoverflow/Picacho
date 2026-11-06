@@ -141,7 +141,72 @@ impl MailApp {
 impl MailApp {
     /// An account's picture, or its initials.
     pub(super) fn account_avatar(&self, a: &Account, index: usize, size: f32) -> AnyElement {
-        avatar(&initials(&a.name), size, index, self.colors()).into_any_element()
+        match self.avatars.get(&a.id) {
+            Some(path) => img(path.clone())
+                .size(px(size))
+                .flex_shrink_0()
+                .rounded_full()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            None => avatar(&initials(&a.name), size, index, self.colors()).into_any_element(),
+        }
+    }
+    /// Shows a saved picture, and fetches a Google profile picture once.
+    pub(super) fn load_avatar(&mut self, a: Account, cx: &mut Context<Self>) {
+        if let Some(path) = self.backend.avatar(&a.id) {
+            self.avatars.insert(a.id.clone(), path);
+        }
+        let backend = self.backend.clone();
+        let id = a.id.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { backend.fetch_google_avatar(&a) });
+        cx.spawn(async move |this, cx| {
+            // A missing picture is not a mailbox problem; it is not reported.
+            if let Ok(Some(path)) = task.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.avatars.insert(id, path);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+    pub(super) fn choose_avatar(&mut self, id: String, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a picture".into()),
+        });
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picker.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let key = id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let bytes = std::fs::read(&path)?;
+                    anyhow::ensure!(bytes.len() <= 20 << 20, "Choose a picture under 20 MB.");
+                    backend.set_avatar(&key, &bytes, true)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(path) => {
+                        this.avatars.insert(id, path);
+                    }
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
