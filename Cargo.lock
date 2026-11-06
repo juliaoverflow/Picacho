@@ -5878,6 +5878,7 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "chrono",
+ "core-graphics 0.24.0",
  "data-url",
  "directories",
  "fontique",

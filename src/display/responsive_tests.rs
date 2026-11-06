@@ -196,3 +196,40 @@ fn bulk_selection_and_compose_controls_fit_a_narrow_window(cx: &mut TestAppConte
     inside(bounds(cx, "send"), panel, "send action");
     inside(bounds(cx, "save-close"), panel, "save draft action");
 }
+#[gpui::test]
+fn dragging_panes_keeps_the_list_readable_and_snaps_into_rails(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    resize(cx, 1440., 900.);
+    let drag = |cx: &mut VisualTestContext, pane: Pane, from: f32, to: f32| {
+        view.update(cx, |this, cx| {
+            this.begin_resize(pane, from, cx);
+            this.resize_to(to, cx);
+            this.end_resize(cx);
+        });
+        frame(cx);
+    };
+    // Widening the sidebar and reader as far as possible leaves the list usable.
+    drag(cx, Pane::Sidebar, 228., 2000.);
+    drag(cx, Pane::Reader, 1000., -2000.);
+    let list = bounds(cx, "message-list");
+    assert!(list.size.width >= px(LIST_MIN - 1.), "{list:?}");
+    view.read_with(cx, |this, _| {
+        assert!(!this.sidebar_collapsed && !this.reader_collapsed);
+    });
+    // Dragging past half the smallest useful width snaps into the rail.
+    let sidebar = bounds(cx, "sidebar").size.width;
+    drag(cx, Pane::Sidebar, 300., 300. - f32::from(sidebar));
+    let reader = view.read_with(cx, |this, _| this.reader_shown.get());
+    drag(cx, Pane::Reader, 900., 900. + reader);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(this.sidebar_collapsed && this.reader_collapsed);
+    });
+    assert!(cx.debug_bounds("reader-ribbon").is_some());
+    // Dragging back out reopens a pane at its smallest useful width or more.
+    drag(cx, Pane::Sidebar, 60., 400.);
+    view.read_with(cx, |this, _| {
+        assert!(!this.sidebar_collapsed);
+        assert!(this.sidebar_width >= SIDEBAR_MIN);
+    });
+}

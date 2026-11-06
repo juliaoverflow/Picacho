@@ -1,10 +1,14 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[cfg(all(debug_assertions, target_os = "macos"))]
+#[path = "devdriver.rs"]
+mod devdriver;
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
 #[path = "panes.rs"]
 mod panes;
+use panes::{LIST_MIN, Pane, Resize};
 #[path = "reader.rs"]
 mod reader;
 #[cfg(test)]
@@ -35,7 +39,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
@@ -370,6 +374,7 @@ enum Action {
     ToggleSubfolders(String),
     ConfirmRemove(String),
     ToggleSidebar,
+    ToggleReader,
     StartSelecting(String),
     ToggleSelected(String),
     SelectAll,
@@ -446,6 +451,18 @@ pub struct MailApp {
     sidebar_width: f32,
     /// Whether the window is too narrow for the expanded sidebar.
     compact: Cell<bool>,
+    window_width: Cell<f32>,
+    /// The pane edge being dragged.
+    resizing: Option<Resize>,
+    /// The reader's dragged width; until then it fills the space left of the list.
+    reader_width: Option<f32>,
+    reader_collapsed: bool,
+    reader_anim: u64,
+    reader_from: f32,
+    reader_since: Option<std::time::Instant>,
+    reader_shown: Cell<f32>,
+    /// The collapsed reader's colors, for the message they were taken from.
+    palette: RefCell<(String, Vec<u32>)>,
     menu: Option<PopupMenu>,
     filter_anchor: Rc<Cell<Bounds<Pixels>>>,
     selecting: bool,
@@ -639,6 +656,12 @@ impl MailApp {
             .preference("sidebar_width")
             .and_then(|w| w.parse::<f32>().ok())
             .map_or(SIDEBAR_WIDTH, |w| w.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+        let reader_width = backend
+            .store
+            .preference("reader_width")
+            .and_then(|w| w.parse::<f32>().ok())
+            .map(|w| w.max(panes::READER_MIN));
+        let reader_collapsed = backend.store.preference("reader").as_deref() == Some("collapsed");
         let reading_defaults = backend
             .store
             .preference("reading_defaults")
@@ -665,6 +688,15 @@ impl MailApp {
             sidebar_shown: Cell::new(0.),
             sidebar_width,
             compact: Cell::new(false),
+            window_width: Cell::new(0.),
+            resizing: None,
+            reader_width,
+            reader_collapsed,
+            reader_anim: 0,
+            reader_from: 0.,
+            reader_since: None,
+            reader_shown: Cell::new(0.),
+            palette: RefCell::new((String::new(), Vec::new())),
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
             selecting: false,
@@ -731,6 +763,8 @@ impl MailApp {
         };
         this.filter(cx);
         this.apply_theme(window, cx);
+        #[cfg(all(debug_assertions, target_os = "macos"))]
+        devdriver::start(window, cx);
         if this.account.is_some() {
             cx.defer_in(window, |this, _, cx| {
                 this.refresh_counts(cx);
@@ -2213,6 +2247,7 @@ impl MailApp {
                 self.anim += 1;
             }
             Action::ToggleSidebar => self.set_sidebar_collapsed(!self.sidebar_collapsed, cx),
+            Action::ToggleReader => self.set_reader_collapsed(!self.reader_collapsed, cx),
             Action::StartSelecting(id) => {
                 self.selection.insert(id.clone());
                 self.select_anchor = Some(id);
@@ -3364,7 +3399,7 @@ impl MailApp {
     }
     fn message_list(
         &self,
-        width: Option<f32>,
+        single: bool,
         corners: Corners<Pixels>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -3376,9 +3411,9 @@ impl MailApp {
             .flex_col()
             .id("message-list")
             .debug_selector(|| "message-list".into())
-            .w(px(width.unwrap_or(380.)))
-            .flex_shrink_0()
-            .when(width.is_none(), |d| d.w_full().flex_1().min_w_0())
+            .flex_1()
+            .min_w(px(if single { 0. } else { LIST_MIN }))
+            .when(single, |d| d.w_full())
             .min_h_0()
             .h_full()
             .bg(rgb(c.surface))
@@ -5260,6 +5295,7 @@ impl Render for MailApp {
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
             .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
             .when(!self.onboarding, |d| self.main(d, window, cx))
+            .map(|d| self.track_resize(d, cx))
             .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
             .when(self.menu.is_some(), |d| d.child(self.popup_menu(cx)))
     }
@@ -5299,6 +5335,9 @@ impl MailApp {
             bottom_right: corners.bottom_right,
             ..Corners::default()
         };
+        let layout = self.layout(f32::from(width), compact);
+        self.window_width.set(f32::from(width));
+        let resizable = !single;
         d.child(self.topbar(window, cx))
             .child(
                 div()
@@ -5307,29 +5346,24 @@ impl MailApp {
                     .min_h_0()
                     .min_w_0()
                     .when(show_sidebar, |d| {
-                        let collapsed = compact || self.sidebar_collapsed;
-                        let width = if collapsed {
-                            SIDEBAR_RAIL
-                        } else {
-                            self.sidebar_width
-                        };
-                        d.child(self.sidebar(width, collapsed, cx))
+                        d.child(self.sidebar(layout.sidebar, layout.sidebar_collapsed, cx))
+                    })
+                    .when(show_sidebar && resizable && !compact, |d| {
+                        d.child(self.resize_handle(Pane::Sidebar, cx))
                     })
                     .when(show_list, |d| {
-                        d.child(self.message_list(
-                            if single {
-                                None
-                            } else if compact {
-                                Some(320.)
-                            } else {
-                                Some(380.)
-                            },
-                            list_corners,
-                            cx,
-                        ))
+                        d.child(self.message_list(single, list_corners, cx))
+                    })
+                    .when(show_reader && resizable, |d| {
+                        d.child(self.resize_handle(Pane::Reader, cx))
                     })
                     .when(show_reader, |d| {
-                        d.child(self.reader(reader_corners, window, cx))
+                        d.child(self.reader_pane(
+                            resizable.then_some(layout.reader),
+                            reader_corners,
+                            window,
+                            cx,
+                        ))
                     }),
             )
             .when(self.modal.is_none() && !self.status.is_empty(), |d| {

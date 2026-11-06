@@ -13,6 +13,7 @@ impl MailApp {
     pub(super) fn reader(
         &self,
         corners: Corners<Pixels>,
+        framed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -20,6 +21,9 @@ impl MailApp {
         let Some(m) = self.selected_mail() else {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()
+                .id("reader-pane")
+                .debug_selector(|| "reader-pane".into())
+                .relative()
                 .flex_1()
                 .min_w_0()
                 .bg(rgb(c.surface))
@@ -32,6 +36,15 @@ impl MailApp {
                 .gap_3()
                 .text_size(px(13.))
                 .text_color(rgb(c.muted))
+                .when(framed, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(10.))
+                            .left(px(8.))
+                            .child(self.reader_toggle(false, cx)),
+                    )
+                })
                 .child(icon_el("mail", 36., c.border))
                 .child("No message selected")
                 .into_any_element();
@@ -49,6 +62,10 @@ impl MailApp {
             .gap_1()
             .border_b_1()
             .border_color(rgb(c.border))
+            .when(framed, |d| {
+                d.child(self.reader_toggle(false, cx))
+                    .child(div().w(px(1.)).h(px(20.)).mx_1().bg(rgb(c.border)))
+            })
             .when(single, |d| {
                 d.child(self.button(
                     "reader-back",
