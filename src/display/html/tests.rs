@@ -217,3 +217,39 @@ fn long_email_painting_uses_visible_offset_and_hidpi_scale() {
         "a scrolled HiDPI tile shows the blue section"
     );
 }
+
+#[test]
+fn dark_reading_darkens_pages_lightens_text_and_keeps_brand_colors() {
+    use super::document::{Role, dark_color};
+    let lightness = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let white = [1., 1., 1., 1.];
+    let black = [0., 0., 0., 1.];
+    let blue = [0.1, 0.45, 0.91, 1.];
+    assert!(
+        lightness(dark_color(white, Role::Surface)) < 0.2,
+        "white page turns dark"
+    );
+    assert!(
+        lightness(dark_color(black, Role::Text)) > 0.75,
+        "black text turns light"
+    );
+    assert!(
+        lightness(dark_color(white, Role::Text)) > 0.98,
+        "white text on a banner stays"
+    );
+    let kept = dark_color(blue, Role::Surface);
+    assert!(
+        (kept[2] - blue[2]).abs() < 0.15 && kept[2] > kept[0],
+        "a blue button stays blue"
+    );
+    let sky = dark_color([0.24, 0.71, 1., 1.], Role::Surface);
+    assert!(
+        sky[2] > 0.8,
+        "a light but saturated brand color is not flipped"
+    );
+    let page = dark_color(white, Role::Surface);
+    assert!(
+        (page[0] - page[2]).abs() < 0.01,
+        "neutral stays neutral: {page:?}"
+    );
+}

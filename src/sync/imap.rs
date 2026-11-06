@@ -76,20 +76,6 @@ struct Xoauth {
     user: String,
     token: String,
 }
-pub(crate) fn select_message_mailbox(session: &mut ImapSession, mail: &Mail) -> Result<()> {
-    let mailbox = session.select(&mail.remote_folder)?;
-    let expected = mail
-        .id
-        .rsplit(':')
-        .nth(1)
-        .and_then(|s| s.parse::<u32>().ok())
-        .context("Cached message identity is invalid. Refresh this mailbox.")?;
-    ensure!(
-        expected > 0 && mailbox.uid_validity == Some(expected),
-        "The server reset this mailbox's message identities. Refresh before opening or changing this message."
-    );
-    Ok(())
-}
 impl imap::Authenticator for Xoauth {
     type Response = String;
     fn process(&self, _: &[u8]) -> String {
@@ -105,6 +91,7 @@ pub(crate) fn uid_set(uids: &[u32]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
+#[derive(Clone)]
 pub(crate) struct Name {
     pub(crate) name: String,
     attributes: Vec<String>,
@@ -181,16 +168,6 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
         .collect();
     out.sort_by_key(|f| f.name.to_lowercase());
     out
-}
-pub(crate) fn resolve_folder(
-    session: &mut ImapSession,
-    provider: Provider,
-    folder: Folder,
-) -> Result<String> {
-    if folder == Folder::Inbox {
-        return Ok("INBOX".into());
-    }
-    resolve_in(&list(session)?, provider, folder)
 }
 pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> Result<String> {
     if folder == Folder::Inbox {
@@ -275,5 +252,246 @@ fn starttls(socket: &mut Wire) -> Result<()> {
             response.starts_with("* ") && !response.starts_with("* BYE"),
             "Invalid IMAP STARTTLS response"
         );
+    }
+}
+
+/// Header fields the message list shows. Full headers carry Received, DKIM
+/// and ARC chains that are often several times larger, and are only needed
+/// once a message is opened (its whole source is downloaded then).
+pub(crate) const LIST_HEADERS: &str =
+    "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID CONTENT-TYPE)]";
+
+/// Extensions beyond IMAP4rev1 that change how a mailbox is synchronized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Extensions {
+    /// RFC 7162: per-message change counters (MODSEQ) and CHANGEDSINCE.
+    pub(crate) condstore: bool,
+    /// Gmail's X-GM-EXT-1, including permanent message ids.
+    pub(crate) gmail: bool,
+}
+pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
+    let caps = session.capabilities()?;
+    Ok(Extensions {
+        condstore: caps.has_str("CONDSTORE"),
+        gmail: caps.has_str("X-GM-EXT-1"),
+    })
+}
+
+/// What SELECT reported about a mailbox.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Selected {
+    pub(crate) name: String,
+    pub(crate) exists: u32,
+    pub(crate) validity: u32,
+    pub(crate) uid_next: Option<u32>,
+    /// HIGHESTMODSEQ, when the server tracks changes for this mailbox.
+    pub(crate) modseq: Option<u64>,
+}
+
+/// A mailbox name as an IMAP quoted string.
+pub(crate) fn quote(name: &str) -> Result<String> {
+    ensure!(
+        !name.contains(['\r', '\n', '\0']),
+        "Invalid mailbox name from the server"
+    );
+    Ok(format!(
+        "\"{}\"",
+        name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+/// SELECT, asking for change tracking when the server supports it. The imap
+/// crate's own SELECT discards HIGHESTMODSEQ, so this reads the response here.
+pub(crate) fn select(session: &mut ImapSession, name: &str, condstore: bool) -> Result<Selected> {
+    let command = format!(
+        "SELECT {}{}",
+        quote(name)?,
+        if condstore { " (CONDSTORE)" } else { "" }
+    );
+    let data = session.run_command_and_read_response(command)?;
+    let mut selected = Selected {
+        name: name.into(),
+        ..Default::default()
+    };
+    let mut validity = None;
+    for response in responses(&data)? {
+        use imap_proto::{MailboxDatum, Response, ResponseCode};
+        match response {
+            Response::Data {
+                code: Some(code), ..
+            } => match code {
+                ResponseCode::UidValidity(v) => validity = Some(v),
+                ResponseCode::UidNext(n) => selected.uid_next = Some(n),
+                ResponseCode::HighestModSeq(m) if condstore => selected.modseq = Some(m),
+                _ => {}
+            },
+            Response::MailboxData(MailboxDatum::Exists(n)) => selected.exists = n,
+            _ => {}
+        }
+    }
+    selected.validity = validity
+        .filter(|v| *v > 0)
+        .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
+    // UIDNEXT 0 is not a valid UID; treat it as missing.
+    selected.uid_next = selected.uid_next.filter(|n| *n > 0);
+    Ok(selected)
+}
+
+/// One message from a UID FETCH, with only the attributes that were asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub(crate) uid: u32,
+    pub(crate) flags: Option<Vec<String>>,
+    pub(crate) size: Option<u32>,
+    pub(crate) internal_date: Option<i64>,
+    pub(crate) header: Option<Vec<u8>>,
+    pub(crate) gmail_id: Option<u64>,
+}
+impl Row {
+    fn flag(&self, name: &str) -> bool {
+        self.flags
+            .iter()
+            .flatten()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    }
+    pub(crate) fn seen(&self) -> bool {
+        self.flag("\\Seen")
+    }
+    pub(crate) fn flagged(&self) -> bool {
+        self.flag("\\Flagged")
+    }
+}
+
+/// UID FETCH that also understands MODSEQ and Gmail's X-GM-MSGID. Rows can
+/// include unsolicited updates for other messages; callers filter by UID.
+pub(crate) fn uid_fetch_rows(
+    session: &mut ImapSession,
+    set: &str,
+    items: &str,
+) -> Result<Vec<Row>> {
+    ensure!(
+        !set.contains(['\r', '\n']) && !items.contains(['\r', '\n']),
+        "Invalid IMAP FETCH"
+    );
+    let data = session.run_command_and_read_response(format!("UID FETCH {set} {items}"))?;
+    let mut rows = Vec::new();
+    for response in responses(&data)? {
+        let imap_proto::Response::Fetch(_, attributes) = response else {
+            continue;
+        };
+        let mut row = Row::default();
+        for attribute in attributes {
+            use imap_proto::AttributeValue as A;
+            match attribute {
+                A::Uid(uid) => row.uid = uid,
+                A::Flags(flags) => row.flags = Some(flags.iter().map(|f| (*f).into()).collect()),
+                A::Rfc822Size(size) => row.size = Some(size),
+                A::InternalDate(date) => row.internal_date = internal_date(date),
+                A::GmailMsgId(id) => row.gmail_id = Some(id),
+                A::BodySection {
+                    data: Some(data), ..
+                }
+                | A::Rfc822Header(Some(data)) => row.header = Some(data.to_vec()),
+                _ => {}
+            }
+        }
+        if row.uid > 0 {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+fn internal_date(date: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_str(date.trim(), "%d-%b-%Y %H:%M:%S %z")
+        .ok()
+        .map(|d| d.timestamp())
+}
+/// Untagged responses that the imap crate has already read and validated.
+fn responses(data: &[u8]) -> Result<Vec<imap_proto::Response<'_>>> {
+    let mut rest = data;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        match imap_proto::parse_response(rest) {
+            Ok((next, response)) => {
+                out.push(response);
+                rest = next;
+            }
+            Err(_) => bail!("Invalid IMAP response"),
+        }
+    }
+    Ok(out)
+}
+
+/// Compact UID set for a command ("1:4,7"), from UIDs in any order.
+pub(crate) fn uid_ranges(uids: &[u32]) -> String {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        while i + 1 < sorted.len() && sorted[i + 1] == sorted[i] + 1 {
+            i += 1;
+        }
+        out.push(if sorted[i] == start {
+            start.to_string()
+        } else {
+            format!("{start}:{}", sorted[i])
+        });
+        i += 1;
+    }
+    out.join(",")
+}
+
+/// Servers say this when an account is over its bandwidth or connection
+/// limits; Gmail uses several of these. Retrying immediately makes it worse.
+pub(crate) fn throttled(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "[throttled]",
+        "[overquota]",
+        "[limit]",
+        "bandwidth limits",
+        "too many simultaneous connections",
+        "account exceeded command",
+        "[unavailable]",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+    #[test]
+    fn parses_condstore_and_gmail_fetch_rows() {
+        let data = b"* 3 FETCH (X-GM-MSGID 1278455344230334865 UID 77 MODSEQ (12) FLAGS (\\Seen \\Flagged) RFC822.SIZE 420 INTERNALDATE \" 7-Jul-2026 02:44:25 -0700\" BODY[HEADER.FIELDS (SUBJECT)] {15}\r\nSubject: Hi\r\n\r\n)\r\n";
+        let responses = responses(data).unwrap();
+        assert_eq!(responses.len(), 1);
+        let imap_proto::Response::Fetch(_, attributes) = &responses[0] else {
+            panic!("not a fetch")
+        };
+        assert!(attributes.contains(&imap_proto::AttributeValue::GmailMsgId(1278455344230334865)));
+        assert!(attributes.contains(&imap_proto::AttributeValue::ModSeq(12)));
+        assert_eq!(
+            internal_date(" 7-Jul-2026 02:44:25 -0700"),
+            Some(1783417465)
+        );
+    }
+    #[test]
+    fn uid_ranges_are_compact() {
+        assert_eq!(uid_ranges(&[9, 1, 2, 3, 7, 3]), "1:3,7,9");
+        assert_eq!(uid_ranges(&[]), "");
+    }
+    #[test]
+    fn gmail_limits_are_recognized() {
+        assert!(throttled(&anyhow::anyhow!(
+            "NO [ALERT] Account exceeded command or bandwidth limits. (Failure)"
+        )));
+        assert!(throttled(&anyhow::anyhow!("NO [THROTTLED] slow down")));
+        assert!(!throttled(&anyhow::anyhow!(
+            "NO [AUTHENTICATIONFAILED] bad"
+        )));
     }
 }

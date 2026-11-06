@@ -5,5 +5,6 @@ mod resources;
 #[cfg(test)]
 mod tests;
 mod view;
+mod worker;
 
-pub use view::HtmlView;
+pub use view::{HtmlContextMenu, HtmlView, thumbnail};

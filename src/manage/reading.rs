@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub struct ReadingOptions {
     pub html: bool,
     pub block_remote: bool,
+    /// Light or dark email bodies. Older saved choices have none: light.
+    pub theme: EmailTheme,
 }
 
 impl Default for ReadingOptions {
@@ -13,6 +15,26 @@ impl Default for ReadingOptions {
         Self {
             html: true,
             block_remote: true,
+            theme: EmailTheme::Light,
+        }
+    }
+}
+
+/// How an email body is colored, independent of the app's own appearance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmailTheme {
+    #[default]
+    Light,
+    Dark,
+    /// Follows the app's light or dark appearance.
+    App,
+}
+impl EmailTheme {
+    pub fn is_dark(self, app_dark: bool) -> bool {
+        match self {
+            EmailTheme::Light => false,
+            EmailTheme::Dark => true,
+            EmailTheme::App => app_dark,
         }
     }
 }

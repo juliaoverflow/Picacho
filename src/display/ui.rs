@@ -23,8 +23,8 @@ mod responsive_tests;
 mod settings;
 #[path = "window.rs"]
 mod window;
-use super::html::HtmlView;
-use crate::manage::reading::{ReadingOptions, message_key};
+use super::html::{HtmlContextMenu, HtmlView};
+use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
 use crate::{
     manage::{
@@ -42,7 +42,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
@@ -282,6 +282,8 @@ enum Modal {
     Help,
     RemoveAccount(String),
     Reconnect(String),
+    /// The raw source of the open message.
+    Original,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -405,6 +407,18 @@ enum Action {
     SetReadingDefaults(ReadingOptions),
     ToggleHtml,
     ToggleRemote,
+    /// Shows the open email's body in light or dark colors.
+    ToggleEmailTheme,
+    /// Opens the collapsed reader at a fraction of the message's height.
+    Reveal(f32),
+    /// Shows the HTML part (true) or the plain text part (false).
+    ShowHtml(bool),
+    ToggleDetails,
+    ShowOriginal,
+    CopyOriginal,
+    SaveOriginal,
+    CopyText(String),
+    OpenUrl(String),
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -467,8 +481,8 @@ pub struct MailApp {
     reader_from: f32,
     reader_since: Option<std::time::Instant>,
     reader_shown: Cell<f32>,
-    /// The collapsed reader's colors, for the message they were taken from.
-    palette: RefCell<(String, Vec<u32>)>,
+    /// Where the collapsed reader's preview was last laid out.
+    preview_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Account pictures saved on this computer.
     avatars: HashMap<String, std::path::PathBuf>,
     menu: Option<PopupMenu>,
@@ -483,8 +497,14 @@ pub struct MailApp {
     oldest_first: bool,
     download: Download,
     /// Catalog progress per (account, mailbox), and catalogs running now.
-    catalogs: HashMap<(String, String), crate::manage::backend::Catalog>,
+    catalogs: HashMap<(String, String), catalog::Progress>,
     cataloging: HashSet<(String, String)>,
+    /// The open mailbox's layout: every message the server has, listed or not.
+    layout: Option<crate::manage::backend::Layout>,
+    /// Placeholder rows on screen waiting to be listed, and whether a
+    /// request for them is running.
+    wanted_rows: Vec<u32>,
+    filling: bool,
     search: Entity<InputState>,
     focus: FocusHandle,
     modal: Option<Modal>,
@@ -528,6 +548,27 @@ pub struct MailApp {
     load_generation: u64,
     read_generation: u64,
     anim: u64,
+    /// The message whose body is being fetched or decoded now.
+    reading: Option<String>,
+    /// Bumped only when a different message opens (its entrance animation),
+    /// when details open, and when the remote-content switch flips.
+    open_anim: u64,
+    details_anim: u64,
+    /// When the open message and its details appeared. Their entrance
+    /// animations run only just after, never again when the reader is
+    /// rebuilt (as at the end of a pane animation).
+    open_at: Option<std::time::Instant>,
+    details_at: Option<std::time::Instant>,
+    /// A place in the message to show once the reader opens, as a fraction
+    /// of its height (from the collapsed reader's preview).
+    reveal: Option<f32>,
+    switch_anim: u64,
+    switch_at: Option<std::time::Instant>,
+    /// Whether the open message's details are expanded, and what was read
+    /// from its original source.
+    details_open: bool,
+    details: Option<MessageInfo>,
+    original_scroll: UniformListScrollHandle,
     list_scroll: UniformListScrollHandle,
     reader_scroll: ScrollHandle,
     reading_defaults: ReadingOptions,
@@ -682,6 +723,11 @@ impl MailApp {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let html_view = cx.new(HtmlView::new);
+        subscriptions.push(
+            cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
+                this.html_menu(menu, cx)
+            }),
+        );
         let mut this = Self {
             backend,
             accounts,
@@ -710,7 +756,6 @@ impl MailApp {
             reader_from: 0.,
             reader_since: None,
             reader_shown: Cell::new(0.),
-            palette: RefCell::new((String::new(), Vec::new())),
             avatars: HashMap::new(),
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
@@ -725,6 +770,9 @@ impl MailApp {
             download: Download::default(),
             catalogs: HashMap::new(),
             cataloging: HashSet::new(),
+            layout: None,
+            wanted_rows: Vec::new(),
+            filling: false,
             search,
             focus: cx.focus_handle(),
             modal: None,
@@ -766,6 +814,18 @@ impl MailApp {
             load_generation: 0,
             read_generation: 0,
             anim: 0,
+            reading: None,
+            open_anim: 0,
+            details_anim: 0,
+            open_at: None,
+            details_at: None,
+            reveal: None,
+            preview_bounds: Rc::new(Cell::new(Bounds::default())),
+            switch_anim: 0,
+            switch_at: None,
+            details_open: false,
+            details: None,
+            original_scroll: UniformListScrollHandle::new(),
             list_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
             reading_defaults,
@@ -868,6 +928,9 @@ impl MailApp {
             .messages
             .iter()
             .enumerate()
+            // Placeholders have nothing to match yet; they show only in the
+            // whole, unsearched list, where they hold their messages' places.
+            .filter(|(_, m)| !m.pending || (filter == Filter::All && query.is_empty()))
             .filter(|(_, m)| match filter {
                 Filter::All => true,
                 // Opening a message reads it; it stays listed while it is open.
@@ -888,13 +951,20 @@ impl MailApp {
     /// Reloads sidebar unread counts and download progress from the cache.
     fn refresh_counts(&mut self, cx: &mut Context<Self>) {
         let store = self.backend.store.clone();
+        let now = chrono::Utc::now().timestamp();
+        let offline: Vec<(String, i64)> = self
+            .accounts
+            .iter()
+            .filter(|a| a.provider != Provider::Pop3)
+            .filter_map(|a| Some((a.id.clone(), a.sync.offline_since(now)?)))
+            .collect();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     Ok::<_, anyhow::Error>((
                         store.unread_counts()?,
-                        store.download_counts(crate::sync::transport::MAX_MESSAGE)?,
+                        store.download_counts(crate::sync::transport::MAX_MESSAGE, &offline)?,
                     ))
                 })
                 .await;
@@ -918,6 +988,8 @@ impl MailApp {
             let every = Duration::from_secs(u64::from(a.sync.refresh_minutes) * 60);
             if a.sync.refresh_minutes == 0
                 || self.account_blocked(&a.id)
+                // The server is limiting this account; wait it out.
+                || self.backend.throttled_until(&a.id).is_some()
                 || self
                     .last_check
                     .get(&a.id)
@@ -972,7 +1044,10 @@ impl MailApp {
         }
     }
     fn download_account(&mut self, a: Account, cx: &mut Context<Self>) {
-        if self.account_blocked(&a.id) || !self.downloading.insert(a.id.clone()) {
+        if self.account_blocked(&a.id)
+            || self.backend.throttled_until(&a.id).is_some()
+            || !self.downloading.insert(a.id.clone())
+        {
             return;
         }
         self.download.active = true;
@@ -1371,6 +1446,8 @@ impl MailApp {
         self.read_generation += 1;
         self.syncing = false;
         self.messages.clear();
+        self.layout = None;
+        self.wanted_rows.clear();
         self.filter_by = Filter::All;
         Self::set(&self.search, "", w, cx);
         self.search_open = false;
@@ -1397,12 +1474,13 @@ impl MailApp {
             let gen_ = self.load_generation;
             self.task(
                 cx,
-                move |b| b.store.summaries(&id, mailbox),
+                move |b| b.listed(&id, &mailbox),
                 move |this, result, cx| {
                     if gen_ != this.load_generation {
                         return;
                     }
-                    if let Ok(ms) = result {
+                    if let Ok((ms, layout)) = result {
+                        this.layout = layout;
                         this.set_messages(ms, cx);
                     }
                     this.refresh(cx);
@@ -1422,11 +1500,12 @@ impl MailApp {
         let generation = self.load_generation;
         self.task(
             cx,
-            move |b| b.store.summaries(&id, mailbox),
+            move |b| b.listed(&id, &mailbox),
             move |this, result, cx| {
                 if generation == this.load_generation
-                    && let Ok(messages) = result
+                    && let Ok((messages, layout)) = result
                 {
+                    this.layout = layout;
                     this.set_messages(messages, cx);
                 }
             },
@@ -1476,6 +1555,8 @@ impl MailApp {
                                 attachments: vec![],
                                 message_id: String::new(),
                                 has_attachments: !d.attachments.is_empty(),
+                                gmail_id: 0,
+                                pending: false,
                             })
                             .collect();
                         this.filter(cx);
@@ -1486,8 +1567,20 @@ impl MailApp {
         );
     }
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
+        // A placeholder has nothing to open until it is listed.
+        if self.messages.iter().any(|m| m.id == id && m.pending) {
+            return;
+        }
+        // Clicking the open message again leaves the reader as it is.
+        if self.selected.as_ref() == Some(&id) {
+            return;
+        }
         self.html_view.update(cx, |view, cx| view.clear(cx));
         self.selected = Some(id.clone());
+        self.details_open = false;
+        self.open_anim += 1;
+        self.open_at = Some(std::time::Instant::now());
+        self.reveal = None;
         self.anim += 1;
         self.read_generation += 1;
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
@@ -1527,6 +1620,7 @@ impl MailApp {
         if let Some(a) = self.current_account() {
             let account_id = a.id.clone();
             let id2 = id.clone();
+            self.reading = Some(id.clone());
             self.task(
                 cx,
                 move |b| {
@@ -1537,6 +1631,9 @@ impl MailApp {
                     Ok(m)
                 },
                 move |this, result, cx| {
+                    if this.reading.as_ref() == Some(&id2) {
+                        this.reading = None;
+                    }
                     this.account_result(&account_id, IssueSource::Read, &result);
                     match result {
                         Ok(mail) => {
@@ -2136,6 +2233,138 @@ impl MailApp {
         })
         .detach();
     }
+    /// Reads the open message's original source and its details once.
+    fn load_details(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.selected_mail() else {
+            return;
+        };
+        if self.details.as_ref().is_some_and(|d| d.id == m.id) {
+            return;
+        }
+        self.details = Some(MessageInfo {
+            id: m.id.clone(),
+            result: None,
+        });
+        let Some(account) = self.account_of(&m) else {
+            self.details = Some(MessageInfo {
+                id: m.id.clone(),
+                result: Some(Err("This message's account is not available.".into())),
+            });
+            return;
+        };
+        let id = m.id.clone();
+        self.task(
+            cx,
+            move |b| {
+                let raw = b.original(&account, &m)?;
+                let details = crate::sync::mime::details(&raw);
+                Ok(Original::new(details, &raw))
+            },
+            move |this, result, cx| {
+                if this.details.as_ref().is_some_and(|d| d.id == id) {
+                    this.details = Some(MessageInfo {
+                        id,
+                        result: Some(result.map(Rc::new).map_err(|e| e.to_string())),
+                    });
+                }
+                cx.notify();
+            },
+        );
+    }
+    fn original_source(&self) -> Option<Rc<Original>> {
+        let info = self.details.as_ref()?;
+        if Some(&info.id) != self.selected.as_ref() {
+            return None;
+        }
+        info.result.as_ref()?.as_ref().ok().cloned()
+    }
+    fn save_original(&mut self, cx: &mut Context<Self>) {
+        let (Some(original), Some(m)) = (self.original_source(), self.selected_mail()) else {
+            return;
+        };
+        let stem: String = m
+            .subject
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == ' ' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(60)
+            .collect();
+        let name = format!("{}.eml", stem.trim().trim_matches('_').if_empty("message"));
+        let picker = cx.prompt_for_new_path(&self.backend.store.path, Some(&name));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = picker.await {
+                let result = std::fs::write(&path, &original.raw);
+                let _ = this.update(cx, |this, cx| match result {
+                    Ok(()) => this.notice("Original message saved", false, cx),
+                    Err(e) => this.notice(e.to_string(), true, cx),
+                });
+            }
+        })
+        .detach();
+    }
+    /// The email's own context menu: copy, links and images, and the source.
+    fn html_menu(&mut self, menu: &HtmlContextMenu, cx: &mut Context<Self>) {
+        let mut entries = Vec::new();
+        if let Some(text) = &menu.selection {
+            entries.push(entry("Copy", "copy", Action::CopyText(text.clone())));
+        }
+        if let Some(link) = &menu.link {
+            if !entries.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            let mailto = link.starts_with("mailto:");
+            entries.push(entry(
+                if mailto {
+                    "Open Email Link"
+                } else {
+                    "Open Link in Browser"
+                },
+                "external-link",
+                Action::OpenUrl(link.clone()),
+            ));
+            entries.push(entry(
+                if mailto {
+                    "Copy Email Address"
+                } else {
+                    "Copy Link Address"
+                },
+                "copy",
+                Action::CopyText(
+                    link.strip_prefix("mailto:")
+                        .map(|a| a.split('?').next().unwrap_or(a).to_string())
+                        .unwrap_or_else(|| link.clone()),
+                ),
+            ));
+        }
+        if let Some(image) = &menu.image {
+            if !entries.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            entries.push(entry(
+                "Open Image in Browser",
+                "external-link",
+                Action::OpenUrl(image.clone()),
+            ));
+            entries.push(entry(
+                "Copy Image Address",
+                "copy",
+                Action::CopyText(image.clone()),
+            ));
+        }
+        if !entries.is_empty() {
+            entries.push(Entry::Separator);
+        }
+        if let Some(body) = self.selected_mail().and_then(|m| m.body) {
+            entries.push(entry("Copy Message Text", "copy", Action::CopyText(body)));
+        }
+        entries.push(entry("Show Original", "code", Action::ShowOriginal));
+        self.open_menu(menu.position, entries, cx);
+    }
     fn save_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(m) = self.selected_mail() else {
             return;
@@ -2323,6 +2552,7 @@ impl MailApp {
                     let all: HashSet<String> = self
                         .visible
                         .iter()
+                        .filter(|i| !self.messages[**i].pending)
                         .map(|i| self.messages[*i].id.clone())
                         .collect();
                     self.selection = if self.selection == all {
@@ -2554,11 +2784,63 @@ impl MailApp {
                     Err(e) => self.notice(e.to_string(), true, cx),
                 }
             }
-            Action::ToggleHtml | Action::ToggleRemote => {
+            Action::ShowHtml(on) => {
+                if let Some(m) = self.selected_mail()
+                    && self.reading_options(&m).html != on
+                {
+                    self.handle(Action::ToggleHtml, w, cx);
+                }
+            }
+            Action::ToggleDetails => {
+                self.details_open = !self.details_open;
+                if self.details_open {
+                    self.details_anim += 1;
+                    self.details_at = Some(std::time::Instant::now());
+                    self.load_details(cx);
+                }
+            }
+            Action::ShowOriginal => {
+                self.load_details(cx);
+                self.original_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                self.modal = Some(Modal::Original);
+                self.menu = None;
+                self.anim += 1;
+            }
+            Action::CopyOriginal => {
+                if let Some(raw) = self.original_source() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(raw.text.to_string()));
+                    self.notice("Original message copied", false, cx);
+                }
+            }
+            Action::SaveOriginal => self.save_original(cx),
+            Action::CopyText(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.menu = None;
+            }
+            Action::OpenUrl(url) => {
+                self.menu = None;
+                cx.open_url(&url);
+            }
+            Action::Reveal(fraction) => {
+                self.reveal = Some(fraction.clamp(0., 1.));
+                self.set_reader_collapsed(false, cx);
+            }
+            Action::ToggleHtml | Action::ToggleRemote | Action::ToggleEmailTheme => {
                 if let Some(m) = self.selected_mail() {
+                    if matches!(action, Action::ToggleRemote) {
+                        self.switch_anim += 1;
+                        self.switch_at = Some(std::time::Instant::now());
+                    }
                     let mut options = self.reading_options(&m);
                     match action {
                         Action::ToggleHtml => options.html = !options.html,
+                        Action::ToggleEmailTheme => {
+                            options.theme = if options.theme.is_dark(self.dark) {
+                                EmailTheme::Light
+                            } else {
+                                EmailTheme::Dark
+                            }
+                        }
                         _ => options.block_remote = !options.block_remote,
                     }
                     if let Err(e) = self.backend.store.set_preference(
@@ -2703,10 +2985,17 @@ impl MailApp {
             self.notice(e.to_string(), true, cx);
             return;
         }
+        let offline = a.sync.offline_days;
+        let account = a.clone();
         // A new sync window applies at the next sync; run it now for the open account.
         if window && self.account.as_ref() == Some(&id) {
             self.open_mailbox(Some(id), self.mailbox(), w, cx);
         }
+        // A wider offline range starts downloading now; any change recounts.
+        if offline != OFFLINE_WHEN_OPENED {
+            self.download_account(account, cx);
+        }
+        self.refresh_counts(cx);
     }
     fn close_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         self.search_open = false;
@@ -3527,6 +3816,7 @@ impl MailApp {
             } else {
                 uniform_list("message-list", count, move |range, _, cx| {
                     entity.update(cx, |this, cx| {
+                        this.want_rows(range.clone(), cx);
                         range
                             .map(|i| this.message_row(this.visible[i], cx))
                             .collect::<Vec<_>>()
@@ -3875,9 +4165,12 @@ impl MailApp {
                 .bg(rgb(c.soft)),
             )
     }
-    fn message_row(&self, index: usize, cx: &Context<Self>) -> impl IntoElement + use<> {
+    fn message_row(&self, index: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let m = &self.messages[index];
+        if m.pending {
+            return placeholder_row(&m.id, c).into_any_element();
+        }
         let id = m.id.clone();
         let selected = self.selected.as_ref() == Some(&m.id);
         let checked = self.selection.contains(&m.id);
@@ -4108,9 +4401,14 @@ impl MailApp {
                     }
                     this.handle(Action::ToggleSelected(id.clone()), w, cx)
                 } else {
-                    this.handle(Action::Select(id.clone()), w, cx)
+                    this.handle(Action::Select(id.clone()), w, cx);
+                    // Double-clicking opens a collapsed reader.
+                    if e.click_count() >= 2 && this.reader_collapsed {
+                        this.set_reader_collapsed(false, cx);
+                    }
                 }
             }))
+            .into_any_element()
     }
     fn select_range(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let position = |id: &str| self.visible.iter().position(|i| self.messages[*i].id == id);
@@ -4120,6 +4418,7 @@ impl MailApp {
         let (a, b) = (a.min(b), a.max(b));
         let ids: Vec<String> = self.visible[a..=b]
             .iter()
+            .filter(|i| !self.messages[**i].pending)
             .map(|i| self.messages[*i].id.clone())
             .collect();
         self.selection.extend(ids);
@@ -5039,6 +5338,7 @@ impl MailApp {
             Modal::Compose => "New Message",
             Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
+            Modal::Original => "Original Message",
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -5048,6 +5348,7 @@ impl MailApp {
             Modal::Compose => self.compose_modal(cx),
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
+            Modal::Original => self.original_modal(cx),
         };
         let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
         let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
@@ -5061,11 +5362,14 @@ impl MailApp {
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
                 Modal::RemoveAccount(_) | Modal::Reconnect(_) | Modal::About => 400.,
-                Modal::Settings => 820.,
+                Modal::Settings | Modal::Original => 820.,
             }))
             .max_w(available_width)
             .when(*modal == Modal::Settings, |d| {
                 d.h(px(600.).min(available_height))
+            })
+            .when(*modal == Modal::Original, |d| {
+                d.h(px(760.).min(available_height))
             })
             .max_h(available_height)
             .rounded(px(18.))
@@ -5100,8 +5404,9 @@ impl MailApp {
                     )),
             )
             .child(match modal {
-                // Settings scrolls its own sections beside a fixed sidebar.
-                Modal::Settings => div()
+                // Settings scrolls its own sections beside a fixed sidebar;
+                // the original source scrolls its own lines.
+                Modal::Settings | Modal::Original => div()
                     .flex_1()
                     .min_h_0()
                     .flex()
@@ -5251,6 +5556,7 @@ impl MailApp {
 }
 impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_reveal(window, cx);
         let c = self.colors();
         div()
             .id("mail-app")
@@ -5590,6 +5896,11 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "monitor",
         "lock",
         "warning",
+        "image",
+        "image-off",
+        "code",
+        "text",
+        "formatted",
     ]
     .contains(&name)
     {
@@ -5603,6 +5914,50 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .size_full()
             .text_color(rgb(color)),
     )
+}
+/// A message the server has that is not listed yet: the row's shape, so the
+/// list keeps its length and scrollbar while headers load.
+fn placeholder_row(id: &str, c: Colors) -> Stateful<Div> {
+    let bar = |width: f32, height: f32| {
+        div()
+            .w(relative(width))
+            .h(px(height))
+            .rounded(px(height / 2.))
+            .bg(rgb(c.soft))
+    };
+    div()
+        .id(SharedString::from(format!("row-{id}")))
+        .debug_selector(|| "placeholder-row".into())
+        .h(px(ROW_HEIGHT))
+        .w_full()
+        .pl(px(14.))
+        .pr(px(18.))
+        .py(px(11.))
+        .border_b_1()
+        .border_color(rgb(c.border))
+        .flex()
+        .items_start()
+        .gap(px(12.))
+        .bg(rgb(c.surface))
+        .child(
+            div()
+                .size(px(36.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(rgb(c.soft)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(9.))
+                .pt(px(4.))
+                .child(bar(0.38, 10.))
+                .child(bar(0.72, 9.))
+                .child(bar(0.55, 9.)),
+        )
 }
 fn avatar(initials: &str, size: f32, index: usize, c: Colors) -> Div {
     let light = [
@@ -5884,6 +6239,51 @@ fn plain_markdown(text: &str) -> String {
     result
 }
 
+/// The open message's details, read from its original source.
+struct MessageInfo {
+    id: String,
+    /// None while loading.
+    result: Option<Result<Rc<Original>, String>>,
+}
+/// A message's original source, prepared for display.
+pub(super) struct Original {
+    details: crate::sync::mime::Details,
+    raw: Vec<u8>,
+    text: SharedString,
+    /// Display lines, wrapped so every row has the same height.
+    lines: Vec<SharedString>,
+}
+impl Original {
+    const WRAP: usize = 110;
+    fn new(details: crate::sync::mime::Details, raw: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(raw).into_owned();
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            let chars: Vec<char> = line.chars().collect();
+            if chars.is_empty() {
+                lines.push(SharedString::default());
+            }
+            for chunk in chars.chunks(Self::WRAP) {
+                lines.push(chunk.iter().collect::<String>().into());
+            }
+        }
+        Self {
+            details,
+            raw: raw.to_vec(),
+            text: text.into(),
+            lines,
+        }
+    }
+}
+trait IfEmpty {
+    fn if_empty<'a>(&'a self, other: &'a str) -> &'a str;
+}
+impl IfEmpty for str {
+    fn if_empty<'a>(&'a self, other: &'a str) -> &'a str {
+        if self.is_empty() { other } else { self }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6022,6 +6422,7 @@ mod tests {
             days: 30,
             refresh_minutes: 15,
             notify: false,
+            offline_days: 365,
         };
         act(&view, Action::SetSync(first.clone(), sync), cx);
         let saved = store.accounts().unwrap();
@@ -6079,6 +6480,62 @@ mod tests {
         cx.debug_bounds(selector)
             .unwrap_or_else(|| panic!("{selector} was not rendered"))
             .center()
+    }
+
+    #[gpui::test]
+    fn unlisted_mail_holds_its_rows_as_placeholders(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let a = view.read_with(cx, |this, _| this.accounts[0].clone());
+        // The server has 500 more messages than are listed here.
+        view.update_in(cx, |this, w, cx| {
+            this.backend.set_test_layout(
+                &a,
+                &Folder::Inbox.into(),
+                "INBOX",
+                7,
+                (1..=500).collect(),
+            );
+            this.open_mailbox(Some(a.id.clone()), Folder::Inbox.into(), w, cx);
+        });
+        cx.run_until_parked();
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.messages.len(), 510);
+            assert_eq!(
+                this.visible.len(),
+                510,
+                "the scrollbar covers the whole mailbox"
+            );
+            // Newest first, by arrival: placeholders keep their places.
+            assert!(this.messages[this.visible[0]].pending);
+            assert_eq!(this.messages[this.visible[0]].uid, 500);
+        });
+        assert!(cx.debug_bounds("placeholder-row").is_some());
+        // Placeholders cannot be opened or selected, and filters skip them.
+        let pending = view.read_with(cx, |this, _| this.messages[this.visible[0]].id.clone());
+        act(&view, Action::Select(pending), cx);
+        act(&view, Action::SelectAll, cx);
+        view.update(cx, |this, cx| {
+            assert!(this.selected.is_none());
+            assert_eq!(this.selection.len(), 10);
+            this.filter_by = Filter::Unread;
+            this.apply_filter(cx);
+            assert!(this.visible.iter().all(|i| !this.messages[*i].pending));
+        });
+        // Listing a placeholder puts the message in its row.
+        view.update(cx, |this, cx| {
+            this.filter_by = Filter::All;
+            this.apply_filter(cx);
+            let id = this.messages[this.visible[0]].id.clone();
+            let mut listed = demo_mail().remove(0);
+            listed.id = id;
+            listed.uid = 500;
+            listed.subject = "Listed now".into();
+            assert!(this.place(vec![listed], cx));
+            let row = &this.messages[this.visible[0]];
+            assert!(!row.pending);
+            assert_eq!(row.subject, "Listed now");
+        });
     }
 
     #[gpui::test]

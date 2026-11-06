@@ -6,7 +6,7 @@ Sync implements the wire protocols; Manage owns cache policy and per-account ser
 
 An IMAP identity is `(account, remote mailbox, UIDVALIDITY, UID)`. Never use message sequence numbers as persistent identities. A missing or zero UIDVALIDITY is an error. Opening, downloading, or modifying cached mail selects its mailbox and checks the generation before using its UID. A completed snapshot invalidates previous generations across standard, custom and virtual Starred views, including their raw bodies.
 
-SEARCH describes the entire retention window. Only the newest requested headers need to be fetched; older cached messages within that window remain. FETCH may contain unsolicited flag updates. Only requested UIDs with actual headers become summaries. If requested headers are missing, repeat SEARCH: confirmed expunges can be reconciled, while omitted but still-present messages fail the snapshot and preserve the cache. A new message arriving after SEARCH is picked up on the next refresh.
+SEARCH describes the entire retention window. Only the newest requested headers need to be fetched (and only those not already cached; cached ones get a flags-only FETCH); older cached messages within that window remain. FETCH may contain unsolicited flag updates. Only requested UIDs with actual headers become summaries. If requested headers are missing, repeat SEARCH: confirmed expunges can be reconciled, while omitted but still-present messages fail the snapshot and preserve the cache. A new message arriving after SEARCH is picked up on the next refresh.
 
 One mailbox's header updates, old-generation removal, flag clearing and reconciliation commit in one SQLite transaction. Failure rolls the transaction back. Starred synchronization clears stale stars in that source mailbox, rather than deleting unrelated non-starred messages. Database failure tests deliberately abort writes after reconciliation has started.
 
@@ -33,26 +33,103 @@ refresh, credential writes, and encryption-key updates share account serializati
 No Keychain read or browser-token refresh runs on the UI thread.
 
 Polling coalesces in-flight requests by account and mailbox, independently of
-global UI busy state. A sync keeps the newest 300 messages' flags current; the
-list always shows every cached message in the mailbox.
+global UI busy state. While the server limits an account (see Gmail below),
+automatic checks, the catalog and body downloads pause; explicit refreshes and
+opening a message still try.
 
-## Catalog
+## Incremental synchronization
 
-There is no "Load more" step. After a mailbox syncs, `Backend::catalog` lists
-the rest of it in the background, 500 headers per request, newest first: it
-searches the mailbox (within the account's sync window), fetches headers only
-for UIDs that are not cached yet, and commits them through the same snapshot
-transaction, so expunged mail is still reconciled. Each batch reports
-`cataloged`/`total`, the list shows that progress at its foot, and the next
-batch starts until the catalog is complete. One catalog runs per mailbox and
-shares the account's serialization. POP3 has no header-only listing, so older
-messages are downloaded whole, 25 at a time. The list loads cached messages
-without bodies (`Store::summaries`); opening a message reads its body. When
-the list reloads, its scroll position stays on the same message. Inbox polling timestamps only advance for inbox checks; refreshing
-other folders cannot postpone inbox checks indefinitely. Each account has its
-own body-download worker, with account locks released between small batches.
-Download errors retain their account/cause; selecting a stale or inaccessible
-mailbox no longer silently pauses the downloader.
+Each server mailbox's last synchronization is saved in `mailbox_state`
+(UIDVALIDITY, UIDNEXT, message count, HIGHESTMODSEQ, sync window), only after
+the mail it describes has committed. A check SELECTs the mailbox (with
+`(CONDSTORE)` when advertised) and then asks only for what changed:
+
+- New mail: `UID FETCH <old UIDNEXT>:*`, keeping only UIDs at or above it
+  (`n:*` always returns the newest message).
+- Flags: with CONDSTORE, `UID FETCH 1:* (UID FLAGS) (CHANGEDSINCE <modseq>)`,
+  or nothing when HIGHESTMODSEQ is unchanged; without it, the flags of the
+  newest cached messages.
+- Removals: without QRESYNC there is no list of expunged UIDs, but the count
+  shows them. If EXISTS is not the old count plus the new messages, the check
+  falls back to the full SEARCH snapshot above, which reconciles them.
+
+The full snapshot also runs on the first check, after UIDVALIDITY or the sync
+window changes, without UIDNEXT, or when more new mail arrived than a check
+lists (the catalog lists the rest). A confirmed MOVE lowers the source's saved
+count, so moving mail does not force the next check into a search. An
+unchanged mailbox costs one SELECT.
+
+## Connections
+
+Each account keeps one signed-in IMAP connection (`connection.rs`), taken by
+an operation under the account lock and put back when it succeeds. A failed
+operation drops it. A connection idle for 20 seconds is checked with NOOP
+before use, so STORE/MOVE (never replayed) are not sent on a closed one; after
+ten idle minutes it is replaced. The mailbox list (LIST) is read once per
+connection except by sync, which refreshes the folder list, and a mailbox stays
+selected between operations. Replacing an account's sign-in or removing it
+signs the connection out.
+
+## Catalog and placeholder rows
+
+There is no "Load more" step. The first full snapshot's SEARCH is the
+mailbox's *layout*: every UID within the sync window, held in memory per
+account and mailbox, updated by later checks and moves, and replaced when
+UIDVALIDITY or the window changes. The message list draws a row for each
+UID from the start (`Backend::listed`): cached messages, and placeholders
+for the rest, in arrival (UID) order, newest first, so rows keep their places
+and the scrollbar covers the whole mailbox while headers load. Without a
+layout (Starred, POP3, before the first check) the list is cached mail by
+date, as before.
+
+Placeholders around the visible rows are listed first (`Backend::fill`, only
+the latest visible range is kept while one request runs). `Backend::catalog`
+lists the rest in the background, 200 headers per request, newest first,
+reusing the layout rather than searching again; if no layout matches it
+searches once and reconciles the cache with the result. Listed messages
+replace their placeholders in place; a changed layout reloads the list.
+Placeholders cannot be opened or selected, and filters and searches show only
+listed mail. POP3 has no header-only listing, so older messages are
+downloaded whole, 25 at a time.
+
+Headers are fetched as `BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE
+MESSAGE-ID CONTENT-TYPE)]` with FLAGS, RFC822.SIZE and INTERNALDATE. Full
+headers (Received, DKIM and ARC chains) are often several times larger and
+are only needed once a message is opened, when its whole source downloads.
+The list loads cached messages without bodies (`Store::summaries`); opening a
+message reads its body. When the list reloads, its scroll position stays on
+the same message. Inbox polling timestamps only advance for inbox checks;
+refreshing other folders cannot postpone inbox checks indefinitely.
+
+## Bodies
+
+Each account has its own body-download worker, with account locks released
+between small batches. Only messages inside the account's offline range
+(Settings → "Download for offline reading": one month by default, one year,
+all, or only when opened) download ahead of time; the rest download when
+opened. Download errors retain their account/cause; selecting a stale or
+inaccessible mailbox no longer silently pauses the downloader.
+
+## Gmail
+
+Gmail exposes labels as folders, so one message appears in INBOX, All Mail
+and each label. With `X-GM-EXT-1`, header listing also reads `X-GM-MSGID`,
+Gmail's permanent per-message id (`Mail::gmail_id`). Body downloads skip a
+message whose id is already downloading, copy content already downloaded
+under another label (`Store::share_gmail_raw`), and opening a message uses
+such a copy instead of the network. The id is server-assigned, so unlike
+Message-ID a sender cannot make two different messages share one. Parsing
+it needs the vendored `imap-proto` patch (`vendor/imap-proto/README.md`).
+
+Gmail allows 2,500 MB of IMAP downloads per account per day and then slows
+the account to a crawl. Background traffic (headers and bodies) is counted per
+account per UTC day; at 1 GB the catalog and body downloads stop until the
+next day, leaving room for opening messages and other mail apps. Responses
+that report a server limit (`[THROTTLED]`, `[OVERQUOTA]`, "bandwidth limits",
+"Too many simultaneous connections", `[UNAVAILABLE]`) pause background work
+for the account for ten minutes, doubling while they continue (up to four
+hours), and are shown as a typed `Throttled` account issue rather than a
+connection failure.
 
 - Account operations serialize, including token refresh and local changes. Separate accounts can continue independently.
 - Read-only mailbox synchronization retries once on a fresh connection after a transient I/O failure, with a 250 ms delay. Protocol rejection, malformed responses, authentication rejection and certificate failures are not automatically replayed. The normal polling schedule or an explicit refresh can try again later.
@@ -64,7 +141,7 @@ mailbox no longer silently pauses the downloader.
 
 TCP attempts have a shared 12-second budget after name resolution, with at most three seconds per address. Verified TLS is mandatory, including STARTTLS; rejection never falls back to plaintext. The socket has a 30-second inactivity timeout. A wire wrapper adds a 90-second response budget and a 32 MiB byte budget between outgoing writes, including TLS framing. This bounds the IMAP library's otherwise unbounded response buffering, even when a peer lies about RFC822.SIZE. TLS handshake writes can also restart this wire budget. The decoded-message limit remains 25 MiB. POP3 status lines and multiline responses have separate length/completeness checks.
 
-System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. IDLE, QRESYNC/CONDSTORE, persistent sessions, resumable partial MIME downloads, and an offline mutation queue remain future work. Polling performs full searches; this task does not claim best-in-class throughput on very large mailboxes.
+System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. IDLE, QRESYNC, ESEARCH and COMPRESS=DEFLATE (neither `imap` 2.4 nor its parser support the last two), resumable partial MIME downloads, and an offline mutation queue remain future work. Removals still cost one full SEARCH, since Gmail offers no QRESYNC.
 
 ## Reference implementation review
 

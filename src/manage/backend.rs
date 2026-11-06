@@ -15,9 +15,15 @@ use std::{
 use zeroize::Zeroize;
 
 use crate::sync::transport::*;
+#[path = "connection.rs"]
+mod connection;
+use connection::{Connection, Limits};
 #[cfg(test)]
 #[path = "dovecot_tests.rs"]
 mod dovecot_tests;
+#[cfg(test)]
+#[path = "incremental_tests.rs"]
+mod incremental_tests;
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
@@ -31,12 +37,31 @@ pub enum Change {
     Move(Folder),
 }
 /// How much of a mailbox has been listed on this computer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct Catalog {
     pub cataloged: usize,
     pub total: usize,
+    /// Messages this request listed.
+    pub added: Vec<Mail>,
+    /// Every message in the mailbox, for drawing rows not yet listed.
+    pub layout: Option<Layout>,
+}
+/// The UIDs of every message in a server mailbox (within the sync window),
+/// oldest first: one row each, in arrival order, before their headers load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub remote: String,
+    pub validity: u32,
+    days: u32,
+    pub uids: Arc<Vec<u32>>,
+}
+impl Layout {
+    pub fn id(&self, account: &str, uid: u32) -> String {
+        format!("{account}:{}:{}:{uid}", self.remote, self.validity)
+    }
 }
 impl Catalog {
+    #[cfg(test)]
     pub fn complete(&self) -> bool {
         self.cataloged >= self.total
     }
@@ -51,6 +76,11 @@ pub struct Backend {
     /// Decrypted Pinal messages by id. Memory only: the cache on disk keeps
     /// them encrypted, so reloads from it get their bodies back from here.
     readable: Mutex<HashMap<String, Mail>>,
+    /// Signed-in IMAP connections by account; see `connection.rs`.
+    connections: Mutex<HashMap<String, Connection>>,
+    limits: Mutex<Limits>,
+    /// Mailbox layouts by (account, mailbox key), from the latest search.
+    layouts: Mutex<HashMap<(String, String), Layout>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -64,6 +94,9 @@ impl Backend {
             credentials: Mutex::new(HashMap::new()),
             mail_keys: Mutex::new(HashMap::new()),
             readable: Mutex::new(HashMap::new()),
+            connections: Mutex::new(HashMap::new()),
+            limits: Mutex::new(Limits::default()),
+            layouts: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -176,6 +209,8 @@ impl Backend {
             let _ = session.logout();
         }
         ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+        // A replaced sign-in must not keep using the old session.
+        self.disconnect(&account.id);
         self.save_credentials(&account.id, &secret)?;
         self.store.save_account(&account)?;
         Ok(account)
@@ -233,6 +268,11 @@ impl Backend {
     pub fn remove_account(&self, id: &str) -> Result<()> {
         let lock = self.account_lock(id);
         let _operation = lock.lock().unwrap();
+        self.disconnect(id);
+        self.layouts
+            .lock()
+            .unwrap()
+            .retain(|(account, _), _| account != id);
         self.store.remove_account(id)?;
         self.credentials.lock().unwrap().remove(id);
         self.mail_keys.lock().unwrap().remove(id);
@@ -386,18 +426,21 @@ impl Backend {
     }
     fn sync_once(&self, a: &Account, mailbox: &Mailbox, limit: usize) -> Result<Vec<Mail>> {
         let folder = mailbox.folder();
-        let secret = self.credentials(a)?;
         if a.provider == Provider::Pop3 {
+            let secret = self.credentials(a)?;
             return self.sync_pop(a, folder, limit, &secret.password);
         }
         if folder == Folder::Drafts {
             return Ok(vec![]);
         }
-        let mut session = self.imap_login(a, &secret)?;
-        let names = list(&mut session)?;
-        let _ = self.store.save_folders(&a.id, &custom_folders(&names));
-        let mut result = Vec::new();
-        if folder == Folder::Starred {
+        self.with_imap(a, |c| {
+            // One LIST per sync keeps the folder list current.
+            let names = c.names(true)?.to_vec();
+            let _ = self.store.save_folders(&a.id, &custom_folders(&names));
+            if folder != Folder::Starred {
+                let remote = remote_name(&names, a, mailbox)?;
+                return self.sync_remote(c, a, mailbox, &remote, limit);
+            }
             let folders = if a.provider == Provider::Gmail {
                 vec![Folder::Archive]
             } else {
@@ -409,6 +452,7 @@ impl Backend {
                     Folder::Trash,
                 ]
             };
+            let mut result = Vec::new();
             let mut visited = std::collections::HashSet::new();
             for source in folders {
                 let remote = match resolve_in(&names, a.provider, source) {
@@ -417,11 +461,13 @@ impl Backend {
                     Err(e) => return Err(e),
                 };
                 if visited.insert(remote.clone()) {
-                    result.extend(self.fetch_mailbox(
-                        &mut session,
+                    let selected = c.select(&remote)?;
+                    result.extend(self.full_sync(
+                        c,
                         a,
                         &source.into(),
                         &remote,
+                        &selected,
                         true,
                         limit,
                     )?);
@@ -437,11 +483,105 @@ impl Backend {
                 })
             });
             result.truncate(limit);
+            Ok(result)
+        })
+    }
+    /// Brings one server mailbox's cache up to date. After a first full
+    /// synchronization, later ones ask only for what changed: messages past
+    /// the last UIDNEXT, flags changed since the last HIGHESTMODSEQ (or the
+    /// newest flags, without CONDSTORE), and a full search only when the
+    /// message count shows something was removed.
+    fn sync_remote(
+        &self,
+        c: &mut Connection,
+        a: &Account,
+        mailbox: &Mailbox,
+        remote: &str,
+        limit: usize,
+    ) -> Result<Vec<Mail>> {
+        let selected = c.select(remote)?;
+        let state = self.store.mailbox_state(&a.id, remote)?;
+        let Some((state, uid_next)) = state.zip(selected.uid_next).filter(|(state, next)| {
+            state.validity == selected.validity
+                && state.days == a.sync.days
+                && state.uid_next > 0
+                && *next >= state.uid_next
+                // Many new messages: list the newest; the catalog lists the rest.
+                && selected.exists <= state.exists.saturating_add(limit as u32)
+        }) else {
+            return self.full_sync(c, a, mailbox, remote, &selected, false, limit);
+        };
+        let validity = selected.validity;
+        let fresh = if uid_next > state.uid_next && selected.exists > 0 {
+            // "n:*" always includes the newest message, even below n.
+            self.list_messages(
+                c,
+                a,
+                mailbox.folder(),
+                remote,
+                validity,
+                &format!("{}:*", state.uid_next),
+                |uid| uid >= state.uid_next,
+            )?
         } else {
-            let remote = remote_name(&names, a, mailbox)?;
-            result = self.fetch_mailbox(&mut session, a, mailbox, &remote, false, limit)?;
+            Vec::new()
+        };
+        // Without removals, the count grows by exactly the new messages.
+        if selected.exists != state.exists.saturating_add(fresh.len() as u32) {
+            return self.full_sync(c, a, mailbox, remote, &selected, false, limit);
         }
-        let _ = session.logout();
+        let prefix = format!("{}:{remote}:{validity}:", a.id);
+        let condstore = c.extensions()?.condstore;
+        let rows = match (state.modseq, selected.modseq) {
+            (Some(old), Some(new)) if condstore => {
+                if new == old {
+                    Vec::new()
+                } else {
+                    uid_fetch_rows(
+                        &mut c.session,
+                        "1:*",
+                        &format!("(UID FLAGS) (CHANGEDSINCE {old})"),
+                    )?
+                }
+            }
+            _ => {
+                let newest: Vec<u32> = self
+                    .store
+                    .messages(&a.id, mailbox, limit)?
+                    .into_iter()
+                    .filter(|m| m.id.starts_with(&prefix))
+                    .map(|m| m.uid)
+                    .collect();
+                if newest.is_empty() {
+                    Vec::new()
+                } else {
+                    uid_fetch_rows(&mut c.session, &uid_ranges(&newest), "(UID FLAGS)")?
+                }
+            }
+        };
+        let flags: Vec<(u32, bool, bool)> = rows
+            .iter()
+            .filter(|r| r.flags.is_some())
+            .map(|r| (r.uid, !r.seen(), r.flagged()))
+            .collect();
+        let before = (a.sync.days > 0)
+            .then(|| chrono::Utc::now().timestamp() - i64::from(a.sync.days) * 86_400);
+        self.store
+            .apply_changes(mailbox, &a.id, &prefix, &fresh, &flags, before)?;
+        self.store.save_mailbox_state(
+            &a.id,
+            remote,
+            Some(&store::MailboxState {
+                validity,
+                uid_next,
+                exists: selected.exists,
+                modseq: selected.modseq,
+                days: a.sync.days,
+            }),
+        )?;
+        self.extend_layout(a, mailbox, validity, fresh.iter().map(|m| m.uid), &[]);
+        let mut result = self.store.messages(&a.id, mailbox, limit)?;
+        result.retain(|m| m.id.starts_with(&prefix));
         Ok(result)
     }
     /// Catalogs up to `batch` more of a mailbox's headers, newest first,
@@ -471,70 +611,214 @@ impl Backend {
         if matches!(folder, Folder::Drafts | Folder::Starred) {
             return Ok(Catalog::default());
         }
-        let secret = self.credentials(a)?;
+        self.ensure_background(a)?;
         if a.provider == Provider::Pop3 {
+            let secret = self.credentials(a)?;
             return self.catalog_pop(a, folder, batch, &secret.password);
         }
-        let mut session = self.imap_login(a, &secret)?;
-        let names = list(&mut session)?;
-        let remote = remote_name(&names, a, mailbox)?;
-        let selected = session.select(&remote)?;
-        let validity = selected
-            .uid_validity
-            .filter(|v| *v > 0)
-            .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
-        let mut query = "ALL".to_owned();
-        if a.sync.days > 0 {
-            let since = chrono::Utc::now() - chrono::Duration::days(a.sync.days.into());
-            query = format!("{query} SINCE {}", since.format("%-d-%b-%Y"));
-        }
-        let mut uids: Vec<_> = session.uid_search(&query)?.into_iter().collect();
-        ensure!(
-            uids.iter().all(|uid| *uid > 0),
-            "Invalid IMAP UID in search response"
-        );
-        uids.sort_unstable();
-        let prefix = format!("{}:{remote}:{validity}:", a.id);
+        self.with_imap(a, |c| {
+            let remote = remote_name(c.names(false)?, a, mailbox)?;
+            let selected = c.selected(&remote)?;
+            let layout = self.layout_for(c, a, mailbox, &remote, &selected)?;
+            let prefix = format!("{}:{remote}:{}:", a.id, layout.validity);
+            let cached = self.store.cached_ids(&a.id, &prefix)?;
+            let missing: Vec<u32> = layout
+                .uids
+                .iter()
+                .copied()
+                .filter(|uid| !cached.contains(&format!("{prefix}{uid}")))
+                .collect();
+            let next = &missing[missing.len().saturating_sub(batch)..];
+            let added = self.list_uids(c, a, folder, &remote, layout.validity, next)?;
+            // UIDs expunged since SEARCH have no headers; the next search drops
+            // them. A batch with no headers at all would never finish.
+            ensure!(
+                next.is_empty() || !added.is_empty(),
+                "The server omitted requested headers; cached mail has been kept. Refresh to retry."
+            );
+            self.store.save_messages(&added)?;
+            Ok(Catalog {
+                cataloged: layout.uids.len() - missing.len() + added.len(),
+                total: layout.uids.len(),
+                added,
+                layout: Some(layout),
+            })
+        })
+    }
+    /// Lists specific messages of a mailbox now, for rows the list is
+    /// showing before the catalog reaches them.
+    pub fn fill(
+        &self,
+        a: &Account,
+        mailbox: &Mailbox,
+        layout: &Layout,
+        uids: &[u32],
+    ) -> Result<Vec<Mail>> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let prefix = format!("{}:{}:{}:", a.id, layout.remote, layout.validity);
         let cached = self.store.cached_ids(&a.id, &prefix)?;
-        let all_ids: Vec<String> = uids.iter().map(|uid| format!("{prefix}{uid}")).collect();
-        let missing: Vec<u32> = uids
+        let wanted: Vec<u32> = uids
             .iter()
-            .zip(&all_ids)
-            .filter(|(_, id)| !cached.contains(*id))
-            .map(|(uid, _)| *uid)
+            .copied()
+            .filter(|uid| !cached.contains(&format!("{prefix}{uid}")))
             .collect();
-        let next = &missing[missing.len().saturating_sub(batch)..];
-        let result = fetch_headers(
-            &mut session,
-            a,
-            folder,
-            &remote,
-            validity,
-            next,
-            &HashMap::new(),
-        )?;
-        // UIDs expunged since SEARCH have no headers; the next search drops
-        // them. A batch with no headers at all would never finish.
-        ensure!(
-            next.is_empty() || !result.is_empty(),
-            "The server omitted requested headers; cached mail has been kept. Refresh to retry."
-        );
+        if wanted.is_empty() || a.provider == Provider::Pop3 {
+            return Ok(Vec::new());
+        }
+        self.with_imap(a, |c| {
+            let selected = c.selected(&layout.remote)?;
+            ensure!(
+                selected.validity == layout.validity,
+                "The server reset this mailbox's message identities. Refresh this mailbox."
+            );
+            let added = self.list_uids(
+                c,
+                a,
+                mailbox.folder(),
+                &layout.remote,
+                layout.validity,
+                &wanted,
+            )?;
+            self.store.save_messages(&added)?;
+            Ok(added)
+        })
+    }
+    /// What the message list shows for a mailbox: its cached messages and,
+    /// once its layout is known, a placeholder for every message not listed
+    /// yet, all in arrival order (newest first) so rows keep their places
+    /// as they load. Without a layout, cached messages are newest first.
+    pub fn listed(&self, account: &str, mailbox: &Mailbox) -> Result<(Vec<Mail>, Option<Layout>)> {
+        let mut messages = self.store.summaries(account, mailbox.clone())?;
+        let layout = self.layout(account, mailbox);
+        if let Some(layout) = &layout {
+            let prefix = layout.id(account, 0);
+            let prefix = &prefix[..prefix.len() - 1];
+            let listed: std::collections::HashSet<u32> = messages
+                .iter()
+                .filter(|m| m.id.starts_with(prefix))
+                .map(|m| m.uid)
+                .collect();
+            messages.extend(
+                layout
+                    .uids
+                    .iter()
+                    .filter(|uid| !listed.contains(uid))
+                    .map(|uid| {
+                        Mail::placeholder(
+                            layout.id(account, *uid),
+                            account,
+                            mailbox,
+                            &layout.remote,
+                            *uid,
+                        )
+                    }),
+            );
+            // This generation by UID; anything else (not yet reconciled) after.
+            messages.sort_by_key(|m| {
+                let current = m.id.starts_with(prefix);
+                (
+                    !current,
+                    std::cmp::Reverse(if current { i64::from(m.uid) } else { m.date }),
+                )
+            });
+        }
+        Ok((messages, layout))
+    }
+    /// The latest layout of a mailbox, if one is known.
+    pub fn layout(&self, account: &str, mailbox: &Mailbox) -> Option<Layout> {
+        self.layouts
+            .lock()
+            .unwrap()
+            .get(&(account.to_owned(), mailbox.key()))
+            .cloned()
+    }
+    /// Searches the mailbox once per generation (not once per batch), and
+    /// reconciles the cache with what the search found.
+    fn layout_for(
+        &self,
+        c: &mut Connection,
+        a: &Account,
+        mailbox: &Mailbox,
+        remote: &str,
+        selected: &crate::sync::transport::Selected,
+    ) -> Result<Layout> {
+        if let Some(layout) = self.layout(&a.id, mailbox).filter(|l| {
+            l.remote == remote && l.validity == selected.validity && l.days == a.sync.days
+        }) {
+            return Ok(layout);
+        }
+        let uids = search(&mut c.session, a, false)?;
+        let all_ids: Vec<String> = uids
+            .iter()
+            .map(|uid| format!("{}:{remote}:{}:{uid}", a.id, selected.validity))
+            .collect();
         self.store.apply_snapshot(
             &store::MailboxSnapshot {
                 account: &a.id,
                 mailbox,
-                remote: &remote,
-                validity,
+                remote,
+                validity: selected.validity,
                 ids: &all_ids,
                 starred_only: false,
             },
-            &result,
+            &[],
         )?;
-        let _ = session.logout();
-        Ok(Catalog {
-            cataloged: uids.len() - missing.len() + result.len(),
-            total: uids.len(),
-        })
+        Ok(self.set_layout(a, mailbox, remote, selected.validity, uids))
+    }
+    fn set_layout(
+        &self,
+        a: &Account,
+        mailbox: &Mailbox,
+        remote: &str,
+        validity: u32,
+        uids: Vec<u32>,
+    ) -> Layout {
+        let layout = Layout {
+            remote: remote.into(),
+            validity,
+            days: a.sync.days,
+            uids: Arc::new(uids),
+        };
+        self.layouts
+            .lock()
+            .unwrap()
+            .insert((a.id.clone(), mailbox.key()), layout.clone());
+        layout
+    }
+    /// Gives a mailbox a layout without a server, for display tests.
+    #[cfg(test)]
+    pub fn set_test_layout(
+        &self,
+        a: &Account,
+        mailbox: &Mailbox,
+        remote: &str,
+        validity: u32,
+        uids: Vec<u32>,
+    ) {
+        self.set_layout(a, mailbox, remote, validity, uids);
+    }
+    /// Adds new and removes moved messages in a known layout.
+    fn extend_layout(
+        &self,
+        a: &Account,
+        mailbox: &Mailbox,
+        validity: u32,
+        added: impl Iterator<Item = u32>,
+        removed: &[u32],
+    ) {
+        let mut layouts = self.layouts.lock().unwrap();
+        let Some(layout) = layouts.get_mut(&(a.id.clone(), mailbox.key())) else {
+            return;
+        };
+        if layout.validity != validity {
+            return;
+        }
+        let mut uids: Vec<u32> = layout.uids.iter().copied().chain(added).collect();
+        uids.retain(|uid| !removed.contains(uid));
+        uids.sort_unstable();
+        uids.dedup();
+        layout.uids = Arc::new(uids);
     }
     /// POP3 has no headers-only listing, so older messages are downloaded
     /// whole, a small batch at a time. Originals stay on the server.
@@ -571,55 +855,74 @@ impl Backend {
         Ok(Catalog {
             cataloged: ids.len() - missing.len() + fetched,
             total: ids.len(),
+            ..Default::default()
         })
     }
-    fn fetch_mailbox(
+    /// Searches the whole mailbox (within the sync window), lists the newest
+    /// `limit` messages that are not cached, refreshes the flags of the cached
+    /// ones among them, and reconciles removals: the first synchronization of
+    /// a mailbox, and the fallback when changes cannot be read incrementally.
+    #[allow(clippy::too_many_arguments)]
+    fn full_sync(
         &self,
-        session: &mut ImapSession,
+        c: &mut Connection,
         a: &Account,
         mailbox: &Mailbox,
         remote: &str,
+        selected: &crate::sync::transport::Selected,
         starred_only: bool,
         limit: usize,
     ) -> Result<Vec<Mail>> {
         let folder = mailbox.folder();
-        let selected = session.select(remote)?;
-        let validity = selected
-            .uid_validity
-            .filter(|v| *v > 0)
-            .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
-        let mut query = if starred_only { "FLAGGED" } else { "ALL" }.to_owned();
-        if a.sync.days > 0 {
-            // Older mail stays on the server; reconciling drops it from the cache.
-            let since = chrono::Utc::now() - chrono::Duration::days(a.sync.days.into());
-            query = format!("{query} SINCE {}", since.format("%-d-%b-%Y"));
-        }
-        let mut uids: Vec<_> = session.uid_search(&query)?.into_iter().collect();
-        ensure!(
-            uids.iter().all(|uid| *uid > 0),
-            "Invalid IMAP UID in search response"
-        );
-        uids.sort_unstable();
-        let mut all_ids: Vec<_> = uids
+        let validity = selected.validity;
+        let all = search(&mut c.session, a, starred_only)?;
+        let mut all_ids: Vec<_> = all
             .iter()
             .map(|uid| format!("{}:{remote}:{validity}:{uid}", a.id))
             .collect();
-        let start = uids.len().saturating_sub(limit);
-        let uids = &uids[start..];
-        let cached: HashMap<_, _> = self
-            .store
-            .messages(&a.id, mailbox, 5000)?
-            .into_iter()
-            .map(|m| (m.id.clone(), m))
-            .collect();
-        let result = fetch_headers(session, a, folder, remote, validity, uids, &cached)?;
-        let mut result = result;
-        if result.len() != uids.len() {
+        let newest = &all[all.len().saturating_sub(limit)..];
+        // Only the newest rows are refreshed; do not load a whole cataloged
+        // mailbox to find them.
+        let mut cached: HashMap<u32, Mail> = HashMap::new();
+        for uid in newest {
+            if let Some(m) = self
+                .store
+                .message(&format!("{}:{remote}:{validity}:{uid}", a.id))?
+            {
+                cached.insert(*uid, m);
+            }
+        }
+        let (known, unknown): (Vec<u32>, Vec<u32>) =
+            newest.iter().partition(|uid| cached.contains_key(uid));
+        let mut result = self.list_uids(c, a, folder, remote, validity, &unknown)?;
+        for chunk in known.chunks(500) {
+            for row in uid_fetch_rows(&mut c.session, &uid_ranges(chunk), "(UID FLAGS)")? {
+                // Unsolicited updates for other messages are not part of this.
+                if !chunk.contains(&row.uid) || row.flags.is_none() {
+                    continue;
+                }
+                let Some(old) = cached.get(&row.uid) else {
+                    continue;
+                };
+                ensure!(
+                    !result.iter().any(|m: &Mail| m.uid == row.uid),
+                    "Duplicate IMAP flags response"
+                );
+                let mut m = old.clone();
+                m.unread = !row.seen();
+                m.starred = row.flagged();
+                result.push(m);
+            }
+        }
+        if result.len() != newest.len() {
             // An expunge can race SEARCH/FETCH. Confirm vanished UIDs before
             // removing them; an incomplete successful FETCH is not a snapshot.
-            let current = session.uid_search(&query)?;
+            let current: std::collections::HashSet<u32> = search(&mut c.session, a, starred_only)?
+                .into_iter()
+                .collect();
             ensure!(
-                uids.iter()
+                newest
+                    .iter()
                     .all(|uid| !current.contains(uid) || result.iter().any(|m| m.uid == *uid)),
                 "The server omitted requested headers; cached mail has been kept. Refresh to retry."
             );
@@ -642,6 +945,22 @@ impl Backend {
             },
             &result,
         )?;
+        if !starred_only {
+            let state = selected.uid_next.map(|uid_next| store::MailboxState {
+                validity,
+                uid_next,
+                exists: selected.exists,
+                modseq: selected.modseq,
+                days: a.sync.days,
+            });
+            self.store
+                .save_mailbox_state(&a.id, remote, state.as_ref())?;
+            let uids = all_ids
+                .iter()
+                .filter_map(|id| id.rsplit(':').next()?.parse().ok())
+                .collect();
+            self.set_layout(a, mailbox, remote, validity, uids);
+        }
         let keep: std::collections::HashSet<_> = all_ids.iter().collect();
         let prefix = format!("{}:{remote}:{validity}:", a.id);
         self.readable.lock().unwrap().retain(|id, m| {
@@ -650,6 +969,80 @@ impl Backend {
                 || (id.starts_with(&prefix) && (starred_only || keep.contains(id)))
         });
         result.sort_by_key(|m| std::cmp::Reverse(m.date));
+        Ok(result)
+    }
+    /// Lists messages by UID, 100 per request.
+    fn list_uids(
+        &self,
+        c: &mut Connection,
+        a: &Account,
+        folder: Folder,
+        remote: &str,
+        validity: u32,
+        uids: &[u32],
+    ) -> Result<Vec<Mail>> {
+        let mut result = Vec::new();
+        for chunk in uids.chunks(100) {
+            result.extend(self.list_messages(
+                c,
+                a,
+                folder,
+                remote,
+                validity,
+                &uid_ranges(chunk),
+                |uid| chunk.contains(&uid),
+            )?);
+        }
+        Ok(result)
+    }
+    /// Headers (only the fields the list shows), flags, size and arrival date
+    /// for the messages in `set` that `wanted` accepts. On Gmail this also
+    /// reads each message's permanent id, which is shared across labels.
+    #[allow(clippy::too_many_arguments)]
+    fn list_messages(
+        &self,
+        c: &mut Connection,
+        a: &Account,
+        folder: Folder,
+        remote: &str,
+        validity: u32,
+        set: &str,
+        wanted: impl Fn(u32) -> bool,
+    ) -> Result<Vec<Mail>> {
+        if set.is_empty() {
+            return Ok(Vec::new());
+        }
+        let gmail = c.extensions()?.gmail;
+        let items = format!(
+            "(UID FLAGS RFC822.SIZE INTERNALDATE{} {LIST_HEADERS})",
+            if gmail { " X-GM-MSGID" } else { "" }
+        );
+        let rows = uid_fetch_rows(&mut c.session, set, &items)?;
+        let mut result: Vec<Mail> = Vec::new();
+        let mut bytes = 0;
+        for row in rows {
+            // Unsolicited flag updates are legal during FETCH. They are
+            // not downloaded headers and must not create or replace mail.
+            let Some(header) = row.header.as_deref().filter(|_| wanted(row.uid)) else {
+                continue;
+            };
+            ensure!(
+                !result.iter().any(|m| m.uid == row.uid),
+                "Duplicate IMAP header response"
+            );
+            bytes += header.len();
+            let id = format!("{}:{remote}:{validity}:{}", a.id, row.uid);
+            let mut m = parse_message(header, a, &id, folder, remote, row.uid)?;
+            m.unread = !row.seen();
+            m.starred = row.flagged();
+            m.size = row.size.unwrap_or(0);
+            m.gmail_id = row.gmail_id.unwrap_or(0);
+            if m.date == 0 {
+                m.date = row.internal_date.unwrap_or_default();
+            }
+            result.push(m);
+        }
+        self.note_traffic(a, bytes);
         Ok(result)
     }
     fn sync_pop(
@@ -697,6 +1090,17 @@ impl Backend {
         }
         Ok(messages)
     }
+    /// The message exactly as the server delivered it, downloading it first
+    /// when only its headers are cached.
+    pub fn original(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
+        if let Some(raw) = self.store.raw(&m.id)? {
+            return Ok(raw);
+        }
+        self.read(a, m)?;
+        self.store
+            .raw(&m.id)?
+            .context("The original message is not available offline.")
+    }
     pub fn read(&self, a: &Account, m: &Mail) -> Result<Mail> {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -713,18 +1117,24 @@ impl Backend {
                 a.provider != Provider::Pop3,
                 "Message is not cached. Refresh the mailbox."
             );
-            let secret = self.credentials(a)?;
-            let mut session = self.imap_login(a, &secret)?;
-            select_message_mailbox(&mut session, m)?;
-            let fetched = session.uid_fetch(m.uid.to_string(), "(UID BODY.PEEK[])")?;
-            let raw = fetched
-                .iter()
-                .filter(|f| f.uid == Some(m.uid))
-                .find_map(|f| f.body())
-                .context("Message no longer exists on the server")?
-                .to_vec();
-            ensure!(raw.len() <= MAX_MESSAGE, "Message exceeds the 25 MB limit.");
-            let _ = session.logout();
+            let raw = match self.store.gmail_raw(&a.id, m.gmail_id)? {
+                // The same Gmail message, already downloaded under another label.
+                Some(raw) => raw,
+                None => self.with_imap(a, |c| {
+                    c.select_for(m)?;
+                    let fetched = c
+                        .session
+                        .uid_fetch(m.uid.to_string(), "(UID BODY.PEEK[])")?;
+                    let raw = fetched
+                        .iter()
+                        .filter(|f| f.uid == Some(m.uid))
+                        .find_map(|f| f.body())
+                        .context("Message no longer exists on the server")?
+                        .to_vec();
+                    ensure!(raw.len() <= MAX_MESSAGE, "Message exceeds the 25 MB limit.");
+                    Ok(raw)
+                })?,
+            };
             self.store.save_raw(&m.id, &raw)?;
             raw
         };
@@ -775,81 +1185,103 @@ impl Backend {
             return Ok(());
         }
         if a.provider != Provider::Pop3 {
-            let secret = self.credentials(a)?;
-            let mut session = self.imap_login(a, &secret)?;
-            let target = match change {
-                Change::Move(folder) => {
-                    // UID MOVE is atomic and does not expunge unrelated deleted messages.
-                    let caps = session.capabilities()?;
-                    ensure!(
-                        caps.has_str("MOVE"),
-                        "This server does not support safe message moves (IMAP MOVE)."
-                    );
-                    Some(resolve_folder(&mut session, a.provider, folder)?)
-                }
-                _ => None,
-            };
-            let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
-            for m in &current {
-                match groups.iter_mut().find(|(first, _)| {
-                    first.remote_folder == m.remote_folder && same_validity(first, m)
-                }) {
-                    Some((_, uids)) => uids.push(m.uid),
-                    None => groups.push((m, vec![m.uid])),
-                }
-            }
-            for (first, uids) in groups {
-                select_message_mailbox(&mut session, first)?;
-                for chunk in uids.chunks(200) {
-                    let set = uid_set(chunk);
-                    match change {
-                        Change::Read(read) => {
-                            session.uid_store(
-                                &set,
-                                if read {
-                                    "+FLAGS.SILENT (\\Seen)"
-                                } else {
-                                    "-FLAGS.SILENT (\\Seen)"
-                                },
-                            )?;
-                        }
-                        Change::Star(star) => {
-                            session.uid_store(
-                                &set,
-                                if star {
-                                    "+FLAGS.SILENT (\\Flagged)"
-                                } else {
-                                    "-FLAGS.SILENT (\\Flagged)"
-                                },
-                            )?;
-                        }
-                        Change::Move(_) => {
-                            let escaped = target
-                                .as_deref()
-                                .unwrap_or_default()
-                                .replace('\\', "\\\\")
-                                .replace('"', "\\\"");
-                            session.run_command_and_check_ok(format!(
-                                "UID MOVE {set} \"{escaped}\""
-                            ))?;
-                        }
-                    }
-                    let confirmed: Vec<_> = current
-                        .iter()
-                        .filter(|m| {
-                            m.remote_folder == first.remote_folder
-                                && same_validity(m, first)
-                                && chunk.contains(&m.uid)
-                        })
-                        .cloned()
-                        .collect();
-                    self.commit_change(&confirmed, change, true)?;
-                }
-            }
-            let _ = session.logout();
-            return Ok(());
+            return self.with_imap(a, |c| self.change_remote(c, a, &current, change));
         }
         self.commit_change(&current, change, false)
+    }
+    fn change_remote(
+        &self,
+        c: &mut Connection,
+        a: &Account,
+        current: &[Mail],
+        change: Change,
+    ) -> Result<()> {
+        let target = match change {
+            Change::Move(folder) => {
+                // UID MOVE is atomic and does not expunge unrelated deleted messages.
+                let caps = c.session.capabilities()?;
+                ensure!(
+                    caps.has_str("MOVE"),
+                    "This server does not support safe message moves (IMAP MOVE)."
+                );
+                Some(resolve_in(c.names(false)?, a.provider, folder)?)
+            }
+            _ => None,
+        };
+        let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
+        for m in current {
+            match groups.iter_mut().find(|(first, _)| {
+                first.remote_folder == m.remote_folder && same_validity(first, m)
+            }) {
+                Some((_, uids)) => uids.push(m.uid),
+                None => groups.push((m, vec![m.uid])),
+            }
+        }
+        for (first, uids) in groups {
+            let selected = c.select_for(first)?;
+            for chunk in uids.chunks(200) {
+                let set = uid_set(chunk);
+                match change {
+                    Change::Read(read) => {
+                        c.session.uid_store(
+                            &set,
+                            if read {
+                                "+FLAGS.SILENT (\\Seen)"
+                            } else {
+                                "-FLAGS.SILENT (\\Seen)"
+                            },
+                        )?;
+                    }
+                    Change::Star(star) => {
+                        c.session.uid_store(
+                            &set,
+                            if star {
+                                "+FLAGS.SILENT (\\Flagged)"
+                            } else {
+                                "-FLAGS.SILENT (\\Flagged)"
+                            },
+                        )?;
+                    }
+                    Change::Move(_) => {
+                        c.session.run_command_and_check_ok(format!(
+                            "UID MOVE {set} {}",
+                            quote(target.as_deref().unwrap_or_default())?
+                        ))?;
+                        // The source mailbox now has fewer messages; keep its
+                        // saved state in step so the next check stays incremental.
+                        if let Some(mut state) =
+                            self.store.mailbox_state(&a.id, &first.remote_folder)?
+                            && state.validity == selected.validity
+                        {
+                            state.exists = state.exists.saturating_sub(chunk.len() as u32);
+                            self.store.save_mailbox_state(
+                                &a.id,
+                                &first.remote_folder,
+                                Some(&state),
+                            )?;
+                        }
+                        self.extend_layout(
+                            a,
+                            &first.mailbox(),
+                            selected.validity,
+                            std::iter::empty(),
+                            chunk,
+                        );
+                    }
+                }
+                let confirmed: Vec<_> = current
+                    .iter()
+                    .filter(|m| {
+                        m.remote_folder == first.remote_folder
+                            && same_validity(m, first)
+                            && chunk.contains(&m.uid)
+                    })
+                    .cloned()
+                    .collect();
+                self.commit_change(&confirmed, change, true)?;
+            }
+        }
+        Ok(())
     }
     fn commit_change(&self, current: &[Mail], change: Change, remote: bool) -> Result<()> {
         let updated: Vec<_> = current
@@ -876,18 +1308,16 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         if a.provider != Provider::Pop3 && mailbox.folder() != Folder::Drafts {
-            let secret = self.credentials(a)?;
-            let mut session = self.imap_login(a, &secret)?;
-            let remote = match mailbox {
-                Mailbox::Remote(name) => name.clone(),
-                Mailbox::Standard(folder) => resolve_folder(&mut session, a.provider, *folder)?,
-            };
-            session.select(&remote)?;
-            let unseen: Vec<u32> = session.uid_search("UNSEEN")?.into_iter().collect();
-            if !unseen.is_empty() {
-                session.uid_store(uid_set(&unseen), "+FLAGS.SILENT (\\Seen)")?;
-            }
-            let _ = session.logout();
+            self.with_imap(a, |c| {
+                let remote = remote_name(c.names(false)?, a, mailbox)?;
+                c.selected(&remote)?;
+                let unseen: Vec<u32> = c.session.uid_search("UNSEEN")?.into_iter().collect();
+                if !unseen.is_empty() {
+                    c.session
+                        .uid_store(uid_ranges(&unseen), "+FLAGS.SILENT (\\Seen)")?;
+                }
+                Ok(())
+            })?;
         }
         let mut cached = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
         cached.retain(|m| m.unread);
@@ -902,22 +1332,35 @@ impl Backend {
         if a.provider == Provider::Pop3 {
             return Ok(0);
         }
+        // Only mail inside the account's offline range downloads ahead of
+        // time; the rest downloads when it is opened.
+        let Some(since) = a.sync.offline_since(chrono::Utc::now().timestamp()) else {
+            return Ok(0);
+        };
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        self.ensure_background(a)?;
+        // A Gmail message appears once per label; download it only once.
+        let shared = if a.provider == Provider::Gmail {
+            self.store.share_gmail_raw(&a.id)?
+        } else {
+            0
+        };
         let mut budget = 12 * 1024 * 1024usize;
-        let mut pending = Vec::new();
-        for m in self.store.missing(&a.id, MAX_MESSAGE, max)? {
+        let mut pending: Vec<Mail> = Vec::new();
+        for m in self.store.missing(&a.id, MAX_MESSAGE, max, since)? {
             if !pending.is_empty() && m.size as usize > budget {
                 break;
+            }
+            if m.gmail_id != 0 && pending.iter().any(|p| p.gmail_id == m.gmail_id) {
+                continue;
             }
             budget = budget.saturating_sub(m.size as usize);
             pending.push(m);
         }
         if pending.is_empty() {
-            return Ok(0);
+            return Ok(shared);
         }
-        let secret = self.credentials(a)?;
-        let mut session = self.imap_login(a, &secret)?;
         let mut groups: Vec<Vec<&Mail>> = Vec::new();
         for m in &pending {
             match groups
@@ -928,50 +1371,53 @@ impl Backend {
                 None => groups.push(vec![m]),
             }
         }
-        let mut stored = 0;
-        for group in groups {
-            select_message_mailbox(&mut session, group[0]).context(
-                "Could not download messages from their mailbox. Refresh that mailbox first.",
-            )?;
-            let uids: Vec<u32> = group.iter().map(|m| m.uid).collect();
-            for chunk in uids.chunks(10) {
-                for f in session
-                    .uid_fetch(uid_set(chunk), "(UID BODY.PEEK[])")?
-                    .iter()
-                {
-                    let (Some(uid), Some(raw)) = (f.uid, f.body()) else {
-                        continue;
-                    };
-                    let Some(m) = group.iter().find(|m| m.uid == uid) else {
-                        continue;
-                    };
-                    if raw.len() > MAX_MESSAGE {
-                        continue;
-                    }
-                    self.store.save_raw(&m.id, raw)?;
-                    // Encrypted mail stays ciphertext on disk; it is read on open.
-                    if crate::manage::crypto::encrypted_part(raw).is_some() {
-                        stored += 1;
-                        continue;
-                    }
-                    // Keep summaries small: list views load every row's JSON.
-                    if let Ok(parsed) =
-                        parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid)
+        self.with_imap(a, |c| {
+            let mut stored = shared;
+            for group in groups {
+                c.select_for(group[0]).context(
+                    "Could not download messages from their mailbox. Refresh that mailbox first.",
+                )?;
+                let uids: Vec<u32> = group.iter().map(|m| m.uid).collect();
+                for chunk in uids.chunks(10) {
+                    for f in c
+                        .session
+                        .uid_fetch(uid_set(chunk), "(UID BODY.PEEK[])")?
+                        .iter()
                     {
-                        let mut next = (*m).clone();
-                        next.has_attachments = !parsed.attachments.is_empty();
-                        next.attachments = parsed.attachments;
-                        if next.snippet.is_empty() {
-                            next.snippet = parsed.snippet;
+                        let (Some(uid), Some(raw)) = (f.uid, f.body()) else {
+                            continue;
+                        };
+                        let Some(m) = group.iter().find(|m| m.uid == uid) else {
+                            continue;
+                        };
+                        self.note_traffic(a, raw.len());
+                        if raw.len() > MAX_MESSAGE {
+                            continue;
                         }
-                        self.store.save_messages(&[next])?;
+                        self.store.save_raw(&m.id, raw)?;
+                        // Encrypted mail stays ciphertext on disk; it is read on open.
+                        if crate::manage::crypto::encrypted_part(raw).is_some() {
+                            stored += 1;
+                            continue;
+                        }
+                        // Keep summaries small: list views load every row's JSON.
+                        if let Ok(parsed) =
+                            parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid)
+                        {
+                            let mut next = (*m).clone();
+                            next.has_attachments = !parsed.attachments.is_empty();
+                            next.attachments = parsed.attachments;
+                            if next.snippet.is_empty() {
+                                next.snippet = parsed.snippet;
+                            }
+                            self.store.save_messages(&[next])?;
+                        }
+                        stored += 1;
                     }
-                    stored += 1;
                 }
             }
-        }
-        let _ = session.logout();
-        Ok(stored)
+            Ok(stored)
+        })
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
         let lock = self.account_lock(&a.id);
@@ -991,17 +1437,16 @@ impl Backend {
         };
         let message = crate::sync::smtp::deliver(a, d, &secret, tls)?;
         // Gmail and Outlook save sent messages themselves. Custom IMAP servers do not.
-        if a.provider == Provider::Imap
-            && let Ok(mut session) = self.imap_login(a, &secret)
-        {
-            if let Ok(sent) = resolve_folder(&mut session, a.provider, Folder::Sent) {
-                let _ = session.append_with_flags(
+        if a.provider == Provider::Imap {
+            let _ = self.with_imap(a, |c| {
+                let sent = resolve_in(c.names(false)?, a.provider, Folder::Sent)?;
+                c.session.append_with_flags(
                     sent,
                     message.formatted(),
                     &[imap::types::Flag::Seen],
-                );
-            }
-            let _ = session.logout();
+                )?;
+                Ok(())
+            });
         }
         // SMTP acceptance is the delivery boundary. Do not report a send failure
         // after this point, which could encourage a duplicate transmission.
@@ -1033,66 +1478,22 @@ impl Backend {
     }
 }
 
-/// Headers, flags and sizes for `uids` in the selected mailbox. Messages
-/// already cached keep their parsed fields; bodies are fetched when opened.
-fn fetch_headers(
-    session: &mut ImapSession,
-    a: &Account,
-    folder: Folder,
-    remote: &str,
-    validity: u32,
-    uids: &[u32],
-    cached: &HashMap<String, Mail>,
-) -> Result<Vec<Mail>> {
-    let mut result = Vec::new();
-    // Batch headers; message bodies and attachments are fetched only when opened.
-    for chunk in uids.chunks(100) {
-        let set = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        for f in session
-            .uid_fetch(
-                set,
-                "(UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER])",
-            )?
-            .iter()
-        {
-            let Some(uid) = f.uid else {
-                continue;
-            };
-            // Unsolicited flag updates are legal during FETCH. They are
-            // not downloaded headers and must not create or replace mail.
-            if !chunk.contains(&uid) || f.header().is_none() {
-                continue;
-            }
-            ensure!(
-                !result.iter().any(|m: &Mail| m.uid == uid),
-                "Duplicate IMAP header response"
-            );
-            let id = format!("{}:{remote}:{validity}:{uid}", a.id);
-            let mut m = if let Some(old) = cached.get(&id) {
-                old.clone()
-            } else {
-                parse_message(f.header().unwrap_or_default(), a, &id, folder, remote, uid)?
-            };
-            m.unread = !f
-                .flags()
-                .iter()
-                .any(|v| matches!(v, imap::types::Flag::Seen));
-            m.starred = f
-                .flags()
-                .iter()
-                .any(|v| matches!(v, imap::types::Flag::Flagged));
-            m.size = f.size.unwrap_or(0);
-            if m.date == 0 {
-                m.date = f.internal_date().map(|d| d.timestamp()).unwrap_or_default();
-            }
-            result.push(m);
-        }
+/// UIDs of the selected mailbox's messages within the account's sync
+/// window (only flagged ones for Starred), oldest first.
+fn search(session: &mut ImapSession, a: &Account, starred_only: bool) -> Result<Vec<u32>> {
+    let mut query = if starred_only { "FLAGGED" } else { "ALL" }.to_owned();
+    if a.sync.days > 0 {
+        // Older mail stays on the server; reconciling drops it from the cache.
+        let since = chrono::Utc::now() - chrono::Duration::days(a.sync.days.into());
+        query = format!("{query} SINCE {}", since.format("%-d-%b-%Y"));
     }
-    Ok(result)
+    let mut uids: Vec<_> = session.uid_search(&query)?.into_iter().collect();
+    ensure!(
+        uids.iter().all(|uid| *uid > 0),
+        "Invalid IMAP UID in search response"
+    );
+    uids.sort_unstable();
+    Ok(uids)
 }
 
 /// The server mailbox behind a mailbox view.

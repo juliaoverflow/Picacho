@@ -24,6 +24,9 @@ impl Server {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((socket, _)) => {
+                        // Accepted sockets inherit the listener's non-blocking
+                        // mode on macOS, which breaks the TLS handshake.
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(3)))
                             .unwrap();
@@ -91,6 +94,8 @@ fn imap_server(fault: ImapFault) -> Result<(Vec<u8>, Server)> {
                 String::new()
             } else if command.starts_with("LIST ") {
                 "* LIST (\\Archive) \"/\" \"Archive\"\r\n".into()
+            } else if command == "CAPABILITY" {
+                "* CAPABILITY IMAP4rev1 MOVE\r\n".into()
             } else if command.starts_with("SELECT ") {
                 if fault.no_validity {
                     "* 1 EXISTS\r\n".into()

@@ -484,12 +484,35 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "default-remote".into());
+        let theme = self
+            .segmented(
+                "default-theme",
+                [
+                    ("Light", EmailTheme::Light),
+                    ("Dark", EmailTheme::Dark),
+                    ("Match app", EmailTheme::App),
+                ]
+                .into_iter()
+                .map(|(label, theme)| {
+                    (
+                        label.to_string(),
+                        Action::SetReadingDefaults(ReadingOptions { theme, ..options }),
+                        options.theme == theme,
+                    )
+                })
+                .collect(),
+                cx,
+            )
+            .max_w(px(300.));
         div().flex().flex_col().gap_5()
             .child(self.section("Reading"))
             .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted))
                 .child("Defaults for all accounts. Each email has its own controls above the message. Emails with saved choices keep those choices."))
             .child(self.setting(
                 "Render HTML", "Show the email's original formatting and interactive content.", html,
+            ))
+            .child(self.setting(
+                "Email colors", "Show email bodies light or dark. Emails designed for dark mode use their own dark colors; others are recolored.", theme,
             ))
             .child(self.setting(
                 "Block remote content", "Prevent images, stylesheets and fonts from contacting remote servers. Loading them may reveal that you opened an email.", remote,
@@ -647,6 +670,34 @@ impl MailApp {
                     ),
                 ),
             );
+        }
+        if a.provider != Provider::Pop3 {
+            page = page.child(self.setting(
+                "Download for offline reading",
+                "Message contents in this range download in the background. Other messages download when you open them.",
+                self.segmented(
+                    &format!("offline-{}", a.id),
+                    [
+                        (30, "1 month"),
+                        (365, "1 year"),
+                        (0, "All"),
+                        (OFFLINE_WHEN_OPENED, "When opened"),
+                    ]
+                    .into_iter()
+                    .map(|(days, label)| {
+                        (
+                            label.to_owned(),
+                            set(SyncSettings {
+                                offline_days: days,
+                                ..sync
+                            }),
+                            sync.offline_days == days,
+                        )
+                    })
+                    .collect(),
+                    cx,
+                ),
+            ));
         }
         page = page
             .child(self.setting(

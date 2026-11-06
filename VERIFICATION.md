@@ -107,3 +107,7 @@ The renderer embeds Blitz 0.3.0-beta.4's DOM/HTML/paint crates without its stand
 shell or unrestricted network client. The scoped Stylo derive patch needed to
 compile alongside GPUI is documented in `vendor/stylo_derive/README.md`; Linux's
 Fontconfig API features are aligned in Cargo.toml.
+
+## Incremental sync and Gmail limits (November 5, 2026)
+
+Verified on macOS (Apple Silicon). `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo test` pass: 70 passed, 2 ignored (live discovery, Dovecot not installed). New tests use a scripted CONDSTORE + X-GM-EXT-1 server over local TLS: an unchanged mailbox costs one SELECT; new mail and flag changes use `UID FETCH n:*` and `CHANGEDSINCE` with no SEARCH; a removal falls back to one SEARCH; everything uses one sign-in. Placeholder rows fill on demand; each Gmail message downloads once across labels; a `[THROTTLED]` reply pauses background work without contacting the server. A GPUI test draws placeholder rows and checks that they cannot be opened, selected or matched by filters. Eight reliability tests had been failing on macOS because their fixture's accepted sockets inherited non-blocking mode; the fixture now clears it, and they pass. Gmail's pre-login CAPABILITY was checked live (it lists `X-GM-EXT-1`); CONDSTORE is detected after sign-in at runtime and was not checked against a live Gmail account. The debug app launched with an empty profile; the new rows were not inspected against a real mailbox.

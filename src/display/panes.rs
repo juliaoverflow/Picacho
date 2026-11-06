@@ -7,7 +7,7 @@ pub(super) fn ease_out(t: f32) -> f32 {
 }
 
 impl MailApp {
-    fn pane_animating(since: Option<std::time::Instant>) -> bool {
+    pub(super) fn pane_animating(since: Option<std::time::Instant>) -> bool {
         since.is_some_and(|t| t.elapsed() < PANE_ANIMATION)
     }
     /// Re-renders once an animation finishes so its outgoing layer is dropped.
@@ -214,7 +214,10 @@ impl MailApp {
 pub(super) const LIST_MIN: f32 = 300.;
 /// The list's width when the reader has not been resized yet.
 const LIST_DEFAULT: f32 = 380.;
-pub(super) const READER_MIN: f32 = 420.;
+/// The narrowest reader: wide enough for the email's controls row (light
+/// or dark, formatted or plain, remote images) on one line at the narrow
+/// reader's 20-pixel margins. `reader_controls_stay_on_one_row` checks it.
+pub(super) const READER_MIN: f32 = 528.;
 /// A collapsed reader's ribbon, as wide as the sidebar rail.
 pub(super) const RIBBON: f32 = 60.;
 
@@ -499,7 +502,7 @@ impl MailApp {
 impl MailApp {
     /// The collapsed reader: actions for the open message above a soft,
     /// blurred swatch of the message's own colors.
-    pub(super) fn ribbon(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn ribbon(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors();
         let mail = self.selected_mail();
         let action = |id: &'static str, tip: &str, icon: &str, action: Action| {
@@ -571,82 +574,130 @@ impl MailApp {
                     Action::Move(Folder::Trash),
                 ));
         }
-        column.child(self.swatch(mail.as_ref()))
+        column.child(self.preview(mail.as_ref(), cx))
     }
-    /// A rounded tile of blurred color, taken from the message's HTML (or
-    /// its sender when it has none). Shadows give the blur; the tile clips.
-    fn swatch(&self, mail: Option<&Mail>) -> impl IntoElement {
+    /// The open message in miniature, filling the collapsed reader below its
+    /// actions: the HTML email itself scaled to the ribbon's width, or a
+    /// minimap of a plain text message's subject and lines. Clicking a place
+    /// in it opens the reader there.
+    fn preview(&self, mail: Option<&Mail>, cx: &mut Context<Self>) -> AnyElement {
         let c = self.colors();
-        let palette = match mail {
-            Some(m) => {
-                let mut cache = self.palette.borrow_mut();
-                let key = format!("{}:{}", m.id, m.html.as_ref().map_or(0, String::len));
-                if cache.0 != key {
-                    *cache = (key, email_palette(m.html.as_deref(), &m.from));
-                }
-                cache.1.clone()
-            }
-            None => vec![c.accent, c.soft, c.border],
-        };
-        let base = palette[0];
-        let mut tile = div()
-            .id("reader-swatch")
-            .debug_selector(|| "reader-swatch".into())
+        let tile = div()
+            .id("reader-preview")
+            .debug_selector(|| "reader-preview".into())
             .relative()
             .flex_1()
             .min_h(px(40.))
             .w(px(RIBBON - 16.))
             .mt_2()
             .mb_2()
-            .rounded(px(16.))
+            .rounded(px(10.))
             .overflow_hidden()
             .border_1()
-            .border_color(rgba((c.border << 8) | 0xb0))
-            // GPUI paints shadows beneath every fill in a layer, so the base
-            // color is a shadow too rather than the tile's background.
+            .border_color(rgb(c.border));
+        let Some(m) = mail else {
+            return tile.bg(rgb(c.bg)).into_any_element();
+        };
+        let options = self.reading_options(m);
+        let dark = self.email_dark(options);
+        let anchor = self.preview_bounds.clone();
+        let measure = canvas(move |bounds, _, _| anchor.set(bounds), |_, _, _, _| {})
+            .absolute()
+            .inset_0();
+        let anchor = self.preview_bounds.clone();
+        let reveal = move |height: f32| {
+            let anchor = anchor.clone();
+            move |this: &mut Self, e: &MouseDownEvent, w: &mut Window, cx: &mut Context<Self>| {
+                let y = f32::from(e.position.y - anchor.get().top());
+                this.handle(Action::Reveal((y / height.max(1.)).min(1.)), w, cx);
+            }
+        };
+        let tile = tile
+            .cursor_pointer()
+            .hover(move |s| s.border_color(rgb(c.accent)))
+            .tooltip(|w, cx| Tooltip::new("Open the message here").build(w, cx))
+            .child(measure);
+        if options.html
+            && let Some(html) = &m.html
+        {
+            self.html_view.update(cx, |view, cx| {
+                view.set_content(html, options.block_remote, dark, cx)
+            });
+            let view = self.html_view.read(cx);
+            let page = view.page_color();
+            let height = view.thumbnail_height();
+            let cropped =
+                height.is_some_and(|h| h > f32::from(self.preview_bounds.get().size.height));
+            return tile
+                .bg(rgb(page))
+                .on_mouse_down(MouseButton::Left, cx.listener(reveal(height.unwrap_or(1.))))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(crate::display::html::thumbnail(self.html_view.clone())),
+                )
+                // A long email fades out at the bottom of the strip.
+                .when(cropped, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(px(36.))
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(rgba(page << 8), 0.),
+                                linear_color_stop(rgba((page << 8) | 0xff), 1.),
+                            )),
+                    )
+                })
+                .into_any_element();
+        }
+        // Plain text: the subject, then a bar for each wrapped line.
+        let (bg, fg) = if dark == self.dark {
+            (c.surface, c.text)
+        } else if dark {
+            (0x1f2023, 0xe8eaed)
+        } else {
+            (0xffffff, 0x202124)
+        };
+        let lines = minimap_lines(m.body.as_deref().unwrap_or(&m.snippet));
+        const LINE: f32 = 5.;
+        let width = RIBBON - 16. - 14.;
+        let bar = move |fraction: f32, height: f32, alpha: u32| {
+            div()
+                .h(px(height))
+                .w(px((width * fraction).max(3.)))
+                .rounded_full()
+                .bg(rgba((fg << 8) | alpha))
+        };
+        let height = 26. + lines.len() as f32 * LINE;
+        tile.bg(rgb(bg))
+            .on_mouse_down(MouseButton::Left, cx.listener(reveal(height)))
             .child(
                 div()
                     .absolute()
-                    .inset_0()
-                    .rounded(px(16.))
-                    .shadow(vec![BoxShadow {
-                        color: rgb(base).into(),
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(0.),
-                        spread_radius: px(0.),
-                    }]),
-            );
-        // Shadows alone (no fill) paint soft, blurred pools of color.
-        let spots = [
-            (0.1, -0.4),
-            (0.28, 0.5),
-            (0.47, -0.3),
-            (0.64, 0.45),
-            (0.8, -0.2),
-        ];
-        for (i, (top, left)) in spots.iter().enumerate() {
-            let color = palette[(i + 1) % palette.len()];
-            tile = tile.child(
-                div()
-                    .absolute()
-                    .top(relative(*top))
-                    .left(px(left * 30. + 8.))
-                    .size(px(28.))
-                    .rounded_full()
-                    .shadow(vec![BoxShadow {
-                        color: rgb(color).into(),
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(26.),
-                        spread_radius: px(22.),
-                    }]),
-            );
-        }
-        // A frosted wash ties the colors together and keeps them quiet.
-        tile.child(div().absolute().inset_0().bg(linear_gradient(
-            180.,
-            linear_color_stop(rgba((c.surface << 8) | 0x20), 0.),
-            linear_color_stop(rgba(c.surface << 8), 1.),
-        )))
+                    .top(px(8.))
+                    .left(px(7.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(bar(
+                        (m.subject.chars().count() as f32 / 24.).min(1.),
+                        4.,
+                        0xa0,
+                    ))
+                    .child(bar(0.55, 3., 0x60))
+                    .child(div().h(px(6.)))
+                    .children(lines.into_iter().map(move |line| {
+                        div()
+                            .h(px(LINE - 3.))
+                            .when_some(line, |d, fraction| d.child(bar(fraction, 2., 0x55)))
+                    })),
+            )
+            .into_any_element()
     }
     pub(super) fn reader_toggle(&self, collapsed: bool, cx: &Context<Self>) -> Stateful<Div> {
         self.button(
@@ -668,99 +719,30 @@ impl MailApp {
     }
 }
 
-/// Up to four distinct colors that characterize an email's HTML, most used
-/// first, falling back to tones derived from the sender.
-pub(super) fn email_palette(html: Option<&str>, sender: &str) -> Vec<u32> {
-    let mut counts: Vec<(u32, usize)> = Vec::new();
-    let mut add = |color: u32| match counts.iter_mut().find(|(c, _)| *c == color) {
-        Some((_, n)) => *n += 1,
-        None => counts.push((color, 1)),
-    };
-    let text = html.unwrap_or_default();
-    let bytes = text.as_bytes();
-    let hex = |b: u8| (b as char).to_digit(16);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'#' {
-            let digits = bytes[i + 1..]
-                .iter()
-                .take_while(|b| b.is_ascii_hexdigit())
-                .count();
-            let d = |k: usize| hex(bytes[i + 1 + k]).unwrap_or(0);
-            if digits == 6 {
-                add((0..6).fold(0, |v, k| v << 4 | d(k)));
-            } else if digits == 3 {
-                add((0..3).fold(0, |v, k| (v << 8) | (d(k) * 17)));
+/// A plain text message as minimap lines: each wrapped line's length as a
+/// fraction of the widest, or None for a blank line between paragraphs.
+pub(super) fn minimap_lines(text: &str) -> Vec<Option<f32>> {
+    const WRAP: usize = 48;
+    const MAX: usize = 240;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let length = line.trim_end().chars().count();
+        if length == 0 {
+            if lines.last().is_some_and(|l: &Option<f32>| l.is_some()) {
+                lines.push(None);
             }
-            i += 1 + digits;
             continue;
         }
-        if bytes.len() - i > 4
-            && bytes[i..i + 4].eq_ignore_ascii_case(b"rgb(")
-            && let Some(end) = text[i..].find(')')
-        {
-            let parts: Vec<u32> = text[i + 4..i + end]
-                .split(',')
-                .take(3)
-                .filter_map(|p| p.trim().parse::<f32>().ok())
-                .map(|v| v.clamp(0., 255.) as u32)
-                .collect();
-            if let [r, g, b] = parts[..] {
-                add((r << 16) | (g << 8) | b);
-            }
-            i += end;
-            continue;
-        }
-        i += 1;
-    }
-    let channels = |c: u32| {
-        (
-            (c >> 16) as i32 & 255,
-            (c >> 8) as i32 & 255,
-            c as i32 & 255,
-        )
-    };
-    let colorful = |c: u32| {
-        let (r, g, b) = channels(c);
-        let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
-        hi - lo > 40 && hi > 60
-    };
-    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
-    let mut palette: Vec<u32> = Vec::new();
-    for (color, _) in counts.iter().filter(|(c, _)| colorful(*c)) {
-        let (r, g, b) = channels(*color);
-        let distinct = palette.iter().all(|p| {
-            let (pr, pg, pb) = channels(*p);
-            (pr - r).abs() + (pg - g).abs() + (pb - b).abs() > 60
-        });
-        if distinct {
-            palette.push(*color);
-        }
-        if palette.len() == 4 {
-            break;
+        let mut rest = length;
+        while rest > 0 && lines.len() < MAX {
+            let part = rest.min(WRAP);
+            // Wrapped lines run full width; a paragraph's last line is shorter.
+            lines.push(Some(part as f32 / WRAP as f32));
+            rest -= part;
         }
     }
-    if palette.is_empty() {
-        // Sender tones: one hue from the address, at three lightnesses.
-        let hue = sender
-            .bytes()
-            .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b.into()))
-            % 360;
-        palette = [(0.45, 0.55), (0.62, 0.5), (0.35, 0.7)]
-            .iter()
-            .enumerate()
-            .map(|(k, (l, s))| {
-                let rgba = hsla(((hue + k as u32 * 40) % 360) as f32 / 360., *s, *l, 1.).to_rgb();
-                ((rgba.r * 255.) as u32) << 16
-                    | ((rgba.g * 255.) as u32) << 8
-                    | (rgba.b * 255.) as u32
-            })
-            .collect();
-    }
-    while palette.len() < 3 {
-        palette.push(palette[palette.len() - 1]);
-    }
-    palette
+    lines.truncate(MAX);
+    lines
 }
 
 /// A vertically scrolling area with a scrollbar over its right edge. The
@@ -787,24 +769,12 @@ pub(super) fn scroll_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::email_palette;
+    use super::minimap_lines;
 
     #[test]
-    fn palette_prefers_frequent_saturated_html_colors() {
-        let html = r##"<body style="background:#ffffff;color:#222"><div bgcolor="#1f4e5f">
-            <p style="color:#e07a5f">x</p><p style="color:#E07A5F">y</p><a style="background:rgb(129, 178, 154)">z</a>"##;
-        let palette = email_palette(Some(html), "a@b.c");
-        assert_eq!(palette[0], 0xe07a5f);
-        assert!(palette.contains(&0x1f4e5f));
-        assert!(palette.contains(&0x81b29a));
-        assert!(!palette.contains(&0xffffff));
-    }
-
-    #[test]
-    fn palette_falls_back_to_sender_tones() {
-        let a = email_palette(None, "mara@example.org");
-        assert_eq!(a.len(), 3);
-        assert_eq!(a, email_palette(Some("<p>plain</p>"), "mara@example.org"));
-        assert_ne!(a, email_palette(None, "owen@example.org"));
+    fn minimap_wraps_long_lines_and_keeps_one_gap_between_paragraphs() {
+        let lines = minimap_lines(&format!("{}\n\n\n\nshort\n", "x".repeat(60)));
+        assert_eq!(lines, vec![Some(1.), Some(12. / 48.), None, Some(5. / 48.)]);
+        assert!(minimap_lines(&"word ".repeat(100_000)).len() <= 240);
     }
 }

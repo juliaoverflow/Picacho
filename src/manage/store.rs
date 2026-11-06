@@ -25,7 +25,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, account TEXT NOT NULL, folder TEXT NOT NULL, date INTEGER NOT NULL, data TEXT NOT NULL, raw BLOB);
             CREATE INDEX IF NOT EXISTS mailbox ON messages(account, folder, date DESC);
             CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, account TEXT NOT NULL, data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));")?;
         Ok(Self {
             db: Mutex::new(db),
             path: path.into(),
@@ -58,7 +59,7 @@ impl Store {
         tx.execute(
             "DELETE FROM preferences WHERE substr(key,1,8)='reading:' AND json_valid(substr(key,9)) AND json_extract(substr(key,9),'$[0]')=?1", [id],
         )?;
-        for table in ["accounts", "messages", "drafts"] {
+        for table in ["accounts", "messages", "drafts", "mailbox_state"] {
             tx.execute(
                 &format!(
                     "DELETE FROM {table} WHERE {}=?1",
@@ -294,25 +295,159 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    /// Messages whose full content has not been downloaded yet, newest first.
-    pub fn missing(&self, account: &str, max_size: usize, limit: usize) -> Result<Vec<Mail>> {
+    /// Messages dated `since` or later whose full content has not been
+    /// downloaded yet, newest first.
+    pub fn missing(
+        &self,
+        account: &str,
+        max_size: usize,
+        limit: usize,
+        since: i64,
+    ) -> Result<Vec<Mail>> {
         let db = self.db.lock().unwrap();
         let mut q = db.prepare(
-            "SELECT data FROM messages WHERE account=?1 AND raw IS NULL
+            "SELECT data FROM messages WHERE account=?1 AND raw IS NULL AND date >= ?4
              AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC LIMIT ?3",
         )?;
-        q.query_map(params![account, max_size, limit], |r| r.get::<_, String>(0))?
-            .map(|r| Ok(serde_json::from_str(&r?)?))
-            .collect()
+        q.query_map(params![account, max_size, limit, since], |r| {
+            r.get::<_, String>(0)
+        })?
+        .map(|r| Ok(serde_json::from_str(&r?)?))
+        .collect()
     }
-    /// Total and not-yet-downloaded message counts across all accounts.
-    pub fn download_counts(&self, max_size: usize) -> Result<(usize, usize)> {
-        Ok(self.db.lock().unwrap().query_row(
+    /// Messages that download in the background, and how many of those have
+    /// not yet, across accounts. `since` gives each account's oldest date;
+    /// accounts that download only on open are left out.
+    pub fn download_counts(
+        &self,
+        max_size: usize,
+        since: &[(String, i64)],
+    ) -> Result<(usize, usize)> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
             "SELECT COUNT(*), COALESCE(SUM(raw IS NULL),0) FROM messages
-             WHERE json_extract(data,'$.size') <= ?1",
-            [max_size],
-            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+             WHERE account=?1 AND date >= ?3 AND json_extract(data,'$.size') <= ?2",
+        )?;
+        let mut totals = (0, 0);
+        for (account, since) in since {
+            let (total, missing) = q.query_row(params![account, max_size, since], |r| {
+                Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
+            })?;
+            totals.0 += total;
+            totals.1 += missing;
+        }
+        Ok(totals)
+    }
+    /// Copies already-downloaded content to other copies of the same Gmail
+    /// message (one per label). Returns how many copies were filled.
+    pub fn share_gmail_raw(&self, account: &str) -> Result<usize> {
+        Ok(self.db.lock().unwrap().execute(
+            "UPDATE messages SET raw=(SELECT o.raw FROM messages o WHERE o.account=messages.account
+                 AND o.raw IS NOT NULL AND json_extract(o.data,'$.gmail_id')=json_extract(messages.data,'$.gmail_id') LIMIT 1)
+             WHERE account=?1 AND raw IS NULL AND json_extract(data,'$.gmail_id') > 0
+               AND EXISTS (SELECT 1 FROM messages o WHERE o.account=messages.account AND o.raw IS NOT NULL
+                 AND json_extract(o.data,'$.gmail_id')=json_extract(messages.data,'$.gmail_id'))",
+            [account],
         )?)
+    }
+    /// Downloaded content of another copy of a Gmail message, if any.
+    pub fn gmail_raw(&self, account: &str, gmail_id: u64) -> Result<Option<Vec<u8>>> {
+        use rusqlite::OptionalExtension;
+        if gmail_id == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT raw FROM messages WHERE account=?1 AND raw IS NOT NULL
+                 AND json_extract(data,'$.gmail_id')=?2 LIMIT 1",
+                params![account, gmail_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    /// What the last synchronization of a server mailbox saw.
+    pub fn mailbox_state(&self, account: &str, remote: &str) -> Result<Option<MailboxState>> {
+        use rusqlite::OptionalExtension;
+        let data: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT data FROM mailbox_state WHERE account=?1 AND remote=?2",
+                params![account, remote],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+    }
+    /// Saved only after the mail it describes has been committed.
+    pub fn save_mailbox_state(
+        &self,
+        account: &str,
+        remote: &str,
+        state: Option<&MailboxState>,
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        match state {
+            Some(state) => db.execute(
+                "INSERT OR REPLACE INTO mailbox_state VALUES (?1,?2,?3)",
+                params![account, remote, serde_json::to_string(state)?],
+            )?,
+            None => db.execute(
+                "DELETE FROM mailbox_state WHERE account=?1 AND remote=?2",
+                params![account, remote],
+            )?,
+        };
+        Ok(())
+    }
+    /// Commits one incremental synchronization: new messages, flag changes
+    /// for cached ones (by UID, within `prefix`'s generation), and removal of
+    /// mail older than the account's sync window (`before`).
+    pub fn apply_changes(
+        &self,
+        mailbox: &Mailbox,
+        account: &str,
+        prefix: &str,
+        fresh: &[Mail],
+        flags: &[(u32, bool, bool)],
+        before: Option<i64>,
+    ) -> Result<()> {
+        ensure!(
+            fresh
+                .iter()
+                .all(|m| m.account == account && m.id.starts_with(prefix)),
+            "Invalid mailbox update"
+        );
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        write_messages(&tx, fresh)?;
+        for (uid, unread, starred) in flags {
+            let id = format!("{prefix}{uid}");
+            let data: Option<String> = {
+                use rusqlite::OptionalExtension;
+                tx.query_row("SELECT data FROM messages WHERE id=?1", [&id], |r| r.get(0))
+                    .optional()?
+            };
+            if let Some(data) = data {
+                let mut mail: Mail = serde_json::from_str(&data)?;
+                if (mail.unread, mail.starred) != (*unread, *starred) {
+                    mail.unread = *unread;
+                    mail.starred = *starred;
+                    write_messages(&tx, &[mail])?;
+                }
+            }
+        }
+        if let Some(before) = before {
+            tx.execute(
+                "DELETE FROM messages WHERE account=?1 AND folder=?2 AND date < ?3",
+                params![account, mailbox.key(), before],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
     /// Unread counts keyed by (account, mailbox key).
     pub fn unread_counts(&self) -> Result<HashMap<(String, String), usize>> {
@@ -414,8 +549,15 @@ mod tests {
         s.save_raw(&ms[0].id, b"raw")?;
         assert_eq!(s.raw(&ms[0].id)?, Some(b"raw".to_vec()));
         assert_eq!(s.messages("demo", Folder::Starred, 300)?.len(), 2);
-        assert_eq!(s.download_counts(1 << 20)?, (10, 9));
-        assert_eq!(s.missing("demo", 1 << 20, 100)?.len(), 9);
+        let everything = [("demo".to_owned(), i64::MIN)];
+        assert_eq!(s.download_counts(1 << 20, &everything)?, (10, 9));
+        assert_eq!(s.missing("demo", 1 << 20, 100, i64::MIN)?.len(), 9);
+        // Only mail inside an account's offline range downloads ahead.
+        let newest = ms.iter().map(|m| m.date).max().unwrap();
+        let recent = [("demo".to_owned(), newest)];
+        assert!(s.download_counts(1 << 20, &recent)?.0 < 10);
+        assert!(s.missing("demo", 1 << 20, 100, newest)?.len() < 9);
+        assert_eq!(s.download_counts(1 << 20, &[])?, (0, 0));
         assert_eq!(s.unread_counts()?[&("demo".into(), "inbox".into())], 2);
         let mut other = ms[1].clone();
         other.id = "remote-1".into();
@@ -459,6 +601,18 @@ mod tests {
 }
 
 /// Inputs validated before a mailbox snapshot is committed.
+/// A server mailbox as of its last synchronization: enough to ask only for
+/// what changed since (new UIDs, CONDSTORE flag changes, removals).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MailboxState {
+    pub validity: u32,
+    pub uid_next: u32,
+    pub exists: u32,
+    #[serde(default)]
+    pub modseq: Option<u64>,
+    /// The account's sync window (days) these results used.
+    pub days: u32,
+}
 pub struct MailboxSnapshot<'a> {
     pub account: &'a str,
     pub mailbox: &'a Mailbox,

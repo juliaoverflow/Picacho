@@ -80,6 +80,8 @@ pub fn parse_message(
         attachments,
         message_id: header("Message-ID"),
         has_attachments,
+        gmail_id: 0,
+        pending: false,
     })
 }
 pub(crate) fn collect_leaves<'a>(
@@ -162,5 +164,177 @@ mod tests {
         let mut old = serde_json::to_value(&m).unwrap();
         old.as_object_mut().unwrap().remove("html");
         assert!(serde_json::from_value::<Mail>(old).unwrap().html.is_none());
+    }
+}
+
+/// What a reader shows under "details": addressing, the sending domains and
+/// how the message was protected in transit and by its sender.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Details {
+    pub from: String,
+    pub reply_to: String,
+    pub to: String,
+    pub cc: String,
+    pub date: String,
+    pub subject: String,
+    pub message_id: String,
+    /// The envelope sender's domain (SPF's `smtp.mailfrom`, else Return-Path).
+    pub mailed_by: Option<String>,
+    /// Domains whose DKIM signatures cover the message.
+    pub signed_by: Vec<String>,
+    pub spf: Option<String>,
+    pub dkim: Option<String>,
+    pub dmarc: Option<String>,
+    pub security: Security,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Security {
+    /// The message itself is encrypted (OpenPGP or S/MIME).
+    EndToEnd,
+    /// The last hop into the mailbox used TLS.
+    Tls,
+    /// The last hop is recorded and did not use TLS.
+    Plain,
+    #[default]
+    Unknown,
+}
+impl Security {
+    pub fn label(self) -> &'static str {
+        match self {
+            Security::EndToEnd => "End-to-end encryption",
+            Security::Tls => "Standard encryption (TLS)",
+            Security::Plain => "Not encrypted in transit",
+            Security::Unknown => "Not recorded",
+        }
+    }
+}
+
+fn domain_of(address: &str) -> Option<String> {
+    let address = address
+        .trim()
+        .trim_matches(|c| c == '<' || c == '>' || c == '"');
+    let domain = address.rsplit_once('@').map_or(address, |(_, d)| d);
+    let domain = domain
+        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    (!domain.is_empty() && domain.contains('.')).then_some(domain)
+}
+/// The value after `key=` in an Authentication-Results or DKIM header.
+fn property<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(key) {
+        let start = from + i;
+        let boundary = start == 0
+            || matches!(
+                lower.as_bytes()[start - 1],
+                b' ' | b'\t' | b'\r' | b'\n' | b';'
+            );
+        let after = start + key.len();
+        if boundary && lower[after..].trim_start().starts_with('=') {
+            let rest = lower[after..].trim_start()[1..].trim_start();
+            let offset = text.len() - rest.len();
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == ';' || c == ')' || c == '(')
+                .unwrap_or(rest.len());
+            return Some(&text[offset..offset + end]);
+        }
+        from = start + key.len();
+    }
+    None
+}
+
+pub fn details(raw: &[u8]) -> Details {
+    let Ok((headers, _)) = mailparse::parse_headers(raw) else {
+        return Details::default();
+    };
+    let one = |name: &str| headers.get_first_value(name).unwrap_or_default();
+    let all = |name: &str| headers.get_all_values(name);
+    // The topmost results were added by the receiving server; later ones may
+    // be forged by the sender.
+    let results = all("Authentication-Results")
+        .into_iter()
+        .chain(all("ARC-Authentication-Results"))
+        .next()
+        .unwrap_or_default();
+    let verdict = |key: &str| property(&results, key).map(|v| v.to_ascii_lowercase());
+    let mut signed_by: Vec<String> = Vec::new();
+    for signature in all("DKIM-Signature") {
+        if let Some(d) = property(&signature, "d").and_then(domain_of)
+            && !signed_by.contains(&d)
+        {
+            signed_by.push(d);
+        }
+    }
+    // When the receiver verified DKIM, show the domain it vouched for first.
+    if verdict("dkim").as_deref() == Some("pass")
+        && let Some(d) = property(&results, "header.d")
+            .or_else(|| property(&results, "header.i"))
+            .and_then(domain_of)
+    {
+        signed_by.retain(|s| s != &d);
+        signed_by.insert(0, d);
+    }
+    let mailed_by = property(&results, "smtp.mailfrom")
+        .and_then(domain_of)
+        .or_else(|| domain_of(&one("Return-Path")));
+    let content_type = one("Content-Type").to_ascii_lowercase();
+    let security = if content_type.contains("multipart/encrypted")
+        || content_type.contains("application/pkcs7-mime")
+        || crate::manage::crypto::encrypted_part(raw).is_some()
+    {
+        Security::EndToEnd
+    } else if let Some(hop) = all("Received").into_iter().next() {
+        let hop = hop.to_ascii_lowercase();
+        if hop.contains("esmtps")
+            || hop.contains("esmtpsa")
+            || hop.contains("tls")
+            || hop.contains("cipher=")
+            || hop.contains("https")
+        {
+            Security::Tls
+        } else {
+            Security::Plain
+        }
+    } else {
+        Security::Unknown
+    };
+    Details {
+        from: one("From"),
+        reply_to: one("Reply-To"),
+        to: one("To"),
+        cc: one("Cc"),
+        date: one("Date"),
+        subject: one("Subject"),
+        message_id: one("Message-ID"),
+        mailed_by,
+        signed_by,
+        spf: verdict("spf"),
+        dkim: verdict("dkim"),
+        dmarc: verdict("dmarc"),
+        security,
+    }
+}
+
+#[cfg(test)]
+mod details_tests {
+    use super::*;
+    #[test]
+    fn reads_sending_domains_verdicts_and_transport_security() {
+        let raw = b"Received: from mail.example.com (mail.example.com [192.0.2.1])\r\n\tby mx.local with ESMTPS id abc\r\n\t(version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384);\r\n\tMon, 1 Jan 2024 00:00:00 +0000\r\nAuthentication-Results: mx.local;\r\n\tdkim=pass header.i=@news.example.com header.s=s1;\r\n\tspf=pass (sender ok) smtp.mailfrom=bounce@bounces.example.com;\r\n\tdmarc=pass (p=REJECT) header.from=example.com\r\nDKIM-Signature: v=1; a=rsa-sha256; d=esp.example.net; s=k;\r\nDKIM-Signature: v=1; a=rsa-sha256; d=news.example.com; s=s1;\r\nReturn-Path: <other@elsewhere.org>\r\nFrom: News <hi@example.com>\r\nSubject: Hello\r\n\r\nBody";
+        let d = details(raw);
+        assert_eq!(d.mailed_by.as_deref(), Some("bounces.example.com"));
+        assert_eq!(d.signed_by, vec!["news.example.com", "esp.example.net"]);
+        assert_eq!(d.spf.as_deref(), Some("pass"));
+        assert_eq!(d.dkim.as_deref(), Some("pass"));
+        assert_eq!(d.dmarc.as_deref(), Some("pass"));
+        assert_eq!(d.security, Security::Tls);
+        assert_eq!(d.subject, "Hello");
+        let plain =
+            details(b"Received: from a by b with SMTP; x\r\nReturn-Path: <x@plain.org>\r\n\r\n");
+        assert_eq!(plain.security, Security::Plain);
+        assert_eq!(plain.mailed_by.as_deref(), Some("plain.org"));
+        assert_eq!(plain.spf, None);
     }
 }

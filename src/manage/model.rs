@@ -161,6 +161,26 @@ pub struct SyncSettings {
     /// Minutes between checks for new mail; 0 checks only on request.
     pub refresh_minutes: u32,
     pub notify: bool,
+    /// Message contents from the last this many days download in the
+    /// background; 0 downloads all of them, `OFFLINE_WHEN_OPENED` none.
+    /// Anything else downloads when it is opened.
+    #[serde(default = "default_offline_days")]
+    pub offline_days: u32,
+}
+/// `SyncSettings::offline_days`: download message contents only when opened.
+pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
+fn default_offline_days() -> u32 {
+    30
+}
+impl SyncSettings {
+    /// The oldest date whose contents download in the background, if any do.
+    pub fn offline_since(&self, now: i64) -> Option<i64> {
+        match self.offline_days {
+            OFFLINE_WHEN_OPENED => None,
+            0 => Some(i64::MIN),
+            days => Some(now - i64::from(days) * 86_400),
+        }
+    }
 }
 impl Default for SyncSettings {
     fn default() -> Self {
@@ -168,6 +188,7 @@ impl Default for SyncSettings {
             days: 0,
             refresh_minutes: 5,
             notify: true,
+            offline_days: default_offline_days(),
         }
     }
 }
@@ -380,8 +401,50 @@ pub struct Mail {
     pub message_id: String,
     #[serde(default)]
     pub has_attachments: bool,
+    /// Gmail's permanent id, shared by the copies under each label; 0 elsewhere.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gmail_id: u64,
+    /// A row the list knows exists on the server but has not listed yet.
+    /// Never stored; the list draws it as a placeholder until it loads.
+    #[serde(skip)]
+    pub pending: bool,
+}
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 impl Mail {
+    /// A row for a message the server has that is not listed here yet.
+    pub fn placeholder(
+        id: String,
+        account: &str,
+        mailbox: &Mailbox,
+        remote: &str,
+        uid: u32,
+    ) -> Self {
+        Self {
+            id,
+            account: account.into(),
+            folder: mailbox.folder(),
+            remote_folder: remote.into(),
+            uid,
+            from: String::new(),
+            sender: String::new(),
+            to: String::new(),
+            subject: String::new(),
+            snippet: String::new(),
+            date: 0,
+            unread: false,
+            starred: false,
+            size: 0,
+            body: None,
+            html: None,
+            attachments: Vec::new(),
+            message_id: String::new(),
+            has_attachments: false,
+            gmail_id: 0,
+            pending: true,
+        }
+    }
     pub fn mailbox(&self) -> Mailbox {
         if self.folder == Folder::Other {
             Mailbox::Remote(self.remote_folder.clone())
@@ -539,6 +602,8 @@ pub fn demo_mail() -> Vec<Mail> {
             attachments: vec![],
             message_id: String::new(),
             has_attachments: i == 2,
+            gmail_id: 0,
+            pending: false,
         })
         .collect()
 }

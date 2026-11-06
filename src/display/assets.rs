@@ -55,6 +55,17 @@ impl AssetSource for Assets {
             "mail/monitor.svg" => {
                 Some("<rect x='2' y='4' width='20' height='13' rx='2'/><path d='M8 21h8M12 17v4'/>")
             }
+            "mail/image.svg" => Some(
+                "<rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='9' cy='9' r='2'/><path d='m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21'/>",
+            ),
+            "mail/image-off.svg" => Some(
+                "<path d='M2 2l20 20M10.4 3H19a2 2 0 0 1 2 2v8.6M21 18.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5c0-.6.2-1 .6-1.4M6 21l7.6-7.6'/>",
+            ),
+            "mail/code.svg" => Some("<path d='m16 18 6-6-6-6M8 6l-6 6 6 6'/>"),
+            "mail/text.svg" => Some("<path d='M4 6h16M4 12h16M4 18h10'/>"),
+            "mail/formatted.svg" => {
+                Some("<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M3 9h18M9 21V9'/>")
+            }
             "mail/lock.svg" => Some(
                 "<rect x='4' y='10' width='16' height='11' rx='2'/><path d='M8 10V7a4 4 0 0 1 8 0v3'/>",
             ),

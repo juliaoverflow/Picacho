@@ -82,6 +82,16 @@ pub(super) fn backend(cert: &[u8]) -> Result<(Backend, Account, PathBuf)> {
 }
 use std::path::PathBuf;
 
+/// UIDs in an IMAP set such as "1:3,7".
+pub(super) fn expand(set: &str) -> Vec<u32> {
+    set.split(',')
+        .flat_map(|part| match part.split_once(':') {
+            Some((a, b)) => (a.parse::<u32>().unwrap()..=b.parse::<u32>().unwrap()).collect(),
+            None => vec![part.parse::<u32>().unwrap()],
+        })
+        .collect()
+}
+
 #[test]
 fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
     let (cert, tls_acceptor) = tls_fixture()?;
@@ -234,9 +244,10 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
         assert_eq!(in_project.len(), 1);
         assert_eq!(in_project[0].folder, Folder::Other);
         assert_eq!(in_project[0].mailbox(), project);
-        assert_eq!(b.store.download_counts(MAX_MESSAGE)?, (2, 1));
+        let everything = [(a.id.clone(), i64::MIN)];
+        assert_eq!(b.store.download_counts(MAX_MESSAGE, &everything)?, (2, 1));
         assert_eq!(b.download_batch(&a, 25)?, 1);
-        assert_eq!(b.store.download_counts(MAX_MESSAGE)?, (2, 0));
+        assert_eq!(b.store.download_counts(MAX_MESSAGE, &everything)?, (2, 0));
         assert!(b.store.raw(&in_project[0].id)?.is_some());
         assert!(b.store.message(&in_project[0].id)?.unwrap().body.is_none());
         b.change_many(&a, &in_project, Change::Star(false))?;
@@ -273,6 +284,7 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
     if let Err(e) = &result {
         eprintln!("IMAP client error: {e:#}");
     }
+    b.disconnect(&a.id);
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
     drop(b);
@@ -489,6 +501,8 @@ fn imap_starttls_and_sync_window() -> Result<()> {
                 "* LIST () \"/\" INBOX\r\n"
             } else if command.starts_with("UID SEARCH") {
                 "* SEARCH\r\n"
+            } else if command == "CAPABILITY" {
+                "* CAPABILITY IMAP4rev1\r\n"
             } else {
                 ""
             };
@@ -509,6 +523,8 @@ fn imap_starttls_and_sync_window() -> Result<()> {
     a.sync.days = 30;
     a.validate()?;
     assert!(b.sync(&a, Folder::Inbox, 300)?.is_empty());
+    // The connection is kept for the next operation until signed out.
+    b.disconnect(&a.id);
     let seen = server.join().unwrap();
     assert!(seen.iter().any(|c| c.starts_with("LOGIN")));
     let search = seen.iter().find(|c| c.starts_with("UID SEARCH")).unwrap();
@@ -631,6 +647,8 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
     let stopped = stop.clone();
     let requested = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
     let server_requested = requested.clone();
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_searches = searches.clone();
     let server = std::thread::spawn(move || {
         while !stopped.load(Ordering::Relaxed) {
             let (socket, _) = match listener.accept() {
@@ -660,6 +678,7 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
                 } else if upper.starts_with("SELECT ") {
                     "* 12 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n".to_string()
                 } else if upper.starts_with("UID SEARCH ") {
+                    server_searches.fetch_add(1, Ordering::Relaxed);
                     format!(
                         "* SEARCH {}\r\n",
                         (1..=12)
@@ -670,7 +689,7 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
                 } else if upper.starts_with("UID FETCH ") {
                     let set = command.split_whitespace().nth(2).unwrap();
                     let mut out = String::new();
-                    for uid in set.split(',').map(|u| u.parse::<u32>().unwrap()) {
+                    for uid in expand(set) {
                         server_requested.lock().unwrap().push(uid);
                         let header = format!(
                             "From: Sender {uid} <s{uid}@example.com>\r\nSubject: Message {uid}\r\n\
@@ -684,6 +703,8 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
                     out
                 } else if upper.starts_with("LIST ") {
                     "* LIST () \"/\" \"INBOX\"\r\n".into()
+                } else if upper == "CAPABILITY" {
+                    "* CAPABILITY IMAP4rev1\r\n".into()
                 } else if upper == "LOGOUT" {
                     r.get_mut()
                         .write_all(format!("* BYE goodbye\r\n{tag} OK done\r\n").as_bytes())
@@ -707,28 +728,15 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
         let mut progress = Vec::new();
         loop {
             let step = b.catalog(&a, Folder::Inbox, 4)?;
-            progress.push(step);
+            progress.push((step.cataloged, step.total, step.added.len()));
+            assert_eq!(step.layout.as_ref().map(|l| l.uids.len()), Some(12));
             if step.complete() {
                 break;
             }
         }
-        assert_eq!(
-            progress,
-            [
-                Catalog {
-                    cataloged: 7,
-                    total: 12
-                },
-                Catalog {
-                    cataloged: 11,
-                    total: 12
-                },
-                Catalog {
-                    cataloged: 12,
-                    total: 12
-                },
-            ]
-        );
+        assert_eq!(progress, [(7, 12, 4), (11, 12, 4), (12, 12, 1)]);
+        // The sync's search is the layout; batches do not search again.
+        assert_eq!(searches.load(Ordering::Relaxed), 1);
         // Newest missing mail first, and nothing already cached again.
         assert_eq!(*requested.lock().unwrap(), [6, 7, 8, 9, 2, 3, 4, 5, 1]);
         let all = b.store.summaries(&a.id, Folder::Inbox)?;
@@ -741,6 +749,7 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
         assert_eq!(requested.lock().unwrap().len(), 9);
         Ok(())
     })();
+    b.disconnect(&a.id);
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
     std::fs::remove_dir_all(path)?;

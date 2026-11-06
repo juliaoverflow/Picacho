@@ -17,9 +17,13 @@ blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = 
 blitz-traits = "=0.3.0-beta.4"
 anyrender = "0.14"
 anyrender_vello_cpu = { version = "0.18", default-features = false }
+peniko = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+bytemuck = "1"
 chrono = { version = "0.4", features = ["serde"] }
+cursor-icon = "1"
 directories = "6"
+futures = "0.3"
 data-url = "0.3"
 keyboard-types = "0.8"
 kurbo = "0.13"
@@ -28,6 +32,8 @@ gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
 hkdf = "0.12"
 imap = "2.4"
+# Parses responses that imap 2.4 cannot (CONDSTORE SELECT, Gmail ids); patched below.
+imap-proto = "=0.10.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
 mailparse = "0.16"
@@ -62,9 +68,97 @@ strip = true
 [profile.dev]
 debug = 0
 
+# The HTML reader parses, lays out and rasterizes on the CPU; unoptimized,
+# one screen of an email takes ~50x longer. Optimize just those crates in
+# development builds so debug runs reflect real reading speed.
+[profile.dev.package.vello_cpu]
+opt-level = 3
+[profile.dev.package.vello_common]
+opt-level = 3
+[profile.dev.package.fearless_simd]
+opt-level = 3
+[profile.dev.package.anyrender]
+opt-level = 3
+[profile.dev.package.anyrender_vello_cpu]
+opt-level = 3
+[profile.dev.package."blitz-dom"]
+opt-level = 3
+[profile.dev.package."blitz-paint"]
+opt-level = 3
+[profile.dev.package."blitz-html"]
+opt-level = 3
+[profile.dev.package.html5ever]
+opt-level = 3
+[profile.dev.package.stylo]
+opt-level = 3
+[profile.dev.package.selectors]
+opt-level = 3
+[profile.dev.package.taffy]
+opt-level = 3
+[profile.dev.package.parley]
+opt-level = 3
+[profile.dev.package.parley_engine]
+opt-level = 3
+[profile.dev.package.harfrust]
+opt-level = 3
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package."read-fonts"]
+opt-level = 3
+[profile.dev.package.kurbo]
+opt-level = 3
+[profile.dev.package.peniko]
+opt-level = 3
+[profile.dev.package."tiny-skia-path"]
+opt-level = 3
+[profile.dev.package.usvg]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package."zune-jpeg"]
+opt-level = 3
+[profile.dev.package.glifo]
+opt-level = 3
+[profile.dev.package.color]
+opt-level = 3
+[profile.dev.package.cssparser]
+opt-level = 3
+[profile.dev.package.markup5ever]
+opt-level = 3
+[profile.dev.package.string_cache]
+opt-level = 3
+[profile.dev.package.tendril]
+opt-level = 3
+[profile.dev.package.fontique]
+opt-level = 3
+[profile.dev.package.fontdb]
+opt-level = 3
+[profile.dev.package.servo_arc]
+opt-level = 3
+[profile.dev.package.hashbrown]
+opt-level = 3
+[profile.dev.package.smallvec]
+opt-level = 3
+[profile.dev.package.bytemuck]
+opt-level = 3
+[profile.dev.package.icu_segmenter]
+opt-level = 3
+[profile.dev.package."unicode-bidi"]
+opt-level = 3
+[profile.dev.package.atomic_refcell]
+opt-level = 3
+[profile.dev.package.euclid]
+opt-level = 3
+[profile.dev.package.app_units]
+opt-level = 3
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Debug builds only: the development driver captures the app's own window.
 core-graphics = "0.24"
+# Debug builds only: the development driver sends the window real mouse events.
+objc = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 # GPUI enables Fontconfig's dlopen API; select the matching API in Blitz's font backend.
@@ -73,3 +167,5 @@ fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
 [patch.crates-io]
 # ToCss error inference with GPUI's log/serde feature; see the patch README.
 stylo_derive = { path = "vendor/stylo_derive" }
+# Parses Gmail's X-GM-MSGID; see the patch README.
+imap-proto = { path = "vendor/imap-proto" }
