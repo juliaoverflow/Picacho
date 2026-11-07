@@ -225,6 +225,7 @@ impl MailApp {
                         }),
                     ),
             )
+            .children(self.thread_cards(m, true, cx))
             .child(
                 div()
                     .flex()
@@ -284,20 +285,25 @@ impl MailApp {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
         } else {
+            let has_quotes;
             if options.html
                 && let Some(html) = &m.html
             {
+                let hidden = self.html_without_quotes(m, html);
+                has_quotes = hidden.is_some();
+                let shown = match &hidden {
+                    Some(hidden) if !self.quotes_open => hidden.as_str(),
+                    _ => html.as_str(),
+                };
                 self.html_view.update(cx, |view, cx| {
-                    view.set_content(html, options.block_remote, dark, cx)
+                    view.set_content(shown, options.block_remote, dark, cx)
                 });
                 content = content.child(self.html_view.clone());
             } else {
                 self.html_view.update(cx, |view, cx| view.clear(cx));
                 let loading = m.body.is_none() && self.reading.as_ref() == Some(&m.id);
-                let body = m
-                    .body
-                    .clone()
-                    .unwrap_or_else(|| "This message has no text body.".into());
+                let (body, quoted) = self.plain_body(m);
+                has_quotes = quoted;
                 // Plain text takes the email's theme; where that differs from
                 // the app's, the text sits on a page of its own color.
                 let page = (dark != self.dark).then_some(if dark {
@@ -317,8 +323,11 @@ impl MailApp {
                                 })
                                 .child(
                                     gpui_component::text::TextView::markdown(
-                                        SharedString::from(format!("body-{}", m.id)),
-                                        plain_markdown(&body),
+                                        SharedString::from(format!(
+                                            "body-{}-{}",
+                                            m.id, self.quotes_open
+                                        )),
+                                        body,
                                         window,
                                         cx,
                                     )
@@ -332,6 +341,9 @@ impl MailApp {
                                 ),
                         )
                     });
+            }
+            if has_quotes {
+                content = content.child(div().flex().child(self.quotes_toggle(cx)));
             }
             for (i, a) in m.attachments.iter().enumerate() {
                 content = content.child(
@@ -362,6 +374,10 @@ impl MailApp {
                             cx,
                         )),
                 );
+            }
+            let later = self.thread_cards(m, false, cx);
+            if !later.is_empty() {
+                content = content.child(div().mt_8().children(later));
             }
             if let Some(reply) = self.inline_composer(&m.id) {
                 content = content.child(
@@ -533,7 +549,7 @@ impl MailApp {
             .text_size(px(11.))
             .text_color(rgb(c.muted))
             .hover(move |s| s.bg(rgb(c.raised)).text_color(rgb(c.text)))
-            .child(div().min_w_0().truncate().child(format!("to {}", m.to)))
+            .child(div().min_w_0().truncate().child(self.recipients_line(m)))
             .child(div().flex_shrink_0().child(icon_el(
                 if open { "chevron-up" } else { "chevron-down" },
                 12.,
@@ -1084,4 +1100,303 @@ fn switch(on: bool, key: u64, animate: bool, c: Colors) -> AnyElement {
         .relative()
         .child(knob)
         .into_any_element()
+}
+
+impl MailApp {
+    /// The open message's conversation in the loaded list, oldest first,
+    /// including the message itself. Messages join by References, or by
+    /// subject when at least one is a reply (so newsletters that reuse a
+    /// subject stay apart).
+    pub(super) fn thread(&self, m: &Mail) -> Rc<Vec<usize>> {
+        if let Some((id, revision, rows)) = &*self.thread_cache.borrow()
+            && id == &m.id
+            && *revision == self.list_revision
+        {
+            return rows.clone();
+        }
+        let key = super::thread::conversation_subject(&m.subject);
+        let replyish = |x: &Mail, key: &str| {
+            !x.references.is_empty() || x.subject.trim().to_lowercase() != key
+        };
+        let linked = |a: &Mail, b: &Mail| {
+            !b.message_id.is_empty() && a.references.contains(b.message_id.as_str())
+        };
+        let mut seen = HashSet::new();
+        let mut rows: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.account == m.account && !x.pending)
+            .filter(|(_, x)| {
+                x.id == m.id
+                    || linked(x, m)
+                    || linked(m, x)
+                    || (key.chars().count() > 2
+                        && super::thread::conversation_subject(&x.subject) == key
+                        && (replyish(x, &key) || replyish(m, &key)))
+            })
+            // The same message under several labels or folders shows once.
+            .filter(|(_, x)| x.message_id.is_empty() || seen.insert(x.message_id.clone()))
+            .map(|(i, _)| i)
+            .collect();
+        rows.sort_by_key(|i| self.messages[*i].date);
+        let rows = Rc::new(rows);
+        *self.thread_cache.borrow_mut() = Some((m.id.clone(), self.list_revision, rows.clone()));
+        rows
+    }
+
+    /// Cards for the conversation's other messages, before or after `m`.
+    /// A long history folds its middle behind a "more" row.
+    fn thread_cards(&self, m: &Mail, before: bool, cx: &Context<Self>) -> Vec<AnyElement> {
+        let c = self.colors();
+        let rows = self.thread(m);
+        if rows.len() < 2 {
+            return vec![];
+        }
+        let position = rows
+            .iter()
+            .position(|i| self.messages[*i].id == m.id)
+            .unwrap_or(rows.len());
+        let side: Vec<usize> = if before {
+            rows[..position.min(rows.len())].to_vec()
+        } else {
+            rows.get(position + 1..)
+                .map(<[usize]>::to_vec)
+                .unwrap_or_default()
+        };
+        let mut out = vec![];
+        if before {
+            out.push(
+                div()
+                    .id("thread-label")
+                    .debug_selector(|| "thread-label".into())
+                    .mb_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(c.muted))
+                    .child(icon_el("thread", 13., c.muted))
+                    .child(format!("CONVERSATION · {} MESSAGES", rows.len()))
+                    .into_any_element(),
+            );
+        }
+        let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
+        let card =
+            |index: usize| {
+                let x = &self.messages[index];
+                let id = x.id.clone();
+                let to = super::thread::short_names(&x.to, &own);
+                div()
+                    .id(SharedString::from(format!("thread-{}", x.id)))
+                    .debug_selector(|| "thread-card".into())
+                    .mb_2()
+                    .px_3()
+                    .py(px(9.))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.bg))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(c.raised)))
+                    .child(avatar(&x.initials(), 28., index, c))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(13.))
+                                            .font_weight(if x.unread {
+                                                FontWeight::BOLD
+                                            } else {
+                                                FontWeight::SEMIBOLD
+                                            })
+                                            .child(x.sender.clone()),
+                                    )
+                                    .when(!to.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(11.))
+                                                .text_color(rgb(c.muted))
+                                                .child(format!("to {}", to.join(", "))),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(c.muted))
+                                    .child(x.snippet.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(rgb(c.muted))
+                            .child(date_short(x.date)),
+                    )
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.handle(Action::Select(id.clone()), w, cx)
+                    }))
+                    .into_any_element()
+            };
+        if before && side.len() > 4 && !self.thread_open {
+            out.push(card(side[0]));
+            let hidden = side.len() - 3;
+            out.push(
+                div()
+                    .id("thread-more")
+                    .debug_selector(|| "thread-more".into())
+                    .mb_2()
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(rgb(c.border))
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(c.raised)).text_color(rgb(c.text)))
+                    .child(format!("{hidden} more messages"))
+                    .on_click(
+                        cx.listener(|this, _, w, cx| this.handle(Action::ExpandThread, w, cx)),
+                    )
+                    .into_any_element(),
+            );
+            out.extend(side[side.len() - 2..].iter().map(|i| card(*i)));
+        } else {
+            out.extend(side.iter().map(|i| card(*i)));
+        }
+        if before {
+            out.push(
+                div()
+                    .h(px(1.))
+                    .bg(rgb(c.border))
+                    .mt_2()
+                    .mb_5()
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// "to Ana, Bo, me · cc Cy +2": who received the message, briefly.
+    fn recipients_line(&self, m: &Mail) -> String {
+        let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
+        let brief = |names: Vec<String>, keep: usize| {
+            if names.len() > keep {
+                format!("{} +{}", names[..keep].join(", "), names.len() - keep)
+            } else {
+                names.join(", ")
+            }
+        };
+        let to = super::thread::short_names(&m.to, &own);
+        let cc = super::thread::short_names(&m.cc, &own);
+        let mut line = if to.is_empty() {
+            "to undisclosed recipients".to_string()
+        } else {
+            format!("to {}", brief(to, 3))
+        };
+        if !cc.is_empty() {
+            line.push_str(&format!(" · cc {}", brief(cc, 2)));
+        }
+        line
+    }
+
+    /// The open HTML email with its quoted history hidden, if it has one.
+    /// Worked out once per message.
+    fn html_without_quotes(&self, m: &Mail, html: &str) -> Option<Rc<String>> {
+        // The body can arrive after the message opens: key by its length too.
+        let key = format!("{}:{}", m.id, html.len());
+        if let Some((k, hidden)) = &*self.quote_cache.borrow()
+            && k == &key
+        {
+            return hidden.clone();
+        }
+        let hidden = super::thread::hide_html_quotes(html).map(Rc::new);
+        *self.quote_cache.borrow_mut() = Some((key, hidden.clone()));
+        hidden
+    }
+
+    /// The plain body as the reader's Markdown, without the quoted history
+    /// unless it is open; and whether there is quoted history.
+    fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
+        let key = format!(
+            "{}:{}:{}",
+            m.id,
+            self.quotes_open,
+            m.body.as_ref().map_or(0, String::len)
+        );
+        if let Some((k, text, quoted)) = &*self.plain_cache.borrow()
+            && k == &key
+        {
+            return (text.clone(), *quoted);
+        }
+        let body = m
+            .body
+            .clone()
+            .unwrap_or_else(|| "This message has no text body.".into());
+        let (written, quoted) = super::thread::split_quoted(&body);
+        let shown = if self.quotes_open {
+            body.as_str()
+        } else {
+            written
+        };
+        let text = SharedString::from(plain_markdown(shown));
+        *self.plain_cache.borrow_mut() = Some((key, text.clone(), quoted.is_some()));
+        (text, quoted.is_some())
+    }
+
+    /// The "•••" pill that shows or hides a reply's quoted history.
+    fn quotes_toggle(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let open = self.quotes_open;
+        div()
+            .id("toggle-quotes")
+            .debug_selector(|| "toggle-quotes".into())
+            .mt_3()
+            .h(px(24.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(7.))
+            .bg(rgb(c.raised))
+            .border_1()
+            .border_color(rgb(c.border))
+            .text_size(px(11.))
+            .text_color(rgb(c.muted))
+            .cursor_pointer()
+            .hover(move |s| s.text_color(rgb(c.text)))
+            .child(div().font_weight(FontWeight::BOLD).child("•••"))
+            .child(if open {
+                "Hide quoted text"
+            } else {
+                "Show quoted text"
+            })
+            .on_click(cx.listener(|this, _, w, cx| this.handle(Action::ToggleQuotes, w, cx)))
+            .into_any_element()
+    }
 }

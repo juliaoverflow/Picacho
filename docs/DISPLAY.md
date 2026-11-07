@@ -158,3 +158,15 @@ failure brings the editor back with its draft.
 Settings → Composing: reply below the message or in a compose window, where
 new messages open, formatted or plain, reply all by default, quoting, undo
 delay, sending checks and a signature.
+
+## Conversations
+
+The reader shows the open message's conversation from the loaded list
+(`thread.rs`): messages join by References, or by subject (prefixes like
+Re:/Fwd:/AW: removed) when at least one of them is a reply, so newsletters
+that reuse a subject stay apart. Earlier messages are cards above the
+message, later ones below; a long history folds its middle into "N more".
+The sender line reads "to Ana, Bo, me · cc Cy +2". A reply's quoted history
+(plain text after "On … wrote:" and similar, or Gmail/Apple/Outlook/
+Thunderbird quote markup in HTML) is folded behind a "•••" toggle. All of
+this is cached per message and list revision, never recomputed per frame.

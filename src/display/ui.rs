@@ -29,6 +29,8 @@ mod reading_tests;
 mod responsive_tests;
 #[path = "settings.rs"]
 mod settings;
+#[path = "thread.rs"]
+mod thread;
 #[path = "tree.rs"]
 mod tree;
 #[path = "window.rs"]
@@ -437,6 +439,10 @@ enum Action {
     /// Shows the HTML part (true) or the plain text part (false).
     ShowHtml(bool),
     ToggleDetails,
+    /// Shows or hides the quoted history of the open reply.
+    ToggleQuotes,
+    /// Lists every message of a long conversation.
+    ExpandThread,
     ShowOriginal,
     CopyOriginal,
     SaveOriginal,
@@ -468,6 +474,9 @@ enum Action {
     SetComposeOptions(ComposeOptions),
     Dismiss,
 }
+
+/// A conversation's rows for one message at one list revision.
+type ThreadRows = (String, u64, Rc<Vec<usize>>);
 
 pub struct MailApp {
     backend: Arc<Backend>,
@@ -589,6 +598,19 @@ pub struct MailApp {
     counts_again: bool,
     /// Unread messages among those loaded, counted when the list changes.
     loaded_unread: usize,
+    /// Bumped whenever the listed messages change; keys `thread_cache`.
+    list_revision: u64,
+    /// The open message's conversation: (message, list revision, rows).
+    thread_cache: std::cell::RefCell<Option<ThreadRows>>,
+    /// The open reply's quoted history is shown, and every message of its
+    /// conversation is listed.
+    quotes_open: bool,
+    thread_open: bool,
+    /// The open HTML email without its quoted history, worked out once.
+    quote_cache: std::cell::RefCell<Option<(String, Option<Rc<String>>)>>,
+    /// The open plain email as Markdown: (message and quote state, text,
+    /// whether it has quoted history).
+    plain_cache: std::cell::RefCell<Option<(String, SharedString, bool)>>,
     /// The open message's reading options, read from preferences once.
     options_cache: std::cell::RefCell<Option<(String, ReadingOptions)>>,
     _subscriptions: Vec<Subscription>,
@@ -900,6 +922,12 @@ impl MailApp {
             counts_again: false,
             loaded_unread: 0,
             options_cache: Default::default(),
+            list_revision: 0,
+            thread_cache: Default::default(),
+            quotes_open: false,
+            thread_open: false,
+            quote_cache: Default::default(),
+            plain_cache: Default::default(),
             _subscriptions: subscriptions,
             load_generation: 0,
             read_generation: 0,
@@ -1039,6 +1067,7 @@ impl MailApp {
         let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
         self.selection.retain(|id| present.contains(id));
         self.loaded_unread = self.messages.iter().filter(|m| m.unread).count();
+        self.list_revision += 1;
         self.sync_selecting();
     }
     /// Reloads sidebar unread counts and download progress from the cache.
@@ -1702,6 +1731,8 @@ impl MailApp {
         self.html_view.update(cx, |view, cx| view.clear(cx));
         self.selected = Some(id.clone());
         self.details_open = false;
+        self.quotes_open = false;
+        self.thread_open = false;
         self.open_anim += 1;
         self.open_at = Some(std::time::Instant::now());
         self.reveal = None;
@@ -2755,6 +2786,11 @@ impl MailApp {
                     self.handle(Action::ToggleHtml, w, cx);
                 }
             }
+            Action::ToggleQuotes => {
+                self.quotes_open = !self.quotes_open;
+                self.html_view.update(cx, |view, cx| view.clear(cx));
+            }
+            Action::ExpandThread => self.thread_open = true,
             Action::ToggleDetails => {
                 self.details_open = !self.details_open;
                 if self.details_open {

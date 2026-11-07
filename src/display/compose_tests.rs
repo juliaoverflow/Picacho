@@ -91,3 +91,28 @@ fn replies_open_inline_and_reply_all_copies_others(cx: &mut TestAppContext) {
         assert_eq!(this.composers[1].read(cx).placement, Placement::Floating);
     });
 }
+
+#[gpui::test]
+fn conversations_group_replies_and_fold_quoted_history(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    let daniel = view.read_with(cx, |this, _| this.messages[4].id.clone());
+    act(&view, Action::Select(daniel), cx);
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        let m = this.selected_ref().unwrap();
+        // Sophie's and Daniel's replies share a conversation in this
+        // account only; newsletters with their own subjects stay apart.
+        assert_eq!(this.thread(m).len(), 2);
+        assert!(!this.quotes_open);
+    });
+    assert!(cx.debug_bounds("thread-label").is_some());
+    assert!(cx.debug_bounds("toggle-quotes").is_some());
+    act(&view, Action::ToggleQuotes, cx);
+    view.read_with(cx, |this, _| assert!(this.quotes_open));
+    let linear = view.read_with(cx, |this, _| this.messages[1].id.clone());
+    act(&view, Action::Select(linear), cx);
+    view.read_with(cx, |this, _| {
+        assert!(!this.quotes_open, "each message starts folded");
+        assert_eq!(this.thread(this.selected_ref().unwrap()).len(), 1);
+    });
+}

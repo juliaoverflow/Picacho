@@ -554,8 +554,8 @@ pub fn demo_mail() -> Vec<Mail> {
         (
             "Daniel Kim",
             "daniel@example.com",
-            "A few photos from the trip",
-            "Finally got around to sorting through these. Such a good weekend — we need to do it again.",
+            "Re: Weekend plans",
+            "Finally got around to sorting through the photos from the trip. Such a good weekend — we need to do it again.\n\nOn Fri, Sophie Chen wrote:\n> That sounds perfect! Let's meet at the usual place around 10.\n>\n> On Thu, Daniel Kim wrote:\n>> Are we still on for Saturday?",
             false,
         ),
         (
