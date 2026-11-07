@@ -203,6 +203,13 @@ impl MailApp {
                 Page::Reading,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-composing".into(),
+                "Composing".into(),
+                icon_el("compose", 15., c.muted).into_any_element(),
+                Page::Composing,
+                cx,
+            ))
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -249,6 +256,7 @@ impl MailApp {
             },
             Page::General => self.general_page(cx),
             Page::Reading => self.reading_page(cx),
+            Page::Composing => self.composing_page(cx),
         };
         div()
             .size_full()
@@ -528,6 +536,194 @@ impl MailApp {
             ))
             .child(self.setting(
                 "Block remote content", "Prevent images, stylesheets and fonts from contacting remote servers. Loading them may reveal that you opened an email.", remote,
+            ))
+            .into_any_element()
+    }
+    pub(super) fn composing_page(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let o = self.compose_options.clone();
+        let set = |change: &dyn Fn(&mut ComposeOptions)| {
+            let mut next = o.clone();
+            change(&mut next);
+            Action::SetComposeOptions(next)
+        };
+        let replies = self
+            .segmented(
+                "reply-placement",
+                vec![
+                    (
+                        "Below the message".into(),
+                        set(&|o| o.reply_placement = ReplyPlacement::Inline),
+                        o.reply_placement == ReplyPlacement::Inline,
+                    ),
+                    (
+                        "In a compose window".into(),
+                        set(&|o| o.reply_placement = ReplyPlacement::Window),
+                        o.reply_placement == ReplyPlacement::Window,
+                    ),
+                ],
+                cx,
+            )
+            .max_w(px(380.));
+        let open_in = self
+            .segmented(
+                "compose-open",
+                [
+                    ("Floating panel", ComposeOpen::Floating),
+                    ("Full size", ComposeOpen::Maximized),
+                    ("New window", ComposeOpen::Window),
+                ]
+                .into_iter()
+                .map(|(label, value)| {
+                    (
+                        label.to_string(),
+                        set(&|o| o.open_in = value),
+                        o.open_in == value,
+                    )
+                })
+                .collect(),
+                cx,
+            )
+            .max_w(px(420.));
+        let format = self
+            .segmented(
+                "compose-format",
+                vec![
+                    (
+                        "Formatted".into(),
+                        set(&|o| o.formatted = true),
+                        o.formatted,
+                    ),
+                    (
+                        "Plain text".into(),
+                        set(&|o| o.formatted = false),
+                        !o.formatted,
+                    ),
+                ],
+                cx,
+            )
+            .max_w(px(300.));
+        let undo = self
+            .segmented(
+                "undo-send",
+                [0u32, 5, 10, 20, 30]
+                    .into_iter()
+                    .map(|secs| {
+                        (
+                            if secs == 0 {
+                                "Off".to_string()
+                            } else {
+                                format!("{secs} s")
+                            },
+                            set(&|o| o.undo_send_seconds = secs),
+                            o.undo_send_seconds == secs,
+                        )
+                    })
+                    .collect(),
+                cx,
+            )
+            .max_w(px(420.));
+        let toggle = |id: &str, on: bool, change: &dyn Fn(&mut ComposeOptions)| {
+            let id = id.to_string();
+            let selector = id.clone();
+            self.switch(id, on, set(change), cx)
+                .debug_selector(move || selector)
+        };
+        let row = |title: &str, caption: &str, control: Stateful<Div>| {
+            div()
+                .flex()
+                .items_center()
+                .gap_4()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title.to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(caption.to_owned()),
+                        ),
+                )
+                .child(control)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(self.section("Composing"))
+            .child(self.setting(
+                "Replies",
+                "Write replies right below the message, like a conversation, or in a compose window.",
+                replies,
+            ))
+            .child(self.setting(
+                "New messages open",
+                "A panel you can move, minimize and resize, the full window, or a separate window.",
+                open_in,
+            ))
+            .child(self.setting(
+                "Message format",
+                "Formatted messages can use bold, lists, links and quotes, and are sent with a plain text version.",
+                format,
+            ))
+            .child(row(
+                "Reply to everyone by default",
+                "Reply answers all recipients. Reply all stays available.",
+                toggle("default-reply-all", o.default_reply_all, &|o| {
+                    o.default_reply_all = !o.default_reply_all
+                }),
+            ))
+            .child(row(
+                "Include the original message",
+                "Replies quote the message they answer.",
+                toggle("quote-original", o.quote_original, &|o| {
+                    o.quote_original = !o.quote_original
+                }),
+            ))
+            .child(self.section("Sending"))
+            .child(self.setting(
+                "Undo send",
+                "Wait a moment before a message leaves, so you can take it back.",
+                undo,
+            ))
+            .child(row(
+                "Attachment reminder",
+                "Ask before sending a message that mentions an attachment but has none.",
+                toggle("attachment-reminder", o.attachment_reminder, &|o| {
+                    o.attachment_reminder = !o.attachment_reminder
+                }),
+            ))
+            .child(row(
+                "Missing subject warning",
+                "Ask before sending a message without a subject.",
+                toggle("empty-subject", o.warn_empty_subject, &|o| {
+                    o.warn_empty_subject = !o.warn_empty_subject
+                }),
+            ))
+            .child(self.section("Signature"))
+            .child(
+                div()
+                    .id("signature")
+                    .debug_selector(|| "signature".into())
+                    .h(px(110.))
+                    .child(field(Input::new(&self.signature_input), c, false).h_full()),
+            )
+            .child(row(
+                "Sign replies and forwards",
+                "Without this, only new messages get the signature.",
+                toggle("signature-replies", o.signature_on_replies, &|o| {
+                    o.signature_on_replies = !o.signature_on_replies
+                }),
             ))
             .into_any_element()
     }

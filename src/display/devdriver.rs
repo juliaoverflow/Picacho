@@ -81,6 +81,10 @@ fn run(
         }
         // Shows the list's sync spinner, as during a long sync.
         Some("syncing") => this.syncing = !this.syncing,
+        // Writes this app's window numbers, for `snap <name> <number>`.
+        Some("windows") => {
+            let _ = std::fs::write(dir.join("windows.txt"), window_numbers());
+        }
         Some("size") => w.resize(size(px(number(1)), px(number(2)))),
         Some("select") => {
             if let Some(i) = this.visible.get(number(1) as usize) {
@@ -119,6 +123,11 @@ fn run(
                     None => return,
                 },
                 Some("close") => Action::Close,
+                Some("compose") => Action::Compose,
+                Some("reply") => Action::Reply(false),
+                Some("replyall") => Action::Reply(true),
+                Some("forward") => Action::Forward,
+                Some("composing") => Action::SettingsPage(Page::Composing),
                 Some("theme") => Action::Theme,
                 Some("details") => Action::ToggleDetails,
                 Some("original") => Action::ShowOriginal,
@@ -237,6 +246,22 @@ unsafe fn send<A: objc::MessageArguments, R: std::any::Any>(
 }
 fn class(name: &str) -> *mut objc::runtime::Object {
     objc::runtime::Class::get(name).expect(name) as *const _ as *mut _
+}
+
+/// Every window of this app, frontmost first, one number per line.
+fn window_numbers() -> String {
+    let mut out = String::new();
+    unsafe {
+        let app: *mut objc::runtime::Object = send(class("NSApplication"), "sharedApplication", ());
+        let windows: *mut objc::runtime::Object = send(app, "orderedWindows", ());
+        let count: usize = send(windows, "count", ());
+        for i in 0..count {
+            let window: *mut objc::runtime::Object = send(windows, "objectAtIndex:", (i,));
+            let number: isize = send(window, "windowNumber", ());
+            out.push_str(&format!("{number}\n"));
+        }
+    }
+    out
 }
 
 /// The frontmost window of this app.

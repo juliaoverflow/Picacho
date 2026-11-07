@@ -5895,6 +5895,7 @@ dependencies = [
  "kurbo 0.13.1",
  "lettre",
  "mailparse",
+ "markdown",
  "native-tls",
  "notify-rust",
  "objc",

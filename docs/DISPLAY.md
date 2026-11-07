@@ -129,3 +129,32 @@ GPUI redraws the whole window whenever the app view is notified, and every
   so the list does not request them again on every frame.
 - GPUI's `debug_bounds` keeps a selector's last bounds after its element is
   gone; tests that assert absence should check state instead.
+
+## Writing mail
+
+`Composer` (`composer.rs`) is one editor entity shown four ways: a floating
+panel at the lower right (drag its header to move it; minimize it to a bar;
+full size fills the main window), an inline reply below the message it
+answers, or a window of its own. Header buttons, top right: Save draft,
+Minimize, Full size, Open in new window, Close (saves). Moving to or from a
+window reopens the editor there with the same draft; within the main window
+it only changes placement. `compose.rs` holds the app's side: what a new
+message, reply, reply all or forward starts with, placement from the
+Composing settings, and sending.
+
+Recipients have To, Cc and Bcc (Cc and Bcc appear on demand) and suggest
+people from loaded mail. With several accounts, From picks the sender.
+Formatted messages are Markdown underneath: the toolbar and shortcuts (⌘B,
+⌘I, ⌘⇧X, ⌘E, ⌘K, ⌘⇧8, ⌘⇧7, ⌘⇧9, ⌘⌥1) wrap or prefix the selection, ⌘⇧P
+previews, and sending adds an HTML version (`smtp::html_body`, raw HTML
+escaped). Files can be dropped on the editor. Drafts save on their own
+after a pause, off the main thread, and at once on ⌘S, close and quit.
+
+Sending checks recipients, then optionally asks about a missing subject or
+an attachment the text mentions. The message then waits out the Undo delay
+(Composing settings) in the outbox with a "Sending… Undo" toast; Undo or a
+failure brings the editor back with its draft.
+
+Settings → Composing: reply below the message or in a compose window, where
+new messages open, formatted or plain, reply all by default, quoting, undo
+delay, sending checks and a signature.

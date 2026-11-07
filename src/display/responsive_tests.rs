@@ -187,14 +187,15 @@ fn bulk_selection_and_compose_controls_fit_a_narrow_window(cx: &mut TestAppConte
     act(&view, Action::StopSelecting, cx);
     view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
     frame(cx);
-    let panel = bounds(cx, "modal-panel");
+    let panel = bounds(cx, "compose-panel");
     inside(
         panel,
         Bounds::new(point(px(0.), px(0.)), size(px(360.), px(320.))),
-        "compose dialog",
+        "compose panel",
     );
-    inside(bounds(cx, "send"), panel, "send action");
-    inside(bounds(cx, "save-close"), panel, "save draft action");
+    inside(bounds(cx, "compose-send"), panel, "send action");
+    inside(bounds(cx, "compose-save"), panel, "save draft action");
+    inside(bounds(cx, "compose-close"), panel, "close action");
 }
 #[gpui::test]
 fn dragging_panes_keeps_the_list_readable_and_snaps_into_rails(cx: &mut TestAppContext) {

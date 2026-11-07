@@ -284,8 +284,9 @@ impl Account {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Folder {
+    #[default]
     Inbox,
     Starred,
     Sent,
@@ -377,7 +378,7 @@ pub struct Attachment {
     pub mime: String,
     pub part: usize,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mail {
     pub id: String,
     pub account: String,
@@ -387,6 +388,9 @@ pub struct Mail {
     pub from: String,
     pub sender: String,
     pub to: String,
+    /// Copied recipients; empty in cache entries from before it was kept.
+    #[serde(default)]
+    pub cc: String,
     pub subject: String,
     pub snippet: String,
     pub date: i64,
@@ -399,6 +403,9 @@ pub struct Mail {
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
     pub message_id: String,
+    /// The thread's earlier message ids (References, or In-Reply-To).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub references: String,
     #[serde(default)]
     pub has_attachments: bool,
     /// Gmail's permanent id, shared by the copies under each label; 0 elsewhere.
@@ -430,19 +437,8 @@ impl Mail {
             from: String::new(),
             sender: String::new(),
             to: String::new(),
-            subject: String::new(),
-            snippet: String::new(),
-            date: 0,
-            unread: false,
-            starred: false,
-            size: 0,
-            body: None,
-            html: None,
-            attachments: Vec::new(),
-            message_id: String::new(),
-            has_attachments: false,
-            gmail_id: 0,
             pending: true,
+            ..Self::default()
         }
     }
     pub fn mailbox(&self) -> Mailbox {
@@ -493,12 +489,35 @@ pub struct Secret {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Draft {
     pub id: String,
+    /// The account it is sent from.
     pub account: String,
     pub to: String,
+    #[serde(default)]
+    pub cc: String,
+    #[serde(default)]
+    pub bcc: String,
     pub subject: String,
+    /// Plain text, or Markdown when `formatted`.
     pub body: String,
+    /// The body is Markdown and is sent with an HTML version.
+    #[serde(default)]
+    pub formatted: bool,
     pub reply_id: String,
+    /// The thread's message ids, oldest first, for the References header.
+    #[serde(default)]
+    pub references: String,
     pub attachments: Vec<std::path::PathBuf>,
+}
+impl Draft {
+    /// Whether anything has been written: an untouched draft is not kept.
+    pub fn is_empty(&self) -> bool {
+        self.to.trim().is_empty()
+            && self.cc.trim().is_empty()
+            && self.bcc.trim().is_empty()
+            && self.subject.trim().is_empty()
+            && self.body.trim().is_empty()
+            && self.attachments.is_empty()
+    }
 }
 
 #[cfg(any(test, feature = "sample-data"))]
@@ -600,7 +619,14 @@ pub fn demo_mail() -> Vec<Mail> {
             body: Some((*body).into()),
             html: None,
             attachments: vec![],
-            message_id: String::new(),
+            // One sample message copies others, to show Cc and Reply All.
+            cc: if i == 2 {
+                "Daniel Kim <daniel@example.com>, Emma Wilson <emma@example.com>".into()
+            } else {
+                String::new()
+            },
+            references: String::new(),
+            message_id: format!("<demo-{i}@picacho.example>"),
             has_attachments: i == 2,
             gmail_id: 0,
             pending: false,

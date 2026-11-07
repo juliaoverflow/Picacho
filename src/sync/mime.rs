@@ -65,6 +65,7 @@ pub fn parse_message(
         from,
         sender,
         to: header("To"),
+        cc: header("Cc"),
         subject: if subject.is_empty() {
             "(No subject)".into()
         } else {
@@ -79,6 +80,14 @@ pub fn parse_message(
         html,
         attachments,
         message_id: header("Message-ID"),
+        references: {
+            let refs = header("References");
+            if refs.trim().is_empty() {
+                header("In-Reply-To")
+            } else {
+                refs
+            }
+        },
         has_attachments,
         gmail_id: 0,
         pending: false,

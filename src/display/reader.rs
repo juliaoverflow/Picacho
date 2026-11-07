@@ -363,39 +363,66 @@ impl MailApp {
                         )),
                 );
             }
-            content = content.child(
-                div()
-                    .mt_10()
-                    .pt_5()
-                    .border_t_1()
-                    .border_color(rgb(c.border))
-                    .flex()
-                    .gap_2()
-                    .child(
-                        self.button(
-                            "reply-bottom",
-                            "Reply",
-                            "reply",
-                            Action::Reply(false),
-                            false,
-                            cx,
-                        )
+            if let Some(reply) = self.inline_composer(&m.id) {
+                content = content.child(
+                    div()
+                        .id("inline-reply")
+                        .debug_selector(|| "inline-reply".into())
+                        .mt_8()
+                        .rounded(px(12.))
                         .border_1()
-                        .border_color(rgb(c.border)),
-                    )
-                    .child(
-                        self.button(
-                            "forward-bottom",
-                            "Forward",
-                            "forward",
-                            Action::Forward,
-                            false,
-                            cx,
+                        .border_color(rgb(c.border))
+                        .shadow_sm()
+                        .overflow_hidden()
+                        .child(reply),
+                );
+            } else {
+                content = content.child(
+                    div()
+                        .mt_10()
+                        .pt_5()
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .flex()
+                        .gap_2()
+                        .child(
+                            self.button(
+                                "reply-bottom",
+                                "Reply",
+                                "reply",
+                                Action::Reply(false),
+                                false,
+                                cx,
+                            )
+                            .border_1()
+                            .border_color(rgb(c.border)),
                         )
-                        .border_1()
-                        .border_color(rgb(c.border)),
-                    ),
-            );
+                        .child(
+                            self.button(
+                                "reply-all-bottom",
+                                "Reply all",
+                                "reply-all",
+                                Action::Reply(true),
+                                false,
+                                cx,
+                            )
+                            .border_1()
+                            .border_color(rgb(c.border)),
+                        )
+                        .child(
+                            self.button(
+                                "forward-bottom",
+                                "Forward",
+                                "forward",
+                                Action::Forward,
+                                false,
+                                cx,
+                            )
+                            .border_1()
+                            .border_color(rgb(c.border)),
+                        ),
+                );
+            }
         }
         div()
             .id("reader-pane")

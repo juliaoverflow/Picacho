@@ -72,6 +72,54 @@ impl AssetSource for Assets {
             "mail/filter.svg" => Some(
                 "<path d='M4 5h16M7 12h10M10 19h4'/><circle cx='8' cy='5' r='2'/><circle cx='16' cy='12' r='2'/>",
             ),
+            "mail/bold.svg" => {
+                Some("<path d='M7 5h6a3.5 3.5 0 0 1 0 7H7zM7 12h7a3.5 3.5 0 0 1 0 7H7z'/>")
+            }
+            "mail/italic.svg" => Some("<path d='M14 5h-4M14 19h-4M14.5 5l-5 14'/>"),
+            "mail/underline.svg" => Some("<path d='M7 4v7a5 5 0 0 0 10 0V4M5 20h14'/>"),
+            "mail/strike.svg" => Some(
+                "<path d='M5 12h14M16.5 7.5A4 3 0 0 0 12 5c-2.5 0-4.5 1.3-4.5 3.2 0 1.2.8 2.2 2.3 2.8M8 16.5c.6 1.5 2.2 2.5 4.2 2.5 2.6 0 4.6-1.4 4.6-3.4 0-.7-.2-1.3-.6-1.8'/>",
+            ),
+            "mail/list.svg" => Some(
+                "<path d='M9 6h11M9 12h11M9 18h11'/><circle cx='4.5' cy='6' r='1' fill='currentColor'/><circle cx='4.5' cy='12' r='1' fill='currentColor'/><circle cx='4.5' cy='18' r='1' fill='currentColor'/>",
+            ),
+            "mail/list-ordered.svg" => Some(
+                "<path d='M10 6h10M10 12h10M10 18h10M4 4.5h1.2V9M3.6 9h2.8M3.6 14.6a1.4 1.4 0 0 1 2.6.7c0 1-2.6 2-2.6 3.2h2.8'/>",
+            ),
+            "mail/quote.svg" => Some(
+                "<path d='M5 7h5v5H6.5A1.5 1.5 0 0 0 5 13.5V17M14 7h5v5h-3.5a1.5 1.5 0 0 0-1.5 1.5V17'/>",
+            ),
+            "mail/link.svg" => Some(
+                "<path d='M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1'/>",
+            ),
+            "mail/heading.svg" => Some("<path d='M6 4v16M18 4v16M6 12h12'/>"),
+            "mail/save.svg" => Some(
+                "<path d='M5 3h11l3 3v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z'/><path d='M7 3v5h8V3M7 21v-7h10v7'/>",
+            ),
+            "mail/popout.svg" => Some(
+                "<rect x='3' y='7' width='14' height='14' rx='2'/><path d='M10 3h11v11M21 3l-9 9'/>",
+            ),
+            "mail/expand.svg" => Some("<path d='M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7'/>"),
+            "mail/shrink.svg" => Some("<path d='M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7'/>"),
+            "mail/dock.svg" => Some("<path d='M5 19h14'/>"),
+            "mail/undock.svg" => Some("<path d='M5 5h14'/>"),
+            "mail/preview.svg" => Some(
+                "<path d='M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z'/><circle cx='12' cy='12' r='3'/>",
+            ),
+            "mail/format.svg" => Some("<path d='M4 20h4M6 20 12 4l6 16M8.3 14h7.4M16 20h4'/>"),
+            "mail/contact.svg" => {
+                Some("<circle cx='12' cy='8' r='4'/><path d='M4 21a8 8 0 0 1 16 0'/>")
+            }
+            "mail/thread.svg" => Some(
+                "<path d='M4 5h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z'/><path d='M22 9v8a2 2 0 0 1-2 2h-1v3l-4-3h-3'/>",
+            ),
+            "mail/upload.svg" => Some("<path d='M12 16V4m-5 5 5-5 5 5M4 16v5h16v-5'/>"),
+            "mail/cloud.svg" => Some(
+                "<path d='M7 18a5 5 0 0 1-.8-9.94A7 7 0 0 1 19.4 9.6 4.3 4.3 0 0 1 18.5 18Z'/>",
+            ),
+            "mail/grid.svg" => Some(
+                "<rect x='3' y='3' width='7' height='7' rx='1.5'/><rect x='14' y='3' width='7' height='7' rx='1.5'/><rect x='3' y='14' width='7' height='7' rx='1.5'/><rect x='14' y='14' width='7' height='7' rx='1.5'/>",
+            ),
             _ => None,
         };
         if let Some(shape) = shape {

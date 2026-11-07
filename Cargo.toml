@@ -37,6 +37,7 @@ imap-proto = "=0.10.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
 mailparse = "0.16"
+markdown = "1.0.0"
 native-tls = "0.2"
 notify-rust = "4"
 open = "5"

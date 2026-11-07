@@ -2,6 +2,11 @@
 mod accounts;
 #[path = "catalog.rs"]
 mod catalog;
+#[path = "compose.rs"]
+mod compose;
+#[path = "composer.rs"]
+mod composer;
+use composer::{Composer, ComposerDrag, Placement};
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[path = "devdriver.rs"]
 mod devdriver;
@@ -26,6 +31,7 @@ mod tree;
 #[path = "window.rs"]
 mod window;
 use super::html::{HtmlContextMenu, HtmlView};
+use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
 use crate::{
@@ -280,7 +286,6 @@ enum Modal {
     Connect,
     Settings,
     About,
-    Compose,
     Help,
     RemoveAccount(String),
     Reconnect(String),
@@ -363,6 +368,7 @@ enum Step {
 enum Page {
     General,
     Reading,
+    Composing,
     Account(String),
 }
 #[derive(Clone)]
@@ -449,15 +455,14 @@ enum Action {
     Sample,
     SubmitAccount,
     Remove(String),
-    Send,
-    Attach,
-    RemoveAttachment(usize),
     SaveAttachment(usize),
     UnlockMail,
     BackToList,
     LockMail(String),
     OpenDraft(String),
-    DiscardDraft,
+    /// Puts back a message whose sending was delayed for undo.
+    UndoSend(u64),
+    SetComposeOptions(ComposeOptions),
     Dismiss,
 }
 
@@ -557,12 +562,22 @@ pub struct MailApp {
     manual: bool,
     setup_generation: u64,
     notice_generation: u64,
-    compose_to: Entity<InputState>,
-    compose_subject: Entity<InputState>,
-    compose_body: Entity<InputState>,
-    draft: Draft,
-    draft_revision: u64,
     drafts: Vec<Draft>,
+    /// Open message editors: floating, inline replies and windows.
+    composers: Vec<Entity<Composer>>,
+    compose_options: ComposeOptions,
+    /// Messages waiting out their undo delay, or being sent.
+    outbox: Vec<compose::Outgoing>,
+    outbox_generation: u64,
+    /// Inline replies by the message they answer.
+    inline_replies: HashMap<String, EntityId>,
+    composer_subscriptions: HashMap<EntityId, Subscription>,
+    /// The signature field in Composing settings.
+    signature_input: Entity<InputState>,
+    signature_revision: u64,
+    /// A move asked for by a composer whose subscription had no window.
+    pending_place: Option<(EntityId, Placement)>,
+    /// Any message is being delivered now; quitting waits for it.
     sending: bool,
     /// A spinner tick is pending (see `spinner`).
     spin_scheduled: bool,
@@ -646,9 +661,6 @@ impl MailApp {
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let backend = Arc::new(Backend::new(store));
         let search = input("Search", false, false, window, cx);
-        let compose_to = input("", false, false, window, cx);
-        let compose_subject = input("", false, false, window, cx);
-        let compose_body = input("", true, false, window, cx);
         let placeholders = [
             "you@example.com",
             "Password",
@@ -700,13 +712,6 @@ impl MailApp {
             }),
         );
         let encrypted = HashSet::new();
-        for state in [&compose_to, &compose_subject, &compose_body] {
-            subscriptions.push(cx.subscribe(state, |this, _, event, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.schedule_draft_save(cx);
-                }
-            }));
-        }
         subscriptions.push(cx.observe_window_appearance(window, |this, w, cx| {
             if this.appearance == Appearance::System {
                 this.dark = system_dark(w);
@@ -760,6 +765,37 @@ impl MailApp {
             .preference("reading_defaults")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let compose_options: ComposeOptions = backend
+            .store
+            .preference(crate::manage::composing::PREFERENCE)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let signature_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .placeholder("Your name, title, phone…")
+                .default_value(compose_options.signature.clone())
+        });
+        subscriptions.push(cx.subscribe(&signature_input, |this, input, e, cx| {
+            if matches!(e, InputEvent::Change) {
+                let signature = input.read(cx).value().to_string();
+                this.signature_revision += 1;
+                let revision = this.signature_revision;
+                cx.spawn(async move |this, cx| {
+                    Timer::after(Duration::from_millis(500)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.signature_revision == revision {
+                            let options = ComposeOptions {
+                                signature,
+                                ..this.compose_options.clone()
+                            };
+                            this.save_compose_options(options, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }));
         let html_view = cx.new(HtmlView::new);
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
@@ -845,12 +881,16 @@ impl MailApp {
             manual: false,
             setup_generation: 0,
             notice_generation: 0,
-            compose_to,
-            compose_subject,
-            compose_body,
-            draft: Draft::default(),
-            draft_revision: 0,
             drafts: vec![],
+            composers: vec![],
+            compose_options,
+            outbox: vec![],
+            outbox_generation: 0,
+            inline_replies: HashMap::new(),
+            composer_subscriptions: HashMap::new(),
+            signature_input,
+            signature_revision: 0,
+            pending_place: None,
             sending: false,
             spin_scheduled: false,
             counts_running: false,
@@ -1406,6 +1446,12 @@ impl MailApp {
             cx,
         );
         let c = self.colors();
+        for composer in &self.composers {
+            composer.update(cx, |composer, cx| {
+                composer.colors = c;
+                cx.notify();
+            });
+        }
         let theme = Theme::global_mut(cx);
         theme.colors.background = rgb(c.bg).into();
         theme.colors.foreground = rgb(c.text).into();
@@ -1626,6 +1672,8 @@ impl MailApp {
                                 body: Some(d.body.clone()),
                                 html: None,
                                 attachments: vec![],
+                                cc: d.cc.clone(),
+                                references: String::new(),
                                 message_id: String::new(),
                                 has_attachments: !d.attachments.is_empty(),
                                 gmail_id: 0,
@@ -1838,103 +1886,7 @@ impl MailApp {
             },
         );
     }
-    fn new_compose(&mut self, mode: u8, w: &mut Window, cx: &mut Context<Self>) {
-        if self.modal == Some(Modal::Compose) || self.onboarding {
-            return;
-        }
-        let selected = self.selected_mail();
-        let own = self.current_account().map(|a| a.email).unwrap_or_default();
-        let (to, subject, body, reply_id) = if let Some(m) = selected.filter(|_| mode > 0) {
-            let subject = if mode == 3 {
-                format!("Fwd: {}", m.subject)
-            } else if m.subject.to_lowercase().starts_with("re:") {
-                m.subject.clone()
-            } else {
-                format!("Re: {}", m.subject)
-            };
-            let to = if mode == 3 {
-                String::new()
-            } else if mode == 2 {
-                let mut addresses = vec![m.from.clone()];
-                if let Ok(parsed) = mailparse::addrparse(&m.to) {
-                    for a in parsed.iter() {
-                        if let mailparse::MailAddr::Single(a) = a
-                            && !a.addr.eq_ignore_ascii_case(&own)
-                            && !addresses.contains(&a.addr)
-                        {
-                            addresses.push(a.addr.clone());
-                        }
-                    }
-                }
-                addresses.join(", ")
-            } else {
-                m.from.clone()
-            };
-            let body = format!(
-                "\n\nOn {}, {} wrote:\n{}",
-                date_full(m.date),
-                m.sender,
-                m.body
-                    .unwrap_or_default()
-                    .lines()
-                    .map(|l| format!("> {l}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-            (to, subject, body, m.message_id)
-        } else {
-            (String::new(), String::new(), String::new(), String::new())
-        };
-        self.draft = Draft {
-            id: uuid::Uuid::new_v4().to_string(),
-            account: self.account.clone().unwrap_or_else(|| "demo".into()),
-            to: to.clone(),
-            subject: subject.clone(),
-            body: body.clone(),
-            reply_id,
-            attachments: vec![],
-        };
-        Self::set(&self.compose_to, to, w, cx);
-        Self::set(&self.compose_subject, subject, w, cx);
-        Self::set(&self.compose_body, body, w, cx);
-        self.modal = Some(Modal::Compose);
-        self.anim += 1;
-        self.compose_to.update(cx, |s, cx| s.focus(w, cx));
-        cx.notify();
-    }
-    fn snapshot_draft(&mut self, cx: &App) {
-        self.draft.to = Self::value(&self.compose_to, cx);
-        self.draft.subject = Self::value(&self.compose_subject, cx);
-        self.draft.body = Self::value(&self.compose_body, cx);
-    }
-    fn persist_draft(&mut self, cx: &App) {
-        if self.modal == Some(Modal::Compose) && !self.sending {
-            self.snapshot_draft(cx);
-            if !self.draft.to.is_empty()
-                || !self.draft.subject.is_empty()
-                || !self.draft.body.is_empty()
-            {
-                let _ = self.backend.store.save_draft(&self.draft);
-            }
-        }
-    }
-    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
-        self.draft_revision += 1;
-        let rev = self.draft_revision;
-        cx.spawn(async move |this, cx| {
-            Timer::after(Duration::from_millis(700)).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.draft_revision == rev {
-                    this.persist_draft(cx);
-                }
-            });
-        })
-        .detach();
-    }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.sending {
-            return;
-        }
         if self.menu.take().is_some() {
             cx.notify();
             return;
@@ -1959,7 +1911,6 @@ impl MailApp {
         self.connecting = false;
         self.discovering = false;
         self.setup_generation += 1;
-        self.persist_draft(cx);
         self.modal = None;
         self.status.clear();
         self.error = false;
@@ -2246,70 +2197,6 @@ impl MailApp {
             },
         );
     }
-    fn send(&mut self, cx: &mut Context<Self>) {
-        if self.sending || self.modal != Some(Modal::Compose) {
-            return;
-        }
-        let Some(a) = self.current_account() else {
-            self.notice(
-                "Connect an account before sending. Your draft is saved locally.",
-                true,
-                cx,
-            );
-            return;
-        };
-        self.snapshot_draft(cx);
-        let d = self.draft.clone();
-        if d.to.trim().is_empty() {
-            self.notice("Add a recipient before sending.", true, cx);
-            return;
-        }
-        if let Err(e) = self.backend.store.save_draft(&d) {
-            self.notice(e.to_string(), true, cx);
-            return;
-        }
-        self.sending = true;
-        let id = a.id.clone();
-        self.task(
-            cx,
-            move |b| b.send(&a, &d),
-            move |this, result, cx| {
-                this.sending = false;
-                this.account_result(&id, IssueSource::Send, &result);
-                match result {
-                    Ok(()) => {
-                        this.modal = None;
-                        this.draft = Draft::default();
-                        this.notice("Message sent", false, cx);
-                        if this.folder == Folder::Drafts {
-                            this.load_drafts(cx);
-                        }
-                    }
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
-                }
-            },
-        );
-    }
-    fn attach(&mut self, cx: &mut Context<Self>) {
-        let picker = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach files".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = picker.await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.modal == Some(Modal::Compose) {
-                        this.draft.attachments.extend(paths);
-                        this.persist_draft(cx);
-                        cx.notify();
-                    }
-                });
-            }
-        })
-        .detach();
-    }
     /// Reads the open message's original source and its details once.
     fn load_details(&mut self, cx: &mut Context<Self>) {
         let Some(m) = self.selected_mail() else {
@@ -2493,9 +2380,6 @@ impl MailApp {
         }
     }
     fn handle(&mut self, action: Action, w: &mut Window, cx: &mut Context<Self>) {
-        if self.sending && !matches!(action, Action::Theme | Action::Dismiss) {
-            return;
-        }
         self.menu = None;
         if self.onboarding
             && matches!(
@@ -2505,17 +2389,12 @@ impl MailApp {
         {
             return;
         }
-        if self.modal == Some(Modal::Compose)
-            && matches!(
-                action,
-                Action::Connect | Action::Settings | Action::Help | Action::OpenMailbox(..)
-            )
-        {
-            self.persist_draft(cx);
-        }
         match action {
             Action::Compose => self.new_compose(0, w, cx),
-            Action::Reply(all) => self.new_compose(if all { 2 } else { 1 }, w, cx),
+            Action::Reply(all) => {
+                let all = all || self.compose_options.default_reply_all;
+                self.new_compose(if all { 2 } else { 1 }, w, cx)
+            }
             Action::Forward => self.new_compose(3, w, cx),
             Action::Refresh => {
                 if let Some(id) = self.account.clone() {
@@ -2572,9 +2451,7 @@ impl MailApp {
             }
             Action::DeleteDraft(id) => {
                 let _ = self.backend.store.delete_draft(&id);
-                if self.draft.id == id {
-                    self.draft = Draft::default();
-                }
+                self.drop_composer_for_draft(&id, cx);
                 self.load_drafts(cx);
             }
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
@@ -3011,34 +2888,15 @@ impl MailApp {
                     },
                 );
             }
-            Action::Send => self.send(cx),
-            Action::Attach => self.attach(cx),
-            Action::RemoveAttachment(i) => {
-                if i < self.draft.attachments.len() {
-                    self.draft.attachments.remove(i);
-                    self.persist_draft(cx);
-                }
-            }
             Action::SaveAttachment(i) => self.save_attachment(i, cx),
 
             Action::OpenDraft(id) => {
                 if let Some(d) = self.drafts.iter().find(|d| d.id == id).cloned() {
-                    self.draft = d.clone();
-                    Self::set(&self.compose_to, d.to, w, cx);
-                    Self::set(&self.compose_subject, d.subject, w, cx);
-                    Self::set(&self.compose_body, d.body, w, cx);
-                    self.modal = Some(Modal::Compose);
-                    self.anim += 1;
+                    self.open_draft(d, w, cx);
                 }
             }
-            Action::DiscardDraft => {
-                let _ = self.backend.store.delete_draft(&self.draft.id);
-                self.draft = Draft::default();
-                self.modal = None;
-                if self.folder == Folder::Drafts {
-                    self.load_drafts(cx);
-                }
-            }
+            Action::UndoSend(id) => self.undo_send(id, w, cx),
+            Action::SetComposeOptions(options) => self.save_compose_options(options, cx),
             Action::Dismiss => self.status.clear(),
         }
         self.sync_selecting();
@@ -4577,93 +4435,6 @@ impl MailApp {
             )
             .into_any_element()
     }
-    fn compose_modal(&self, cx: &Context<Self>) -> AnyElement {
-        let c = self.colors();
-        let a = self.current_account();
-        let mut d = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .when_some(a, |d, a| {
-                d.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(c.muted))
-                        .child(format!("From: {}", a.email)),
-                )
-            })
-            .child(
-                field(Input::new(&self.compose_to), c, false)
-                    .prefix(
-                        div()
-                            .w(px(44.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("To"),
-                    )
-                    .disabled(self.sending)
-                    .h(px(40.)),
-            )
-            .child(
-                field(Input::new(&self.compose_subject), c, false)
-                    .prefix(
-                        div()
-                            .w(px(44.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("Subject"),
-                    )
-                    .disabled(self.sending)
-                    .h(px(40.)),
-            )
-            .child(
-                field(Input::new(&self.compose_body), c, self.sending)
-                    .disabled(self.sending)
-                    .h(px(260.))
-                    .text_size(px(14.)),
-            );
-        for (i, path) in self.draft.attachments.iter().enumerate() {
-            d = d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(icon_el("paperclip", 14., c.muted))
-                    .child(
-                        div().text_size(px(12.)).flex_1().truncate().child(
-                            path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                        ),
-                    )
-                    .child(self.button(
-                        format!("remove-attachment-{i}"),
-                        "@Remove attachment",
-                        "close",
-                        Action::RemoveAttachment(i),
-                        false,
-                        cx,
-                    )),
-            );
-        }
-        d.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(self.button(
-                    "attach",
-                    "Attach files",
-                    "paperclip",
-                    Action::Attach,
-                    false,
-                    cx,
-                ))
-                .child(div().flex_1()),
-        )
-        .into_any_element()
-    }
     fn help_modal(&self) -> AnyElement {
         let c = self.colors();
         div()
@@ -4689,6 +4460,10 @@ impl MailApp {
                     ("Toggle sidebar", "⌃ ⌘ S"),
                     ("Move to trash", "⌘ ⌫"),
                     ("Send message", "⌘ Enter"),
+                    ("Save draft", "⌘ S"),
+                    ("Bold / italic / link", "⌘ B / ⌘ I / ⌘ K"),
+                    ("Bulleted / numbered list", "⌘ ⇧ 8 / ⌘ ⇧ 7"),
+                    ("Preview formatting", "⌘ ⇧ P"),
                     ("Appearance", "⌘ ⇧ L"),
                     ("Close / save draft", "Escape"),
                 ]
@@ -5186,7 +4961,6 @@ impl MailApp {
             Modal::Reconnect(_) => "Sign In Again",
             Modal::Settings => "Settings",
             Modal::About => "About Picacho",
-            Modal::Compose => "New Message",
             Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
             Modal::Original => "Original Message",
@@ -5196,7 +4970,6 @@ impl MailApp {
             Modal::Reconnect(id) => self.reconnect_form(id),
             Modal::Settings => self.settings_modal(window, cx),
             Modal::About => self.about_modal(),
-            Modal::Compose => self.compose_modal(cx),
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
             Modal::Original => self.original_modal(cx),
@@ -5209,7 +4982,6 @@ impl MailApp {
             .flex()
             .flex_col()
             .w(px(match modal {
-                Modal::Compose => 720.,
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
                 Modal::RemoveAccount(_) | Modal::Reconnect(_) | Modal::About => 400.,
@@ -5346,29 +5118,6 @@ impl MailApp {
                 true,
                 cx,
             ));
-        } else if *modal == Modal::Compose {
-            footer = footer
-                .child(self.button(
-                    "discard",
-                    "Discard",
-                    "trash",
-                    Action::DiscardDraft,
-                    false,
-                    cx,
-                ))
-                .child(div().flex_1())
-                .child(self.button("save-close", "Save Draft", "", Action::Close, false, cx))
-                .child(
-                    self.button(
-                        "send",
-                        if self.sending { "Sending…" } else { "Send" },
-                        "send",
-                        Action::Send,
-                        true,
-                        cx,
-                    )
-                    .when(self.sending, |d| d.opacity(0.5)),
-                );
         } else {
             footer = footer.child(div().flex_1()).child(self.button(
                 "done",
@@ -5408,6 +5157,7 @@ impl MailApp {
 impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_reveal(window, cx);
+        self.apply_pending_place(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = self.root(window, cx);
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
@@ -5505,7 +5255,6 @@ impl MailApp {
                     this.handle(Action::SelectAll, w, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &SendMail, _, cx| this.send(cx)))
             .on_action(cx.listener(|this, _: &ShowAbout, w, cx| this.handle(Action::About, w, cx)))
             .on_action(
                 cx.listener(|this, _: &AddAccount, w, cx| this.handle(Action::Connect, w, cx)),
@@ -5554,6 +5303,12 @@ impl MailApp {
             .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
             .when(!self.onboarding, |d| self.main(d, window, cx))
             .map(|d| self.track_resize(d, cx))
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ComposerDrag>, w, cx| {
+                this.drag_composer(e, w, cx)
+            }))
+            .when(!self.onboarding, |d| {
+                d.children(self.composer_layer(window, cx))
+            })
             .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
             .when(self.menu.is_some(), |d| d.child(self.popup_menu(cx)))
     }
@@ -5780,6 +5535,28 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "code",
         "text",
         "formatted",
+        "bold",
+        "italic",
+        "underline",
+        "strike",
+        "list",
+        "list-ordered",
+        "quote",
+        "link",
+        "heading",
+        "save",
+        "popout",
+        "expand",
+        "shrink",
+        "dock",
+        "undock",
+        "preview",
+        "format",
+        "contact",
+        "thread",
+        "upload",
+        "cloud",
+        "grid",
     ]
     .contains(&name)
     {
@@ -5896,6 +5673,7 @@ pub fn run(store: Arc<Store>) {
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
         cx.set_menus(menus());
         // `secondary` is Command on macOS and Control elsewhere.
+        cx.bind_keys(composer::bindings());
         cx.bind_keys([
             KeyBinding::new("secondary-q", Quit, Some("Mail")),
             KeyBinding::new("secondary-w", CloseWindow, Some("Mail")),
