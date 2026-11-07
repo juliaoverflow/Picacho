@@ -71,6 +71,12 @@ debug = 0
 # The HTML reader parses, lays out and rasterizes on the CPU; unoptimized,
 # one screen of an email takes ~50x longer. Optimize just those crates in
 # development builds so debug runs reflect real reading speed.
+# The UI framework lays out and paints the whole window on each frame;
+# optimize it too, so debug builds show real frame cost.
+[profile.dev.package.gpui]
+opt-level = 2
+[profile.dev.package.gpui-component]
+opt-level = 2
 [profile.dev.package.vello_cpu]
 opt-level = 3
 [profile.dev.package.vello_common]

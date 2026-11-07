@@ -1,9 +1,20 @@
 //! Reader view components.
 use super::*;
-use gpui_component::Sizable as _;
 
 impl MailApp {
+    /// The message's saved choices or the defaults. The open message's are
+    /// read once, not on every frame.
     pub(super) fn reading_options(&self, mail: &Mail) -> ReadingOptions {
+        if let Some((id, options)) = &*self.options_cache.borrow()
+            && id == &mail.id
+        {
+            return *options;
+        }
+        let options = self.read_options(mail);
+        *self.options_cache.borrow_mut() = Some((mail.id.clone(), options));
+        options
+    }
+    fn read_options(&self, mail: &Mail) -> ReadingOptions {
         let Some(saved) = self
             .backend
             .store
@@ -56,7 +67,7 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let c = self.colors();
-        let Some(m) = self.selected_mail() else {
+        let Some(m) = self.selected_ref() else {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()
                 .id("reader-pane")
@@ -249,7 +260,7 @@ impl MailApp {
                                             .child(format!("<{}>", m.from)),
                                     ),
                             )
-                            .child(self.details_toggle(&m, cx)),
+                            .child(self.details_toggle(m, cx)),
                     )
                     .child(
                         div()
@@ -258,15 +269,15 @@ impl MailApp {
                             .child(date_full(m.date)),
                     ),
             )
-            .when(self.details_open, |d| d.child(self.details_panel(&m, cx)));
+            .when(self.details_open, |d| d.child(self.details_panel(m, cx)));
         let locked = m.body.is_none() && self.locked.contains(&m.account);
-        let options = self.reading_options(&m);
+        let options = self.reading_options(m);
         let dark = self.email_dark(options);
         // A full-width reader in a narrow window shows the controls as icons.
         let narrow = window.viewport_size().width < px(super::panes::READER_MIN);
         content = content
             .when(!locked, |d| {
-                d.child(self.rendering_controls(&m, options, narrow, cx))
+                d.child(self.rendering_controls(m, options, narrow, cx))
             })
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
         if locked {
@@ -465,11 +476,7 @@ fn loading_body(c: Colors) -> AnyElement {
         .items_center()
         .justify_center()
         .gap_3()
-        .child(
-            gpui_component::spinner::Spinner::new()
-                .color(rgb(c.muted).into())
-                .with_size(gpui_component::Size::Large),
-        )
+        .child(spinner(24., c.muted))
         .child(
             div()
                 .text_size(px(12.))
@@ -581,11 +588,7 @@ impl MailApp {
                         .items_center()
                         .gap_2()
                         .text_color(rgb(c.muted))
-                        .child(
-                            gpui_component::spinner::Spinner::new()
-                                .color(rgb(c.muted).into())
-                                .with_size(gpui_component::Size::Small),
-                        )
+                        .child(spinner(13., c.muted))
                         .child("Checking the sender…")
                         .into_any_element(),
                 )
@@ -871,11 +874,7 @@ impl MailApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    gpui_component::spinner::Spinner::new()
-                        .color(rgb(c.muted).into())
-                        .with_size(gpui_component::Size::Large),
-                )
+                .child(spinner(24., c.muted))
                 .into_any_element(),
             Some(Err(e)) => div()
                 .flex_1()

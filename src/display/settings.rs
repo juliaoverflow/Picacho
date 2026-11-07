@@ -368,6 +368,18 @@ impl MailApp {
             )
             .into_any_element()
     }
+    /// Whether the open settings page lists an account's mail errors: only
+    /// that account's own page does.
+    pub(super) fn settings_page_has_errors(&self) -> bool {
+        let Page::Account(id) = &self.page else {
+            return false;
+        };
+        self.accounts.iter().any(|a| &a.id == id)
+            && self
+                .account_issues
+                .get(id)
+                .is_some_and(|issues| !issues.is_empty())
+    }
     fn account_error_details(&self, a: &Account, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let mut issues: Vec<_> = self
@@ -572,7 +584,7 @@ impl MailApp {
                             ),
                     ),
             )
-            .when(self.account_issues.get(&a.id).is_some_and(|issues| !issues.is_empty()), |page| {
+            .when(self.settings_page_has_errors(), |page| {
                 page.child(self.account_error_details(a, cx))
             })
             .child(self.section("Profile picture"))

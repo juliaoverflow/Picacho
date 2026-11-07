@@ -76,6 +76,9 @@ impl MailApp {
             (_, None) => true,
             (None, Some(_)) => false,
         };
+        if !same {
+            self.unfillable.clear();
+        }
         if !same || !self.place(catalog.added, cx) {
             self.reload_cached(cx);
         }
@@ -119,7 +122,7 @@ impl MailApp {
         let wanted: Vec<u32> = self.visible[from..to]
             .iter()
             .map(|i| &self.messages[*i])
-            .filter(|m| m.pending)
+            .filter(|m| m.pending && !self.unfillable.contains(&m.uid))
             .map(|m| m.uid)
             .collect();
         if wanted.is_empty() {
@@ -151,6 +154,7 @@ impl MailApp {
         let generation = self.load_generation;
         let backend = self.backend.clone();
         let account = a.clone();
+        let asked = uids.clone();
         let job = cx
             .background_executor()
             .spawn(async move { backend.fill(&account, &mailbox, &layout, &uids) });
@@ -165,6 +169,12 @@ impl MailApp {
                 }
                 match result {
                     Ok(listed) => {
+                        // Rows the server did not list (deleted meanwhile)
+                        // are not asked for again on every frame; the next
+                        // catalog or sync settles them.
+                        let got: HashSet<u32> = listed.iter().map(|m| m.uid).collect();
+                        this.unfillable
+                            .extend(asked.iter().filter(|u| !got.contains(u)));
                         if !this.place(listed, cx) {
                             this.reload_cached(cx);
                         }

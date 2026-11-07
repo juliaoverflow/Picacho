@@ -36,6 +36,8 @@ struct Thumbnail {
 pub struct HtmlView {
     source: String,
     blocked: bool,
+    /// The reader's dark choice the current tone was chosen for.
+    dark: bool,
     tone: Tone,
     thumbnail: Option<Thumbnail>,
     /// The thumbnail asked of the worker: (revision, width, max height, scale).
@@ -88,6 +90,7 @@ impl HtmlView {
         Self {
             source: String::new(),
             blocked: true,
+            dark: false,
             tone: Tone::Light,
             thumbnail: None,
             thumbnail_requested: None,
@@ -142,14 +145,18 @@ impl HtmlView {
     /// Shows `html`, with remote content `blocked` or not, in light or `dark`
     /// colors. The same content again keeps the current document.
     pub fn set_content(&mut self, html: &str, blocked: bool, dark: bool, cx: &mut Context<Self>) {
-        let tone = Tone::for_email(html, dark);
+        // Called on every reader render: compare cheaply before scanning
+        // the HTML for its color scheme.
         if self.worker.is_some()
-            && self.source == html
+            && self.dark == dark
             && self.blocked == blocked
-            && self.tone == tone
+            && self.source.len() == html.len()
+            && self.source == html
         {
             return;
         }
+        let tone = Tone::for_email(html, dark);
+        self.dark = dark;
         self.clear(cx);
         self.source = html.into();
         self.blocked = blocked;

@@ -523,6 +523,8 @@ pub struct MailApp {
     /// request for them is running.
     wanted_rows: Vec<u32>,
     filling: bool,
+    /// Placeholder rows a fill asked for that the server did not list.
+    unfillable: HashSet<u32>,
     search: Entity<InputState>,
     focus: FocusHandle,
     modal: Option<Modal>,
@@ -562,6 +564,15 @@ pub struct MailApp {
     draft_revision: u64,
     drafts: Vec<Draft>,
     sending: bool,
+    /// A spinner tick is pending (see `spinner`).
+    spin_scheduled: bool,
+    /// A count refresh is running, and another was asked for meanwhile.
+    counts_running: bool,
+    counts_again: bool,
+    /// Unread messages among those loaded, counted when the list changes.
+    loaded_unread: usize,
+    /// The open message's reading options, read from preferences once.
+    options_cache: std::cell::RefCell<Option<(String, ReadingOptions)>>,
     _subscriptions: Vec<Subscription>,
     load_generation: u64,
     read_generation: u64,
@@ -803,6 +814,7 @@ impl MailApp {
             layout: None,
             wanted_rows: Vec::new(),
             filling: false,
+            unfillable: HashSet::new(),
             search,
             focus: cx.focus_handle(),
             modal: None,
@@ -840,6 +852,11 @@ impl MailApp {
             draft_revision: 0,
             drafts: vec![],
             sending: false,
+            spin_scheduled: false,
+            counts_running: false,
+            counts_again: false,
+            loaded_unread: 0,
+            options_cache: Default::default(),
             _subscriptions: subscriptions,
             load_generation: 0,
             read_generation: 0,
@@ -908,10 +925,12 @@ impl MailApp {
             .cloned()
     }
     fn selected_mail(&self) -> Option<Mail> {
-        self.messages
-            .iter()
-            .find(|m| Some(&m.id) == self.selected.as_ref())
-            .cloned()
+        self.selected_ref().cloned()
+    }
+    /// The open message, without copying its body.
+    fn selected_ref(&self) -> Option<&Mail> {
+        let id = self.selected.as_ref()?;
+        self.messages.iter().find(|m| &m.id == id)
     }
     fn value(state: &Entity<InputState>, cx: &App) -> String {
         state.read(cx).value().to_string()
@@ -976,10 +995,18 @@ impl MailApp {
         }
         let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
         self.selection.retain(|id| present.contains(id));
+        self.loaded_unread = self.messages.iter().filter(|m| m.unread).count();
         self.sync_selecting();
     }
     /// Reloads sidebar unread counts and download progress from the cache.
+    /// Requests made while one runs are coalesced into a single follow-up,
+    /// spaced out so a running download does not query on every batch.
     fn refresh_counts(&mut self, cx: &mut Context<Self>) {
+        if self.counts_running {
+            self.counts_again = true;
+            return;
+        }
+        self.counts_running = true;
         let store = self.backend.store.clone();
         let now = chrono::Utc::now().timestamp();
         let offline: Vec<(String, i64)> = self
@@ -998,15 +1025,29 @@ impl MailApp {
                     ))
                 })
                 .await;
-            if let Ok((unread, (total, missing))) = result {
-                let _ = this.update(cx, |this, cx| {
-                    this.unread = unread;
-                    this.download.total = total;
-                    this.download.missing = missing;
-                    this.download.paused = missing > 0 && !this.download.active;
-                    cx.notify();
-                });
-            }
+            let _ = this.update(cx, |this, cx| {
+                if let Ok((unread, (total, missing))) = result {
+                    let paused = missing > 0 && !this.download.active;
+                    if this.unread != unread
+                        || this.download.total != total
+                        || this.download.missing != missing
+                        || this.download.paused != paused
+                    {
+                        this.unread = unread;
+                        this.download.total = total;
+                        this.download.missing = missing;
+                        this.download.paused = paused;
+                        cx.notify();
+                    }
+                }
+            });
+            Timer::after(Duration::from_millis(400)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.counts_running = false;
+                if std::mem::take(&mut this.counts_again) {
+                    this.refresh_counts(cx);
+                }
+            });
         })
         .detach();
     }
@@ -1479,6 +1520,7 @@ impl MailApp {
         self.messages.clear();
         self.layout = None;
         self.wanted_rows.clear();
+        self.unfillable.clear();
         self.filter_by = Filter::All;
         Self::set(&self.search, "", w, cx);
         self.search_open = false;
@@ -2819,7 +2861,10 @@ impl MailApp {
                     "reading_defaults",
                     &serde_json::to_string(&options).unwrap(),
                 ) {
-                    Ok(()) => self.reading_defaults = options,
+                    Ok(()) => {
+                        self.reading_defaults = options;
+                        self.options_cache.borrow_mut().take();
+                    }
                     Err(e) => self.notice(e.to_string(), true, cx),
                 }
             }
@@ -2882,6 +2927,7 @@ impl MailApp {
                         }
                         _ => options.block_remote = !options.block_remote,
                     }
+                    self.options_cache.borrow_mut().take();
                     if let Err(e) = self.backend.store.set_preference(
                         &message_key(&m.account, &m.id),
                         &serde_json::to_string(&options).unwrap(),
@@ -3653,7 +3699,7 @@ impl MailApp {
         if self.folder == Folder::Drafts {
             return 0;
         }
-        let loaded = self.messages.iter().filter(|m| m.unread).count();
+        let loaded = self.loaded_unread;
         match &self.account {
             Some(id) if self.folder != Folder::Starred => {
                 self.unread_for(id, &self.mailbox()).max(loaded)
@@ -5362,6 +5408,24 @@ impl MailApp {
 impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_reveal(window, cx);
+        SPINNING.with(|s| s.set(false));
+        let root = self.root(window, cx);
+        if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
+            self.spin_scheduled = true;
+            cx.spawn(async move |this, cx| {
+                Timer::after(SPIN_STEP).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.spin_scheduled = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        root
+    }
+}
+impl MailApp {
+    fn root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = self.colors();
         div()
             .id("mail-app")
@@ -5647,17 +5711,27 @@ fn back_out(t: f32) -> f32 {
     let (c1, t) = (1.70158, t - 1.);
     1. + (c1 + 1.) * t.powi(3) + c1 * t.powi(2)
 }
+thread_local! {
+    /// Set while a render draws a spinner, so the app keeps ticking it.
+    static SPINNING: Cell<bool> = const { Cell::new(false) };
+    static SPIN_EPOCH: std::time::Instant = std::time::Instant::now();
+}
+/// Spinners turn in steps on a slow clock instead of on every display frame:
+/// each frame redraws the whole window, so a vsync spinner kept the CPU busy
+/// for as long as a sync or download ran.
+const SPIN_STEP: Duration = Duration::from_millis(70);
+const SPIN_STEPS: u128 = 14;
 fn spinner(size: f32, color: u32) -> impl IntoElement {
+    SPINNING.with(|s| s.set(true));
+    let step = SPIN_EPOCH.with(|e| e.elapsed().as_millis() / SPIN_STEP.as_millis()) % SPIN_STEPS;
     svg()
         .path("icons/loader-circle.svg")
         .size(px(size))
         .flex_shrink_0()
         .text_color(rgb(color))
-        .with_animation(
-            "spinner",
-            Animation::new(Duration::from_millis(900)).repeat(),
-            |s, t| s.with_transformation(Transformation::rotate(percentage(t))),
-        )
+        .with_transformation(Transformation::rotate(percentage(
+            step as f32 / SPIN_STEPS as f32,
+        )))
 }
 fn folder_icon(f: Folder) -> &'static str {
     match f {
@@ -6273,7 +6347,10 @@ mod tests {
     }
     /// Test windows draw before dispatching input, so a no-op mouse move
     /// brings the rendered frame up to date.
+    /// Draws a fresh frame. The app no longer redraws on its own while idle,
+    /// so ask for one before moving the pointer.
     pub(super) fn frame(cx: &mut VisualTestContext) {
+        cx.update(|w, _| w.refresh());
         cx.simulate_event(MouseMoveEvent {
             position: point(px(1.), px(1.)),
             pressed_button: None,

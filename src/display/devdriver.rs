@@ -2,7 +2,7 @@
 //!
 //! Set `PICACHO_DEV_DIR` to a folder, then append lines to `<dir>/cmd`:
 //! `snap <name> <window-number>` saves `<dir>/<name>.png` of this window,
-//! `size <w> <h>`, `action <name>`, `select <index>`, `scroll <index>`,
+//! `size <w> <h>`, `syncing` (toggles the sync spinner), `action <name>`, `select <index>`, `scroll <index>`,
 //! `drag <sidebar|reader> <from-x> <to-x>`, `log <name>`,
 //! `rscroll <y|end>`, `mouse <move|down|up|click|dclick|rclick|drag> <x> <y>` (window coordinates)
 //! and `eml <path>` (opens a message file at the top of the list). End a line with
@@ -79,6 +79,8 @@ fn run(
                 format!("offset={offset:?} selected={:?}", this.selected),
             );
         }
+        // Shows the list's sync spinner, as during a long sync.
+        Some("syncing") => this.syncing = !this.syncing,
         Some("size") => w.resize(size(px(number(1)), px(number(2)))),
         Some("select") => {
             if let Some(i) = this.visible.get(number(1) as usize) {

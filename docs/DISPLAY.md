@@ -113,3 +113,19 @@ mailed-by (the SPF envelope domain), signed-by (DKIM domains), transport
 security (TLS on the last hop, or end-to-end encryption) and SPF/DKIM/DMARC
 verdicts from the receiving server's Authentication-Results. Show Original
 opens the raw source with those facts, Copy and Download (.eml).
+
+## Frame budget
+
+GPUI redraws the whole window whenever the app view is notified, and every
+`with_animation` frame notifies it. Keep the app quiet when nothing changes:
+
+- Never use repeating animations. `spinner()` turns in steps on a slow
+  clock (`SPIN_STEP`) and schedules its own next tick only while one is drawn.
+- Rendering must not touch SQLite or copy message bodies: use
+  `selected_ref()`, the cached `reading_options`, and `loaded_unread`.
+- Background loops coalesce their UI updates (`refresh_counts` runs at most
+  one follow-up per interval and notifies only when counts change).
+- Placeholder rows the server did not list are remembered in `unfillable`
+  so the list does not request them again on every frame.
+- GPUI's `debug_bounds` keeps a selector's last bounds after its element is
+  gone; tests that assert absence should check state instead.
