@@ -4,7 +4,7 @@
 //! `snap <name> <window-number>` saves `<dir>/<name>.png` of this window,
 //! `size <w> <h>`, `action <name>`, `select <index>`, `scroll <index>`,
 //! `drag <sidebar|reader> <from-x> <to-x>`, `log <name>`,
-//! `rscroll <y|end>`, `mouse <move|down|up|click|dclick|rclick> <x> <y>` (window coordinates)
+//! `rscroll <y|end>`, `mouse <move|down|up|click|dclick|rclick|drag> <x> <y>` (window coordinates)
 //! and `eml <path>` (opens a message file at the top of the list). End a line with
 //! ` &` to run the next one without waiting. Capturing its own window needs no
 //! screen-recording permission. Release builds do not include this module.
@@ -205,6 +205,11 @@ fn mouse(words: &[&str], height: f32) {
         Some("click") => &[(1, 1), (2, 1)],
         Some("dclick") => &[(1, 1), (2, 1), (1, 2), (2, 2)],
         Some("rclick") => &[(3, 1), (4, 1)],
+        // Moves with the left button held, as while dragging.
+        Some("drag") => {
+            send_mouse(6, 1, x, y);
+            return;
+        }
         _ => &[],
     };
     // Move first so hover state is current, like a real pointer.

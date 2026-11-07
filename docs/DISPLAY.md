@@ -34,6 +34,28 @@ Debug macOS builds include a driver for visual checks: run with
 `PICACHO_DEV_DIR=<dir>` and append commands to `<dir>/cmd` (see
 `devdriver.rs`). It captures only the app's own window.
 
+## Sidebar arrangement
+
+The sidebar is a tree of accounts, folders and separators (`tree.rs`), saved
+as the `sidebar_tree` preference and reconciled with the saved accounts on
+start and whenever one is added or removed. Each account and folder keeps its
+own open/closed state (`collapsed_accounts`); the rail uses the same state,
+so collapsing the sidebar never opens or closes an account. Clicking an
+account or folder toggles it; its chevron turns and its contents slide in.
+
+Add… (the + row, or + in the rail) and a right-click on empty sidebar space
+offer Add Account, New Folder and New Separator. A new folder starts with
+its name selected; double-click or Rename… edits it, Enter or clicking away
+saves and Escape cancels. Deleting a folder keeps its contents in its place.
+
+Every entry can be dragged. The upper or lower half of a row places it
+before or after (a line with a dot marks the spot); the middle of a folder
+drops into it (the folder is outlined), and holding there opens a closed
+folder. To the left of a folder's last entry, a drop leaves the folder. The
+dragged entry dims, a pill follows the pointer, the list scrolls near its
+edges and the moved entry flashes where it landed. A folder never goes
+inside itself.
+
 ## Locked messages
 
 Locked and readable messages share the same reader shell: toolbar, flex sizing, scroll handle and background. Add content inside that shell rather than returning early from a locked-message branch. The password panel has an explicit width bounded by the reader, an input label, inline errors and a per-account unlock-in-progress state. Enter submits; blank input gives feedback and focuses the field. Duplicate submissions are ignored while an unlock runs. Clear the input on submission, mailbox navigation and Back navigation, and zeroize the worker's password string when it is finished.
