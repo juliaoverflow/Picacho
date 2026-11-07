@@ -346,6 +346,9 @@ struct PopupMenu {
     position: Point<Pixels>,
     entries: Vec<Entry>,
     key: u64,
+    /// When the menu opened. A trackpad's two-finger click also sends small
+    /// scroll events; those must not close the menu it just opened.
+    opened: std::time::Instant,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
@@ -1126,6 +1129,7 @@ impl MailApp {
             position,
             entries,
             key: self.anim,
+            opened: std::time::Instant::now(),
         });
         cx.notify();
     }
@@ -3966,7 +3970,6 @@ impl MailApp {
         let drafts = self.folder == Folder::Drafts;
         let row_group = SharedString::from(format!("row-group-{id}"));
         let lead_group = SharedString::from(format!("lead-group-{id}"));
-        let entries = self.mail_entries(&m.id);
         let check_fg = c.on_accent;
         let checkbox = div()
             .size(px(20.))
@@ -4166,12 +4169,14 @@ impl MailApp {
                             .child(m.snippet.clone()),
                     ),
             )
-            .on_mouse_down(
-                MouseButton::Right,
+            .on_mouse_down(MouseButton::Right, {
+                // Built on demand: rows render often, menus open rarely.
+                let id = id.clone();
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                    this.open_menu(e.position, entries.clone(), cx)
-                }),
-            )
+                    let entries = this.mail_entries(&id);
+                    this.open_menu(e.position, entries, cx)
+                })
+            })
             .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
                 let modifiers = e.modifiers();
                 if this.folder == Folder::Drafts {
@@ -4966,6 +4971,7 @@ impl MailApp {
             .bg(rgb(c.raised))
             .shadow_lg()
             .text_size(px(13.))
+            .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
         let any_checks = menu
@@ -5025,21 +5031,33 @@ impl MailApp {
                 }
             }
         }
-        let close =
-            |this: &mut Self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| {
-                this.menu = None;
-                cx.notify();
-            };
+        // A press outside the panel closes it. A left press is consumed, like
+        // a native menu; a right press goes on, so right-clicking another row
+        // or folder opens its menu at once.
+        let panel = panel.on_mouse_down_out(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+            this.menu = None;
+            if e.button == MouseButton::Left {
+                cx.stop_propagation();
+            }
+            cx.notify();
+        }));
         div()
             .id("menu-backdrop")
-            .occlude()
             .absolute()
             .inset_0()
-            .on_mouse_down(MouseButton::Left, cx.listener(close))
-            .on_mouse_down(MouseButton::Right, cx.listener(close))
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-                this.menu = None;
-                cx.notify();
+            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
+                let moved = match e.delta {
+                    ScrollDelta::Pixels(d) => d.x.abs().max(d.y.abs()) > px(3.),
+                    ScrollDelta::Lines(d) => d.x.abs().max(d.y.abs()) > 0.2,
+                };
+                let settled = this
+                    .menu
+                    .as_ref()
+                    .is_some_and(|m| m.opened.elapsed() > Duration::from_millis(250));
+                if moved && settled && !matches!(e.touch_phase, TouchPhase::Ended) {
+                    this.menu = None;
+                    cx.notify();
+                }
             }))
             .child(
                 anchored()
@@ -6468,6 +6486,14 @@ mod tests {
                     .any(|e| matches!(e, Entry::Item { label, .. } if label.as_ref() == "Archive"))
             );
         });
+        // A trackpad's two-finger click sends a tiny scroll with it; the menu stays.
+        cx.simulate_event(ScrollWheelEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Started,
+        });
+        view.read_with(cx, |this, _| assert!(this.menu.is_some()));
         // Choosing "Select" from the menu starts selection mode.
         let select = view.read_with(cx, |this, _| {
             this.menu
