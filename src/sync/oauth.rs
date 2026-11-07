@@ -107,6 +107,32 @@ fn http() -> Result<reqwest::blocking::Client> {
 /// The Google account's profile picture, if it has one. The sign-in's
 /// `profile` scope covers the OpenID userinfo endpoint; the image itself is
 /// only fetched from Google's own content host.
+/// The Gravatar picture for an address, or `None` when it has none. Only
+/// the SHA-256 hash of the address leaves this computer.
+pub fn gravatar(email: &str) -> Result<Option<Vec<u8>>> {
+    use sha2::Digest;
+    use std::io::Read;
+    let hash = sha2::Sha256::digest(email.trim().to_lowercase().as_bytes());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    // d=404 asks for an error rather than a generated placeholder.
+    let response = client
+        .get(format!("https://gravatar.com/avatar/{hex}?s=256&d=404"))
+        .send()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    response
+        .error_for_status()?
+        .take(5 << 20)
+        .read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
     let client = reqwest::blocking::Client::builder()

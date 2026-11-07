@@ -172,6 +172,131 @@ impl MailApp {
         })
         .detach();
     }
+    /// The picture menu: from the provider, a preset, or a file.
+    pub(super) fn avatar_entries(&self, id: &str) -> Vec<Entry> {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id) else {
+            return vec![];
+        };
+        let provider = if a.provider == Provider::Gmail && a.oauth {
+            "Load from Google"
+        } else {
+            "Load from Gravatar"
+        };
+        let mut entries = vec![
+            entry(provider, "cloud", Action::ProviderAvatar(id.into())),
+            entry(
+                "Choose from Presets…",
+                "grid",
+                Action::AvatarPresets(id.into()),
+            ),
+            entry(
+                "Upload Your Own…",
+                "upload",
+                Action::ChooseAvatar(id.into()),
+            ),
+        ];
+        if self.avatars.contains_key(id) {
+            entries.push(Entry::Separator);
+            entries.push(danger(
+                "Remove Picture",
+                "trash",
+                Action::RemoveAvatar(id.into()),
+            ));
+        }
+        entries
+    }
+    /// Replaces the picture with the provider's, if it has one.
+    pub(super) fn provider_avatar(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        self.notice("Looking for your picture…", false, cx);
+        self.task(
+            cx,
+            move |b| b.provider_avatar(&a),
+            move |this, result, cx| match result {
+                Ok(Some(path)) => {
+                    this.avatars.insert(id, path);
+                    this.notice("Picture updated", false, cx);
+                }
+                Ok(None) => this.notice("No picture was found for this address.", true, cx),
+                Err(e) => this.notice(format!("{e:#}"), true, cx),
+            },
+        );
+    }
+    pub(super) fn preset_avatar(&mut self, id: String, name: &'static str, cx: &mut Context<Self>) {
+        let Some(bytes) = crate::display::assets::preset(name) else {
+            return;
+        };
+        if matches!(self.modal, Some(Modal::AvatarPresets(_))) {
+            self.modal = std::mem::take(&mut self.presets_from_settings).then_some(Modal::Settings);
+        }
+        self.task(
+            cx,
+            move |b| b.set_avatar(&id, bytes, "preset").map(|path| (id, path)),
+            |this, result, cx| match result {
+                Ok((id, path)) => {
+                    this.avatars.insert(id, path);
+                }
+                Err(e) => this.notice(format!("{e:#}"), true, cx),
+            },
+        );
+    }
+    /// A grid of preset pictures.
+    pub(super) fn presets_modal(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        div()
+            .id("avatar-presets")
+            .debug_selector(|| "avatar-presets".into())
+            .flex()
+            .flex_wrap()
+            .justify_center()
+            .gap_4()
+            .children(
+                crate::display::assets::PRESETS
+                    .iter()
+                    .map(|(name, label, _)| {
+                        let id = id.to_string();
+                        let name: &'static str = name;
+                        div()
+                            .id(SharedString::from(format!("preset-{name}")))
+                            .debug_selector(move || format!("preset-{name}"))
+                            .w(px(92.))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .group("preset")
+                            .child(
+                                div()
+                                    .size(px(84.))
+                                    .p(px(3.))
+                                    .rounded(px(14.))
+                                    .border_2()
+                                    .border_color(rgb(c.border))
+                                    .bg(rgb(c.bg))
+                                    .shadow_sm()
+                                    .hover(move |s| s.border_color(rgb(c.accent)))
+                                    .child(
+                                        img(SharedString::from(format!("avatars/{name}.jpg")))
+                                            .size_full()
+                                            .rounded(px(10.)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(c.muted))
+                                    .child(*label),
+                            )
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.handle(Action::SetPresetAvatar(id.clone(), name), w, cx)
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
     pub(super) fn choose_avatar(&mut self, id: String, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -193,7 +318,7 @@ impl MailApp {
                 .spawn(async move {
                     let bytes = std::fs::read(&path)?;
                     anyhow::ensure!(bytes.len() <= 20 << 20, "Choose a picture under 20 MB.");
-                    backend.set_avatar(&key, &bytes, true)
+                    backend.set_avatar(&key, &bytes, "custom")
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {

@@ -7,6 +7,12 @@ impl AssetSource for Assets {
         if let Some(name) = path.strip_prefix("brand/") {
             return Ok(brand(name).map(Cow::Borrowed));
         }
+        if let Some(name) = path
+            .strip_prefix("avatars/")
+            .and_then(|n| n.strip_suffix(".jpg"))
+        {
+            return Ok(preset(name).map(Cow::Borrowed));
+        }
         let shape = match path {
             "mail/logo.svg" => Some(
                 "<path fill='currentColor' stroke='none' d='M2 17v-5a10 10 0 0 1 20 0v5a20 10 0 0 0-6-3v-2a4 4 0 0 0-8 0v2a20 10 0 0 0-6 3Zm0 5a10 5 0 0 1 20 0Z'/>",
@@ -162,4 +168,66 @@ fn brand(name: &str) -> Option<&'static [u8]> {
         _ => return None,
     };
     Some(svg.as_bytes())
+}
+
+/// Preset account pictures (CC0 photographs; see assets/avatars/README.md),
+/// as (name, label, JPEG bytes). Drawn with `img("avatars/<name>.jpg")`.
+pub const PRESETS: [(&str, &str, &[u8]); 10] = [
+    (
+        "tulip",
+        "Tulips",
+        include_bytes!("../../assets/avatars/tulip.jpg"),
+    ),
+    (
+        "butterfly",
+        "Butterfly",
+        include_bytes!("../../assets/avatars/butterfly.jpg"),
+    ),
+    (
+        "beach",
+        "Beach",
+        include_bytes!("../../assets/avatars/beach.jpg"),
+    ),
+    (
+        "leaf",
+        "Dewdrops",
+        include_bytes!("../../assets/avatars/leaf.jpg"),
+    ),
+    (
+        "kitten",
+        "Kitten",
+        include_bytes!("../../assets/avatars/kitten.jpg"),
+    ),
+    (
+        "penguin",
+        "Penguin",
+        include_bytes!("../../assets/avatars/penguin.jpg"),
+    ),
+    (
+        "chess",
+        "Chess",
+        include_bytes!("../../assets/avatars/chess.jpg"),
+    ),
+    (
+        "guitar",
+        "Guitar",
+        include_bytes!("../../assets/avatars/guitar.jpg"),
+    ),
+    (
+        "duck",
+        "Rubber Duck",
+        include_bytes!("../../assets/avatars/duck.jpg"),
+    ),
+    (
+        "sunflower",
+        "Sunflower",
+        include_bytes!("../../assets/avatars/sunflower.jpg"),
+    ),
+];
+
+pub fn preset(name: &str) -> Option<&'static [u8]> {
+    PRESETS
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(_, _, b)| *b)
 }

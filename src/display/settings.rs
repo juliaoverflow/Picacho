@@ -789,40 +789,42 @@ impl MailApp {
                 if a.provider == Provider::Gmail && a.oauth {
                     "Shown beside this mailbox. Your Google profile picture is used until you choose another."
                 } else {
-                    "Shown beside this mailbox in the sidebar."
+                    "Shown beside this mailbox. Load one from Gravatar, pick a preset or upload your own."
                 },
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap_3()
-                    .child(self.account_avatar(a, index, 48.))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("avatar-picker-{}", a.id)))
+                            .debug_selector(|| "avatar-picker".into())
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .child(self.account_avatar(a, index, 48.))
+                            .tooltip(|w, cx| Tooltip::new("Change picture").build(w, cx))
+                            .on_click({
+                                let id = a.id.clone();
+                                cx.listener(move |this, _, w, cx| {
+                                    this.handle(Action::AvatarMenu(id.clone()), w, cx)
+                                })
+                            }),
+                    )
                     .child(
                         self.button(
                             format!("choose-avatar-{}", a.id),
-                            "Choose Picture…",
-                            "user",
-                            Action::ChooseAvatar(a.id.clone()),
+                            "Change Picture",
+                            "chevron-down",
+                            Action::AvatarMenu(a.id.clone()),
                             false,
                             cx,
                         )
+                        .flex_row_reverse()
                         .border_1()
                         .border_color(rgb(c.border)),
-                    )
-                    .when(self.avatars.contains_key(&a.id), |row| {
-                        row.child(
-                            self.button(
-                                format!("remove-avatar-{}", a.id),
-                                "Remove",
-                                "",
-                                Action::RemoveAvatar(a.id.clone()),
-                                false,
-                                cx,
-                            )
-                            .border_1()
-                            .border_color(rgb(c.border)),
-                        )
-                    }),
+                    ),
             ))
             .when(self.encrypted.contains(&a.id), |page| {
                 let locked = self.locked.contains(&a.id);

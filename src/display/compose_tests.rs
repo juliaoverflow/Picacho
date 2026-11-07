@@ -1,4 +1,5 @@
-//! Writing mail: replies, placement, drafts, and sending with undo.
+//! Writing mail (replies, placement, drafts, sending with undo), reading
+//! conversations, and account pictures.
 use super::tests::{act, frame, two_accounts};
 use super::*;
 use std::prelude::v1::test;
@@ -114,5 +115,41 @@ fn conversations_group_replies_and_fold_quoted_history(cx: &mut TestAppContext) 
     view.read_with(cx, |this, _| {
         assert!(!this.quotes_open, "each message starts folded");
         assert_eq!(this.thread(this.selected_ref().unwrap()).len(), 1);
+    });
+}
+
+#[gpui::test]
+fn every_preset_picture_decodes_and_applies_from_settings(cx: &mut TestAppContext) {
+    for (name, _, bytes) in crate::display::assets::PRESETS {
+        let image = image::load_from_memory(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!((image.width(), image.height()), (256, 256), "{name}");
+    }
+    let (view, cx, _) = two_accounts(cx);
+    let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    act(&view, Action::AccountSettings(id.clone()), cx);
+    act(&view, Action::AvatarPresets(id.clone()), cx);
+    frame(cx);
+    assert!(cx.debug_bounds("preset-penguin").is_some());
+    act(&view, Action::SetPresetAvatar(id.clone(), "penguin"), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.avatars.contains_key(&id));
+        assert!(this.modal == Some(Modal::Settings), "back in Settings");
+        let entries = this.avatar_entries(&id);
+        let labels: Vec<_> = entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, .. } => Some(label.to_string()),
+                Entry::Separator => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Load from Gravatar",
+                "Choose from Presets…",
+                "Upload Your Own…",
+                "Remove Picture"
+            ]
+        );
     });
 }

@@ -299,6 +299,8 @@ enum Modal {
     Reconnect(String),
     /// The raw source of the open message.
     Original,
+    /// Preset pictures for an account.
+    AvatarPresets(String),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -414,6 +416,11 @@ enum Action {
     ToggleReader,
     ChooseAvatar(String),
     RemoveAvatar(String),
+    /// The account picture menu: provider, presets, upload, remove.
+    AvatarMenu(String),
+    ProviderAvatar(String),
+    AvatarPresets(String),
+    SetPresetAvatar(String, &'static str),
     StartSelecting(String),
     ToggleSelected(String),
     SelectAll,
@@ -592,6 +599,8 @@ pub struct MailApp {
     /// The signature field in Composing settings.
     signature_input: Entity<InputState>,
     signature_revision: u64,
+    /// The preset picker was opened from Settings, which it returns to.
+    presets_from_settings: bool,
     /// A move asked for by a composer whose subscription had no window.
     pending_place: Option<(EntityId, Placement)>,
     /// Any message is being delivered now; quitting waits for it.
@@ -920,6 +929,7 @@ impl MailApp {
             composer_subscriptions: HashMap::new(),
             signature_input,
             signature_revision: 0,
+            presets_from_settings: false,
             pending_place: None,
             sending: false,
             spin_scheduled: false,
@@ -1275,6 +1285,7 @@ impl MailApp {
                 "settings",
                 Action::AccountSettings(id.clone()),
             ),
+            entry("Change Picture…", "user", Action::AvatarMenu(id.clone())),
             Entry::Separator,
             danger("Remove Account…", "trash", Action::ConfirmRemove(id)),
         ]
@@ -1956,7 +1967,13 @@ impl MailApp {
         self.connecting = false;
         self.discovering = false;
         self.setup_generation += 1;
-        self.modal = None;
+        self.modal = if matches!(self.modal, Some(Modal::AvatarPresets(_)))
+            && std::mem::take(&mut self.presets_from_settings)
+        {
+            Some(Modal::Settings)
+        } else {
+            None
+        };
         self.status.clear();
         self.error = false;
         Self::set(&self.form[PASSWORD], "", w, cx);
@@ -2535,6 +2552,18 @@ impl MailApp {
             Action::ToggleSidebar => self.set_sidebar_collapsed(!self.sidebar_collapsed, cx),
             Action::ToggleReader => self.set_reader_collapsed(!self.reader_collapsed, cx),
             Action::ChooseAvatar(id) => self.choose_avatar(id, cx),
+            Action::AvatarMenu(id) => {
+                let entries = self.avatar_entries(&id);
+                self.open_menu(w.mouse_position(), entries, cx);
+                return;
+            }
+            Action::ProviderAvatar(id) => self.provider_avatar(id, cx),
+            Action::AvatarPresets(id) => {
+                self.presets_from_settings = self.modal == Some(Modal::Settings);
+                self.modal = Some(Modal::AvatarPresets(id));
+                self.anim += 1;
+            }
+            Action::SetPresetAvatar(id, name) => self.preset_avatar(id, name, cx),
             Action::RemoveAvatar(id) => match self.backend.remove_avatar(&id) {
                 Ok(()) => {
                     self.avatars.remove(&id);
@@ -5016,6 +5045,7 @@ impl MailApp {
             Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
             Modal::Original => "Original Message",
+            Modal::AvatarPresets(_) => "Choose a Picture",
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -5025,6 +5055,7 @@ impl MailApp {
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
             Modal::Original => self.original_modal(cx),
+            Modal::AvatarPresets(id) => self.presets_modal(id, cx),
         };
         let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
         let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
@@ -5036,6 +5067,7 @@ impl MailApp {
             .w(px(match modal {
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
+                Modal::AvatarPresets(_) => 560.,
                 Modal::RemoveAccount(_) | Modal::Reconnect(_) | Modal::About => 400.,
                 Modal::Settings | Modal::Original => 820.,
             }))

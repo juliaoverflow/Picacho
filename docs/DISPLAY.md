@@ -179,3 +179,12 @@ Reply, Reply all and Forward open compose windows. Composers move to a
 window with "Open in new window". Detached windows use the "Detached" key
 context: ⌘W closes them (a composer saves first) and Escape closes a
 message window.
+
+## Account pictures
+
+Clicking an account's picture (or Change Picture in its settings, or
+Change Picture… in its sidebar menu) opens a menu: Load from Google (Gmail
+browser sign-ins) or Gravatar (only the SHA-256 of the address is sent),
+Choose from Presets…, Upload Your Own…, and Remove Picture. Presets are
+CC0 photographs bundled in `assets/avatars` (sources in its README) and
+listed in `assets.rs`; the picker returns to Settings when opened from it.
