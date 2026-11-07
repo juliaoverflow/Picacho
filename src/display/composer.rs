@@ -542,7 +542,7 @@ impl Composer {
 
     /// Checks the draft and asks the app to send it. Missing recipients stop
     /// here; a missing subject or attachment asks first.
-    fn request_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn request_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sending {
             return;
         }
@@ -588,6 +588,14 @@ impl Composer {
             }
         })
         .detach();
+    }
+
+    /// Fills the recipient and subject fields, as typing would (tests).
+    #[cfg(test)]
+    pub(super) fn fill(&mut self, to: &str, subject: &str, w: &mut Window, cx: &mut Context<Self>) {
+        let (to, subject) = (to.to_string(), subject.to_string());
+        self.recipients[TO].update(cx, |s, cx| s.set_value(to, w, cx));
+        self.subject.update(cx, |s, cx| s.set_value(subject, w, cx));
     }
 
     fn attach(&mut self, cx: &mut Context<Self>) {

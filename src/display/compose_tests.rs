@@ -1,0 +1,93 @@
+//! Writing mail: replies, placement, drafts, and sending with undo.
+use super::tests::{act, frame, two_accounts};
+use super::*;
+use std::prelude::v1::test;
+
+fn type_into(composer: &Entity<Composer>, to: &str, subject: &str, cx: &mut VisualTestContext) {
+    composer.update_in(cx, |c, w, cx| c.fill(to, subject, w, cx));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn sending_waits_for_undo_and_failures_restore_the_draft(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    type_into(&composer, "ana@example.com", "Plans", cx);
+    composer.update_in(cx, |c, w, cx| c.request_send(w, cx));
+    cx.run_until_parked();
+    let id = view.read_with(cx, |this, _| {
+        assert!(this.composers.is_empty(), "the editor leaves while sending");
+        assert_eq!(this.outbox.len(), 1);
+        this.outbox[0].id
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("undo-send").is_some());
+    // Undo puts the editor back with what was written.
+    act(&view, Action::UndoSend(id), cx);
+    view.read_with(cx, |this, cx| {
+        assert!(this.outbox.is_empty());
+        assert_eq!(this.composers.len(), 1);
+        assert_eq!(this.composers[0].read(cx).draft.subject, "Plans");
+        assert!(!this.composers[0].read(cx).sending);
+    });
+    // After the delay it is sent; the test server has no credentials, so it
+    // fails and comes back with the error and the draft kept.
+    composer.update_in(cx, |c, w, cx| c.request_send(w, cx));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    view.read_with(cx, |this, cx| {
+        assert!(this.outbox.is_empty());
+        assert_eq!(this.composers.len(), 1);
+        assert!(this.composers[0].read(cx).error.is_some());
+    });
+    let draft_id = composer.read_with(cx, |c, _| c.draft.id.clone());
+    let accounts = view.read_with(cx, |this, _| this.accounts.clone());
+    assert!(
+        accounts.iter().any(|a| store
+            .drafts(&a.id)
+            .unwrap()
+            .iter()
+            .any(|d| d.id == draft_id)),
+        "the draft is kept"
+    );
+}
+
+#[gpui::test]
+fn replies_open_inline_and_reply_all_copies_others(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    let id = view.read_with(cx, |this, _| this.messages[2].id.clone());
+    act(&view, Action::Select(id.clone()), cx);
+    act(&view, Action::Reply(true), cx);
+    view.read_with(cx, |this, cx| {
+        let reply = this
+            .inline_composer(&id)
+            .expect("reply opens below the message");
+        let draft = &reply.read(cx).draft;
+        assert_eq!(reply.read(cx).placement, Placement::Inline);
+        assert!(draft.to.contains("sophie@example.com"));
+        assert!(draft.cc.contains("daniel@example.com"));
+        assert!(draft.subject.starts_with("Re:"));
+        assert!(draft.body.contains("> "), "the original is quoted");
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("inline-reply").is_some());
+    // Replying again returns to the same reply.
+    act(&view, Action::Reply(false), cx);
+    view.read_with(cx, |this, _| assert_eq!(this.composers.len(), 1));
+    // With replies set to open in a window of their own, the reply floats
+    // or opens per "New messages open".
+    let options = ComposeOptions {
+        reply_placement: ReplyPlacement::Window,
+        ..ComposeOptions::default()
+    };
+    act(&view, Action::SetComposeOptions(options), cx);
+    let other = view.read_with(cx, |this, _| this.messages[3].id.clone());
+    act(&view, Action::Select(other), cx);
+    act(&view, Action::Reply(false), cx);
+    view.read_with(cx, |this, cx| {
+        assert_eq!(this.composers.len(), 2);
+        assert_eq!(this.composers[1].read(cx).placement, Placement::Floating);
+    });
+}

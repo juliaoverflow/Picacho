@@ -450,8 +450,9 @@ impl MailApp {
             delivering: false,
         });
         let delay = Duration::from_secs(u64::from(self.compose_options.undo_send_seconds));
+        let timer = cx.background_executor().timer(delay);
         cx.spawn(async move |this, cx| {
-            Timer::after(delay).await;
+            timer.await;
             let _ = this.update(cx, |this, cx| this.deliver(id, cx));
         })
         .detach();

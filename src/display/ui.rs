@@ -4,6 +4,9 @@ mod accounts;
 mod catalog;
 #[path = "compose.rs"]
 mod compose;
+#[cfg(test)]
+#[path = "compose_tests.rs"]
+mod compose_tests;
 #[path = "composer.rs"]
 mod composer;
 use composer::{Composer, ComposerDrag, Placement};
