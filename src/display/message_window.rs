@@ -68,14 +68,15 @@ impl MessageWindow {
         let c = self.colors;
         div()
             .id(id)
-            .h(px(32.))
-            .px_3()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .h(px(28.))
+            .px_2()
             .flex()
             .items_center()
             .gap_2()
-            .rounded(px(8.))
+            .rounded(px(7.))
             .cursor_pointer()
-            .text_size(px(13.))
+            .text_size(px(12.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(c.muted))
             .hover(move |s| s.bg(rgb(c.raised)).text_color(rgb(c.text)))
@@ -186,15 +187,17 @@ impl Render for MessageWindow {
                 .child(icon_el("paperclip", 14., c.muted))
                 .child(format!("{}  ·  {} KB", a.name, a.size / 1024))
         });
-        let toolbar = div()
-            .h(px(48.))
-            .flex_shrink_0()
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_1()
-            .border_b_1()
-            .border_color(rgb(c.border))
+        let toolbar = super::window::detached_bar("message-titlebar", c)
+            .child(icon_el("mail", 15., c.muted))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(60.))
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(m.subject.clone()),
+            )
             .child(self.button("w-reply", "Reply", "reply", cx, |t, _, cx| t.reply(1, cx)))
             .child(
                 self.button("w-reply-all", "Reply all", "reply-all", cx, |t, _, cx| {
@@ -206,7 +209,6 @@ impl Render for MessageWindow {
                     t.reply(3, cx)
                 }),
             )
-            .child(div().flex_1())
             .when(m.html.is_some(), |d| {
                 let blocked = self.options.block_remote;
                 d.child(self.button(
@@ -225,10 +227,13 @@ impl Render for MessageWindow {
                     },
                 ))
             });
+        let toolbar =
+            super::window::detached_titlebar(toolbar, c, |_, w, _| w.remove_window(), window, cx);
         div()
             .id("message-window")
             .key_context("Detached")
             .track_focus(&self.focus)
+            .map(|d| super::window::window_frame(d, c, window))
             .size_full()
             .flex()
             .flex_col()
@@ -369,16 +374,7 @@ impl MailApp {
         let out = made.clone();
         let bounds = Bounds::centered(None, size(px(880.), px(780.)), cx);
         let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(420.), px(360.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from(mail.subject.clone())),
-                    appears_transparent: false,
-                    traffic_light_position: None,
-                }),
-                ..Default::default()
-            },
+            window::detached_options(SharedString::from(mail.subject.clone()), bounds),
             {
                 let mail = mail.clone();
                 move |window, cx| {

@@ -690,6 +690,49 @@ impl Composer {
             }))
     }
 
+    /// A compose window's title bar: its title, Save draft and Move into
+    /// main window, then the platform's window controls.
+    fn window_header(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        let bar = super::window::detached_bar("compose-titlebar", c)
+            .child(icon_el("compose", 15., c.muted))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.title(cx)),
+            )
+            .child(self.icon_button(
+                "save",
+                "save",
+                "Save draft · ⌘S",
+                false,
+                cx,
+                |this, _, cx| this.save(cx),
+            ))
+            .child(self.icon_button(
+                "dock-main",
+                "shrink",
+                "Move into main window",
+                false,
+                cx,
+                |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Floating)),
+            ));
+        let me = cx.weak_entity();
+        super::window::detached_titlebar(
+            bar,
+            c,
+            move |_, _, cx| {
+                let _ = me.update(cx, |_, cx| cx.emit(ComposerEvent::Close));
+            },
+            window,
+            cx,
+        )
+    }
+
     fn header(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
         let floating = matches!(self.placement, Placement::Floating | Placement::Maximized);
@@ -1372,7 +1415,11 @@ impl Render for Composer {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.add_files(paths.paths().to_vec(), cx)
             }))
-            .child(self.header(cx));
+            .child(if self.placement == Placement::Window {
+                self.window_header(window, cx)
+            } else {
+                self.header(cx)
+            });
         if self.minimized {
             return root;
         }
@@ -1418,6 +1465,7 @@ impl Render for ComposeWindow {
         let composer = self.composer.clone();
         div()
             .key_context("Detached")
+            .map(|d| super::window::window_frame(d, c, window))
             .size_full()
             .flex()
             .flex_col()

@@ -188,3 +188,16 @@ browser sign-ins) or Gravatar (only the SHA-256 of the address is sent),
 Choose from Presets…, Upload Your Own…, and Remove Picture. Presets are
 CC0 photographs bundled in `assets/avatars` (sources in its README) and
 listed in `assets.rs`; the picker returns to Settings when opened from it.
+
+Message and compose windows draw their own title bar on every platform
+(`window::detached_options`, `detached_bar`, `detached_titlebar`): the title
+and the window's actions sit beside macOS's window buttons, in Linux
+client-side decorations (move, window menu, minimize, maximize, close), or
+with Windows' hit-tested caption controls.
+
+Layers drawn over the app (dialogs, floating composers) end a left press
+with `swallow_press` after their own controls handle it: gpui-component's
+selectable text checks only its bounds, so a press on a layer over an
+email would otherwise start selecting the email's text. Popup menus key
+their animation on `menu_anim`, never `anim`, which an open dialog uses for
+its entrance.

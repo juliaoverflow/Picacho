@@ -127,6 +127,14 @@ fn every_preset_picture_decodes_and_applies_from_settings(cx: &mut TestAppContex
     let (view, cx, _) = two_accounts(cx);
     let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
     act(&view, Action::AccountSettings(id.clone()), cx);
+    // Opening the picture menu leaves Settings as it is: its entrance
+    // animation does not replay under the menu.
+    let before = view.read_with(cx, |this, _| this.anim);
+    act(&view, Action::AvatarMenu(id.clone()), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.menu.is_some());
+        assert_eq!(this.anim, before);
+    });
     act(&view, Action::AvatarPresets(id.clone()), cx);
     frame(cx);
     assert!(cx.debug_bounds("preset-penguin").is_some());
@@ -152,4 +160,28 @@ fn every_preset_picture_decodes_and_applies_from_settings(cx: &mut TestAppContex
             ]
         );
     });
+}
+
+#[gpui::test]
+fn dragging_a_floating_composer_moves_it_and_never_selects_mail_text(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    let first = view.read_with(cx, |this, _| this.messages[0].id.clone());
+    act(&view, Action::Select(first), cx);
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    frame(cx);
+    let header = cx
+        .debug_bounds("compose-header")
+        .expect("floating composer");
+    // Grab the title, away from the header's buttons.
+    let start = point(header.left() + px(40.), header.center().y);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    for step in 1..=4 {
+        let p = start - point(px(60. * step as f32), px(30. * step as f32));
+        cx.simulate_mouse_move(p, Some(MouseButton::Left), Modifiers::none());
+    }
+    let end = start - point(px(240.), px(120.));
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    let origin = composer.read_with(cx, |c, _| c.origin).expect("moved");
+    assert!(origin.x < header.left(), "{origin:?} vs {header:?}");
 }

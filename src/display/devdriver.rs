@@ -85,6 +85,17 @@ fn run(
         Some("windows") => {
             let _ = std::fs::write(dir.join("windows.txt"), window_numbers());
         }
+        // Opens an empty composer in a window of its own.
+        Some("composewindow") => {
+            let draft = Draft {
+                id: uuid::Uuid::new_v4().to_string(),
+                account: this.account.clone().unwrap_or_else(|| "demo".into()),
+                formatted: true,
+                subject: "Lunch on Friday?".into(),
+                ..Draft::default()
+            };
+            this.open_composer(draft, Placement::Window, None, w, cx);
+        }
         Some("size") => w.resize(size(px(number(1)), px(number(2)))),
         Some("select") => {
             if let Some(i) = this.visible.get(number(1) as usize) {

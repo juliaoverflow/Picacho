@@ -201,20 +201,14 @@ impl MailApp {
             let bounds = Bounds::centered(None, size(px(680.), px(640.)), cx);
             let handle = cx
                 .open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        window_min_size: Some(size(px(420.), px(360.))),
-                        titlebar: Some(TitlebarOptions {
-                            title: Some(SharedString::from(if draft.subject.is_empty() {
-                                "New Message".to_string()
-                            } else {
-                                draft.subject.clone()
-                            })),
-                            appears_transparent: false,
-                            traffic_light_position: None,
+                    window::detached_options(
+                        SharedString::from(if draft.subject.is_empty() {
+                            "New Message".to_string()
+                        } else {
+                            draft.subject.clone()
                         }),
-                        ..Default::default()
-                    },
+                        bounds,
+                    ),
                     move |window, cx| {
                         let composer = cx.new(|cx| {
                             Composer::new(
@@ -627,6 +621,7 @@ impl MailApp {
                             .top(px(TITLEBAR_HEIGHT))
                             .bg(rgba(0x101c2c55))
                             .occlude()
+                            .on_mouse_down(MouseButton::Left, swallow_press)
                             .flex()
                             .p(px(inset))
                             .child(
@@ -676,6 +671,7 @@ impl MailApp {
                     .w(px(w))
                     .h(px(h))
                     .occlude()
+                    .on_mouse_down(MouseButton::Left, swallow_press)
                     .when(minimized, |d| d.rounded_t(px(10.)))
                     .when(!minimized, |d| d.rounded(px(14.)))
                     .border_1()

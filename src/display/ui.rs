@@ -607,6 +607,7 @@ pub struct MailApp {
     sending: bool,
     /// A spinner tick is pending (see `spinner`).
     spin_scheduled: bool,
+    menu_anim: u64,
     /// A count refresh is running, and another was asked for meanwhile.
     counts_running: bool,
     counts_again: bool,
@@ -933,6 +934,7 @@ impl MailApp {
             pending_place: None,
             sending: false,
             spin_scheduled: false,
+            menu_anim: 0,
             counts_running: false,
             counts_again: false,
             loaded_unread: 0,
@@ -1252,11 +1254,13 @@ impl MailApp {
         }
     }
     fn open_menu(&mut self, position: Point<Pixels>, entries: Vec<Entry>, cx: &mut Context<Self>) {
-        self.anim += 1;
+        // Its own counter: bumping `anim` would replay an open dialog's
+        // entrance, as if Settings reloaded under the menu.
+        self.menu_anim += 1;
         self.menu = Some(PopupMenu {
             position,
             entries,
-            key: self.anim,
+            key: self.menu_anim,
             opened: std::time::Instant::now(),
         });
         cx.notify();
@@ -5219,6 +5223,7 @@ impl MailApp {
         let corners = window::window_corners(window);
         div()
             .occlude()
+            .on_mouse_down(MouseButton::Left, swallow_press)
             .absolute()
             .inset_0()
             .rounded_tl(corners.top_left)
@@ -5503,6 +5508,13 @@ impl MailApp {
                 )
             })
     }
+}
+/// Ends a left press on a layer drawn over the app (dialogs, floating
+/// composers) once its own controls have had it. Selectable text views
+/// check only their bounds, not what covers them, so without this a press
+/// on the layer started a text selection in the email underneath.
+fn swallow_press(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
+    cx.stop_propagation()
 }
 /// Overshooting ease-out. GPUI requires easing output within 0..=1, so apply
 /// this inside an animator rather than with `with_easing`.

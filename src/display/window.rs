@@ -5,7 +5,11 @@
 //! it moves the window, opens the compositor's window menu, and carries the
 //! minimize, maximize and close controls. The root surface is rounded and
 //! outlined to match Adwaita and Breeze. GPUI-component's `Root` supplies the
-//! shadow and resize edges. macOS and Windows windows are left unchanged.
+//! shadow and resize edges. macOS and Windows main windows are left unchanged.
+//!
+//! Message and compose windows (`detached_*`) draw their own title bar on
+//! every platform: under macOS's window buttons, as Linux client-side
+//! decorations, and with hit-tested caption controls on Windows.
 use super::{Colors, icon_el};
 use gpui::{prelude::*, *};
 use gpui_component::tooltip::Tooltip;
@@ -176,4 +180,83 @@ fn control(id: &'static str, icon: &str, label: &'static str, c: Colors) -> Stat
             .tooltip(move |w, cx| Tooltip::new(label).build(w, cx))
             .child(icon_el(icon, 16., c.muted)),
     )
+}
+
+/// Options for a message or compose window: Picacho draws its title bar.
+pub(super) fn detached_options(title: SharedString, bounds: Bounds<Pixels>) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(420.), px(360.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some(title),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(13.), px(12.))),
+        }),
+        window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
+            .then_some(WindowDecorations::Client),
+        ..Default::default()
+    }
+}
+
+/// The start of a message or compose window's title bar. Add the title
+/// and buttons (stopping mouse-down, see [`no_drag`]), then finish it with
+/// [`detached_titlebar`].
+pub(super) fn detached_bar(id: &'static str, c: Colors) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .h(px(super::TITLEBAR_HEIGHT))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        // Room for the macOS window buttons.
+        .pl(px(if cfg!(target_os = "macos") { 80. } else { 12. }))
+        .pr_2()
+        .bg(rgb(c.bg))
+        .border_b_1()
+        .border_color(rgb(c.border))
+        .on_click(on_titlebar_double_click)
+}
+
+/// Makes a finished bar the window's title bar: it moves the window and,
+/// where the system draws none, carries minimize, maximize and close.
+pub(super) fn detached_titlebar(
+    bar: Stateful<Div>,
+    c: Colors,
+    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    w: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    if is_client_decorated(w) {
+        return client_titlebar(bar, c, true, on_close, w, cx);
+    }
+    if cfg!(target_os = "windows") {
+        // Windows hit-tests these areas itself: dragging, snapping and the
+        // caption buttons behave like a native title bar.
+        return bar
+            .window_control_area(WindowControlArea::Drag)
+            .child(
+                control("window-minimize", "window-minimize", "Minimize", c)
+                    .window_control_area(WindowControlArea::Min),
+            )
+            .child(
+                control(
+                    "window-maximize",
+                    if w.is_maximized() {
+                        "window-restore"
+                    } else {
+                        "window-maximize"
+                    },
+                    "Maximize",
+                    c,
+                )
+                .window_control_area(WindowControlArea::Max),
+            )
+            .child(
+                control("window-close", "window-close", "Close", c)
+                    .window_control_area(WindowControlArea::Close),
+            );
+    }
+    bar
 }
