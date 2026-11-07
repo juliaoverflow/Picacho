@@ -16,6 +16,8 @@ mod devdriver;
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
+#[path = "message_window.rs"]
+mod message_window;
 #[path = "panes.rs"]
 mod panes;
 use panes::{LIST_MIN, Pane, Resize};
@@ -108,7 +110,8 @@ actions!(
         Zoom,
         Hide,
         HideOthers,
-        ShowAll
+        ShowAll,
+        OpenInWindow
     ]
 );
 
@@ -384,6 +387,8 @@ enum Action {
     Refresh,
     OpenMailbox(String, Mailbox),
     Select(String),
+    /// Opens a message in a window of its own.
+    OpenWindow(String),
     Star(String),
     Read(String),
     Move(Folder),
@@ -1344,6 +1349,12 @@ impl MailApp {
         };
         let ids = vec![m.id.clone()];
         let mut entries = vec![
+            entry(
+                "Open in New Window",
+                "popout",
+                Action::OpenWindow(m.id.clone()),
+            ),
+            Entry::Separator,
             entry("Reply", "reply", Action::ReplyTo(m.id.clone(), 1)),
             entry("Reply All", "reply-all", Action::ReplyTo(m.id.clone(), 2)),
             entry("Forward", "forward", Action::ReplyTo(m.id.clone(), 3)),
@@ -2442,6 +2453,7 @@ impl MailApp {
                     self.select(id, cx);
                 }
             }
+            Action::OpenWindow(id) => self.open_message_window(id, w, cx),
             Action::Star(id) => {
                 if let Some(m) = self.messages.iter().find(|m| m.id == id) {
                     let star = !m.starred;
@@ -4486,6 +4498,7 @@ impl MailApp {
                     ("Search mail", "⌘ F"),
                     ("Refresh mailbox", "⌘ R"),
                     ("Next / previous message", "⌥ ↓ / ⌥ ↑"),
+                    ("Open message in new window", "⌘ O"),
                     ("Reply", "⌘ ⇧ R"),
                     ("Reply all", "⌘ ⌥ R"),
                     ("Forward", "⌘ ⇧ F"),
@@ -5337,6 +5350,13 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &ShowAttachments, w, cx| {
                 this.handle(Action::SetFilter(Filter::Attachments), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenInWindow, w, cx| {
+                if this.modal.is_none()
+                    && let Some(id) = this.selected.clone()
+                {
+                    this.handle(Action::OpenWindow(id), w, cx)
+                }
+            }))
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
             .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
@@ -5751,6 +5771,9 @@ pub fn run(store: Arc<Store>) {
             KeyBinding::new("secondary-6", GoSpam, Some("Mail")),
             KeyBinding::new("secondary-7", GoTrash, Some("Mail")),
             KeyBinding::new("secondary-m", Minimize, Some("Mail")),
+            KeyBinding::new("secondary-o", OpenInWindow, Some("Mail")),
+            KeyBinding::new("secondary-w", CloseWindow, Some("Detached")),
+            KeyBinding::new("escape", Close, Some("Detached")),
             KeyBinding::new("cmd-h", Hide, None),
             KeyBinding::new("alt-cmd-h", HideOthers, None),
         ]);

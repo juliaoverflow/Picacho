@@ -124,6 +124,10 @@ fn run(
                 },
                 Some("close") => Action::Close,
                 Some("compose") => Action::Compose,
+                Some("window") => match this.selected.clone() {
+                    Some(id) => Action::OpenWindow(id),
+                    None => return,
+                },
                 Some("reply") => Action::Reply(false),
                 Some("replyall") => Action::Reply(true),
                 Some("forward") => Action::Forward,
@@ -268,7 +272,7 @@ fn window_numbers() -> String {
 fn key_window() -> u32 {
     unsafe {
         let app: *mut objc::runtime::Object = send(class("NSApplication"), "sharedApplication", ());
-        let windows: *mut objc::runtime::Object = send(app, "windows", ());
+        let windows: *mut objc::runtime::Object = send(app, "orderedWindows", ());
         let window: *mut objc::runtime::Object = send(windows, "firstObject", ());
         if window.is_null() {
             return 0;

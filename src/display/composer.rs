@@ -1415,11 +1415,16 @@ impl Render for ComposeWindow {
         let c = self.composer.read(cx).colors;
         let title = self.composer.read(cx).title(cx);
         window.set_window_title(&title);
+        let composer = self.composer.clone();
         div()
+            .key_context("Detached")
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(c.surface))
+            .on_action(move |_: &CloseWindow, _, cx| {
+                composer.update(cx, |_, cx| cx.emit(ComposerEvent::Close))
+            })
             .font_family(".SystemUIFont")
             .text_size(px(14.))
             .child(self.composer.clone())

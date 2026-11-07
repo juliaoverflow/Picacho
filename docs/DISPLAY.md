@@ -170,3 +170,12 @@ The sender line reads "to Ana, Bo, me · cc Cy +2". A reply's quoted history
 (plain text after "On … wrote:" and similar, or Gmail/Apple/Outlook/
 Thunderbird quote markup in HTML) is folded behind a "•••" toggle. All of
 this is cached per message and list revision, never recomputed per frame.
+
+## Windows
+
+A message opens in a window of its own from its context menu, the reader's
+toolbar or ⌘O (`message_window.rs`); it reads like the reader, and its
+Reply, Reply all and Forward open compose windows. Composers move to a
+window with "Open in new window". Detached windows use the "Detached" key
+context: ⌘W closes them (a composer saves first) and Escape closes a
+message window.

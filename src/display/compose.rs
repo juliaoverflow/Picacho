@@ -24,11 +24,26 @@ impl MailApp {
     /// Starts a new message (mode 0), a reply (1), a reply to all (2) or a
     /// forward (3) of the open message.
     pub(super) fn new_compose(&mut self, mode: u8, w: &mut Window, cx: &mut Context<Self>) {
+        let original = self.selected_mail();
+        self.compose_reply(mode, original, None, w, cx);
+    }
+
+    /// Like `new_compose`, answering `original` (when mode > 0), in
+    /// `placement` if given rather than where the settings put it.
+    pub(super) fn compose_reply(
+        &mut self,
+        mode: u8,
+        original: Option<Mail>,
+        placement: Option<Placement>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.onboarding {
             return;
         }
+        let forced = placement;
         let options = self.compose_options.clone();
-        let original = self.selected_mail().filter(|_| mode > 0);
+        let original = original.filter(|_| mode > 0);
         // One inline reply per message: go back to it rather than start another.
         if let Some(m) = &original
             && let Some(existing) = self.inline_composer(&m.id)
@@ -99,8 +114,9 @@ impl MailApp {
                         m.sender,
                         quoted
                             .lines()
-                            .map(|l| if l.is_empty() {
-                                ">".to_string()
+                            // Nested quotes stay compact: ">>", not "> >".
+                            .map(|l| if l.is_empty() || l.starts_with('>') {
+                                format!(">{l}")
                             } else {
                                 format!("> {l}")
                             })
@@ -113,14 +129,14 @@ impl MailApp {
                 draft.body = format!("{}{quote}", sign(true));
             }
         }
-        let placement = match (&original, options.reply_placement) {
+        let placement = forced.unwrap_or(match (&original, options.reply_placement) {
             (Some(_), ReplyPlacement::Inline) if self.reader_visible(w) => Placement::Inline,
             _ => match options.open_in {
                 ComposeOpen::Floating => Placement::Floating,
                 ComposeOpen::Maximized => Placement::Maximized,
                 ComposeOpen::Window => Placement::Window,
             },
-        };
+        });
         let answers = original
             .filter(|_| placement == Placement::Inline)
             .map(|m| m.id);

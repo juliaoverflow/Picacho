@@ -151,6 +151,14 @@ impl MailApp {
             ))
             .child(div().flex_1())
             .child(self.button(
+                "open-window",
+                "@Open in new window · ⌘O",
+                "popout",
+                Action::OpenWindow(m.id.clone()),
+                false,
+                cx,
+            ))
+            .child(self.button(
                 "archive",
                 "@Archive message",
                 "archive",
