@@ -54,7 +54,7 @@ impl MailApp {
                         total: catalog.total,
                     };
                     this.catalogs.insert(key.clone(), progress);
-                    if this.account.as_ref() == Some(&a.id) && this.mailbox().key() == key.1 {
+                    if this.shows_only(&a.id) && this.mailbox().key() == key.1 {
                         this.show_catalog(catalog, cx);
                     }
                     if !progress.complete() {

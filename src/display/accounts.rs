@@ -21,7 +21,7 @@ impl MailApp {
             },
             move |this, _, cx| {
                 this.retrying.remove(&id);
-                let visible = this.account.as_ref() == Some(&id) && this.folder != Folder::Drafts;
+                let visible = this.shows(&id) && this.folder != Folder::Drafts;
                 let mailbox = if visible {
                     this.mailbox()
                 } else {
@@ -134,6 +134,7 @@ impl MailApp {
             .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted)).child(
                 if browser { "Sign in with the same email address in your browser. Your cached mail, drafts, and settings are kept." }
                 else { "Update the password for this mailbox. Your cached mail, drafts, and settings are kept." }))
+            .when_some(a.service.browser_unavailable().filter(|_| !browser), |d, why| d.child(notice_box(why, self.colors())))
             .when(!browser, |d| d.child(self.field(a.service.password_label(), PASSWORD)))
             .when_some(a.service.password_help().filter(|_| !browser), |d, (help, _)| d.child(div().text_size(px(12.)).child(help)))
             .into_any_element()

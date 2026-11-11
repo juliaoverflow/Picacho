@@ -229,8 +229,9 @@ impl MailApp {
             return;
         };
         if matches!(self.modal, Some(Modal::AvatarPresets(_))) {
-            self.modal = std::mem::take(&mut self.presets_from_settings).then_some(Modal::Settings);
+            self.modal = None;
         }
+        self.presets_for = None;
         self.task(
             cx,
             move |b| b.set_avatar(&id, bytes, "preset").map(|path| (id, path)),

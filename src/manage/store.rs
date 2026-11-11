@@ -114,7 +114,7 @@ impl Store {
         } else {
             "data"
         };
-        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred'))) ORDER BY date DESC LIMIT ?3"))?;
+        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred'))) ORDER BY date DESC, id DESC LIMIT ?3"))?;
         let rows = q.query_map(
             params![
                 account,
@@ -307,7 +307,7 @@ impl Store {
         let db = self.db.lock().unwrap();
         let mut q = db.prepare(
             "SELECT data FROM messages WHERE account=?1 AND raw IS NULL AND date >= ?4
-             AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC LIMIT ?3",
+             AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC, id DESC LIMIT ?3",
         )?;
         q.query_map(params![account, max_size, limit, since], |r| {
             r.get::<_, String>(0)
@@ -464,6 +464,17 @@ impl Store {
         })?
         .map(|r| Ok(r?))
         .collect()
+    }
+    /// Each unread message's account, mailbox key and recipients.
+    pub fn unread_recipients(&self) -> Result<Vec<crate::manage::forwarding::UnreadRow>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT account, folder, coalesce(json_extract(data,'$.to'),''), coalesce(json_extract(data,'$.cc'),'')
+             FROM messages WHERE json_extract(data,'$.unread')",
+        )?;
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .map(|r| Ok(r?))
+            .collect()
     }
     pub fn folders(&self, account: &str) -> Vec<RemoteFolder> {
         self.preference(&format!("folders:{account}"))

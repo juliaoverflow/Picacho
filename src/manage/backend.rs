@@ -473,7 +473,7 @@ impl Backend {
                     )?);
                 }
             }
-            result.sort_by_key(|m| std::cmp::Reverse(m.date));
+            result.sort_by(Mail::newest_first);
             let mut seen = std::collections::HashSet::new();
             result.retain(|m| {
                 seen.insert(if m.message_id.is_empty() {
@@ -687,10 +687,26 @@ impl Backend {
     /// What the message list shows for a mailbox: its cached messages and,
     /// once its layout is known, a placeholder for every message not listed
     /// yet, all in arrival order (newest first) so rows keep their places
-    /// as they load. Without a layout, cached messages are newest first.
+    /// as they load. Before this launch has a layout, the last sync's saved
+    /// UIDVALIDITY gives the same arrival order, so the list doesn't reorder
+    /// when the first sync after a relaunch finishes.
     pub fn listed(&self, account: &str, mailbox: &Mailbox) -> Result<(Vec<Mail>, Option<Layout>)> {
         let mut messages = self.store.summaries(account, mailbox.clone())?;
         let layout = self.layout(account, mailbox);
+        let saved = if layout.is_none() && mailbox.folder() != Folder::Starred {
+            match messages.first().map(|m| m.remote_folder.clone()) {
+                Some(remote) => self
+                    .store
+                    .mailbox_state(account, &remote)?
+                    .map(|state| format!("{account}:{remote}:{}:", state.validity)),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(prefix) = &saved {
+            sort_arrival(&mut messages, prefix);
+        }
         if let Some(layout) = &layout {
             let prefix = layout.id(account, 0);
             let prefix = &prefix[..prefix.len() - 1];
@@ -714,14 +730,7 @@ impl Backend {
                         )
                     }),
             );
-            // This generation by UID; anything else (not yet reconciled) after.
-            messages.sort_by_key(|m| {
-                let current = m.id.starts_with(prefix);
-                (
-                    !current,
-                    std::cmp::Reverse(if current { i64::from(m.uid) } else { m.date }),
-                )
-            });
+            sort_arrival(&mut messages, prefix);
         }
         Ok((messages, layout))
     }
@@ -968,7 +977,7 @@ impl Backend {
                 || m.remote_folder != remote
                 || (id.starts_with(&prefix) && (starred_only || keep.contains(id)))
         });
-        result.sort_by_key(|m| std::cmp::Reverse(m.date));
+        result.sort_by(Mail::newest_first);
         Ok(result)
     }
     /// Lists messages by UID, 100 per request.
@@ -1084,7 +1093,7 @@ impl Backend {
         // POP3 has no folders. Keep local moves and messages removed from the
         // remote server; UIDL identities prevent duplicate downloads.
         messages = self.store.messages(&a.id, folder, limit)?;
-        messages.sort_by_key(|m| std::cmp::Reverse(m.date));
+        messages.sort_by(Mail::newest_first);
         if folder == Folder::Starred {
             messages.retain(|m| m.starred);
         }
@@ -1508,4 +1517,19 @@ fn remote_name(names: &[Name], a: &Account, mailbox: &Mailbox) -> Result<String>
         }
         Mailbox::Standard(folder) => resolve_in(names, a.provider, *folder)?,
     })
+}
+
+/// One mailbox generation (ids starting with `prefix`) newest-arrived
+/// first by UID; anything else (not yet reconciled) after it, newest first.
+fn sort_arrival(messages: &mut [Mail], prefix: &str) {
+    messages.sort_by(|a, b| {
+        let (ca, cb) = (a.id.starts_with(prefix), b.id.starts_with(prefix));
+        cb.cmp(&ca).then_with(|| {
+            if ca && cb {
+                b.uid.cmp(&a.uid)
+            } else {
+                Mail::newest_first(a, b)
+            }
+        })
+    });
 }

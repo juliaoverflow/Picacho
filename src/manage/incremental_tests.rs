@@ -411,3 +411,45 @@ fn server_limits_pause_background_work() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     result
 }
+
+#[test]
+fn a_relaunch_lists_a_mailbox_in_the_same_order_as_after_sync() -> Result<()> {
+    let world = Arc::new(StdMutex::new(World::default()));
+    world
+        .lock()
+        .unwrap()
+        .boxes
+        .insert("INBOX".into(), mailbox(&[1, 2, 3], 1000));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (cert, port, server) = serve(world.clone(), stop.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let result = (|| -> Result<()> {
+        let inbox: Mailbox = Folder::Inbox.into();
+        b.sync(&a, inbox.clone(), 300)?;
+        // The newest arrival carries the oldest date (moved-in mail).
+        let mut moved = b
+            .store
+            .summaries(&a.id, inbox.clone())?
+            .into_iter()
+            .find(|m| m.uid == 3)
+            .unwrap();
+        moved.date = 1;
+        b.store.save_messages(&[moved])?;
+        let uids = |rows: Vec<Mail>| rows.iter().map(|m| m.uid).collect::<Vec<_>>();
+        let synced = uids(b.listed(&a.id, &inbox)?.0);
+        assert_eq!(synced, [3, 2, 1]);
+        // A new launch has no layout in memory until its first sync.
+        let relaunched = Backend::new(b.store.clone());
+        let (rows, layout) = relaunched.listed(&a.id, &inbox)?;
+        assert!(layout.is_none());
+        assert_eq!(uids(rows), synced);
+        Ok(())
+    })();
+    b.disconnect(&a.id);
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    result
+}

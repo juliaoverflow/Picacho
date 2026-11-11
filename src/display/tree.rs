@@ -154,16 +154,17 @@ pub(super) fn move_node(nodes: &mut Vec<Node>, key: &str, at: &DropAt) -> bool {
     *nodes = next;
     true
 }
-/// Keeps the arrangement in step with the saved accounts: removed accounts
-/// leave it, new ones are added at the end, and duplicates are dropped.
-pub(super) fn reconcile(nodes: &mut Vec<Node>, accounts: &[Account]) -> bool {
-    fn keep(nodes: &mut Vec<Node>, accounts: &[Account], seen: &mut HashSet<String>) {
+/// Keeps the arrangement in step with the saved accounts (and aliases shown
+/// as accounts): removed ones leave it, new ones are added at the end, and
+/// duplicates are dropped.
+pub(super) fn reconcile(nodes: &mut Vec<Node>, accounts: &[String]) -> bool {
+    fn keep(nodes: &mut Vec<Node>, accounts: &[String], seen: &mut HashSet<String>) {
         nodes.retain_mut(|n| {
             if !seen.insert(n.key().to_owned()) {
                 return false;
             }
             match n {
-                Node::Account { id } => accounts.iter().any(|a| &a.id == id),
+                Node::Account { id } => accounts.contains(id),
                 Node::Folder { children, .. } => {
                     keep(children, accounts, seen);
                     true
@@ -175,9 +176,9 @@ pub(super) fn reconcile(nodes: &mut Vec<Node>, accounts: &[Account]) -> bool {
     let before = nodes.clone();
     let mut seen = HashSet::new();
     keep(nodes, accounts, &mut seen);
-    for a in accounts {
-        if !seen.contains(&a.id) {
-            nodes.push(Node::Account { id: a.id.clone() });
+    for id in accounts {
+        if !seen.contains(id) {
+            nodes.push(Node::Account { id: id.clone() });
         }
     }
     *nodes != before
@@ -303,7 +304,7 @@ impl Render for DragPreview {
 }
 
 impl MailApp {
-    pub(super) fn load_tree(store: &Store, accounts: &[Account]) -> Vec<Node> {
+    pub(super) fn load_tree(store: &Store, accounts: &[String]) -> Vec<Node> {
         let mut tree: Vec<Node> = store
             .preference("sidebar_tree")
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -318,15 +319,20 @@ impl MailApp {
     }
     /// Brings the arrangement up to date after accounts are added or removed.
     pub(super) fn sync_tree(&mut self) {
-        if reconcile(&mut self.tree, &self.accounts) {
+        if reconcile(
+            &mut self.tree,
+            &Self::tree_ids(&self.accounts, &self.forwarding),
+        ) {
             self.save_tree();
         }
     }
     /// The first account the sidebar lists.
     pub(super) fn first_account(&self) -> Option<String> {
-        account_order(&self.tree).into_iter().next()
+        account_order(&self.tree)
+            .into_iter()
+            .find(|id| !fwd::is_view(id))
     }
-    fn open(&self, key: &str) -> bool {
+    pub(super) fn open(&self, key: &str) -> bool {
         !self.collapsed.contains(key)
     }
     /// Opens or closes an account or folder.
@@ -569,7 +575,7 @@ impl MailApp {
         Some(at)
     }
     /// Tracks the pointer over a row while an entry is dragged.
-    fn on_hover_row(
+    pub(super) fn on_hover_row(
         &mut self,
         key: &str,
         e: &DragMoveEvent<Dragged>,
@@ -661,7 +667,12 @@ impl MailApp {
         cx.notify();
     }
     /// Makes a row draggable as `key`.
-    fn draggable(&self, el: Stateful<Div>, key: &str, cx: &Context<Self>) -> Stateful<Div> {
+    pub(super) fn draggable(
+        &self,
+        el: Stateful<Div>,
+        key: &str,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         if self.tree_ui.renaming.as_deref() == Some(key) {
             return el;
         }
@@ -669,6 +680,13 @@ impl MailApp {
             return el;
         };
         let (label, icon): (SharedString, PreviewIcon) = match node {
+            Node::Account { id } if fwd::is_view(id) => (
+                fwd::find_alias(&self.forwarding, id)
+                    .map(|(_, a)| a.email.clone())
+                    .unwrap_or_default()
+                    .into(),
+                PreviewIcon::Icon("alias"),
+            ),
             Node::Account { id } => {
                 let i = self.accounts.iter().position(|a| &a.id == id).unwrap_or(0);
                 let a = &self.accounts[i.min(self.accounts.len().saturating_sub(1))];
@@ -786,7 +804,7 @@ impl MailApp {
         }
     }
     /// A block in the arrangement: an entry and, when open, its contents.
-    fn block(&self, key: &str, inset: f32, cx: &App) -> Div {
+    pub(super) fn block(&self, key: &str, inset: f32, cx: &App) -> Div {
         let dragging = self.dragging(cx) == Some(key);
         div()
             .relative()
@@ -798,7 +816,7 @@ impl MailApp {
             .children(self.drop_line(key, inset, cx))
     }
     /// A chevron that turns as its account or folder opens and closes.
-    fn chevron(&self, key: &str, open: bool) -> AnyElement {
+    pub(super) fn chevron(&self, key: &str, open: bool) -> AnyElement {
         let c = self.colors();
         let to = if open { 0.25 } else { 0. };
         let icon = svg()
@@ -832,7 +850,7 @@ impl MailApp {
             .into_any_element()
     }
     /// Contents slide in one after another just after their parent opens.
-    fn reveal<E: IntoElement + Styled + 'static>(
+    pub(super) fn reveal<E: IntoElement + Styled + 'static>(
         &self,
         key: &str,
         el: E,
@@ -881,7 +899,7 @@ impl MailApp {
             })
             .collect()
     }
-    fn next_row(row: &Cell<usize>) -> usize {
+    pub(super) fn next_row(row: &Cell<usize>) -> usize {
         let i = row.get();
         row.set(i + 1);
         i
@@ -893,6 +911,9 @@ impl MailApp {
         row: &Cell<usize>,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        if fwd::is_view(id) {
+            return self.view_block(id, depth, row, true, cx);
+        }
         let c = self.colors();
         let i = self.accounts.iter().position(|a| a.id == id)?;
         let a = &self.accounts[i];
@@ -1297,6 +1318,11 @@ impl MailApp {
                 move |this, e: &DragMoveEvent<Dragged>, _, cx| this.on_hover_row(&key, e, false, cx)
             });
             match n {
+                Node::Account { id } if fwd::is_view(id) => {
+                    if let Some(el) = self.rail_view(id, row, true, cx) {
+                        out.push(el);
+                    }
+                }
                 Node::Account { id } => {
                     let Some(i) = self.accounts.iter().position(|a| &a.id == id) else {
                         continue;
@@ -1531,7 +1557,6 @@ impl MailApp {
 #[cfg(test)]
 mod tests {
     use super::{DropAt, Node, account_order, move_node, parent_if_last, reconcile, unwrap_folder};
-    use crate::manage::model::{Account, Provider};
 
     fn acc(id: &str) -> Node {
         Node::Account { id: id.into() }
@@ -1582,15 +1607,11 @@ mod tests {
 
     #[test]
     fn reconcile_follows_accounts_and_deleting_a_folder_keeps_its_contents() {
-        let mut first = Account::new(Provider::Imap);
-        first.id = "a".into();
-        let mut second = first.clone();
-        second.id = "b".into();
         let mut t = vec![
             folder("f", vec![acc("gone"), acc("a"), acc("a")]),
             Node::new_separator(),
         ];
-        assert!(reconcile(&mut t, &[first, second]));
+        assert!(reconcile(&mut t, &["a".into(), "b".into()]));
         assert_eq!(keys(&t)[0], "f[a]");
         assert_eq!(account_order(&t), ["a", "b"]);
         let mut t = vec![acc("x"), folder("f", vec![acc("a"), acc("b")]), acc("y")];

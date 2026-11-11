@@ -4,6 +4,7 @@ pub mod avatar;
 pub mod backend;
 pub mod composing;
 pub mod crypto;
+pub mod forwarding;
 pub mod model;
 pub mod status;
 pub mod store;

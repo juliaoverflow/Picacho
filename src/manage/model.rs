@@ -84,17 +84,34 @@ impl Service {
     }
     pub fn password_label(self) -> &'static str {
         match self {
-            Self::Gmail | Self::Fastmail | Self::Zoho => "App password",
+            Self::Gmail | Self::Outlook | Self::Fastmail | Self::Zoho => "App password",
             Self::ICloud => "App-specific password",
             Self::ProtonBridge => "Bridge password",
             _ => "Password",
         }
     }
-    /// One sentence on where the password comes from, with a page that makes one.
+    /// Why this build can't offer browser sign-in for a service that
+    /// usually has it: the app was compiled without that provider's OAuth
+    /// registration, so an app password is the only way in.
+    pub fn browser_unavailable(self) -> Option<&'static str> {
+        if crate::sync::oauth::configured(self.provider()) {
+            return None;
+        }
+        match self {
+            Self::Gmail => Some(
+                "This copy of Picacho was built without Google sign-in, so an app password is the only way to connect Gmail.",
+            ),
+            Self::Outlook => Some(
+                "This copy of Picacho was built without Microsoft sign-in, so an app password is the only way to connect Outlook.",
+            ),
+            _ => None,
+        }
+    }
+    /// Where the password comes from, with a page that makes one.
     pub fn password_help(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Gmail => Some((
-                "Gmail needs an app password, made in your Google Account.",
+                "Turn on 2-Step Verification in your Google Account, then make an app password and paste it here. Spaces are ignored.",
                 "https://myaccount.google.com/apppasswords",
             )),
             Self::ICloud => Some((
@@ -114,7 +131,7 @@ impl Service {
                 "https://proton.me/support/apple-mail-certificate",
             )),
             Self::Outlook => Some((
-                "Microsoft sign-in isn't set up in this build. Use an app password if your account allows one.",
+                "Turn on two-step verification in your Microsoft account, then make an app password and paste it here. Work and school accounts can use one only if their admin allows it.",
                 "https://account.live.com/proofs/AppPassword",
             )),
             _ => None,
@@ -422,6 +439,11 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 impl Mail {
+    /// Newest first, ties broken by id, so every list of the same messages
+    /// comes out in the same order (as SQLite's `date DESC, id DESC`).
+    pub fn newest_first(a: &Mail, b: &Mail) -> std::cmp::Ordering {
+        b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id))
+    }
     /// A row for a message the server has that is not listed here yet.
     pub fn placeholder(
         id: String,

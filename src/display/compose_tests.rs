@@ -138,6 +138,13 @@ fn every_preset_picture_decodes_and_applies_from_settings(cx: &mut TestAppContex
     act(&view, Action::AvatarPresets(id.clone()), cx);
     frame(cx);
     assert!(cx.debug_bounds("preset-penguin").is_some());
+    // The pictures open over Settings: it stays open and does not replay
+    // its entrance (which looked like Settings reloading).
+    view.read_with(cx, |this, _| {
+        assert!(this.modal == Some(Modal::Settings));
+        assert_eq!(this.anim, before);
+    });
+    assert!(cx.debug_bounds("presets-sheet").is_some());
     act(&view, Action::SetPresetAvatar(id.clone(), "penguin"), cx);
     view.read_with(cx, |this, _| {
         assert!(this.avatars.contains_key(&id));
@@ -184,4 +191,40 @@ fn dragging_a_floating_composer_moves_it_and_never_selects_mail_text(cx: &mut Te
     let composer = view.read_with(cx, |this, _| this.composers[0].clone());
     let origin = composer.read_with(cx, |c, _| c.origin).expect("moved");
     assert!(origin.x < header.left(), "{origin:?} vs {header:?}");
+}
+
+#[gpui::test]
+fn settings_expands_pops_out_and_comes_back(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    act(&view, Action::Settings, cx);
+    act(&view, Action::SettingsPage(Page::Forwarding), cx);
+    act(&view, Action::PlaceSettings(SettingsPlace::Maximized), cx);
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.modal == Some(Modal::Settings));
+        assert_eq!(this.settings_place, SettingsPlace::Maximized);
+    });
+    assert!(cx.debug_bounds("forwarding-add").is_some());
+    // The list spans the page (inside its padding).
+    let page = cx.debug_bounds("settings-page").unwrap();
+    let list = cx.debug_bounds("forwarding-list").unwrap();
+    assert!(
+        list.size.width > page.size.width - px(60.),
+        "{list:?} in {page:?}"
+    );
+    act(&view, Action::PlaceSettings(SettingsPlace::Window), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.modal.is_none(), "the dialog leaves the main window");
+        assert!(this.settings_window.is_some());
+        assert!(this.page == Page::Forwarding, "the page is kept");
+    });
+    // Opening Settings again goes to its window rather than a dialog.
+    act(&view, Action::Settings, cx);
+    view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+    act(&view, Action::PlaceSettings(SettingsPlace::Dialog), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.settings_window.is_none());
+        assert!(this.modal == Some(Modal::Settings));
+        assert!(this.page == Page::Forwarding);
+    });
 }

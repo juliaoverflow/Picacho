@@ -35,6 +35,8 @@ mod settings;
 mod thread;
 #[path = "tree.rs"]
 mod tree;
+#[path = "views.rs"]
+mod views;
 #[path = "window.rs"]
 mod window;
 use super::html::{HtmlContextMenu, HtmlView};
@@ -44,6 +46,7 @@ use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSourc
 use crate::{
     manage::{
         backend::{Backend, Change},
+        forwarding::{self as fwd, ALL_MAIL, AliasDisplay, ForwardingAccount, ForwardingService},
         model::*,
         store::Store,
     },
@@ -364,6 +367,9 @@ struct PopupMenu {
     /// When the menu opened. A trackpad's two-finger click also sends small
     /// scroll events; those must not close the menu it just opened.
     opened: std::time::Instant,
+    /// The window it opened in, when not the main window (popped-out
+    /// Settings draws its own menus).
+    window: Option<WindowId>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
@@ -373,12 +379,22 @@ enum Step {
     Credentials,
     Done,
 }
+/// Where Settings is shown: a dialog, filling the main window, or in a
+/// window of its own (like a composer).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum SettingsPlace {
+    #[default]
+    Dialog,
+    Maximized,
+    Window,
+}
 /// A Settings section.
 #[derive(Clone, Debug, PartialEq)]
 enum Page {
     General,
     Reading,
     Composing,
+    Forwarding,
     Account(String),
 }
 #[derive(Clone)]
@@ -484,6 +500,31 @@ enum Action {
     /// Puts back a message whose sending was delayed for undo.
     UndoSend(u64),
     SetComposeOptions(ComposeOptions),
+    /// Lists All Mail when there are several accounts.
+    SetAllMail(bool),
+    /// The service picked in Forwarding settings' add form.
+    ForwardingService(ForwardingService),
+    ConnectForwarding,
+    RefreshAliases(String),
+    RemoveForwarding(String),
+    /// Where a service's aliases forward to; `None` is any mailbox.
+    SetDeliverTo(String, Option<String>),
+    /// Opens the new alias form under a service, or closes it.
+    NewAlias(String),
+    CreateAlias(String),
+    /// Lists every alias of a service rather than the first few.
+    ShowAllAliases(String),
+    /// (service account, alias, on)
+    SetAliasEnabled(String, String, bool),
+    SetAliasDisplay(String, String, AliasDisplay),
+    /// The first click asks again; the second deletes.
+    DeleteAlias(String, String),
+    /// Shows or hides a forwarding service's details in the list.
+    ToggleForwarding(String),
+    /// Shows or hides the form that connects a forwarding service.
+    AddForwarding,
+    PlaceSettings(SettingsPlace),
+    ClosePresets,
     Dismiss,
 }
 
@@ -600,7 +641,13 @@ pub struct MailApp {
     signature_input: Entity<InputState>,
     signature_revision: u64,
     /// The preset picker was opened from Settings, which it returns to.
-    presets_from_settings: bool,
+    /// The account whose preset pictures are shown over Settings.
+    presets_for: Option<String>,
+    settings_place: SettingsPlace,
+    /// Settings' own window while it is popped out.
+    settings_window: Option<AnyWindowHandle>,
+    /// The main window, to return to from popped-out Settings.
+    main_window: Option<AnyWindowHandle>,
     /// A move asked for by a composer whose subscription had no window.
     pending_place: Option<(EntityId, Placement)>,
     /// Any message is being delivered now; quitting waits for it.
@@ -669,6 +716,27 @@ pub struct MailApp {
     locked: HashSet<String>,
     unlocking: HashSet<String>,
     unlock_errors: HashMap<String, String>,
+    /// Alias forwarding services and their aliases.
+    forwarding: Vec<ForwardingAccount>,
+    /// All Mail is listed when there are several accounts.
+    all_mail: bool,
+    /// What the open view lists: its mailboxes and address filters.
+    scope: fwd::Scope,
+    /// Forwarding settings' add form, and the work running there.
+    fwd_service: ForwardingService,
+    fwd_key: Entity<InputState>,
+    fwd_server: Entity<InputState>,
+    fwd_note: Entity<InputState>,
+    fwd_busy: HashSet<String>,
+    fwd_error: Option<String>,
+    /// An alias waiting for its delete to be confirmed.
+    fwd_confirm: Option<String>,
+    /// The service whose new alias form is open.
+    fwd_creating: Option<String>,
+    fwd_expanded: HashSet<String>,
+    /// Forwarding services whose details are open in the list.
+    fwd_open: HashSet<String>,
+    fwd_adding: bool,
 }
 fn input(
     placeholder: &str,
@@ -687,8 +755,12 @@ fn input(
 impl MailApp {
     pub fn new(store: Arc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let accounts = store.accounts().unwrap_or_default();
-        let tree = Self::load_tree(&store, &accounts);
-        let account = tree::account_order(&tree).into_iter().next();
+        let forwarding = fwd::load(&store);
+        let all_mail = fwd::all_mail_enabled(&store);
+        let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
+        let account = tree::account_order(&tree)
+            .into_iter()
+            .find(|id| !fwd::is_view(id));
         let appearance = match store.preference("theme").as_deref() {
             Some("dark") => Appearance::Dark,
             Some("light") => Appearance::Light,
@@ -752,6 +824,27 @@ impl MailApp {
             }),
         );
         let encrypted = HashSet::new();
+        let fwd_key = input("API key", false, true, window, cx);
+        let fwd_server = input(
+            "Server (optional, for self-hosted)",
+            false,
+            false,
+            window,
+            cx,
+        );
+        let fwd_note = input("Note for a new alias (optional)", false, false, window, cx);
+        subscriptions.push(cx.subscribe_in(&fwd_key, window, |this, _, event, w, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.handle(Action::ConnectForwarding, w, cx);
+            }
+        }));
+        subscriptions.push(cx.subscribe_in(&fwd_note, window, |this, _, event, w, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && let Some(id) = this.fwd_creating.clone()
+            {
+                this.handle(Action::CreateAlias(id), w, cx);
+            }
+        }));
         subscriptions.push(cx.observe_window_appearance(window, |this, w, cx| {
             if this.appearance == Appearance::System {
                 this.dark = system_dark(w);
@@ -789,6 +882,7 @@ impl MailApp {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let sidebar_collapsed = backend.store.preference("sidebar").as_deref() == Some("collapsed");
+        let oldest_first = backend.store.preference("sort").as_deref() == Some("oldest");
         let sidebar_width = backend
             .store
             .preference("sidebar_width")
@@ -883,7 +977,7 @@ impl MailApp {
             search_open: false,
             search_anim: 0,
             filter_by: Filter::All,
-            oldest_first: false,
+            oldest_first,
             download: Download::default(),
             catalogs: HashMap::new(),
             cataloging: HashSet::new(),
@@ -930,7 +1024,10 @@ impl MailApp {
             composer_subscriptions: HashMap::new(),
             signature_input,
             signature_revision: 0,
-            presets_from_settings: false,
+            presets_for: None,
+            settings_place: SettingsPlace::Dialog,
+            settings_window: None,
+            main_window: Some(window.window_handle()),
             pending_place: None,
             sending: false,
             spin_scheduled: false,
@@ -975,7 +1072,22 @@ impl MailApp {
             locked: HashSet::new(),
             unlocking: HashSet::new(),
             unlock_errors: HashMap::new(),
+            forwarding,
+            all_mail,
+            scope: fwd::Scope::default(),
+            fwd_service: ForwardingService::default(),
+            fwd_key,
+            fwd_server,
+            fwd_note,
+            fwd_busy: HashSet::new(),
+            fwd_error: None,
+            fwd_confirm: None,
+            fwd_creating: None,
+            fwd_expanded: HashSet::new(),
+            fwd_open: HashSet::new(),
+            fwd_adding: false,
         };
+        this.update_scope();
         this.filter(cx);
         this.apply_theme(window, cx);
         #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -1006,11 +1118,16 @@ impl MailApp {
     fn account_of(&self, m: &Mail) -> Option<Account> {
         self.accounts.iter().find(|a| a.id == m.account).cloned()
     }
+    /// The open mailbox's account. In All Mail or an alias's view, the
+    /// first mailbox it draws from, which new messages are sent from.
     fn current_account(&self) -> Option<Account> {
-        self.accounts
-            .iter()
-            .find(|a| Some(&a.id) == self.account.as_ref())
-            .cloned()
+        let id = self.account.as_ref()?;
+        let id = if fwd::is_view(id) {
+            self.scope.accounts.first()?
+        } else {
+            id
+        };
+        self.accounts.iter().find(|a| &a.id == id).cloned()
     }
     fn selected_mail(&self) -> Option<Mail> {
         self.selected_ref().cloned()
@@ -1076,6 +1193,9 @@ impl MailApp {
                 Filter::Attachments => m.has_attachments(),
             })
             .filter(|(_, m)| m.matches(&query))
+            // Views leave out mail of aliases shown on their own, or list
+            // only an alias's mail.
+            .filter(|(_, m)| m.pending || self.scope.admits(m))
             .map(|(i, _)| i)
             .collect();
         if self.oldest_first {
@@ -1083,7 +1203,11 @@ impl MailApp {
         }
         let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
         self.selection.retain(|id| present.contains(id));
-        self.loaded_unread = self.messages.iter().filter(|m| m.unread).count();
+        self.loaded_unread = self
+            .messages
+            .iter()
+            .filter(|m| m.unread && self.scope.admits(m))
+            .count();
         self.list_revision += 1;
         self.sync_selecting();
     }
@@ -1097,6 +1221,9 @@ impl MailApp {
         }
         self.counts_running = true;
         let store = self.backend.store.clone();
+        let accounts = self.accounts.clone();
+        let forwarding = self.forwarding.clone();
+        let all_mail = self.shows_all_mail();
         let now = chrono::Utc::now().timestamp();
         let offline: Vec<(String, i64)> = self
             .accounts
@@ -1108,8 +1235,15 @@ impl MailApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let raw = store.unread_counts()?;
+                    // Recipients are only read when an alias has a view of its own.
+                    let rows = if fwd::separate_views(&forwarding).is_empty() {
+                        Vec::new()
+                    } else {
+                        store.unread_recipients()?
+                    };
                     Ok::<_, anyhow::Error>((
-                        store.unread_counts()?,
+                        fwd::view_counts(raw, &rows, &accounts, &forwarding, all_mail),
                         store.download_counts(crate::sync::transport::MAX_MESSAGE, &offline)?,
                     ))
                 })
@@ -1262,6 +1396,7 @@ impl MailApp {
             entries,
             key: self.menu_anim,
             opened: std::time::Instant::now(),
+            window: None,
         });
         cx.notify();
     }
@@ -1533,6 +1668,10 @@ impl MailApp {
         }
     }
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.account.as_deref().is_some_and(fwd::is_view) {
+            self.refresh_view(cx);
+            return;
+        }
         let Some(a) = self.current_account() else {
             return;
         };
@@ -1556,7 +1695,7 @@ impl MailApp {
             self.last_check
                 .insert(id.clone(), std::time::Instant::now());
         }
-        let visible = self.account.as_ref() == Some(&id) && self.mailbox() == mailbox;
+        let visible = self.shows(&id) && self.mailbox() == mailbox;
         if visible {
             self.syncing = true;
         }
@@ -1571,7 +1710,7 @@ impl MailApp {
             move |this, result, cx| {
                 this.sync_requests.remove(&(id.clone(), key.clone()));
                 this.account_result(&id, IssueSource::Sync(key.clone()), &result);
-                let visible = this.account.as_ref() == Some(&id) && this.mailbox().key() == key;
+                let visible = this.shows(&id) && this.mailbox().key() == key;
                 if visible {
                     this.syncing = false;
                 }
@@ -1615,6 +1754,7 @@ impl MailApp {
             Mailbox::Remote(name) => name.clone(),
             Mailbox::Standard(_) => String::new(),
         };
+        self.update_scope();
         self.selected = None;
         self.selecting = false;
         self.selection.clear();
@@ -1647,22 +1787,17 @@ impl MailApp {
                 .collect();
             self.filter(cx);
         } else {
-            let id = self.account.clone().unwrap();
             let gen_ = self.load_generation;
-            self.task(
-                cx,
-                move |b| b.listed(&id, &mailbox),
-                move |this, result, cx| {
-                    if gen_ != this.load_generation {
-                        return;
-                    }
-                    if let Ok((ms, layout)) = result {
-                        this.layout = layout;
-                        this.set_messages(ms, cx);
-                    }
-                    this.refresh(cx);
-                },
-            );
+            self.task(cx, self.list_job(mailbox), move |this, result, cx| {
+                if gen_ != this.load_generation {
+                    return;
+                }
+                if let Ok((ms, layout)) = result {
+                    this.layout = layout;
+                    this.set_messages(ms, cx);
+                }
+                this.refresh(cx);
+            });
         }
         self.anim += 1;
         cx.notify();
@@ -1670,30 +1805,36 @@ impl MailApp {
     /// Reload confirmed cache state after a failed or partly applied operation.
     /// A generation check prevents an old request from replacing a newer view.
     fn reload_cached(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.account.clone() else {
+        if self.account.is_none() {
             return;
-        };
+        }
         let mailbox = self.mailbox();
         let generation = self.load_generation;
-        self.task(
-            cx,
-            move |b| b.listed(&id, &mailbox),
-            move |this, result, cx| {
-                if generation == this.load_generation
-                    && let Ok((messages, layout)) = result
-                {
-                    this.layout = layout;
-                    this.set_messages(messages, cx);
-                }
-            },
-        );
+        self.task(cx, self.list_job(mailbox), move |this, result, cx| {
+            if generation == this.load_generation
+                && let Ok((messages, layout)) = result
+            {
+                this.layout = layout;
+                this.set_messages(messages, cx);
+            }
+        });
     }
     fn load_drafts(&mut self, cx: &mut Context<Self>) {
-        let id = self.account.clone().unwrap_or_else(|| "demo".into());
+        let ids = match &self.account {
+            Some(id) if fwd::is_view(id) => self.scope.accounts.clone(),
+            Some(id) => vec![id.clone()],
+            None => vec!["demo".into()],
+        };
         let generation = self.load_generation;
         self.task(
             cx,
-            move |b| b.store.drafts(&id),
+            move |b| {
+                let mut drafts = Vec::new();
+                for id in &ids {
+                    drafts.extend(b.store.drafts(id)?);
+                }
+                Ok(drafts)
+            },
             move |this, result, cx| {
                 if generation != this.load_generation || this.folder != Folder::Drafts {
                     return;
@@ -1798,7 +1939,7 @@ impl MailApp {
         {
             m.unread = false;
         }
-        if let Some(a) = self.current_account() {
+        if let Some(a) = self.account_of(&m) {
             let account_id = a.id.clone();
             let id2 = id.clone();
             self.reading = Some(id.clone());
@@ -1879,51 +2020,65 @@ impl MailApp {
             self.selecting = false;
         }
         cx.notify();
-        let Some(a) = self.current_account() else {
-            return;
-        };
-        let generation = self.load_generation;
-        let count = before.len();
-        let sent = before.clone();
-        let account_id = a.id.clone();
-        self.task(
-            cx,
-            move |b| b.change_many(&a, &sent, change),
-            move |this, result, cx| {
-                this.refresh_counts(cx);
-                this.account_result(&account_id, IssueSource::Change, &result);
-                match result {
-                    Ok(()) => {
-                        if let Change::Move(folder) = change {
-                            this.notice(
-                                if count == 1 {
-                                    format!("Moved to {}", folder.label())
-                                } else {
-                                    format!("Moved {count} messages to {}", folder.label())
-                                },
-                                false,
-                                cx,
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        if generation == this.load_generation {
-                            for old in before {
-                                match this.messages.iter_mut().find(|m| m.id == old.id) {
-                                    Some(m) => *m = old,
-                                    None => this.messages.push(old),
-                                }
+        // A view can list several mailboxes; each one's server gets its own.
+        let mut groups: Vec<(Account, Vec<Mail>)> = vec![];
+        for m in before {
+            let Some(a) = self.account_of(&m) else {
+                continue;
+            };
+            match groups.iter_mut().find(|(g, _)| g.id == a.id) {
+                Some((_, ms)) => ms.push(m),
+                None => groups.push((a, vec![m])),
+            }
+        }
+        for (a, before) in groups {
+            let generation = self.load_generation;
+            let count = before.len();
+            let sent = before.clone();
+            let account_id = a.id.clone();
+            self.task(
+                cx,
+                move |b| b.change_many(&a, &sent, change),
+                move |this, result, cx| {
+                    this.refresh_counts(cx);
+                    this.account_result(&account_id, IssueSource::Change, &result);
+                    match result {
+                        Ok(()) => {
+                            if let Change::Move(folder) = change {
+                                this.notice(
+                                    if count == 1 {
+                                        format!("Moved to {}", folder.label())
+                                    } else {
+                                        format!("Moved {count} messages to {}", folder.label())
+                                    },
+                                    false,
+                                    cx,
+                                );
                             }
-                            this.messages.sort_by_key(|m| std::cmp::Reverse(m.date));
-                            this.filter(cx);
                         }
-                        this.reload_cached(cx);
+                        Err(_) => {
+                            if generation == this.load_generation {
+                                for old in before {
+                                    match this.messages.iter_mut().find(|m| m.id == old.id) {
+                                        Some(m) => *m = old,
+                                        None => this.messages.push(old),
+                                    }
+                                }
+                                this.messages.sort_by(Mail::newest_first);
+                                this.filter(cx);
+                            }
+                            this.reload_cached(cx);
+                        }
                     }
-                }
-            },
-        );
+                },
+            );
+        }
     }
     fn mark_all_read(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
+        if fwd::is_view(&id) {
+            self.mark_view_read(id, mailbox, cx);
+            return;
+        }
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
@@ -1947,7 +2102,7 @@ impl MailApp {
         );
     }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        if self.menu.take().is_some() || self.presets_for.take().is_some() {
             cx.notify();
             return;
         }
@@ -1971,13 +2126,7 @@ impl MailApp {
         self.connecting = false;
         self.discovering = false;
         self.setup_generation += 1;
-        self.modal = if matches!(self.modal, Some(Modal::AvatarPresets(_)))
-            && std::mem::take(&mut self.presets_from_settings)
-        {
-            Some(Modal::Settings)
-        } else {
-            None
-        };
+        self.modal = None;
         self.status.clear();
         self.error = false;
         Self::set(&self.form[PASSWORD], "", w, cx);
@@ -2241,6 +2390,7 @@ impl MailApp {
                         this.sync_tree();
                         this.load_avatar(saved.clone(), cx);
                         this.account = Some(saved.id.clone());
+                        this.update_scope();
                         if this.onboarding {
                             this.step = Step::Done;
                             this.anim += 1;
@@ -2464,7 +2614,11 @@ impl MailApp {
             Action::Forward => self.new_compose(3, w, cx),
             Action::Refresh => {
                 if let Some(id) = self.account.clone() {
-                    self.retry_account(id, cx);
+                    if fwd::is_view(&id) {
+                        self.refresh(cx);
+                    } else {
+                        self.retry_account(id, cx);
+                    }
                 }
             }
             Action::Select(id) => {
@@ -2522,6 +2676,13 @@ impl MailApp {
                 self.load_drafts(cx);
             }
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
+            Action::RefreshAccount(id) if fwd::is_view(&id) => {
+                if self.account.as_ref() == Some(&id) {
+                    self.refresh(cx);
+                } else {
+                    self.open_mailbox(Some(id), Folder::Inbox.into(), w, cx);
+                }
+            }
             Action::RefreshAccount(id) => {
                 if self.account.as_ref() == Some(&id) {
                     self.retry_account(id, cx);
@@ -2559,13 +2720,24 @@ impl MailApp {
             Action::AvatarMenu(id) => {
                 let entries = self.avatar_entries(&id);
                 self.open_menu(w.mouse_position(), entries, cx);
+                let here = w.window_handle().window_id();
+                if self.settings_window.is_some_and(|h| h.window_id() == here)
+                    && let Some(menu) = &mut self.menu
+                {
+                    menu.window = Some(here);
+                }
                 return;
             }
             Action::ProviderAvatar(id) => self.provider_avatar(id, cx),
             Action::AvatarPresets(id) => {
-                self.presets_from_settings = self.modal == Some(Modal::Settings);
-                self.modal = Some(Modal::AvatarPresets(id));
-                self.anim += 1;
+                if self.modal == Some(Modal::Settings) || self.settings_window.is_some() {
+                    // Over Settings, which stays open where it was.
+                    self.menu_anim += 1;
+                    self.presets_for = Some(id);
+                } else {
+                    self.modal = Some(Modal::AvatarPresets(id));
+                    self.anim += 1;
+                }
             }
             Action::SetPresetAvatar(id, name) => self.preset_avatar(id, name, cx),
             Action::RemoveAvatar(id) => match self.backend.remove_avatar(&id) {
@@ -2614,6 +2786,10 @@ impl MailApp {
             }
             Action::OldestFirst(oldest) => {
                 self.oldest_first = oldest;
+                let _ = self
+                    .backend
+                    .store
+                    .set_preference("sort", if oldest { "oldest" } else { "newest" });
                 self.filter(cx);
                 self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
@@ -2628,6 +2804,13 @@ impl MailApp {
                 self.download(cx);
             }
             Action::Connect => {
+                // Adding an account happens in the main window, also when
+                // asked from popped-out Settings.
+                if let Some(main) = self.main_window
+                    && main.window_id() != w.window_handle().window_id()
+                {
+                    let _ = main.update(cx, |_, w, _| w.activate_window());
+                }
                 if self.onboarding {
                     self.begin_setup(Step::Provider, w, cx);
                 } else {
@@ -2761,7 +2944,7 @@ impl MailApp {
                 );
             }
             Action::Settings => {
-                if self.modal != Some(Modal::Settings) {
+                if !self.reveal_settings_window(cx) && self.modal != Some(Modal::Settings) {
                     self.settings_scroll.set_offset(point(px(0.), px(0.)));
                     self.page = Page::General;
                     self.modal = Some(Modal::Settings);
@@ -2784,7 +2967,7 @@ impl MailApp {
             Action::AccountSettings(id) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
                 self.page = Page::Account(id);
-                if self.modal != Some(Modal::Settings) {
+                if !self.reveal_settings_window(cx) && self.modal != Some(Modal::Settings) {
                     self.modal = Some(Modal::Settings);
                     self.anim += 1;
                 }
@@ -2946,6 +3129,7 @@ impl MailApp {
                         match result {
                             Ok(()) => {
                                 this.accounts.retain(|a| a.id != id);
+                                this.forget_mailbox(&id);
                                 this.sync_tree();
                                 this.account_issues.remove(&id);
                                 this.folders.remove(&id);
@@ -2954,6 +3138,7 @@ impl MailApp {
                                 this.modal = None;
                                 if this.account.as_ref() == Some(&id) {
                                     this.account = this.first_account();
+                                    this.update_scope();
                                     this.messages.clear();
                                     this.selected = None;
                                     this.load_generation += 1;
@@ -2981,6 +3166,55 @@ impl MailApp {
             }
             Action::UndoSend(id) => self.undo_send(id, w, cx),
             Action::SetComposeOptions(options) => self.save_compose_options(options, cx),
+            Action::SetAllMail(on) => self.set_all_mail(on, cx),
+            Action::ForwardingService(service) => {
+                self.fwd_service = service;
+                self.fwd_error = None;
+            }
+            Action::ConnectForwarding => self.connect_forwarding(w, cx),
+            Action::RefreshAliases(id) => self.refresh_aliases(id, cx),
+            Action::RemoveForwarding(id) => self.remove_forwarding(id, cx),
+            Action::SetDeliverTo(id, to) => {
+                self.edit_forwarding(&id, |f| f.deliver_to = to, cx);
+            }
+            Action::NewAlias(id) => {
+                if self.fwd_creating.take() != Some(id.clone()) {
+                    self.fwd_creating = Some(id);
+                    Self::set(&self.fwd_note, "", w, cx);
+                    self.fwd_note.update(cx, |s, cx| s.focus(w, cx));
+                }
+            }
+            Action::CreateAlias(id) => self.create_alias(id, cx),
+            Action::ShowAllAliases(id) => {
+                self.fwd_expanded.insert(id);
+            }
+            Action::SetAliasEnabled(id, alias, on) => self.set_alias_enabled(id, alias, on, cx),
+            Action::SetAliasDisplay(id, alias, display) => {
+                self.edit_forwarding(
+                    &id,
+                    |f| {
+                        if let Some(a) = f.aliases.iter_mut().find(|a| a.id == alias) {
+                            a.display = display;
+                        }
+                    },
+                    cx,
+                );
+            }
+            Action::DeleteAlias(id, alias) => self.delete_alias(id, alias, cx),
+            Action::ToggleForwarding(id) => {
+                if !self.fwd_open.remove(&id) {
+                    self.fwd_open.insert(id);
+                }
+            }
+            Action::AddForwarding => {
+                self.fwd_adding = !self.fwd_adding;
+                self.fwd_error = None;
+                if self.fwd_adding {
+                    self.fwd_key.update(cx, |s, cx| s.focus(w, cx));
+                }
+            }
+            Action::PlaceSettings(place) => self.place_settings(place, w, cx),
+            Action::ClosePresets => self.presets_for = None,
             Action::Dismiss => self.status.clear(),
         }
         self.sync_selecting();
@@ -3244,6 +3478,11 @@ impl MailApp {
             .pb_2();
         let mut list = self.tree_list(list, &self.sidebar_scroll, cx);
         let row = Cell::new(0);
+        if self.shows_all_mail()
+            && let Some(el) = self.view_block(ALL_MAIL, 0, &row, false, cx)
+        {
+            list = list.child(el);
+        }
         for el in self.sidebar_nodes(&self.tree, 0, &row, cx) {
             list = list.child(el);
         }
@@ -3377,6 +3616,11 @@ impl MailApp {
             .child(div().h(px(1.)).w(px(28.)).my_1().bg(rgb(c.border)));
         let mut rail = self.tree_list(rail, &self.rail_scroll, cx);
         let row = Cell::new(0);
+        if self.shows_all_mail()
+            && let Some(el) = self.rail_view(ALL_MAIL, &row, false, cx)
+        {
+            rail = rail.child(el);
+        }
         for el in self.rail_nodes(&self.tree, &row, cx) {
             rail = rail.child(el);
         }
@@ -4460,6 +4704,9 @@ impl MailApp {
                         .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
                 );
         }
+        if let Some(why) = self.service.browser_unavailable() {
+            content = content.child(notice_box(why, c));
+        }
         content = content.child(self.field(self.service.password_label(), PASSWORD));
         if let Some((help, url)) = self.service.password_help() {
             content = content.child(
@@ -4613,6 +4860,8 @@ impl MailApp {
                 },
                 if self.manual {
                     "We couldn't find your settings. Enter them below.".into()
+                } else if self.service.browser_unavailable().is_some() {
+                    "Connect with an app password from your account's security settings.".into()
                 } else {
                     String::new()
                 },
@@ -5082,7 +5331,14 @@ impl MailApp {
             }))
             .max_w(available_width)
             .when(*modal == Modal::Settings, |d| {
-                d.h(px(600.).min(available_height))
+                if self.settings_place == SettingsPlace::Maximized {
+                    // Like a full-size composer: below the title bar, which
+                    // stays visible and usable.
+                    d.w(available_width)
+                        .h((available_height - px(TITLEBAR_HEIGHT)).max(px(0.)))
+                } else {
+                    d.h(px(600.).min(available_height))
+                }
             })
             .when(*modal == Modal::Original, |d| {
                 d.h(px(760.).min(available_height))
@@ -5110,6 +5366,9 @@ impl MailApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
+                    .when(*modal == Modal::Settings, |d| {
+                        d.child(self.settings_place_controls(cx))
+                    })
                     .child(self.button(
                         "modal-close",
                         "@Close dialog",
@@ -5226,11 +5485,14 @@ impl MailApp {
     }
     fn modal_frame(&self, panel: Stateful<Div>, window: &Window) -> AnyElement {
         let corners = window::window_corners(window);
+        let below_titlebar =
+            self.modal == Some(Modal::Settings) && self.settings_place == SettingsPlace::Maximized;
         div()
             .occlude()
             .on_mouse_down(MouseButton::Left, swallow_press)
             .absolute()
             .inset_0()
+            .when(below_titlebar, |d| d.top(px(TITLEBAR_HEIGHT)))
             .rounded_tl(corners.top_left)
             .rounded_tr(corners.top_right)
             .rounded_bl(corners.bottom_left)
@@ -5411,7 +5673,10 @@ impl MailApp {
                 d.children(self.composer_layer(window, cx))
             })
             .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
-            .when(self.menu.is_some(), |d| d.child(self.popup_menu(cx)))
+            .when(
+                self.menu.as_ref().is_some_and(|m| m.window.is_none()),
+                |d| d.child(self.popup_menu(cx)),
+            )
     }
 }
 impl MailApp {
@@ -5665,6 +5930,8 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "upload",
         "cloud",
         "grid",
+        "alias",
+        "inboxes",
     ]
     .contains(&name)
     {
@@ -5723,6 +5990,20 @@ fn placeholder_row(id: &str, c: Colors) -> Stateful<Div> {
                 .child(bar(0.55, 9.)),
         )
 }
+/// A quiet, tinted note that explains a limitation before the form asks
+/// for something, e.g. why only an app password is offered.
+fn notice_box(text: &'static str, c: Colors) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap_2()
+        .p_3()
+        .rounded(px(8.))
+        .bg(rgb(c.soft))
+        .text_size(px(12.))
+        .child(div().pt(px(1.)).child(icon_el("info", 14., c.accent)))
+        .child(div().flex_1().min_w_0().child(text))
+}
 fn avatar(initials: &str, size: f32, index: usize, c: Colors) -> Div {
     let light = [
         (0xdbe9e1, 0x3b6b51),
@@ -5750,6 +6031,7 @@ fn avatar(initials: &str, size: f32, index: usize, c: Colors) -> Div {
         .child(initials.to_owned())
 }
 fn date_short(ts: i64) -> String {
+    use chrono::Datelike;
     let Some(date) = chrono::DateTime::from_timestamp(ts, 0) else {
         return String::new();
     };
@@ -5757,9 +6039,31 @@ fn date_short(ts: i64) -> String {
     let local = date.with_timezone(&chrono::Local);
     if local.date_naive() == now.date_naive() {
         local.format("%-I:%M %p").to_string()
-    } else {
+    } else if local.year() == now.year() {
         local.format("%b %-d").to_string()
+    } else {
+        local.format("%b %-d, %Y").to_string()
     }
+}
+#[cfg(test)]
+#[::core::prelude::v1::test]
+fn short_dates_name_the_year_only_when_it_differs() {
+    use chrono::{Datelike, TimeZone};
+    let now = chrono::Local::now();
+    let at = |y: i32, m: u32| {
+        chrono::Local
+            .with_ymd_and_hms(y, m, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp()
+    };
+    let earlier_month = if now.month() == 1 { 1 } else { now.month() - 1 };
+    let this_year = date_short(at(now.year(), earlier_month));
+    assert!(!this_year.contains(&now.year().to_string()), "{this_year}");
+    let last_year = date_short(at(now.year() - 1, 6));
+    assert!(
+        last_year.ends_with(&format!(", {}", now.year() - 1)),
+        "{last_year}"
+    );
 }
 fn date_full(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)

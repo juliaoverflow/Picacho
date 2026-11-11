@@ -210,6 +210,13 @@ impl MailApp {
                 Page::Composing,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-forwarding".into(),
+                "Forwarding".into(),
+                icon_el("alias", 15., c.muted).into_any_element(),
+                Page::Forwarding,
+                cx,
+            ))
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -257,10 +264,12 @@ impl MailApp {
             Page::General => self.general_page(cx),
             Page::Reading => self.reading_page(cx),
             Page::Composing => self.composing_page(cx),
+            Page::Forwarding => self.forwarding_page(cx),
         };
         div()
             .size_full()
             .min_h_0()
+            .relative()
             .flex()
             .when(narrow, |d| d.flex_col())
             .child(nav)
@@ -278,6 +287,9 @@ impl MailApp {
                     .child(page)
                     .map(|page| super::panes::scroll_frame(page, &self.settings_scroll)),
             )
+            .when_some(self.presets_for.as_deref(), |d, id| {
+                d.child(self.presets_sheet(id, cx))
+            })
             .into_any_element()
     }
     pub(super) fn general_page(&self, cx: &Context<Self>) -> AnyElement {
@@ -349,6 +361,13 @@ impl MailApp {
                     self.accent.label()
                 ),
                 swatches,
+            ))
+            .child(self.section("Mailboxes"))
+            .child(self.toggle_row(
+                "All Mail",
+                "With more than one account, list every account's inbox, drafts, spam and other mail together at the top of the sidebar.",
+                self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
+                    .debug_selector(|| "all-mail".into()),
             ))
             .child(self.section("Picacho"))
             .child(
@@ -993,5 +1012,337 @@ impl MailApp {
                     ),
             );
         page.into_any_element()
+    }
+}
+
+impl MailApp {
+    /// Moves Settings between a dialog, the full main window and a window
+    /// of its own, keeping the page and everything on it.
+    pub(super) fn place_settings(
+        &mut self,
+        place: SettingsPlace,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if place == SettingsPlace::Window {
+            if self.settings_place == SettingsPlace::Window {
+                self.reveal_settings_window(cx);
+                return;
+            }
+            self.main_window = Some(w.window_handle());
+            self.settings_place = SettingsPlace::Window;
+            if self.modal == Some(Modal::Settings) {
+                self.modal = None;
+            }
+            let app = cx.entity();
+            let weak = cx.weak_entity();
+            let colors = self.colors();
+            // The new window draws Settings from this view, so it opens once
+            // this update has finished.
+            cx.defer(move |cx| {
+                let bounds = Bounds::centered(None, size(px(900.), px(680.)), cx);
+                let opened = cx.open_window(
+                    window::detached_options("Settings".into(), bounds),
+                    move |window, cx| {
+                        let view = cx.new(|cx| SettingsWindow::new(app, colors, cx));
+                        view.read(cx).focus.focus(window);
+                        cx.new(|cx| Root::new(view, window, cx))
+                    },
+                );
+                let handle = match opened {
+                    Ok(handle) => AnyWindowHandle::from(handle),
+                    Err(e) => {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.settings_place = SettingsPlace::Dialog;
+                            this.modal = Some(Modal::Settings);
+                            this.notice(format!("{e:#}"), true, cx);
+                        });
+                        return;
+                    }
+                };
+                let app = weak.clone();
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.on_window_should_close(cx, move |_, cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            this.settings_window = None;
+                            this.settings_place = SettingsPlace::Dialog;
+                            this.presets_for = None;
+                            cx.notify();
+                        });
+                        true
+                    });
+                });
+                let _ = weak.update(cx, |this, cx| {
+                    this.settings_window = Some(handle);
+                    cx.notify();
+                });
+            });
+            return;
+        }
+        // Back from its own window: close that window, show the dialog in
+        // the main window, and bring the main window forward.
+        let popped = self.settings_place == SettingsPlace::Window;
+        if let Some(handle) = self.settings_window.take() {
+            if handle.window_id() == w.window_handle().window_id() {
+                w.remove_window();
+            } else {
+                let _ = handle.update(cx, |_, w, _| w.remove_window());
+            }
+        }
+        if popped {
+            if let Some(main) = self.main_window {
+                let _ = main.update(cx, |_, w, _| w.activate_window());
+            }
+            self.anim += 1;
+        }
+        self.settings_place = place;
+        self.modal = Some(Modal::Settings);
+    }
+    /// Brings popped-out Settings forward. False when Settings is not in a
+    /// window of its own, so the caller shows the dialog.
+    pub(super) fn reveal_settings_window(&self, cx: &mut App) -> bool {
+        if let Some(handle) = self.settings_window {
+            let _ = handle.update(cx, |_, w, _| w.activate_window());
+        }
+        self.settings_place == SettingsPlace::Window
+    }
+    /// Expand and pop-out controls for the Settings dialog's header, like a
+    /// composer's.
+    pub(super) fn settings_place_controls(&self, cx: &Context<Self>) -> Div {
+        let maximized = self.settings_place == SettingsPlace::Maximized;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(self.button(
+                "settings-maximize",
+                if maximized {
+                    "@Exit full size"
+                } else {
+                    "@Full size"
+                },
+                if maximized { "shrink" } else { "expand" },
+                Action::PlaceSettings(if maximized {
+                    SettingsPlace::Dialog
+                } else {
+                    SettingsPlace::Maximized
+                }),
+                false,
+                cx,
+            ))
+            .child(self.button(
+                "settings-popout",
+                "@Open in new window",
+                "popout",
+                Action::PlaceSettings(SettingsPlace::Window),
+                false,
+                cx,
+            ))
+    }
+    /// Preset pictures drawn over Settings, so choosing one never closes
+    /// Settings or loses its place.
+    pub(super) fn presets_sheet(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x101c2c55))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .id("presets-sheet")
+                    .debug_selector(|| "presets-sheet".into())
+                    .w(px(540.))
+                    .max_w_full()
+                    .max_h_full()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.surface))
+                    .shadow_2xl()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .px_5()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(rgb(c.border))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Choose a Picture"),
+                            )
+                            .child(self.button(
+                                "presets-close",
+                                "@Close",
+                                "close",
+                                Action::ClosePresets,
+                                false,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("presets-sheet-content")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_5()
+                            .child(self.presets_modal(id, cx)),
+                    ),
+            )
+            .with_animation(
+                ("presets-sheet", self.menu_anim),
+                Animation::new(Duration::from_millis(140)).with_easing(|t| 1. - (1. - t).powi(3)),
+                |d, t| d.opacity(t),
+            )
+            .into_any_element()
+    }
+}
+
+/// Settings popped out into a window of its own. It draws the app's
+/// Settings under a Picacho title bar, like a compose window.
+pub(super) struct SettingsWindow {
+    app: Entity<MailApp>,
+    colors: Colors,
+    focus: FocusHandle,
+    _observe: Subscription,
+}
+impl SettingsWindow {
+    fn new(app: Entity<MailApp>, colors: Colors, cx: &mut Context<Self>) -> Self {
+        let _observe = cx.observe(&app, |this, app, cx| {
+            this.colors = app.read(cx).colors();
+            cx.notify();
+        });
+        Self {
+            app,
+            colors,
+            focus: cx.focus_handle(),
+            _observe,
+        }
+    }
+    fn act(&self, action: Action, w: &mut Window, cx: &mut Context<Self>) {
+        self.app.update(cx, |app, cx| app.handle(action, w, cx));
+    }
+}
+/// Closes popped-out Settings from its own controls, which (unlike the
+/// system's close button) don't ask `on_window_should_close`.
+fn close_settings_window(app: &WeakEntity<MailApp>, w: &mut Window, cx: &mut App) {
+    let _ = app.update(cx, |this, cx| {
+        this.settings_window = None;
+        this.settings_place = SettingsPlace::Dialog;
+        this.presets_for = None;
+        this.menu = None;
+        cx.notify();
+    });
+    w.remove_window();
+}
+impl Render for SettingsWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = self.colors;
+        window.set_window_title("Settings");
+        let id = window.window_handle().window_id();
+        let (content, menu, status, error) = self.app.update(cx, |app, cx| {
+            let menu = app
+                .menu
+                .as_ref()
+                .is_some_and(|m| m.window == Some(id))
+                .then(|| app.popup_menu(cx));
+            (
+                app.settings_modal(window, cx),
+                menu,
+                app.status.clone(),
+                app.error,
+            )
+        });
+        let dock = window::no_drag(
+            div()
+                .id("settings-dock")
+                .debug_selector(|| "settings-dock".into())
+                .size(px(28.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(rgb(c.raised)))
+                .active(|s| s.opacity(0.75))
+                .child(icon_el("shrink", 15., c.muted))
+                .tooltip(|w, cx| Tooltip::new("Move into main window").build(w, cx))
+                .on_click(cx.listener(|this, _, w, cx| {
+                    this.act(Action::PlaceSettings(SettingsPlace::Dialog), w, cx)
+                })),
+        );
+        let bar = window::detached_bar("settings-titlebar", c)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Settings"),
+            )
+            .child(dock);
+        let app = self.app.downgrade();
+        let bar = window::detached_titlebar(
+            bar,
+            c,
+            move |_, w, cx| close_settings_window(&app, w, cx),
+            window,
+            cx,
+        );
+        div()
+            .key_context("Detached")
+            .track_focus(&self.focus)
+            .map(|d| window::window_frame(d, c, window))
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.surface))
+            .text_color(rgb(c.text))
+            .font_family(".SystemUIFont")
+            .text_size(px(14.))
+            .on_action(cx.listener(|this, _: &Close, w, cx| {
+                // Escape closes a menu or the pictures first, then the window.
+                let closed = this.app.update(cx, |app, cx| {
+                    let closed = app.menu.take().is_some() || app.presets_for.take().is_some();
+                    cx.notify();
+                    closed
+                });
+                if !closed {
+                    close_settings_window(&this.app.downgrade(), w, cx);
+                }
+            }))
+            .child(bar)
+            .child(div().flex_1().min_h_0().flex().child(content))
+            .when(!status.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .px_5()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .text_size(px(12.))
+                        .text_color(rgb(if error { c.danger } else { c.accent }))
+                        .child(status),
+                )
+            })
+            .children(menu)
     }
 }
