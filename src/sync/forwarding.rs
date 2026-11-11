@@ -251,6 +251,54 @@ impl Client {
         Ok(())
     }
 
+    /// SimpleLogin: the reverse aliases of an alias's contacts. Mail sent
+    /// to one of these from your mailbox goes out as the alias.
+    pub fn reverse_aliases(&self, alias: &Alias) -> Result<std::collections::HashSet<String>> {
+        use reqwest::Method;
+        ensure!(
+            self.service == ForwardingService::SimpleLogin,
+            "Only SimpleLogin has reverse aliases"
+        );
+        let mut out = std::collections::HashSet::new();
+        for page in 0..100 {
+            let v = self.send(self.request(
+                Method::GET,
+                &format!("/api/aliases/{}/contacts?page_id={page}", alias.id),
+            ))?;
+            let contacts = v["contacts"].as_array().cloned().unwrap_or_default();
+            if contacts.is_empty() {
+                break;
+            }
+            out.extend(
+                contacts
+                    .iter()
+                    .map(|c| str_of(&c["reverse_alias_address"]).to_lowercase())
+                    .filter(|a| !a.is_empty()),
+            );
+        }
+        Ok(out)
+    }
+
+    /// SimpleLogin: the reverse alias for writing to `contact` as `alias`,
+    /// made if it does not exist yet.
+    pub fn reverse_alias(&self, alias: &Alias, contact: &str) -> Result<String> {
+        use reqwest::Method;
+        ensure!(
+            self.service == ForwardingService::SimpleLogin,
+            "Only SimpleLogin has reverse aliases"
+        );
+        let v = self.send(
+            self.request(Method::POST, &format!("/api/aliases/{}/contacts", alias.id))
+                .json(&json!({ "contact": contact })),
+        )?;
+        let address = str_of(&v["reverse_alias_address"]);
+        ensure!(
+            !address.is_empty(),
+            "SimpleLogin did not give an address for writing to {contact}"
+        );
+        Ok(address)
+    }
+
     /// Deletes an alias. Mail sent to it afterwards is refused.
     pub fn delete(&self, alias: &Alias) -> Result<()> {
         use reqwest::Method;

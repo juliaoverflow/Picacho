@@ -91,6 +91,7 @@ pub fn parse_message(
         has_attachments,
         gmail_id: 0,
         pending: false,
+        reply_to: header("Reply-To"),
     })
 }
 pub(crate) fn collect_leaves<'a>(

@@ -8,11 +8,11 @@
 //! nothing. The service accounts are kept in preferences and their API keys
 //! in the system keychain, like mailbox passwords.
 use crate::manage::{
-    model::{Account, Folder, Mail, Secret},
+    model::{Account, Draft, Folder, Mail, Secret},
     store::{self, Store},
 };
 use crate::sync::forwarding::Client;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -46,6 +46,12 @@ impl ForwardingService {
             Self::Addy => "https://app.addy.io",
             Self::FirefoxRelay => "https://relay.firefox.com",
         }
+    }
+    /// Whether mail can be written as an alias, not only replied to.
+    /// SimpleLogin does it with reverse aliases and addy.io with
+    /// `alias+name=domain` addresses; Firefox Relay only relays replies.
+    pub fn can_send(self) -> bool {
+        !matches!(self, Self::FirefoxRelay)
     }
     /// Where the API key is made, in one sentence, and the page.
     pub fn key_help(self) -> (&'static str, &'static str) {
@@ -208,6 +214,149 @@ pub fn delete(account: &ForwardingAccount, alias: &Alias) -> Result<()> {
 pub fn forget(account: &ForwardingAccount) {
     let _ = store::secret_entry(&account.secret_id())
         .and_then(|e| e.delete_credential().map_err(Into::into));
+}
+
+/// An alias offered in a composer's From menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendAlias {
+    /// Lowercase.
+    pub email: String,
+    pub note: String,
+    pub service: ForwardingService,
+    /// The Picacho mailbox it sends through, when the service has one set.
+    pub deliver_to: Option<String>,
+}
+/// Turned-on aliases at services that can send, in the services' order.
+pub fn sendable(forwarding: &[ForwardingAccount]) -> Vec<SendAlias> {
+    forwarding
+        .iter()
+        .filter(|f| f.service.can_send())
+        .flat_map(|f| {
+            f.aliases.iter().filter(|a| a.enabled).map(|a| SendAlias {
+                email: a.email.clone(),
+                note: a.note.clone(),
+                service: f.service,
+                deliver_to: f.deliver_to.clone(),
+            })
+        })
+        .collect()
+}
+/// The sendable alias with this address, and its service account.
+fn find_sendable<'a>(
+    forwarding: &'a [ForwardingAccount],
+    email: &str,
+) -> Option<(&'a ForwardingAccount, &'a Alias)> {
+    forwarding
+        .iter()
+        .filter(|f| f.service.can_send())
+        .find_map(|f| {
+            let alias = f
+                .aliases
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(email.trim()))?;
+            Some((f, alias))
+        })
+}
+
+/// The draft with its recipients rewritten so the service sends it as
+/// `draft.send_as`: SimpleLogin's reverse aliases, or addy.io's
+/// `alias+name=domain@alias-domain`. Addresses that already go through the
+/// alias (as in a reply to mail it forwarded) are kept. Unchanged when the
+/// draft is sent as its account.
+pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
+    if draft.send_as.is_empty() {
+        return Ok(draft.clone());
+    }
+    let forwarding = load(store);
+    let Some((account, alias)) = find_sendable(&forwarding, &draft.send_as) else {
+        anyhow::bail!(
+            "{} is no longer an alias Picacho can send as. Choose another address in From.",
+            draft.send_as
+        );
+    };
+    anyhow::ensure!(
+        alias.enabled,
+        "{} is turned off at {}. Turn it on in Forwarding settings, or choose another address in From.",
+        alias.email,
+        account.service.label()
+    );
+    let fields = [&draft.to, &draft.cc, &draft.bcc]
+        .map(|list| crate::sync::smtp::recipients(list))
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let routed: Vec<Vec<(Option<String>, String)>> = match account.service {
+        ForwardingService::Addy => fields
+            .into_iter()
+            .map(|list| {
+                list.into_iter()
+                    .map(|(name, address)| Ok((name, addy_route(&alias.email, &address)?)))
+                    .collect::<Result<_>>()
+            })
+            .collect::<Result<_>>()?,
+        ForwardingService::SimpleLogin => {
+            let client = account.client()?;
+            let reverse = client.reverse_aliases(alias)?;
+            let mut made: HashMap<String, String> = HashMap::new();
+            let mut out = Vec::new();
+            for list in fields {
+                let mut field = Vec::new();
+                for (name, address) in list {
+                    let key = address.to_lowercase();
+                    let routed = if reverse.contains(&key) {
+                        address
+                    } else if let Some(r) = made.get(&key) {
+                        r.clone()
+                    } else {
+                        let r = client.reverse_alias(alias, &address)?;
+                        made.insert(key, r.clone());
+                        r
+                    };
+                    field.push((name, routed));
+                }
+                out.push(field);
+            }
+            out
+        }
+        ForwardingService::FirefoxRelay => unreachable!("Firefox Relay cannot send"),
+    };
+    let join = |list: &[(Option<String>, String)]| {
+        list.iter()
+            .map(|(name, address)| match name {
+                Some(n) if !n.is_empty() && n != address => {
+                    format!("\"{}\" <{address}>", n.replace(['"', '\\'], ""))
+                }
+                _ => address.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Ok(Draft {
+        to: join(&routed[0]),
+        cc: join(&routed[1]),
+        bcc: join(&routed[2]),
+        ..draft.clone()
+    })
+}
+
+/// addy.io's address for writing to `recipient` as `alias`:
+/// `alias-local+recipient-local=recipient-domain@alias-domain`. An address
+/// already in that form for this alias is kept.
+fn addy_route(alias: &str, recipient: &str) -> Result<String> {
+    let (alias_local, alias_domain) = alias
+        .rsplit_once('@')
+        .with_context(|| format!("{alias} is not an email address"))?;
+    let (local, domain) = recipient
+        .rsplit_once('@')
+        .with_context(|| format!("{recipient} is not an email address"))?;
+    if domain.eq_ignore_ascii_case(alias_domain)
+        && local
+            .to_lowercase()
+            .strip_prefix(&format!("{}+", alias_local.to_lowercase()))
+            .is_some_and(|rest| rest.contains('='))
+    {
+        return Ok(recipient.to_owned());
+    }
+    Ok(format!("{alias_local}+{local}={domain}@{alias_domain}"))
 }
 
 /// The view id of an alias shown on its own.
@@ -374,6 +523,95 @@ pub fn view_counts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn addy_routes_each_recipient_through_the_alias() {
+        assert_eq!(
+            addy_route("shop@me.anonaddy.com", "ana@example.org").unwrap(),
+            "shop+ana=example.org@me.anonaddy.com"
+        );
+        // A reply address addy.io already gave is kept.
+        assert_eq!(
+            addy_route(
+                "shop@me.anonaddy.com",
+                "shop+ana=example.org@me.anonaddy.com"
+            )
+            .unwrap(),
+            "shop+ana=example.org@me.anonaddy.com"
+        );
+        assert!(addy_route("shop@me.anonaddy.com", "nobody").is_err());
+    }
+
+    #[test]
+    fn drafts_sent_as_an_alias_are_routed_and_others_unchanged() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&p)?;
+        let alias = |email: &str, enabled| Alias {
+            id: email.into(),
+            email: email.into(),
+            enabled,
+            note: String::new(),
+            display: AliasDisplay::Included,
+        };
+        save(
+            &store,
+            &[
+                ForwardingAccount {
+                    id: "addy".into(),
+                    service: ForwardingService::Addy,
+                    server: String::new(),
+                    name: String::new(),
+                    deliver_to: None,
+                    aliases: vec![
+                        alias("shop@me.anonaddy.com", true),
+                        alias("old@me.anonaddy.com", false),
+                    ],
+                },
+                ForwardingAccount {
+                    id: "relay".into(),
+                    service: ForwardingService::FirefoxRelay,
+                    server: String::new(),
+                    name: String::new(),
+                    deliver_to: None,
+                    aliases: vec![alias("x@mozmail.com", true)],
+                },
+            ],
+        )?;
+        let draft = Draft {
+            to: "Ana <ana@example.org>, bo@example.net".into(),
+            cc: "cy@example.com".into(),
+            ..Draft::default()
+        };
+        assert_eq!(route(&store, &draft)?.to, draft.to, "sent as the account");
+        let routed = route(
+            &store,
+            &Draft {
+                send_as: "Shop@me.anonaddy.com".into(),
+                ..draft.clone()
+            },
+        )?;
+        assert_eq!(
+            routed.to,
+            "\"Ana\" <shop+ana=example.org@me.anonaddy.com>, shop+bo=example.net@me.anonaddy.com"
+        );
+        assert_eq!(routed.cc, "shop+cy=example.com@me.anonaddy.com");
+        // Turned-off aliases and services that cannot send are refused.
+        for send_as in ["old@me.anonaddy.com", "x@mozmail.com"] {
+            let draft = Draft {
+                send_as: send_as.into(),
+                ..draft.clone()
+            };
+            assert!(route(&store, &draft).is_err(), "{send_as}");
+        }
+        let offered: Vec<String> = sendable(&load(&store))
+            .into_iter()
+            .map(|a| a.email)
+            .collect();
+        assert_eq!(offered, ["shop@me.anonaddy.com"]);
+        drop(store);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+
     use super::*;
     use crate::manage::model::Provider;
 

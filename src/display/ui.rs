@@ -119,6 +119,8 @@ actions!(
 );
 
 const TITLEBAR_HEIGHT: f32 = 38.;
+/// Space around full-size Settings, the same on every side.
+const MAXIMIZED_MARGIN: f32 = 40.;
 const SIDEBAR_WIDTH: f32 = 228.;
 const SIDEBAR_RAIL: f32 = 60.;
 const SIDEBAR_MIN: f32 = 190.;
@@ -523,6 +525,12 @@ enum Action {
     ToggleForwarding(String),
     /// Shows or hides the form that connects a forwarding service.
     AddForwarding,
+    /// Menus in Forwarding settings: a service's, where it delivers, an alias's.
+    ServiceMenu(String),
+    DeliverMenu(String),
+    AliasMenu(String, String),
+    /// Leaves a pending Remove or Delete in Forwarding settings.
+    CancelForwardingConfirm,
     PlaceSettings(SettingsPlace),
     ClosePresets,
     Dismiss,
@@ -727,6 +735,8 @@ pub struct MailApp {
     fwd_key: Entity<InputState>,
     fwd_server: Entity<InputState>,
     fwd_note: Entity<InputState>,
+    /// Narrows a service's aliases.
+    fwd_search: Entity<InputState>,
     fwd_busy: HashSet<String>,
     fwd_error: Option<String>,
     /// An alias waiting for its delete to be confirmed.
@@ -833,6 +843,12 @@ impl MailApp {
             cx,
         );
         let fwd_note = input("Note for a new alias (optional)", false, false, window, cx);
+        let fwd_search = input("Find an alias", false, false, window, cx);
+        subscriptions.push(cx.subscribe(&fwd_search, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.subscribe_in(&fwd_key, window, |this, _, event, w, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.handle(Action::ConnectForwarding, w, cx);
@@ -1079,6 +1095,7 @@ impl MailApp {
             fwd_key,
             fwd_server,
             fwd_note,
+            fwd_search,
             fwd_busy: HashSet::new(),
             fwd_error: None,
             fwd_confirm: None,
@@ -1399,6 +1416,17 @@ impl MailApp {
             window: None,
         });
         cx.notify();
+    }
+    /// Opens a menu at the pointer in the window it was asked from: the
+    /// main window, or popped-out Settings.
+    fn open_menu_here(&mut self, entries: Vec<Entry>, w: &Window, cx: &mut Context<Self>) {
+        self.open_menu(w.mouse_position(), entries, cx);
+        let here = w.window_handle().window_id();
+        if self.settings_window.is_some_and(|h| h.window_id() == here)
+            && let Some(menu) = &mut self.menu
+        {
+            menu.window = Some(here);
+        }
     }
     fn account_entries(&self, id: &str) -> Vec<Entry> {
         let id = id.to_owned();
@@ -1877,6 +1905,7 @@ impl MailApp {
                                 has_attachments: !d.attachments.is_empty(),
                                 gmail_id: 0,
                                 pending: false,
+                                reply_to: String::new(),
                             })
                             .collect();
                         this.filter(cx);
@@ -2719,13 +2748,7 @@ impl MailApp {
             Action::ChooseAvatar(id) => self.choose_avatar(id, cx),
             Action::AvatarMenu(id) => {
                 let entries = self.avatar_entries(&id);
-                self.open_menu(w.mouse_position(), entries, cx);
-                let here = w.window_handle().window_id();
-                if self.settings_window.is_some_and(|h| h.window_id() == here)
-                    && let Some(menu) = &mut self.menu
-                {
-                    menu.window = Some(here);
-                }
+                self.open_menu_here(entries, w, cx);
                 return;
             }
             Action::ProviderAvatar(id) => self.provider_avatar(id, cx),
@@ -3206,6 +3229,19 @@ impl MailApp {
                     self.fwd_open.insert(id);
                 }
             }
+            Action::ServiceMenu(id) => {
+                let entries = self.service_entries(&id);
+                self.open_menu_here(entries, w, cx);
+            }
+            Action::DeliverMenu(id) => {
+                let entries = self.deliver_entries(&id);
+                self.open_menu_here(entries, w, cx);
+            }
+            Action::AliasMenu(id, alias) => {
+                let entries = self.alias_entries(&id, &alias);
+                self.open_menu_here(entries, w, cx);
+            }
+            Action::CancelForwardingConfirm => self.fwd_confirm = None,
             Action::AddForwarding => {
                 self.fwd_adding = !self.fwd_adding;
                 self.fwd_error = None;
@@ -5122,6 +5158,8 @@ impl MailApp {
         };
         let mut panel = div()
             .min_w(px(200.))
+            // Long addresses end in an ellipsis rather than widen the menu.
+            .max_w(px(380.))
             .p_1()
             .flex()
             .flex_col()
@@ -5182,7 +5220,14 @@ impl MailApp {
                                             .into_any_element()
                                     }),
                             )
-                            .child(div().flex_1().pr_4().child(label.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .pr_4()
+                                    .child(label.clone()),
+                            )
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.menu = None;
                                 this.handle(action.clone(), w, cx)
@@ -5333,9 +5378,11 @@ impl MailApp {
             .when(*modal == Modal::Settings, |d| {
                 if self.settings_place == SettingsPlace::Maximized {
                     // Like a full-size composer: below the title bar, which
-                    // stays visible and usable.
-                    d.w(available_width)
-                        .h((available_height - px(TITLEBAR_HEIGHT)).max(px(0.)))
+                    // stays visible and usable, with an even margin all round.
+                    let edge = px(2. * MAXIMIZED_MARGIN);
+                    let viewport = window.viewport_size();
+                    d.w((viewport.width - edge).max(px(0.)))
+                        .h((viewport.height - px(TITLEBAR_HEIGHT) - edge).max(px(0.)))
                 } else {
                     d.h(px(600.).min(available_height))
                 }
@@ -5501,7 +5548,11 @@ impl MailApp {
             .flex()
             .items_center()
             .justify_center()
-            .p_4()
+            .p(px(if below_titlebar {
+                MAXIMIZED_MARGIN
+            } else {
+                16.
+            }))
             .child(panel.with_animation(
                 ("modal-enter", self.anim),
                 Animation::new(Duration::from_millis(180)).with_easing(|t| 1. - (1. - t).powi(3)),
@@ -6078,6 +6129,7 @@ fn date_full(ts: i64) -> String {
 pub fn run(store: Arc<Store>) {
     let app = Application::new().with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::sync::oauth::opened);
+    super::desktop::register();
     app.run(move |cx| {
         gpui_component::init(cx);
         cx.on_action(|_: &Hide, cx| cx.hide());
@@ -6145,6 +6197,7 @@ pub fn run(store: Arc<Store>) {
                 // window's title bar (GNOME never offers server decorations).
                 window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
                     .then_some(WindowDecorations::Client),
+                app_id: Some(super::desktop::APP_ID.into()),
                 ..Default::default()
             },
             move |window, cx| {

@@ -1429,6 +1429,10 @@ impl Backend {
         })
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
+        // Sending as an alias asks its service for the routed addresses
+        // first, outside the account's lock.
+        let routed = crate::manage::forwarding::route(&self.store, d)?;
+        let d = &routed;
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         use lettre::transport::smtp::client::TlsParameters;

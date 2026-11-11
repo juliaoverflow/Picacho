@@ -194,6 +194,7 @@ pub(super) fn detached_options(title: SharedString, bounds: Bounds<Pixels>) -> W
         }),
         window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
             .then_some(WindowDecorations::Client),
+        app_id: Some(crate::display::desktop::APP_ID.into()),
         ..Default::default()
     }
 }

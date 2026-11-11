@@ -410,6 +410,10 @@ pub struct Mail {
     /// Copied recipients; empty in cache entries from before it was kept.
     #[serde(default)]
     pub cc: String,
+    /// Where replies go, when the sender asked for somewhere else (alias
+    /// services and mailing lists do). Empty in older cache entries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply_to: String,
     pub subject: String,
     pub snippet: String,
     pub date: i64,
@@ -515,6 +519,10 @@ pub struct Draft {
     pub id: String,
     /// The account it is sent from.
     pub account: String,
+    /// An alias (at a forwarding service that can send) the message is sent
+    /// as, through `account`; empty to send as the account itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub send_as: String,
     pub to: String,
     #[serde(default)]
     pub cc: String,
@@ -654,6 +662,7 @@ pub fn demo_mail() -> Vec<Mail> {
             has_attachments: i == 2,
             gmail_id: 0,
             pending: false,
+            reply_to: String::new(),
         })
         .collect()
 }

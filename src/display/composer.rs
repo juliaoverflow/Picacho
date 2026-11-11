@@ -79,6 +79,23 @@ impl Render for NoPreview {
     }
 }
 
+/// Aliases past which the From menu offers a search field.
+const FROM_FILTER_AT: usize = 6;
+
+/// A small label naming the forwarding service a message is sent through.
+fn service_badge(service: fwd::ForwardingService, c: Colors) -> Div {
+    div()
+        .flex_shrink_0()
+        .px(px(5.))
+        .py(px(1.))
+        .rounded(px(4.))
+        .bg(rgb(c.soft))
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(c.muted))
+        .child(service.label())
+}
+
 /// Recipient fields, in order.
 const TO: usize = 0;
 const CC: usize = 1;
@@ -107,7 +124,14 @@ pub(super) struct Composer {
     show_bcc: bool,
     preview: bool,
     from_open: bool,
+    /// When a press outside closed the From menu: the same press on its
+    /// button must not open it again.
+    from_closed: Option<std::time::Instant>,
+    /// Narrows a long From menu.
+    from_filter: Entity<InputState>,
     accounts: Vec<Account>,
+    /// Aliases at forwarding services that can send.
+    aliases: Vec<fwd::SendAlias>,
     /// Known people (name, address) offered while typing a recipient.
     contacts: Rc<Vec<(String, String)>>,
     suggestions: Vec<(String, String)>,
@@ -127,6 +151,7 @@ impl Composer {
         draft: Draft,
         placement: Placement,
         accounts: Vec<Account>,
+        aliases: Vec<fwd::SendAlias>,
         contacts: Rc<Vec<(String, String)>>,
         options: ComposeOptions,
         colors: Colors,
@@ -143,6 +168,7 @@ impl Composer {
             field("Bcc", window, cx),
         ];
         let subject = field("Subject", window, cx);
+        let from_filter = field("Find an address", window, cx);
         let body = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -181,6 +207,11 @@ impl Composer {
                 }
             }));
         }
+        subscriptions.push(cx.subscribe(&from_filter, |_, _, e, cx| {
+            if matches!(e, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
         for state in [&subject, &body] {
             subscriptions.push(cx.subscribe(state, |this, _, e, cx| {
                 if matches!(e, InputEvent::Change) {
@@ -207,7 +238,10 @@ impl Composer {
             show_bcc,
             preview: false,
             from_open: false,
+            from_closed: None,
+            from_filter,
             accounts,
+            aliases,
             contacts,
             suggestions: vec![],
             suggest_field: TO,
@@ -905,6 +939,46 @@ impl Composer {
             .text_size(px(13.))
     }
 
+    /// The alias the draft is sent as, when it is one Picacho knows.
+    fn send_alias(&self) -> Option<&fwd::SendAlias> {
+        (!self.draft.send_as.is_empty())
+            .then(|| {
+                self.aliases
+                    .iter()
+                    .find(|a| a.email.eq_ignore_ascii_case(&self.draft.send_as))
+            })
+            .flatten()
+    }
+
+    /// Opens or closes the From menu, starting it unfiltered.
+    fn toggle_from(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .from_closed
+            .take()
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(400))
+        {
+            return;
+        }
+        self.from_open = !self.from_open;
+        if self.from_open {
+            self.from_filter.update(cx, |s, cx| {
+                s.set_value("", w, cx);
+                if self.aliases.len() > FROM_FILTER_AT {
+                    s.focus(w, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// Sends as an account (`alias` None) or as an alias through `account`.
+    fn choose_sender(&mut self, account: String, alias: Option<String>, cx: &mut Context<Self>) {
+        self.draft.account = account;
+        self.draft.send_as = alias.unwrap_or_default();
+        self.from_open = false;
+        self.changed(cx);
+    }
+
     fn sender_row(&self, cx: &Context<Self>) -> Option<Div> {
         let c = self.colors;
         let current = self
@@ -912,11 +986,25 @@ impl Composer {
             .iter()
             .find(|a| a.id == self.draft.account)
             .or(self.accounts.first())?;
-        let several = self.accounts.len() > 1;
-        let label = if current.name.is_empty() || current.name == current.email {
-            current.email.clone()
-        } else {
-            format!("{} <{}>", current.name, current.email)
+        let alias = self.send_alias();
+        let several = self.accounts.len() + self.aliases.len() > 1;
+        let (label, tip) = match alias {
+            Some(a) => (
+                a.email.clone(),
+                format!(
+                    "Sent through {} from {}. Recipients see {}.",
+                    a.service.label(),
+                    current.email,
+                    a.email
+                ),
+            ),
+            None if current.name.is_empty() || current.name == current.email => {
+                (current.email.clone(), current.email.clone())
+            }
+            None => (
+                format!("{} <{}>", current.name, current.email),
+                current.email.clone(),
+            ),
         };
         let mut picker = div()
             .id("compose-from")
@@ -925,8 +1013,11 @@ impl Composer {
             .items_center()
             .gap_1()
             .min_w_0()
+            .max_w_full()
             .text_size(px(13.))
-            .child(div().min_w_0().truncate().child(label));
+            .child(div().min_w_0().truncate().child(label))
+            .when_some(alias, |d, a| d.child(service_badge(a.service, c)))
+            .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx));
         if several {
             picker = picker
                 .cursor_pointer()
@@ -935,58 +1026,179 @@ impl Composer {
                 .rounded(px(5.))
                 .hover(move |s| s.bg(rgb(c.raised)))
                 .child(icon_el("chevron-down", 12., c.muted))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.from_open = !this.from_open;
-                    cx.notify();
-                }));
+                .on_click(cx.listener(|this, _, w, cx| this.toggle_from(w, cx)));
         }
         let mut row = self.row("From", picker).relative();
-        if self.from_open {
-            let mut list = div()
-                .absolute()
-                .top(px(36.))
-                .left(px(70.))
-                .min_w(px(260.))
-                .p_1()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(rgb(c.border))
-                .bg(rgb(c.raised))
-                .shadow_lg()
-                .occlude()
-                .flex()
-                .flex_col();
-            for (i, a) in self.accounts.iter().enumerate() {
-                let id = a.id.clone();
-                let on = a.id == current.id;
-                list = list.child(
-                    div()
-                        .id(("from-account", i))
-                        .h(px(30.))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .text_size(px(13.))
-                        .hover(move |s| s.bg(rgb(c.soft)))
-                        .child(
-                            div()
-                                .size(px(14.))
-                                .when(on, |d| d.child(icon_el("check", 14., c.accent))),
-                        )
-                        .child(div().flex_1().truncate().child(a.email.clone()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.draft.account = id.clone();
-                            this.from_open = false;
-                            this.changed(cx);
-                        })),
-                );
-            }
-            row = row.child(deferred(list).with_priority(2));
+        if self.from_open && several {
+            row = row.child(deferred(self.sender_menu(current, cx)).with_priority(2));
         }
         Some(row)
+    }
+
+    /// Accounts, then each service's aliases, filtered when the list is long.
+    fn sender_menu(&self, current: &Account, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        let query = self.from_filter.read(cx).value().trim().to_lowercase();
+        let matches = |text: &[&str]| {
+            query.is_empty() || text.iter().any(|t| t.to_lowercase().contains(&query))
+        };
+        let alias = self.send_alias().map(|a| a.email.clone());
+        let option = |id: (&'static str, usize),
+                      title: String,
+                      caption: String,
+                      on: bool,
+                      account: String,
+                      alias: Option<String>| {
+            div()
+                .id(id)
+                .min_h(px(40.))
+                .px_2()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(rgb(c.soft)))
+                .child(
+                    div()
+                        .size(px(14.))
+                        .flex_shrink_0()
+                        .when(on, |d| d.child(icon_el("check", 14., c.accent))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(13.)).truncate().child(title))
+                        .when(!caption.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(c.muted))
+                                    .truncate()
+                                    .child(caption),
+                            )
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.choose_sender(account.clone(), alias.clone(), cx)
+                }))
+        };
+        let heading = |text: String| {
+            div()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(c.muted))
+                .child(text)
+        };
+        let mut list = div().flex().flex_col();
+        let mut shown = 0;
+        let accounts: Vec<&Account> = self
+            .accounts
+            .iter()
+            .filter(|a| matches(&[&a.email, &a.name]))
+            .collect();
+        if !accounts.is_empty() && !self.aliases.is_empty() {
+            list = list.child(heading("Accounts".into()));
+        }
+        for (i, a) in accounts.into_iter().enumerate() {
+            let named = !a.name.is_empty() && a.name != a.email;
+            list = list.child(option(
+                ("from-account", i),
+                a.email.clone(),
+                if named { a.name.clone() } else { String::new() },
+                alias.is_none() && a.id == current.id,
+                a.id.clone(),
+                None,
+            ));
+            shown += 1;
+        }
+        let mut service = None;
+        for (i, a) in self.aliases.iter().enumerate() {
+            if !matches(&[&a.email, &a.note]) {
+                continue;
+            }
+            if service != Some(a.service) {
+                service = Some(a.service);
+                list = list.child(heading(format!("{} aliases", a.service.label())));
+            }
+            // Through the mailbox the service delivers to, else this one.
+            let through = a
+                .deliver_to
+                .as_ref()
+                .and_then(|id| self.accounts.iter().find(|x| &x.id == id))
+                .unwrap_or(current);
+            let caption = if a.note.is_empty() {
+                format!("Sends through {}", through.email)
+            } else {
+                format!("{} · through {}", a.note, through.email)
+            };
+            list = list.child(option(
+                ("from-alias", i),
+                a.email.clone(),
+                caption,
+                alias.as_deref() == Some(a.email.as_str()),
+                through.id.clone(),
+                Some(a.email.clone()),
+            ));
+            shown += 1;
+        }
+        if shown == 0 {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child("No address matches."),
+            );
+        }
+        div()
+            .id("from-menu")
+            .debug_selector(|| "from-menu".into())
+            .absolute()
+            .top(px(36.))
+            .left(px(66.))
+            .right(px(12.))
+            .max_w(px(440.))
+            .p_1()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.raised))
+            .shadow_lg()
+            .occlude()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.from_open = false;
+                this.from_closed = Some(std::time::Instant::now());
+                cx.notify();
+            }))
+            .when(self.aliases.len() > FROM_FILTER_AT, |d| {
+                d.child(
+                    div()
+                        .px_1()
+                        .pb_1()
+                        .mb_1()
+                        .border_b_1()
+                        .border_color(rgb(c.border))
+                        .child(self.input(&self.from_filter)),
+                )
+            })
+            .child(
+                div()
+                    .id("from-menu-list")
+                    .max_h(px(300.))
+                    .overflow_y_scroll()
+                    .child(list),
+            )
     }
 
     fn recipient_row(&self, field: usize, cx: &Context<Self>) -> Div {
@@ -1423,9 +1635,7 @@ impl Render for Composer {
         if self.minimized {
             return root;
         }
-        if !inline || self.accounts.len() > 1 {
-            root = root.children(self.sender_row(cx));
-        }
+        root = root.children(self.sender_row(cx));
         root = root.child(self.recipient_row(TO, cx));
         if self.show_cc {
             root = root.child(self.recipient_row(CC, cx));

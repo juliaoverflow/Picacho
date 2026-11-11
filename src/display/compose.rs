@@ -82,8 +82,14 @@ impl MailApp {
             Some(m) => {
                 let forward = mode == 3;
                 draft.subject = reply_subject(&m.subject, forward);
+                // Answer as the alias the message was sent to.
+                let aliases = fwd::sendable(&self.forwarding);
+                if let Some(alias) = alias_addressed(m, &aliases) {
+                    draft.send_as = alias.email.clone();
+                }
                 if !forward {
-                    let (to, cc) = reply_recipients(m, mode == 2, &own);
+                    let (to, cc) =
+                        reply_recipients(m, mode == 2, &[own.as_str(), draft.send_as.as_str()]);
                     draft.to = to;
                     draft.cc = cc;
                     draft.reply_id = m.message_id.clone();
@@ -191,6 +197,7 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) -> Option<Entity<Composer>> {
         let accounts = self.accounts.clone();
+        let aliases = fwd::sendable(&self.forwarding);
         let contacts = self.contacts();
         let options = self.compose_options.clone();
         let colors = self.colors();
@@ -212,8 +219,8 @@ impl MailApp {
                     move |window, cx| {
                         let composer = cx.new(|cx| {
                             Composer::new(
-                                draft, placement, accounts, contacts, options, colors, backend,
-                                window, cx,
+                                draft, placement, accounts, aliases, contacts, options, colors,
+                                backend, window, cx,
                             )
                         });
                         composer.update(cx, |c, cx| {
@@ -244,7 +251,7 @@ impl MailApp {
         } else {
             let composer = cx.new(|cx| {
                 Composer::new(
-                    draft, placement, accounts, contacts, options, colors, backend, w, cx,
+                    draft, placement, accounts, aliases, contacts, options, colors, backend, w, cx,
                 )
             });
             composer.update(cx, |c, cx| {
@@ -790,11 +797,14 @@ pub(super) fn reply_subject(subject: &str, forward: bool) -> String {
     }
 }
 
-/// To and Cc for a reply: the sender; for Reply All also everyone else on
-/// To and Cc, never yourself.
-pub(super) fn reply_recipients(m: &Mail, all: bool, own: &str) -> (String, String) {
-    let mut seen: HashSet<String> = HashSet::new();
-    seen.insert(own.to_lowercase());
+/// To and Cc for a reply: the sender (or where they asked replies to go);
+/// for Reply All also everyone else on To and Cc, never yourself. `own`
+/// holds your addresses: the account's first, then the alias it was sent
+/// to. Only the account's marks mail as your own sent message: addy.io
+/// forwards mail as if it came from the alias.
+pub(super) fn reply_recipients(m: &Mail, all: bool, own: &[&str]) -> (String, String) {
+    let own: Vec<&str> = own.iter().copied().filter(|o| !o.is_empty()).collect();
+    let mut seen: HashSet<String> = own.iter().map(|o| o.to_lowercase()).collect();
     let format = |name: Option<String>, email: &str| match name {
         Some(n) if !n.is_empty() && n != email => {
             if n.contains([',', '"']) {
@@ -807,15 +817,27 @@ pub(super) fn reply_recipients(m: &Mail, all: bool, own: &str) -> (String, Strin
     };
     let mut to = vec![];
     // Replying to your own sent message answers its recipients.
-    if m.from.eq_ignore_ascii_case(own) {
+    if own.first().is_some_and(|o| m.from.eq_ignore_ascii_case(o)) {
         for (name, email) in crate::sync::smtp::recipients(&m.to).unwrap_or_default() {
             if seen.insert(email.to_lowercase()) {
                 to.push(format(name, &email));
             }
         }
-    } else if !m.from.is_empty() {
-        seen.insert(m.from.to_lowercase());
-        to.push(format(Some(m.sender.clone()), &m.from));
+    } else {
+        // Alias services and mailing lists name their reply address in
+        // Reply-To; the sender is then left out, as mail clients do.
+        let reply_to = crate::sync::smtp::recipients(&m.reply_to).unwrap_or_default();
+        if !reply_to.is_empty() {
+            seen.insert(m.from.to_lowercase());
+            for (name, email) in reply_to {
+                if seen.insert(email.to_lowercase()) {
+                    to.push(format(name, &email));
+                }
+            }
+        } else if !m.from.is_empty() {
+            seen.insert(m.from.to_lowercase());
+            to.push(format(Some(m.sender.clone()), &m.from));
+        }
     }
     let mut cc = vec![];
     if all {
@@ -828,6 +850,19 @@ pub(super) fn reply_recipients(m: &Mail, all: bool, own: &str) -> (String, Strin
         }
     }
     (to.join(", "), cc.join(", "))
+}
+
+/// The sendable alias a message was addressed to, if any.
+pub(super) fn alias_addressed<'a>(
+    m: &Mail,
+    aliases: &'a [fwd::SendAlias],
+) -> Option<&'a fwd::SendAlias> {
+    let addressed: Vec<String> = [&m.to, &m.cc]
+        .into_iter()
+        .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
+        .map(|(_, email)| email.to_lowercase())
+        .collect();
+    aliases.iter().find(|a| addressed.contains(&a.email))
 }
 
 #[cfg(test)]
@@ -853,10 +888,10 @@ mod tests {
             ..Mail::default()
         };
         assert_eq!(
-            reply_recipients(&m, false, "me@example.com"),
+            reply_recipients(&m, false, &["me@example.com"]),
             ("Ana <ana@example.com>".into(), String::new())
         );
-        let (to, cc) = reply_recipients(&m, true, "ME@example.com");
+        let (to, cc) = reply_recipients(&m, true, &["ME@example.com"]);
         assert_eq!(to, "Ana <ana@example.com>");
         assert_eq!(cc, "Bo <bo@example.com>, cy@example.com");
         // Replying to your own sent message goes to its recipients.
@@ -866,8 +901,35 @@ mod tests {
             ..Mail::default()
         };
         assert_eq!(
-            reply_recipients(&sent, false, "me@example.com").0,
+            reply_recipients(&sent, false, &["me@example.com"]).0,
             "bo@example.com"
         );
+    }
+
+    #[test]
+    fn replies_go_where_reply_to_asks_and_never_to_your_alias() {
+        // How addy.io forwards: from the alias, replies to a routed address.
+        let m = Mail {
+            from: "shop@me.anonaddy.com".into(),
+            sender: "Ana".into(),
+            reply_to: "shop+ana=example.org@me.anonaddy.com".into(),
+            to: "shop@me.anonaddy.com, bo@example.com".into(),
+            ..Mail::default()
+        };
+        let own = ["me@example.com", "shop@me.anonaddy.com"];
+        let (to, cc) = reply_recipients(&m, true, &own);
+        assert_eq!(to, "shop+ana=example.org@me.anonaddy.com");
+        assert_eq!(cc, "bo@example.com");
+        let aliases = [fwd::SendAlias {
+            email: "shop@me.anonaddy.com".into(),
+            note: String::new(),
+            service: fwd::ForwardingService::Addy,
+            deliver_to: None,
+        }];
+        assert_eq!(
+            alias_addressed(&m, &aliases).map(|a| a.email.as_str()),
+            Some("shop@me.anonaddy.com")
+        );
+        assert!(alias_addressed(&Mail::default(), &aliases).is_none());
     }
 }

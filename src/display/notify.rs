@@ -25,7 +25,11 @@ pub fn new_mail(account: &str, latest: (&str, &str), count: usize) {
                 }
             });
         }
-        let _ = notify_rust::Notification::new()
+        let mut note = notify_rust::Notification::new();
+        // The icon installed with the desktop entry; see `desktop`.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        note.icon(super::desktop::APP_ID);
+        let _ = note
             .appname("Picacho")
             .summary(&title)
             .subtitle(&account)

@@ -15,6 +15,8 @@ const ALIAS_FOLDERS: [Folder; 5] = [
 ];
 /// Aliases listed per service before "Show all".
 const ALIASES_SHOWN: usize = 25;
+/// Aliases past which a service offers a search field.
+const SEARCH_ALIASES_AT: usize = 6;
 
 impl MailApp {
     /// The sidebar arrangement's entries: accounts, then aliases shown as accounts.
@@ -844,7 +846,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Aliases from SimpleLogin, addy.io and Firefox Relay forward mail to one of your mailboxes. Choose whether each alias's mail stays in that mailbox or appears as an account of its own, without Sent or Drafts."),
+                    .child("Connect SimpleLogin, addy.io or Firefox Relay to manage your aliases here. Their mail can stay in the mailbox it arrives in or appear as an account of its own, and SimpleLogin and addy.io aliases can be chosen in From to send as them."),
             )
             .child(list)
             .into_any_element()
@@ -958,33 +960,45 @@ impl MailApp {
             .active(|s| s.opacity(0.75))
             .child(icon_el(icon, 15., c.muted))
             .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
-            .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
+            .on_click(cx.listener(move |this, _, w, cx| {
+                // Inside a row that opens when clicked.
+                cx.stop_propagation();
+                this.handle(action.clone(), w, cx)
+            }))
     }
-    /// One forwarding service in the list, and its aliases when open.
+    /// One forwarding service in the list: what it is and where its mail
+    /// goes on one line, opening to its settings and aliases.
     fn forwarding_row(&self, f: &ForwardingAccount, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let busy = self.fwd_busy.contains(&f.id);
         let removing = self.fwd_confirm.as_deref() == Some(f.id.as_str());
         let open = self.fwd_open.contains(&f.id);
-        let server = fwd_server_label(f);
-        let target = match &f.deliver_to {
-            Some(id) => self
-                .accounts
-                .iter()
-                .find(|a| &a.id == id)
-                .map(|a| a.email.clone())
-                .unwrap_or_else(|| "a removed mailbox".into()),
-            None => "any mailbox".into(),
+        let count = f.aliases.len();
+        // A self-hosted server is named; the service's own is implied.
+        let server = if f.server.is_empty() {
+            String::new()
+        } else {
+            format!("{} · ", fwd_server_label(f))
         };
+        let caption = format!(
+            "{server}{count} alias{} · {}",
+            if count == 1 { "" } else { "es" },
+            match self.deliver_label(f) {
+                Some(email) => format!("to {email}"),
+                None => "to any mailbox".into(),
+            }
+        );
         let toggle = Action::ToggleForwarding(f.id.clone());
-        let info = div()
+        let header = div()
             .id(SharedString::from(format!("forwarding-info-{}", f.id)))
-            .flex_1()
-            .min_w_0()
+            .min_h(px(60.))
+            .px_4()
+            .py_2()
             .flex()
             .items_center()
             .gap_3()
             .cursor_pointer()
+            .hover(move |s| s.bg(rgb(c.surface)))
             .child(self.view_mark("alias", 36., false))
             .child(
                 div()
@@ -1005,81 +1019,23 @@ impl MailApp {
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
                             .truncate()
-                            .child(format!(
-                                "{server} · {} alias{} · to {target}",
-                                f.aliases.len(),
-                                if f.aliases.len() == 1 { "" } else { "es" }
-                            )),
+                            .child(caption),
                     ),
             )
-            .on_click({
-                let toggle = toggle.clone();
-                cx.listener(move |this, _, w, cx| this.handle(toggle.clone(), w, cx))
-            });
-        let actions = div()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap_1()
-            .child(if busy {
-                div()
-                    .size(px(30.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(spinner(14., c.muted))
-                    .into_any_element()
-            } else {
-                self.fwd_icon_button(
-                    format!("aliases-refresh-{}", f.id),
-                    "refresh",
-                    "Refresh aliases",
-                    Action::RefreshAliases(f.id.clone()),
-                    cx,
-                )
-                .into_any_element()
-            })
-            .child(if removing {
-                self.small_button(
-                    format!("forwarding-remove-{}", f.id),
-                    "Remove?",
-                    "",
-                    Action::RemoveForwarding(f.id.clone()),
-                    cx,
-                )
-                .text_color(rgb(c.danger))
-                .border_color(rgb(c.danger))
-                .into_any_element()
-            } else {
-                self.fwd_icon_button(
-                    format!("forwarding-remove-{}", f.id),
-                    "trash",
-                    "Remove service",
-                    Action::RemoveForwarding(f.id.clone()),
-                    cx,
-                )
-                .into_any_element()
-            })
+            .when(busy, |d| d.child(spinner(14., c.muted)))
             .child(self.fwd_icon_button(
-                format!("forwarding-toggle-{}", f.id),
-                if open { "chevron-up" } else { "chevron-down" },
-                if open {
-                    "Hide aliases"
-                } else {
-                    "Manage aliases"
-                },
-                toggle,
+                format!("forwarding-menu-{}", f.id),
+                "ellipsis",
+                "More",
+                Action::ServiceMenu(f.id.clone()),
                 cx,
-            ));
-        let row = div()
-            .min_h(px(60.))
-            .px_4()
-            .py_2()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(info)
-            .child(actions);
+            ))
+            .child(icon_el(
+                if open { "chevron-up" } else { "chevron-down" },
+                14.,
+                c.muted,
+            ))
+            .on_click(cx.listener(move |this, _, w, cx| this.handle(toggle.clone(), w, cx)));
         div()
             .id(SharedString::from(format!("forwarding-{}", f.id)))
             .debug_selector({
@@ -1090,67 +1046,223 @@ impl MailApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(row)
+            .child(header)
+            .when(removing, |d| {
+                d.child(self.confirm_strip(
+                    format!("forwarding-remove-{}", f.id),
+                    format!(
+                        "Remove {}? Its aliases keep working; Picacho stops managing them.",
+                        f.service.label()
+                    ),
+                    "Remove",
+                    Action::RemoveForwarding(f.id.clone()),
+                    cx,
+                ))
+            })
             .when(open, |d| d.child(self.forwarding_details(f, cx)))
             .into_any_element()
     }
-    /// Where a service delivers, and its aliases.
+    /// The address of the mailbox a service delivers to; None for any.
+    fn deliver_label(&self, f: &ForwardingAccount) -> Option<String> {
+        let id = f.deliver_to.as_ref()?;
+        Some(
+            self.accounts
+                .iter()
+                .find(|a| &a.id == id)
+                .map(|a| a.email.clone())
+                .unwrap_or_else(|| "a removed mailbox".into()),
+        )
+    }
+    /// A sentence asking to confirm, with Cancel and the action.
+    fn confirm_strip(
+        &self,
+        id: String,
+        question: String,
+        confirm: &str,
+        action: Action,
+        cx: &Context<Self>,
+    ) -> Div {
+        let c = self.colors();
+        div()
+            .mx_4()
+            .mb_3()
+            .px_3()
+            .py_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(c.danger))
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(div().flex_1().min_w_0().text_size(px(12.)).child(question))
+            .child(self.small_button(
+                format!("{id}-cancel"),
+                "Cancel",
+                "",
+                Action::CancelForwardingConfirm,
+                cx,
+            ))
+            .child(
+                self.small_button(id, confirm, "", action, cx)
+                    .text_color(rgb(c.danger))
+                    .border_color(rgb(c.danger)),
+            )
+    }
+    /// Where a service delivers, whether it can send, and its aliases.
     fn forwarding_details(&self, f: &ForwardingAccount, cx: &Context<Self>) -> Div {
         let c = self.colors();
         let busy = self.fwd_busy.contains(&f.id);
-        let mut deliver: Vec<(String, Action, bool)> = vec![(
-            "Any mailbox".into(),
-            Action::SetDeliverTo(f.id.clone(), None),
-            f.deliver_to.is_none(),
-        )];
-        deliver.extend(self.accounts.iter().map(|a| {
-            (
-                a.email.clone(),
-                Action::SetDeliverTo(f.id.clone(), Some(a.id.clone())),
-                f.deliver_to.as_deref() == Some(a.id.as_str()),
-            )
-        }));
         let creating = self.fwd_creating.as_deref() == Some(f.id.as_str());
-        let mut aliases = div().flex().flex_col().gap_1();
-        let expanded = self.fwd_expanded.contains(&f.id);
-        let shown = if expanded {
-            f.aliases.len()
+        let deliver = div()
+            .id(SharedString::from(format!("deliver-{}", f.id)))
+            .debug_selector({
+                let id = f.id.clone();
+                move || format!("deliver-{id}")
+            })
+            .h(px(30.))
+            .min_w(px(140.))
+            .max_w(px(280.))
+            .flex_shrink()
+            .min_w_0()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.surface))
+            .cursor_pointer()
+            .hover(move |s| s.border_color(rgb(c.muted)))
+            .text_size(px(12.))
+            .child(
+                div().flex_1().min_w_0().truncate().child(
+                    self.deliver_label(f)
+                        .unwrap_or_else(|| "Any mailbox".into()),
+                ),
+            )
+            .child(icon_el("chevrons-up-down", 12., c.muted))
+            .on_click(cx.listener({
+                let action = Action::DeliverMenu(f.id.clone());
+                move |this, _, w, cx| this.handle(action.clone(), w, cx)
+            }));
+        let sending = if f.service.can_send() {
+            format!(
+                "Send as an alias by choosing it in From when you write. It goes out from {}, which must be a verified mailbox at {}.",
+                self.deliver_label(f)
+                    .unwrap_or_else(|| "the mailbox you write from".into()),
+                f.service.label()
+            )
         } else {
-            f.aliases.len().min(ALIASES_SHOWN)
+            format!(
+                "{} only relays replies to mail it forwarded; new messages can't be sent as an alias.",
+                f.service.label()
+            )
         };
-        for a in &f.aliases[..shown] {
-            aliases = aliases.child(self.alias_row(f, a, cx));
+        let query = Self::value(&self.fwd_search, cx).trim().to_lowercase();
+        let matching: Vec<&Alias> = f
+            .aliases
+            .iter()
+            .filter(|a| {
+                query.is_empty()
+                    || a.email.contains(&query)
+                    || a.note.to_lowercase().contains(&query)
+            })
+            .collect();
+        let expanded = self.fwd_expanded.contains(&f.id) || !query.is_empty();
+        let shown = if expanded {
+            matching.len()
+        } else {
+            matching.len().min(ALIASES_SHOWN)
+        };
+        let mut aliases = div()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.surface))
+            .flex()
+            .flex_col()
+            .overflow_hidden();
+        for (i, a) in matching[..shown].iter().enumerate() {
+            aliases = aliases.child(self.alias_row(f, a, i > 0, cx));
         }
-        if f.aliases.is_empty() {
+        if matching.is_empty() {
             aliases = aliases.child(
                 div()
-                    .py_2()
+                    .px_3()
+                    .py_3()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("No aliases yet."),
+                    .child(if f.aliases.is_empty() {
+                        "No aliases yet."
+                    } else {
+                        "No alias matches."
+                    }),
             );
         }
-        if shown < f.aliases.len() {
-            aliases = aliases.child(div().pt_1().child(self.link(
-                &format!("aliases-all-{}", f.id),
-                &format!("Show all {} aliases", f.aliases.len()),
-                Action::ShowAllAliases(f.id.clone()),
-                cx,
-            )));
+        if shown < matching.len() {
+            aliases = aliases.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(c.border))
+                    .child(self.link(
+                        &format!("aliases-all-{}", f.id),
+                        &format!("Show all {} aliases", matching.len()),
+                        Action::ShowAllAliases(f.id.clone()),
+                        cx,
+                    )),
+            );
         }
         div()
             .px_4()
             .pb_4()
             .pt_1()
-            .ml(px(48.))
             .flex()
             .flex_col()
             .gap_4()
-            .child(self.setting(
-                "Forwards to",
-                "The mailbox these aliases deliver to. Any mailbox looks for their mail in every account.",
-                self.segmented(&format!("deliver-{}", f.id), deliver, cx),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Forwards to"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(c.muted))
+                                    .child("Where the aliases' mail arrives. Any mailbox looks in every account."),
+                            ),
+                    )
+                    .child(deliver),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.))
+                    .bg(rgb(c.surface))
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(div().mt(px(1.)).child(icon_el("send", 13., c.muted)))
+                    .child(div().flex_1().min_w_0().child(sending)),
+            )
             .child(
                 div()
                     .flex()
@@ -1158,11 +1270,26 @@ impl MailApp {
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Aliases"),
+                            .child(format!("Aliases ({})", f.aliases.len())),
                     )
+                    .child(div().flex_1())
+                    .when(f.aliases.len() > SEARCH_ALIASES_AT, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("aliases-search-{}", f.id)))
+                                .w(px(200.))
+                                .flex_shrink()
+                                .min_w_0()
+                                .child(field(
+                                    Input::new(&self.fwd_search)
+                                        .prefix(icon_el("search", 13., c.muted)),
+                                    c,
+                                    false,
+                                )),
+                        )
+                    })
                     .child(self.small_button(
                         format!("alias-new-{}", f.id),
                         if creating { "Cancel" } else { "New Alias" },
@@ -1175,14 +1302,13 @@ impl MailApp {
                 d.child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
                         .gap_2()
                         .child(
                             div()
                                 .id("alias-note")
                                 .flex_1()
-                                .min_w(px(180.))
+                                .min_w_0()
                                 .child(field(Input::new(&self.fwd_note), c, busy)),
                         )
                         .child(
@@ -1195,36 +1321,37 @@ impl MailApp {
                                 cx,
                             )
                             .h(px(32.))
+                            .flex_shrink_0()
                             .when(busy, |d| d.opacity(0.6)),
                         ),
                 )
             })
             .child(aliases)
     }
-    fn alias_row(&self, f: &ForwardingAccount, a: &Alias, cx: &Context<Self>) -> AnyElement {
+    /// One alias: its address and status, a switch for forwarding, and a
+    /// menu for the rest. Long addresses end in an ellipsis; the full one
+    /// is in the tooltip.
+    fn alias_row(
+        &self,
+        f: &ForwardingAccount,
+        a: &Alias,
+        divided: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let c = self.colors();
         let key = format!("{}:{}", f.id, a.id);
         let deleting = self.fwd_confirm.as_deref() == Some(key.as_str());
-        let display = self
-            .segmented(
-                &format!("alias-display-{key}"),
-                [
-                    (AliasDisplay::Included, "In mailbox"),
-                    (AliasDisplay::Separate, "Own account"),
-                ]
-                .into_iter()
-                .map(|(d, label)| {
-                    (
-                        label.to_owned(),
-                        Action::SetAliasDisplay(f.id.clone(), a.id.clone(), d),
-                        a.display == d,
-                    )
-                })
-                .collect(),
-                cx,
-            )
-            .w(px(220.))
-            .flex_shrink_0();
+        let mut status: Vec<String> = Vec::new();
+        if !a.enabled {
+            status.push("Off: mail to it is refused".into());
+        }
+        if a.display == AliasDisplay::Separate {
+            status.push("Own account".into());
+        }
+        if !a.note.is_empty() {
+            status.push(a.note.clone());
+        }
+        let email = a.email.clone();
         let switch = self
             .switch(
                 format!("alias-enabled-{key}"),
@@ -1233,102 +1360,139 @@ impl MailApp {
                 cx,
             )
             .tooltip(|w, cx| Tooltip::new("Forward mail sent to this alias").build(w, cx));
-        let icon_button = |id: String, icon: &'static str, tip: &'static str, action: Action| {
-            div()
-                .id(SharedString::from(id))
-                .size(px(28.))
-                .flex_shrink_0()
-                .rounded(px(7.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(move |s| s.bg(rgb(c.surface)))
-                .child(icon_el(icon, 14., c.muted))
-                .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
-                .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
-        };
-        div()
+        let row = div()
             .id(SharedString::from(format!("alias-{key}")))
-            .w_full()
-            .min_w_0()
+            .min_h(px(48.))
+            .px_3()
             .py_2()
-            .border_t_1()
-            .border_color(rgb(c.border))
             .flex()
-            .flex_wrap()
             .items_center()
             .gap_3()
             .child(
                 div()
+                    .size(px(7.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(if a.enabled { c.accent } else { c.border })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("alias-address-{key}")))
                     .flex_1()
-                    .min_w(px(160.))
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap(px(1.))
-                    .when(!a.enabled, |d| d.opacity(0.6))
                     .child(
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
                             .truncate()
+                            .when(!a.enabled, |d| d.text_color(rgb(c.muted)))
                             .child(a.email.clone()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(c.muted))
-                            .truncate()
-                            .child(match (a.enabled, a.note.is_empty()) {
-                                (true, true) => "Forwarding".to_owned(),
-                                (true, false) => a.note.clone(),
-                                (false, true) => "Off: mail to it is refused".to_owned(),
-                                (false, false) => format!("Off · {}", a.note),
-                            }),
-                    ),
-            )
-            .child(display)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(switch)
-                    .child(icon_button(
-                        format!("alias-copy-{key}"),
-                        "copy",
-                        "Copy address",
-                        Action::CopyText(a.email.clone()),
-                    ))
-                    .child(if deleting {
-                        div()
-                            .id(SharedString::from(format!("alias-delete-{key}")))
-                            .h(px(28.))
-                            .px_2()
-                            .rounded(px(7.))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(c.danger))
-                            .border_1()
-                            .border_color(rgb(c.danger))
-                            .child("Delete?")
-                            .on_click(cx.listener({
-                                let action = Action::DeleteAlias(f.id.clone(), a.id.clone());
-                                move |this, _, w, cx| this.handle(action.clone(), w, cx)
-                            }))
-                    } else {
-                        icon_button(
-                            format!("alias-delete-{key}"),
-                            "trash",
-                            "Delete alias",
-                            Action::DeleteAlias(f.id.clone(), a.id.clone()),
+                    .when(!status.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(c.muted))
+                                .truncate()
+                                .child(status.join(" · ")),
                         )
-                    }),
+                    })
+                    .tooltip(move |w, cx| Tooltip::new(email.clone()).build(w, cx)),
             )
+            .child(switch)
+            .child(self.fwd_icon_button(
+                format!("alias-menu-{key}"),
+                "ellipsis",
+                "More",
+                Action::AliasMenu(f.id.clone(), a.id.clone()),
+                cx,
+            ));
+        div()
+            .when(divided, |d| d.border_t_1().border_color(rgb(c.border)))
+            .child(row)
+            .when(deleting, |d| {
+                d.child(self.confirm_strip(
+                    format!("alias-delete-{key}"),
+                    format!("Delete {}? Mail sent to it will be refused.", a.email),
+                    "Delete",
+                    Action::DeleteAlias(f.id.clone(), a.id.clone()),
+                    cx,
+                ))
+            })
             .into_any_element()
+    }
+    /// The menu of a service's row.
+    pub(super) fn service_entries(&self, id: &str) -> Vec<Entry> {
+        vec![
+            entry(
+                "Refresh Aliases",
+                "refresh",
+                Action::RefreshAliases(id.into()),
+            ),
+            Entry::Separator,
+            danger(
+                "Remove Service…",
+                "trash",
+                Action::RemoveForwarding(id.into()),
+            ),
+        ]
+    }
+    /// Where a service's aliases deliver: any mailbox, or one account.
+    pub(super) fn deliver_entries(&self, id: &str) -> Vec<Entry> {
+        let current = self
+            .forwarding
+            .iter()
+            .find(|f| f.id == id)
+            .and_then(|f| f.deliver_to.clone());
+        let mut entries = vec![
+            checked(
+                "Any mailbox",
+                current.is_none(),
+                Action::SetDeliverTo(id.into(), None),
+            ),
+            Entry::Separator,
+        ];
+        entries.extend(self.accounts.iter().map(|a| {
+            checked(
+                a.email.clone(),
+                current.as_deref() == Some(a.id.as_str()),
+                Action::SetDeliverTo(id.into(), Some(a.id.clone())),
+            )
+        }));
+        entries
+    }
+    /// The menu of an alias's row.
+    pub(super) fn alias_entries(&self, id: &str, alias: &str) -> Vec<Entry> {
+        let Some(a) = self
+            .forwarding
+            .iter()
+            .find(|f| f.id == id)
+            .and_then(|f| f.aliases.iter().find(|a| a.id == alias))
+        else {
+            return vec![];
+        };
+        let show = |label: &str, display: AliasDisplay| {
+            checked(
+                label.to_owned(),
+                a.display == display,
+                Action::SetAliasDisplay(id.into(), alias.into(), display),
+            )
+        };
+        vec![
+            entry("Copy Address", "copy", Action::CopyText(a.email.clone())),
+            Entry::Separator,
+            show("Show in Its Mailbox", AliasDisplay::Included),
+            show("Show as Its Own Account", AliasDisplay::Separate),
+            Entry::Separator,
+            danger(
+                "Delete Alias…",
+                "trash",
+                Action::DeleteAlias(id.into(), alias.into()),
+            ),
+        ]
     }
 }
 fn fwd_server_label(f: &ForwardingAccount) -> String {
@@ -1476,5 +1640,85 @@ mod tests {
         });
         let after = cx.debug_bounds(header).unwrap().origin.y;
         assert!(after < before - px(100.), "{before:?} -> {after:?}");
+    }
+
+    #[gpui::test]
+    fn replies_to_alias_mail_are_sent_as_the_alias(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        let alias = fwd::alias_view("sl", "1");
+        act(&view, Action::OpenMailbox(alias, Folder::Inbox.into()), cx);
+        let id = view.read_with(cx, |this, _| this.messages[this.visible[0]].id.clone());
+        act(&view, Action::Select(id), cx);
+        act(&view, Action::Reply(false), cx);
+        view.read_with(cx, |this, cx| {
+            let draft = &this.composers.last().unwrap().read(cx).draft;
+            assert_eq!(draft.send_as, "shop@sl.io");
+            assert_eq!(draft.account, work);
+            assert!(!draft.to.contains("shop@sl.io"), "never to yourself");
+        });
+        // A new message is written as the account.
+        act(&view, Action::Compose, cx);
+        view.read_with(cx, |this, cx| {
+            assert!(
+                this.composers
+                    .last()
+                    .unwrap()
+                    .read(cx)
+                    .draft
+                    .send_as
+                    .is_empty()
+            );
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("compose-from").is_some());
+    }
+
+    #[gpui::test]
+    fn long_alias_addresses_stay_inside_the_forwarding_page(cx: &mut TestAppContext) {
+        let (view, cx, _) = setup(cx);
+        let long = format!("{}@{}.example.com", "a".repeat(90), "b".repeat(60));
+        view.update(cx, |this, _| {
+            this.forwarding[0].aliases[0].email = long.clone();
+            this.forwarding[0].aliases[0].note = "n".repeat(200);
+        });
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Forwarding), cx);
+        act(&view, Action::ToggleForwarding("sl".into()), cx);
+        frame(cx);
+        let list = cx.debug_bounds("forwarding-list").unwrap();
+        let service = cx.debug_bounds("forwarding-sl").unwrap();
+        let deliver = cx.debug_bounds("deliver-sl").unwrap();
+        assert!(
+            service.right() <= list.right() + px(1.),
+            "{service:?} in {list:?}"
+        );
+        assert!(deliver.right() <= list.right(), "{deliver:?} in {list:?}");
+        // The alias menu offers what the row no longer shows inline.
+        view.update_in(cx, |this, _, _| {
+            let labels: Vec<String> = this
+                .alias_entries("sl", "1")
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    "Copy Address",
+                    "Show in Its Mailbox",
+                    "Show as Its Own Account",
+                    "Delete Alias…"
+                ]
+            );
+        });
+        // Deleting asks first, in the row.
+        act(&view, Action::DeleteAlias("sl".into(), "1".into()), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.fwd_confirm.as_deref(), Some("sl:1"))
+        });
+        act(&view, Action::CancelForwardingConfirm, cx);
+        view.read_with(cx, |this, _| assert!(this.fwd_confirm.is_none()));
     }
 }

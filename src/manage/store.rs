@@ -341,14 +341,48 @@ impl Store {
     /// Copies already-downloaded content to other copies of the same Gmail
     /// message (one per label). Returns how many copies were filled.
     pub fn share_gmail_raw(&self, account: &str) -> Result<usize> {
-        Ok(self.db.lock().unwrap().execute(
-            "UPDATE messages SET raw=(SELECT o.raw FROM messages o WHERE o.account=messages.account
-                 AND o.raw IS NOT NULL AND json_extract(o.data,'$.gmail_id')=json_extract(messages.data,'$.gmail_id') LIMIT 1)
-             WHERE account=?1 AND raw IS NULL AND json_extract(data,'$.gmail_id') > 0
-               AND EXISTS (SELECT 1 FROM messages o WHERE o.account=messages.account AND o.raw IS NOT NULL
-                 AND json_extract(o.data,'$.gmail_id')=json_extract(messages.data,'$.gmail_id'))",
-            [account],
-        )?)
+        // Two passes over the account rather than a correlated subquery: that
+        // re-read every message's JSON once per missing copy, which held the
+        // database for seconds on a few thousand messages and stalled the UI.
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let mut downloaded: HashMap<i64, String> = HashMap::new();
+        let mut missing: Vec<(String, i64)> = Vec::new();
+        {
+            let mut q = tx.prepare(
+                "SELECT id, json_extract(data,'$.gmail_id'), raw IS NOT NULL FROM messages
+                 WHERE account=?1 AND json_extract(data,'$.gmail_id') > 0",
+            )?;
+            let rows = q.query_map([account], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, gmail_id, has_raw) = row?;
+                if has_raw {
+                    downloaded.entry(gmail_id).or_insert(id);
+                } else {
+                    missing.push((id, gmail_id));
+                }
+            }
+        }
+        let mut filled = 0;
+        {
+            let mut copy = tx.prepare(
+                "UPDATE messages SET raw=(SELECT raw FROM messages WHERE id=?2)
+                 WHERE id=?1 AND raw IS NULL",
+            )?;
+            for (id, gmail_id) in &missing {
+                if let Some(source) = downloaded.get(gmail_id) {
+                    filled += copy.execute(params![id, source])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(filled)
     }
     /// Downloaded content of another copy of a Gmail message, if any.
     pub fn gmail_raw(&self, account: &str, gmail_id: u64) -> Result<Option<Vec<u8>>> {
@@ -547,6 +581,29 @@ pub fn write_secret(id: &str, s: &Secret) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gmail_copies_share_downloaded_content() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        let mut ms = demo_mail();
+        // Two labels of one message, a second message, and one without an ID.
+        for (m, gmail_id) in ms.iter_mut().zip([7, 7, 7, 8, 0]) {
+            m.gmail_id = gmail_id;
+        }
+        s.save_messages(&ms[..5])?;
+        s.save_raw(&ms[0].id, b"seven")?;
+        assert_eq!(s.share_gmail_raw("demo")?, 2);
+        assert_eq!(s.raw(&ms[1].id)?, Some(b"seven".to_vec()));
+        assert_eq!(s.raw(&ms[2].id)?, Some(b"seven".to_vec()));
+        assert_eq!(s.raw(&ms[3].id)?, None);
+        assert_eq!(s.raw(&ms[4].id)?, None);
+        // Other accounts never receive this one's content.
+        assert_eq!(s.share_gmail_raw("other")?, 0);
+        assert_eq!(s.share_gmail_raw("demo")?, 0);
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
     #[test]
     fn cache_roundtrip_and_account_isolation() -> Result<()> {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
