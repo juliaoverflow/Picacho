@@ -60,6 +60,9 @@ gpui = { version = "=0.2.2", features = ["test-support"] }
 [features]
 # Offers a fictional sample inbox from onboarding, for development and screenshots.
 sample-data = []
+# Offers Pinal Mail when adding an account. Off while Pinal's services are not
+# public; existing Pinal accounts keep working either way.
+pinal = []
 
 [profile.release]
 lto = "thin"

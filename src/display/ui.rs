@@ -4272,7 +4272,8 @@ impl MailApp {
             .flex_shrink_0()
             .child(img(SharedString::from(format!("brand/{key}.svg"))).size_full())
     }
-    /// The first setup step: Pinal Mail, then the other supported services.
+    /// The first setup step: Pinal Mail (with the `pinal` feature), then the
+    /// other supported services.
     fn provider_picker(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let pinal = div()
@@ -4365,13 +4366,17 @@ impl MailApp {
                     this.handle(Action::ChooseService(service), w, cx)
                 }))
         };
-        let others: Vec<Service> = Service::PICKER[1..].to_vec();
+        let others: Vec<Service> = Service::PICKER
+            .iter()
+            .copied()
+            .filter(|s| *s != Service::Pinal)
+            .collect();
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
-            .child(pinal)
+            .children(cfg!(feature = "pinal").then_some(pinal))
             .children(
                 others
                     .chunks(3)
@@ -6092,9 +6097,10 @@ mod tests {
         act(&view, Action::Start, cx);
         view.read_with(cx, |this, _| assert!(this.step == Step::Provider));
         frame(cx);
-        assert!(
+        assert_eq!(
             cx.debug_bounds("service-Pinal").is_some(),
-            "Pinal Mail is offered"
+            cfg!(feature = "pinal"),
+            "Pinal Mail is offered only with the pinal feature"
         );
         assert!(cx.debug_bounds("service-ProtonBridge").is_some());
         // Password services use fixed servers and never ask for them.
@@ -6197,7 +6203,11 @@ mod tests {
             assert!(this.step == Step::Provider);
         });
         frame(cx);
-        assert!(cx.debug_bounds("service-Pinal").is_some());
+        assert_eq!(
+            cx.debug_bounds("service-Pinal").is_some(),
+            cfg!(feature = "pinal")
+        );
+        assert!(cx.debug_bounds("service-Gmail").is_some());
     }
 
     pub(super) fn two_accounts(

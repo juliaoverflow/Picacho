@@ -43,7 +43,9 @@ pub enum SignIn {
     Password,
 }
 impl Service {
-    pub const PICKER: [Self; 7] = [
+    /// The services offered when adding an account, in order.
+    pub const PICKER: &'static [Self] = &[
+        #[cfg(feature = "pinal")]
         Self::Pinal,
         Self::Gmail,
         Self::Outlook,

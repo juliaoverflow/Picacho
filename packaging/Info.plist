@@ -3,7 +3,7 @@
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Picacho</string>
   <key>CFBundleDisplayName</key><string>Picacho</string>
-  <key>CFBundleIdentifier</key><string>com.pinal.Picacho</string>
+  <key>CFBundleIdentifier</key><string>tech.pinal.picacho</string>
   <key>CFBundleExecutable</key><string>picacho</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -15,7 +15,7 @@
   <key>NSHumanReadableCopyright</key><string>© 2026 Pinal</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>CFBundleURLTypes</key><array><dict>
-    <key>CFBundleURLName</key><string>com.pinal.Picacho.sign-in</string>
+    <key>CFBundleURLName</key><string>tech.pinal.picacho.sign-in</string>
     <key>CFBundleURLSchemes</key><array><string>picacho</string></array>
   </dict></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>

@@ -42,7 +42,7 @@ Verified on Linux x86_64 with Rust 1.96.0. `cargo fmt --check`, strict Clippy fo
 
 Linux x86_64, Rust 1.96.0: formatting, strict all-target Clippy, and the full suite pass (41 tests passed, 2 opt-in checks ignored). Local fault coverage includes incomplete/failed IMAP snapshots, transient reconnect, expunge races, missing/reset UIDVALIDITY, unsolicited flags, cleanup disconnects, partially accepted bulk changes, invalid/duplicate POP3 UIDL rows, interrupted RETR, repair of a summary without raw data, transactional database failures, dot unstuffing, response-size limits and command deadlines.
 
-The opt-in Dovecot comparison also passes: Dovecot 2.4.1-4 (7d8c0e5759), verified loopback TLS, isolated Maildir, Picacho versus Python imaplib/poplib UID/flag/body-hash results. IMAP moves, POP3 deduplication and local-folder preservation were exercised. Thunderbird and NeoMutt source reviews and exact reproduction instructions are recorded in [docs/SYNCHRONIZATION.md](docs/SYNCHRONIZATION.md). Full desktop clients were not run against real user accounts.
+The opt-in Dovecot comparison also passes: Dovecot 2.4.1-4 (7d8c0e5759), verified loopback TLS, isolated Maildir, Picacho versus Python imaplib/poplib UID/flag/body-hash results. IMAP moves, POP3 deduplication and local-folder preservation were exercised. Thunderbird and NeoMutt source reviews and exact reproduction instructions are recorded in [docs/SYNCHRONIZATION.md](SYNCHRONIZATION.md). Full desktop clients were not run against real user accounts.
 
 ## Responsive Display (October 26, 2026)
 
@@ -50,7 +50,7 @@ Formatting, strict all-target/all-feature Clippy, normal and sample-data builds 
 
 Four new GPUI tests cover eight viewport sizes from 1440×1000 to 360×320: settings bounds, wrapping synchronization choices, scrolling to account controls, locked-reader toolbar/password sizing, scrolling to Unlock, inline blank-input feedback and focus, narrow-reader Back navigation, bulk-selection controls, compose footer actions, onboarding and Add Account. Existing UI interaction tests also pass.
 
-The native Linux GPUI application launched under Xvfb/Mesa; general and account settings were visually inspected at 1440×1000, 640×480 and 360×320. Long account names, horizontal account navigation and wrapping controls were checked using an isolated profile with synthetic accounts. Native encrypted-message unlocking was not exercised against a live Pinal account; its pane layout/interaction is covered by the headless GPUI tests. See [docs/DISPLAY.md](docs/DISPLAY.md).
+The native Linux GPUI application launched under Xvfb/Mesa; general and account settings were visually inspected at 1440×1000, 640×480 and 360×320. Long account names, horizontal account navigation and wrapping controls were checked using an isolated profile with synthetic accounts. Native encrypted-message unlocking was not exercised against a live Pinal account; its pane layout/interaction is covered by the headless GPUI tests. See [docs/DISPLAY.md](DISPLAY.md).
 
 ## Mailbox errors and independent synchronization (October 26, 2026)
 

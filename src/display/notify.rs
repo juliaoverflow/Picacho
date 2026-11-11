@@ -21,7 +21,7 @@ pub fn new_mail(account: &str, latest: (&str, &str), count: usize) {
                 if std::env::current_exe()
                     .is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS"))
                 {
-                    let _ = notify_rust::set_application("com.pinal.Picacho");
+                    let _ = notify_rust::set_application("tech.pinal.picacho");
                 }
             });
         }

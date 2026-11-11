@@ -152,7 +152,7 @@ fn onboarding_and_add_account_can_scroll_at_minimum_window_size(cx: &mut TestApp
     let (view, cx) = open(store(), cx);
     resize(cx, 360., 320.);
     act(&view, Action::Start, cx);
-    let service = bounds(cx, "service-Pinal");
+    let service = bounds(cx, "service-Gmail");
     assert!(
         service.left() >= px(0.) && service.right() <= px(360.),
         "provider card: {service:?}"
