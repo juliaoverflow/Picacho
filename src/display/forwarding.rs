@@ -704,6 +704,62 @@ impl MailApp {
                 )
                 .h(px(28.))
             });
+        // Keeping the mailboxes to their aliases: they don't write as
+        // themselves, and show the alias used where their address was.
+        let protected: Vec<String> = fwd::forwards_to(f, &self.accounts)
+            .iter()
+            .filter_map(|id| self.accounts.iter().find(|a| &a.id == id))
+            .map(|a| a.email.clone())
+            .collect();
+        let aliases_only = f.service.can_send().then(|| {
+            let mailboxes = if protected.is_empty() {
+                "No mailbox here receives its aliases yet; choose one in Forwards to.".to_owned()
+            } else {
+                format!(
+                    "{} can't write as {}: new mail and replies go out as an alias, and the alias used is shown wherever its address was, in received and sent mail.",
+                    protected.join(", "),
+                    if protected.len() > 1 { "themselves" } else { "itself" }
+                )
+            };
+            div()
+                .px_4()
+                .pb_3()
+                .flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    self.switch(
+                        format!("aliases-only-{}", f.id),
+                        f.aliases_only,
+                        Action::SetAliasesOnly(f.id.clone(), !f.aliases_only),
+                        cx,
+                    )
+                    .debug_selector({
+                        let id = f.id.clone();
+                        move || format!("aliases-only-{id}")
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Send only as aliases"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(mailboxes),
+                        ),
+                )
+        });
         div()
             .border_t_1()
             .border_color(rgb(c.border))
@@ -711,6 +767,7 @@ impl MailApp {
             .flex()
             .flex_col()
             .child(toolbar)
+            .children(aliases_only)
             .when(creating, |d| {
                 d.child(div().px_4().pb_3().child(self.alias_form(f, busy, cx)))
             })

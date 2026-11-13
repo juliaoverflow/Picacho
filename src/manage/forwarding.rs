@@ -186,6 +186,10 @@ pub struct ForwardingAccount {
     /// The service's mailboxes or recipients, where it has them.
     #[serde(default)]
     pub mailboxes: Vec<ServiceMailbox>,
+    /// The mailboxes it forwards to send only as its aliases: they can't
+    /// write as themselves, and their address is shown as the alias used.
+    #[serde(default)]
+    pub aliases_only: bool,
 }
 impl ForwardingAccount {
     fn secret_id(&self) -> String {
@@ -258,6 +262,7 @@ pub fn connect(
             .map(|a| a.id.clone()),
         aliases,
         mailboxes,
+        aliases_only: false,
     };
     store::write_secret(
         &account.secret_id(),
@@ -612,6 +617,89 @@ pub fn sendable(forwarding: &[ForwardingAccount]) -> Vec<SendAlias> {
         })
         .collect()
 }
+/// The Picacho mailboxes a service forwards to: the one it delivers to,
+/// and those that are among its mailboxes.
+pub fn forwards_to(f: &ForwardingAccount, accounts: &[Account]) -> Vec<String> {
+    accounts
+        .iter()
+        .filter(|a| {
+            f.deliver_to.as_deref() == Some(a.id.as_str())
+                || f.mailboxes
+                    .iter()
+                    .any(|m| m.email.eq_ignore_ascii_case(&a.email))
+        })
+        .map(|a| a.id.clone())
+        .collect()
+}
+
+/// Whether `account` may send only as an alias: a service that can send
+/// forwards to it, with "Send only as aliases" on.
+pub fn requires_alias(forwarding: &[ForwardingAccount], accounts: &[Account], account: &str) -> bool {
+    forwarding.iter().any(|f| {
+        f.aliases_only
+            && f.service.can_send()
+            && forwards_to(f, accounts).iter().any(|id| id == account)
+    })
+}
+
+/// The alias `account` writes as when none was chosen: the first turned-on
+/// alias (pinned ones first) of a service that keeps it to its aliases.
+pub fn default_alias(
+    forwarding: &[ForwardingAccount],
+    accounts: &[Account],
+    account: &str,
+) -> Option<String> {
+    forwarding
+        .iter()
+        .filter(|f| {
+            f.aliases_only
+                && f.service.can_send()
+                && forwards_to(f, accounts).iter().any(|id| id == account)
+        })
+        .flat_map(|f| {
+            let mut aliases: Vec<&Alias> = f.aliases.iter().filter(|a| a.enabled).collect();
+            aliases.sort_by_key(|a| !a.pinned);
+            aliases
+        })
+        .map(|a| a.email.clone())
+        .next()
+}
+
+/// The name recipients see for `alias`, when it has one.
+pub fn alias_name(forwarding: &[ForwardingAccount], alias: &str) -> Option<String> {
+    forwarding
+        .iter()
+        .flat_map(|f| &f.aliases)
+        .find(|a| a.email.eq_ignore_ascii_case(alias))
+        .map(|a| a.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// `text` with every mention of `address` (in any case) replaced by `alias`.
+pub fn mask_address<'a>(text: &'a str, address: &str, alias: &str) -> std::borrow::Cow<'a, str> {
+    let address = address.trim();
+    if address.is_empty() || !address.is_ascii() {
+        return text.into();
+    }
+    let lower = text.to_ascii_lowercase();
+    let needle = address.to_ascii_lowercase();
+    if !lower.contains(&needle) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(i) = lower[from..].find(&needle) {
+        let at = from + i;
+        out.push_str(&text[last..at]);
+        out.push_str(alias);
+        last = at + needle.len();
+        from = last;
+    }
+    out.push_str(&text[last..]);
+    out.into()
+}
+
 /// The sendable alias with this address, and its service account.
 fn find_sendable<'a>(
     forwarding: &'a [ForwardingAccount],
@@ -1059,6 +1147,57 @@ mod tests {
             "shop+ana=example.org@me.anonaddy.com"
         );
         assert!(addy_route("shop@me.anonaddy.com", "nobody").is_err());
+    }
+
+    #[test]
+    fn mailboxes_kept_to_their_aliases() {
+        let account = |id: &str, email: &str| Account {
+            id: id.into(),
+            email: email.into(),
+            ..Account::new(Provider::Imap)
+        };
+        let accounts = [account("w", "work@example.com"), account("h", "home@example.com")];
+        let alias = |email: &str, enabled, pinned| Alias {
+            id: email.into(),
+            email: email.into(),
+            enabled,
+            pinned,
+            ..Alias::default()
+        };
+        let mut services = vec![ForwardingAccount {
+            id: "sl".into(),
+            service: ForwardingService::SimpleLogin,
+            deliver_to: Some("w".into()),
+            mailboxes: vec![ServiceMailbox {
+                id: "1".into(),
+                email: "HOME@example.com".into(),
+            }],
+            aliases: vec![
+                alias("off@sl.io", false, true),
+                alias("a@sl.io", true, false),
+                alias("b@sl.io", true, true),
+            ],
+            ..ForwardingAccount::default()
+        }];
+        assert_eq!(forwards_to(&services[0], &accounts), ["w", "h"]);
+        assert!(!requires_alias(&services, &accounts, "w"), "off by default");
+        services[0].aliases_only = true;
+        assert!(requires_alias(&services, &accounts, "w"));
+        assert!(requires_alias(&services, &accounts, "h"));
+        // A pinned, turned-on alias first.
+        assert_eq!(default_alias(&services, &accounts, "w").as_deref(), Some("b@sl.io"));
+        // Firefox Relay can't send, so it never keeps a mailbox from sending.
+        services[0].service = ForwardingService::FirefoxRelay;
+        assert!(!requires_alias(&services, &accounts, "w"));
+
+        assert_eq!(
+            mask_address("To: Work <WORK@example.com>, work@example.com", "work@example.com", "a@sl.io"),
+            "To: Work <a@sl.io>, a@sl.io"
+        );
+        assert!(matches!(
+            mask_address("nothing here", "work@example.com", "a@sl.io"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

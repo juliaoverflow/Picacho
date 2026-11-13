@@ -96,6 +96,15 @@ impl Render for MessageWindow {
         let c = self.colors;
         let m = &self.mail;
         window.set_window_title(&m.subject);
+        // A mailbox kept to its aliases shows the alias used in its place.
+        let mask = self.app.upgrade().and_then(|app| app.read(cx).mask_for(m));
+        let (sender, from) = match &mask {
+            Some(k) => (
+                if k.sent { k.sender() } else { m.sender.clone() },
+                k.apply(&m.from).into_owned(),
+            ),
+            None => (m.sender.clone(), m.from.clone()),
+        };
         let dark = self.options.theme.is_dark(self.app_dark);
         let to = super::thread::short_names(&m.to, &self.own);
         let cc = super::thread::short_names(&m.cc, &self.own);
@@ -119,6 +128,8 @@ impl Render for MessageWindow {
                 Some(h) if !self.quotes_open => h.as_str(),
                 _ => html.as_str(),
             };
+            let masked = mask.as_ref().map(|k| k.apply(shown));
+            let shown = masked.as_deref().unwrap_or(shown);
             let blocked = self.options.block_remote;
             let clean = self.clean_links(cx);
             self.html.update(cx, |view, cx| {
@@ -134,6 +145,8 @@ impl Render for MessageWindow {
             } else {
                 written
             };
+            let masked = mask.as_ref().map(|k| k.apply(shown));
+            let shown = masked.as_deref().unwrap_or(shown);
             body = body.child(
                 gpui_component::text::TextView::markdown(
                     SharedString::from(format!("window-body-{}-{}", m.id, self.quotes_open)),
@@ -295,13 +308,13 @@ impl Render for MessageWindow {
                                                 div()
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_size(px(13.))
-                                                    .child(m.sender.clone()),
+                                                    .child(sender),
                                             )
                                             .child(
                                                 div()
                                                     .text_size(px(11.))
                                                     .text_color(rgb(c.muted))
-                                                    .child(format!("<{}>", m.from)),
+                                                    .child(format!("<{from}>")),
                                             ),
                                     )
                                     .child(

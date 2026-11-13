@@ -1710,6 +1710,15 @@ impl Backend {
         // Sending as an alias asks its service for the routed addresses
         // first, outside the account's lock, once it knows the alias is
         // still there.
+        if d.send_as.trim().is_empty() {
+            let forwarding = crate::manage::forwarding::load(&self.store);
+            let accounts = self.store.accounts()?;
+            ensure!(
+                !crate::manage::forwarding::requires_alias(&forwarding, &accounts, &a.id),
+                "{} sends only as its aliases (Settings → Forwarding). Choose an alias in From.",
+                a.email
+            );
+        }
         crate::manage::forwarding::verify_alias(&self.store, d)?;
         let routed = crate::manage::forwarding::route(&self.store, d)?;
         let d = &routed;

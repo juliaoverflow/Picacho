@@ -6,6 +6,27 @@ use super::tree::Dragged;
 use super::*;
 use crate::manage::backend::Layout;
 
+/// How mail of a mailbox kept to its aliases is shown: its own address
+/// (and, on mail it sent, its name) in place of which the alias used is.
+pub(super) struct Mask {
+    pub address: String,
+    pub alias: String,
+    /// The name recipients see for the alias, when it has one.
+    pub alias_name: Option<String>,
+    /// The mailbox sent it, so its sender is the alias.
+    pub sent: bool,
+}
+impl Mask {
+    /// `text` with the mailbox's address replaced by the alias.
+    pub fn apply<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        fwd::mask_address(text, &self.address, &self.alias)
+    }
+    /// What the alias is called as a sender: its name, else its address.
+    pub fn sender(&self) -> String {
+        self.alias_name.clone().unwrap_or_else(|| self.alias.clone())
+    }
+}
+
 /// An alias's view has no Sent or Drafts: nothing is written from it.
 const ALIAS_FOLDERS: [Folder; 5] = [
     Folder::Inbox,
@@ -44,6 +65,40 @@ impl MailApp {
     /// layout and placeholders apply.
     pub(super) fn shows_only(&self, account: &str) -> bool {
         self.account.is_some() && self.scope.accounts == [account]
+    }
+    /// Whether `account` may only send as an alias (Forwarding settings).
+    pub(super) fn requires_alias(&self, account: &str) -> bool {
+        fwd::requires_alias(&self.forwarding, &self.accounts, account)
+    }
+    /// Accounts that may only send as an alias.
+    pub(super) fn alias_only_accounts(&self) -> HashSet<String> {
+        self.accounts
+            .iter()
+            .filter(|a| self.requires_alias(&a.id))
+            .map(|a| a.id.clone())
+            .collect()
+    }
+    /// For mail of a mailbox kept to its aliases, the alias that stands for
+    /// the mailbox in `m`: the one it was sent as, or the one it came to.
+    pub(super) fn mask_for(&self, m: &Mail) -> Option<Mask> {
+        let a = self.accounts.iter().find(|a| a.id == m.account)?;
+        if !self.requires_alias(&a.id) {
+            return None;
+        }
+        let sent = m.folder == Folder::Sent || m.from.eq_ignore_ascii_case(&a.email);
+        let alias = sent
+            .then(|| fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes))
+            .flatten()
+            .or_else(|| {
+                super::compose::alias_addressed(m, &fwd::sendable(&self.forwarding))
+                    .map(|a| a.email.clone())
+            })?;
+        Some(Mask {
+            address: a.email.clone(),
+            alias_name: fwd::alias_name(&self.forwarding, &alias),
+            alias,
+            sent,
+        })
     }
     /// The alias a sent message went out as, for mail in Sent.
     pub(super) fn sent_alias(&self, m: &Mail) -> Option<String> {
@@ -816,9 +871,10 @@ impl MailApp {
     pub(super) fn update_composer_aliases(&mut self, cx: &mut Context<Self>) {
         let aliases = fwd::sendable(&self.forwarding);
         let services = Self::alias_services(&self.forwarding);
+        let alias_only = self.alias_only_accounts();
         for composer in &self.composers {
             composer.update(cx, |c, cx| {
-                c.set_forwarding(aliases.clone(), services.clone());
+                c.set_forwarding(aliases.clone(), services.clone(), alias_only.clone());
                 cx.notify();
             });
         }
@@ -1532,6 +1588,90 @@ mod tests {
             assert!(this.unsubscribing.is_empty());
             assert!(!this.unsubscribed.contains(&other.key()));
         });
+    }
+
+    #[gpui::test]
+    fn a_mailbox_kept_to_its_aliases_writes_and_shows_as_them(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // Off: Work writes as itself, and its address shows as it is.
+        view.update_in(cx, |this, w, cx| {
+            assert!(!this.requires_alias(&work));
+            this.new_compose(0, w, cx);
+            assert!(this.composers[0].read(cx).draft.send_as.is_empty());
+            this.composers.clear();
+        });
+        act(&view, Action::SetAliasesOnly("sl".into(), true), cx);
+        let store = view.read_with(cx, |this, _| {
+            assert!(this.requires_alias(&work));
+            assert!(fwd::load(&this.backend.store)[0].aliases_only, "saved");
+            this.backend.store.clone()
+        });
+        // New mail goes out as its alias; without one it can't be sent.
+        view.update_in(cx, |this, w, cx| {
+            this.new_compose(0, w, cx);
+            let composer = this.composers[0].clone();
+            assert_eq!(composer.read(cx).draft.send_as, "shop@sl.io");
+            composer.update(cx, |c, cx| {
+                c.draft.send_as.clear();
+                c.fill("ana@example.org", "Hi", w, cx);
+                c.request_send(w, cx);
+                let error = c.error.clone().unwrap_or_default();
+                assert!(error.contains("sends only as its aliases"), "{error}");
+            });
+        });
+        // Nor by any other way of sending.
+        let a = store.accounts().unwrap().into_iter().find(|a| a.id == work).unwrap();
+        let backend = view.read_with(cx, |this, _| this.backend.clone());
+        let refused = backend
+            .send(&a, &Draft { to: "ana@example.org".into(), ..Draft::default() })
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("sends only as its aliases"), "{refused}");
+        // Mail that came to the alias shows the alias where Work's address was.
+        let id = view.update(cx, |this, _| {
+            let m = this
+                .messages
+                .iter_mut()
+                .find(|m| m.account == work && m.to.contains("shop@sl.io"))
+                .unwrap();
+            m.html = None;
+            m.body = Some("This email was sent to WORK@example.com.".into());
+            m.id.clone()
+        });
+        act(&view, Action::Select(id.clone()), cx);
+        view.update_in(cx, |this, w, cx| {
+            let m = this.messages.iter().find(|m| m.id == id).unwrap().clone();
+            let body = this.plain_body(&m).0.to_string();
+            assert!(body.contains("shop@sl"), "{body}");
+            assert!(!body.to_lowercase().contains("work@example"), "{body}");
+            // A reply goes out as the alias, quoting nothing of Work's address.
+            this.compose_reply(1, Some(m), Some(Placement::Floating), w, cx);
+            let draft = this.composers.last().unwrap().read(cx).draft.clone();
+            assert_eq!(draft.send_as, "shop@sl.io");
+            assert!(!draft.body.to_lowercase().contains("work@example.com"), "{}", draft.body);
+        });
+        // Its sent mail is from the alias.
+        let sent = Mail {
+            id: format!("{work}:sent:9"),
+            account: work.clone(),
+            folder: Folder::Sent,
+            from: "work@example.com".into(),
+            sender: "Work".into(),
+            to: "ra+ana@simplelogin.co".into(),
+            ..Mail::default()
+        };
+        view.update(cx, |this, _| {
+            fwd::remember_routes(&store, "shop@sl.io", ["ra+ana@simplelogin.co".to_owned()])
+                .unwrap();
+            this.alias_routes = fwd::routes(&store);
+            let mask = this.mask_for(&sent).expect("masked");
+            assert!(mask.sent);
+            assert_eq!(mask.sender(), "shop@sl.io");
+            assert_eq!(mask.apply("Work <work@example.com>"), "Work <shop@sl.io>");
+        });
+        // Turned off, everything is as it was.
+        act(&view, Action::SetAliasesOnly("sl".into(), false), cx);
+        view.read_with(cx, |this, _| assert!(this.mask_for(&sent).is_none()));
     }
 
     #[gpui::test]

@@ -138,6 +138,8 @@ pub(super) struct Composer {
     /// Services that can make aliases to send as: (service, the mailbox it
     /// forwards to, or `None` for any).
     alias_services: Vec<(String, fwd::ForwardingService, Option<String>)>,
+    /// Accounts that send only as an alias (Forwarding settings).
+    alias_only: HashSet<String>,
     /// Known people (name, address) offered while typing a recipient.
     contacts: Rc<Vec<(String, String)>>,
     suggestions: Vec<(String, String)>,
@@ -249,6 +251,7 @@ impl Composer {
             accounts,
             aliases,
             alias_services: vec![],
+            alias_only: HashSet::new(),
             contacts,
             suggestions: vec![],
             suggest_field: TO,
@@ -585,6 +588,19 @@ impl Composer {
     /// here; a missing subject or attachment asks first.
     pub(super) fn request_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sending {
+            return;
+        }
+        if self.needs_alias() {
+            let email = self
+                .accounts
+                .iter()
+                .find(|a| a.id == self.draft.account)
+                .map_or(String::new(), |a| a.email.clone());
+            self.error = Some(format!(
+                "{email} sends only as its aliases. Choose an alias in From."
+            ));
+            self.from_open = true;
+            cx.notify();
             return;
         }
         let d = self.snapshot(cx);
@@ -962,9 +978,16 @@ impl Composer {
         &mut self,
         aliases: Vec<fwd::SendAlias>,
         services: Vec<(String, fwd::ForwardingService, Option<String>)>,
+        alias_only: HashSet<String>,
     ) {
         self.aliases = aliases;
         self.alias_services = services;
+        self.alias_only = alias_only;
+    }
+
+    /// The draft would go out as an account that sends only as an alias.
+    fn needs_alias(&self) -> bool {
+        self.draft.send_as.trim().is_empty() && self.alias_only.contains(&self.draft.account)
     }
 
     /// Sends as the mailbox again, after the alias in From went away.
@@ -1052,8 +1075,16 @@ impl Composer {
         let alias = self.send_alias();
         // Sending as an alias that is no longer listed; sending says so.
         let missing = alias.is_none() && !self.draft.send_as.is_empty();
-        let several = self.accounts.len() + self.aliases.len() > 1 || missing;
+        let several = self.accounts.len() + self.aliases.len() > 1 || missing || self.needs_alias();
+        let blocked = alias.is_none() && !missing && self.needs_alias();
         let (label, tip) = match alias {
+            None if blocked => (
+                "Choose an alias".to_owned(),
+                format!(
+                    "{} sends only as its aliases (Settings → Forwarding).",
+                    current.email
+                ),
+            ),
             None if missing => (
                 self.draft.send_as.clone(),
                 format!(
@@ -1092,9 +1123,10 @@ impl Composer {
                     .min_w_0()
                     .truncate()
                     .when(missing, |d| d.text_color(rgb(c.danger)).line_through())
+                    .when(blocked, |d| d.text_color(rgb(c.danger)))
                     .child(label),
             )
-            .when(missing, |d| d.child(icon_el("warning", 13., c.danger)))
+            .when(missing || blocked, |d| d.child(icon_el("warning", 13., c.danger)))
             .when_some(alias, |d, a| d.child(service_badge(a.service, c)))
             .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx));
         if several {
@@ -1185,9 +1217,11 @@ impl Composer {
         };
         let mut list = div().flex().flex_col();
         let mut shown = 0;
+        // Accounts kept to their aliases can't be chosen to write as.
         let accounts: Vec<&Account> = self
             .accounts
             .iter()
+            .filter(|a| !self.alias_only.contains(&a.id))
             .filter(|a| matches(&[&a.email, &a.name]))
             .collect();
         if !accounts.is_empty() && !self.aliases.is_empty() {

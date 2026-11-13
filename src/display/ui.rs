@@ -636,6 +636,9 @@ enum Action {
     /// Menus in Forwarding settings: a service's, where it delivers, an alias's.
     ServiceMenu(String),
     DeliverMenu(String),
+    /// Keeps the mailboxes a service forwards to from sending as
+    /// themselves (service, on).
+    SetAliasesOnly(String, bool),
     AliasMenu(String, String),
     /// Leaves a pending Remove or Delete in Forwarding settings.
     CancelForwardingConfirm,
@@ -4086,6 +4089,9 @@ impl MailApp {
                 let entries = self.service_entries(&id);
                 self.open_menu_here(entries, w, cx);
             }
+            Action::SetAliasesOnly(id, on) => {
+                self.edit_forwarding(&id, |f| f.aliases_only = on, cx);
+            }
             Action::DeliverMenu(id) => {
                 let entries = self.deliver_entries(&id);
                 self.open_menu_here(entries, w, cx);
@@ -5396,6 +5402,11 @@ impl MailApp {
         let star_id = m.id.clone();
         // Sent mail names the alias it went out as, in place of the address.
         let sent_alias = self.sent_alias(m);
+        // A mailbox kept to its aliases sent it as the alias.
+        let sender = match self.mask_for(m) {
+            Some(k) if k.sent => k.sender(),
+            _ => m.sender.clone(),
+        };
         let address = (sent_alias.is_none()
             && !m.from.is_empty()
             && !m.from.eq_ignore_ascii_case(&m.sender))
@@ -5455,7 +5466,7 @@ impl MailApp {
                                     } else {
                                         FontWeight::MEDIUM
                                     })
-                                    .child(m.sender.clone()),
+                                    .child(sender),
                             )
                             .child(
                                 div()

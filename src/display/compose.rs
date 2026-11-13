@@ -109,6 +109,23 @@ impl MailApp {
                 if let Some(alias) = alias_addressed(m, &aliases) {
                     draft.send_as = alias.email.clone();
                 }
+                // A mailbox kept to its aliases answers its own sent mail as
+                // the alias it went out as.
+                let mask = self.mask_for(m);
+                if draft.send_as.is_empty()
+                    && let Some(k) = &mask
+                {
+                    draft.send_as = k.alias.clone();
+                }
+                // Nothing quoted names the mailbox behind the alias.
+                let masked = |text: &str| match &mask {
+                    Some(k) => k.apply(text).into_owned(),
+                    None => text.to_owned(),
+                };
+                let sender = match &mask {
+                    Some(k) if k.sent => k.sender(),
+                    _ => m.sender.clone(),
+                };
                 if !forward {
                     let (to, cc) =
                         reply_recipients(m, mode == 2, &[own.as_str(), draft.send_as.as_str()]);
@@ -119,19 +136,19 @@ impl MailApp {
                         .trim()
                         .to_string();
                 }
-                let quoted = m.body.clone().unwrap_or_default();
+                let quoted = masked(&m.body.clone().unwrap_or_default());
                 let quote = if forward {
                     format!(
                         "\n\n---------- Forwarded message ----------\nFrom: {} <{}>\nDate: {}\nSubject: {}\nTo: {}\n{}\n{}",
-                        m.sender,
-                        m.from,
+                        sender,
+                        masked(&m.from),
                         date_full(m.date),
                         m.subject,
-                        m.to,
+                        masked(&m.to),
                         if m.cc.is_empty() {
                             String::new()
                         } else {
-                            format!("Cc: {}\n", m.cc)
+                            format!("Cc: {}\n", masked(&m.cc))
                         },
                         quoted
                     )
@@ -139,7 +156,7 @@ impl MailApp {
                     format!(
                         "\n\nOn {}, {} wrote:\n{}",
                         date_full(m.date),
-                        m.sender,
+                        sender,
                         quoted
                             .lines()
                             // Nested quotes stay compact: ">>", not "> >".
@@ -156,6 +173,13 @@ impl MailApp {
                 };
                 draft.body = format!("{}{quote}", sign(true));
             }
+        }
+        // A mailbox kept to its aliases writes as one of them.
+        if draft.send_as.is_empty()
+            && let Some(alias) =
+                fwd::default_alias(&self.forwarding, &self.accounts, &draft.account)
+        {
+            draft.send_as = alias;
         }
         let placement = forced.unwrap_or(match (&original, options.reply_placement) {
             (Some(_), ReplyPlacement::Inline) if self.reader_visible(w) => Placement::Inline,
@@ -303,7 +327,10 @@ impl MailApp {
             composer
         };
         let services = Self::alias_services(&self.forwarding);
-        composer.update(cx, |c, _| c.set_forwarding(fwd::sendable(&self.forwarding), services));
+        let alias_only = self.alias_only_accounts();
+        composer.update(cx, |c, _| {
+            c.set_forwarding(fwd::sendable(&self.forwarding), services, alias_only)
+        });
         // The From menu should not offer aliases deleted elsewhere.
         self.refresh_aliases_due(super::views::ALIAS_REFRESH_SOON, cx);
         if let Some(message) = answers {

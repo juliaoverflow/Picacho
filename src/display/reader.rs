@@ -259,6 +259,15 @@ impl MailApp {
         };
         let compact = window.viewport_size().width < px(1180.);
         let single = window.viewport_size().width < px(900.);
+        // A mailbox kept to its aliases shows the alias used in its place.
+        let mask = self.mask_for(m);
+        let (sender, from) = match &mask {
+            Some(k) => (
+                if k.sent { k.sender() } else { m.sender.clone() },
+                k.apply(&m.from).into_owned(),
+            ),
+            None => (m.sender.clone(), m.from.clone()),
+        };
         let toolbar = div()
             .id("reader-toolbar")
             .debug_selector(|| "reader-toolbar".into())
@@ -418,14 +427,14 @@ impl MailApp {
                                         div()
                                             .text_size(px(13.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child(m.sender.clone()),
+                                            .child(sender),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
                                             .text_color(rgb(c.muted))
                                             .truncate()
-                                            .child(format!("<{}>", m.from)),
+                                            .child(format!("<{from}>")),
                                     )
                                     .when_some(self.sent_alias(m), |d, alias| {
                                         d.child(
@@ -470,6 +479,8 @@ impl MailApp {
                     Some(hidden) if !self.quotes_open => hidden.as_str(),
                     _ => html.as_str(),
                 };
+                let masked = mask.as_ref().map(|k| k.apply(shown));
+                let shown = masked.as_deref().unwrap_or(shown);
                 self.html_view.update(cx, |view, cx| {
                     view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
@@ -784,10 +795,19 @@ impl MailApp {
             .flex_col()
             .gap(px(7.))
             .text_size(px(12.));
-        let from = if m.sender != m.from && !m.sender.is_empty() {
-            format!("{} <{}>", m.sender, m.from)
+        let mask = self.mask_for(m);
+        let masked = |v: &str| match &mask {
+            Some(k) => k.apply(v).into_owned(),
+            None => v.to_owned(),
+        };
+        let sender = match &mask {
+            Some(k) if k.sent => k.sender(),
+            _ => m.sender.clone(),
+        };
+        let from = if sender != m.from && !sender.is_empty() {
+            masked(&format!("{} <{}>", sender, m.from))
         } else {
-            m.from.clone()
+            masked(&m.from)
         };
         let details = info
             .and_then(|i| i.result.as_ref())
@@ -795,11 +815,11 @@ impl MailApp {
         let header = |value: Option<&String>| value.filter(|v| !v.trim().is_empty()).cloned();
         let mut panel_rows: Vec<AnyElement> = vec![row("from:", text(from)).into_any_element()];
         if let Some(v) = header(details.map(|d| &d.details.reply_to)) {
-            panel_rows.push(row("reply-to:", text(v)).into_any_element());
+            panel_rows.push(row("reply-to:", text(masked(&v))).into_any_element());
         }
-        panel_rows.push(row("to:", text(m.to.clone())).into_any_element());
+        panel_rows.push(row("to:", text(masked(&m.to))).into_any_element());
         if let Some(v) = header(details.map(|d| &d.details.cc)) {
-            panel_rows.push(row("cc:", text(v)).into_any_element());
+            panel_rows.push(row("cc:", text(masked(&v))).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
         panel_rows.push(row("subject:", text(m.subject.clone())).into_any_element());
@@ -1652,11 +1672,13 @@ impl MailApp {
     /// The plain body as the reader's Markdown, without the quoted history
     /// unless it is open; and whether there is quoted history.
     pub(super) fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
+        let mask = self.mask_for(m);
         let key = format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             m.id,
             self.quotes_open,
             self.clean_links,
+            mask.as_ref().map_or("", |k| k.alias.as_str()),
             m.body.as_ref().map_or(0, String::len)
         );
         if let Some((k, text, quoted)) = &*self.plain_cache.borrow()
@@ -1674,10 +1696,14 @@ impl MailApp {
         } else {
             written
         };
+        let shown = match &mask {
+            Some(k) => k.apply(shown),
+            None => shown.into(),
+        };
         let shown = if self.clean_links {
-            crate::manage::tracking::clean_text(shown)
+            crate::manage::tracking::clean_text(&shown).into_owned().into()
         } else {
-            shown.into()
+            shown
         };
         let text = SharedString::from(plain_markdown(&shown));
         *self.plain_cache.borrow_mut() = Some((key, text.clone(), quoted.is_some()));
