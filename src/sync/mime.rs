@@ -165,6 +165,15 @@ pub(crate) fn html_to_text(html: &str) -> String {
         }
         // Namespaced Office elements (`<o:p>`, `<v:shape>`) hold no text of their own.
         let base = name.rsplit(':').next().unwrap_or(&name).to_owned();
+        // A `<body>`, or text-bearing content, ends an unclosed `<head>` (and
+        // `<title>` in it), as browsers read it; nothing after would show.
+        if !closing
+            && (base == "body" || BLOCK_ELEMENTS.contains(&base.as_str()))
+            && let Some(at) = hidden.iter().position(|h| h == "head")
+            && (base == "body" || hidden[at..].iter().all(|h| h == "head" || h == "title"))
+        {
+            hidden.truncate(at);
+        }
         if HIDDEN_ELEMENTS.contains(&base.as_str()) {
             if closing {
                 if let Some(at) = hidden.iter().rposition(|h| *h == base) {
@@ -186,11 +195,12 @@ pub(crate) fn html_to_text(html: &str) -> String {
     }
     // Templates sometimes escape their padding twice (`&amp;#847;`), which
     // would leave `&#847;` showing; those are dropped too.
-    tidy(&strip_invisible_references(&decode_entities(&text)))
+    tidy(&strip_padding_references(&decode_entities(&text)))
 }
-/// Removes character references that stand for invisible characters.
-fn strip_invisible_references(text: &str) -> String {
-    if !text.contains("&#") && !text.contains("&zwnj") && !text.contains("&zwj") && !text.contains("&shy") {
+/// Removes character references that stand for invisible characters, and
+/// turns those for spaces into spaces: what's left of padding escaped twice.
+fn strip_padding_references(text: &str) -> String {
+    if !text.contains("&#") && !text.contains("&zwnj") && !text.contains("&zwj") && !text.contains("&shy") && !text.contains("&nbsp") {
         return text.to_owned();
     }
     decode(text, true)
@@ -251,9 +261,10 @@ fn tidy(text: &str) -> String {
 /// A preview of a message's text: its first words, without entities or
 /// invisible characters (some plain-text parts carry `&zwnj;` literally).
 pub(crate) fn snippet(body: &str) -> String {
-    // Decoded twice: a preview is better off without padding a template
-    // escaped twice (`&amp;#847;&amp;nbsp;`) than showing it.
-    let text: String = decode_entities(&decode_entities(body))
+    // Decoded once; then the padding a template escaped twice
+    // (`&amp;#847;&amp;nbsp;`) is dropped, while text that spells out an
+    // entity (`&amp;lt;`) keeps showing it as written.
+    let text: String = strip_padding_references(&decode_entities(body))
         .chars()
         .filter(|c| !invisible(*c))
         .collect();
@@ -269,7 +280,8 @@ pub(crate) fn decode_entities(text: &str) -> String {
     decode(text, false)
 }
 /// Decodes references; with `only_invisible`, only those for invisible
-/// characters (which are then left out), keeping the rest as written.
+/// characters (which are then left out) and spaces, keeping the rest as
+/// written.
 fn decode(text: &str, only_invisible: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -295,9 +307,15 @@ fn decode(text: &str, only_invisible: bool) -> String {
             None => None,
         };
         let decoded = if only_invisible {
-            decoded
-                .filter(|(c, _)| c.chars().all(invisible))
-                .map(|(_, len)| (String::new(), len))
+            decoded.and_then(|(c, len)| {
+                if c.chars().all(invisible) {
+                    Some((String::new(), len))
+                } else if c.chars().all(char::is_whitespace) {
+                    Some((" ".to_owned(), len))
+                } else {
+                    None
+                }
+            })
         } else {
             decoded
         };
@@ -499,6 +517,23 @@ mod tests {
         // Ampersands that aren't references stay.
         assert_eq!(decode_entities("Tom & Jerry &unknown; AT&T"), "Tom & Jerry &unknown; AT&T");
         assert_eq!(html_to_text("1 < 2 and 3 > 2"), "1 < 2 and 3 > 2");
+        // An unclosed head (and title) ends where the body starts.
+        assert_eq!(
+            html_to_text("<html><head><title>x</title><body><p>Your order shipped</p></body></html>"),
+            "Your order shipped"
+        );
+        assert_eq!(
+            html_to_text("<html><head><title>Receipt<body><p>Thanks</p>"),
+            "Thanks"
+        );
+        assert_eq!(html_to_text("<head><meta charset=utf-8><div>Hi</div>"), "Hi");
+        assert_eq!(
+            html_to_text("<head><style>p { color: red }</style></head><body>Shown</body>"),
+            "Shown"
+        );
+        // Text that spells out an entity keeps it; twice-escaped padding goes.
+        assert_eq!(snippet("Type &amp;lt; for <"), "Type &lt; for <");
+        assert_eq!(snippet("Sale&amp;#847;&amp;nbsp;now"), "Sale now");
     }
 
     #[test]
@@ -551,6 +586,9 @@ pub struct Details {
     pub arrival: Option<Arrival>,
     /// The envelope sender, from the delivering server's Return-Path.
     pub return_path: Option<String>,
+    /// Whether `auth::check` has run: the checks look the sender's records
+    /// up in DNS, so they wait until asked for.
+    pub checked: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -766,14 +804,38 @@ fn internal(ip: std::net::IpAddr) -> bool {
         }
     }
 }
+/// Domains of Microsoft's Exchange Online servers.
+const MICROSOFT_DOMAINS: [&str; 3] = ["outlook.com", "office365.com", "exchangelabs.com"];
+/// Whether a host is `domain` or within it.
+fn within(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+/// A hop between two of Exchange Online's own servers. They pass mail over
+/// public IPv6 addresses from Microsoft's internal blocks (2603:10a6::/32,
+/// 2603:10b6::/32 and 2603:1096::/32), so a public address alone doesn't
+/// mark where mail reached Outlook or Microsoft 365. Both ends must be
+/// Microsoft's: the receiving server it wrote, and the sending one, which
+/// connected from one of those blocks and named itself in Microsoft's
+/// domains.
+fn microsoft_internal(hop: &Arrival) -> bool {
+    let Some(std::net::IpAddr::V6(ip)) = hop.ip else {
+        return false;
+    };
+    let ours = |host: &str| MICROSOFT_DOMAINS.iter().any(|d| within(host, d));
+    matches!(ip.segments()[..2], [0x2603, 0x10a6 | 0x10b6 | 0x1096])
+        && ours(&hop.helo)
+        && ours(&hop.by)
+}
 /// The hop over which the mailbox's provider received the message.
 ///
 /// `Received` headers are added on top, so those above the provider's own
 /// hops are its own, and any below may be forged by the sender. Going down
-/// from the top, the provider's internal hops (no `from` clause, or a
-/// private client address) are skipped; the first hop from a public address
-/// is the arrival. When the client's address isn't noted, nothing below can
-/// be trusted, so that hop is used, without an address.
+/// from the top, the provider's internal hops (no `from` clause, a private
+/// client address, or one between Microsoft's own servers) are skipped;
+/// the first other hop from a public address is the arrival. When the
+/// client's address isn't noted, nothing below can be trusted, so that hop
+/// is used, without an address.
 fn arrival(received: &[String]) -> Option<Arrival> {
     for header in received {
         let Some(hop) = hop(header) else {
@@ -781,6 +843,7 @@ fn arrival(received: &[String]) -> Option<Arrival> {
         };
         match hop.ip {
             Some(ip) if internal(ip) => continue,
+            Some(_) if microsoft_internal(&hop) => continue,
             _ => return Some(hop),
         }
     }
@@ -876,6 +939,45 @@ mod details_tests {
             Security::Tls
         );
         assert_eq!(security("by mx.example with SMTP id 1; d"), Security::Unknown);
+    }
+
+    #[test]
+    fn outlooks_internal_hops_are_not_taken_for_the_arrival() {
+        let raw = concat!(
+            "Received: from DM6PR11MB4593.namprd11.prod.outlook.com (2603:10b6:5:2a1::21)\r\n",
+            " by SN6PR11MB3117.namprd11.prod.outlook.com with HTTPS; Mon, 1 Jan 2024 00:00:03 +0000\r\n",
+            "Received: from BN9PR03CA0123.namprd03.prod.outlook.com (2603:10b6:408:fe::8)\r\n",
+            " by DM6PR11MB4593.namprd11.prod.outlook.com (2603:10b6:5:2a1::21) with Microsoft SMTP\r\n",
+            " Server (version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.20.1; d\r\n",
+            "Received: from BN2PEPF000044A7.namprd04.prod.outlook.com\r\n",
+            " (2603:10b6:408:fe:cafe::4b) by BN9PR03CA0123.outlook.office365.com\r\n",
+            " (2603:10b6:408:fe::8) with Microsoft SMTP Server (version=TLS1_3,\r\n",
+            " cipher=TLS_AES_256_GCM_SHA384) id 15.20.2 via Frontend Transport; d\r\n",
+            "Received: from mail-sender.news.example (198.51.100.25) by\r\n",
+            " BN2PEPF000044A7.mail.protection.outlook.com (10.167.243.158) with Microsoft SMTP\r\n",
+            " Server (version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id\r\n",
+            " 15.20.3 via Frontend Transport; d\r\n",
+            // Forged by the sender, below the provider's hops.
+            "Received: from mail.bank.example (mail.bank.example [192.0.2.80]) by mx.example with ESMTPS; d\r\n",
+            "\r\n",
+        );
+        let d = details(raw.as_bytes(), false);
+        let arrival = d.arrival.unwrap();
+        assert_eq!(arrival.ip, Some("198.51.100.25".parse().unwrap()));
+        assert_eq!(arrival.helo, "mail-sender.news.example");
+        assert_eq!(arrival.by, "bn2pepf000044a7.mail.protection.outlook.com");
+        assert_eq!(d.security, Security::Tls);
+        // A sender claiming a Microsoft name from outside Microsoft's
+        // internal blocks is where the mail arrived.
+        let raw = concat!(
+            "Received: from x.prod.outlook.com (2001:db8::5) by BN2PEPF000044A7.mail.protection.outlook.com (10.1.1.1) with SMTP; d\r\n",
+            "Received: from mail.bank.example (mail.bank.example [192.0.2.80]) by y.prod.outlook.com; d\r\n",
+            "\r\n",
+        );
+        assert_eq!(
+            details(raw.as_bytes(), false).arrival.unwrap().ip,
+            Some("2001:db8::5".parse().unwrap())
+        );
     }
 
     #[test]

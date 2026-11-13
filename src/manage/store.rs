@@ -244,6 +244,32 @@ impl Store {
         }
         Ok(crate::manage::subscriptions::group(mails))
     }
+    /// The newest `limit` messages from `address` in `account` that offer
+    /// to unsubscribe, newest first, each once, outside Junk and Trash.
+    pub fn subscription_messages(&self, account: &str, address: &str, limit: usize) -> Result<Vec<Mail>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND lower(trim(json_extract(data,'$.from')))=?2 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL ORDER BY json_extract(data,'$.date') DESC",
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for row in q.query_map(params![account, address.trim().to_lowercase()], |r| r.get::<_, String>(0))? {
+            let Ok(mail) = serde_json::from_str::<Mail>(&row?) else {
+                continue;
+            };
+            if crate::manage::subscriptions::Subscription::of(&mail).is_none() {
+                continue;
+            }
+            let identity = if mail.message_id.is_empty() { mail.id.clone() } else { mail.message_id.clone() };
+            if seen.insert(identity) {
+                out.push(mail);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
     /// Works out again the preview (and text, where kept) of cached
     /// messages from their downloaded source, after how mail is read as
     /// text changed (Office markup, character references and invisible
@@ -342,16 +368,38 @@ impl Store {
     /// Reads List-Unsubscribe from the downloaded source of messages cached
     /// before it was kept. Returns how many were found.
     pub fn backfill_subscriptions(&self) -> Result<usize> {
-        let found: Vec<(String, String, bool)> = {
+        let ids: Vec<String> = {
             let db = self.db.lock().unwrap();
             let mut q = db.prepare(
-                "SELECT id, raw FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL AND CAST(substr(raw,1,65536) AS TEXT) LIKE '%list-unsubscribe%'",
+                "SELECT id FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL",
             )?;
-            let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+            q.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut total = 0;
+        // In batches, as refresh_previews does, so sync and the interface
+        // get the cache in between.
+        for chunk in ids.chunks(100) {
+            let rows: Vec<(String, Vec<u8>)> = {
+                let db = self.db.lock().unwrap();
+                // Only the headers are needed, which come first.
+                let mut q = db.prepare(
+                    "SELECT substr(raw,1,65536) FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL",
+                )?;
+                let mut rows = Vec::new();
+                for id in chunk {
+                    if let Some(head) = q.query_map([id], |r| r.get::<_, Vec<u8>>(0))?.next() {
+                        rows.push((id.clone(), head?));
+                    }
+                }
+                rows
+            };
             let mut found = Vec::new();
-            for row in rows {
-                let (id, raw) = row?;
-                let Ok((headers, _)) = mailparse::parse_headers(&raw) else {
+            for (id, head) in rows {
+                if !head.windows(16).any(|w| w.eq_ignore_ascii_case(b"list-unsubscribe")) {
+                    continue;
+                }
+                let Ok((headers, _)) = mailparse::parse_headers(&head) else {
                     continue;
                 };
                 use mailparse::MailHeaderMap;
@@ -367,18 +415,21 @@ impl Store {
                     .contains("list-unsubscribe=one-click");
                 found.push((id, header.trim().to_owned(), one_click));
             }
-            found
-        };
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        for (id, header, one_click) in &found {
-            tx.execute(
-                "UPDATE messages SET data=json_set(data,'$.list_unsubscribe',?2,'$.one_click',json(?3)) WHERE id=?1",
-                params![id, header, if *one_click { "true" } else { "false" }],
-            )?;
+            if found.is_empty() {
+                continue;
+            }
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            for (id, header, one_click) in &found {
+                tx.execute(
+                    "UPDATE messages SET data=json_set(data,'$.list_unsubscribe',?2,'$.one_click',json(?3)) WHERE id=?1",
+                    params![id, header, if *one_click { "true" } else { "false" }],
+                )?;
+            }
+            tx.commit()?;
+            total += found.len();
         }
-        tx.commit()?;
-        Ok(found.len())
+        Ok(total)
     }
     pub fn message(&self, id: &str) -> Result<Option<Mail>> {
         use rusqlite::OptionalExtension;

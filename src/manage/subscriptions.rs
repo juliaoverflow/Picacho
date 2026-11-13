@@ -1,8 +1,14 @@
 //! Mail subscriptions: senders whose mail carries a List-Unsubscribe
 //! header, how many of their messages a mailbox holds, and asking them to
 //! stop (RFC 2369, with RFC 8058 one-click where offered).
-use crate::manage::model::{Draft, Mail};
-use anyhow::{Context, Result, bail};
+//!
+//! The header is only trusted as far as its sender's DKIM signature vouches
+//! for it: anyone can send mail "from" a newsletter's address. One click is
+//! used only when the signature covers it, and anything else (a message
+//! sent from the person's account, a page to open) is shown to them first.
+use crate::manage::model::{Draft, Folder, Mail};
+use crate::sync::auth::SignedUnsubscribe;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -30,8 +36,13 @@ impl Subscription {
         key(&self.account, &self.address)
     }
     /// The subscription a message belongs to, if it is from one.
+    /// Mail in Junk or Trash is not offered: unsubscribing from spam tells
+    /// its sender the address is read.
     pub fn of(m: &Mail) -> Option<Self> {
-        if m.list_unsubscribe.trim().is_empty() || method(&m.list_unsubscribe, m.one_click).is_none() {
+        if matches!(m.folder, Folder::Junk | Folder::Trash)
+            || m.list_unsubscribe.trim().is_empty()
+            || method(&m.list_unsubscribe, m.one_click).is_none()
+        {
             return None;
         }
         Some(Self {
@@ -96,8 +107,9 @@ pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
 pub enum Method {
     /// POST `List-Unsubscribe=One-Click` to the address; done at once.
     OneClick(String),
-    /// Send a message (address, subject, body).
-    Mail { to: String, subject: String, body: String },
+    /// Send a message to one address with this subject; the body is
+    /// always just "unsubscribe".
+    Mail { to: String, subject: String },
     /// A web page the sender wants opened.
     Web(String),
 }
@@ -133,25 +145,31 @@ pub fn method(header: &str, one_click: bool) -> Option<Method> {
     if one_click && let Some(url) = &https {
         return Some(Method::OneClick(url.clone()));
     }
+    // Of a mailto: only one recipient, and its subject, are used: other
+    // recipients (in the address or `to=`, `cc=`, `bcc=`) and the body
+    // would let a sender have the person's account mail anyone anything.
     if let Some(mailto) = all.iter().find(|u| u.to_ascii_lowercase().starts_with("mailto:")) {
         let rest = &mailto["mailto:".len()..];
         let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
         let mut subject = String::new();
-        let mut body = String::new();
         for pair in query.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            match k.to_ascii_lowercase().as_str() {
-                "subject" => subject = decode(v),
-                "body" => body = decode(v),
-                _ => {}
+            if k.eq_ignore_ascii_case("subject") {
+                subject = decode(v);
             }
         }
-        let to = decode(to);
-        if to.contains('@') {
+        let subject: String = subject
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        let to = decode(to).trim().to_owned();
+        if single_address(&to) {
             return Some(Method::Mail {
                 to,
                 subject: if subject.is_empty() { "unsubscribe".into() } else { subject },
-                body: if body.is_empty() { "unsubscribe".into() } else { body },
             });
         }
     }
@@ -161,6 +179,46 @@ pub fn method(header: &str, one_click: bool) -> Option<Method> {
                 .find(|u| u.to_ascii_lowercase().starts_with("http://"))
         })
         .map(Method::Web)
+}
+
+/// Whether `to` is exactly one plain address (`local@domain`).
+fn single_address(to: &str) -> bool {
+    let Some((local, domain)) = to.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !to.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, ',' | ';' | '<' | '>' | '"' | '(' | ')' | ':' | '\\' | '[' | ']')
+        })
+        && !domain.contains('@')
+}
+
+/// What unsubscribing will do, worked out before anything is done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub method: Method,
+    /// Whether the header it came from was signed by the sender (DKIM, for
+    /// the From address's domain).
+    pub verified: bool,
+}
+impl Plan {
+    /// From the newest message whose header its sender signed; failing
+    /// that, from the `latest` header, which anyone could have written, and
+    /// then never by one click.
+    pub fn new(signed: Option<&SignedUnsubscribe>, latest: &str) -> Option<Self> {
+        match signed {
+            Some(s) => method(&s.header, s.one_click).map(|method| Self { method, verified: true }),
+            None => method(latest, false).map(|method| Self { method, verified: false }),
+        }
+    }
+    /// Whether the person is asked first: everything but a one-click
+    /// request, which is only planned when the sender signed it.
+    pub fn needs_confirmation(&self) -> bool {
+        !matches!(self.method, Method::OneClick(_))
+    }
 }
 
 /// Percent-decoding for mailto: parts.
@@ -194,17 +252,36 @@ pub enum Outcome {
     Open(String),
 }
 
-/// Asks the sender of `sub` to stop. Mail goes out through `send`.
+/// The redirects a one-click request follows: a few, and only to HTTPS,
+/// so the request is never sent on in the clear.
+fn https_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            attempt.error("too many redirects")
+        } else if attempt.url().scheme() != "https" {
+            attempt.error("redirected to an address that isn't HTTPS")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Carries out `plan` for `account`. Mail goes out through `send`.
 pub fn unsubscribe(
-    sub: &Subscription,
+    plan: &Plan,
+    account: &str,
     send: impl FnOnce(&Draft) -> Result<()>,
 ) -> Result<Outcome> {
-    match method(&sub.unsubscribe, sub.one_click).context("This sender offers no way to unsubscribe.")? {
+    match &plan.method {
         Method::OneClick(url) => {
+            if !plan.verified {
+                bail!("The sender's request to unsubscribe couldn't be verified.");
+            }
             let response = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(https_redirects())
                 .build()?
-                .post(&url)
+                .post(url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body("List-Unsubscribe=One-Click")
                 .send()?;
@@ -213,19 +290,19 @@ pub fn unsubscribe(
             }
             Ok(Outcome::Done)
         }
-        Method::Mail { to, subject, body } => {
+        Method::Mail { to, subject } => {
             let draft = Draft {
                 id: uuid::Uuid::new_v4().to_string(),
-                account: sub.account.clone(),
-                to,
-                subject,
-                body,
+                account: account.to_owned(),
+                to: to.clone(),
+                subject: subject.clone(),
+                body: "unsubscribe".into(),
                 ..Draft::default()
             };
             send(&draft)?;
             Ok(Outcome::Done)
         }
-        Method::Web(url) => Ok(Outcome::Open(url)),
+        Method::Web(url) => Ok(Outcome::Open(url.clone())),
     }
 }
 
@@ -246,7 +323,6 @@ mod tests {
             Some(Method::Mail {
                 to: "leave-123@lists.example.com".into(),
                 subject: "Unsubscribe me".into(),
-                body: "unsubscribe".into(),
             })
         );
         assert_eq!(
@@ -254,6 +330,74 @@ mod tests {
             Some(Method::Web("https://example.com/u".into()))
         );
         assert_eq!(method("nonsense", true), None);
+    }
+
+    #[test]
+    fn mail_goes_to_one_address_with_a_fixed_body() {
+        // Two recipients in one address: not mailed, the page is offered.
+        let h = "<mailto:a@evil.example,b@victim.example?subject=SUBSCRIBE&body=confirm%20yes>, <https://example.com/u>";
+        assert_eq!(method(h, false), Some(Method::Web("https://example.com/u".into())));
+        for to in [
+            "a@evil.example%2Cb@victim.example",
+            "a@evil.example;b@victim.example",
+            "Name <a@evil.example>",
+            "a@b@evil.example",
+            "a@localhost",
+            "",
+        ] {
+            assert_eq!(method(&format!("<mailto:{to}>"), false), None, "{to}");
+        }
+        // Extra recipients and the body in the query are ignored.
+        let Some(Method::Mail { to, subject }) = method(
+            "<mailto:leave@lists.example.com?cc=b@victim.example&bcc=c@victim.example&subject=Stop%0D%0ABcc:%20d@x.example&body=confirm>",
+            false,
+        ) else {
+            panic!("a mailto");
+        };
+        assert_eq!(to, "leave@lists.example.com");
+        assert_eq!(subject, "StopBcc: d@x.example");
+        let mut sent = None;
+        let plan = Plan::new(None, "<mailto:leave@lists.example.com?body=SUBSCRIBE>").unwrap();
+        unsubscribe(&plan, "acct", |d| {
+            sent = Some(d.clone());
+            Ok(())
+        })
+        .unwrap();
+        let sent = sent.unwrap();
+        assert_eq!((sent.to.as_str(), sent.body.as_str()), ("leave@lists.example.com", "unsubscribe"));
+    }
+
+    #[test]
+    fn one_click_only_for_a_signed_header() {
+        let h = "<https://example.com/u/1>, <mailto:leave@example.com>";
+        // Unsigned (or forged): never one click, and asked first.
+        let plan = Plan::new(None, h).unwrap();
+        assert!(!plan.verified);
+        assert!(matches!(plan.method, Method::Mail { .. }));
+        assert!(plan.needs_confirmation());
+        // Signed, with one-click signed too.
+        let signed = SignedUnsubscribe { header: h.into(), one_click: true };
+        let plan = Plan::new(Some(&signed), "<https://forged.example/u>").unwrap();
+        assert_eq!(plan, Plan { method: Method::OneClick("https://example.com/u/1".into()), verified: true });
+        assert!(!plan.needs_confirmation());
+        // A one-click plan that wasn't verified is refused outright.
+        let forged = Plan { method: Method::OneClick("https://forged.example/u".into()), verified: false };
+        assert!(unsubscribe(&forged, "acct", |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn junk_and_trash_are_not_offered() {
+        let m = |folder| Mail {
+            account: "a".into(),
+            from: "news@example.com".into(),
+            folder,
+            list_unsubscribe: "<https://example.com/u>".into(),
+            ..Mail::default()
+        };
+        assert!(Subscription::of(&m(Folder::Inbox)).is_some());
+        assert!(Subscription::of(&m(Folder::Junk)).is_none());
+        assert!(Subscription::of(&m(Folder::Trash)).is_none());
+        assert_eq!(group([m(Folder::Junk), m(Folder::Trash)]).len(), 0);
     }
 
     #[test]

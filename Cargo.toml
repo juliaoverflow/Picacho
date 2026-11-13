@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Picacho: a fast, native email client for macOS, Windows, and Linux"
 license = "MIT"
+# mail-auth 0.14 and later need mail-parser 1.0, which needs Rust 1.98.
+rust-version = "1.98"
 
 [dependencies]
 aes-gcm = "0.11"
@@ -32,12 +34,13 @@ gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
 hkdf = "0.13"
 # Tokio runs mail-auth's DNS lookups (hickory) for checking senders.
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 imap = "2.4"
 # Parses responses that imap 2.4 cannot (CONDSTORE SELECT, Gmail ids); patched below.
 imap-proto = "=0.10.2"
-# The v1 feature keeps keyring 3's stores: Keychain, Credential Manager and the
-# Secret Service, which finds items saved by keyring 3 by service and user.
+# Keyring 4's default features (its `v1` set, left on here) keep keyring 3's
+# stores: Keychain, Credential Manager and the Secret Service, which finds
+# items saved by keyring 3 by service and user.
 keyring = "4"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
 # Checks DKIM, SPF and DMARC. Pure-Rust crypto, without aws-lc's C build.

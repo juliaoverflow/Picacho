@@ -116,7 +116,9 @@ impl MailApp {
         );
     }
     /// Asks a subscription's sender to stop, and remembers that it was.
-    pub(super) fn unsubscribe(&mut self, sub: MailSubscription, cx: &mut Context<Self>) {
+    /// Works out how first (checking the sender's signature), and asks the
+    /// person before sending mail from their account or opening a page.
+    pub(super) fn unsubscribe(&mut self, sub: MailSubscription, w: &mut Window, cx: &mut Context<Self>) {
         let key = sub.key();
         if self.unsubscribed.contains(&key) || !self.unsubscribing.insert(key.clone()) {
             return;
@@ -131,9 +133,80 @@ impl MailApp {
         } else {
             sub.name.clone()
         };
+        let window = w.window_handle();
+        let planning = account.clone();
         self.task(
             cx,
-            move |b| b.unsubscribe(&account, &sub),
+            move |b| b.unsubscribe_plan(&planning, &sub),
+            move |this, result, cx| {
+                let plan = match result {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        this.unsubscribing.remove(&key);
+                        this.notice(format!("Couldn't unsubscribe: {e:#}"), true, cx);
+                        return;
+                    }
+                };
+                if !plan.needs_confirmation() {
+                    this.carry_out_unsubscribe(key, who, account, plan, cx);
+                    return;
+                }
+                let (title, mut detail, go) = match &plan.method {
+                    subs::Method::Mail { to, subject } => (
+                        format!("Email {to} to unsubscribe?"),
+                        format!(
+                            "A message saying \"unsubscribe\", with the subject \"{subject}\", will be sent from {} to {to}.",
+                            account.email
+                        ),
+                        "Send",
+                    ),
+                    subs::Method::Web(url) => (
+                        format!("Open {who}'s unsubscribe page?"),
+                        format!("{url} will open in your browser."),
+                        "Open",
+                    ),
+                    subs::Method::OneClick(_) => unreachable!("one click needs no confirmation"),
+                };
+                if !plan.verified {
+                    detail.push_str(&format!(
+                        "\n\nThe sender's signature doesn't cover this request, so it may not come from {}.",
+                        sub_address(&key)
+                    ));
+                }
+                let answer = window.update(cx, |_, window, cx| {
+                    window.prompt(PromptLevel::Info, &title, Some(&detail), &[go, "Cancel"], cx)
+                });
+                let Ok(answer) = answer else {
+                    this.unsubscribing.remove(&key);
+                    return;
+                };
+                cx.spawn(async move |this, cx| {
+                    let go = matches!(answer.await, Ok(0));
+                    let _ = this.update(cx, |this, cx| {
+                        if go {
+                            this.carry_out_unsubscribe(key, who, account, plan, cx);
+                        } else {
+                            this.unsubscribing.remove(&key);
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            },
+        );
+        cx.notify();
+    }
+    fn carry_out_unsubscribe(
+        &mut self,
+        key: String,
+        who: String,
+        account: crate::manage::model::Account,
+        plan: subs::Plan,
+        cx: &mut Context<Self>,
+    ) {
+        self.task(
+            cx,
+            move |b| b.unsubscribe(&account, &plan),
             move |this, result, cx| {
                 this.unsubscribing.remove(&key);
                 match result {
@@ -458,4 +531,9 @@ impl MailApp {
             .child(self.unsubscribe_button(format!("unsubscribe-{index}"), sub, cx))
             .into_any_element()
     }
+}
+
+/// The sender's address in a subscription key.
+fn sub_address(key: &str) -> &str {
+    key.split_once('\u{1f}').map_or(key, |(_, address)| address)
 }

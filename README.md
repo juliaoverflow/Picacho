@@ -27,7 +27,7 @@ Picacho is a fast, native email client written in Rust with GPUI. It runs withou
 
 ## Build
 
-Requirements: Rust 1.96 or later. On macOS 12 or later, Xcode with its command-line tools; if GPUI reports a missing Metal compiler, run `xcodebuild -downloadComponent MetalToolchain`. Credentials are kept in the system keychain on each platform: macOS Keychain, Windows Credential Manager, or the Secret Service on Linux.
+Requirements: Rust 1.98 or later. On macOS 12 or later, Xcode with its command-line tools; if GPUI reports a missing Metal compiler, run `xcodebuild -downloadComponent MetalToolchain`. Credentials are kept in the system keychain on each platform: macOS Keychain, Windows Credential Manager, or the Secret Service on Linux.
 
 Create an optimized, locally signed macOS application bundle:
 

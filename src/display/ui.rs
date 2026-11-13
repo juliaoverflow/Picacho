@@ -496,6 +496,8 @@ enum Action {
     /// Shows the HTML part (true) or the plain text part (false).
     ShowHtml(bool),
     ToggleDetails,
+    /// Checks the open message's sender (SPF, DKIM, DMARC) in DNS.
+    CheckSender,
     /// Shows or hides the quoted history of the open reply.
     ToggleQuotes,
     /// Lists every message of a long conversation.
@@ -782,6 +784,8 @@ pub struct MailApp {
     /// Whether the open message's details are expanded, and what was read
     /// from its original source.
     details_open: bool,
+    /// The message whose sender is being checked.
+    sender_checking: Option<String>,
     /// What the Original Message window shows.
     source_view: SourceView,
     /// The open subscriptions list (in place of the message list), for an
@@ -1243,6 +1247,7 @@ impl MailApp {
             switch_anim: 0,
             switch_at: None,
             details_open: false,
+            sender_checking: None,
             source_view: SourceView::Original,
             subs_open: false,
             subs: Vec::new(),
@@ -2703,8 +2708,10 @@ impl MailApp {
             cx,
             move |b| {
                 let raw = b.original(&account, &m)?;
-                let mut details = crate::sync::mime::details(&raw, b.decrypts(&account, &raw));
-                crate::sync::auth::check(&raw, &mut details);
+                // The sender is checked only when asked (Check sender): the
+                // lookups reach the sender's DNS and can tell it when the
+                // message was opened.
+                let details = crate::sync::mime::details(&raw, b.decrypts(&account, &raw));
                 Ok(Original::new(details, &raw))
             },
             move |this, result, cx| {
@@ -2717,6 +2724,39 @@ impl MailApp {
                 cx.notify();
             },
         );
+    }
+    /// Checks the open message's sender, once, when asked.
+    fn check_sender(&mut self, cx: &mut Context<Self>) {
+        let Some(original) = self.original_source() else {
+            return;
+        };
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        if original.details.checked || self.sender_checking.as_ref() == Some(&id) {
+            return;
+        }
+        self.sender_checking = Some(id.clone());
+        let (raw, mut details) = (original.raw.clone(), original.details.clone());
+        self.task(
+            cx,
+            move |_| {
+                crate::sync::auth::check(&raw, &mut details);
+                Ok(Original::new(details, &raw))
+            },
+            move |this, result, cx| {
+                if this.sender_checking.as_ref() == Some(&id) {
+                    this.sender_checking = None;
+                }
+                if let (Ok(original), Some(info)) = (result, this.details.as_mut())
+                    && info.id == id
+                {
+                    info.result = Some(Ok(Rc::new(original)));
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
     }
     fn original_source(&self) -> Option<Rc<Original>> {
         let info = self.details.as_ref()?;
@@ -3306,8 +3346,9 @@ impl MailApp {
                     self.load_details(cx);
                 }
             }
+            Action::CheckSender => self.check_sender(cx),
             Action::OpenSubscriptions(id) => self.open_subscriptions(id, w, cx),
-            Action::Unsubscribe(sub) => self.unsubscribe(sub, cx),
+            Action::Unsubscribe(sub) => self.unsubscribe(sub, w, cx),
             Action::ShowOriginal => self.handle(Action::ShowSource(SourceView::Original), w, cx),
             Action::ShowSource(view) => {
                 self.source_view = view;

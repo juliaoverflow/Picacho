@@ -1500,17 +1500,24 @@ mod tests {
             this.unsubscribed
                 .insert(crate::manage::subscriptions::key(&work, "hello@thebrowser.com"));
         });
-        act(
-            &view,
-            Action::Unsubscribe(view.read_with(cx, |this, _| this.subs.first().cloned()).unwrap_or_else(|| {
-                MailSubscription {
-                    account: work.clone(),
-                    address: "hello@thebrowser.com".into(),
-                    ..Default::default()
-                }
-            })),
-            cx,
-        );
+        let subs = view.read_with(cx, |this, _| this.subs.clone());
+        let (done, other): (Vec<_>, Vec<_>) = subs
+            .into_iter()
+            .partition(|s| s.account == work && s.address == "hello@thebrowser.com");
+        act(&view, Action::Unsubscribe(done[0].clone()), cx);
         view.read_with(cx, |this, _| assert!(this.unsubscribing.is_empty()));
+        assert!(!cx.has_pending_prompt());
+        // Its header was never signed (the sample mail has no signatures),
+        // so nothing is sent or opened until the person agrees.
+        let other = other[0].clone();
+        act(&view, Action::Unsubscribe(other.clone()), cx);
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt(), "asks before unsubscribing");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert!(this.unsubscribing.is_empty());
+            assert!(!this.unsubscribed.contains(&other.key()));
+        });
     }
 }

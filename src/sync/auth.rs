@@ -4,11 +4,15 @@
 //! The answers are worked out here, from the message and DNS, rather than
 //! read from `Authentication-Results` or `DKIM-Signature` headers, which a
 //! sender can write themselves. They reflect DNS now, not at delivery: a
-//! signing key since retired makes an old signature fail.
+//! signing key since retired can't verify an old signature, so for older
+//! mail that is reported as "couldn't verify", not as a failure.
 //!
-//! Lookups go through the system's DNS resolver, and only when a message's
-//! details are opened. The sender's own DNS servers see the lookups for its
-//! domain, as the receiving server's did on delivery.
+//! Lookups go through the system's DNS resolver, and only when the person
+//! asks for them (Check sender in a message's details, or unsubscribing).
+//! The sender's own DNS servers see each lookup for its domain, at the
+//! time it is made: a sender that gives every recipient their own DKIM
+//! selector learns when that recipient's message was checked, much as a
+//! remote image would tell it the message was opened.
 use super::mime::{Arrival, Details};
 use mail_auth::{
     AuthenticatedMessage, DkimOutput, DkimResult, DmarcResult, DnsCache, MessageAuthenticator,
@@ -28,6 +32,9 @@ use std::{
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// Answers kept per record type before the oldest are dropped.
 const CACHE_ENTRIES: usize = 2000;
+/// How old a message must be before a signature that no longer verifies
+/// against today's key is put down to the key having changed.
+const KEY_ROTATION_AGE: i64 = 7 * 24 * 3600;
 
 /// DNS answers, kept until they expire, so opening several messages from
 /// one sender looks its records up once.
@@ -115,7 +122,12 @@ fn checker() -> Option<&'static Checker> {
     static CHECKER: OnceLock<Option<Checker>> = OnceLock::new();
     CHECKER
         .get_or_init(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            // Each check blocks its own caller's thread; the workers drive
+            // DNS, so several messages' checks run at once rather than
+            // queueing behind one another's timeouts.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("picacho-dns")
                 .enable_all()
                 .build()
                 .ok()?;
@@ -178,12 +190,30 @@ struct Verdicts {
     mailed_by: Option<String>,
     dmarc: Option<String>,
 }
+/// Whether a signature's result could come from its signing key having
+/// been replaced or withdrawn since: it no longer verifies, or its key
+/// record is gone or revoked. A changed body, by contrast, is a failure
+/// whatever the key.
+fn key_may_have_changed(result: &DkimResult) -> bool {
+    use mail_auth::{Error, dkim::DkimError};
+    match result {
+        DkimResult::Fail(e) | DkimResult::PermError(e) => matches!(
+            e,
+            Error::Crypto(_) | Error::Dns(_) | Error::Dkim(DkimError::PublicKeyRevoked)
+        ),
+        _ => false,
+    }
+}
+/// The verdict for DKIM, or DMARC, that could not be confirmed either way.
+pub const UNVERIFIABLE: &str = "unverifiable";
+
 async fn verify(
     authenticator: &MessageAuthenticator,
     cache: &Cache,
     message: &AuthenticatedMessage<'_>,
     arrival: Option<&Arrival>,
     return_path: &str,
+    old: bool,
 ) -> Verdicts {
     let dkim = authenticator
         .verify_dkim(Parameters::new(message).with_cache(cache))
@@ -220,11 +250,22 @@ async fn verify(
         )
         .await;
     let signed_by = verified_domains(&dkim);
+    // An older message whose signatures no longer verify against today's
+    // keys can't be told from a forgery: neither is called a failure.
+    let unverifiable =
+        signed_by.is_empty() && old && dkim.iter().any(|o| key_may_have_changed(o.result()));
     // One verdict for all signatures: a pass if any verified.
-    let dkim_verdict = if signed_by.is_empty() {
-        dkim.first().map(|o| dkim_name(o.result()).to_owned())
-    } else {
+    let dkim_verdict = if !signed_by.is_empty() {
         Some("pass".into())
+    } else if unverifiable {
+        Some(UNVERIFIABLE.into())
+    } else {
+        dkim.first().map(|o| dkim_name(o.result()).to_owned())
+    };
+    let dmarc_verdict = match dmarc.result() {
+        // DMARC failed only for want of the signature that couldn't be checked.
+        DmarcResult::Fail(_) if unverifiable => UNVERIFIABLE,
+        result => dmarc_name(&result),
     };
     Verdicts {
         signed_by,
@@ -234,7 +275,7 @@ async fn verify(
             .filter(|s| s.result() == SpfResult::Pass)
             .map(|s| s.domain().to_ascii_lowercase()),
         spf: spf.map(|s| s.result().to_string()),
-        dmarc: Some(dmarc_name(&dmarc.result()).into()),
+        dmarc: Some(dmarc_verdict.into()),
     }
 }
 
@@ -247,8 +288,10 @@ async fn verify(
 /// wrote, so a panic in them leaves the results empty rather than stopping
 /// the details from showing.
 pub fn check(raw: &[u8], details: &mut Details) {
+    details.checked = true;
     let arrival = details.arrival.clone();
     let return_path = details.return_path.clone().unwrap_or_default();
+    let old = age(raw).is_some_and(|age| age > KEY_ROTATION_AGE);
     let verdicts = std::panic::catch_unwind(|| {
         let checker = checker()?;
         let message = AuthenticatedMessage::parse(raw)?;
@@ -264,6 +307,7 @@ pub fn check(raw: &[u8], details: &mut Details) {
                         &message,
                         arrival.as_ref(),
                         &return_path,
+                        old,
                     ),
                 )
                 .await
@@ -278,6 +322,91 @@ pub fn check(raw: &[u8], details: &mut Details) {
     details.spf = v.spf;
     details.mailed_by = v.mailed_by;
     details.dmarc = v.dmarc;
+}
+
+/// How long ago, in seconds, a message says it was written.
+fn age(raw: &[u8]) -> Option<i64> {
+    use mailparse::MailHeaderMap;
+    let (headers, _) = mailparse::parse_headers(raw).ok()?;
+    let date = mailparse::dateparse(&headers.get_first_value("Date")?).ok()?;
+    Some(chrono::Utc::now().timestamp() - date)
+}
+
+/// A message's List-Unsubscribe header, as its sender signed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedUnsubscribe {
+    pub header: String,
+    /// Whether one-click (RFC 8058) is offered, with List-Unsubscribe-Post
+    /// signed too.
+    pub one_click: bool,
+}
+
+/// The List-Unsubscribe header of `raw`, when a DKIM signature that
+/// verifies, from the From address's domain (or a parent of it), covers it
+/// (RFC 8058, Section 4). Anything else in a mailbox could have been written
+/// by anyone using the sender's address. None too when DNS can't be reached.
+///
+/// Called from any thread outside Tokio.
+pub fn signed_unsubscribe(raw: &[u8]) -> Option<SignedUnsubscribe> {
+    std::panic::catch_unwind(|| {
+        let checker = checker()?;
+        let message = AuthenticatedMessage::parse(raw)?;
+        checker
+            .runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    TIMEOUT,
+                    unsubscribe_signature(&checker.authenticator, &checker.cache, &message, raw),
+                )
+                .await
+            })
+            .ok()
+            .flatten()
+    })
+    .ok()
+    .flatten()
+}
+async fn unsubscribe_signature(
+    authenticator: &MessageAuthenticator,
+    cache: &Cache,
+    message: &AuthenticatedMessage<'_>,
+    raw: &[u8],
+) -> Option<SignedUnsubscribe> {
+    use mailparse::MailHeaderMap;
+    let (headers, _) = mailparse::parse_headers(raw).ok()?;
+    // RFC 8058: with more than one, which applies is unclear.
+    let [header] = &headers.get_all_values("List-Unsubscribe")[..] else {
+        return None;
+    };
+    let from = mailparse::addrparse_header(headers.get_first_header("From")?).ok()?;
+    let [mailparse::MailAddr::Single(from)] = &from[..] else {
+        return None;
+    };
+    let from_domain = from.addr.rsplit_once('@')?.1.trim().to_ascii_lowercase();
+    let dkim = authenticator
+        .verify_dkim(Parameters::new(message).with_cache(cache))
+        .await;
+    let covers = |h: &[String], name: &str| h.iter().any(|h| h.trim().eq_ignore_ascii_case(name));
+    let signature = dkim
+        .iter()
+        .filter(|o| *o.result() == DkimResult::Pass)
+        .filter_map(|o| o.signature())
+        .filter(|s| {
+            let d = s.d.to_ascii_lowercase();
+            from_domain == d || from_domain.ends_with(&format!(".{d}"))
+        })
+        .find(|s| covers(&s.h, "List-Unsubscribe"))?;
+    let posts = headers.get_all_values("List-Unsubscribe-Post");
+    let one_click = covers(&signature.h, "List-Unsubscribe-Post")
+        && posts.len() == 1
+        && posts[0]
+            .to_ascii_lowercase()
+            .replace(' ', "")
+            .contains("list-unsubscribe=one-click");
+    Some(SignedUnsubscribe {
+        header: header.trim().to_owned(),
+        one_click,
+    })
 }
 
 #[cfg(test)]
@@ -347,12 +476,111 @@ mod tests {
                 "DKIM-Signature: {signature}\r\nFrom: Bank <alerts@bank.example>\r\nSubject: Urgent\r\n\r\n{body}"
             );
             let message = AuthenticatedMessage::parse(raw.as_bytes()).unwrap();
-            let v = runtime.block_on(verify(&authenticator, &cache, &message, None, ""));
+            let v = runtime.block_on(verify(&authenticator, &cache, &message, None, "", false));
             assert!(v.signed_by.is_empty(), "{signature}: {v:?}");
             assert_ne!(v.dkim.as_deref(), Some("pass"), "{signature}");
             assert_eq!(v.dmarc.as_deref(), Some("fail"), "{signature}");
             assert_eq!((v.spf, v.mailed_by), (None, None), "no recorded arrival");
         }
+    }
+
+    fn offline() -> (tokio::runtime::Runtime, MessageAuthenticator) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // No resolver is reached: every answer is in the cache.
+        let authenticator = MessageAuthenticator::new(
+            mail_auth::hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                &mail_auth::hickory_resolver::config::CLOUDFLARE,
+            ),
+            Default::default(),
+        )
+        .unwrap();
+        (runtime, authenticator)
+    }
+    /// Signs `message` as bank.example with RFC 8463's example key.
+    fn sign(message: &str, headers: &[&str]) -> String {
+        use mail_auth::{crypto::Ed25519Key, dkim::DkimSigner, headers::HeaderWriter};
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.decode(s).unwrap();
+        let key = Ed25519Key::from_seed_and_public_key(
+            &b64("nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A="),
+            &b64("11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="),
+        )
+        .unwrap();
+        let signature = DkimSigner::from_key(key)
+            .domain("bank.example")
+            .selector("s1")
+            .headers(headers.iter().copied())
+            .sign(message.as_bytes())
+            .unwrap();
+        format!("{}{message}", signature.to_header())
+    }
+
+    #[test]
+    fn only_a_signed_list_unsubscribe_is_trusted() {
+        let (runtime, authenticator) = offline();
+        let cache = bank_dns();
+        let check = |raw: &str| {
+            let message = AuthenticatedMessage::parse(raw.as_bytes()).unwrap();
+            runtime.block_on(unsubscribe_signature(&authenticator, &cache, &message, raw.as_bytes()))
+        };
+        let message = "From: Bank News <news@mail.bank.example>\r\nSubject: News\r\nList-Unsubscribe: <https://bank.example/u/1>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\r\nHello.\r\n";
+        let all = ["From", "Subject", "List-Unsubscribe", "List-Unsubscribe-Post"];
+        assert_eq!(
+            check(&sign(message, &all)),
+            Some(SignedUnsubscribe { header: "<https://bank.example/u/1>".into(), one_click: true })
+        );
+        // The header signed, but not the request for one click.
+        assert_eq!(
+            check(&sign(message, &["From", "List-Unsubscribe"])).map(|s| s.one_click),
+            Some(false)
+        );
+        // Signed, but the header isn't among what was signed.
+        assert_eq!(check(&sign(message, &["From", "Subject"])), None);
+        // A header changed after signing (as a forger replaying it would).
+        let replaced = sign(message, &all).replace("https://bank.example/u/1", "https://evil.example/u");
+        assert_eq!(check(&replaced), None);
+        // A valid signature from a domain other than the From address's.
+        let other = message.replace("news@mail.bank.example", "news@news.example");
+        assert_eq!(check(&sign(&other, &all)), None);
+        // Unsigned.
+        assert_eq!(check(message), None);
+    }
+
+    #[test]
+    fn old_mail_whose_key_changed_is_unverifiable_not_failed() {
+        let (runtime, authenticator) = offline();
+        let message = "From: Bank <alerts@bank.example>\r\nSubject: Statement\r\n\r\nHello.\r\n";
+        let signed = sign(message, &["From", "Subject"]);
+        // The key since replaced with another.
+        let cache = Cache::default();
+        let later = Instant::now() + Duration::from_secs(3600);
+        cache.txt.insert(
+            "s1._domainkey.bank.example.".into(),
+            DomainKey::parse(b"v=DKIM1; k=ed25519; p=GBEUmNb5Xm9Jrl/C8pBMjqTkGbYNK5Ou1uxW0EEnfMk=")
+                .unwrap()
+                .into(),
+            later,
+        );
+        cache.txt.insert(
+            "_dmarc.bank.example.".into(),
+            DmarcRecord::parse(b"v=DMARC1; p=reject").unwrap().into(),
+            later,
+        );
+        let parsed = AuthenticatedMessage::parse(signed.as_bytes()).unwrap();
+        let recent = runtime.block_on(verify(&authenticator, &cache, &parsed, None, "", false));
+        assert_eq!(recent.dkim.as_deref(), Some("fail"));
+        assert_eq!(recent.dmarc.as_deref(), Some("fail"));
+        let old = runtime.block_on(verify(&authenticator, &cache, &parsed, None, "", true));
+        assert_eq!(old.dkim.as_deref(), Some(UNVERIFIABLE));
+        assert_eq!(old.dmarc.as_deref(), Some(UNVERIFIABLE));
+        // A body changed after signing fails however old the message.
+        let tampered = signed.replace("Hello.", "Pay now.");
+        let parsed = AuthenticatedMessage::parse(tampered.as_bytes()).unwrap();
+        let v = runtime.block_on(verify(&authenticator, &bank_dns(), &parsed, None, "", true));
+        assert_ne!(v.dkim.as_deref(), Some(UNVERIFIABLE));
+        assert_ne!(v.dkim.as_deref(), Some("pass"));
     }
 
     #[test]

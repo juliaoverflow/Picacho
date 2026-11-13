@@ -686,6 +686,56 @@ impl MailApp {
                 );
                 let checks: Vec<(&str, &Option<String>)> =
                     vec![("SPF", &d.spf), ("DKIM", &d.dkim), ("DMARC", &d.dmarc)];
+                if !d.checked {
+                    let checking = self.sender_checking.as_deref() == Some(m.id.as_str());
+                    panel_rows.push(
+                        row(
+                            "verified:",
+                            if checking {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_color(rgb(c.muted))
+                                    .child(spinner(13., c.muted))
+                                    .child("Checking the sender…")
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        self.button(
+                                            "check-sender",
+                                            "Check sender",
+                                            "",
+                                            Action::CheckSender,
+                                            false,
+                                            cx,
+                                        )
+                                        .h(px(24.))
+                                        .text_size(px(11.5))
+                                        .border_1()
+                                        .border_color(rgb(c.border)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(c.muted))
+                                            .child("Looks up SPF, DKIM and DMARC; the sender's DNS can see when."),
+                                    )
+                                    .into_any_element()
+                            },
+                        )
+                        .into_any_element(),
+                    );
+                } else if !checks.iter().any(|(_, v)| v.is_some()) {
+                    panel_rows.push(
+                        row("verified:", text("Couldn't check the sender (no DNS answer)".into()))
+                            .into_any_element(),
+                    );
+                }
                 if checks.iter().any(|(_, v)| v.is_some()) {
                     panel_rows.push(
                         row(
@@ -985,9 +1035,14 @@ impl MailApp {
                         )
                         .child(div().flex_1().min_w_0().truncate().child(value))
                 };
+                let checked = d.checked;
                 let verdict = |v: &Option<String>, domain: Option<&String>| match (v, domain) {
+                    (Some(v), _) if v == crate::sync::auth::UNVERIFIABLE => {
+                        "Couldn't verify (the signing key may have changed since)".into()
+                    }
                     (Some(v), Some(d)) => format!("{} with domain {d}", v.to_uppercase()),
                     (Some(v), None) => v.to_uppercase(),
+                    (None, _) if !checked => "Not checked (use Check sender in the message's details)".into(),
                     (None, _) => "Not recorded".into(),
                 };
                 let view = self.source_view;
@@ -1146,7 +1201,11 @@ fn verdict_chip(name: &str, verdict: &str, c: Colors) -> AnyElement {
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(fg))
         .bg(rgba((bg << 8) | 0x1f))
-        .child(format!("{name} {verdict}"))
+        .child(if verdict == crate::sync::auth::UNVERIFIABLE {
+            format!("{name} couldn't verify (key may have changed)")
+        } else {
+            format!("{name} {verdict}")
+        })
         .into_any_element()
 }
 

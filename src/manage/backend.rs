@@ -1437,14 +1437,39 @@ impl Backend {
             Ok(stored)
         })
     }
-    /// Asks a subscription's sender to stop: one click, or a message sent
-    /// from `a`, or the page to open.
-    pub fn unsubscribe(
+    /// Works out how to unsubscribe from `sub`: from the newest of its
+    /// recent messages whose List-Unsubscribe its sender signed, so a forged
+    /// message "from" the sender can't redirect it; failing that, from the
+    /// latest, without one click. Looks the signatures' keys up in DNS, and
+    /// may download a message's source.
+    pub fn unsubscribe_plan(
         &self,
         a: &Account,
         sub: &crate::manage::subscriptions::Subscription,
+    ) -> Result<crate::manage::subscriptions::Plan> {
+        use crate::manage::subscriptions::Plan;
+        let messages = self.store.subscription_messages(&a.id, &sub.address, 5)?;
+        for m in &messages {
+            let Ok(raw) = self.original(a, m) else {
+                continue;
+            };
+            if let Some(plan) = crate::sync::auth::signed_unsubscribe(&raw)
+                .and_then(|signed| Plan::new(Some(&signed), ""))
+            {
+                return Ok(plan);
+            }
+        }
+        let latest = messages.first().map_or(sub.unsubscribe.as_str(), |m| m.list_unsubscribe.as_str());
+        Plan::new(None, latest).context("This sender offers no way to unsubscribe.")
+    }
+    /// Carries out a plan from `unsubscribe_plan`: one click, or a message
+    /// sent from `a`, or the page to open.
+    pub fn unsubscribe(
+        &self,
+        a: &Account,
+        plan: &crate::manage::subscriptions::Plan,
     ) -> Result<crate::manage::subscriptions::Outcome> {
-        crate::manage::subscriptions::unsubscribe(sub, |d| self.send(a, d))
+        crate::manage::subscriptions::unsubscribe(plan, &a.id, |d| self.send(a, d))
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
         // Sending as an alias asks its service for the routed addresses
