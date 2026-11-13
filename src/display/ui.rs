@@ -1115,7 +1115,12 @@ impl MailApp {
         let demo = demo_mail();
         #[cfg(not(feature = "sample-data"))]
         let demo = Vec::new();
-        let messages = if let Some(id) = &account {
+        // A saved place is opened once the app is up; the first mailbox's
+        // mail isn't read for it meanwhile.
+        let restoring = backend.store.preference("last_place").is_some();
+        let messages = if restoring {
+            vec![]
+        } else if let Some(id) = &account {
             backend
                 .store
                 .summaries(id, Folder::Inbox)
@@ -1397,9 +1402,16 @@ impl MailApp {
         #[cfg(all(debug_assertions, target_os = "macos"))]
         devdriver::start(window, cx);
         if this.account.is_some() {
-            cx.defer_in(window, |this, _, cx| {
+            cx.defer_in(window, |this, w, cx| {
                 this.refresh_counts(cx);
-                this.refresh(cx);
+                // Back where the person was, else the first mailbox.
+                if this.restore_place(w, cx) {
+                } else if this.messages.is_empty() {
+                    let first = this.account.clone();
+                    this.open_mailbox(first, Folder::Inbox.into(), w, cx);
+                } else {
+                    this.refresh(cx);
+                }
             });
         }
         for a in this.accounts.clone() {
@@ -2351,6 +2363,7 @@ impl MailApp {
                 this.refresh(cx);
             });
         }
+        self.save_place();
         self.anim += 1;
         cx.notify();
     }

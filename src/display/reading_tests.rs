@@ -386,3 +386,59 @@ fn copy_link_address_puts_the_link_on_the_clipboard(cx: &mut TestAppContext) {
     assert_eq!(copied.as_deref(), Some("https://shop.example/p?id=7"));
     view.read_with(cx, |this, _| assert!(this.menu.is_none()));
 }
+
+#[gpui::test]
+fn the_last_open_mailbox_opens_again_after_a_restart(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let (first, second) = view.read_with(cx, |this, _| {
+        (this.accounts[0].id.clone(), this.accounts[1].id.clone())
+    });
+    // A server folder of the second account.
+    let receipts = Mailbox::Remote("INBOX/Receipts".into());
+    act(&view, Action::OpenMailbox(second.clone(), receipts.clone()), cx);
+    cx.run_until_parked();
+    store.flush();
+    let (restarted, cx) = open(store.clone(), cx);
+    cx.run_until_parked();
+    restarted.read_with(cx, |this, _| {
+        assert_eq!(this.account.as_ref(), Some(&second));
+        assert_eq!(this.mailbox(), receipts);
+    });
+    // All Mail's Starred.
+    act(&restarted, Action::OpenMailbox(fwd::ALL_MAIL.into(), Folder::Starred.into()), cx);
+    cx.run_until_parked();
+    store.flush();
+    let (restarted, cx) = open(store.clone(), cx);
+    cx.run_until_parked();
+    restarted.read_with(cx, |this, _| {
+        assert_eq!(this.account.as_deref(), Some(fwd::ALL_MAIL));
+        assert_eq!(this.folder, Folder::Starred);
+        let accounts: HashSet<&str> = this.messages.iter().map(|m| m.account.as_str()).collect();
+        assert_eq!(accounts.len(), 2, "both accounts' starred mail is listed");
+    });
+    // The first account's subscriptions.
+    act(&restarted, Action::OpenSubscriptions(first.clone()), cx);
+    cx.run_until_parked();
+    store.flush();
+    let (restarted, cx) = open(store.clone(), cx);
+    cx.run_until_parked();
+    restarted.read_with(cx, |this, _| {
+        assert_eq!(this.account.as_ref(), Some(&first));
+        assert!(this.subs_open);
+    });
+    // A place that is gone (its account removed) opens the first mailbox.
+    store
+        .set_preference(
+            "last_place",
+            r#"{"account":"gone","mailbox":{"Standard":"Archive"},"subscriptions":false}"#,
+        )
+        .unwrap();
+    let (restarted, cx) = open(store, cx);
+    cx.run_until_parked();
+    restarted.read_with(cx, |this, _| {
+        assert_eq!(this.account.as_ref(), Some(&first));
+        assert_eq!(this.folder, Folder::Inbox);
+        assert!(!this.subs_open);
+        assert_eq!(this.messages.len(), 10, "its mail is listed");
+    });
+}

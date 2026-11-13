@@ -96,6 +96,7 @@ impl MailApp {
         self.subs.clear();
         self.subs_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.load_subscriptions(cx);
+        self.save_place();
     }
     pub(super) fn load_subscriptions(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.account.clone() else {
@@ -156,6 +157,7 @@ impl MailApp {
         self.filter(cx);
         self.scroll_list_to_top();
         self.load_sender_mail(cx);
+        self.save_place();
         cx.notify();
     }
     /// Back from a subscription's mail to the subscriptions, which keep
@@ -173,6 +175,7 @@ impl MailApp {
         self.messages.clear();
         self.filter(cx);
         self.load_subscriptions(cx);
+        self.save_place();
         cx.notify();
     }
     /// Loads the open subscription's mail into the list, one copy of each

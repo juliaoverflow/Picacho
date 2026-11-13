@@ -6,6 +6,21 @@ use super::tree::Dragged;
 use super::*;
 use crate::manage::backend::Layout;
 
+/// Where the person was: the open mailbox (an account's, All Mail's or an
+/// alias's), and whether its subscriptions (and one sender's mail) were
+/// shown. Saved as it changes and opened again at launch.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Place {
+    pub account: String,
+    pub mailbox: Mailbox,
+    #[serde(default)]
+    pub subscriptions: bool,
+    #[serde(default)]
+    pub sender: Option<MailSubscription>,
+}
+/// The preference holding the last `Place`.
+const PLACE_PREFERENCE: &str = "last_place";
+
 /// How mail of a mailbox kept to its aliases is shown: its own address
 /// (and, on mail it sent, its name) in place of which the alias used is.
 pub(super) struct Mask {
@@ -65,6 +80,69 @@ impl MailApp {
     /// layout and placeholders apply.
     pub(super) fn shows_only(&self, account: &str) -> bool {
         self.account.is_some() && self.scope.accounts == [account]
+    }
+    /// Remembers the open mailbox, to open it again at the next launch.
+    pub(super) fn save_place(&self) {
+        let Some(account) = self.account.clone() else {
+            return;
+        };
+        let place = Place {
+            account,
+            mailbox: self.mailbox(),
+            subscriptions: self.subs_open,
+            sender: self.subs_open.then(|| self.subs_sender.clone()).flatten(),
+        };
+        if let Ok(json) = serde_json::to_string(&place) {
+            self.backend.store.set_preference_soon(PLACE_PREFERENCE, &json);
+        }
+    }
+    /// The place saved last, when it can still be opened: its account,
+    /// view or alias is still listed, and so is its mailbox.
+    pub(super) fn saved_place(&self) -> Option<Place> {
+        let place: Place =
+            serde_json::from_str(&self.backend.store.preference(PLACE_PREFERENCE)?).ok()?;
+        let id = place.account.as_str();
+        let listed = if id == ALL_MAIL {
+            self.shows_all_mail()
+        } else if fwd::is_view(id) {
+            fwd::separate_views(&self.forwarding).iter().any(|v| v == id)
+        } else {
+            self.accounts.iter().any(|a| a.id == id)
+        };
+        if !listed {
+            return None;
+        }
+        let mailbox_listed = match &place.mailbox {
+            Mailbox::Standard(folder) if fwd::is_view(id) => {
+                Self::view_folders(id).contains(folder)
+            }
+            Mailbox::Standard(folder) => *folder != Folder::Other,
+            Mailbox::Remote(name) => {
+                !fwd::is_view(id)
+                    && self
+                        .folders
+                        .get(id)
+                        .is_some_and(|folders| folders.iter().any(|f| &f.name == name))
+            }
+        };
+        // Subscriptions are listed per account and for All Mail.
+        let subscriptions_listed = !place.subscriptions || id == ALL_MAIL || !fwd::is_view(id);
+        (mailbox_listed && subscriptions_listed).then_some(place)
+    }
+    /// Opens the place saved last; false when there is none to open.
+    pub(super) fn restore_place(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(place) = self.saved_place() else {
+            return false;
+        };
+        if place.subscriptions {
+            self.open_subscriptions(place.account, w, cx);
+            if let Some(sender) = place.sender {
+                self.open_subscription(sender, cx);
+            }
+        } else {
+            self.open_mailbox(Some(place.account), place.mailbox, w, cx);
+        }
+        true
     }
     /// Whether `account` may only send as an alias (Forwarding settings).
     pub(super) fn requires_alias(&self, account: &str) -> bool {
