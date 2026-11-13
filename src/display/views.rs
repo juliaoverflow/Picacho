@@ -17,6 +17,11 @@ const ALIAS_FOLDERS: [Folder; 5] = [
 const ALIASES_SHOWN: usize = 25;
 /// Aliases past which a service offers a search field.
 const SEARCH_ALIASES_AT: usize = 6;
+/// How often aliases are fetched again in the background.
+pub(super) const ALIAS_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Opening Forwarding settings or a composer fetches them unless they
+/// were fetched this recently.
+pub(super) const ALIAS_REFRESH_SOON: Duration = Duration::from_secs(30);
 
 impl MailApp {
     /// The sidebar arrangement's entries: accounts, then aliases shown as accounts.
@@ -510,6 +515,7 @@ impl MailApp {
             self.filter(cx);
         }
         self.refresh_counts(cx);
+        self.update_composer_aliases(cx);
         cx.notify();
     }
     /// Changes a service account here (not at the service) and saves it.
@@ -575,13 +581,17 @@ impl MailApp {
         // The key is not kept in the field once sent.
         Self::set(&self.fwd_key, "", w, cx);
     }
-    pub(super) fn refresh_aliases(&mut self, id: String, cx: &mut Context<Self>) {
+    /// Fetches a service's aliases again. `quiet` ones (made by Picacho on
+    /// its own) don't report failures.
+    pub(super) fn refresh_aliases(&mut self, id: String, quiet: bool, cx: &mut Context<Self>) {
         let Some(account) = self.forwarding.iter().find(|f| f.id == id).cloned() else {
             return;
         };
         if !self.fwd_busy.insert(id.clone()) {
             return;
         }
+        self.fwd_refreshed
+            .insert(id.clone(), std::time::Instant::now());
         self.task(
             cx,
             move |_| fwd::refresh(&account),
@@ -589,15 +599,41 @@ impl MailApp {
                 this.fwd_busy.remove(&id);
                 match result {
                     Ok(aliases) => {
-                        if let Some(f) = this.forwarding.iter_mut().find(|f| f.id == id) {
+                        let Some(f) = this.forwarding.iter_mut().find(|f| f.id == id) else {
+                            return;
+                        };
+                        if f.aliases != aliases {
                             f.aliases = aliases;
+                            this.views_changed(cx);
                         }
-                        this.views_changed(cx);
                     }
+                    Err(_) if quiet => {}
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }
             },
         );
+    }
+    /// Fetches every service's aliases again unless that was done within
+    /// `within`: they can be made, changed or deleted outside Picacho.
+    pub(super) fn refresh_aliases_due(&mut self, within: Duration, cx: &mut Context<Self>) {
+        // Tests have no services or keychain to ask.
+        if cfg!(test) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due: Vec<String> = self
+            .forwarding
+            .iter()
+            .map(|f| f.id.clone())
+            .filter(|id| {
+                self.fwd_refreshed
+                    .get(id)
+                    .is_none_or(|t| now.duration_since(*t) >= within)
+            })
+            .collect();
+        for id in due {
+            self.refresh_aliases(id, true, cx);
+        }
     }
     pub(super) fn remove_forwarding(&mut self, id: String, cx: &mut Context<Self>) {
         if self.fwd_confirm.as_deref() != Some(&id) {
@@ -615,13 +651,39 @@ impl MailApp {
         let Some(account) = self.forwarding.iter().find(|f| f.id == id).cloned() else {
             return;
         };
-        if !self.fwd_busy.insert(id.clone()) {
+        if self.fwd_busy.contains(&id) {
             return;
         }
-        let note = Self::value(&self.fwd_note, cx).trim().to_owned();
+        let domain = self.alias_domain(&id).cloned();
+        let prefix = fwd::clean_prefix(&Self::value(&self.fwd_prefix, cx));
+        let typed = !Self::value(&self.fwd_prefix, cx).trim().is_empty();
+        if typed && prefix.is_empty() {
+            self.notice(
+                "Use letters, numbers, dots, dashes or underscores in the prefix.",
+                true,
+                cx,
+            );
+            return;
+        }
+        let new = fwd::NewAlias {
+            prefix: if domain.as_ref().is_none_or(|d| d.custom_prefix) {
+                prefix
+            } else {
+                String::new()
+            },
+            domain: domain.map(|d| d.suffix),
+            format: self.fwd_format,
+            note: Self::value(&self.fwd_note, cx).trim().to_owned(),
+            mailbox: self
+                .fwd_mailbox
+                .as_ref()
+                .and_then(|m| self.accounts.iter().find(|a| &a.id == m))
+                .map(|a| a.email.clone()),
+        };
+        self.fwd_busy.insert(id.clone());
         self.task(
             cx,
-            move |_| fwd::create(&account, &note),
+            move |_| fwd::create(&account, &new),
             move |this, result, cx| {
                 this.fwd_busy.remove(&id);
                 match result {
@@ -633,11 +695,248 @@ impl MailApp {
                         }
                         this.fwd_creating = None;
                         let _ = fwd::save(&this.backend.store, &this.forwarding);
+                        this.update_composer_aliases(cx);
                     }
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }
             },
         );
+    }
+    /// Opens a service's new alias form, empty, for an alias forwarding to
+    /// `mailbox`, and lists the domains it can use.
+    pub(super) fn open_alias_form(
+        &mut self,
+        id: String,
+        mailbox: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(service) = self.forwarding.iter().find(|f| f.id == id).map(|f| f.service) else {
+            return;
+        };
+        self.fwd_creating = Some(id.clone());
+        self.fwd_domain = None;
+        self.fwd_format = None;
+        self.fwd_mailbox = mailbox;
+        Self::set(&self.fwd_prefix, "", w, cx);
+        Self::set(&self.fwd_note, "", w, cx);
+        let first = if service == ForwardingService::FirefoxRelay {
+            self.fwd_note.clone()
+        } else {
+            self.fwd_prefix.clone()
+        };
+        match self.settings_window {
+            Some(handle) if handle.window_id() != w.window_handle().window_id() => {
+                let _ = handle.update(cx, |_, w, cx| first.update(cx, |s, cx| s.focus(w, cx)));
+            }
+            _ => first.update(cx, |s, cx| s.focus(w, cx)),
+        }
+        if !matches!(self.fwd_options.get(&id), Some(Ok(_))) {
+            self.load_alias_options(id, cx);
+        }
+    }
+    pub(super) fn load_alias_options(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.forwarding.iter().find(|f| f.id == id).cloned() else {
+            return;
+        };
+        let busy = format!("options:{id}");
+        if !self.fwd_busy.insert(busy.clone()) {
+            return;
+        }
+        self.task(
+            cx,
+            move |_| fwd::options(&account),
+            move |this, result, cx| {
+                this.fwd_busy.remove(&busy);
+                this.fwd_options
+                    .insert(id, result.map_err(|e| format!("{e:#}")));
+                cx.notify();
+            },
+        );
+    }
+    /// From a composer's From menu: Forwarding settings, open at the
+    /// service's new alias form for `mailbox`.
+    pub(super) fn new_alias_for(
+        &mut self,
+        id: String,
+        mailbox: String,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
+        self.page = Page::Forwarding;
+        if !self.reveal_settings_window(cx) {
+            if self.modal != Some(Modal::Settings) {
+                self.modal = Some(Modal::Settings);
+                self.anim += 1;
+            }
+            w.activate_window();
+        }
+        self.fwd_adding = false;
+        self.fwd_open.insert(id.clone());
+        self.open_alias_form(id, Some(mailbox), w, cx);
+    }
+    /// Applies a new alias form asked for by a composer that was restored
+    /// after Undo (its subscription has no window).
+    pub(super) fn apply_pending_new_alias(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((id, mailbox)) = self.pending_new_alias.take() {
+            self.new_alias_for(id, mailbox, w, cx);
+        }
+    }
+    /// Gives open composers the aliases they can send as now.
+    pub(super) fn update_composer_aliases(&mut self, cx: &mut Context<Self>) {
+        let aliases = fwd::sendable(&self.forwarding);
+        let services = Self::alias_services(&self.forwarding);
+        for composer in &self.composers {
+            composer.update(cx, |c, cx| {
+                c.set_forwarding(aliases.clone(), services.clone());
+                cx.notify();
+            });
+        }
+    }
+    /// Services that can make aliases to send as: (service, the mailbox it
+    /// forwards to, if one).
+    pub(super) fn alias_services(
+        forwarding: &[ForwardingAccount],
+    ) -> Vec<(String, fwd::ForwardingService, Option<String>)> {
+        forwarding
+            .iter()
+            .filter(|f| f.service.can_send())
+            .map(|f| (f.id.clone(), f.service, f.deliver_to.clone()))
+            .collect()
+    }
+    /// The domain the new alias form will use: the chosen one, else the
+    /// service's default.
+    pub(super) fn alias_domain(&self, id: &str) -> Option<&fwd::AliasDomain> {
+        let Some(Ok(options)) = self.fwd_options.get(id) else {
+            return None;
+        };
+        self.fwd_domain
+            .as_ref()
+            .and_then(|s| options.domains.iter().find(|d| &d.suffix == s))
+            .or(options.domains.first())
+    }
+    /// The domains a service offers, grouped: the person's own, then
+    /// premium, then free.
+    pub(super) fn domain_entries(&self, id: &str) -> Vec<Entry> {
+        let Some(Ok(options)) = self.fwd_options.get(id) else {
+            return vec![];
+        };
+        let chosen = self.alias_domain(id).map(|d| d.suffix.clone());
+        let mut entries = vec![];
+        for kinds in [
+            &[fwd::DomainKind::Custom, fwd::DomainKind::Username][..],
+            &[fwd::DomainKind::Premium],
+            &[fwd::DomainKind::Shared],
+        ] {
+            let group: Vec<&fwd::AliasDomain> = options
+                .domains
+                .iter()
+                .filter(|d| kinds.contains(&d.kind))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            if !entries.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            entries.extend(group.into_iter().map(|d| {
+                checked(
+                    format!("{} · {}", d.suffix, d.kind.label()),
+                    chosen.as_ref() == Some(&d.suffix),
+                    Action::SetAliasDomain(d.suffix.clone()),
+                )
+            }));
+        }
+        entries
+    }
+    /// Ways to fill the prefix: the service's suggestion, or random.
+    pub(super) fn prefix_entries(&self, id: &str) -> Vec<Entry> {
+        let mut entries = vec![];
+        if let Some(Ok(options)) = self.fwd_options.get(id)
+            && !options.prefix_suggestion.is_empty()
+        {
+            entries.push(entry(
+                format!("Suggested: {}", options.prefix_suggestion),
+                "star",
+                Action::SetAliasPrefix(options.prefix_suggestion.clone()),
+            ));
+            entries.push(Entry::Separator);
+        }
+        entries.extend(fwd::AliasFormat::ALL.into_iter().map(|format| {
+            entry(
+                format.label(),
+                "refresh",
+                Action::RandomPrefix(format),
+            )
+        }));
+        entries
+    }
+    /// SimpleLogin takes the prefix as given, so a random one is made here
+    /// and can be edited; addy.io makes its own, so the field is cleared.
+    pub(super) fn random_prefix(
+        &mut self,
+        format: fwd::AliasFormat,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let service = self
+            .fwd_creating
+            .as_ref()
+            .and_then(|id| self.forwarding.iter().find(|f| &f.id == id))
+            .map(|f| f.service);
+        if service == Some(ForwardingService::SimpleLogin) {
+            self.fwd_format = None;
+            Self::set(&self.fwd_prefix, fwd::random_prefix(format), w, cx);
+        } else {
+            self.fwd_format = Some(format);
+            Self::set(&self.fwd_prefix, "", w, cx);
+        }
+    }
+    pub(super) fn save_alias_note(&mut self, cx: &mut Context<Self>) {
+        let Some((id, alias_id)) = self.fwd_editing.take() else {
+            return;
+        };
+        let note = Self::value(&self.fwd_description, cx).trim().to_owned();
+        let Some(account) = self.forwarding.iter().find(|f| f.id == id).cloned() else {
+            return;
+        };
+        let Some(alias) = account.aliases.iter().find(|a| a.id == alias_id).cloned() else {
+            return;
+        };
+        if alias.note == note {
+            return;
+        }
+        let busy = format!("{id}:{alias_id}");
+        if !self.fwd_busy.insert(busy.clone()) {
+            return;
+        }
+        // Shown at once; put back if the service refuses.
+        let before = alias.note.clone();
+        self.set_alias_note(&id, &alias_id, &note);
+        self.task(
+            cx,
+            move |_| fwd::set_note(&account, &alias, &note),
+            move |this, result, cx| {
+                this.fwd_busy.remove(&busy);
+                if let Err(e) = result {
+                    this.set_alias_note(&id, &alias_id, &before);
+                    this.notice(format!("{e:#}"), true, cx);
+                }
+                let _ = fwd::save(&this.backend.store, &this.forwarding);
+                this.update_composer_aliases(cx);
+            },
+        );
+    }
+    fn set_alias_note(&mut self, id: &str, alias: &str, note: &str) {
+        if let Some(a) = self
+            .forwarding
+            .iter_mut()
+            .find(|f| f.id == id)
+            .and_then(|f| f.aliases.iter_mut().find(|a| a.id == alias))
+        {
+            a.note = note.to_owned();
+        }
     }
     pub(super) fn set_alias_enabled(
         &mut self,
@@ -1298,7 +1597,106 @@ impl MailApp {
                         cx,
                     )),
             )
-            .when(creating, |d| {
+            .when(creating, |d| d.child(self.alias_form(f, busy, cx)))
+            .child(aliases)
+    }
+    /// The new alias form: a prefix (typed, suggested or random) and a
+    /// domain where the service lets them be chosen, and a description.
+    fn alias_form(&self, f: &ForwardingAccount, busy: bool, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors();
+        let id = f.id.clone();
+        let picks = f.service != ForwardingService::FirefoxRelay;
+        let loading = self.fwd_busy.contains(&format!("options:{id}"));
+        let options = self.fwd_options.get(&id);
+        let domain = self.alias_domain(&id);
+        let prefix_ok = domain.is_none_or(|d| d.custom_prefix);
+        let prefix = fwd::clean_prefix(&Self::value(&self.fwd_prefix, cx));
+        let random = match self.fwd_format {
+            Some(format) => format!("a {} prefix", format.label().to_lowercase()),
+            None => "a random prefix".into(),
+        };
+        let preview = domain.map(|d| {
+            if prefix_ok && !prefix.is_empty() {
+                format!("Creates {prefix}{}", d.suffix)
+            } else if prefix_ok {
+                format!("Creates {random} with {}", d.suffix)
+            } else {
+                format!("Creates {random} with {}. This domain only takes random aliases.", d.suffix)
+            }
+        });
+        let domain_button = div()
+            .id(SharedString::from(format!("alias-domain-{id}")))
+            .debug_selector({
+                let id = id.clone();
+                move || format!("alias-domain-{id}")
+            })
+            .h(px(32.))
+            .w(px(220.))
+            .flex_shrink()
+            .min_w(px(120.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.bg))
+            .cursor_pointer()
+            .hover(move |s| s.border_color(rgb(c.muted)))
+            .text_size(px(12.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().child(match (domain, options) {
+                        (Some(d), _) => d.suffix.clone(),
+                        (None, _) if loading => "Loading domains…".into(),
+                        _ => "Default domain".to_string(),
+                    }))
+                    .when_some(domain, |d, domain| {
+                        d.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(c.muted))
+                                .child(domain.kind.label()),
+                        )
+                    }),
+            )
+            .child(if loading {
+                spinner(12., c.muted).into_any_element()
+            } else {
+                icon_el("chevrons-up-down", 12., c.muted).into_any_element()
+            })
+            .on_click(cx.listener({
+                let action = Action::DomainMenu(id.clone());
+                move |this, _, w, cx| this.handle(action.clone(), w, cx)
+            }));
+        let caption = |text: String, color: u32| {
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(color))
+                .child(text)
+        };
+        let mailbox = self
+            .fwd_mailbox
+            .as_ref()
+            .and_then(|m| self.accounts.iter().find(|a| &a.id == m))
+            .map(|a| a.email.clone());
+        div()
+            .id(SharedString::from(format!("alias-form-{id}")))
+            .debug_selector(|| "alias-form".into())
+            .p_3()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.surface))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(picks, |d| {
                 d.child(
                     div()
                         .flex()
@@ -1306,27 +1704,94 @@ impl MailApp {
                         .gap_2()
                         .child(
                             div()
-                                .id("alias-note")
+                                .id("alias-prefix")
+                                .debug_selector(|| "alias-prefix".into())
                                 .flex_1()
-                                .min_w_0()
-                                .child(field(Input::new(&self.fwd_note), c, busy)),
+                                .min_w(px(100.))
+                                .child(field(
+                                    Input::new(&self.fwd_prefix).disabled(busy || !prefix_ok),
+                                    c,
+                                    busy || !prefix_ok,
+                                )),
                         )
                         .child(
-                            self.button(
-                                format!("alias-create-{}", f.id),
-                                if busy { "Creating…" } else { "Create" },
-                                "",
-                                Action::CreateAlias(f.id.clone()),
-                                true,
+                            self.fwd_icon_button(
+                                format!("alias-prefix-menu-{id}"),
+                                "ellipsis",
+                                "Random prefix",
+                                Action::PrefixMenu(id.clone()),
                                 cx,
                             )
-                            .h(px(32.))
-                            .flex_shrink_0()
-                            .when(busy, |d| d.opacity(0.6)),
-                        ),
+                            .border_1()
+                            .border_color(rgb(c.border)),
+                        )
+                        .child(domain_button),
                 )
             })
-            .child(aliases)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("alias-note")
+                            .flex_1()
+                            .min_w_0()
+                            .child(field(Input::new(&self.fwd_note), c, busy)),
+                    )
+                    .child(
+                        self.button(
+                            format!("alias-create-{id}"),
+                            if busy { "Creating…" } else { "Create" },
+                            "",
+                            Action::CreateAlias(id.clone()),
+                            true,
+                            cx,
+                        )
+                        .h(px(32.))
+                        .flex_shrink_0()
+                        .when(busy, |d| d.opacity(0.6)),
+                    ),
+            )
+            .when_some(preview.filter(|_| picks), |d, p| d.child(caption(p, c.muted)))
+            .when_some(
+                mailbox.filter(|_| f.service == ForwardingService::SimpleLogin),
+                |d, email| d.child(caption(format!("Forwards to {email}"), c.muted)),
+            )
+            .when(
+                matches!(options, Some(Ok(o)) if !o.can_create),
+                |d| {
+                    d.child(caption(
+                        format!("{} won't make more aliases on this plan.", f.service.label()),
+                        c.danger,
+                    ))
+                },
+            )
+            .when_some(
+                match options {
+                    Some(Err(e)) if picks => Some(e.clone()),
+                    _ => None,
+                },
+                |d, e| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(caption(
+                                format!("Couldn't list domains: {e}. New aliases use the default domain."),
+                                c.danger,
+                            ))
+                            .child(self.link(
+                                &format!("alias-domains-retry-{id}"),
+                                "Try Again",
+                                Action::DomainMenu(id.clone()),
+                                cx,
+                            )),
+                    )
+                },
+            )
     }
     /// One alias: its address and status, a switch for forwarding, and a
     /// menu for the rest. Long addresses end in an ellipsis; the full one
@@ -1410,9 +1875,46 @@ impl MailApp {
                 Action::AliasMenu(f.id.clone(), a.id.clone()),
                 cx,
             ));
+        let editing = self
+            .fwd_editing
+            .as_ref()
+            .is_some_and(|(s, x)| s == &f.id && x == &a.id);
         div()
             .when(divided, |d| d.border_t_1().border_color(rgb(c.border)))
             .child(row)
+            .when(editing, |d| {
+                d.child(
+                    div()
+                        .id(SharedString::from(format!("alias-note-edit-{key}")))
+                        .debug_selector(|| "alias-note-edit".into())
+                        .px_3()
+                        .pb_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(field(Input::new(&self.fwd_description), c, false)),
+                        )
+                        .child(self.small_button(
+                            format!("alias-note-cancel-{key}"),
+                            "Cancel",
+                            "",
+                            Action::CancelAliasNote,
+                            cx,
+                        ))
+                        .child(self.button(
+                            format!("alias-note-save-{key}"),
+                            "Save",
+                            "",
+                            Action::SaveAliasNote,
+                            true,
+                            cx,
+                        ).h(px(30.))),
+                )
+            })
             .when(deleting, |d| {
                 d.child(self.confirm_strip(
                     format!("alias-delete-{key}"),
@@ -1483,6 +1985,15 @@ impl MailApp {
         };
         vec![
             entry("Copy Address", "copy", Action::CopyText(a.email.clone())),
+            entry(
+                if a.note.is_empty() {
+                    "Add Description…"
+                } else {
+                    "Edit Description…"
+                },
+                "compose",
+                Action::EditAliasNote(id.into(), alias.into()),
+            ),
             Entry::Separator,
             show("Show in Its Mailbox", AliasDisplay::Included),
             show("Show as Its Own Account", AliasDisplay::Separate),
@@ -1674,6 +2185,50 @@ mod tests {
     }
 
     #[gpui::test]
+    fn sending_as_a_deleted_alias_explains_and_resets_from(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // Deleted elsewhere: the service no longer lists it, though this
+        // window has not fetched the aliases again yet.
+        view.update(cx, |this, _| {
+            let mut gone = this.forwarding.clone();
+            gone[0].aliases.clear();
+            fwd::save(&this.backend.store, &gone).unwrap();
+        });
+        view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+        let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+        composer.update_in(cx, |c, w, cx| {
+            c.fill("ana@example.com", "Plans", w, cx);
+            c.draft.send_as = "shop@sl.io".into();
+        });
+        cx.run_until_parked();
+        composer.update_in(cx, |c, w, cx| c.request_send(w, cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(6));
+        cx.run_until_parked();
+        view.read_with(cx, |this, cx| {
+            assert!(
+                matches!(&this.modal, Some(Modal::AliasGone(why, from))
+                    if why.contains("shop@sl.io") && from == "work@example.com"),
+                "a dialog says the alias is gone"
+            );
+            assert!(this.forwarding[0].aliases.is_empty(), "and it is forgotten");
+            assert!(this.outbox.is_empty());
+            let c = this.composers[0].read(cx);
+            assert!(c.draft.send_as.is_empty(), "From is the mailbox again");
+            assert_eq!(c.draft.account, work);
+            assert!(c.error.is_some());
+            assert!(
+                this.account_issues
+                    .get(&work)
+                    .is_none_or(|issues| !issues.contains_key(&IssueSource::Send)),
+                "a deleted alias is not a mailbox problem"
+            );
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("alias-gone").is_some());
+    }
+
+    #[gpui::test]
     fn long_alias_addresses_stay_inside_the_forwarding_page(cx: &mut TestAppContext) {
         let (view, cx, _) = setup(cx);
         let long = format!("{}@{}.example.com", "a".repeat(90), "b".repeat(60));
@@ -1707,6 +2262,7 @@ mod tests {
                 labels,
                 [
                     "Copy Address",
+                    "Edit Description…",
                     "Show in Its Mailbox",
                     "Show as Its Own Account",
                     "Delete Alias…"

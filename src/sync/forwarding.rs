@@ -6,7 +6,10 @@
 //! and can be self-hosted, so the server is configurable.
 //!
 //! These helpers only talk to the service; Manage keeps the result.
-use crate::manage::forwarding::{Alias, ForwardingService};
+use crate::manage::forwarding::{
+    Alias, AliasDomain, AliasFormat, AliasOptions, DomainKind, ForwardingService, NewAlias,
+    random_prefix,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -176,28 +179,100 @@ impl Client {
         Ok(out)
     }
 
-    /// A new random alias, described by `note`.
-    pub fn create(&self, note: &str) -> Result<Alias> {
+    /// The domains new aliases can use, and whether a prefix can be chosen.
+    pub fn options(&self) -> Result<AliasOptions> {
         use reqwest::Method;
-        let alias = match self.service {
+        Ok(match self.service {
             ForwardingService::SimpleLogin => {
+                parse_simplelogin_options(&self.send(self.request(Method::GET, "/api/v5/alias/options"))?)
+            }
+            ForwardingService::Addy => {
+                let v = self.send(self.request(Method::GET, "/api/v1/domain-options"))?;
+                // Which are the person's own; neither is needed to make an alias.
+                let custom = self
+                    .send(self.request(Method::GET, "/api/v1/domains"))
+                    .unwrap_or_default();
+                let username = self
+                    .send(self.request(Method::GET, "/api/v1/account-details"))
+                    .map(|d| str_of(&d["data"]["username"]))
+                    .unwrap_or_default();
+                parse_addy_options(&v, &custom, &username)
+            }
+            ForwardingService::FirefoxRelay => AliasOptions {
+                can_create: true,
+                ..AliasOptions::default()
+            },
+        })
+    }
+
+    /// A new alias: at a chosen domain and with a chosen prefix where the
+    /// service allows, otherwise random.
+    pub fn create(&self, new: &NewAlias) -> Result<Alias> {
+        use reqwest::Method;
+        let note = new.note.as_str();
+        let alias = match self.service {
+            ForwardingService::SimpleLogin if new.domain.is_none() && new.prefix.is_empty() => {
+                let mode = match new.format {
+                    Some(AliasFormat::RandomWords) => "?mode=word",
+                    Some(_) => "?mode=uuid",
+                    None => "",
+                };
                 let v = self.send(
-                    self.request(Method::POST, "/api/alias/random/new")
+                    self.request(Method::POST, &format!("/api/alias/random/new{mode}"))
                         .json(&json!({ "note": note })),
                 )?;
                 parse_simplelogin_alias(&v)
             }
+            ForwardingService::SimpleLogin => {
+                // Suffixes are signed for a short while, so sign one now.
+                let options = self.send(self.request(Method::GET, "/api/v5/alias/options"))?;
+                ensure!(
+                    options["can_create"].as_bool() != Some(false),
+                    "SimpleLogin won't make more aliases on this plan."
+                );
+                let signed = simplelogin_signed_suffix(&options, new.domain.as_deref())
+                    .context("SimpleLogin no longer offers that domain. Choose another.")?;
+                let prefix = if new.prefix.is_empty() {
+                    random_prefix(new.format.unwrap_or(AliasFormat::RandomWords))
+                } else {
+                    new.prefix.clone()
+                };
+                let mailboxes = self.send(self.request(Method::GET, "/api/v2/mailboxes"))?;
+                let mailbox = simplelogin_mailbox(&mailboxes, new.mailbox.as_deref())
+                    .context("SimpleLogin has no mailbox to forward the alias to")?;
+                let v = self.send(
+                    self.request(Method::POST, "/api/v3/alias/custom/new")
+                        .json(&json!({
+                            "alias_prefix": prefix,
+                            "signed_suffix": signed,
+                            "mailbox_ids": [mailbox],
+                            "note": note,
+                        })),
+                )?;
+                parse_simplelogin_alias(&v)
+            }
             ForwardingService::Addy => {
-                // New aliases use the account's own default domain and format.
+                // Unless chosen, the account's own default domain and format.
                 let details = self.send(self.request(Method::GET, "/api/v1/account-details"))?;
                 let data = &details["data"];
-                let domain = Some(str_of(&data["default_alias_domain"]))
+                let domain = new
+                    .domain
+                    .as_deref()
+                    .map(|d| d.trim_start_matches('@').to_owned())
+                    .or_else(|| Some(str_of(&data["default_alias_domain"])))
                     .filter(|d| !d.is_empty())
                     .unwrap_or_else(|| "anonaddy.me".into());
                 let mut body = json!({ "domain": domain, "description": note });
-                let format = str_of(&data["default_alias_format"]);
-                if !format.is_empty() {
-                    body["format"] = json!(format);
+                if !new.prefix.is_empty() {
+                    body["format"] = json!("custom");
+                    body["local_part"] = json!(new.prefix);
+                } else if let Some(format) = new.format {
+                    body["format"] = json!(format.addy_key());
+                } else {
+                    let format = str_of(&data["default_alias_format"]);
+                    if !format.is_empty() {
+                        body["format"] = json!(format);
+                    }
                 }
                 let v = self.send(self.request(Method::POST, "/api/v1/aliases").json(&body))?;
                 parse_addy_alias(&v["data"])
@@ -211,6 +286,56 @@ impl Client {
             }
         };
         alias.context("The new alias was made, but its address was missing from the reply")
+    }
+
+    /// Whether the alias still exists at the service; it can be deleted
+    /// from the service's own app or another client.
+    pub fn alias_exists(&self, alias: &Alias) -> Result<bool> {
+        use reqwest::{Method, StatusCode};
+        let id = &alias.id;
+        let path = match self.service {
+            ForwardingService::SimpleLogin => format!("/api/aliases/{id}"),
+            ForwardingService::Addy => format!("/api/v1/aliases/{id}"),
+            ForwardingService::FirefoxRelay => format!("/api/v1/relayaddresses/{id}/"),
+        };
+        let response = self
+            .request(Method::GET, &path)
+            .send()
+            .with_context(|| format!("Could not reach {}", self.service.label()))?;
+        let status = response.status();
+        // SimpleLogin answers Forbidden for an alias that isn't the key's,
+        // which a deleted one no longer is.
+        if status == StatusCode::NOT_FOUND
+            || (self.service == ForwardingService::SimpleLogin && status == StatusCode::FORBIDDEN)
+        {
+            return Ok(false);
+        }
+        ensure!(
+            status.is_success(),
+            "{} answered {status}",
+            self.service.label()
+        );
+        let v: Value = serde_json::from_str(&response.text().unwrap_or_default()).unwrap_or_default();
+        Ok(alias_listed(self.service, &v))
+    }
+
+    /// Changes an alias's description.
+    pub fn set_note(&self, alias: &Alias, note: &str) -> Result<()> {
+        use reqwest::Method;
+        let id = &alias.id;
+        let (path, body) = match self.service {
+            ForwardingService::SimpleLogin => (format!("/api/aliases/{id}"), json!({ "note": note })),
+            ForwardingService::Addy => (
+                format!("/api/v1/aliases/{id}"),
+                json!({ "description": note }),
+            ),
+            ForwardingService::FirefoxRelay => (
+                format!("/api/v1/relayaddresses/{id}/"),
+                json!({ "description": note }),
+            ),
+        };
+        self.send(self.request(Method::PATCH, &path).json(&body))?;
+        Ok(())
     }
 
     /// Turns forwarding for an alias on or off.
@@ -351,6 +476,112 @@ fn parse_simplelogin(v: &Value) -> Vec<Alias> {
         .filter_map(parse_simplelogin_alias)
         .collect()
 }
+/// Whether a service's reply about one alias shows it still in use.
+/// addy.io keeps deleted aliases for a while, marked as deleted.
+fn alias_listed(service: ForwardingService, v: &Value) -> bool {
+    match service {
+        ForwardingService::Addy => v["data"]["deleted_at"].is_null(),
+        _ => true,
+    }
+}
+fn parse_simplelogin_options(v: &Value) -> AliasOptions {
+    let domains = v["suffixes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let suffix = str_of(&s["suffix"]);
+            (!suffix.is_empty() && !str_of(&s["signed_suffix"]).is_empty()).then(|| AliasDomain {
+                suffix,
+                kind: if s["is_custom"].as_bool() == Some(true) {
+                    DomainKind::Custom
+                } else if s["is_premium"].as_bool() == Some(true) {
+                    DomainKind::Premium
+                } else {
+                    DomainKind::Shared
+                },
+                custom_prefix: true,
+            })
+        })
+        .collect();
+    AliasOptions {
+        domains,
+        prefix_suggestion: str_of(&v["prefix_suggestion"]),
+        can_create: v["can_create"].as_bool().unwrap_or(true),
+    }
+}
+/// The signed form of `suffix`. SimpleLogin's shared domains add a random
+/// word that changes between requests, so the same domain will do.
+fn simplelogin_signed_suffix(v: &Value, suffix: Option<&str>) -> Option<String> {
+    let suffixes = v["suffixes"].as_array()?;
+    let domain = |s: &str| s.rsplit_once('@').map(|(_, d)| d.to_lowercase());
+    let found = match suffix {
+        None => suffixes.first(),
+        Some(want) => suffixes
+            .iter()
+            .find(|s| str_of(&s["suffix"]).eq_ignore_ascii_case(want))
+            .or_else(|| {
+                suffixes
+                    .iter()
+                    .find(|s| domain(&str_of(&s["suffix"])) == domain(want))
+            }),
+    }?;
+    Some(str_of(&found["signed_suffix"])).filter(|s| !s.is_empty())
+}
+/// The SimpleLogin mailbox for `address`, else the default one.
+fn simplelogin_mailbox(v: &Value, address: Option<&str>) -> Option<Value> {
+    let mailboxes = v["mailboxes"].as_array()?;
+    address
+        .and_then(|a| {
+            mailboxes
+                .iter()
+                .find(|m| str_of(&m["email"]).eq_ignore_ascii_case(a))
+        })
+        .or_else(|| mailboxes.iter().find(|m| m["default"].as_bool() == Some(true)))
+        .or_else(|| mailboxes.first())
+        .map(|m| m["id"].clone())
+}
+fn parse_addy_options(v: &Value, custom: &Value, username: &str) -> AliasOptions {
+    let custom: std::collections::HashSet<String> = custom["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|d| str_of(&d["domain"]).to_lowercase())
+        .collect();
+    let default = str_of(&v["defaultAliasDomain"]).to_lowercase();
+    let username = username.to_lowercase();
+    let mut domains: Vec<AliasDomain> = v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|d| str_of(d).to_lowercase())
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            let kind = if custom.contains(&d) {
+                DomainKind::Custom
+            } else if !username.is_empty() && d.starts_with(&format!("{username}.")) {
+                DomainKind::Username
+            } else {
+                DomainKind::Shared
+            };
+            AliasDomain {
+                suffix: format!("@{d}"),
+                kind,
+                // Shared domains only take random aliases.
+                custom_prefix: kind != DomainKind::Shared,
+            }
+        })
+        .collect();
+    if let Some(i) = domains.iter().position(|d| d.suffix[1..] == default) {
+        let d = domains.remove(i);
+        domains.insert(0, d);
+    }
+    AliasOptions {
+        domains,
+        prefix_suggestion: String::new(),
+        can_create: true,
+    }
+}
 fn parse_addy_alias(v: &Value) -> Option<Alias> {
     alias(
         &v["id"],
@@ -363,6 +594,8 @@ fn parse_addy(v: &Value) -> Vec<Alias> {
     v.as_array()
         .into_iter()
         .flatten()
+        // Deleted aliases are kept a while, marked; they no longer forward.
+        .filter(|a| a["deleted_at"].is_null())
         .filter_map(parse_addy_alias)
         .collect()
 }
@@ -399,8 +632,14 @@ mod tests {
         assert!(!got[0].enabled);
         assert_eq!(got[0].note, "store");
 
-        let addy = json!([{"id": "50c9e585-e7f5", "email": "x1@anonaddy.me", "active": true, "description": null}]);
+        let addy = json!([
+            {"id": "50c9e585-e7f5", "email": "x1@anonaddy.me", "active": true, "description": null},
+            {"id": "gone", "email": "x2@anonaddy.me", "active": false, "deleted_at": "2026-01-01 10:00:00"}
+        ]);
         let got = parse_addy(&addy);
+        assert_eq!(got.len(), 1, "deleted aliases are left out");
+        assert!(!alias_listed(ForwardingService::Addy, &json!({"data": addy[1]})));
+        assert!(alias_listed(ForwardingService::Addy, &json!({"data": addy[0]})));
         assert_eq!(got[0].id, "50c9e585-e7f5");
         assert!(got[0].enabled);
         assert_eq!(got[0].note, "");
@@ -409,6 +648,51 @@ mod tests {
         let got = parse_relay(&relay);
         assert_eq!(got[0].email, "abc@mozmail.com");
         assert_eq!(got[0].note, "news");
+    }
+
+    #[test]
+    fn reads_the_domains_aliases_can_use() {
+        let sl = json!({"can_create": true, "prefix_suggestion": "shop", "suffixes": [
+            {"suffix": "@me.org", "signed_suffix": "@me.org.X", "is_custom": true, "is_premium": false},
+            {"suffix": ".cat@simplelogin.com", "signed_suffix": ".cat@simplelogin.com.Y", "is_custom": false, "is_premium": false},
+            {"suffix": ".dog@slmail.me", "signed_suffix": ".dog@slmail.me.Z", "is_custom": false, "is_premium": true}
+        ]});
+        let got = parse_simplelogin_options(&sl);
+        assert_eq!(got.prefix_suggestion, "shop");
+        let kinds: Vec<_> = got.domains.iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, [DomainKind::Custom, DomainKind::Shared, DomainKind::Premium]);
+        // A shared suffix's word changes between requests; its domain matches.
+        assert_eq!(
+            simplelogin_signed_suffix(&sl, Some(".bird@slmail.me")).as_deref(),
+            Some(".dog@slmail.me.Z")
+        );
+        assert_eq!(
+            simplelogin_signed_suffix(&sl, None).as_deref(),
+            Some("@me.org.X")
+        );
+        let mailboxes = json!({"mailboxes": [
+            {"id": 1, "email": "a@x.org", "default": false},
+            {"id": 2, "email": "b@x.org", "default": true}
+        ]});
+        assert_eq!(simplelogin_mailbox(&mailboxes, Some("A@x.org")), Some(json!(1)));
+        assert_eq!(simplelogin_mailbox(&mailboxes, None), Some(json!(2)));
+
+        let addy = json!({"data": ["anonaddy.me", "jo.anonaddy.com", "me.org"], "defaultAliasDomain": "me.org"});
+        let custom = json!({"data": [{"domain": "me.org"}]});
+        let got = parse_addy_options(&addy, &custom, "Jo");
+        let listed: Vec<_> = got
+            .domains
+            .iter()
+            .map(|d| (d.suffix.as_str(), d.kind, d.custom_prefix))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("@me.org", DomainKind::Custom, true),
+                ("@anonaddy.me", DomainKind::Shared, false),
+                ("@jo.anonaddy.com", DomainKind::Username, true),
+            ]
+        );
     }
 
     #[test]

@@ -260,6 +260,10 @@ impl MailApp {
             });
             composer
         };
+        let services = Self::alias_services(&self.forwarding);
+        composer.update(cx, |c, _| c.set_forwarding(fwd::sendable(&self.forwarding), services));
+        // The From menu should not offer aliases deleted elsewhere.
+        self.refresh_aliases_due(super::views::ALIAS_REFRESH_SOON, cx);
         if let Some(message) = answers {
             self.inline_replies.insert(message, composer.entity_id());
             self.scroll_reader_to_end(w);
@@ -296,6 +300,9 @@ impl MailApp {
             }
             ComposerEvent::Place(placement) => self.place_composer(composer, *placement, w, cx),
             ComposerEvent::Saved => self.refresh_drafts(cx),
+            ComposerEvent::NewAlias(service, mailbox) => {
+                self.handle(Action::NewAliasFor(service.clone(), mailbox.clone()), w, cx);
+            }
         }
         cx.notify();
     }
@@ -510,19 +517,65 @@ impl MailApp {
             cx,
             move |b| b.send(&a, &draft),
             move |this, result, cx| {
-                this.account_result(&account_id, IssueSource::Send, &result);
-                match result {
-                    Ok(()) => {
+                let gone = result
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<fwd::AliasGone>())
+                    .cloned();
+                // A deleted alias is not a problem with the mailbox.
+                if gone.is_none() {
+                    this.account_result(&account_id, IssueSource::Send, &result);
+                }
+                match (result, gone) {
+                    (Ok(()), _) => {
                         this.outbox.retain(|o| o.id != id);
                         this.notice("Message sent", false, cx);
                         this.refresh_drafts(cx);
                     }
-                    Err(e) => this.send_failed(id, format!("{e:#}"), cx),
+                    (Err(_), Some(gone)) => this.alias_gone(id, gone, cx),
+                    (Err(e), None) => this.send_failed(id, format!("{e:#}"), cx),
                 }
                 this.sending = this.outbox.iter().any(|o| o.delivering);
             },
         );
         cx.notify();
+    }
+
+    /// The alias a message was to be sent as no longer exists: it is
+    /// forgotten here, From goes back to the mailbox, and a dialog says so.
+    fn alias_gone(&mut self, id: u64, gone: fwd::AliasGone, cx: &mut Context<Self>) {
+        let Some(out) = self.outbox.iter().find(|o| o.id == id) else {
+            return;
+        };
+        let composer = out.composer.clone();
+        let account = composer.read(cx).draft.account.clone();
+        let from = self
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .map(|a| a.email.clone())
+            .unwrap_or_default();
+        composer.update(cx, |c, cx| c.reset_sender(cx));
+        let mut changed = false;
+        for f in &mut self.forwarding {
+            let before = f.aliases.len();
+            f.aliases.retain(|a| !a.email.eq_ignore_ascii_case(&gone.email));
+            changed |= f.aliases.len() != before;
+        }
+        if changed {
+            self.views_changed(cx);
+        }
+        self.send_failed(
+            id,
+            format!("{gone} From was reset to {from}."),
+            cx,
+        );
+        // It was out of the list of open composers while sending.
+        self.update_composer_aliases(cx);
+        self.modal = Some(Modal::AliasGone(gone.to_string(), from));
+        self.anim += 1;
+        // Others may have gone too.
+        self.refresh_aliases_due(Duration::ZERO, cx);
     }
 
     fn send_failed(&mut self, id: u64, error: String, cx: &mut Context<Self>) {
@@ -586,6 +639,10 @@ impl MailApp {
                     this.pending_place = Some((composer.entity_id(), *p));
                 }
                 ComposerEvent::Saved => this.refresh_drafts(cx),
+                // Opening Settings needs the window; the next render does it.
+                ComposerEvent::NewAlias(service, mailbox) => {
+                    this.pending_new_alias = Some((service.clone(), mailbox.clone()));
+                }
             }
             cx.notify();
         });

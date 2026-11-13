@@ -201,8 +201,138 @@ pub fn connect(
 pub fn refresh(account: &ForwardingAccount) -> Result<Vec<Alias>> {
     Ok(account.merge(account.client()?.aliases()?))
 }
-pub fn create(account: &ForwardingAccount, note: &str) -> Result<Alias> {
-    account.client()?.create(note)
+pub fn create(account: &ForwardingAccount, new: &NewAlias) -> Result<Alias> {
+    account.client()?.create(new)
+}
+/// The domains and prefixes the account can make aliases with.
+pub fn options(account: &ForwardingAccount) -> Result<AliasOptions> {
+    account.client()?.options()
+}
+/// Changes an alias's description at the service.
+pub fn set_note(account: &ForwardingAccount, alias: &Alias, note: &str) -> Result<()> {
+    account.client()?.set_note(alias, note)
+}
+
+/// What kind of domain an alias can be made at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomainKind {
+    /// A domain the person owns and added to the service.
+    Custom,
+    /// addy.io's subdomain of the person's username.
+    Username,
+    /// A shared domain only paying subscribers can use.
+    Premium,
+    /// A shared domain anyone can use.
+    Shared,
+}
+impl DomainKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Custom => "Your domain",
+            Self::Username => "Your subdomain",
+            Self::Premium => "Premium",
+            Self::Shared => "Free",
+        }
+    }
+}
+/// A domain (or, at SimpleLogin, a suffix) a new alias can end in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasDomain {
+    /// What follows the prefix: `@example.com`, or SimpleLogin's
+    /// `.word@simplelogin.com`.
+    pub suffix: String,
+    pub kind: DomainKind,
+    /// Whether the prefix can be chosen here; otherwise it is random.
+    pub custom_prefix: bool,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AliasOptions {
+    /// The domains, the default first.
+    pub domains: Vec<AliasDomain>,
+    /// A prefix the service suggests, if any.
+    pub prefix_suggestion: String,
+    /// False when the account has reached its alias limit.
+    pub can_create: bool,
+}
+/// How a random prefix is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AliasFormat {
+    RandomWords,
+    RandomCharacters,
+    Uuid,
+}
+impl AliasFormat {
+    pub const ALL: [Self; 3] = [Self::RandomWords, Self::RandomCharacters, Self::Uuid];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RandomWords => "Random Words",
+            Self::RandomCharacters => "Random Characters",
+            Self::Uuid => "UUID",
+        }
+    }
+    /// addy.io's name for it.
+    pub fn addy_key(self) -> &'static str {
+        match self {
+            Self::RandomWords => "random_words",
+            Self::RandomCharacters => "random_characters",
+            Self::Uuid => "uuid",
+        }
+    }
+}
+/// A new alias to make.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewAlias {
+    /// Empty for a random one.
+    pub prefix: String,
+    /// An `AliasDomain::suffix`; `None` for the account's default.
+    pub domain: Option<String>,
+    /// How the service makes a random prefix; `None` for its default.
+    pub format: Option<AliasFormat>,
+    pub note: String,
+    /// The real address its mail should go to, where the service asks.
+    pub mailbox: Option<String>,
+}
+
+const WORDS: [&str; 64] = [
+    "amber", "apple", "arrow", "aspen", "basil", "berry", "birch", "breeze", "brook", "cactus",
+    "canyon", "cedar", "cherry", "cinder", "clover", "comet", "coral", "cotton", "daisy", "delta",
+    "dune", "ember", "fable", "fern", "field", "flint", "frost", "garnet", "glade", "harbor",
+    "hazel", "heron", "indigo", "ivy", "jasper", "juniper", "lagoon", "lark", "lemon", "lilac",
+    "maple", "marble", "meadow", "mesa", "mint", "moss", "nectar", "oak", "olive", "orbit",
+    "pebble", "pine", "plum", "quartz", "raven", "ridge", "sage", "slate", "spruce", "summit",
+    "thistle", "tulip", "willow", "zephyr",
+];
+/// A random prefix made here, for services that take the prefix as given.
+pub fn random_prefix(format: AliasFormat) -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    match format {
+        AliasFormat::RandomWords => {
+            let word = |rng: &mut rand::rngs::ThreadRng| WORDS[rng.random_range(0..WORDS.len())];
+            format!(
+                "{}.{}{}",
+                word(&mut rng),
+                word(&mut rng),
+                rng.random_range(10..100)
+            )
+        }
+        AliasFormat::RandomCharacters => {
+            const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+            (0..10)
+                .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+                .collect()
+        }
+        AliasFormat::Uuid => uuid::Uuid::new_v4().to_string(),
+    }
+}
+/// A typed prefix as services accept it: lowercase, without spaces or `@`.
+pub fn clean_prefix(prefix: &str) -> String {
+    prefix
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect()
 }
 pub fn set_enabled(account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
     account.client()?.set_enabled(alias, enabled)
@@ -258,6 +388,52 @@ fn find_sendable<'a>(
         })
 }
 
+/// Sending failed because the alias in From no longer exists: it was
+/// deleted at its service, or is no longer listed here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasGone {
+    /// The alias's address.
+    pub email: String,
+    /// The service it was at, when known.
+    pub service: Option<ForwardingService>,
+}
+impl std::fmt::Display for AliasGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.service {
+            Some(s) => write!(f, "{} no longer exists at {}.", self.email, s.label()),
+            None => write!(f, "{} is no longer an alias Picacho can send as.", self.email),
+        }
+    }
+}
+impl std::error::Error for AliasGone {}
+
+/// Before sending as an alias, asks its service whether the alias still
+/// exists, since it can be deleted elsewhere. When the service can't be
+/// asked, sending goes ahead and reports any problem itself.
+pub fn verify_alias(store: &Store, draft: &Draft) -> Result<()> {
+    if draft.send_as.is_empty() {
+        return Ok(());
+    }
+    let forwarding = load(store);
+    let Some((account, alias)) = find_sendable(&forwarding, &draft.send_as) else {
+        return Err(AliasGone {
+            email: draft.send_as.trim().to_lowercase(),
+            service: None,
+        }
+        .into());
+    };
+    if let Ok(client) = account.client()
+        && let Ok(false) = client.alias_exists(alias)
+    {
+        return Err(AliasGone {
+            email: alias.email.clone(),
+            service: Some(account.service),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// The draft with its recipients rewritten so the service sends it as
 /// `draft.send_as`: SimpleLogin's reverse aliases, or addy.io's
 /// `alias+name=domain@alias-domain`. Addresses that already go through the
@@ -269,10 +445,11 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
     }
     let forwarding = load(store);
     let Some((account, alias)) = find_sendable(&forwarding, &draft.send_as) else {
-        anyhow::bail!(
-            "{} is no longer an alias Picacho can send as. Choose another address in From.",
-            draft.send_as
-        );
+        return Err(AliasGone {
+            email: draft.send_as.trim().to_lowercase(),
+            service: None,
+        }
+        .into());
     };
     anyhow::ensure!(
         alias.enabled,
@@ -602,6 +779,22 @@ mod tests {
             };
             assert!(route(&store, &draft).is_err(), "{send_as}");
         }
+        // An alias no longer listed is reported as gone, so From can be reset.
+        let gone = route(
+            &store,
+            &Draft {
+                send_as: "Deleted@me.anonaddy.com".into(),
+                ..draft.clone()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            gone.downcast_ref::<AliasGone>(),
+            Some(&AliasGone {
+                email: "deleted@me.anonaddy.com".into(),
+                service: None
+            })
+        );
         let offered: Vec<String> = sendable(&load(&store))
             .into_iter()
             .map(|a| a.email)

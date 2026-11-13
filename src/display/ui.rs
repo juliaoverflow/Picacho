@@ -306,6 +306,9 @@ enum Modal {
     Original,
     /// Preset pictures for an account.
     AvatarPresets(String),
+    /// A message wasn't sent because the alias in From no longer exists:
+    /// (why, the address From was reset to).
+    AliasGone(String, String),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -515,7 +518,23 @@ enum Action {
     SetDeliverTo(String, Option<String>),
     /// Opens the new alias form under a service, or closes it.
     NewAlias(String),
+    /// Opens Forwarding settings at a service's new alias form, for an
+    /// alias that forwards to a mailbox: (service, mailbox).
+    NewAliasFor(String, String),
     CreateAlias(String),
+    /// The new alias form's domain menu, for a service.
+    DomainMenu(String),
+    /// A domain chosen in the new alias form: its suffix.
+    SetAliasDomain(String),
+    /// The new alias form's random prefix menu, for a service.
+    PrefixMenu(String),
+    /// A random prefix: made here, or left to the service to make.
+    RandomPrefix(fwd::AliasFormat),
+    SetAliasPrefix(String),
+    /// Edits an alias's description: (service, alias).
+    EditAliasNote(String, String),
+    SaveAliasNote,
+    CancelAliasNote,
     /// Lists every alias of a service rather than the first few.
     ShowAllAliases(String),
     /// (service account, alias, on)
@@ -749,6 +768,21 @@ pub struct MailApp {
     fwd_confirm: Option<String>,
     /// The service whose new alias form is open.
     fwd_creating: Option<String>,
+    /// The new alias form: its prefix, the domains each service offers (or
+    /// why they could not be listed), the chosen domain's suffix, how a
+    /// random prefix is made, and the mailbox the alias forwards to.
+    fwd_prefix: Entity<InputState>,
+    fwd_options: HashMap<String, Result<fwd::AliasOptions, String>>,
+    fwd_domain: Option<String>,
+    fwd_format: Option<fwd::AliasFormat>,
+    fwd_mailbox: Option<String>,
+    /// The alias whose description is being edited: (service, alias).
+    fwd_editing: Option<(String, String)>,
+    fwd_description: Entity<InputState>,
+    /// A new alias form asked for by a composer whose subscription had no window.
+    pending_new_alias: Option<(String, String)>,
+    /// When each service's aliases were last fetched.
+    fwd_refreshed: HashMap<String, std::time::Instant>,
     fwd_expanded: HashSet<String>,
     /// Forwarding services whose details are open in the list.
     fwd_open: HashSet<String>,
@@ -848,7 +882,27 @@ impl MailApp {
             window,
             cx,
         );
-        let fwd_note = input("Note for a new alias (optional)", false, false, window, cx);
+        let fwd_note = input("Description (optional)", false, false, window, cx);
+        let fwd_prefix = input("Random prefix", false, false, window, cx);
+        subscriptions.push(cx.subscribe_in(&fwd_prefix, window, |this, _, event, w, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => {
+                    if let Some(id) = this.fwd_creating.clone() {
+                        this.handle(Action::CreateAlias(id), w, cx);
+                    }
+                }
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            }
+        }));
+        let fwd_description = input("Description", false, false, window, cx);
+        subscriptions.push(
+            cx.subscribe_in(&fwd_description, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.handle(Action::SaveAliasNote, w, cx);
+                }
+            }),
+        );
         let fwd_search = input("Find an alias", false, false, window, cx);
         subscriptions.push(cx.subscribe(&fwd_search, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
@@ -1117,6 +1171,15 @@ impl MailApp {
             fwd_error: None,
             fwd_confirm: None,
             fwd_creating: None,
+            fwd_prefix,
+            fwd_options: HashMap::new(),
+            fwd_domain: None,
+            fwd_format: None,
+            fwd_mailbox: None,
+            fwd_editing: None,
+            fwd_description,
+            pending_new_alias: None,
+            fwd_refreshed: HashMap::new(),
             fwd_expanded: HashSet::new(),
             fwd_open: HashSet::new(),
             fwd_adding: false,
@@ -1138,7 +1201,11 @@ impl MailApp {
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_secs(20)).await;
-                if this.update(cx, |this, cx| this.check_due(cx)).is_err() {
+                let checked = this.update(cx, |this, cx| {
+                    this.check_due(cx);
+                    this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
+                });
+                if checked.is_err() {
                     break;
                 }
             }
@@ -3041,6 +3108,9 @@ impl MailApp {
             }
             Action::SettingsPage(page) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
+                if page == Page::Forwarding {
+                    self.refresh_aliases_due(views::ALIAS_REFRESH_SOON, cx);
+                }
                 self.page = page;
             }
             Action::About => {
@@ -3239,19 +3309,57 @@ impl MailApp {
                 self.fwd_error = None;
             }
             Action::ConnectForwarding => self.connect_forwarding(w, cx),
-            Action::RefreshAliases(id) => self.refresh_aliases(id, cx),
+            Action::RefreshAliases(id) => self.refresh_aliases(id, false, cx),
             Action::RemoveForwarding(id) => self.remove_forwarding(id, cx),
             Action::SetDeliverTo(id, to) => {
                 self.edit_forwarding(&id, |f| f.deliver_to = to, cx);
             }
             Action::NewAlias(id) => {
                 if self.fwd_creating.take() != Some(id.clone()) {
-                    self.fwd_creating = Some(id);
-                    Self::set(&self.fwd_note, "", w, cx);
-                    self.fwd_note.update(cx, |s, cx| s.focus(w, cx));
+                    let mailbox = self
+                        .forwarding
+                        .iter()
+                        .find(|f| f.id == id)
+                        .and_then(|f| f.deliver_to.clone());
+                    self.open_alias_form(id, mailbox, w, cx);
                 }
             }
+            Action::NewAliasFor(id, mailbox) => self.new_alias_for(id, mailbox, w, cx),
             Action::CreateAlias(id) => self.create_alias(id, cx),
+            Action::DomainMenu(id) => {
+                if !matches!(self.fwd_options.get(&id), Some(Ok(_))) {
+                    self.load_alias_options(id, cx);
+                } else {
+                    let entries = self.domain_entries(&id);
+                    self.open_menu_here(entries, w, cx);
+                    return;
+                }
+            }
+            Action::SetAliasDomain(suffix) => self.fwd_domain = Some(suffix),
+            Action::PrefixMenu(id) => {
+                let entries = self.prefix_entries(&id);
+                self.open_menu_here(entries, w, cx);
+                return;
+            }
+            Action::RandomPrefix(format) => self.random_prefix(format, w, cx),
+            Action::SetAliasPrefix(prefix) => {
+                self.fwd_format = None;
+                Self::set(&self.fwd_prefix, prefix, w, cx);
+            }
+            Action::EditAliasNote(id, alias) => {
+                let note = self
+                    .forwarding
+                    .iter()
+                    .find(|f| f.id == id)
+                    .and_then(|f| f.aliases.iter().find(|a| a.id == alias))
+                    .map(|a| a.note.clone())
+                    .unwrap_or_default();
+                self.fwd_editing = Some((id, alias));
+                Self::set(&self.fwd_description, note, w, cx);
+                self.fwd_description.update(cx, |s, cx| s.focus(w, cx));
+            }
+            Action::SaveAliasNote => self.save_alias_note(cx),
+            Action::CancelAliasNote => self.fwd_editing = None,
             Action::ShowAllAliases(id) => {
                 self.fwd_expanded.insert(id);
             }
@@ -5385,6 +5493,34 @@ impl MailApp {
             )
             .into_any_element()
     }
+    fn alias_gone_modal(&self, why: &str, from: &str) -> AnyElement {
+        let c = self.colors();
+        div()
+            .id("alias-gone")
+            .debug_selector(|| "alias-gone".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(icon_el("warning", 16., c.danger))
+                    .child(why.to_owned()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(format!(
+                        "Your message wasn't sent and is back in its composer. From was reset to {from}; send it from there, or choose another address in From."
+                    )),
+            )
+            .into_any_element()
+    }
     fn setup_submit(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let busy = self.discovering || self.connecting;
@@ -5429,6 +5565,7 @@ impl MailApp {
             Modal::RemoveAccount(_) => "Remove Account",
             Modal::Original => "Original Message",
             Modal::AvatarPresets(_) => "Choose a Picture",
+            Modal::AliasGone(..) => "Alias No Longer Exists",
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -5439,6 +5576,7 @@ impl MailApp {
             Modal::RemoveAccount(id) => self.remove_modal(id),
             Modal::Original => self.original_modal(cx),
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
+            Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
         };
         let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
         let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
@@ -5451,7 +5589,10 @@ impl MailApp {
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
                 Modal::AvatarPresets(_) => 560.,
-                Modal::RemoveAccount(_) | Modal::Reconnect(_) | Modal::About => 400.,
+                Modal::RemoveAccount(_)
+                | Modal::Reconnect(_)
+                | Modal::About
+                | Modal::AliasGone(..) => 400.,
                 Modal::Settings | Modal::Original => 820.,
             }))
             .max_w(available_width)
@@ -5645,6 +5786,7 @@ impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_reveal(window, cx);
         self.apply_pending_place(window, cx);
+        self.apply_pending_new_alias(window, cx);
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = self.root(window, cx);
