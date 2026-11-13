@@ -256,16 +256,17 @@ impl MailApp {
                 .child("Add Account")
                 .on_click(cx.listener(|this, _, w, cx| this.handle(Action::Connect, w, cx))),
         );
-        let page = match &self.page {
-            Page::Account(id) => match self.accounts.iter().position(|a| &a.id == id) {
-                Some(i) => self.account_page(i, cx),
-                None => self.general_page(cx),
-            },
-            Page::General => self.general_page(cx),
-            Page::Reading => self.reading_page(cx),
-            Page::Composing => self.composing_page(cx),
-            Page::Forwarding => self.forwarding_page(cx),
+        // The reverse aliases subpage scrolls on its own, in place of
+        // Forwarding, whose scroll is kept for coming back.
+        let sub = matches!(self.page, Page::Forwarding)
+            .then(|| self.reverse_page(cx))
+            .flatten();
+        let page = if let Some(sub) = sub {
+            (sub, &self.fwd_reverse_scroll, "reverse-page")
+        } else {
+            (self.settings_body(cx), &self.settings_scroll, "settings-page")
         };
+        let (page, scroll, page_id) = page;
         div()
             .size_full()
             .min_h_0()
@@ -275,9 +276,9 @@ impl MailApp {
             .child(nav)
             .child(
                 div()
-                    .id("settings-page")
-                    .track_scroll(&self.settings_scroll)
-                    .debug_selector(|| "settings-page".into())
+                    .id(page_id)
+                    .track_scroll(scroll)
+                    .debug_selector(move || page_id.into())
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -285,7 +286,7 @@ impl MailApp {
                     .p_6()
                     .when(narrow, |d| d.p_4())
                     .child(page)
-                    .map(|page| super::panes::scroll_frame(page, &self.settings_scroll)),
+                    .map(|page| super::panes::scroll_frame(page, scroll)),
             )
             .when_some(self.presets_for.as_deref(), |d, id| {
                 d.child(self.presets_sheet(id, cx))
@@ -1358,5 +1359,21 @@ impl Render for SettingsWindow {
                 )
             })
             .children(menu)
+    }
+}
+
+impl MailApp {
+    /// The open settings page.
+    fn settings_body(&self, cx: &Context<Self>) -> AnyElement {
+        match &self.page {
+            Page::Account(id) => match self.accounts.iter().position(|a| &a.id == id) {
+                Some(i) => self.account_page(i, cx),
+                None => self.general_page(cx),
+            },
+            Page::General => self.general_page(cx),
+            Page::Reading => self.reading_page(cx),
+            Page::Composing => self.composing_page(cx),
+            Page::Forwarding => self.forwarding_page(cx),
+        }
     }
 }

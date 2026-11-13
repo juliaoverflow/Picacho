@@ -225,6 +225,212 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// The subscriptions detected in `accounts`' cached mail.
+    pub fn subscriptions(
+        &self,
+        accounts: &[String],
+    ) -> Result<Vec<crate::manage::subscriptions::Subscription>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL",
+        )?;
+        let mut mails = Vec::new();
+        for account in accounts {
+            for row in q.query_map([account], |r| r.get::<_, String>(0))? {
+                if let Ok(mail) = serde_json::from_str::<Mail>(&row?) {
+                    mails.push(mail);
+                }
+            }
+        }
+        Ok(crate::manage::subscriptions::group(mails))
+    }
+    /// The newest `limit` messages from `address` in `account` that offer
+    /// to unsubscribe, newest first, each once, outside Junk and Trash.
+    pub fn subscription_messages(&self, account: &str, address: &str, limit: usize) -> Result<Vec<Mail>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND lower(trim(json_extract(data,'$.from')))=?2 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL ORDER BY json_extract(data,'$.date') DESC",
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for row in q.query_map(params![account, address.trim().to_lowercase()], |r| r.get::<_, String>(0))? {
+            let Ok(mail) = serde_json::from_str::<Mail>(&row?) else {
+                continue;
+            };
+            if crate::manage::subscriptions::Subscription::of(&mail).is_none() {
+                continue;
+            }
+            let identity = if mail.message_id.is_empty() { mail.id.clone() } else { mail.message_id.clone() };
+            if seen.insert(identity) {
+                out.push(mail);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+    /// Works out again the preview (and text, where kept) of cached
+    /// messages from their downloaded source, after how mail is read as
+    /// text changed (Office markup, character references and invisible
+    /// padding used to show in previews). Background downloads keep only a
+    /// preview, so it is worked out from the source whenever there is one.
+    /// Returns how many changed.
+    pub fn refresh_previews(&self) -> Result<usize> {
+        let ids: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            let mut q = db.prepare(
+                "SELECT id FROM messages WHERE raw IS NOT NULL OR json_type(data,'$.body')='text' OR json_extract(data,'$.snippet')<>''",
+            )?;
+            q.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut changed = 0;
+        // In batches, so other work gets the cache in between.
+        for chunk in ids.chunks(100) {
+            let rows: Vec<(String, String, Option<Vec<u8>>)> = {
+                let db = self.db.lock().unwrap();
+                let mut q = db.prepare("SELECT data, raw FROM messages WHERE id=?1")?;
+                let mut rows = Vec::new();
+                for id in chunk {
+                    if let Some(row) = q
+                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))?
+                        .next()
+                    {
+                        let (data, raw) = row?;
+                        rows.push((id.clone(), data, raw));
+                    }
+                }
+                rows
+            };
+            let mut updates = Vec::new();
+            for (id, data, raw) in rows {
+                let Ok(mail) = serde_json::from_str::<Mail>(&data) else {
+                    continue;
+                };
+                // Encrypted sources hold no readable text; what is cached stays.
+                let parsed = raw
+                    .as_deref()
+                    .filter(|raw| {
+                        crate::manage::crypto::encrypted_part(raw).is_none()
+                            && !raw.windows(27).any(|w| w == b"-----BEGIN PGP MESSAGE-----")
+                    })
+                    .and_then(|raw| {
+                        let mut a = Account::new(Provider::Imap);
+                        a.id = mail.account.clone();
+                        crate::sync::mime::parse_message(
+                            raw,
+                            &a,
+                            &mail.id,
+                            mail.folder,
+                            &mail.remote_folder,
+                            mail.uid,
+                        )
+                        .ok()
+                    });
+                let (body, snippet) = match parsed {
+                    Some(p) => (
+                        // Only text that was kept is replaced.
+                        mail.body.as_ref().and(p.body.clone()).or(mail.body.clone()),
+                        p.snippet,
+                    ),
+                    None => {
+                        let text = mail.body.as_deref().unwrap_or(&mail.snippet);
+                        (mail.body.clone(), crate::sync::mime::snippet(text))
+                    }
+                };
+                if body != mail.body || snippet != mail.snippet {
+                    updates.push((id, body, snippet));
+                }
+            }
+            if updates.is_empty() {
+                continue;
+            }
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            for (id, body, snippet) in &updates {
+                match body {
+                    Some(body) => tx.execute(
+                        "UPDATE messages SET data=json_set(data,'$.body',?2,'$.snippet',?3) WHERE id=?1",
+                        params![id, body, snippet],
+                    )?,
+                    None => tx.execute(
+                        "UPDATE messages SET data=json_set(data,'$.snippet',?2) WHERE id=?1",
+                        params![id, snippet],
+                    )?,
+                };
+            }
+            tx.commit()?;
+            changed += updates.len();
+        }
+        Ok(changed)
+    }
+    /// Reads List-Unsubscribe from the downloaded source of messages cached
+    /// before it was kept. Returns how many were found.
+    pub fn backfill_subscriptions(&self) -> Result<usize> {
+        let ids: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            let mut q = db.prepare(
+                "SELECT id FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL",
+            )?;
+            q.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut total = 0;
+        // In batches, as refresh_previews does, so sync and the interface
+        // get the cache in between.
+        for chunk in ids.chunks(100) {
+            let rows: Vec<(String, Vec<u8>)> = {
+                let db = self.db.lock().unwrap();
+                // Only the headers are needed, which come first.
+                let mut q = db.prepare(
+                    "SELECT substr(raw,1,65536) FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL",
+                )?;
+                let mut rows = Vec::new();
+                for id in chunk {
+                    if let Some(head) = q.query_map([id], |r| r.get::<_, Vec<u8>>(0))?.next() {
+                        rows.push((id.clone(), head?));
+                    }
+                }
+                rows
+            };
+            let mut found = Vec::new();
+            for (id, head) in rows {
+                if !head.windows(16).any(|w| w.eq_ignore_ascii_case(b"list-unsubscribe")) {
+                    continue;
+                }
+                let Ok((headers, _)) = mailparse::parse_headers(&head) else {
+                    continue;
+                };
+                use mailparse::MailHeaderMap;
+                let header = headers.get_first_value("List-Unsubscribe").unwrap_or_default();
+                if header.trim().is_empty() {
+                    continue;
+                }
+                let one_click = headers
+                    .get_first_value("List-Unsubscribe-Post")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .replace(' ', "")
+                    .contains("list-unsubscribe=one-click");
+                found.push((id, header.trim().to_owned(), one_click));
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            for (id, header, one_click) in &found {
+                tx.execute(
+                    "UPDATE messages SET data=json_set(data,'$.list_unsubscribe',?2,'$.one_click',json(?3)) WHERE id=?1",
+                    params![id, header, if *one_click { "true" } else { "false" }],
+                )?;
+            }
+            tx.commit()?;
+            total += found.len();
+        }
+        Ok(total)
+    }
     pub fn message(&self, id: &str) -> Result<Option<Mail>> {
         use rusqlite::OptionalExtension;
         let json: Option<String> = self

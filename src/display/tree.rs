@@ -1090,6 +1090,7 @@ impl MailApp {
                 }
             }
         }
+        block = add(block, self.subscriptions_nav(id, cx));
         Some(block.into_any_element())
     }
     fn folder_block(
@@ -1471,6 +1472,12 @@ impl MailApp {
                                 index,
                             ));
                         }
+                        let button = self.subscriptions_rail(id, cx);
+                        block = block.child(self.reveal(
+                            id,
+                            div().child(self.stagger(button, Self::next_row(row))),
+                            Folder::ALL.len(),
+                        ));
                     }
                     out.push(block.into_any_element());
                 }

@@ -46,7 +46,7 @@ fn derivations_match_the_web_app_known_answers() {
     let aad = context(&["pinal-mail/v1/slot", "user-1", &"0".repeat(32), "password"]);
     let wrapped = cipher
         .encrypt(
-            Nonce::from_slice(&[0; 12]),
+            &Nonce::from([0; 12]),
             Payload {
                 msg: &mk,
                 aad: &aad,

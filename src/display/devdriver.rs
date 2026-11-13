@@ -180,7 +180,8 @@ fn run(
                 crate::sync::mime::parse_message(&raw, &account, &id, Folder::Inbox, "INBOX", 0)
             {
                 mail.date = chrono::Utc::now().timestamp();
-                let details = crate::sync::mime::details(&raw);
+                let mut details = crate::sync::mime::details(&raw, false);
+                crate::sync::auth::check(&raw, &mut details);
                 this.details = Some(MessageInfo {
                     id: id.clone(),
                     result: Some(Ok(Rc::new(Original::new(details, &raw)))),

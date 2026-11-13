@@ -387,6 +387,14 @@ impl Backend {
             .insert(a.id.clone(), keys.clone());
         Ok(Some(keys))
     }
+    /// Whether this computer can decrypt the message: it is encrypted, and
+    /// the account's keys opened it.
+    pub fn decrypts(&self, a: &Account, raw: &[u8]) -> bool {
+        matches!(
+            self.plaintext(a, raw),
+            Ok((crate::manage::crypto::Protection::Pinal, _))
+        )
+    }
     /// The readable message: decrypted here when Pinal stored it encrypted.
     fn plaintext(
         &self,
@@ -1429,9 +1437,45 @@ impl Backend {
             Ok(stored)
         })
     }
+    /// Works out how to unsubscribe from `sub`: from the newest of its
+    /// recent messages whose List-Unsubscribe its sender signed, so a forged
+    /// message "from" the sender can't redirect it; failing that, from the
+    /// latest, without one click. Looks the signatures' keys up in DNS, and
+    /// may download a message's source.
+    pub fn unsubscribe_plan(
+        &self,
+        a: &Account,
+        sub: &crate::manage::subscriptions::Subscription,
+    ) -> Result<crate::manage::subscriptions::Plan> {
+        use crate::manage::subscriptions::Plan;
+        let messages = self.store.subscription_messages(&a.id, &sub.address, 5)?;
+        for m in &messages {
+            let Ok(raw) = self.original(a, m) else {
+                continue;
+            };
+            if let Some(plan) = crate::sync::auth::signed_unsubscribe(&raw)
+                .and_then(|signed| Plan::new(Some(&signed), ""))
+            {
+                return Ok(plan);
+            }
+        }
+        let latest = messages.first().map_or(sub.unsubscribe.as_str(), |m| m.list_unsubscribe.as_str());
+        Plan::new(None, latest).context("This sender offers no way to unsubscribe.")
+    }
+    /// Carries out a plan from `unsubscribe_plan`: one click, or a message
+    /// sent from `a`, or the page to open.
+    pub fn unsubscribe(
+        &self,
+        a: &Account,
+        plan: &crate::manage::subscriptions::Plan,
+    ) -> Result<crate::manage::subscriptions::Outcome> {
+        crate::manage::subscriptions::unsubscribe(plan, &a.id, |d| self.send(a, d))
+    }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
         // Sending as an alias asks its service for the routed addresses
-        // first, outside the account's lock.
+        // first, outside the account's lock, once it knows the alias is
+        // still there.
+        crate::manage::forwarding::verify_alias(&self.store, d)?;
         let routed = crate::manage::forwarding::route(&self.store, d)?;
         let d = &routed;
         let lock = self.account_lock(&a.id);

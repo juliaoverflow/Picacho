@@ -446,6 +446,13 @@ pub struct Mail {
     /// Gmail's permanent id, shared by the copies under each label; 0 elsewhere.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub gmail_id: u64,
+    /// The List-Unsubscribe header of mail from a subscription: where to
+    /// ask to stop it (mailto: and https: addresses in angle brackets).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub list_unsubscribe: String,
+    /// The sender accepts a one-click unsubscribe (RFC 8058).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_click: bool,
     /// A row the list knows exists on the server but has not listed yet.
     /// Never stored; the list draws it as a placeholder until it loads.
     #[serde(skip)]
@@ -673,6 +680,12 @@ pub fn demo_mail() -> Vec<Mail> {
             message_id: format!("<demo-{i}@picacho.example>"),
             has_attachments: i == 2,
             gmail_id: 0,
+            list_unsubscribe: if *from == "hello@thebrowser.com" {
+                "<mailto:unsubscribe@thebrowser.com?subject=unsubscribe>".into()
+            } else {
+                String::new()
+            },
+            one_click: false,
             pending: false,
             reply_to: String::new(),
         })

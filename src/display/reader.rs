@@ -278,7 +278,8 @@ impl MailApp {
                             .child(date_full(m.date)),
                     ),
             )
-            .when(self.details_open, |d| d.child(self.details_panel(m, cx)));
+            .when(self.details_open, |d| d.child(self.details_panel(m, cx)))
+            .children(self.unsubscribe_banner(m, cx));
         let locked = m.body.is_none() && self.locked.contains(&m.account);
         let options = self.reading_options(m);
         let dark = self.email_dark(options);
@@ -447,6 +448,7 @@ impl MailApp {
                         ),
                 );
             }
+            content = content.child(self.source_links(cx));
         }
         div()
             .id("reader-pane")
@@ -667,7 +669,7 @@ impl MailApp {
                 let (icon, color) = match d.security {
                     Security::EndToEnd | Security::Tls => ("lock", 0x1e8e3e),
                     Security::Plain => ("warning", c.danger),
-                    Security::Unknown => ("info", c.muted),
+                    Security::Undecrypted | Security::Unknown => ("info", c.muted),
                 };
                 panel_rows.push(
                     row(
@@ -684,6 +686,56 @@ impl MailApp {
                 );
                 let checks: Vec<(&str, &Option<String>)> =
                     vec![("SPF", &d.spf), ("DKIM", &d.dkim), ("DMARC", &d.dmarc)];
+                if !d.checked {
+                    let checking = self.sender_checking.as_deref() == Some(m.id.as_str());
+                    panel_rows.push(
+                        row(
+                            "verified:",
+                            if checking {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_color(rgb(c.muted))
+                                    .child(spinner(13., c.muted))
+                                    .child("Checking the sender…")
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        self.button(
+                                            "check-sender",
+                                            "Check sender",
+                                            "",
+                                            Action::CheckSender,
+                                            false,
+                                            cx,
+                                        )
+                                        .h(px(24.))
+                                        .text_size(px(11.5))
+                                        .border_1()
+                                        .border_color(rgb(c.border)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(c.muted))
+                                            .child("Looks up SPF, DKIM and DMARC; the sender's DNS can see when."),
+                                    )
+                                    .into_any_element()
+                            },
+                        )
+                        .into_any_element(),
+                    );
+                } else if !checks.iter().any(|(_, v)| v.is_some()) {
+                    panel_rows.push(
+                        row("verified:", text("Couldn't check the sender (no DNS answer)".into()))
+                            .into_any_element(),
+                    );
+                }
                 if checks.iter().any(|(_, v)| v.is_some()) {
                     panel_rows.push(
                         row(
@@ -913,6 +965,39 @@ impl MailApp {
         row.into_any_element()
     }
 
+    /// Quiet links at the very bottom of a message to its headers, HTML
+    /// and whole source.
+    fn source_links(&self, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let mut row = div()
+            .id("message-source-links")
+            .debug_selector(|| "message-source-links".into())
+            .mt_6()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.))
+            .text_color(rgb(c.muted));
+        for (i, view) in SourceView::ALL.into_iter().enumerate() {
+            if i > 0 {
+                row = row.child("·");
+            }
+            let label = match view {
+                SourceView::Headers => "View headers",
+                SourceView::Html => "View HTML",
+                SourceView::Original => "View original",
+            };
+            row = row.child(self.link(
+                &format!("view-source-{}", view.label().to_lowercase()),
+                label,
+                Action::ShowSource(view),
+                cx,
+            ));
+        }
+        div().child(row)
+    }
+
     pub(super) fn original_modal(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let info = self
@@ -950,13 +1035,44 @@ impl MailApp {
                         )
                         .child(div().flex_1().min_w_0().truncate().child(value))
                 };
+                let checked = d.checked;
                 let verdict = |v: &Option<String>, domain: Option<&String>| match (v, domain) {
+                    (Some(v), _) if v == crate::sync::auth::UNVERIFIABLE => {
+                        "Couldn't verify (the signing key may have changed since)".into()
+                    }
                     (Some(v), Some(d)) => format!("{} with domain {d}", v.to_uppercase()),
                     (Some(v), None) => v.to_uppercase(),
+                    (None, _) if !checked => "Not checked (use Check sender in the message's details)".into(),
                     (None, _) => "Not recorded".into(),
                 };
-                let lines = original.lines.clone();
+                let view = self.source_view;
+                let shown = original.view(view);
+                let lines = shown.map(|(_, l)| l.clone()).unwrap_or_default();
                 let mono = c;
+                // Switches between the message's headers, HTML and source.
+                let mut tabs = div().flex().gap_1().ml_auto();
+                for v in SourceView::ALL {
+                    let on = v == view;
+                    tabs = tabs.child(
+                        div()
+                            .id(SharedString::from(format!("source-tab-{}", v.label().to_lowercase())))
+                            .px_2()
+                            .h(px(30.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if on { c.text } else { c.muted }))
+                            .when(on, |d| d.bg(rgb(c.soft)))
+                            .hover(move |s| s.bg(rgb(c.soft)))
+                            .child(v.label())
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.handle(Action::ShowSource(v), w, cx)
+                            })),
+                    );
+                }
                 div()
                     .flex_1()
                     .min_h_0()
@@ -1014,10 +1130,20 @@ impl MailApp {
                                         .text_size(px(12.))
                                         .border_1()
                                         .border_color(rgb(c.border)),
-                                    ),
+                                    )
+                                    .child(tabs),
                             ),
                     )
-                    .child(
+                    .when(shown.is_none(), |d| {
+                        d.child(
+                            div()
+                                .p_5()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child("This message has no HTML part; it is plain text."),
+                        )
+                    })
+                    .when(shown.is_some(), |d| d.child(
                         div()
                             .id("original-source")
                             .debug_selector(|| "original-source".into())
@@ -1044,7 +1170,7 @@ impl MailApp {
                                 .size_full()
                                 .py_3(),
                             ),
-                    )
+                    ))
                     .into_any_element()
             }
         };
@@ -1075,7 +1201,11 @@ fn verdict_chip(name: &str, verdict: &str, c: Colors) -> AnyElement {
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(fg))
         .bg(rgba((bg << 8) | 0x1f))
-        .child(format!("{name} {verdict}"))
+        .child(if verdict == crate::sync::auth::UNVERIFIABLE {
+            format!("{name} couldn't verify (key may have changed)")
+        } else {
+            format!("{name} {verdict}")
+        })
         .into_any_element()
 }
 
@@ -1252,7 +1382,7 @@ impl MailApp {
                                     .truncate()
                                     .text_size(px(12.))
                                     .text_color(rgb(c.muted))
-                                    .child(x.snippet.clone()),
+                                    .child(super::preview(&x.snippet)),
                             ),
                     )
                     .child(

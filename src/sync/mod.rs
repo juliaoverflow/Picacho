@@ -1,5 +1,6 @@
 //! Sync: provider discovery, authentication, and incoming/outgoing protocols.
 //! Protocol helpers never depend on Display and never mutate the message database.
+pub mod auth;
 pub mod discover;
 pub mod forwarding;
 mod imap;

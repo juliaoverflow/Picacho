@@ -158,6 +158,25 @@ fn resource_policy_blocks_every_network_path_and_enabling_it_loads_css_and_image
 }
 
 #[test]
+fn only_web_and_email_links_are_opened() {
+    for url in [
+        "file:///C:/Windows/System32/calc.exe",
+        "file://attacker.example/share/payload.exe",
+        "smb://attacker.example/share/payload.exe",
+        "\\\\attacker.example\\share\\payload.exe",
+        "javascript:alert(1)",
+        "ms-msdt:/id PCWDiagnostic",
+        "search-ms:query=x&crumb=location:\\\\attacker.example\\share",
+        "http://user:secret@example.com/",
+        "/relative/image.png",
+    ] {
+        assert!(super::openable_url(url).is_none(), "{url}");
+    }
+    assert!(super::openable_url("https://example.com/a.png").is_some());
+    assert!(super::openable_url("mailto:ana@example.com").is_some());
+}
+
+#[test]
 fn unsafe_resource_schemes_and_credentials_are_refused() {
     for url in [
         "file:///etc/passwd",
@@ -200,6 +219,36 @@ fn unsafe_resource_schemes_and_credentials_are_refused() {
         b"hello"
     );
     cancelled.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn context_menus_never_offer_local_or_network_share_images() {
+    let target = |src: &str| {
+        let mut email = EmailDocument::new(
+            &format!(
+                "<body style='margin:0'><a href='file:///C:/x.exe'><img src='{src}' style='display:block;width:100px;height:100px'></a></body>"
+            ),
+            true,
+        );
+        email.layout(400);
+        email.context_at(50., 50.)
+    };
+    for src in [
+        "file://attacker.example/share/payload.exe",
+        "smb://attacker.example/share/payload.exe",
+        "\\\\attacker.example\\share\\payload.exe",
+        // Unresolvable against the email's base; these used to stop it rendering.
+        "logo.png",
+        "http://[",
+    ] {
+        let hit = target(src);
+        assert_eq!(hit.image, None, "{src}");
+        assert_eq!(hit.link, None, "a file: link is not offered either");
+    }
+    assert_eq!(
+        target("https://example.com/a.png").image.as_deref(),
+        Some("https://example.com/a.png")
+    );
 }
 
 #[test]

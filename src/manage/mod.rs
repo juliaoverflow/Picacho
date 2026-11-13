@@ -8,5 +8,6 @@ pub mod forwarding;
 pub mod model;
 pub mod status;
 pub mod store;
+pub mod subscriptions;
 
 pub mod reading;

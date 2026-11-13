@@ -66,6 +66,9 @@ pub(super) enum ComposerEvent {
     Place(Placement),
     /// The draft was saved; lists of drafts may refresh.
     Saved,
+    /// Open Forwarding settings to make an alias at a service for a
+    /// mailbox: (service, mailbox).
+    NewAlias(String, String),
 }
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -132,6 +135,9 @@ pub(super) struct Composer {
     accounts: Vec<Account>,
     /// Aliases at forwarding services that can send.
     aliases: Vec<fwd::SendAlias>,
+    /// Services that can make aliases to send as: (service, the mailbox it
+    /// forwards to, or `None` for any).
+    alias_services: Vec<(String, fwd::ForwardingService, Option<String>)>,
     /// Known people (name, address) offered while typing a recipient.
     contacts: Rc<Vec<(String, String)>>,
     suggestions: Vec<(String, String)>,
@@ -242,6 +248,7 @@ impl Composer {
             from_filter,
             accounts,
             aliases,
+            alias_services: vec![],
             contacts,
             suggestions: vec![],
             suggest_field: TO,
@@ -950,6 +957,62 @@ impl Composer {
             .flatten()
     }
 
+    /// The aliases and alias services, after they change in Settings.
+    pub(super) fn set_forwarding(
+        &mut self,
+        aliases: Vec<fwd::SendAlias>,
+        services: Vec<(String, fwd::ForwardingService, Option<String>)>,
+    ) {
+        self.aliases = aliases;
+        self.alias_services = services;
+    }
+
+    /// Sends as the mailbox again, after the alias in From went away.
+    pub(super) fn reset_sender(&mut self, cx: &mut Context<Self>) {
+        self.draft.send_as.clear();
+        self.from_open = false;
+        self.changed(cx);
+    }
+
+    /// The service that makes aliases for `account`: one forwarding to it,
+    /// else one forwarding to any mailbox.
+    fn alias_service_for(&self, account: &str) -> Option<&(String, fwd::ForwardingService, Option<String>)> {
+        self.alias_services
+            .iter()
+            .find(|(_, _, to)| to.as_deref() == Some(account))
+            .or_else(|| self.alias_services.iter().find(|(_, _, to)| to.is_none()))
+    }
+
+    /// A button that opens Settings to make a new alias for `account`.
+    fn new_alias_button(&self, id: (&'static str, usize), account: &Account, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        let c = self.colors;
+        let (service, kind, _) = self.alias_service_for(&account.id)?;
+        let tip = format!("New {} alias for {}", kind.label(), account.email);
+        let (service, mailbox) = (service.clone(), account.id.clone());
+        Some(
+            div()
+                .id(id)
+                .debug_selector(move || format!("{}-{}", id.0, id.1))
+                .size(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(rgb(c.soft)))
+                .child(icon_el("alias", 14., c.muted))
+                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.from_open = false;
+                    cx.emit(ComposerEvent::NewAlias(service.clone(), mailbox.clone()));
+                    cx.notify();
+                })),
+        )
+    }
+
     /// Opens or closes the From menu, starting it unfiltered.
     fn toggle_from(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self
@@ -987,8 +1050,17 @@ impl Composer {
             .find(|a| a.id == self.draft.account)
             .or(self.accounts.first())?;
         let alias = self.send_alias();
-        let several = self.accounts.len() + self.aliases.len() > 1;
+        // Sending as an alias that is no longer listed; sending says so.
+        let missing = alias.is_none() && !self.draft.send_as.is_empty();
+        let several = self.accounts.len() + self.aliases.len() > 1 || missing;
         let (label, tip) = match alias {
+            None if missing => (
+                self.draft.send_as.clone(),
+                format!(
+                    "{} no longer exists. Choose another address.",
+                    self.draft.send_as
+                ),
+            ),
             Some(a) => (
                 a.email.clone(),
                 format!(
@@ -1015,7 +1087,14 @@ impl Composer {
             .min_w_0()
             .max_w_full()
             .text_size(px(13.))
-            .child(div().min_w_0().truncate().child(label))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .when(missing, |d| d.text_color(rgb(c.danger)).line_through())
+                    .child(label),
+            )
+            .when(missing, |d| d.child(icon_el("warning", 13., c.danger)))
             .when_some(alias, |d, a| d.child(service_badge(a.service, c)))
             .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx));
         if several {
@@ -1028,7 +1107,14 @@ impl Composer {
                 .child(icon_el("chevron-down", 12., c.muted))
                 .on_click(cx.listener(|this, _, w, cx| this.toggle_from(w, cx)));
         }
-        let mut row = self.row("From", picker).relative();
+        let field = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .child(picker)
+            .children(self.new_alias_button(("compose-new-alias", 0), current, cx));
+        let mut row = self.row("From", field).relative();
         if self.from_open && several {
             row = row.child(deferred(self.sender_menu(current, cx)).with_priority(2));
         }
@@ -1109,14 +1195,17 @@ impl Composer {
         }
         for (i, a) in accounts.into_iter().enumerate() {
             let named = !a.name.is_empty() && a.name != a.email;
-            list = list.child(option(
-                ("from-account", i),
-                a.email.clone(),
-                if named { a.name.clone() } else { String::new() },
-                alias.is_none() && a.id == current.id,
-                a.id.clone(),
-                None,
-            ));
+            list = list.child(
+                option(
+                    ("from-account", i),
+                    a.email.clone(),
+                    if named { a.name.clone() } else { String::new() },
+                    alias.is_none() && a.id == current.id,
+                    a.id.clone(),
+                    None,
+                )
+                .children(self.new_alias_button(("from-account-new-alias", i), a, cx)),
+            );
             shown += 1;
         }
         let mut service = None;
