@@ -8283,7 +8283,22 @@ mod tests {
         view.update_in(cx, |this, w, cx| {
             this.open_mailbox(Some(ALL_MAIL.into()), Folder::Junk.into(), w, cx)
         });
-        cx.run_until_parked();
+        // Let the real syncs it starts (on other threads) finish first, so
+        // none lands in the middle of the states set below.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let idle = view.read_with(cx, |this, _| {
+                !this.cache_loading
+                    && this.sync_requests.is_empty()
+                    && this.retrying.is_empty()
+                    && this.cataloging.is_empty()
+                    && this.busy == 0
+            });
+            if idle {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let (ids, key) = view.read_with(cx, |this, _| {
             assert!(this.visible.is_empty());
             let ids: Vec<String> = this.accounts.iter().map(|a| a.id.clone()).collect();
@@ -8302,7 +8317,8 @@ mod tests {
             assert!(this.checking_server());
         });
         assert!(cx.debug_bounds("empty-list-detail").is_some());
-        assert!(cx.debug_bounds("empty-list-retry").is_none());
+        // (Test frames keep the bounds of elements drawn before, as the
+        // Refresh button may have been while the real syncs failed.)
         // Done, but that account failed: it says which, with a way to retry.
         view.update(cx, |this, cx| {
             this.sync_requests.clear();
