@@ -12,5 +12,10 @@ data keeps its sources' licenses, as `NOTICE` explains:
 - Brave adblock lists and Firefox Query Stripping: MPL-2.0
   (`LICENSES/MPL-2.0.txt`)
 
+`picacho-rules.json` holds Picacho's own rules in the same format (source
+`custom`), for trackers in mail the catalog doesn't know, such as Best Buy's
+MessageGears click addresses. They are added to the catalog's rules when
+it is loaded. Add rules there rather than in `catalog.json`.
+
 To update, replace `catalog.json` with the one from a newer `url-sanitize`
 crate (`catalog/catalog.json`) and bump `url-sanitize-core` to match.

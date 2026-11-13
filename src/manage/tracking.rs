@@ -8,20 +8,26 @@
 //! hold no readable destination and are left as they are.
 use std::borrow::Cow;
 use std::sync::OnceLock;
-use url_sanitize_core::{Catalog, SanitizeResult, Sanitizer, SanitizerOptions};
+use url_sanitize_core::{Catalog, SanitizeResult, Sanitizer, SanitizerOptions, SanitizerRule};
 
 /// url-sanitize's merged rule catalog, as its `url-sanitize` 2.4.1 release
-/// embeds it.
+/// embeds it. Kept unchanged, so it can be replaced by a newer one.
 const CATALOG_JSON: &str = include_str!("../../assets/url-sanitize/catalog.json");
+/// Picacho's own rules, in the catalog's rule format, for trackers in mail
+/// that the catalog doesn't know.
+const OWN_RULES_JSON: &str = include_str!("../../assets/url-sanitize/picacho-rules.json");
 
 /// The compiled rules, built on first use.
 fn sanitizer() -> &'static Sanitizer {
     static SANITIZER: OnceLock<Sanitizer> = OnceLock::new();
     SANITIZER.get_or_init(|| {
-        Catalog::from_json(CATALOG_JSON)
-            .expect("the embedded url-sanitize catalog parses")
-            // Referral and affiliate codes stay; links aren't blocked.
-            .compile(SanitizerOptions::default())
+        let mut catalog =
+            Catalog::from_json(CATALOG_JSON).expect("the embedded url-sanitize catalog parses");
+        let own: Vec<SanitizerRule> =
+            serde_json::from_str(OWN_RULES_JSON).expect("Picacho's link rules parse");
+        catalog.rules.extend(own);
+        // Referral and affiliate codes stay; links aren't blocked.
+        catalog.compile(SanitizerOptions::default())
     })
 }
 
@@ -185,6 +191,24 @@ mod tests {
         assert_eq!(
             clean_url("https://click.news.example/ls/click?upn=abc"),
             None
+        );
+    }
+
+    #[test]
+    fn email_click_trackers_open_the_page_they_lead_to() {
+        // Best Buy's mail: a MessageGears click address holding a Best Buy
+        // redirect in base64, which holds the page with campaign codes.
+        let link = "https://trk.email.bestbuy.com/c/m/?T=2RLTeyJhaSI6OTQwMTc0ODEsImUiOiJtZy1lbmM6UGNWUWNrMGhiRDNmb2VOdmgvS0o1ZW5FdVFMY3ZjMVg3SGN4VlNvbnY2RFVsdXNTWkQ5ZmdXSDNFQnRXdGF3ZyIsInJpIjoiNDA5ODc1NDA1IiwicnEiOiIwMi1iMjYzMTctNmEyOTNmYTEyYzU1NDU0NmJhNTEyZmFmMzNmMGNmNTgiLCJtIjpmYWxzZSwidWkiOiI1MjAyMDgiLCJ1biI6IjRYJTNBZ2xvYmFsXzU4MTMxNTJfRlkyN1NhbGVRdWFkTW9kcy1VcGRhdGVVUkxzX0NlbGxQaG9uZXNfUU1fMDUxOTIwMjYlM0E1In0%3A%3AuqkeD-qoqyV027kx3JyC0A&mg_x_url=aHR0cHM6Ly93d3cuYmVzdGJ1eS5jb20vZWFzZS9lbWFpbD9ldXQ9MzUyMDE0NjM2MiZkZXN0PWh0dHBzJTNBJTJGJTJGd3d3LmJlc3RidXkuY29tJTJGc2l0ZSUyRmFsbC1lbGVjdHJvbmljcy1vbi1zYWxlJTJGYWxsLWNlbGwtcGhvbmVzLW9uLXNhbGUlMkZwY21jYXQxNjkwODk1ODYxNTUyLmMlM0ZpZCUzRHBjbWNhdDE2OTA4OTU4NjE1NTIlMjZzcmMlM0RNRyUyNnZlaGljbGUlM0RlbWFpbCUyNmpvYmlkJTNENzE4NTQlMjZjb21tY29kZSUzREJCWV8yMDI2MTExM19GcmlQTV9FQkZEJTI2ZXV0JTNEMzUyMDE0NjM2MiUyNnJlZiUzREU1MEMyMlIwMDclMjZsb2MlM0RCT0RZ&m=false";
+        assert_eq!(
+            clean_url(link).as_deref(),
+            Some(
+                "https://www.bestbuy.com/site/all-electronics-on-sale/all-cell-phones-on-sale/pcmcat1690895861552.c?id=pcmcat1690895861552"
+            )
+        );
+        // Its product links keep what picks the product.
+        assert_eq!(
+            clean_url("https://www.bestbuy.com/site/x/6.p?skuId=6&src=MG&ref=E50").as_deref(),
+            Some("https://www.bestbuy.com/site/x/6.p?skuId=6")
         );
     }
 

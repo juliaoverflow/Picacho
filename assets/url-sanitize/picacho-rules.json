@@ -1,0 +1,57 @@
+[
+  {
+    "kind": "unwrap-redirect",
+    "source": "custom",
+    "provider": "messagegears-click",
+    "urlPattern": "^https?:\\/\\/[^/?#]+\\/c\\/m\\/?\\?.*$",
+    "exceptions": [],
+    "pattern": "[?&]mg_x_url=([^&#]+)",
+    "captureGroup": 1,
+    "targetEncoding": "base64"
+  },
+  {
+    "kind": "unwrap-redirect",
+    "source": "custom",
+    "provider": "bestbuy-email",
+    "urlPattern": "^https?:\\/\\/(?:[a-z0-9-]+\\.)*?bestbuy\\.com\\/ease\\/email\\?.*$",
+    "exceptions": [],
+    "pattern": "[?&]dest=(https?[^&#]+)",
+    "captureGroup": 1
+  },
+  {
+    "kind": "strip-param",
+    "source": "custom",
+    "provider": "bestbuy-email",
+    "urlPattern": "^https?:\\/\\/(?:[a-z0-9-]+\\.)*?bestbuy\\.com",
+    "paramPattern": "(?:src|vehicle|jobid|commcode|eut|ref|cmp|skuId_ref)",
+    "exceptions": [],
+    "isReferralMarketing": false
+  },
+  {
+    "kind": "strip-param",
+    "source": "custom",
+    "provider": "nextdoor-email",
+    "urlPattern": "^https?:\\/\\/www\\.nextdoor\\.com",
+    "paramPattern": "(?:section|mar|ct|token|auto_token|mobile_deeplink_data|link_source_user_id)",
+    "exceptions": [],
+    "isReferralMarketing": false
+  },
+  {
+    "kind": "strip-param",
+    "source": "custom",
+    "provider": "productreportcard-email",
+    "urlPattern": "^https?:\\/\\/panel\\.productreportcard\\.com",
+    "paramPattern": "(?:qg|inc|qm|cn)",
+    "exceptions": [],
+    "isReferralMarketing": false
+  },
+  {
+    "kind": "strip-param",
+    "source": "custom",
+    "provider": "aliexpress-email",
+    "urlPattern": "^https?:\\/\\/www\\.aliexpress\\.com\\/ssr\\/[0-9-]+\\/[a-zA-Z0-9-]+\\",
+    "paramPattern": "(?:disableNav|pha_manifest|_immersiveMode|businessCode|edm_log_data|edm_click_module|tracelog|rowan_id[0-9]|rowan_msg_id|ck|mem_info)",
+    "exceptions": [],
+    "isReferralMarketing": false
+  }
+]
