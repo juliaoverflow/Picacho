@@ -154,7 +154,7 @@ fn serve(
                             if upper.contains("HEADER.FIELDS") {
                                 let h = header(m.uid);
                                 items += &format!(
-                                    " BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)] {{{}}}\r\n{h}",
+                                    " BODY[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)] {{{}}}\r\n{h}",
                                     h.len()
                                 );
                             } else if upper.contains("BODY.PEEK[]") {

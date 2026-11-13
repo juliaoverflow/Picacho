@@ -6,6 +6,7 @@ pub mod composing;
 pub mod crypto;
 pub mod forwarding;
 pub mod model;
+pub mod search;
 pub mod status;
 pub mod store;
 pub mod subscriptions;

@@ -194,3 +194,5 @@ blitz-paint = { path = "vendor/blitz-paint" }
 stylo_derive = { path = "vendor/stylo_derive" }
 # Parses Gmail's X-GM-MSGID; see the patch README.
 imap-proto = { path = "vendor/imap-proto" }
+# Maximized windows' content is no longer a resize edge; see the patch README.
+gpui-component = { path = "vendor/gpui-component" }

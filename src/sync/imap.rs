@@ -280,9 +280,10 @@ fn starttls(socket: &mut Wire) -> Result<()> {
 
 /// Header fields the message list shows. Full headers carry Received, DKIM
 /// and ARC chains that are often several times larger, and are only needed
-/// once a message is opened (its whole source is downloaded then).
+/// once a message is opened (its whole source is downloaded then). Reply-To
+/// and Cc are small and let the list be searched by them (`reply-to:`).
 pub(crate) const LIST_HEADERS: &str =
-    "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]";
+    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]";
 
 /// Extensions beyond IMAP4rev1 that change how a mailbox is synchronized.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

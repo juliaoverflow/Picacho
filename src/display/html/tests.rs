@@ -328,10 +328,18 @@ fn images_sent_with_the_message_show_by_content_id_even_with_remote_content_bloc
          --rel\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
     );
     raw += &base64::engine::general_purpose::STANDARD.encode(html);
-    // Some senders percent-encode or change the case of the id in the URL.
+    // The address the fixture gives the scan, and the campaign's.
+    let cid = |id: &str| -> String {
+        let tag = &html[html.find(&format!("id=\"{id}\"")).unwrap()..];
+        let src = &tag[tag.find("src=\"cid:").unwrap() + 9..];
+        src[..src.find('"').unwrap()].to_owned()
+    };
+    let (scan, campaign) = (cid("mailpiece-image-src-id"), cid("campaign-representative-image-src-id"));
+    assert_ne!(scan.to_lowercase(), campaign.to_lowercase());
+    // Some senders change the case of the id in the URL.
     for (id, rgb) in [
-        ("2484554579-510.jpg", [255, 0, 0]),
-        ("Mailer-13667.JPG", [0, 0, 255]),
+        (scan, [255, 0, 0]),
+        (campaign.to_uppercase(), [0, 0, 255]),
     ] {
         raw += &format!(
             "\r\n--rel\r\nContent-Type: image/png; name=\"{id}\"\r\n\

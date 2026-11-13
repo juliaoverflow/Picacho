@@ -2,6 +2,161 @@
 use super::*;
 
 impl MailApp {
+    /// Takes the reader's place while several messages are selected: how
+    /// many, from whom, and the actions for all of them.
+    fn selection_summary(
+        &self,
+        corners: Corners<Pixels>,
+        framed: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let c = self.colors();
+        let picked: Vec<&Mail> = self
+            .messages
+            .iter()
+            .filter(|m| self.selection.contains(&m.id))
+            .collect();
+        let n = picked.len();
+        let unread = picked.iter().filter(|m| m.unread).count();
+        let all_starred = n > 0 && picked.iter().all(|m| m.starred);
+        // The senders, most frequent first.
+        let mut senders: Vec<(String, usize)> = Vec::new();
+        for m in &picked {
+            let name = if m.sender.trim().is_empty() { &m.from } else { &m.sender };
+            match senders.iter_mut().find(|(s, _)| s == name) {
+                Some((_, count)) => *count += 1,
+                None => senders.push((name.clone(), 1)),
+            }
+        }
+        senders.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let shown = senders.len().min(3);
+        let mut who = senders[..shown]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if senders.len() > shown {
+            who += &format!(" and {} more", fmt_count(senders.len() - shown));
+        }
+        let action = |id: &str, label: &str, icon: &str, change: Change| {
+            self.button(id.to_owned(), label, icon, Action::ApplySelection(change), false, cx)
+                .w(px(220.))
+                .justify_start()
+                .bg(rgb(c.bg))
+        };
+        div()
+            .id("reader-pane")
+            .debug_selector(|| "reader-pane".into())
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .bg(rgb(c.surface))
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_6()
+            .when(framed, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(10.))
+                        .left(px(8.))
+                        .child(self.reader_toggle(false, cx)),
+                )
+            })
+            .child(icon_el("select", 36., c.accent))
+            .child(
+                div()
+                    .id("selection-summary")
+                    .debug_selector(|| "selection-summary".into())
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{} messages selected", fmt_count(n))),
+            )
+            .child(
+                div()
+                    .max_w(px(360.))
+                    .text_center()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if unread > 0 {
+                        format!("{} unread · from {who}", fmt_count(unread))
+                    } else {
+                        format!("From {who}")
+                    }),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(if unread > 0 {
+                        action("summary-read", "Mark as read", "mail-open", Change::Read(true))
+                    } else {
+                        action("summary-unread", "Mark as unread", "mail", Change::Read(false))
+                    })
+                    .child(if all_starred {
+                        action("summary-unstar", "Unstar", "star", Change::Star(false))
+                    } else {
+                        action("summary-star", "Star", "star", Change::Star(true))
+                    })
+                    .when(self.folder != Folder::Archive, |d| {
+                        d.child(action(
+                            "summary-archive",
+                            "Archive",
+                            "archive",
+                            Change::Move(Folder::Archive),
+                        ))
+                    })
+                    .when(self.folder != Folder::Inbox, |d| {
+                        d.child(action(
+                            "summary-inbox",
+                            "Move to Inbox",
+                            "inbox",
+                            Change::Move(Folder::Inbox),
+                        ))
+                    })
+                    .when(self.folder != Folder::Junk, |d| {
+                        d.child(action(
+                            "summary-spam",
+                            "Move to spam",
+                            "spam",
+                            Change::Move(Folder::Junk),
+                        ))
+                    })
+                    .when(self.folder != Folder::Trash, |d| {
+                        d.child(action(
+                            "summary-trash",
+                            "Move to trash",
+                            "trash",
+                            Change::Move(Folder::Trash),
+                        ))
+                    }),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        self.button(
+                            "summary-done",
+                            "Clear selection",
+                            "",
+                            Action::StopSelecting,
+                            false,
+                            cx,
+                        )
+                        .text_size(px(12.))
+                        .h(px(30.)),
+                    ),
+            )
+    }
     /// The message's saved choices or the defaults. The open message's are
     /// read once, not on every frame.
     pub(super) fn reading_options(&self, mail: &Mail) -> ReadingOptions {
@@ -67,6 +222,10 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let c = self.colors();
+        // Several messages picked: what can be done with all of them.
+        if self.selection.len() > 1 && !self.subs_open {
+            return self.selection_summary(corners, framed, cx).into_any_element();
+        }
         let Some(m) = self.selected_ref() else {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()

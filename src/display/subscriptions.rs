@@ -5,7 +5,7 @@ use super::*;
 use crate::manage::subscriptions::{self as subs, Outcome};
 
 /// A subscription row's height; the list draws only the rows in view.
-const SUB_ROW: f32 = 58.;
+const SUB_ROW: f32 = 68.;
 
 /// Which senders the subscriptions list shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -914,11 +914,30 @@ impl MailApp {
                     )
                     .child(
                         div()
+                            .debug_selector(move || format!("subscription-{index}-address"))
                             .text_size(px(11.5))
                             .text_color(rgb(c.muted))
                             .truncate()
                             .child(detail),
-                    ),
+                    )
+                    // When its latest message came, under its address, as
+                    // the mail list shows times.
+                    .when(sub.latest > 0, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("subscription-{index}-latest")))
+                                .debug_selector(move || format!("subscription-{index}-latest"))
+                                .text_size(px(11.))
+                                .text_color(rgb(if sub.unread > 0 { c.accent } else { c.muted }))
+                                .font_weight(if sub.unread > 0 {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .truncate()
+                                .child(format!("Last email {}", date_short(sub.latest))),
+                        )
+                    }),
             )
             .when(sub.unread > 0, |d| {
                 d.child(badge(format!("{} unread", fmt_count(sub.unread)), true))

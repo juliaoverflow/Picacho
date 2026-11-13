@@ -54,11 +54,11 @@ POP3 downloads are identified by stable UIDL values, cached, and deduplicated. R
 
 - A sidebar listing every account as a collapsible group with its standard mailboxes and server folders (nested beneath the inbox). It collapses to an icon rail with ⌃⌘S.
 - Right-click menus for accounts, mailboxes, and messages.
-- Multi-select with ⌘-click, ⇧-click, ⌘A, or the select button, with a bulk toolbar for read/unread, star, archive, spam, and trash.
+- Multi-select with the list's Select button, ⌘-click, ⇧-click, ⌘A, the avatar checkboxes, or a message's right-click menu (Select, Select All From Sender), with a bulk toolbar for read/unread, star, archive, spam, and trash. While several messages are selected, the reader pane summarizes them and offers the same actions; ⌘⇧U and ⌘⇧S mark or star the whole selection.
 - A filter menu for unread, starred, and attachment-bearing mail, plus newest/oldest ordering.
 - Star, read, and move changes apply instantly and roll back if the server rejects them.
 - Background download of full messages into the local cache, with progress at the bottom of the sidebar (a ring when collapsed).
-- Search and unread filtering within the currently loaded mailbox.
+- Search and unread filtering within the currently loaded mailbox. Every word must match. Search terms: `from:` (sender name or address), `reply-to:`, `to:` (To or Cc), `cc:`, `subject:`, `is:unread`, `is:read`, `is:starred`, `is:unstarred`, `has:attachment`; a leading `-` excludes (`-from:noreply`) and quotes keep spaces (`from:"Ana López"`). A message's right-click menu searches for its sender or its Reply-To address. Reply-To and Cc come with the list headers of mail synced from now on; older cached mail has them once downloaded in full.
 - Native selectable message text, interactive HTML rendered with Blitz, MIME decoding, attachment listing and saving.
 - Compose, reply, reply all, forward, and file attachments.
 - SMTP delivery; failed sends retain the draft.

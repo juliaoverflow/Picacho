@@ -1531,7 +1531,7 @@ mod tests {
     fn subscription_opens_its_mail_and_comes_back_to_it(cx: &mut TestAppContext) {
         let (view, cx, work) = setup(cx);
         // More mail from The Browser: enough to scroll, one of it unread.
-        view.update(cx, |this, _| {
+        let newest = view.update(cx, |this, _| {
             let base = this
                 .backend
                 .store
@@ -1549,6 +1549,7 @@ mod tests {
                 })
                 .collect();
             this.backend.store.save_messages(&extra).unwrap();
+            base.date
         });
         act(&view, Action::OpenSubscriptions(work.clone()), cx);
         frame(cx);
@@ -1557,6 +1558,15 @@ mod tests {
             assert_eq!(this.subs[0].unread, 1);
             this.subs[0].clone()
         });
+        // When its latest message came, as the mail list shows times.
+        assert_eq!(sub.latest, newest);
+        let row = cx.debug_bounds("subscription-0").unwrap();
+        let address = cx.debug_bounds("subscription-0-address").unwrap();
+        let latest = cx.debug_bounds("subscription-0-latest").unwrap();
+        // Under the address, lined up with it, inside the row.
+        assert_eq!(latest.left(), address.left());
+        assert!(latest.top() >= address.bottom(), "{latest:?} under {address:?}");
+        assert!(latest.bottom() <= row.bottom(), "{latest:?} in {row:?}");
         assert!(cx.debug_bounds("subs-tab-unsubscribed").is_some());
         // What to do with all of its mail is in a menu, not beside it.
         assert!(cx.debug_bounds("subscription-0-menu").is_some());

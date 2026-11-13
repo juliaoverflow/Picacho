@@ -575,13 +575,6 @@ impl Mail {
     pub fn initials(&self) -> String {
         initials(&self.sender)
     }
-    /// `query` must already be lowercase.
-    pub fn matches(&self, query: &str) -> bool {
-        query.is_empty()
-            || [&self.sender, &self.from, &self.subject, &self.snippet]
-                .iter()
-                .any(|s| s.to_lowercase().contains(query))
-    }
 }
 pub fn initials(name: &str) -> String {
     name.split_whitespace()

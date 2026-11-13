@@ -285,6 +285,15 @@ fn system_dark(w: &Window) -> bool {
     )
 }
 /// Shortcut text for this platform: macOS symbols, or Ctrl/Alt/Shift words.
+/// A search for `value` in `field`, quoted when it has spaces.
+fn search_term(field: &str, value: &str) -> String {
+    let value = value.replace('"', "");
+    if value.chars().any(char::is_whitespace) {
+        format!("{field}:\"{value}\"")
+    } else {
+        format!("{field}:{value}")
+    }
+}
 fn keys(text: &str) -> String {
     if cfg!(target_os = "macos") {
         return text.into();
@@ -474,7 +483,13 @@ enum Action {
     ToggleSelected(String),
     SelectAll,
     StopSelecting,
+    /// Shows the list's checkboxes, or leaves selection mode.
+    ToggleSelectMode,
+    /// Selects every listed message from the same sender as this one.
+    SelectFromSender(String),
     OpenSearch,
+    /// Opens the search with this query, as `from:ana@example.com`.
+    SearchFor(String),
     CloseSearch,
     SetFilter(Filter),
     OldestFirst(bool),
@@ -675,6 +690,9 @@ pub struct MailApp {
     menu: Option<PopupMenu>,
     filter_anchor: Rc<Cell<Bounds<Pixels>>>,
     selecting: bool,
+    /// Selection mode was turned on from the list's Select button, so the
+    /// checkboxes stay while nothing is picked yet.
+    select_mode: bool,
     selection: HashSet<String>,
     select_anchor: Option<String>,
     select_anim: u64,
@@ -937,7 +955,7 @@ impl MailApp {
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let backend = Arc::new(Backend::new(store));
-        let search = input("Search", false, false, window, cx);
+        let search = input("Search, or from: reply-to: is:unread", false, false, window, cx);
         let placeholders = [
             "you@example.com",
             "Password",
@@ -1197,6 +1215,7 @@ impl MailApp {
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
             selecting: false,
+            select_mode: false,
             selection: HashSet::new(),
             select_anchor: None,
             select_anim: 0,
@@ -1454,6 +1473,7 @@ impl MailApp {
     }
     fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
+        let search = crate::manage::search::Search::parse(&query);
         let filter = self.filter_by;
         let open = self.selected.clone();
         self.visible = self
@@ -1470,7 +1490,7 @@ impl MailApp {
                 Filter::Starred => m.starred,
                 Filter::Attachments => m.has_attachments(),
             })
-            .filter(|(_, m)| m.matches(&query))
+            .filter(|(_, m)| search.matches(m))
             // Views leave out mail of aliases shown on their own, or list
             // only an alias's mail.
             // A subscription's mail is listed whole, as its counts are.
@@ -1906,7 +1926,8 @@ impl MailApp {
             ];
         }
         if self.selection.len() > 1 && self.selection.contains(id) {
-            let n = self.selection.len();
+            let n = fmt_count(self.selection.len());
+            let all_starred = self.selection_all(|m| m.starred);
             return vec![
                 entry(
                     format!("Mark {n} as Read"),
@@ -1918,12 +1939,25 @@ impl MailApp {
                     "mail",
                     Action::ApplySelection(Change::Read(false)),
                 ),
-                entry(
-                    format!("Star {n}"),
-                    "star",
-                    Action::ApplySelection(Change::Star(true)),
-                ),
+                if all_starred {
+                    entry(
+                        format!("Unstar {n}"),
+                        "star",
+                        Action::ApplySelection(Change::Star(false)),
+                    )
+                } else {
+                    entry(
+                        format!("Star {n}"),
+                        "star",
+                        Action::ApplySelection(Change::Star(true)),
+                    )
+                },
                 Entry::Separator,
+                entry(
+                    format!("Move {n} to Inbox"),
+                    "inbox",
+                    Action::ApplySelection(Change::Move(Folder::Inbox)),
+                ),
                 entry(
                     format!("Archive {n}"),
                     "archive",
@@ -1939,6 +1973,9 @@ impl MailApp {
                     "trash",
                     Action::ApplySelection(Change::Move(Folder::Trash)),
                 ),
+                Entry::Separator,
+                entry("Select All", "select", Action::SelectAll),
+                entry("Clear Selection", "close", Action::StopSelecting),
             ];
         }
         let Some(m) = self.messages.iter().find(|m| m.id == id) else {
@@ -2010,6 +2047,36 @@ impl MailApp {
             "select",
             Action::StartSelecting(m.id.clone()),
         ));
+        if !m.from.is_empty() {
+            entries.push(entry(
+                "Select All From Sender",
+                "select",
+                Action::SelectFromSender(m.id.clone()),
+            ));
+            entries.push(Entry::Separator);
+            entries.push(entry(
+                "Show Mail From Sender",
+                "search",
+                Action::SearchFor(search_term("from", &m.from)),
+            ));
+        }
+        // Lists and alias services send from one address and take replies
+        // at another: find everything that replies there.
+        let reply_to = crate::sync::smtp::recipients(&m.reply_to)
+            .ok()
+            .and_then(|list| list.into_iter().next())
+            .map(|(_, email)| email)
+            .filter(|email| !email.eq_ignore_ascii_case(&m.from));
+        if let Some(email) = reply_to {
+            if m.from.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            entries.push(entry(
+                "Show Mail With This Reply-To",
+                "search",
+                Action::SearchFor(search_term("reply-to", &email)),
+            ));
+        }
         entries
     }
     fn filter_entries(&self) -> Vec<Entry> {
@@ -2218,6 +2285,7 @@ impl MailApp {
         self.update_scope();
         self.selected = None;
         self.selecting = false;
+        self.select_mode = false;
         self.selection.clear();
         self.load_generation += 1;
         self.read_generation += 1;
@@ -2526,6 +2594,7 @@ impl MailApp {
         self.filter(cx);
         if self.selection.is_empty() {
             self.selecting = false;
+            self.select_mode = false;
         }
         cx.notify();
         // A view can list several mailboxes; each one's server gets its own.
@@ -2618,8 +2687,9 @@ impl MailApp {
             return;
         }
         if self.modal.is_none() {
-            if !self.selection.is_empty() {
+            if self.selecting {
                 self.selection.clear();
+                self.select_mode = false;
                 self.sync_selecting();
             } else if self.search_open {
                 self.close_search(w, cx);
@@ -3380,7 +3450,52 @@ impl MailApp {
                     };
                 }
             }
-            Action::StopSelecting => self.selection.clear(),
+            Action::StopSelecting => {
+                self.selection.clear();
+                self.select_mode = false;
+            }
+            Action::ToggleSelectMode => {
+                if self.selecting {
+                    self.selection.clear();
+                    self.select_mode = false;
+                } else if self.folder != Folder::Drafts {
+                    self.select_mode = true;
+                    // The open message is the likely first pick.
+                    if let Some(open) = self.selected.clone() {
+                        self.selection.insert(open.clone());
+                        self.select_anchor = Some(open);
+                    }
+                }
+            }
+            Action::SelectFromSender(id) => {
+                if let Some(from) = self
+                    .messages
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map(|m| m.from.to_lowercase())
+                    .filter(|f| !f.is_empty())
+                {
+                    let ids: Vec<String> = self
+                        .visible
+                        .iter()
+                        .map(|i| &self.messages[*i])
+                        .filter(|m| !m.pending && m.from.to_lowercase() == from)
+                        .map(|m| m.id.clone())
+                        .collect();
+                    self.selection.extend(ids);
+                    self.select_anchor = Some(id);
+                }
+            }
+            Action::SearchFor(query) => {
+                if !self.search_open {
+                    self.search_open = true;
+                    self.search_anim += 1;
+                }
+                Self::set(&self.search, &query, w, cx);
+                self.search.update(cx, |s, cx| s.focus(w, cx));
+                self.apply_filter(cx);
+                self.scroll_list_to_top();
+            }
             Action::OpenSearch => {
                 if !self.search_open {
                     self.search_open = true;
@@ -3960,10 +4075,10 @@ impl MailApp {
         self.sync_selecting();
         cx.notify();
     }
-    /// Selection mode is simply "something is selected"; the bulk toolbar
-    /// animates in when the first message is picked.
+    /// Selection mode is "something is selected", or turned on from the
+    /// list's Select button; the bulk toolbar animates in as it starts.
     fn sync_selecting(&mut self) {
-        let now = !self.selection.is_empty();
+        let now = !self.selection.is_empty() || self.select_mode;
         if now && !self.selecting {
             self.select_anim += 1;
         }
@@ -4761,6 +4876,23 @@ impl MailApp {
                         ))
                         .when(self.search_open, |d| d.bg(rgb(c.soft))),
                     )
+                    .when(self.folder != Folder::Drafts, |d| {
+                        d.child(
+                            small(self.button(
+                                "select-toggle",
+                                if self.selecting {
+                                    "@Done selecting · Esc"
+                                } else {
+                                    "@Select messages · ⌘A selects all"
+                                },
+                                "select",
+                                Action::ToggleSelectMode,
+                                false,
+                                cx,
+                            ))
+                            .when(self.selecting, |d| d.bg(rgb(c.soft))),
+                        )
+                    })
                     .child(
                         small(self.button(
                             "filter",
@@ -4836,6 +4968,10 @@ impl MailApp {
                         |d, t| d.h(px(40. * t)).opacity(t),
                     ),
             );
+            // Until something is typed, the fields it can search by.
+            if Self::value(&self.search, cx).trim().is_empty() {
+                header = header.child(self.search_hints(cx));
+            }
         }
         if self.selecting {
             header = header.child(
@@ -4852,10 +4988,51 @@ impl MailApp {
         }
         header
     }
+    /// Chips that start a search by sender, Reply-To, state and so on.
+    fn search_hints(&self, cx: &Context<Self>) -> impl IntoElement {
+        let c = self.colors();
+        div()
+            .id("search-hints")
+            .debug_selector(|| "search-hints".into())
+            .pt_2()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(crate::manage::search::OPERATORS.iter().map(|(op, what)| {
+                let op = *op;
+                let what = *what;
+                div()
+                    .id(SharedString::from(format!("search-hint-{op}")))
+                    .debug_selector(move || format!("search-hint-{op}"))
+                    .px_2()
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.muted))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(c.bg)).text_color(rgb(c.accent)))
+                    .child(op)
+                    .tooltip(move |w, cx| Tooltip::new(what).build(w, cx))
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        // Operators that take a value wait for it; flags
+                        // search straight away and leave room for more.
+                        let query = if op.ends_with(':') {
+                            op.to_owned()
+                        } else {
+                            format!("{op} ")
+                        };
+                        this.handle(Action::SearchFor(query), w, cx)
+                    }))
+            }))
+    }
     fn selection_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
         let n = self.selection.len();
-        let all = n == self.visible.len();
+        let all = n > 0 && n >= self.selectable_count();
         let tool = |id: &str, label: &str, icon: &str, change: Change| {
             self.button(
                 id.to_owned(),
@@ -4892,14 +5069,27 @@ impl MailApp {
             .gap(px(2.))
             .child(
                 div()
+                    .id("selection-count")
+                    .debug_selector(|| "selection-count".into())
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.accent))
-                    .child(format!("{} selected", fmt_count(n))),
+                    .child(if n == 0 {
+                        "Pick messages".to_owned()
+                    } else {
+                        format!("{} selected", fmt_count(n))
+                    })
+                    .when(n == 0, |d| {
+                        d.tooltip(|w, cx| {
+                            Tooltip::new("Click messages to select them; Shift-click selects a range")
+                                .build(w, cx)
+                        })
+                    }),
             )
             .child(
                 div()
                     .id("select-all")
+                    .debug_selector(|| "select-all".into())
                     .ml_2()
                     .text_size(px(12.))
                     .text_color(rgb(c.accent))
@@ -4909,48 +5099,50 @@ impl MailApp {
                     .on_click(cx.listener(|this, _, w, cx| this.handle(Action::SelectAll, w, cx))),
             )
             .child(div().flex_1())
-            .child(if any_unread {
-                tool(
-                    "bulk-read",
-                    "@Mark as read",
-                    "mail-open",
-                    Change::Read(true),
+            .when(n > 0, |d| {
+                d.child(if any_unread {
+                    tool(
+                        "bulk-read",
+                        "@Mark as read",
+                        "mail-open",
+                        Change::Read(true),
+                    )
+                } else {
+                    tool(
+                        "bulk-unread",
+                        "@Mark as unread",
+                        "mail",
+                        Change::Read(false),
+                    )
+                })
+                .child(tool(
+                    "bulk-star",
+                    if all_starred { "@Unstar" } else { "@Star" },
+                    if all_starred { "star-filled" } else { "star" },
+                    Change::Star(!all_starred),
+                ))
+                .child(
+                    tool(
+                        "bulk-archive",
+                        "@Archive",
+                        "archive",
+                        Change::Move(Folder::Archive),
+                    )
+                    .debug_selector(|| "bulk-archive".into()),
                 )
-            } else {
-                tool(
-                    "bulk-unread",
-                    "@Mark as unread",
-                    "mail",
-                    Change::Read(false),
-                )
+                .child(tool(
+                    "bulk-spam",
+                    "@Move to spam",
+                    "spam",
+                    Change::Move(Folder::Junk),
+                ))
+                .child(tool(
+                    "bulk-trash",
+                    "@Move to trash",
+                    "trash",
+                    Change::Move(Folder::Trash),
+                ))
             })
-            .child(tool(
-                "bulk-star",
-                if all_starred { "@Unstar" } else { "@Star" },
-                if all_starred { "star-filled" } else { "star" },
-                Change::Star(!all_starred),
-            ))
-            .child(
-                tool(
-                    "bulk-archive",
-                    "@Archive",
-                    "archive",
-                    Change::Move(Folder::Archive),
-                )
-                .debug_selector(|| "bulk-archive".into()),
-            )
-            .child(tool(
-                "bulk-spam",
-                "@Move to spam",
-                "spam",
-                Change::Move(Folder::Junk),
-            ))
-            .child(tool(
-                "bulk-trash",
-                "@Move to trash",
-                "trash",
-                Change::Move(Folder::Trash),
-            ))
             .child(
                 self.button(
                     "select-done",
@@ -5211,6 +5403,24 @@ impl MailApp {
                 }
             }))
             .into_any_element()
+    }
+    /// Whether every selected message is `test`; false when none is selected.
+    fn selection_all(&self, test: impl Fn(&Mail) -> bool) -> bool {
+        let mut any = false;
+        for m in self.messages.iter().filter(|m| self.selection.contains(&m.id)) {
+            if !test(m) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+    /// Listed messages that can be selected (not placeholders).
+    fn selectable_count(&self) -> usize {
+        self.visible
+            .iter()
+            .filter(|i| !self.messages[**i].pending)
+            .count()
     }
     fn select_range(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let position = |id: &str| self.visible.iter().position(|i| self.messages[*i].id == id);
@@ -6496,7 +6706,11 @@ impl MailApp {
             }))
             .on_action(cx.listener(|this, _: &Reply, w, cx| this.new_compose(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleStar, w, cx| {
-                if let Some(id) = this.selected.clone() {
+                if this.modal.is_some() {
+                } else if !this.selection.is_empty() {
+                    let star = !this.selection_all(|m| m.starred);
+                    this.handle(Action::ApplySelection(Change::Star(star)), w, cx)
+                } else if let Some(id) = this.selected.clone() {
                     this.handle(Action::Star(id), w, cx)
                 }
             }))
@@ -6520,9 +6734,11 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &ReplyAll, w, cx| this.new_compose(2, w, cx)))
             .on_action(cx.listener(|this, _: &ForwardMail, w, cx| this.new_compose(3, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleRead, w, cx| {
-                if this.modal.is_none()
-                    && let Some(id) = this.selected.clone()
-                {
+                if this.modal.is_some() {
+                } else if !this.selection.is_empty() {
+                    let read = !this.selection_all(|m| !m.unread);
+                    this.handle(Action::ApplySelection(Change::Read(read)), w, cx)
+                } else if let Some(id) = this.selected.clone() {
                     this.handle(Action::Read(id), w, cx)
                 }
             }))
@@ -7817,6 +8033,81 @@ mod tests {
             assert!(tree::find(&this.tree, &folder).is_none());
             assert_eq!(tree::account_order(&this.tree), [second, first]);
         });
+    }
+
+    #[gpui::test]
+    fn select_button_summary_and_sender_searches(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        // The list's Select button shows the checkboxes before anything is picked.
+        frame(cx);
+        assert!(cx.debug_bounds("select-toggle").is_some());
+        act(&view, Action::ToggleSelectMode, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selecting);
+            assert!(this.selection.is_empty());
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("select-all").is_some());
+        assert!(cx.debug_bounds("bulk-archive").is_none(), "no tools for nothing");
+        // A plain click picks rather than opens.
+        let (a, b) = view.read_with(cx, |this, _| {
+            (this.messages[1].id.clone(), this.messages[2].id.clone())
+        });
+        for id in [&a, &b] {
+            let at = center(cx, Box::leak(format!("row-{id}").into_boxed_str()));
+            cx.simulate_click(at, Modifiers::none());
+        }
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.selection.len(), 2);
+            assert!(this.selected.is_none());
+        });
+        // The reader sums the selection up and acts on all of it.
+        frame(cx);
+        assert!(cx.debug_bounds("selection-summary").is_some());
+        assert!(cx.debug_bounds("summary-star").is_some());
+        act(&view, Action::ToggleSelectMode, cx);
+        view.read_with(cx, |this, _| {
+            assert!(!this.selecting);
+            assert!(this.selection.is_empty());
+        });
+        // Every listed message from one sender, at once.
+        let (row, from, total) = view.read_with(cx, |this, _| {
+            let m = &this.messages[0];
+            let total = this.messages.iter().filter(|o| o.from == m.from).count();
+            (m.id.clone(), m.from.clone(), total)
+        });
+        act(&view, Action::SelectFromSender(row.clone()), cx);
+        view.read_with(cx, |this, _| assert_eq!(this.selection.len(), total));
+        act(&view, Action::StopSelecting, cx);
+        // The menu searches by sender, and by Reply-To where it differs.
+        view.update(cx, |this, cx| {
+            this.messages[0].reply_to = "List <replies@lists.example>".into();
+            this.apply_filter(cx);
+        });
+        let labels = view.read_with(cx, |this, _| {
+            this.mail_entries(&row)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(labels.iter().any(|l| l == "Show Mail From Sender"));
+        assert!(labels.iter().any(|l| l == "Show Mail With This Reply-To"));
+        act(&view, Action::SearchFor("reply-to:replies@lists.example".into()), cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.search_open);
+            assert_eq!(MailApp::value(&this.search, cx), "reply-to:replies@lists.example");
+            assert_eq!(this.visible.len(), 1);
+            assert_eq!(this.messages[this.visible[0]].id, row);
+        });
+        act(&view, Action::SearchFor(format!("from:{from}")), cx);
+        view.read_with(cx, |this, _| assert_eq!(this.visible.len(), total));
+        // Hints show while the search is empty.
+        act(&view, Action::SearchFor(String::new()), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("search-hint-reply-to:").is_some());
     }
 
     #[gpui::test]
