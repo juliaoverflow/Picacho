@@ -331,3 +331,58 @@ fn reader_buttons_work_after_opening_an_html_email_and_visiting_settings(
     click(cx, "archive".into());
     assert!(reached(cx), "Archive");
 }
+
+#[gpui::test]
+fn copy_link_address_puts_the_link_on_the_clipboard(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some(
+            "<body style=\"margin:0\"><a href=\"https://shop.example/p?id=7&amp;utm_source=mail\" \
+             style=\"display:block;height:300px;font-size:40px\">Big link</a></body>"
+                .into(),
+        );
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..15 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    settle(cx);
+    let email = cx.debug_bounds("html-email").expect("the email is shown");
+    let at = point(email.left() + px(40.), email.top() + px(30.));
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: at,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Right,
+        position: at,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    settle(cx);
+    let index = view.read_with(cx, |this, _| {
+        let menu = this.menu.as_ref().expect("right-clicking a link opens a menu");
+        menu.entries
+            .iter()
+            .position(|e| matches!(e, Entry::Item { label, .. } if label.as_ref() == "Copy Link Address"))
+            .expect("the menu offers to copy the link")
+    });
+    let item: &'static str = Box::leak(format!("menu-item-{index}").into_boxed_str());
+    let item = cx.debug_bounds(item).expect("the menu is drawn").center();
+    cx.simulate_mouse_move(item, None, Modifiers::none());
+    cx.simulate_click(item, Modifiers::none());
+    settle(cx);
+    let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text()));
+    assert_eq!(copied.as_deref(), Some("https://shop.example/p?id=7"));
+    view.read_with(cx, |this, _| assert!(this.menu.is_none()));
+}

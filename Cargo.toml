@@ -198,3 +198,5 @@ stylo_derive = { path = "vendor/stylo_derive" }
 imap-proto = { path = "vendor/imap-proto" }
 # Maximized windows' content is no longer a resize edge; see the patch README.
 gpui-component = { path = "vendor/gpui-component" }
+# Copying from a menu (a click) works on Wayland; see vendor/gpui/PATCHES.md.
+gpui = { path = "vendor/gpui" }
