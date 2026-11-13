@@ -508,6 +508,8 @@ enum Action {
     SetAccent(Accent),
     SetSync(String, SyncSettings),
     SetReadingDefaults(ReadingOptions),
+    /// Removes tracking from links in mail, or stops.
+    SetCleanLinks(bool),
     ToggleHtml,
     ToggleRemote,
     /// Shows the open email's body in light or dark colors.
@@ -875,6 +877,8 @@ pub struct MailApp {
     forwarding: Vec<ForwardingAccount>,
     /// All Mail is listed when there are several accounts.
     all_mail: bool,
+    /// Links in mail lose their tracking parameters and redirect wrappers.
+    clean_links: bool,
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
@@ -946,6 +950,7 @@ impl MailApp {
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
         let alias_routes = fwd::routes(&store);
+        let clean_links = store.preference("clean_links").as_deref() != Some("false");
         let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
         let account = tree::account_order(&tree)
             .into_iter()
@@ -1347,6 +1352,7 @@ impl MailApp {
             forwarding,
             all_mail,
             alias_routes,
+            clean_links,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -3767,6 +3773,12 @@ impl MailApp {
                 self.backend.store.set_preference_soon("accent", accent.key());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
+            Action::SetCleanLinks(on) => {
+                self.clean_links = on;
+                self.backend
+                    .store
+                    .set_preference_soon("clean_links", if on { "true" } else { "false" });
+            }
             Action::SetReadingDefaults(options) => {
                 let before = self.reading_defaults;
                 self.save_preference(
@@ -3838,6 +3850,11 @@ impl MailApp {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
                 // are handed to the system.
+                let url = if self.clean_links {
+                    crate::manage::tracking::clean_url(&url).unwrap_or(url)
+                } else {
+                    url
+                };
                 match super::html::openable_url(&url) {
                     Some(url) => cx.open_url(url.as_str()),
                     None => self.notice("Picacho only opens web and email links.", true, cx),
@@ -8213,6 +8230,39 @@ mod tests {
                 .top()
         };
         assert!(top(cx, &second) < top(cx, &first));
+    }
+
+    #[gpui::test]
+    fn links_lose_their_tracking_until_turned_off(cx: &mut TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        let id = view.update(cx, |this, _| {
+            assert!(this.clean_links, "on by default");
+            let m = &mut this.messages[0];
+            m.html = None;
+            m.body = Some("Order: https://shop.example/o?id=7&utm_source=mail&fbclid=x".into());
+            m.id.clone()
+        });
+        act(&view, Action::Select(id.clone()), cx);
+        let body = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |this, _| {
+                let m = this.messages.iter().find(|m| m.id == id).unwrap();
+                this.plain_body(m).0.to_string()
+            })
+        };
+        let shown = body(&view, cx);
+        assert!(shown.contains("/o?id=7"), "{shown}");
+        assert!(!shown.contains("utm_source") && !shown.contains("fbclid"), "{shown}");
+        // Settings → Reading turns it off, and it stays off.
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Reading), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("clean-links").is_some());
+        act(&view, Action::SetCleanLinks(false), cx);
+        assert!(body(&view, cx).contains("utm"));
+        cx.run_until_parked();
+        store.flush();
+        assert_eq!(store.preference("clean_links").as_deref(), Some("false"));
     }
 
     #[gpui::test]

@@ -41,6 +41,8 @@ pub struct HtmlView {
     /// The message parts `source` refers to by `cid:` address.
     inline: Arc<InlineParts>,
     blocked: bool,
+    /// Tracking is taken out of the links (see `manage::tracking`).
+    clean_links: bool,
     /// The reader's dark choice the current tone was chosen for.
     dark: bool,
     tone: Tone,
@@ -97,6 +99,7 @@ impl HtmlView {
             failed: false,
             inline: Default::default(),
             blocked: true,
+            clean_links: false,
             dark: false,
             tone: Tone::Light,
             thumbnail: None,
@@ -151,7 +154,8 @@ impl HtmlView {
         }
     }
     /// Shows `html`, with remote content `blocked` or not, in light or `dark`
-    /// colors. The same content again keeps the current document.
+    /// colors, with tracking taken out of its links when `clean_links`. The
+    /// same content again keeps the current document.
     /// `inline` holds the message's parts its HTML shows by `cid:` address;
     /// they arrive when the message has been read, which shows it again.
     pub fn set_content(
@@ -160,6 +164,7 @@ impl HtmlView {
         inline: &Arc<InlineParts>,
         blocked: bool,
         dark: bool,
+        clean_links: bool,
         cx: &mut Context<Self>,
     ) {
         // Called on every reader render: compare cheaply before scanning
@@ -167,6 +172,7 @@ impl HtmlView {
         if self.worker.is_some()
             && self.dark == dark
             && self.blocked == blocked
+            && self.clean_links == clean_links
             && self.source.len() == html.len()
             && (Arc::ptr_eq(&self.inline, inline) || self.inline == *inline)
             && self.source == html
@@ -179,10 +185,16 @@ impl HtmlView {
         self.source = html.into();
         self.inline = inline.clone();
         self.blocked = blocked;
+        self.clean_links = clean_links;
         self.tone = tone;
         self.height = 1.;
+        let shown = if clean_links {
+            crate::manage::tracking::clean_html_links(html)
+        } else {
+            html.into()
+        };
         self.worker = Some(worker::spawn(
-            html.into(),
+            shown.into_owned(),
             inline.clone(),
             blocked,
             tone,

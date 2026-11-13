@@ -471,7 +471,7 @@ impl MailApp {
                     _ => html.as_str(),
                 };
                 self.html_view.update(cx, |view, cx| {
-                    view.set_content(shown, &m.inline, options.block_remote, dark, cx)
+                    view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
                 content = content.child(self.html_view.clone());
             } else {
@@ -1651,11 +1651,12 @@ impl MailApp {
 
     /// The plain body as the reader's Markdown, without the quoted history
     /// unless it is open; and whether there is quoted history.
-    fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
+    pub(super) fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
         let key = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             m.id,
             self.quotes_open,
+            self.clean_links,
             m.body.as_ref().map_or(0, String::len)
         );
         if let Some((k, text, quoted)) = &*self.plain_cache.borrow()
@@ -1673,7 +1674,12 @@ impl MailApp {
         } else {
             written
         };
-        let text = SharedString::from(plain_markdown(shown));
+        let shown = if self.clean_links {
+            crate::manage::tracking::clean_text(shown)
+        } else {
+            shown.into()
+        };
+        let text = SharedString::from(plain_markdown(&shown));
         *self.plain_cache.borrow_mut() = Some((key, text.clone(), quoted.is_some()));
         (text, quoted.is_some())
     }

@@ -746,7 +746,7 @@ impl MailApp {
             && let Some(html) = &m.html
         {
             self.html_view.update(cx, |view, cx| {
-                view.set_content(html, &m.inline, options.block_remote, dark, cx)
+                view.set_content(html, &m.inline, options.block_remote, dark, self.clean_links, cx)
             });
             let view = self.html_view.read(cx);
             let page = view.page_color();

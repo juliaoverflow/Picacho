@@ -48,6 +48,11 @@ impl MessageWindow {
         }
     }
 
+    /// Whether links lose their tracking, as set in the app's Settings.
+    fn clean_links(&self, cx: &App) -> bool {
+        self.app.upgrade().is_none_or(|app| app.read(cx).clean_links)
+    }
+
     fn reply(&self, mode: u8, cx: &mut Context<Self>) {
         let (app, mail) = (self.app.clone(), self.mail.clone());
         let _ = self.main.update(cx, move |_, w, cx| {
@@ -115,8 +120,10 @@ impl Render for MessageWindow {
                 _ => html.as_str(),
             };
             let blocked = self.options.block_remote;
-            self.html
-                .update(cx, |view, cx| view.set_content(shown, &m.inline, blocked, dark, cx));
+            let clean = self.clean_links(cx);
+            self.html.update(cx, |view, cx| {
+                view.set_content(shown, &m.inline, blocked, dark, clean, cx)
+            });
             body = body.child(self.html.clone());
         } else {
             let text = m.body.clone().unwrap_or_default();
@@ -130,7 +137,11 @@ impl Render for MessageWindow {
             body = body.child(
                 gpui_component::text::TextView::markdown(
                     SharedString::from(format!("window-body-{}-{}", m.id, self.quotes_open)),
-                    plain_markdown(shown),
+                    if self.clean_links(cx) {
+                        plain_markdown(&crate::manage::tracking::clean_text(shown))
+                    } else {
+                        plain_markdown(shown)
+                    },
                     window,
                     cx,
                 )

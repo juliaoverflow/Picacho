@@ -545,6 +545,14 @@ impl MailApp {
                 cx,
             )
             .max_w(px(300.));
+        let clean = self
+            .switch(
+                "clean-links".into(),
+                self.clean_links,
+                Action::SetCleanLinks(!self.clean_links),
+                cx,
+            )
+            .debug_selector(|| "clean-links".into());
         div().flex().flex_col().gap_5()
             .child(self.section("Reading"))
             .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted))
@@ -557,6 +565,9 @@ impl MailApp {
             ))
             .child(self.setting(
                 "Block remote content", "Prevent images, stylesheets and fonts from contacting remote servers. Loading them may reveal that you opened an email.", remote,
+            ))
+            .child(self.setting(
+                "Remove tracking from links", "Take campaign and click identifiers (such as utm_source and fbclid) out of links, and open the real address behind known redirects (Google, Outlook Safe Links, Facebook). Applies to every email.", clean,
             ))
             .into_any_element()
     }

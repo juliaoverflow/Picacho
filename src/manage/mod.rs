@@ -10,5 +10,6 @@ pub mod search;
 pub mod status;
 pub mod store;
 pub mod subscriptions;
+pub mod tracking;
 
 pub mod reading;
