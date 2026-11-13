@@ -216,6 +216,9 @@ pub struct Account {
     pub id: String,
     pub email: String,
     pub name: String,
+    /// A name the person chose, shown instead of `name` in the sidebar and Settings.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nickname: String,
     pub provider: Provider,
     pub incoming_host: String,
     pub incoming_port: u16,
@@ -244,6 +247,7 @@ impl Account {
             id: uuid::Uuid::new_v4().to_string(),
             email: String::new(),
             name: String::new(),
+            nickname: String::new(),
             provider,
             incoming_host: host.into(),
             incoming_port: if provider == Provider::Pop3 { 995 } else { 993 },
@@ -259,6 +263,14 @@ impl Account {
             },
             incoming_starttls: false,
             sync: SyncSettings::default(),
+        }
+    }
+    /// The name shown for the account: its nickname, if it has one.
+    pub fn label(&self) -> &str {
+        if self.nickname.is_empty() {
+            &self.name
+        } else {
+            &self.nickname
         }
     }
     /// How the account appears in Settings, e.g. "iCloud Mail · IMAP".

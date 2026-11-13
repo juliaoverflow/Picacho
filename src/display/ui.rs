@@ -452,6 +452,8 @@ enum Action {
     Connect,
     Settings,
     AccountSettings(String),
+    /// Edits an account's nickname: in the sidebar (true) or on its Settings page.
+    EditNickname(String, bool),
     RetryAccount(String),
     Reconnect(String),
     SubmitReconnect(String),
@@ -648,6 +650,10 @@ pub struct MailApp {
     /// The signature field in Composing settings.
     signature_input: Entity<InputState>,
     signature_revision: u64,
+    /// The nickname field on an account's Settings page, and the account it
+    /// shows.
+    nickname_input: Entity<InputState>,
+    nickname_for: Option<String>,
     /// The preset picker was opened from Settings, which it returns to.
     /// The account whose preset pictures are shown over Settings.
     presets_for: Option<String>,
@@ -946,6 +952,15 @@ impl MailApp {
                 .detach();
             }
         }));
+        let nickname_input = input("Nickname", false, false, window, cx);
+        subscriptions.push(cx.subscribe(&nickname_input, |this, input, e, cx| {
+            if matches!(e, InputEvent::Change) {
+                if let Some(id) = this.nickname_for.clone() {
+                    let nickname = input.read(cx).value().to_string();
+                    this.set_nickname(&id, &nickname, cx);
+                }
+            }
+        }));
         let html_view = cx.new(HtmlView::new);
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
@@ -1040,6 +1055,8 @@ impl MailApp {
             composer_subscriptions: HashMap::new(),
             signature_input,
             signature_revision: 0,
+            nickname_input,
+            nickname_for: None,
             presets_for: None,
             settings_place: SettingsPlace::Dialog,
             settings_window: None,
@@ -1428,8 +1445,14 @@ impl MailApp {
             menu.window = Some(here);
         }
     }
-    fn account_entries(&self, id: &str) -> Vec<Entry> {
+    /// An account's menu. `inline` when it was opened from the expanded
+    /// sidebar, which can edit the nickname in place.
+    fn account_entries(&self, id: &str, inline: bool) -> Vec<Entry> {
         let id = id.to_owned();
+        let has_nickname = self
+            .accounts
+            .iter()
+            .any(|a| a.id == id && !a.nickname.is_empty());
         vec![
             entry("Refresh", "refresh", Action::RefreshAccount(id.clone())),
             entry(
@@ -1451,6 +1474,15 @@ impl MailApp {
                 "Account Settings…",
                 "settings",
                 Action::AccountSettings(id.clone()),
+            ),
+            entry(
+                if has_nickname {
+                    "Edit Nickname…"
+                } else {
+                    "Add Nickname…"
+                },
+                "compose",
+                Action::EditNickname(id.clone(), inline),
             ),
             entry("Change Picture…", "user", Action::AvatarMenu(id.clone())),
             Entry::Separator,
@@ -2995,6 +3027,18 @@ impl MailApp {
                     self.anim += 1;
                 }
             }
+            Action::EditNickname(id, true) => self.start_rename(id, w, cx),
+            Action::EditNickname(id, false) => {
+                self.handle(Action::AccountSettings(id), w, cx);
+                self.sync_nickname_input(w, cx);
+                let input = self.nickname_input.clone();
+                match self.settings_window {
+                    Some(handle) if handle.window_id() != w.window_handle().window_id() => {
+                        let _ = handle.update(cx, |_, w, cx| input.update(cx, |s, cx| s.focus(w, cx)));
+                    }
+                    _ => input.update(cx, |s, cx| s.focus(w, cx)),
+                }
+            }
             Action::SettingsPage(page) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
                 self.page = page;
@@ -3294,6 +3338,42 @@ impl MailApp {
             self.download_account(account, cx);
         }
         self.refresh_counts(cx);
+    }
+    /// Saves an account's nickname; an empty one goes back to its name.
+    pub(super) fn set_nickname(&mut self, id: &str, nickname: &str, cx: &mut Context<Self>) {
+        let nickname = nickname.trim();
+        let Some(a) = self.accounts.iter_mut().find(|a| a.id == id) else {
+            return;
+        };
+        if a.nickname == nickname {
+            return;
+        }
+        a.nickname = nickname.to_owned();
+        if let Err(e) = self.backend.store.save_account(a) {
+            self.notice(e.to_string(), true, cx);
+        }
+        cx.notify();
+    }
+    /// Shows the open account page's nickname in its field, also after it
+    /// was changed elsewhere, unless the field is being typed in.
+    pub(super) fn sync_nickname_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let shown = match &self.page {
+            Page::Account(id) => self.accounts.iter().find(|a| &a.id == id),
+            _ => None,
+        };
+        let Some((id, nickname)) = shown.map(|a| (a.id.clone(), a.nickname.clone())) else {
+            self.nickname_for = None;
+            return;
+        };
+        let same = self.nickname_for.as_ref() == Some(&id);
+        if same
+            && (Self::value(&self.nickname_input, cx).trim() == nickname
+                || self.nickname_input.read(cx).focus_handle(cx).is_focused(w))
+        {
+            return;
+        }
+        self.nickname_for = Some(id);
+        Self::set(&self.nickname_input, nickname, w, cx);
     }
     fn close_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         self.search_open = false;
@@ -5565,6 +5645,7 @@ impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_reveal(window, cx);
         self.apply_pending_place(window, cx);
+        self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = self.root(window, cx);
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {

@@ -460,13 +460,19 @@ impl MailApp {
             self.save_tree();
         }
     }
+    /// Edits a folder's name, or an account's nickname, in place.
     pub(super) fn start_rename(&mut self, id: String, w: &mut Window, cx: &mut Context<Self>) {
-        let Some(Node::Folder { name, .. }) = find(&self.tree, &id) else {
-            return;
+        let (name, placeholder) = match find(&self.tree, &id) {
+            Some(Node::Folder { name, .. }) => (name.clone(), "Folder name".to_owned()),
+            Some(Node::Account { id }) => match self.accounts.iter().find(|a| &a.id == id) {
+                Some(a) => (a.nickname.clone(), a.name.clone()),
+                None => return,
+            },
+            _ => return,
         };
-        let name = name.clone();
         self.tree_ui.renaming = Some(id);
         self.rename_input.update(cx, |s, cx| {
+            s.set_placeholder(placeholder, w, cx);
             s.set_value(name, w, cx);
             s.focus(w, cx);
         });
@@ -474,13 +480,16 @@ impl MailApp {
         w.on_next_frame(|w, cx| w.dispatch_action(Box::new(gpui_component::input::SelectAll), cx));
         cx.notify();
     }
-    /// Saves the edited name; an empty one keeps the old name.
+    /// Saves the edited name; an empty one keeps a folder's old name and
+    /// clears an account's nickname.
     pub(super) fn commit_rename(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.tree_ui.renaming.take() else {
             return;
         };
         let value = self.rename_input.read(cx).value().trim().to_owned();
-        if !value.is_empty()
+        if matches!(find(&self.tree, &id), Some(Node::Account { .. })) {
+            self.set_nickname(&id, &value, cx);
+        } else if !value.is_empty()
             && let Some(Node::Folder { name, .. }) = node_mut(&mut self.tree, &id)
         {
             *name = value;
@@ -691,7 +700,7 @@ impl MailApp {
                 let i = self.accounts.iter().position(|a| &a.id == id).unwrap_or(0);
                 let a = &self.accounts[i.min(self.accounts.len().saturating_sub(1))];
                 (
-                    a.name.clone().into(),
+                    a.label().to_owned().into(),
                     PreviewIcon::Avatar(self.avatars.get(id).cloned(), initials(&a.name), i),
                 )
             }
@@ -918,7 +927,8 @@ impl MailApp {
         let i = self.accounts.iter().position(|a| a.id == id)?;
         let a = &self.accounts[i];
         let open = self.open(id);
-        let entries = self.account_entries(id);
+        let entries = self.account_entries(id, true);
+        let renaming = self.tree_ui.renaming.as_deref() == Some(id);
         let inbox_unread = self.unread_for(id, &Folder::Inbox.into());
         let current = self.account.as_deref() == Some(id);
         let header = div()
@@ -957,7 +967,9 @@ impl MailApp {
                     .border_color(rgb(if current { c.accent } else { c.bg }))
                     .child(self.account_avatar(a, i, 20.)),
             )
-            .child(
+            .child(if renaming {
+                self.rename_field()
+            } else {
                 div()
                     .flex_1()
                     .min_w_0()
@@ -965,8 +977,9 @@ impl MailApp {
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(if current { c.text } else { c.muted }))
-                    .child(a.name.clone()),
-            )
+                    .child(a.label().to_owned())
+                    .into_any_element()
+            })
             .when(
                 self.account_issues
                     .get(id)
@@ -987,7 +1000,12 @@ impl MailApp {
             })
             .on_click(cx.listener({
                 let id = id.to_owned();
-                move |this, _, w, cx| this.handle(Action::ToggleAccount(id.clone()), w, cx)
+                move |this, _, w, cx| {
+                    if this.tree_ui.renaming.as_ref() == Some(&id) {
+                        return;
+                    }
+                    this.handle(Action::ToggleAccount(id.clone()), w, cx)
+                }
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1094,22 +1112,7 @@ impl MailApp {
         };
         let entries = self.folder_entries(id);
         let label = if renaming {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h(px(24.))
-                .rounded(px(5.))
-                .border_1()
-                .border_color(rgb(c.accent))
-                .bg(rgb(c.bg))
-                .flex()
-                .items_center()
-                .child(
-                    Input::new(&self.rename_input)
-                        .appearance(false)
-                        .text_size(px(13.)),
-                )
-                .into_any_element()
+            self.rename_field()
         } else {
             div()
                 .flex_1()
@@ -1233,6 +1236,26 @@ impl MailApp {
         }
         block.into_any_element()
     }
+    /// The field that edits a folder's name or an account's nickname in place.
+    fn rename_field(&self) -> AnyElement {
+        let c = self.colors();
+        div()
+            .flex_1()
+            .min_w_0()
+            .h(px(24.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(rgb(c.accent))
+            .bg(rgb(c.bg))
+            .flex()
+            .items_center()
+            .child(
+                Input::new(&self.rename_input)
+                    .appearance(false)
+                    .text_size(px(13.)),
+            )
+            .into_any_element()
+    }
     fn separator_block(&self, id: &str, depth: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let entries = self.separator_entries(id);
@@ -1330,12 +1353,16 @@ impl MailApp {
                     let a = &self.accounts[i];
                     let current = self.account.as_ref() == Some(id);
                     let open = self.open(id);
-                    let entries = self.account_entries(id);
+                    let entries = self.account_entries(id, false);
                     let unread = self.unread_for(id, &Folder::Inbox.into());
                     let button = self
                         .rail_button(
                             format!("rail-account-{id}"),
-                            a.email.clone(),
+                            if a.nickname.is_empty() {
+                                a.email.clone()
+                            } else {
+                                format!("{} · {}", a.nickname, a.email)
+                            },
                             div()
                                 .rounded_full()
                                 .border_2()
