@@ -229,7 +229,8 @@ impl MailApp {
                         .child("MAILBOXES"),
                 )
             });
-        for (i, a) in self.accounts.iter().enumerate() {
+        // In the order the sidebar shows them, as the person arranged it.
+        for (i, a) in tree::sidebar_ordered(&self.tree, &self.accounts) {
             nav = nav.child(self.settings_nav(
                 format!("settings-account-{}", a.id),
                 a.label().to_owned(),

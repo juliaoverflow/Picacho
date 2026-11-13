@@ -184,6 +184,24 @@ pub(super) fn reconcile(nodes: &mut Vec<Node>, accounts: &[String]) -> bool {
     *nodes != before
 }
 /// Accounts in the order the sidebar shows them.
+/// `accounts` as the sidebar lists them, each with its index in
+/// `accounts` (which picks its avatar color). Accounts the sidebar doesn't
+/// hold yet follow in their saved order.
+pub(super) fn sidebar_ordered<'a>(
+    nodes: &[Node],
+    accounts: &'a [Account],
+) -> Vec<(usize, &'a Account)> {
+    let mut out: Vec<(usize, &Account)> = account_order(nodes)
+        .iter()
+        .filter_map(|id| accounts.iter().enumerate().find(|(_, a)| &a.id == id))
+        .collect();
+    for (i, a) in accounts.iter().enumerate() {
+        if !out.iter().any(|(_, o)| o.id == a.id) {
+            out.push((i, a));
+        }
+    }
+    out
+}
 pub(super) fn account_order(nodes: &[Node]) -> Vec<String> {
     let mut out = vec![];
     for n in nodes {

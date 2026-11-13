@@ -426,7 +426,14 @@ impl MailApp {
                                             .text_color(rgb(c.muted))
                                             .truncate()
                                             .child(format!("<{}>", m.from)),
-                                    ),
+                                    )
+                                    .when_some(self.sent_alias(m), |d, alias| {
+                                        d.child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .child(alias_tag("reader-sent-alias", alias, c)),
+                                        )
+                                    }),
                             )
                             .child(self.details_toggle(m, cx)),
                     )

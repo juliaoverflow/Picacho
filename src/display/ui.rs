@@ -730,6 +730,8 @@ pub struct MailApp {
     known: HashMap<String, HashSet<String>>,
     busy: usize,
     syncing: bool,
+    /// The open mailbox's cached mail is being read, before any sync.
+    cache_loading: bool,
     status: String,
     error: bool,
     form: Vec<Entity<InputState>>,
@@ -873,6 +875,9 @@ pub struct MailApp {
     forwarding: Vec<ForwardingAccount>,
     /// All Mail is listed when there are several accounts.
     all_mail: bool,
+    /// Reverse addresses that write as an alias, to show which alias sent
+    /// mail went out as (see `fwd::routes`).
+    alias_routes: HashMap<String, String>,
     /// What the open view lists: its mailboxes and address filters.
     scope: fwd::Scope,
     /// Forwarding settings' add form, and the work running there.
@@ -940,6 +945,7 @@ impl MailApp {
         let accounts = store.accounts().unwrap_or_default();
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
+        let alias_routes = fwd::routes(&store);
         let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
         let account = tree::account_order(&tree)
             .into_iter()
@@ -1246,6 +1252,7 @@ impl MailApp {
             known: HashMap::new(),
             busy: 0,
             syncing: false,
+            cache_loading: false,
             status: String::new(),
             error: false,
             form,
@@ -1339,6 +1346,7 @@ impl MailApp {
             unlock_errors: HashMap::new(),
             forwarding,
             all_mail,
+            alias_routes,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -2290,6 +2298,7 @@ impl MailApp {
         self.load_generation += 1;
         self.read_generation += 1;
         self.syncing = false;
+        self.cache_loading = false;
         self.messages.clear();
         self.layout = None;
         self.wanted_rows.clear();
@@ -2317,10 +2326,12 @@ impl MailApp {
             self.filter(cx);
         } else {
             let gen_ = self.load_generation;
+            self.cache_loading = true;
             self.task(cx, self.list_job(mailbox), move |this, result, cx| {
                 if gen_ != this.load_generation {
                     return;
                 }
+                this.cache_loading = false;
                 if let Ok((ms, layout)) = result {
                     this.layout = layout;
                     this.set_messages(ms, cx);
@@ -4690,45 +4701,7 @@ impl MailApp {
             .border_color(rgb(c.border))
             .child(self.list_header(count, cx))
             .child(if count == 0 {
-                let searching = !Self::value(&self.search, cx).trim().is_empty();
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .p_8()
-                    .text_size(px(13.))
-                    .text_color(rgb(c.muted))
-                    .child(if self.syncing && !searching {
-                        spinner(20., c.muted).into_any_element()
-                    } else {
-                        icon_el(
-                            if self.folder == Folder::Drafts {
-                                "compose"
-                            } else if searching {
-                                "search"
-                            } else {
-                                folder_icon(self.folder)
-                            },
-                            28.,
-                            c.border,
-                        )
-                        .into_any_element()
-                    })
-                    .child(if searching {
-                        "No results"
-                    } else if self.syncing {
-                        "Loading…"
-                    } else if self.filter_by != Filter::All {
-                        "No matching mail"
-                    } else if self.folder == Folder::Drafts {
-                        "No drafts"
-                    } else {
-                        "No mail yet"
-                    })
-                    .into_any_element()
+                self.empty_list(cx)
             } else {
                 uniform_list("message-list", count, move |range, _, cx| {
                     entity.update(cx, |this, cx| {
@@ -4771,6 +4744,179 @@ impl MailApp {
                         }),
                 )
             })
+    }
+    /// Accounts the open mailbox is still being fetched from: a sync, a
+    /// sign-in retry or a listing in flight. A view (All Mail, an alias)
+    /// lists several accounts, each fetched on its own.
+    fn fetching_accounts(&self) -> Vec<&Account> {
+        if self.account.is_none() || self.folder == Folder::Drafts {
+            return vec![];
+        }
+        let key = self.mailbox().key();
+        self.accounts
+            .iter()
+            .filter(|a| self.shows(&a.id))
+            .filter(|a| {
+                self.retrying.contains(&a.id)
+                    || self.sync_requests.contains(&(a.id.clone(), key.clone()))
+                    || self.cataloging.contains(&(a.id.clone(), key.clone()))
+            })
+            .collect()
+    }
+    /// Whether the open mailbox may still get mail: its cache is being read
+    /// or one of its accounts is being fetched.
+    fn mailbox_loading(&self) -> bool {
+        self.syncing || self.cache_loading || !self.fetching_accounts().is_empty()
+    }
+    /// Whether the open mailbox is being synced with a server right now.
+    /// Listing a large mailbox in the background has its own progress bar
+    /// and leaves Refresh available.
+    fn checking_server(&self) -> bool {
+        if self.syncing {
+            return true;
+        }
+        if self.account.is_none() || self.folder == Folder::Drafts {
+            return false;
+        }
+        let key = self.mailbox().key();
+        self.sync_requests
+            .iter()
+            .any(|(id, k)| k == &key && self.shows(id))
+    }
+    /// Shown accounts whose last fetch of the open mailbox failed, or that
+    /// can't sign in.
+    fn unreachable_accounts(&self) -> Vec<&Account> {
+        if self.account.is_none() || self.folder == Folder::Drafts {
+            return vec![];
+        }
+        let source = IssueSource::Sync(self.mailbox().key());
+        self.accounts
+            .iter()
+            .filter(|a| self.shows(&a.id))
+            .filter(|a| {
+                self.account_blocked(&a.id)
+                    || self
+                        .account_issues
+                        .get(&a.id)
+                        .is_some_and(|issues| issues.contains_key(&source))
+            })
+            .collect()
+    }
+    /// What an empty list says: an icon (or a spinner), a title, and a
+    /// line explaining it.
+    fn empty_list(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let searching = !Self::value(&self.search, cx).trim().is_empty();
+        let loading = self.mailbox_loading();
+        let fetching = self.fetching_accounts();
+        let shown = self
+            .accounts
+            .iter()
+            .filter(|a| self.shows(&a.id))
+            .count();
+        let names = |list: &[&Account]| match list {
+            [] => String::new(),
+            [one] => one.label().to_owned(),
+            [first, second] => format!("{} and {}", first.label(), second.label()),
+            [first, rest @ ..] => format!("{} and {} more", first.label(), rest.len()),
+        };
+        let unreachable = if loading { vec![] } else { self.unreachable_accounts() };
+        let (icon, title, detail): (Option<&str>, String, Option<String>) = if searching {
+            if loading {
+                (
+                    Some("search"),
+                    "No results yet".into(),
+                    Some("Still fetching mail; more may match.".into()),
+                )
+            } else {
+                (Some("search"), "No results".into(), None)
+            }
+        } else if loading {
+            let detail = if self.cache_loading && fetching.is_empty() {
+                "Reading mail saved on this computer…".to_owned()
+            } else if let Some(p) = self.catalog_progress().filter(|p| p.total > 0) {
+                format!(
+                    "Listed {} of {} messages",
+                    fmt_count(p.cataloged),
+                    fmt_count(p.total)
+                )
+            } else if shown > 1 && !fetching.is_empty() {
+                format!(
+                    "Checking {} of {} accounts: {}",
+                    fetching.len(),
+                    shown,
+                    names(&fetching)
+                )
+            } else if !fetching.is_empty() {
+                format!("Checking {} for mail", names(&fetching))
+            } else {
+                "Checking the server for mail".to_owned()
+            };
+            (None, "Fetching mail…".into(), Some(detail))
+        } else if !unreachable.is_empty() && self.filter_by == Filter::All {
+            (
+                Some("warning"),
+                "Couldn't fetch mail".into(),
+                Some(format!(
+                    "{} couldn't be reached. Refresh to try again.",
+                    names(&unreachable)
+                )),
+            )
+        } else if self.filter_by != Filter::All {
+            (Some("filter"), "No matching mail".into(), None)
+        } else if self.folder == Folder::Drafts {
+            (Some("compose"), "No drafts".into(), None)
+        } else {
+            (Some(folder_icon(self.folder)), "No mail here".into(), None)
+        };
+        let failed = icon == Some("warning");
+        div()
+            .id("empty-list")
+            .debug_selector(|| "empty-list".into())
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_8()
+            .text_size(px(13.))
+            .text_color(rgb(c.muted))
+            .child(match icon {
+                None => spinner(20., c.accent).into_any_element(),
+                Some(icon) => icon_el(icon, 28., c.border).into_any_element(),
+            })
+            .child(
+                div()
+                    .id("empty-list-title")
+                    .debug_selector(|| "empty-list-title".into())
+                    .text_color(rgb(if loading { c.text } else { c.muted }))
+                    .font_weight(if loading {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child(title),
+            )
+            .when_some(detail, |d, detail| {
+                d.child(
+                    div()
+                        .id("empty-list-detail")
+                        .debug_selector(|| "empty-list-detail".into())
+                        .max_w(px(280.))
+                        .text_center()
+                        .text_size(px(12.))
+                        .child(detail),
+                )
+            })
+            .when(failed, |d| {
+                d.child(
+                    self.button("empty-list-retry", "Refresh", "refresh", Action::Refresh, false, cx)
+                        .h(px(30.))
+                        .mt_1(),
+                )
+            })
+            .into_any_element()
     }
     /// Unread messages in the open mailbox: exact from the loaded list when it
     /// holds the whole mailbox, otherwise from the cache's counts.
@@ -4910,7 +5056,7 @@ impl MailApp {
                                 .size_full(),
                         ),
                     )
-                    .child(if self.syncing {
+                    .child(if self.checking_server() {
                         div()
                             .size(px(28.))
                             .flex()
@@ -5225,8 +5371,12 @@ impl MailApp {
                 }))
             });
         let star_id = m.id.clone();
-        let address =
-            (!m.from.is_empty() && !m.from.eq_ignore_ascii_case(&m.sender)).then(|| m.from.clone());
+        // Sent mail names the alias it went out as, in place of the address.
+        let sent_alias = self.sent_alias(m);
+        let address = (sent_alias.is_none()
+            && !m.from.is_empty()
+            && !m.from.eq_ignore_ascii_case(&m.sender))
+        .then(|| m.from.clone());
         div()
             .id(SharedString::from(format!("row-{id}")))
             .debug_selector(|| format!("row-{id}"))
@@ -5291,7 +5441,10 @@ impl MailApp {
                                     .truncate()
                                     .text_size(px(11.))
                                     .text_color(rgb(c.muted))
-                                    .children(address),
+                                    .children(address)
+                                    .when_some(sent_alias, |d, alias| {
+                                        d.child(alias_tag(&format!("sent-alias-{id}"), alias, c))
+                                    }),
                             )
                             .child(
                                 div()
@@ -7106,6 +7259,22 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .text_color(rgb(color)),
     )
 }
+/// The alias a sent message went out as: its icon and address.
+fn alias_tag(id: &str, alias: String, c: Colors) -> Stateful<Div> {
+    let tip = format!("Sent as {alias}");
+    let selector = id.to_owned();
+    div()
+        .id(SharedString::from(id.to_owned()))
+        .debug_selector(move || selector)
+        .flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .text_color(rgb(c.accent))
+        .child(icon_el("alias", 11., c.accent))
+        .child(div().min_w_0().truncate().child(alias))
+        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+}
 /// A message the server has that is not listed yet: the row's shape, so the
 /// list keeps its length and scrollbar while headers load.
 fn placeholder_row(id: &str, c: Colors) -> Stateful<Div> {
@@ -8031,7 +8200,79 @@ mod tests {
         act(&view, Action::DeleteFolder(folder.clone()), cx);
         view.read_with(cx, |this, _| {
             assert!(tree::find(&this.tree, &folder).is_none());
-            assert_eq!(tree::account_order(&this.tree), [second, first]);
+            assert_eq!(tree::account_order(&this.tree), [second.clone(), first.clone()]);
+        });
+        // Settings lists the mailboxes in the sidebar's order, though they
+        // were added the other way round.
+        act(&view, Action::Settings, cx);
+        frame(cx);
+        frame(cx);
+        let top = |cx: &mut VisualTestContext, id: &str| {
+            cx.debug_bounds(Box::leak(format!("settings-account-{id}").into_boxed_str()))
+                .expect("listed in Settings")
+                .top()
+        };
+        assert!(top(cx, &second) < top(cx, &first));
+    }
+
+    #[gpui::test]
+    fn an_empty_all_mail_says_it_is_still_fetching(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        // A test window alternates between two frames; draw both.
+        let redraw = |cx: &mut VisualTestContext| {
+            frame(cx);
+            frame(cx);
+        };
+        // All Mail's spam is empty in the cache; both accounts are asked.
+        view.update_in(cx, |this, w, cx| {
+            this.open_mailbox(Some(ALL_MAIL.into()), Folder::Junk.into(), w, cx)
+        });
+        cx.run_until_parked();
+        let (ids, key) = view.read_with(cx, |this, _| {
+            assert!(this.visible.is_empty());
+            let ids: Vec<String> = this.accounts.iter().map(|a| a.id.clone()).collect();
+            (ids, this.mailbox().key())
+        });
+        // One account still being fetched: the list says so, not "No mail".
+        view.update(cx, |this, cx| {
+            this.account_issues.clear();
+            this.sync_requests.insert((ids[1].clone(), key.clone()));
+            cx.notify();
+        });
+        redraw(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.mailbox_loading());
+            assert_eq!(this.fetching_accounts().len(), 1);
+            assert!(this.checking_server());
+        });
+        assert!(cx.debug_bounds("empty-list-detail").is_some());
+        assert!(cx.debug_bounds("empty-list-retry").is_none());
+        // Done, but that account failed: it says which, with a way to retry.
+        view.update(cx, |this, cx| {
+            this.sync_requests.clear();
+            this.account_result::<()>(
+                &ids[1],
+                IssueSource::Sync(key.clone()),
+                &Err(anyhow::anyhow!("connection reset")),
+            );
+            cx.notify();
+        });
+        redraw(cx);
+        view.read_with(cx, |this, _| {
+            assert!(!this.mailbox_loading());
+            assert_eq!(this.unreachable_accounts().len(), 1);
+        });
+        assert!(cx.debug_bounds("empty-list-retry").is_some());
+        // Every account answered with nothing: it is simply empty.
+        view.update(cx, |this, cx| {
+            this.account_issues.clear();
+            cx.notify();
+        });
+        // (Test frames keep the bounds of elements drawn before, so this
+        // checks the state the list is drawn from.)
+        view.read_with(cx, |this, _| {
+            assert!(!this.mailbox_loading());
+            assert!(this.unreachable_accounts().is_empty());
         });
     }
 

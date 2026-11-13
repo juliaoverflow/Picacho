@@ -572,6 +572,8 @@ impl MailApp {
                 }
                 match (result, gone) {
                     (Ok(()), _) => {
+                        // Sent as an alias: its routed addresses are known now.
+                        this.alias_routes = fwd::routes(&this.backend.store);
                         this.outbox.retain(|o| o.id != id);
                         this.notice("Message sent", false, cx);
                         this.refresh_drafts(cx);

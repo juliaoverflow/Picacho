@@ -1567,11 +1567,21 @@ impl MailApp {
         }
         self.task(
             cx,
-            move |_| fwd::reverse_aliases(&account, &a),
+            move |b| {
+                let list = fwd::reverse_aliases(&account, &a)?;
+                // Mail sent to these went out as the alias.
+                let _ = fwd::remember_routes(
+                    &b.store,
+                    &a.email,
+                    list.iter().map(|r| r.address.clone()),
+                );
+                Ok(list)
+            },
             move |this, result, cx| {
                 this.fwd_busy.remove(&busy);
                 match result {
                     Ok(list) => {
+                        this.alias_routes = fwd::routes(&this.backend.store);
                         let query = if this.fwd_reverse.as_deref() == Some(key.as_str()) {
                             Self::value(&this.fwd_contact_search, cx)
                         } else {
@@ -2018,7 +2028,7 @@ impl MailApp {
             ),
             Entry::Separator,
         ];
-        entries.extend(self.accounts.iter().map(|a| {
+        entries.extend(tree::sidebar_ordered(&self.tree, &self.accounts).into_iter().map(|(_, a)| {
             checked(
                 a.email.clone(),
                 current.as_deref() == Some(a.id.as_str()),

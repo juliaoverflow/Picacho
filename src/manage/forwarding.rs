@@ -733,10 +733,22 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
                 }
                 out.push(field);
             }
+            // Sent copies are addressed to these: note them, so Sent can
+            // say which alias each went out as.
+            let _ = remember_routes(
+                store,
+                &alias.email,
+                reverse.into_iter().chain(made.into_values()),
+            );
             out
         }
         ForwardingService::FirefoxRelay => unreachable!("Firefox Relay cannot send"),
     };
+    let _ = remember_routes(
+        store,
+        &alias.email,
+        routed.iter().flatten().map(|(_, address)| address.clone()),
+    );
     let join = |list: &[(Option<String>, String)]| {
         list.iter()
             .map(|(name, address)| match name {
@@ -754,6 +766,96 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
         bcc: join(&routed[2]),
         ..draft.clone()
     })
+}
+
+/// Where the reverse addresses that write as an alias are kept:
+/// a JSON object of address (lowercase) to the alias's address.
+const ROUTES_PREFERENCE: &str = "alias_routes";
+
+/// The reverse addresses known to write as an alias, to tell which alias a
+/// sent message went out as: its recipients are those addresses.
+pub fn routes(store: &Store) -> HashMap<String, String> {
+    store
+        .preference(ROUTES_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Notes that `addresses` write as `alias`. Saving is serialized, since
+/// sends and the Forwarding settings can both note some at once.
+pub fn remember_routes<I: IntoIterator<Item = String>>(
+    store: &Store,
+    alias: &str,
+    addresses: I,
+) -> Result<()> {
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = routes(store);
+    let alias = alias.trim().to_lowercase();
+    let mut changed = false;
+    for address in addresses {
+        let address = address.trim().to_lowercase();
+        if !address.is_empty() && all.get(&address) != Some(&alias) {
+            all.insert(address, alias.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        store.set_preference(ROUTES_PREFERENCE, &serde_json::to_string(&all)?)?;
+    }
+    Ok(())
+}
+
+/// The alias a message you sent went out as, if any: a recipient is a
+/// reverse address noted for it, an addy.io routed address
+/// (`alias+name=domain@alias-domain`) of a known alias, or the message is
+/// from the alias itself.
+pub fn sent_as(
+    from: &str,
+    to: &str,
+    cc: &str,
+    forwarding: &[ForwardingAccount],
+    routes: &HashMap<String, String>,
+) -> Option<String> {
+    let known = |email: &str| {
+        forwarding
+            .iter()
+            .flat_map(|f| &f.aliases)
+            .any(|a| a.email.eq_ignore_ascii_case(email))
+    };
+    if !from.is_empty() && known(from) {
+        return Some(from.trim().to_lowercase());
+    }
+    let recipients = [to, cc]
+        .into_iter()
+        .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
+        .map(|(_, email)| email.to_lowercase());
+    for email in recipients {
+        if let Some(alias) = routes.get(&email) {
+            return Some(alias.clone());
+        }
+        if let Some(alias) = addy_alias(&email, forwarding) {
+            return Some(alias);
+        }
+    }
+    None
+}
+
+/// The addy.io alias a routed address (`alias+name=domain@alias-domain`)
+/// writes as, when it is one of the person's aliases.
+fn addy_alias(address: &str, forwarding: &[ForwardingAccount]) -> Option<String> {
+    let (local, domain) = address.rsplit_once('@')?;
+    let (alias_local, rest) = local.split_once('+')?;
+    if !rest.contains('=') {
+        return None;
+    }
+    let alias = format!("{alias_local}@{domain}");
+    forwarding
+        .iter()
+        .filter(|f| f.service == ForwardingService::Addy)
+        .flat_map(|f| &f.aliases)
+        .any(|a| a.email.eq_ignore_ascii_case(&alias))
+        .then_some(alias)
 }
 
 /// addy.io's address for writing to `recipient` as `alias`:
@@ -957,6 +1059,59 @@ mod tests {
             "shop+ana=example.org@me.anonaddy.com"
         );
         assert!(addy_route("shop@me.anonaddy.com", "nobody").is_err());
+    }
+
+    #[test]
+    fn sent_mail_names_the_alias_it_went_out_as() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&p)?;
+        let alias = |email: &str| Alias {
+            id: email.into(),
+            email: email.into(),
+            enabled: true,
+            ..Alias::default()
+        };
+        let forwarding = [
+            ForwardingAccount {
+                id: "addy".into(),
+                service: ForwardingService::Addy,
+                aliases: vec![alias("shop@me.anonaddy.com")],
+                ..ForwardingAccount::default()
+            },
+            ForwardingAccount {
+                id: "sl".into(),
+                service: ForwardingService::SimpleLogin,
+                aliases: vec![alias("news@sl.io")],
+                ..ForwardingAccount::default()
+            },
+        ];
+        // SimpleLogin's reverse aliases are opaque: they are noted when used.
+        remember_routes(&store, "News@sl.io", ["RA+abc@SimpleLogin.co".to_owned()])?;
+        remember_routes(&store, "news@sl.io", ["ra+def@simplelogin.co".to_owned()])?;
+        let routes = routes(&store);
+        assert_eq!(routes.len(), 2);
+        let me = "me@example.com";
+        let sent = |to: &str, cc: &str| sent_as(me, to, cc, &forwarding, &routes);
+        assert_eq!(
+            sent("\"ana at example.org\" <ra+abc@simplelogin.co>", "").as_deref(),
+            Some("news@sl.io")
+        );
+        assert_eq!(sent("bo@example.net", "ra+def@simplelogin.co").as_deref(), Some("news@sl.io"));
+        // addy.io's routed addresses name their alias.
+        assert_eq!(
+            sent("shop+ana=example.org@me.anonaddy.com", "").as_deref(),
+            Some("shop@me.anonaddy.com")
+        );
+        // Only the person's own aliases, and not plain plus addressing.
+        assert_eq!(sent("other+ana=example.org@me.anonaddy.com", ""), None);
+        assert_eq!(sent("shop+news@me.anonaddy.com", ""), None);
+        assert_eq!(sent("ana@example.org", ""), None);
+        // Sent from the alias's own address.
+        assert_eq!(
+            sent_as("news@sl.io", "ana@example.org", "", &forwarding, &routes).as_deref(),
+            Some("news@sl.io")
+        );
+        Ok(())
     }
 
     #[test]

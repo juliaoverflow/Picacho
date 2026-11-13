@@ -45,6 +45,13 @@ impl MailApp {
     pub(super) fn shows_only(&self, account: &str) -> bool {
         self.account.is_some() && self.scope.accounts == [account]
     }
+    /// The alias a sent message went out as, for mail in Sent.
+    pub(super) fn sent_alias(&self, m: &Mail) -> Option<String> {
+        if m.folder != Folder::Sent && self.folder != Folder::Sent {
+            return None;
+        }
+        fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes)
+    }
     pub(super) fn shows_all_mail(&self) -> bool {
         self.all_mail && self.accounts.len() > 1
     }
@@ -1525,6 +1532,54 @@ mod tests {
             assert!(this.unsubscribing.is_empty());
             assert!(!this.unsubscribed.contains(&other.key()));
         });
+    }
+
+    #[gpui::test]
+    fn sent_mail_shows_the_alias_it_went_out_as(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // One message sent through a SimpleLogin reverse alias, one not.
+        let (via, plain) = view.update(cx, |this, _| {
+            let store = &this.backend.store;
+            fwd::remember_routes(store, "shop@sl.io", ["ra+ana@simplelogin.co".to_owned()])
+                .unwrap();
+            this.alias_routes = fwd::routes(store);
+            let sent = |id: &str, to: &str| Mail {
+                id: format!("{work}:sent:{id}"),
+                account: work.clone(),
+                folder: Folder::Sent,
+                remote_folder: "Sent".into(),
+                from: "work@example.com".into(),
+                sender: "Work".into(),
+                to: to.into(),
+                subject: format!("Sent {id}"),
+                date: 1_800_000_000,
+                ..Mail::default()
+            };
+            let via = sent("1", "\"ana at example.org\" <ra+ana@simplelogin.co>");
+            let plain = sent("2", "bo@example.net");
+            store.save_messages(&[via.clone(), plain.clone()]).unwrap();
+            (via.id, plain.id)
+        });
+        view.update_in(cx, |this, w, cx| {
+            this.open_mailbox(Some(work.clone()), Folder::Sent.into(), w, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            let find = |id: &str| this.messages.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(this.sent_alias(find(&via)).as_deref(), Some("shop@sl.io"));
+            assert_eq!(this.sent_alias(find(&plain)), None);
+        });
+        frame(cx);
+        frame(cx);
+        let tag: &'static str = Box::leak(format!("sent-alias-{via}").into_boxed_str());
+        assert!(cx.debug_bounds(tag).is_some(), "the row names the alias");
+        let other: &'static str = Box::leak(format!("sent-alias-{plain}").into_boxed_str());
+        assert!(cx.debug_bounds(other).is_none());
+        // The reader says it too.
+        act(&view, Action::Select(via.clone()), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("reader-sent-alias").is_some());
     }
 
     #[gpui::test]
