@@ -331,43 +331,127 @@ pub struct ReverseAlias {
     pub id: String,
     /// The contact's own address.
     pub contact: String,
-    /// The reverse alias, lowercase. Shown only as `obscure` makes it.
+    /// The reverse alias, lowercase. Never shown; only `obscure`d.
     pub address: String,
     /// Whether mail from the contact to the alias is blocked.
     pub blocked: bool,
     /// When the alias last wrote to the contact, in Unix seconds.
     pub last_sent: Option<i64>,
+    /// How much mail went between the alias and the contact; `None` when
+    /// the alias's activity couldn't be read.
+    pub stats: Option<ContactStats>,
 }
-/// A SimpleLogin alias's reverse aliases, as the service lists them now.
+
+/// Days counted as recent in a contact's stats.
+pub const CONTACT_RECENT_DAYS: i64 = 14;
+
+/// How much mail an alias has had with one contact, counted from the
+/// alias's activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContactStats {
+    /// Mail from the contact forwarded to you, in the last
+    /// `CONTACT_RECENT_DAYS` days and all time.
+    pub received_recent: u64,
+    pub received: u64,
+    /// Mail you sent the contact through the reverse alias.
+    pub sent_recent: u64,
+    pub sent: u64,
+    /// Whether the activity was too long to read in full, so the all-time
+    /// counts are at least these.
+    pub partial: bool,
+}
+
+/// What happened in one entry of an alias's activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Mail from a contact forwarded to your mailbox.
+    Forward,
+    /// Mail you sent a contact through its reverse alias.
+    Reply,
+    /// Anything else: blocked or bounced mail.
+    Other,
+}
+
+/// One entry of a SimpleLogin alias's activity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// The reverse alias involved, lowercase; may be empty.
+    pub reverse_alias: String,
+    /// The contact's address, lowercase: the sender of forwarded mail, the
+    /// recipient of a reply.
+    pub contact: String,
+    /// Unix seconds.
+    pub timestamp: i64,
+}
+
+/// Counts each contact's mail from an alias's activity. `partial` says the
+/// activity wasn't read to its start.
+pub fn tally(contacts: &mut [ReverseAlias], activity: &[Activity], partial: bool, now: i64) {
+    let since = now - CONTACT_RECENT_DAYS * 24 * 60 * 60;
+    let mut by_address: HashMap<String, usize> = HashMap::new();
+    let mut by_contact: HashMap<String, usize> = HashMap::new();
+    for (i, c) in contacts.iter_mut().enumerate() {
+        c.stats = Some(ContactStats {
+            partial,
+            ..ContactStats::default()
+        });
+        by_address.insert(c.address.clone(), i);
+        by_contact.entry(c.contact.to_lowercase()).or_insert(i);
+    }
+    for a in activity {
+        let Some(&i) = (!a.reverse_alias.is_empty())
+            .then(|| by_address.get(&a.reverse_alias))
+            .flatten()
+            .or_else(|| by_contact.get(&a.contact))
+        else {
+            continue;
+        };
+        let Some(stats) = contacts[i].stats.as_mut() else {
+            continue;
+        };
+        let recent = a.timestamp >= since;
+        match a.kind {
+            ActivityKind::Forward => {
+                stats.received += 1;
+                stats.received_recent += recent as u64;
+            }
+            ActivityKind::Reply => {
+                stats.sent += 1;
+                stats.sent_recent += recent as u64;
+            }
+            ActivityKind::Other => {}
+        }
+    }
+}
+
+/// A SimpleLogin alias's reverse aliases, as the service lists them now,
+/// with how much mail each has had. Stats are left out, rather than the
+/// list failing, when the activity can't be read.
 pub fn reverse_aliases(account: &ForwardingAccount, alias: &Alias) -> Result<Vec<ReverseAlias>> {
-    account.client()?.contacts(alias)
+    let client = account.client()?;
+    let (contacts, activity) = std::thread::scope(|scope| {
+        let activity = scope.spawn(|| client.activity(alias));
+        let contacts = client.contacts(alias);
+        let activity = activity
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Reading the alias's activity failed")));
+        (contacts, activity)
+    });
+    let mut contacts = contacts?;
+    if let Ok((activity, partial)) = activity {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        tally(&mut contacts, &activity, partial, now);
+    }
+    Ok(contacts)
 }
-/// An address with most of it hidden, for showing a reverse alias without
-/// revealing it: `ra+x7k2abcd@simplelogin.co` reads `ra•••cd@s•••n.co`.
-/// The local part keeps two characters at each end, the domain name one,
-/// and the top-level domain stays readable.
-pub fn obscure(address: &str) -> String {
-    fn hide(text: &str, keep: usize) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() > keep * 2 + 1 {
-            let head: String = chars[..keep].iter().collect();
-            let tail: String = chars[chars.len() - keep..].iter().collect();
-            format!("{head}•••{tail}")
-        } else {
-            let head: String = chars.iter().take(1).collect();
-            format!("{head}•••")
-        }
-    }
-    match address.rsplit_once('@') {
-        Some((local, domain)) => {
-            let domain = match domain.rsplit_once('.') {
-                Some((name, tld)) => format!("{}.{tld}", hide(name, 1)),
-                None => hide(domain, 1),
-            };
-            format!("{}@{domain}", hide(local, 2))
-        }
-        None => hide(address, 2),
-    }
+/// What a reverse alias shows in place of its address: nothing of it, not
+/// even its length, so it can't be read off the screen. It can be copied.
+pub fn obscure(_address: &str) -> String {
+    "••••••••••••".to_owned()
 }
 
 /// What kind of domain an alias can be made at.
@@ -1095,16 +1179,60 @@ mod tests {
     }
 
     #[test]
-    fn reverse_aliases_are_shown_mostly_hidden() {
-        assert_eq!(obscure("ra+x7k2abcd@simplelogin.co"), "ra•••cd@s•••n.co");
-        assert_eq!(obscure("reply+a1b2c3@sl.local"), "re•••c3@s•••.local");
-        // Short parts keep only their first character.
-        assert_eq!(obscure("ab@x.cc"), "a•••@x•••.cc");
-        let shown = obscure("ra+secretpart@simplelogin.cc");
-        assert!(!shown.contains("secretpart") && !shown.contains("simplelogin"));
-        assert!(shown.ends_with(".cc"));
-        // Non-ASCII is cut on character boundaries.
-        assert_eq!(obscure("ñandú+ñ@dominio.es"), "ña•••+ñ@d•••o.es");
+    fn reverse_aliases_are_hidden_entirely() {
+        let a = obscure("ra+x7k2abcd@simplelogin.co");
+        let b = obscure("ab@x.cc");
+        assert_eq!(a, b, "not even the length shows");
+        assert!(!a.contains('@') && !a.chars().any(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn contacts_count_their_mail_recently_and_all_time() {
+        let day = 24 * 60 * 60;
+        let now = 100 * day;
+        let contact = |id: &str, who: &str, ra: &str| ReverseAlias {
+            id: id.into(),
+            contact: who.into(),
+            address: ra.into(),
+            ..ReverseAlias::default()
+        };
+        let mut list = vec![
+            contact("1", "ana@example.org", "ra+ana@sl.co"),
+            contact("2", "Bo@Example.org", "ra+bo@sl.co"),
+        ];
+        let act = |kind, ra: &str, who: &str, days_ago: i64| Activity {
+            kind,
+            reverse_alias: ra.into(),
+            contact: who.into(),
+            timestamp: now - days_ago * day,
+        };
+        let activity = vec![
+            act(ActivityKind::Forward, "ra+ana@sl.co", "ana@example.org", 1),
+            act(ActivityKind::Forward, "ra+ana@sl.co", "ana@example.org", 30),
+            act(ActivityKind::Reply, "ra+ana@sl.co", "ana@example.org", 2),
+            act(ActivityKind::Other, "ra+ana@sl.co", "ana@example.org", 2),
+            // No reverse alias given: matched by the contact's address.
+            act(ActivityKind::Reply, "", "bo@example.org", 20),
+            act(ActivityKind::Forward, "ra+someone@sl.co", "x@example.org", 1),
+        ];
+        tally(&mut list, &activity, false, now);
+        assert_eq!(
+            list[0].stats,
+            Some(ContactStats {
+                received_recent: 1,
+                received: 2,
+                sent_recent: 1,
+                sent: 1,
+                partial: false,
+            })
+        );
+        assert_eq!(
+            list[1].stats,
+            Some(ContactStats {
+                sent: 1,
+                ..ContactStats::default()
+            })
+        );
     }
 
     #[test]

@@ -195,3 +195,139 @@ fn reader_controls_stay_on_one_row(cx: &mut TestAppContext) {
         }
     }
 }
+
+/// The USPS digest as downloaded: its HTML and a scan sent with it.
+fn usps_source() -> Vec<u8> {
+    use base64::Engine as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let image = image::RgbImage::from_pixel(300, 120, image::Rgb([200, 30, 30]));
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    format!(
+        "From: USPS Informed Delivery <USPSInformeddelivery@email.informeddelivery.usps.com>\r\n\
+         Subject: Your Daily Digest\r\nMessage-ID: <digest-1@informeddelivery.usps.com>\r\n\
+         Content-Type: multipart/related; boundary=\"rel\"\r\n\r\n\
+         --rel\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n\
+         --rel\r\nContent-Type: image/png\r\nContent-ID: <2484554579-510.jpg>\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n{}\r\n--rel--\r\n",
+        b64(include_str!("../../tests/fixtures/usps-informed-delivery.html").as_bytes()),
+        b64(&png.into_inner()),
+    )
+    .into_bytes()
+}
+
+#[gpui::test]
+fn reader_buttons_work_after_opening_an_html_email_and_visiting_settings(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, store) = two_accounts(cx);
+    cx.update(|_, cx| cx.bind_keys([KeyBinding::new("escape", Close, Some("Mail"))]));
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    let ids = view.update_in(cx, |this, _, _| {
+        this.messages.iter().take(4).map(|m| m.id.clone()).collect::<Vec<_>>()
+    });
+    // As cached after a download: the list holds summaries; the cache the
+    // HTML and the source, which opening the message reads.
+    let mut usps = store.message(&ids[2]).unwrap().unwrap();
+    usps.html = Some(include_str!("../../tests/fixtures/usps-informed-delivery.html").into());
+    store.save_messages(&[usps]).unwrap();
+    store.save_raw(&ids[2], &usps_source()).unwrap();
+    view.update_in(cx, |this, _, cx| {
+        this.reload_cached(cx);
+        // A big mailbox is always syncing something: the app redraws for
+        // its spinner all the while.
+        this.syncing = true;
+    });
+    cx.run_until_parked();
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..15 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    let bounds = |cx: &mut VisualTestContext, selector: String| {
+        frame(cx);
+        let leaked: &'static str = Box::leak(selector.into_boxed_str());
+        cx.debug_bounds(leaked)
+            .unwrap_or_else(|| panic!("{leaked} was not rendered"))
+    };
+    let click = |cx: &mut VisualTestContext, selector: String| {
+        let at = bounds(cx, selector).center();
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+    };
+    // A few emails, then the HTML one.
+    for id in [&ids[0], &ids[1], &ids[3], &ids[2]] {
+        click(cx, format!("row-{id}"));
+        settle(cx);
+    }
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selected.as_ref(), Some(&ids[2]));
+        let m = this.selected_ref().unwrap();
+        assert!(!m.lacks_inline_parts(), "opening it read its parts");
+    });
+    // Into the email: hover, click, scroll it.
+    let email = bounds(cx, "html-email".into());
+    let inside = point(email.center().x, email.top() + px(200.));
+    cx.simulate_mouse_move(inside, None, Modifiers::none());
+    cx.simulate_click(inside, Modifiers::none());
+    cx.simulate_event(ScrollWheelEvent {
+        position: inside,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
+        ..Default::default()
+    });
+    settle(cx);
+    // Settings, a look around every page, then back with Escape.
+    click(cx, "accounts".into());
+    view.read_with(cx, |this, _| assert!(this.modal == Some(Modal::Settings)));
+    let account = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    for page in [
+        "settings-reading".to_string(),
+        "settings-composing".into(),
+        "settings-forwarding".into(),
+        format!("settings-account-{account}"),
+        "settings-general".into(),
+    ] {
+        click(cx, page);
+        settle(cx);
+    }
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+    // Every button in the reader's toolbar does what it says.
+    // These test accounts have no server: a change shows at once, then is
+    // put back, and the account notes the failure. Either way, it arrived.
+    let reached = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, _| {
+            this.account_issues
+                .values()
+                .any(|issues| issues.contains_key(&IssueSource::Change))
+        })
+    };
+    view.update(cx, |this, _| this.account_issues.clear());
+    click(cx, "read".into());
+    assert!(reached(cx), "Mark unread");
+    click(cx, "forward".into());
+    view.read_with(cx, |this, _| assert_eq!(this.composers.len(), 1, "Forward"));
+    settle(cx);
+    let pane = bounds(cx, "reader-pane".into());
+    let reply = bounds(cx, "inline-reply".into());
+    assert!(
+        reply.top() < pane.bottom() && reply.bottom() > pane.top() + px(57.),
+        "the inline composer is scrolled into view: {reply:?} in {pane:?}"
+    );
+    // Reply while forwarding it inline: the reply opens beside it.
+    click(cx, "reply".into());
+    view.read_with(cx, |this, cx| {
+        assert_eq!(this.composers.len(), 2, "Reply");
+        assert_ne!(this.composers[1].read(cx).placement, Placement::Inline);
+    });
+    // Reply all goes back to that reply rather than start a third.
+    click(cx, "reply-all".into());
+    view.read_with(cx, |this, _| assert_eq!(this.composers.len(), 2, "Reply all"));
+    view.update(cx, |this, _| this.account_issues.clear());
+    click(cx, "archive".into());
+    assert!(reached(cx), "Archive");
+}

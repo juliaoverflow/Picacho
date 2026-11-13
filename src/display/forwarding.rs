@@ -4,7 +4,7 @@
 //! toolbar (where its mail goes, search, New Alias) above its aliases.
 //! An alias row shows its address, a few status pills and its switch; the
 //! rest is in its menu. SimpleLogin aliases can list their reverse
-//! aliases, which are shown partly hidden.
+//! aliases, which are shown fully hidden, with how much mail each has had.
 use super::*;
 use crate::manage::forwarding::{Alias, ReverseAlias};
 
@@ -48,6 +48,10 @@ pub(super) struct ContactRow {
     title: SharedString,
     hidden: SharedString,
     when: SharedString,
+    /// "Received 3 (14d) · 12 total" and the same for sent; empty when
+    /// the alias's activity couldn't be read.
+    received: SharedString,
+    sent: SharedString,
     /// The contact's address, lowercase. The reverse alias is not
     /// searched, so a search can't reveal it either.
     search: String,
@@ -66,9 +70,27 @@ impl ContactRow {
                 .map(|ts| format!("Last written {}", date_short(ts)))
                 .unwrap_or_default()
                 .into(),
+            received: Self::count("Received", contact.stats.map(|s| {
+                (s.received_recent, s.received, s.partial)
+            })),
+            sent: Self::count("Sent", contact.stats.map(|s| (s.sent_recent, s.sent, s.partial))),
             search: contact.contact.to_lowercase(),
             contact,
         }
+    }
+    /// "Received 3 (14d) · 12 total", with a "+" when not all of the
+    /// alias's activity could be read.
+    fn count(what: &str, counts: Option<(u64, u64, bool)>) -> SharedString {
+        counts
+            .map(|(recent, total, partial)| {
+                format!(
+                    "{what} {recent} ({}d) · {total}{} total",
+                    fwd::CONTACT_RECENT_DAYS,
+                    if partial { "+" } else { "" }
+                )
+            })
+            .unwrap_or_default()
+            .into()
     }
 }
 /// An alias's reverse aliases: most recently written first, and which of
@@ -98,7 +120,15 @@ impl Contacts {
             .collect();
     }
     /// A contact just made (or found), listed first.
-    fn add(&mut self, contact: ReverseAlias, query: &str) {
+    fn add(&mut self, mut contact: ReverseAlias, query: &str) {
+        // One found rather than made keeps the mail already counted.
+        if contact.stats.is_none() {
+            contact.stats = self
+                .rows
+                .iter()
+                .find(|r| r.contact.id == contact.id || r.contact.address == contact.address)
+                .and_then(|r| r.contact.stats);
+        }
         self.rows
             .retain(|r| r.contact.id != contact.id && r.contact.address != contact.address);
         self.rows.insert(0, ContactRow::new(contact));
@@ -1413,8 +1443,8 @@ impl MailApp {
             ).px_0())
         })
     }
-    /// One contact, at the list's fixed row height. Its reverse alias is
-    /// never shown in full; it can be copied.
+    /// One contact, at the list's fixed row height, with how much mail it
+    /// has had. Its reverse alias is never shown; it can be copied.
     fn contact_row(
         &self,
         key: &str,
@@ -1467,6 +1497,21 @@ impl MailApp {
                             }),
                     ),
             )
+            .when(!row.received.is_empty(), |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "reverse-stats".into())
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(px(2.))
+                        .text_size(px(11.))
+                        .text_color(rgb(c.muted))
+                        .child(row.received.clone())
+                        .child(row.sent.clone()),
+                )
+            })
             .child(self.fwd_icon_button(
                 format!("reverse-copy-{key}-{index}"),
                 "copy",

@@ -565,7 +565,17 @@ fn collect_layout_children_with_wrap(
             sort_layout_children_by_order(&doc.nodes, &mut out.children);
         }
 
-        DisplayInside::Table => {
+        // A row group or row outside a table (its table was given another
+        // display, as emails do to restack a layout for narrow screens) is
+        // wrapped in an anonymous table in CSS; Blitz lays it out as a table
+        // of its own instead, which keeps its rows stacked and cells in line.
+        inside @ (DisplayInside::Table
+        | DisplayInside::TableRowGroup
+        | DisplayInside::TableHeaderGroup
+        | DisplayInside::TableFooterGroup
+        | DisplayInside::TableRow)
+            if inside == DisplayInside::Table || is_orphan_table_part(doc, container_node_id, inside) =>
+        {
             let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
             #[allow(clippy::arc_with_non_send_sync)]
             let data = SpecialElementData::TableRoot(Arc::new(table_context));
@@ -648,6 +658,31 @@ fn collect_layout_children_with_wrap(
                 block_item_needs_wrap,
             );
         }
+    }
+}
+
+/// Whether a row group or row is outside the table structure it belongs in:
+/// a row group not directly in a table, or a row in neither a table nor a
+/// row group.
+fn is_orphan_table_part(doc: &BaseDocument, node_id: NodeId, inside: DisplayInside) -> bool {
+    let parent = doc.nodes[node_id]
+        .parent
+        .and_then(|id| doc.nodes[id].display_style())
+        .map(|display| display.inside());
+    match inside {
+        DisplayInside::TableRowGroup
+        | DisplayInside::TableHeaderGroup
+        | DisplayInside::TableFooterGroup => parent != Some(DisplayInside::Table),
+        DisplayInside::TableRow => !matches!(
+            parent,
+            Some(
+                DisplayInside::Table
+                    | DisplayInside::TableRowGroup
+                    | DisplayInside::TableHeaderGroup
+                    | DisplayInside::TableFooterGroup
+            )
+        ),
+        _ => false,
     }
 }
 

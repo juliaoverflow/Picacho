@@ -98,10 +98,29 @@ pub struct Backend {
     pending: Mutex<Option<Pending>>,
     /// How far the current sign-in has come; see `sign_in_step`.
     sign_in_step: Mutex<SignInStep>,
+    /// Messages being opened that wait for their account's connection, by
+    /// account. Background downloads give way to them.
+    waiting: Mutex<HashMap<String, usize>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
     test_secret: Option<Secret>,
+}
+/// See `Backend::wait_for`.
+struct Waiting<'a> {
+    backend: &'a Backend,
+    id: String,
+}
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.backend.waiting.lock().unwrap();
+        if let Some(n) = waiting.get_mut(&self.id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                waiting.remove(&self.id);
+            }
+        }
+    }
 }
 impl Backend {
     pub fn new(store: Arc<Store>) -> Self {
@@ -116,11 +135,30 @@ impl Backend {
             layouts: Mutex::new(HashMap::new()),
             pending: Mutex::new(None),
             sign_in_step: Mutex::new(SignInStep::Browser),
+            waiting: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
             test_secret: None,
         }
+    }
+    /// Notes that someone is waiting for `id`'s connection until the
+    /// returned guard is dropped.
+    fn wait_for(&self, id: &str) -> Waiting<'_> {
+        *self
+            .waiting
+            .lock()
+            .unwrap()
+            .entry(id.to_owned())
+            .or_default() += 1;
+        Waiting {
+            backend: self,
+            id: id.to_owned(),
+        }
+    }
+    /// Whether someone is waiting to open a message of `id`'s.
+    fn someone_waiting(&self, id: &str) -> bool {
+        self.waiting.lock().unwrap().get(id).is_some_and(|n| *n > 0)
     }
     pub(super) fn account_lock(&self, id: &str) -> Arc<Mutex<()>> {
         self.operations
@@ -500,6 +538,7 @@ impl Backend {
             if let Some(r) = readable.get(&m.id) {
                 m.body = r.body.clone();
                 m.html = r.html.clone();
+                m.inline = r.inline.clone();
                 m.snippet = r.snippet.clone();
                 m.attachments = r.attachments.clone();
                 m.has_attachments = r.has_attachments;
@@ -1256,8 +1295,26 @@ impl Backend {
             .context("The original message is not available offline.")
     }
     pub fn read(&self, a: &Account, m: &Mail) -> Result<Mail> {
+        // Already downloaded: there is nothing to ask the server, so don't
+        // wait for the account's connection, which a sync or a background
+        // download can hold for a while.
+        if let Some(raw) = self.store.raw(&m.id)? {
+            let latest = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
+            let (next, kept) = self.parse_read(a, &latest, &raw)?;
+            // Flags or a move may have been committed meanwhile; those stay.
+            return Ok(self.store.refresh_message(&kept)?.map_or(next.clone(), |current| {
+                Mail {
+                    unread: current.unread,
+                    starred: current.starred,
+                    folder: current.folder,
+                    ..next
+                }
+            }));
+        }
+        let waiting = self.wait_for(&a.id);
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        drop(waiting);
         let latest = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
         let m = &latest;
         let raw = if let Some(raw) = self.store.raw(&m.id)? {
@@ -1292,28 +1349,33 @@ impl Backend {
             self.store.save_raw(&m.id, &raw)?;
             raw
         };
-        let (protection, plain) = self.plaintext(a, &raw)?;
+        let (next, kept) = self.parse_read(a, m, &raw)?;
+        self.store.save_messages(&[kept])?;
+        Ok(next)
+    }
+    /// A downloaded message read for showing, and what of it the cache
+    /// keeps. Zero-access mail keeps only what the server could already
+    /// see; its body stays in memory and is decrypted again later.
+    fn parse_read(&self, a: &Account, m: &Mail, raw: &[u8]) -> Result<(Mail, Mail)> {
+        let (protection, plain) = self.plaintext(a, raw)?;
         let mut next = parse_message(&plain, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         next.unread = m.unread;
         next.starred = m.starred;
         next.size = m.size;
         if protection == crate::manage::crypto::Protection::Pinal {
-            // Zero-access: keep only what the server could already see in the
-            // local cache. The body stays in memory and is decrypted again later.
             let mut kept = next.clone();
             kept.body = None;
             kept.html = None;
             kept.snippet.clear();
             kept.attachments.clear();
-            self.store.save_messages(&[kept])?;
             self.readable
                 .lock()
                 .unwrap()
                 .insert(next.id.clone(), next.clone());
+            Ok((next, kept))
         } else {
-            self.store.save_messages(&[next.clone()])?;
+            Ok((next.clone(), next))
         }
-        Ok(next)
     }
     pub fn change(&self, a: &Account, m: &Mail, change: Change) -> Result<Mail> {
         self.change_many(a, std::slice::from_ref(m), change)?;
@@ -1565,6 +1627,11 @@ impl Backend {
                 )?;
                 let uids: Vec<u32> = group.iter().map(|m| m.uid).collect();
                 for chunk in uids.chunks(10) {
+                    // Someone is opening a message: let them have the
+                    // connection; the download picks up after.
+                    if stored > shared && self.someone_waiting(&a.id) {
+                        return Ok(stored);
+                    }
                     for f in c
                         .session
                         .uid_fetch(uid_set(chunk), "(UID BODY.PEEK[])")?

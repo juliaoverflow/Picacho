@@ -188,6 +188,8 @@ fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
 [patch.crates-io]
 # An email's unresolvable image or link address no longer panics; see the patch README.
 blitz-dom = { path = "vendor/blitz-dom" }
+# Inline boxes paint gradient backgrounds (emails' dark styles); see the patch README.
+blitz-paint = { path = "vendor/blitz-paint" }
 # ToCss error inference with GPUI's log/serde feature; see the patch README.
 stylo_derive = { path = "vendor/stylo_derive" }
 # Parses Gmail's X-GM-MSGID; see the patch README.

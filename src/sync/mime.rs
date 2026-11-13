@@ -22,9 +22,18 @@ pub fn parse_message(
     let mut body = String::new();
     let mut html = None;
     let mut attachments = Vec::new();
+    let mut inline = InlineParts::default();
     let mut leaves = Vec::new();
     collect_leaves(&p, &mut leaves);
     for (index, part) in leaves.iter().enumerate() {
+        // Parts with a Content-ID can be shown in the HTML (`cid:` images),
+        // also when listed as attachments.
+        if let Some(content_id) = part.headers.get_first_value("Content-ID")
+            && !part.ctype.mimetype.starts_with("text/")
+            && let Ok(bytes) = part.get_body_raw()
+        {
+            inline.insert(&content_id, bytes);
+        }
         let disposition = part.get_content_disposition();
         let filename = disposition
             .params
@@ -93,6 +102,7 @@ pub fn parse_message(
             .contains("list-unsubscribe=one-click"),
         pending: false,
         reply_to: header("Reply-To"),
+        inline: std::sync::Arc::new(inline),
     })
 }
 pub(crate) fn collect_leaves<'a>(

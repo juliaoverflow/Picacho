@@ -1,5 +1,6 @@
 //! Blitz document and software painting, independent of GPUI and mailbox state.
 use super::resources;
+use crate::manage::model::InlineParts;
 use anyrender::{ImageRenderer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::{DocumentConfig, UserAgentStylesheet};
@@ -18,6 +19,19 @@ const DARK_CSS: &str = "html { background: #1f2023; color: #e8eaed; }";
 /// Blocked remote images keep their size as an empty outline, so the layout
 /// is the one the sender designed. Tracking pixels stay invisible.
 const BLOCKED_CSS: &str = "img[src^='http' i], img[src^='//'] { outline: 1px dashed rgba(128, 128, 128, 0.55); outline-offset: -1px; } img[src^='http' i]:not([width]):not([height]), img[src^='//']:not([width]):not([height]) { min-width: 16px; min-height: 16px; } img[width='0'], img[width='1'], img[height='0'], img[height='1'] { outline: none !important; }";
+
+/// An email's HTML, so that Blitz parses it as HTML. Blitz takes a document
+/// for XML when it starts with an XML declaration or an XHTML DOCTYPE, or its
+/// `<html>` declares the XHTML namespace. Countless emails begin with
+/// `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" ...>`, but
+/// a message's HTML part is `text/html`, which browsers and mail apps parse
+/// as HTML whatever its DOCTYPE says. Parsed as XML, its unclosed `<meta>` and
+/// `<br>` tags swallow everything after them and the `<` in its CSS starts
+/// elements, and the email shows nothing. A comment first stops the sniffing
+/// and changes nothing else: HTML allows one before the DOCTYPE.
+pub(super) fn as_html(html: &str) -> String {
+    format!("<!---->{html}")
+}
 
 /// How the body is colored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,12 +70,23 @@ impl EmailDocument {
     pub(super) fn new(html: &str, blocked: bool) -> Self {
         Self::with_tone(html, blocked, Tone::Light)
     }
+    #[cfg(test)]
     pub(super) fn with_tone(html: &str, blocked: bool, tone: Tone) -> Self {
+        Self::with_parts(html, Default::default(), blocked, tone)
+    }
+    /// `inline` holds the parts the HTML shows by `cid:` address.
+    pub(super) fn with_parts(
+        html: &str,
+        inline: Arc<InlineParts>,
+        blocked: bool,
+        tone: Tone,
+    ) -> Self {
         let cancelled = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(AtomicBool::new(false));
-        let resources = resources::Resources::new(blocked, changed.clone(), cancelled.clone());
+        let resources =
+            resources::Resources::new(blocked, inline, changed.clone(), cancelled.clone());
         let doc = HtmlDocument::from_html(
-            html,
+            &as_html(html),
             DocumentConfig {
                 // Relative resources have no implicit sender-controlled origin.
                 base_url: Some("about:blank".into()),

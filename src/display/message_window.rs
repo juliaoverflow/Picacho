@@ -116,7 +116,7 @@ impl Render for MessageWindow {
             };
             let blocked = self.options.block_remote;
             self.html
-                .update(cx, |view, cx| view.set_content(shown, blocked, dark, cx));
+                .update(cx, |view, cx| view.set_content(shown, &m.inline, blocked, dark, cx));
             body = body.child(self.html.clone());
         } else {
             let text = m.body.clone().unwrap_or_default();
@@ -367,7 +367,8 @@ impl MailApp {
             self.dark,
         );
         let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
-        let needs_body = mail.body.is_none() && mail.html.is_none();
+        // Read also for the images the HTML shows from the message itself.
+        let needs_body = mail.body.is_none() && mail.html.is_none() || mail.lacks_inline_parts();
         let account = self.account_of(&mail);
         let unread = mail.unread;
         let made: Rc<std::cell::RefCell<Option<Entity<MessageWindow>>>> = Rc::default();

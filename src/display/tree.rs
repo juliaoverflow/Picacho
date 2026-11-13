@@ -314,7 +314,7 @@ impl MailApp {
     }
     pub(super) fn save_tree(&self) {
         if let Ok(json) = serde_json::to_string(&self.tree) {
-            let _ = self.backend.store.set_preference("sidebar_tree", &json);
+            self.backend.store.set_preference_soon("sidebar_tree", &json);
         }
     }
     /// Brings the arrangement up to date after accounts are added or removed.
@@ -673,6 +673,19 @@ impl MailApp {
             }
             _ => {}
         }
+        cx.notify();
+    }
+    /// Ends a drag whose button was let go unseen: released outside the
+    /// window, or a press the interface missed while it was busy, which
+    /// gpui can otherwise turn into a drag on a later, buttonless move.
+    /// Until a click ended it, nothing else could be clicked.
+    pub(super) fn cancel_stray_drag(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !cx.stop_active_drag(w) {
+            return;
+        }
+        self.tree_ui.dragging = None;
+        self.tree_ui.drop_at = None;
+        self.tree_ui.serial += 1;
         cx.notify();
     }
     /// Makes a row draggable as `key`.

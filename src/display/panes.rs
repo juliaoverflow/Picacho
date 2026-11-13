@@ -27,10 +27,9 @@ impl MailApp {
         self.sidebar_anim += 1;
         self.sidebar_since = Some(std::time::Instant::now());
         Self::after_animation(cx);
-        let _ = self
+        self
             .backend
-            .store
-            .set_preference("sidebar", if collapsed { "collapsed" } else { "expanded" });
+            .store.set_preference_soon("sidebar", if collapsed { "collapsed" } else { "expanded" });
         cx.notify();
     }
     /// Rows slide in one after another while the sidebar opens or closes.
@@ -448,11 +447,11 @@ impl MailApp {
         let store = &self.backend.store;
         match r.pane {
             Pane::Sidebar => {
-                let _ = store.set_preference("sidebar_width", &self.sidebar_width.to_string());
+                store.set_preference_soon("sidebar_width", &self.sidebar_width.to_string());
             }
             Pane::Reader => {
                 if let Some(w) = self.reader_width {
-                    let _ = store.set_preference("reader_width", &w.to_string());
+                    store.set_preference_soon("reader_width", &w.to_string());
                 }
             }
         }
@@ -467,10 +466,9 @@ impl MailApp {
         self.reader_anim += 1;
         self.reader_since = Some(std::time::Instant::now());
         Self::after_animation(cx);
-        let _ = self
+        self
             .backend
-            .store
-            .set_preference("reader", if collapsed { "collapsed" } else { "expanded" });
+            .store.set_preference_soon("reader", if collapsed { "collapsed" } else { "expanded" });
         cx.notify();
     }
     /// A pane edge the person can drag. It is zero-width in the layout and
@@ -748,7 +746,7 @@ impl MailApp {
             && let Some(html) = &m.html
         {
             self.html_view.update(cx, |view, cx| {
-                view.set_content(html, options.block_remote, dark, cx)
+                view.set_content(html, &m.inline, options.block_remote, dark, cx)
             });
             let view = self.html_view.read(cx);
             let page = view.page_color();

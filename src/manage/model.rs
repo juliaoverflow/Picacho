@@ -457,11 +457,85 @@ pub struct Mail {
     /// Never stored; the list draws it as a placeholder until it loads.
     #[serde(skip)]
     pub pending: bool,
+    /// The parts its HTML shows in place (`cid:` images), found when the
+    /// message is read. Never stored: the downloaded source holds them.
+    #[serde(skip)]
+    pub inline: std::sync::Arc<InlineParts>,
 }
 fn is_zero(v: &u64) -> bool {
     *v == 0
 }
+/// A message's parts that its HTML refers to by Content-ID (`cid:`), such
+/// as the pictures in a newsletter sent with its images attached.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct InlineParts {
+    /// By Content-ID, lowercase, without its angle brackets.
+    parts: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+}
+impl InlineParts {
+    /// Whether `html` shows parts of its message (`cid:` images).
+    pub fn wanted_by(html: &str) -> bool {
+        html.as_bytes()
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"cid:"))
+    }
+    /// At most this much is kept per message.
+    pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+    /// Adds a part under its Content-ID header (`<id>`). Returns false,
+    /// adding nothing, once the message's parts would grow too large.
+    pub fn insert(&mut self, content_id: &str, bytes: Vec<u8>) -> bool {
+        let id = content_id
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim()
+            .to_lowercase();
+        let total: usize = self.parts.values().map(|b| b.len()).sum();
+        if id.is_empty() || total + bytes.len() > Self::MAX_BYTES {
+            return false;
+        }
+        self.parts.insert(id, std::sync::Arc::new(bytes));
+        true
+    }
+    /// The part a `cid:` URL names, if the message has it. The URL's id
+    /// may be percent-encoded (RFC 2392).
+    pub fn get(&self, url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        let id = url.get(..4)?.eq_ignore_ascii_case("cid:").then(|| &url[4..])?;
+        self.parts.get(&percent_decoded(id).trim().to_lowercase()).cloned()
+    }
+}
+/// `%XX` escapes decoded; anything else, including a malformed escape, kept.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            (b, ..) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+impl std::fmt::Debug for InlineParts {
+    // The ids, not megabytes of image data.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.parts.keys()).finish()
+    }
+}
 impl Mail {
+    /// Whether the HTML shows parts of the message that haven't been read
+    /// from its source yet; the cache keeps the HTML without them.
+    pub fn lacks_inline_parts(&self) -> bool {
+        self.inline.parts.is_empty() && self.html.as_deref().is_some_and(InlineParts::wanted_by)
+    }
     /// Newest first, ties broken by id, so every list of the same messages
     /// comes out in the same order (as SQLite's `date DESC, id DESC`).
     pub fn newest_first(a: &Mail, b: &Mail) -> std::cmp::Ordering {
@@ -688,6 +762,28 @@ pub fn demo_mail() -> Vec<Mail> {
             one_click: false,
             pending: false,
             reply_to: String::new(),
+            inline: Default::default(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_parts_match_their_cid_addresses() {
+        let mut parts = InlineParts::default();
+        assert!(parts.insert(" <Scan 1@USPS.com> ", vec![1, 2, 3]));
+        // Brackets, case and percent-encoding don't matter (RFC 2392).
+        assert_eq!(parts.get("cid:scan%201@usps.com").as_deref(), Some(&vec![1, 2, 3]));
+        assert_eq!(parts.get("CID:Scan 1@USPS.com").as_deref(), Some(&vec![1, 2, 3]));
+        assert!(parts.get("cid:other@usps.com").is_none());
+        assert!(parts.get("https://usps.com/scan 1").is_none());
+        assert!(!parts.insert("<>", vec![1]), "an empty id names nothing");
+        // A message can't hold more than the limit in memory.
+        assert!(!parts.insert("<big>", vec![0; InlineParts::MAX_BYTES]));
+        assert!(InlineParts::wanted_by("<img src=\"CID:x\">"));
+        assert!(!InlineParts::wanted_by("<img src=\"https://x\">"));
+    }
 }

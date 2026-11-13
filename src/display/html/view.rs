@@ -2,6 +2,7 @@
 //! happens on its own thread (see `worker.rs`).
 use super::document::{Tone, page_color};
 use super::worker::{self, BAND, Command, Output, Update};
+use crate::manage::model::InlineParts;
 use blitz_traits::events::*;
 use futures::{StreamExt, channel::mpsc::UnboundedSender};
 use gpui::{prelude::*, *};
@@ -35,6 +36,10 @@ struct Thumbnail {
 
 pub struct HtmlView {
     source: String,
+    /// Whether the renderer failed on `source`.
+    failed: bool,
+    /// The message parts `source` refers to by `cid:` address.
+    inline: Arc<InlineParts>,
     blocked: bool,
     /// The reader's dark choice the current tone was chosen for.
     dark: bool,
@@ -89,6 +94,8 @@ impl HtmlView {
         .detach();
         Self {
             source: String::new(),
+            failed: false,
+            inline: Default::default(),
             blocked: true,
             dark: false,
             tone: Tone::Light,
@@ -118,7 +125,7 @@ impl HtmlView {
     }
     /// Whether the document is still being parsed, laid out or first painted.
     pub fn is_loading(&self) -> bool {
-        self.worker.is_some() && (!self.laid_out || self.tiles.is_empty())
+        self.worker.is_some() && !self.failed && (!self.laid_out || self.tiles.is_empty())
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -127,6 +134,7 @@ impl HtmlView {
         self.worker = None;
         self.generation += 1;
         self.source.clear();
+        self.failed = false;
         self.retired
             .extend(self.tiles.drain().map(|(_, tile)| tile.image));
         self.retired
@@ -144,13 +152,23 @@ impl HtmlView {
     }
     /// Shows `html`, with remote content `blocked` or not, in light or `dark`
     /// colors. The same content again keeps the current document.
-    pub fn set_content(&mut self, html: &str, blocked: bool, dark: bool, cx: &mut Context<Self>) {
+    /// `inline` holds the message's parts its HTML shows by `cid:` address;
+    /// they arrive when the message has been read, which shows it again.
+    pub fn set_content(
+        &mut self,
+        html: &str,
+        inline: &Arc<InlineParts>,
+        blocked: bool,
+        dark: bool,
+        cx: &mut Context<Self>,
+    ) {
         // Called on every reader render: compare cheaply before scanning
         // the HTML for its color scheme.
         if self.worker.is_some()
             && self.dark == dark
             && self.blocked == blocked
             && self.source.len() == html.len()
+            && (Arc::ptr_eq(&self.inline, inline) || self.inline == *inline)
             && self.source == html
         {
             return;
@@ -159,11 +177,13 @@ impl HtmlView {
         self.dark = dark;
         self.clear(cx);
         self.source = html.into();
+        self.inline = inline.clone();
         self.blocked = blocked;
         self.tone = tone;
         self.height = 1.;
         self.worker = Some(worker::spawn(
             html.into(),
+            inline.clone(),
             blocked,
             tone,
             self.generation,
@@ -238,6 +258,12 @@ impl HtmlView {
                 if let Some(old) = self.thumbnail.replace(thumbnail) {
                     self.retired.push(old.image);
                 }
+                cx.notify();
+            }
+            Output::Failed => {
+                self.failed = true;
+                self.laid_out = true;
+                self.height = 1.;
                 cx.notify();
             }
             Output::Context(target) => {
@@ -435,6 +461,17 @@ pub fn thumbnail(view: Entity<HtmlView>) -> impl IntoElement {
 
 impl Render for HtmlView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.failed {
+            return div()
+                .id("html-email")
+                .debug_selector(|| "html-failed".into())
+                .w_full()
+                .py_6()
+                .text_size(px(13.))
+                .text_color(rgb(0x9aa0a6))
+                .child("This email's formatting couldn't be shown. Choose plain text above to read it.")
+                .into_any_element();
+        }
         let view = cx.entity();
         let loading = self.is_loading();
         div()
@@ -542,5 +579,6 @@ impl Render for HtmlView {
                         ),
                 )
             })
+            .into_any_element()
     }
 }

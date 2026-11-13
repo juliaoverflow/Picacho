@@ -211,8 +211,22 @@ pub(crate) fn build_table_context(
 
     let wm = table_wm(doc, table_root_node_id);
     let root_node = &mut doc.nodes[table_root_node_id];
+    // A row outside a table is a table of that one row (see `construct`).
+    let root_is_row = root_node
+        .display_style()
+        .is_some_and(|display| display.inside() == DisplayInside::TableRow);
 
-    let children = std::mem::take(&mut root_node.children);
+    let children = if root_is_row {
+        Default::default()
+    } else {
+        std::mem::take(&mut root_node.children)
+    };
+    // What the table's rows are collected from.
+    let parts: Vec<NodeId> = if root_is_row {
+        vec![table_root_node_id]
+    } else {
+        children.iter().copied().collect()
+    };
 
     let Some(stylo_styles) = root_node.primary_styles() else {
         panic!("Ignoring table because it has no styles");
@@ -242,7 +256,7 @@ pub(crate) fn build_table_context(
 
     let mut columns: Vec<TableColumn> = Vec::new();
     let mut column_sizes: Vec<taffy::TrackSizingFunction> = Vec::new();
-    for child_id in children.iter().copied() {
+    for child_id in parts.iter().copied() {
         collect_columns(doc, child_id, wm, &mut columns, &mut column_sizes);
     }
     // Percentage column widths only take effect in the fixed table layout algorithm
@@ -269,13 +283,14 @@ pub(crate) fn build_table_context(
         }
     };
     for order in 0..3 {
-        for child_id in children.iter().copied() {
+        for child_id in parts.iter().copied() {
             if row_group_order(doc, child_id) != order {
                 continue;
             }
             collect_table_cells(
                 doc,
                 child_id,
+                false,
                 wm,
                 is_fixed,
                 border_collapse,
@@ -415,8 +430,9 @@ pub(crate) fn build_table_context(
         .map(|cell| cell.node_id)
         .chain(oof_children.iter().map(|(node_id, _)| *node_id))
         .collect();
-    let root_node = &mut doc.nodes[table_root_node_id];
-    root_node.children = children;
+    if !root_is_row {
+        doc.nodes[table_root_node_id].children = children;
+    }
 
     (
         TableContext {
@@ -514,6 +530,8 @@ fn collect_columns(
 fn collect_table_cells(
     doc: &mut BaseDocument,
     node_id: NodeId,
+    // Whether `node_id` is a child of a row.
+    in_row: bool,
     wm: WritingMode,
     is_fixed: bool,
     border_collapse: BorderCollapse,
@@ -558,12 +576,18 @@ fn collect_table_cells(
         | DisplayInside::Contents => {
             let first_row = rows.len();
             let children = std::mem::take(&mut doc.nodes[node_id].children);
+            // `display: contents` is transparent: its children are where it is.
+            let children_in_row = in_row && display.inside() == DisplayInside::Contents;
             for child_id in children.iter().copied() {
-                doc.nodes[child_id]
-                    .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                // A child taken as a cell is laid out (constructed) as one.
+                if !(children_in_row && is_anonymous_cell(doc, child_id)) {
+                    doc.nodes[child_id]
+                        .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                }
                 collect_table_cells(
                     doc,
                     child_id,
+                    children_in_row,
                     wm,
                     is_fixed,
                     border_collapse,
@@ -605,6 +629,7 @@ fn collect_table_cells(
                 collect_table_cells(
                     doc,
                     child_id,
+                    true,
                     wm,
                     is_fixed,
                     border_collapse,
@@ -620,7 +645,12 @@ fn collect_table_cells(
             }
             doc.nodes[node_id].children = children;
         }
-        DisplayInside::TableCell => {
+        // A block or inline box directly in a row is wrapped in an anonymous
+        // cell in CSS (emails restack rows by making cells `display: block`);
+        // Blitz lays it out as that cell.
+        inside
+            if inside == DisplayInside::TableCell || (in_row && is_anonymous_cell_display(display)) =>
+        {
             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             let stylo_style = &node.primary_styles().unwrap();
             let colspan: u16 = node
@@ -750,11 +780,25 @@ fn collect_table_cells(
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             //Ignore
         }
-        DisplayInside::None => {
+        // Cells are taken by the first arm.
+        DisplayInside::None | DisplayInside::TableCell => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             // Ignore
         }
     }
+}
+
+/// Whether a box in a row stands in for an anonymous cell: any block or
+/// inline box other than a table part or caption.
+fn is_anonymous_cell_display(display: style::values::specified::box_::Display) -> bool {
+    matches!(
+        display.inside(),
+        DisplayInside::Flow | DisplayInside::FlowRoot | DisplayInside::Flex | DisplayInside::Grid
+    ) && matches!(display.outside(), DisplayOutside::Block | DisplayOutside::Inline)
+}
+fn is_anonymous_cell(doc: &BaseDocument, node_id: NodeId) -> bool {
+    let node = &doc.nodes[node_id];
+    node.is_element() && node.display_style().is_some_and(is_anonymous_cell_display)
 }
 
 pub struct RangeIter(Range<usize>);

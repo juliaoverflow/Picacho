@@ -2,6 +2,8 @@
 //! rasterization never run on the UI thread, so opening a heavy newsletter,
 //! hovering links or scrolling never stalls the window.
 use super::document::{ContextTarget, EmailDocument, Tone};
+use crate::manage::model::InlineParts;
+use std::sync::Arc;
 use blitz_dom::Document;
 use blitz_traits::events::{BlitzKeyEvent, UiEvent};
 use futures::channel::mpsc::UnboundedSender;
@@ -63,6 +65,8 @@ pub enum Output {
         pixels: Vec<u8>,
     },
     Context(ContextTarget),
+    /// The renderer failed on this email; nothing more will come.
+    Failed,
     Thumbnail {
         revision: u64,
         /// Device pixels.
@@ -79,6 +83,7 @@ const THUMBNAIL_LAYOUT: u32 = 640;
 /// drops the document and cancels its resource work.
 pub fn spawn(
     html: String,
+    inline: Arc<InlineParts>,
     blocked: bool,
     tone: Tone,
     generation: u64,
@@ -87,12 +92,26 @@ pub fn spawn(
     let (tx, rx) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("picacho-html".into())
-        .spawn(move || run(html, blocked, tone, generation, rx, out));
+        .spawn(move || {
+            // A renderer panic on some email must not leave its view waiting
+            // forever: say so, and the reader offers the plain text.
+            let failed = out.clone();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(html, inline, blocked, tone, generation, rx, out)
+            }));
+            if ran.is_err() {
+                let _ = failed.unbounded_send(Update {
+                    generation,
+                    output: Output::Failed,
+                });
+            }
+        });
     tx
 }
 
 fn run(
     html: String,
+    inline: Arc<InlineParts>,
     blocked: bool,
     tone: Tone,
     generation: u64,
@@ -100,7 +119,7 @@ fn run(
     out: UnboundedSender<Update>,
 ) {
     let send = |output| out.unbounded_send(Update { generation, output }).is_ok();
-    let mut doc = EmailDocument::with_tone(&html, blocked, tone);
+    let mut doc = EmailDocument::with_parts(&html, inline, blocked, tone);
     drop(html);
     let mut width = 0u32;
     let mut height = 1f32;

@@ -484,10 +484,9 @@ impl MailApp {
 
     pub(super) fn set_all_mail(&mut self, on: bool, cx: &mut Context<Self>) {
         self.all_mail = on;
-        let _ = self
+        self
             .backend
-            .store
-            .set_preference(fwd::ALL_MAIL_PREFERENCE, if on { "true" } else { "false" });
+            .store.set_preference_soon(fwd::ALL_MAIL_PREFERENCE, if on { "true" } else { "false" });
         self.views_changed(cx);
     }
     /// After aliases, services or All Mail change: saves them, updates the
@@ -1329,6 +1328,13 @@ mod tests {
                 address: format!("ra+secret{i}@simplelogin.co"),
                 blocked: i == 3,
                 last_sent: (i % 2 == 0).then_some(1_700_000_000 + i as i64),
+                stats: (i % 3 == 0).then(|| fwd::ContactStats {
+                    received_recent: 1,
+                    received: i as u64,
+                    sent_recent: 0,
+                    sent: 2,
+                    partial: false,
+                }),
             })
             .collect();
         view.update(cx, |this, _| {

@@ -192,7 +192,12 @@ fn unsafe_resource_schemes_and_credentials_are_refused() {
     ));
     let cancelled = Arc::new(AtomicBool::new(false));
     let resources =
-        resources::Resources::new(false, Arc::new(AtomicBool::new(false)), cancelled.clone());
+        resources::Resources::new(
+            false,
+            Default::default(),
+            Arc::new(AtomicBool::new(false)),
+            cancelled.clone(),
+        );
     struct Capture(std::sync::mpsc::Sender<blitz_traits::net::Bytes>);
     impl blitz_traits::net::NetHandler for Capture {
         fn bytes(self: Box<Self>, _: String, bytes: blitz_traits::net::Bytes) {
@@ -301,4 +306,329 @@ fn dark_reading_darkens_pages_lightens_text_and_keeps_brand_colors() {
         (page[0] - page[2]).abs() < 0.01,
         "neutral stays neutral: {page:?}"
     );
+}
+
+#[test]
+fn images_sent_with_the_message_show_by_content_id_even_with_remote_content_blocked() {
+    use crate::manage::model::{Account, Folder, Provider};
+    use base64::Engine as _;
+    // USPS Informed Delivery: the mailpiece scans are attached to the
+    // message and the HTML shows them as `cid:` images.
+    let html = include_str!("../../../tests/fixtures/usps-informed-delivery.html");
+    let png = |rgb: [u8; 3]| {
+        let image = image::RgbImage::from_pixel(300, 120, image::Rgb(rgb));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+    };
+    let mut raw = String::from(
+        "From: USPS Informed Delivery <USPSInformeddelivery@email.informeddelivery.usps.com>\r\n\
+         Subject: Your Daily Digest\r\n\
+         Content-Type: multipart/related; boundary=\"rel\"\r\n\r\n\
+         --rel\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+    );
+    raw += &base64::engine::general_purpose::STANDARD.encode(html);
+    // Some senders percent-encode or change the case of the id in the URL.
+    for (id, rgb) in [
+        ("2484554579-510.jpg", [255, 0, 0]),
+        ("Mailer-13667.JPG", [0, 0, 255]),
+    ] {
+        raw += &format!(
+            "\r\n--rel\r\nContent-Type: image/png; name=\"{id}\"\r\n\
+             Content-Disposition: inline; filename=\"{id}\"\r\n\
+             Content-ID: <{id}>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+            png(rgb)
+        );
+    }
+    raw += "\r\n--rel--\r\n";
+    let mail = crate::sync::mime::parse_message(
+        raw.as_bytes(),
+        &Account::new(Provider::Imap),
+        "usps",
+        Folder::Inbox,
+        "INBOX",
+        1,
+    )
+    .unwrap();
+    assert!(!mail.lacks_inline_parts(), "{:?}", mail.inline);
+
+    let mut email = EmailDocument::with_parts(
+        mail.html.as_deref().unwrap(),
+        mail.inline.clone(),
+        true,
+        super::document::Tone::Light,
+    );
+    let color_at = |email: &mut EmailDocument, id: &str| {
+        let node = email
+            .doc
+            .get_node(email.doc.get_element_by_id(id).unwrap())
+            .unwrap();
+        let size = node.final_layout().size;
+        let pos = node.absolute_position(0., 0.);
+        let (x, y) = (pos.x + size.width / 2., pos.y + size.height / 2.);
+        let pixels = email.pixels_at(1, 1, 1., x, y);
+        (size, [pixels[2], pixels[1], pixels[0]])
+    };
+    email.layout(640);
+    // The images load on the document's thread; give them a moment.
+    for _ in 0..50 {
+        if color_at(&mut email, "mailpiece-image-src-id").1 == [255, 0, 0] {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        email.layout(640);
+    }
+    let (size, color) = color_at(&mut email, "mailpiece-image-src-id");
+    assert!(size.width > 100. && size.height > 50., "the scan has its size: {size:?}");
+    assert_eq!(color, [255, 0, 0], "the scan is painted");
+    let (_, color) = color_at(&mut email, "campaign-representative-image-src-id");
+    assert_eq!(color, [0, 0, 255], "an id in another case still matches");
+}
+
+/// A development aid, not a check: renders the HTML file `SNAP_HTML` at
+/// `SNAP_WIDTH` (700) pixels to `SNAP_DIR/usps-{light,dark}-{width}.png`,
+/// with a stand-in picture for each image sent with the message (`cid:`).
+/// `cargo test render_to_png -- --ignored`.
+#[test]
+#[ignore]
+fn render_to_png() {
+    use super::document::Tone;
+    let html = std::fs::read_to_string(std::env::var("SNAP_HTML").unwrap()).unwrap();
+    let width: u32 = std::env::var("SNAP_WIDTH").ok().and_then(|w| w.parse().ok()).unwrap_or(700);
+    // Stand-ins for the images sent with the message.
+    let mut inline = crate::manage::model::InlineParts::default();
+    for part in html.split("cid:").skip(1) {
+        let id: String = part.chars().take_while(|c| !matches!(c, '"' | '\'' | ')')).collect();
+        let image = image::RgbImage::from_fn(510, 300, |x, y| {
+            image::Rgb(if (x / 30 + y / 30) % 2 == 0 { [90, 120, 160] } else { [200, 210, 225] })
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        inline.insert(&id, png.into_inner());
+    }
+    let inline = std::sync::Arc::new(inline);
+    for (tone, name) in [(Tone::Light, "light"), (Tone::NativeDark, "dark")] {
+        let mut email = EmailDocument::with_parts(&html, inline.clone(), true, tone);
+        email.layout(width);
+        // The images arrive on the document's thread.
+        std::thread::sleep(Duration::from_millis(300));
+        let height = email.layout(width);
+        let h = (height.ceil() as u32).min(6000);
+        let mut px = email.pixels(width, h, 1., 0);
+        for p in px.chunks_mut(4) {
+            p.swap(0, 2);
+        }
+        let img = image::RgbaImage::from_raw(width, h, px).unwrap();
+        img.save(format!("{}/usps-{name}-{width}.png", std::env::var("SNAP_DIR").unwrap())).unwrap();
+        eprintln!("{name}: height {height}");
+    }
+}
+
+/// The color painted at a point of a document laid out `width` wide.
+fn color_at(email: &mut EmailDocument, x: f32, y: f32) -> [u8; 3] {
+    let pixels = email.pixels_at(1, 1, 1., x, y);
+    [pixels[2], pixels[1], pixels[0]]
+}
+fn element_box(email: &EmailDocument, id: &str) -> (f32, f32, f32, f32) {
+    let node = email
+        .doc
+        .get_node(email.doc.get_element_by_id(id).unwrap())
+        .unwrap();
+    let pos = node.absolute_position(0., 0.);
+    let size = node.final_layout().size;
+    (pos.x, pos.y, size.width, size.height)
+}
+
+#[test]
+fn tables_restacked_for_narrow_screens_keep_their_rows() {
+    // Emails restack a layout by making a table (or its cells) `display:
+    // block` in a narrow-screen media query.
+    let mut email = EmailDocument::new(
+        "<body style='margin:0'>\
+         <table style='display:block;width:100%' cellspacing='0' cellpadding='0'><tbody>\
+         <tr><td id='a' style='background:#ff0000;width:50%;height:40px'>One</td></tr>\
+         <tr><td id='b' style='background:#0000ff;height:40px'>Two</td></tr>\
+         </tbody></table>\
+         <table width='100%' cellspacing='0' cellpadding='0'><tbody>\
+         <tr><td id='c' style='background:#00ff00;height:40px'>Three</td></tr>\
+         <tr><td id='d' style='display:block;background:#ff00ff;height:40px'>Four</td></tr>\
+         </tbody></table></body>",
+        true,
+    );
+    email.layout(400);
+    let (_, ay, _, ah) = element_box(&email, "a");
+    let (_, by, bw, bh) = element_box(&email, "b");
+    assert!(by >= ay + ah - 1., "rows stack: a at {ay}+{ah}, b at {by}");
+    assert!(bw > 0. && bh > 0.);
+    // A block in a row stands in for its cell rather than vanishing.
+    let (dx, dy, dw, dh) = element_box(&email, "d");
+    assert!(dw > 100. && dh >= 40., "the block cell is laid out: {dw}x{dh}");
+    assert_eq!(color_at(&mut email, dx + dw / 2., dy + dh / 2.), [255, 0, 255]);
+}
+
+#[test]
+fn cellspacing_and_cellpadding_attributes_apply() {
+    let mut email = EmailDocument::new(
+        "<body style='margin:0;background:#ffffff'>\
+         <table width='200' cellspacing='0' cellpadding='0'><tr>\
+         <td id='a' style='background:#ff0000;height:30px'></td>\
+         <td id='b' style='background:#0000ff;height:30px'></td></tr></table>\
+         <table width='200' cellspacing='0' cellpadding='12'><tr>\
+         <td id='p'><div id='inner' style='height:10px'></div></td></tr></table></body>",
+        true,
+    );
+    email.layout(400);
+    let (ax, ay, aw, ah) = element_box(&email, "a");
+    let (bx, ..) = element_box(&email, "b");
+    assert_eq!(bx, ax + aw, "no spacing between the cells");
+    // No white seam where they meet, nor above them.
+    assert_ne!(color_at(&mut email, ax + aw - 0.5, ay + ah / 2.), [255, 255, 255]);
+    assert_eq!(ay, 0., "no spacing around the cells");
+    let (px, py, ..) = element_box(&email, "p");
+    let (ix, iy, ..) = element_box(&email, "inner");
+    assert_eq!((ix - px, iy - py), (12., 12.), "cellpadding pads the cell");
+}
+
+#[test]
+fn inline_gradient_backgrounds_paint_over_a_light_color() {
+    // The dark-mode trick: a later light background-color, under a gradient.
+    let mut email = EmailDocument::new(
+        "<style>.dark{background:linear-gradient(#202020,#202020)}.dark{background-color:#f7f7f7}</style>\
+         <body style='margin:0;font-size:40px'><p style='margin:0'>\
+         <span id='s' class='dark' style='color:#ff0000'>MMMM</span></p></body>",
+        true,
+    );
+    email.layout(400);
+    // Inline boxes have no layout box of their own; sample the line.
+    let (_, py, _, ph) = {
+        let p = email.doc.query_selector("p").unwrap().unwrap();
+        let node = email.doc.get_node(p).unwrap();
+        let pos = node.absolute_position(0., 0.);
+        let size = node.final_layout().size;
+        (pos.x, pos.y, size.width, size.height)
+    };
+    let line: Vec<[u8; 3]> = (0..60)
+        .map(|x| color_at(&mut email, x as f32 * 2. + 0.5, py + ph / 2.))
+        .collect();
+    // Red text on the dark gradient keeps green low; the light color under
+    // it (#f7f7f7) would not.
+    assert!(
+        line.iter().all(|[_, g, _]| *g < 60),
+        "only the gradient shows behind the text: {line:?}"
+    );
+    assert!(
+        line.iter().filter(|c| **c == [32, 32, 32]).count() > 5,
+        "between the letters it is the gradient's color: {line:?}"
+    );
+}
+
+#[test]
+fn clicking_an_emails_links_opens_them() {
+    use blitz_dom::DocumentConfig;
+    use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
+    struct Record(std::sync::Mutex<Vec<String>>);
+    impl NavigationProvider for Record {
+        fn navigate_to(&self, options: NavigationOptions) {
+            self.0.lock().unwrap().push(options.url.to_string());
+        }
+    }
+    let record = Arc::new(Record(Default::default()));
+    let html = include_str!("../../../tests/fixtures/usps-informed-delivery.html")
+        .replace(
+            "id=\"mailbox-url-link\" class=\"view-dashboard-a\" href=\"hiddenforprivacy\"",
+            "id=\"mailbox-url-link\" class=\"view-dashboard-a\" href=\"https://example.com/dashboard\"",
+        )
+        .replace(
+            "id=\"unsubscribe-url-link\" href=\"hiddenforprivacy\"",
+            "id=\"unsubscribe-url-link\" href=\"https://example.com/unsubscribe\"",
+        );
+    let mut doc = blitz_html::HtmlDocument::from_html(
+        &super::document::as_html(&html),
+        DocumentConfig {
+            base_url: Some("about:blank".into()),
+            navigation_provider: Some(record.clone()),
+            ..Default::default()
+        },
+    );
+    doc.set_viewport(blitz_traits::shell::Viewport::new(
+        900,
+        600,
+        1.,
+        blitz_traits::shell::ColorScheme::Light,
+    ));
+    doc.resolve(0.);
+    let mut click = |id: &str| {
+        // A link is an inline box, with no layout box of its own: find a
+        // point on its line that hits it.
+        let link = doc.get_element_by_id(id).unwrap();
+        let mut block = doc.get_node(link).unwrap();
+        while block.final_layout().size.height == 0. {
+            block = doc.get_node(block.parent.unwrap()).unwrap();
+        }
+        let pos = block.absolute_position(0., 0.);
+        let size = block.final_layout().size;
+        let within = |doc: &blitz_html::HtmlDocument, x: f32, y: f32| {
+            let mut node = doc.hit(x, y).map(|h| h.node_id);
+            while let Some(id) = node {
+                if id == link {
+                    return true;
+                }
+                node = doc.get_node(id).and_then(|n| n.parent);
+            }
+            false
+        };
+        let (x, y) = (0..400)
+            .flat_map(|i| (0..20).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                (
+                    pos.x + size.width * i as f32 / 400.,
+                    pos.y + size.height * j as f32 / 20.,
+                )
+            })
+            .find(|&(x, y)| within(&doc, x, y))
+            .unwrap_or_else(|| panic!("{id} can be hit"));
+        doc.handle_ui_event(UiEvent::PointerMove(mouse(x, y, false)));
+        doc.handle_ui_event(UiEvent::PointerDown(mouse(x, y, true)));
+        doc.handle_ui_event(UiEvent::PointerUp(mouse(x, y, false)));
+    };
+    // A button made of a span in a link, and a link that opens a new tab.
+    click("mailbox-url-link");
+    click("unsubscribe-url-link");
+    assert_eq!(
+        *record.0.lock().unwrap(),
+        ["https://example.com/dashboard", "https://example.com/unsubscribe"]
+    );
+}
+
+
+#[test]
+fn emails_declaring_xhtml_are_parsed_as_html() {
+    // Countless emails begin with an XHTML DOCTYPE, yet are sent as
+    // text/html. Parsed as XML, the unclosed <meta> swallowed the email and
+    // the `<` in its CSS began elements: it showed nothing at all.
+    let html = include_str!("../../../tests/fixtures/usps-informed-delivery.html");
+    assert!(html.starts_with("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0"));
+    assert!(html.contains("<=430px"));
+    let mut email = EmailDocument::new(html, true);
+    let height = email.layout(640);
+    assert!(height > 1500., "the email is laid out: {height}");
+    let style = email.doc.query_selector("head style").unwrap();
+    assert!(style.is_some(), "<style> is in <head>, not swallowed by a <meta>");
+    let tracking = email
+        .doc
+        .get_node(email.doc.get_element_by_id("pra-shipper-name-id").unwrap())
+        .unwrap();
+    assert_eq!(tracking.text_content(), "Example Shop");
+    // Same with the namespace on <html> and no DOCTYPE, and after an XML
+    // declaration.
+    for start in [
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><meta charset=utf-8>",
+        "<?xml version=\"1.0\"?><html><head><meta charset=utf-8>",
+    ] {
+        let mut email = EmailDocument::new(
+            &format!("{start}<style>/* <=430px */ p {{ height: 40px }}</style></head><body><p>Hi</p></body></html>"),
+            true,
+        );
+        assert!(email.layout(400) >= 40., "{start}");
+    }
 }

@@ -7,8 +7,8 @@
 //!
 //! These helpers only talk to the service; Manage keeps the result.
 use crate::manage::forwarding::{
-    Alias, AliasDomain, AliasFormat, AliasOptions, AliasStats, DomainKind, ForwardingService,
-    NewAlias, ReverseAlias, ServiceMailbox, random_prefix,
+    Activity, ActivityKind, Alias, AliasDomain, AliasFormat, AliasOptions, AliasStats, DomainKind,
+    ForwardingService, NewAlias, ReverseAlias, ServiceMailbox, random_prefix,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -435,6 +435,52 @@ impl Client {
         Ok(parse_contacts(&v))
     }
 
+    /// SimpleLogin: an alias's activity, newest first: mail forwarded,
+    /// replied, blocked or bounced. Also says whether there was more than
+    /// is read, which stops at a few thousand entries.
+    pub fn activity(&self, alias: &Alias) -> Result<(Vec<Activity>, bool)> {
+        /// Pages asked for together.
+        const AT_ONCE: usize = 4;
+        /// 5,000 entries at 20 a page.
+        const MAX_PAGES: usize = 250;
+        ensure!(
+            self.service == ForwardingService::SimpleLogin,
+            "Only SimpleLogin lists an alias's activity"
+        );
+        let mut out = Vec::new();
+        let mut first = 0;
+        while first < MAX_PAGES {
+            let pages: Vec<Result<Vec<Activity>>> = std::thread::scope(|scope| {
+                let running: Vec<_> = (first..(first + AT_ONCE).min(MAX_PAGES))
+                    .map(|page| scope.spawn(move || self.activity_page(alias, page)))
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|page| {
+                        page.join()
+                            .unwrap_or_else(|_| bail!("Reading the alias's activity failed"))
+                    })
+                    .collect()
+            });
+            for page in pages {
+                let page = page?;
+                if page.is_empty() {
+                    return Ok((out, false));
+                }
+                out.extend(page);
+            }
+            first += AT_ONCE;
+        }
+        Ok((out, true))
+    }
+    fn activity_page(&self, alias: &Alias, page: usize) -> Result<Vec<Activity>> {
+        let v = self.send(self.request(
+            reqwest::Method::GET,
+            &format!("/api/aliases/{}/activities?page_id={page}", alias.id),
+        ))?;
+        Ok(parse_activities(&v))
+    }
+
     /// SimpleLogin: blocks or unblocks mail from a contact to its alias.
     /// Returns whether it is blocked now.
     pub fn toggle_contact(&self, contact: &ReverseAlias) -> Result<bool> {
@@ -697,7 +743,42 @@ fn parse_contact(c: &Value) -> Option<ReverseAlias> {
         address,
         blocked: c["block_forward"].as_bool().unwrap_or(false),
         last_sent: c["last_email_sent_timestamp"].as_i64(),
+        stats: None,
     })
+}
+/// An alias's activity page. The contact is the sender of forwarded mail
+/// and the recipient of a reply.
+fn parse_activities(v: &Value) -> Vec<Activity> {
+    v["activities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| {
+            let kind = match str_of(&a["action"]).as_str() {
+                "forward" => ActivityKind::Forward,
+                "reply" => ActivityKind::Reply,
+                _ => ActivityKind::Other,
+            };
+            let contact = match kind {
+                ActivityKind::Reply => str_of(&a["to"]),
+                _ => str_of(&a["from"]),
+            };
+            let mut reverse_alias = str_of(&a["reverse_alias_address"]).trim().to_lowercase();
+            if reverse_alias.is_empty() {
+                reverse_alias = str_of(&a["reverse_alias"])
+                    .rsplit_once('<')
+                    .and_then(|(_, rest)| rest.split_once('>'))
+                    .map(|(inner, _)| inner.trim().to_lowercase())
+                    .unwrap_or_default();
+            }
+            Activity {
+                kind,
+                reverse_alias,
+                contact: contact.trim().to_lowercase(),
+                timestamp: a["timestamp"].as_i64().unwrap_or(0),
+            }
+        })
+        .collect()
 }
 /// Whether a service's reply about one alias shows it still in use.
 /// addy.io keeps deleted aliases for a while, marked as deleted.
@@ -985,6 +1066,26 @@ mod tests {
         assert!(got[0].blocked);
         assert_eq!(got[0].last_sent, Some(1700000000));
         assert_eq!(got[1].last_sent, None);
+    }
+
+    #[test]
+    fn reads_an_aliass_activity() {
+        let v = json!({"activities": [
+            {"action": "reply", "from": "me@sl.co", "to": "Ana@Example.org", "timestamp": 1700000000,
+             "reverse_alias": "\"ana at example.org\" <ra+ana@sl.co>"},
+            {"action": "forward", "from": "bo@example.org", "to": "me@sl.co", "timestamp": 1700000001,
+             "reverse_alias_address": "RA+Bo@sl.co"},
+            {"action": "block", "from": "spam@example.org", "to": "me@sl.co", "timestamp": 1}
+        ]});
+        let got = parse_activities(&v);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].kind, ActivityKind::Reply);
+        assert_eq!(got[0].contact, "ana@example.org");
+        assert_eq!(got[0].reverse_alias, "ra+ana@sl.co");
+        assert_eq!(got[1].kind, ActivityKind::Forward);
+        assert_eq!(got[1].contact, "bo@example.org");
+        assert_eq!(got[1].reverse_alias, "ra+bo@sl.co");
+        assert_eq!(got[2].kind, ActivityKind::Other);
     }
 
     #[test]

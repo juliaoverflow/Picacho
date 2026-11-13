@@ -835,6 +835,8 @@ pub struct MailApp {
     original_scroll: UniformListScrollHandle,
     list_scroll: UniformListScrollHandle,
     reader_scroll: ScrollHandle,
+    /// Renders left that scroll the reader to its end (see `scroll_reader_to_end`).
+    reader_to_end: std::cell::Cell<u8>,
     reading_defaults: ReadingOptions,
     html_view: Entity<HtmlView>,
     settings_scroll: ScrollHandle,
@@ -1070,6 +1072,8 @@ impl MailApp {
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.persist_draft(cx);
+            // Preferences changed just before quitting are still written.
+            this.backend.store.flush();
             std::future::ready(())
         }));
         #[cfg(feature = "sample-data")]
@@ -1301,6 +1305,7 @@ impl MailApp {
             original_scroll: UniformListScrollHandle::new(),
             list_scroll: UniformListScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
+            reader_to_end: Default::default(),
             reading_defaults,
             html_view,
             settings_scroll: ScrollHandle::new(),
@@ -1653,12 +1658,38 @@ impl MailApp {
         .detach();
         cx.notify();
     }
+    /// Saves a preference without waiting for the cache. If it can't be
+    /// saved, says why and calls `undo` to put back what it changed.
+    pub(super) fn save_preference(
+        &mut self,
+        key: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+        undo: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        let store = self.backend.store.clone();
+        let ticket = store.set_preference_soon(key, value);
+        let key = key.to_owned();
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move { store.preference_saved(&key, ticket) })
+                .await;
+            if let Err(e) = saved {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice(e.to_string(), true, cx);
+                    undo(this, cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
     fn save_collapsed(&self) {
         if let Ok(json) = serde_json::to_string(&self.collapsed) {
-            let _ = self
+            self
                 .backend
-                .store
-                .set_preference("collapsed_accounts", &json);
+                .store.set_preference_soon("collapsed_accounts", &json);
         }
     }
     fn open_menu(&mut self, position: Point<Pixels>, entries: Vec<Entry>, cx: &mut Context<Self>) {
@@ -2315,6 +2346,7 @@ impl MailApp {
                                 one_click: false,
                                 pending: false,
                                 reply_to: String::new(),
+                                inline: Default::default(),
                             })
                             .collect();
                         this.filter(cx);
@@ -2386,27 +2418,32 @@ impl MailApp {
             let account_id = a.id.clone();
             let id2 = id.clone();
             self.reading = Some(id.clone());
+            let mark = a.clone();
+            // Showing the message doesn't wait for the server to mark it
+            // read: that needs the account's connection, which a sync or a
+            // download may be using.
             self.task(
                 cx,
-                move |b| {
-                    let mut m = b.read(&a, &m)?;
-                    if m.unread {
-                        m = b.change(&a, &m, Change::Read(true))?;
-                    }
-                    Ok(m)
-                },
+                move |b| b.read(&a, &m),
                 move |this, result, cx| {
                     if this.reading.as_ref() == Some(&id2) {
                         this.reading = None;
                     }
                     this.account_result(&account_id, IssueSource::Read, &result);
                     match result {
-                        Ok(mail) => {
+                        Ok(mut mail) => {
+                            let unread = mail.unread;
+                            // Shown read already; the server catches up below.
+                            mail.unread = false;
                             if let Some(old) = this.messages.iter_mut().find(|m| m.id == id2) {
-                                *old = mail;
+                                *old = mail.clone();
                             }
                             this.filter(cx);
-                            this.refresh_counts(cx);
+                            if unread {
+                                this.mark_read(mark, mail, cx);
+                            } else {
+                                this.refresh_counts(cx);
+                            }
                         }
                         Err(e) => {
                             if e.downcast_ref::<crate::manage::crypto::Locked>().is_some() {
@@ -2424,6 +2461,30 @@ impl MailApp {
             );
         }
         cx.notify();
+    }
+    /// Marks an opened message read at the server and in the cache. It is
+    /// shown read already; a refusal shows the cache as it is.
+    fn mark_read(&mut self, a: Account, mail: Mail, cx: &mut Context<Self>) {
+        let account_id = a.id.clone();
+        let id = mail.id.clone();
+        self.task(
+            cx,
+            move |b| b.change(&a, &Mail { unread: true, ..mail }, Change::Read(true)),
+            move |this, result, cx| {
+                this.account_result(&account_id, IssueSource::Read, &result);
+                match result {
+                    Ok(changed) => {
+                        if let Some(m) = this.messages.iter_mut().find(|m| m.id == id) {
+                            m.unread = changed.unread;
+                            m.starred = changed.starred;
+                        }
+                        this.filter(cx);
+                        this.refresh_counts(cx);
+                    }
+                    Err(_) => this.reload_cached(cx),
+                }
+            },
+        );
     }
     /// Applies a change to messages immediately and reverts it if the server
     /// rejects it.
@@ -3334,10 +3395,9 @@ impl MailApp {
             }
             Action::OldestFirst(oldest) => {
                 self.oldest_first = oldest;
-                let _ = self
+                self
                     .backend
-                    .store
-                    .set_preference("sort", if oldest { "oldest" } else { "newest" });
+                    .store.set_preference_soon("sort", if oldest { "oldest" } else { "newest" });
                 self.filter(cx);
                 self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
@@ -3573,25 +3633,28 @@ impl MailApp {
                     a => a == Appearance::Dark,
                 };
                 self.apply_theme(w, cx);
-                let _ = self.backend.store.set_preference("theme", appearance.key());
+                self.backend.store.set_preference_soon("theme", appearance.key());
             }
             Action::SetAccent(accent) => {
                 self.accent = accent;
                 self.apply_theme(w, cx);
-                let _ = self.backend.store.set_preference("accent", accent.key());
+                self.backend.store.set_preference_soon("accent", accent.key());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
             Action::SetReadingDefaults(options) => {
-                match self.backend.store.set_preference(
+                let before = self.reading_defaults;
+                self.save_preference(
                     "reading_defaults",
                     &serde_json::to_string(&options).unwrap(),
-                ) {
-                    Ok(()) => {
-                        self.reading_defaults = options;
-                        self.options_cache.borrow_mut().take();
-                    }
-                    Err(e) => self.notice(e.to_string(), true, cx),
-                }
+                    cx,
+                    move |this, cx| {
+                        this.reading_defaults = before;
+                        this.options_cache.borrow_mut().take();
+                        this.html_view.update(cx, |view, cx| view.clear(cx));
+                    },
+                );
+                self.reading_defaults = options;
+                self.options_cache.borrow_mut().take();
             }
             Action::ShowHtml(on) => {
                 if let Some(m) = self.selected_mail()
@@ -3677,12 +3740,16 @@ impl MailApp {
                         _ => options.block_remote = !options.block_remote,
                     }
                     self.options_cache.borrow_mut().take();
-                    if let Err(e) = self.backend.store.set_preference(
+                    // Unsaved, the message reads its options as saved before.
+                    self.save_preference(
                         &message_key(&m.account, &m.id),
                         &serde_json::to_string(&options).unwrap(),
-                    ) {
-                        self.notice(e.to_string(), true, cx);
-                    }
+                        cx,
+                        |this, cx| {
+                            this.options_cache.borrow_mut().take();
+                            this.html_view.update(cx, |view, cx| view.clear(cx));
+                        },
+                    );
                     self.html_view.update(cx, |view, cx| view.clear(cx));
                 }
             }
@@ -6351,8 +6418,25 @@ impl Render for MailApp {
 impl MailApp {
     fn root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        // A drag only lasts while the button is held: a move without it
+        // means the release was missed, and the drag would otherwise stay,
+        // swallowing clicks, until the next one.
+        let this = cx.weak_entity();
+        let stray_drags = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture && cx.has_active_drag() && !e.dragging() {
+                        let _ = this.update(cx, |this, cx| this.cancel_stray_drag(window, cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
         div()
             .id("mail-app")
+            .child(stray_drags)
             .key_context("Mail")
             .track_focus(&self.focus)
             .size_full()
@@ -7611,6 +7695,48 @@ mod tests {
             assert_eq!(this.download.missing, 20);
         });
         assert!(cx.debug_bounds("download-ring").is_some());
+    }
+
+    #[gpui::test]
+    fn a_setting_that_cannot_be_saved_says_so_and_is_put_back(cx: &mut TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        store.fail_preference_writes_for_test();
+        let before = view.read_with(cx, |this, _| this.reading_defaults);
+        let changed = ReadingOptions {
+            html: !before.html,
+            ..before
+        };
+        act(&view, Action::SetReadingDefaults(changed), cx);
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert!(this.error, "an error is shown: {}", this.status);
+            assert!(this.status.contains("Couldn't save"), "{}", this.status);
+            assert_eq!(this.reading_defaults, before, "the old setting is back");
+        });
+    }
+
+    #[gpui::test]
+    fn a_drag_whose_release_was_missed_ends_on_the_next_move(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        let from = center(cx, Box::leak(format!("account-{first}").into_boxed_str()));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        for i in 1..=4 {
+            let at = point(from.x, from.y + px(10. * i as f32));
+            cx.simulate_mouse_move(at, MouseButton::Left, Modifiers::none());
+        }
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "dragging while held"));
+        // The release never arrives; the pointer moves on with no button.
+        cx.simulate_event(MouseMoveEvent {
+            position: point(from.x + px(40.), from.y + px(60.)),
+            pressed_button: None,
+            modifiers: Modifiers::none(),
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!cx.has_active_drag(), "the drag ended"));
+        view.read_with(cx, |this, _| {
+            assert!(this.tree_ui.dragging.is_none() && this.tree_ui.drop_at.is_none());
+        });
     }
 
     #[gpui::test]

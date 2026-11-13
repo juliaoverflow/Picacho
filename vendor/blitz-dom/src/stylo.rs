@@ -977,6 +977,56 @@ impl<'a> TElement for BlitzNode<'a> {
             Some(LengthPercentage::Length(length))
         }
 
+        /// Declarations from a snippet of CSS, for attributes that map to
+        /// properties which are simplest written as CSS. Invalid ones drop.
+        fn css_declarations(css: &str) -> Vec<PropertyDeclaration> {
+            use style::stylesheets::{CssRuleType, UrlExtraData};
+            let url = UrlExtraData(Arc::new(
+                url::Url::parse("about:blank").expect("a valid URL"),
+            ));
+            style::properties::declaration_block::parse_style_attribute(
+                css,
+                &url,
+                None,
+                QuirksMode::NoQuirks,
+                CssRuleType::Style,
+            )
+            .declarations()
+            .to_vec()
+        }
+
+        // `cellpadding` on a cell's table pads the cell, and `cellspacing`
+        // sets the table's border-spacing: nearly every HTML email sets
+        // both to 0, and without them colored cells sit apart in a grid of
+        // seams. (A `cellpadding` applies to the cells of that table only,
+        // not of tables nested in them.)
+        // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+        if *tag == local_name!("td") || *tag == local_name!("th") {
+            let mut next = self.parent;
+            while let Some(id) = next {
+                let node = self.with(id);
+                let Some(element) = node.data.downcast_element() else {
+                    break;
+                };
+                if element.name.local == local_name!("table") {
+                    let padding = element
+                        .attrs()
+                        .iter()
+                        .find(|attr| &*attr.name.local == "cellpadding")
+                        .and_then(|attr| {
+                            style::servo::attr::parse_unsigned_integer(attr.value.chars()).ok()
+                        });
+                    if let Some(px) = padding {
+                        for decl in css_declarations(&format!("padding: {px}px")) {
+                            push_style(decl);
+                        }
+                    }
+                    break;
+                }
+                next = node.parent;
+            }
+        }
+
         // `<input type=image>` is the only input type that is replaced
         // content, and it is the only one that takes the embedded-content
         // presentational attributes. The type attribute is matched ASCII
@@ -1175,6 +1225,32 @@ impl<'a> TElement for BlitzNode<'a> {
                                 _ => unreachable!("side table above only yields lrtb"),
                             });
                         }
+                    }
+                }
+            }
+
+            if *tag == local_name!("table") && &**name == "cellspacing" {
+                if let Ok(px) = style::servo::attr::parse_unsigned_integer(value.chars()) {
+                    for decl in css_declarations(&format!("border-spacing: {px}px")) {
+                        push_style(decl);
+                    }
+                }
+            }
+
+            // `valign` on table parts maps to vertical-align.
+            if &**name == "valign"
+                && (*tag == local_name!("td")
+                    || *tag == local_name!("th")
+                    || *tag == local_name!("tr")
+                    || *tag == local_name!("tbody")
+                    || *tag == local_name!("thead")
+                    || *tag == local_name!("tfoot")
+                    || *tag == local_name!("col"))
+            {
+                let keyword = value.trim().to_ascii_lowercase();
+                if matches!(keyword.as_str(), "top" | "middle" | "bottom" | "baseline") {
+                    for decl in css_declarations(&format!("vertical-align: {keyword}")) {
+                        push_style(decl);
                     }
                 }
             }

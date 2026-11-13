@@ -1,5 +1,6 @@
 //! Every subresource, including CSS imports/fonts/backgrounds, crosses this boundary.
 //! No cookie jar, mailbox credentials, referrer, filesystem access or script runtime.
+use crate::manage::model::InlineParts;
 use blitz_traits::{
     navigation::{NavigationOptions, NavigationProvider},
     net::{Bytes, NetHandler, NetProvider, Request},
@@ -20,12 +21,20 @@ type Fetch = (Request, Box<dyn NetHandler>);
 
 pub struct Resources {
     blocked: bool,
+    /// The message's own parts, for `cid:` addresses. Local, so shown
+    /// even while remote content is blocked.
+    inline: Arc<InlineParts>,
     cancelled: Arc<AtomicBool>,
     count: AtomicUsize,
     tx: mpsc::Sender<Fetch>,
 }
 impl Resources {
-    pub fn new(blocked: bool, changed: Arc<AtomicBool>, cancelled: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        blocked: bool,
+        inline: Arc<InlineParts>,
+        changed: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Fetch>();
         let stopped = cancelled.clone();
         // One worker per visible document: bounded concurrency, no work on the UI thread.
@@ -74,6 +83,7 @@ impl Resources {
         });
         Self {
             blocked,
+            inline,
             cancelled,
             count: AtomicUsize::new(0),
             tx,
@@ -97,6 +107,9 @@ impl NetProvider for Resources {
                 .and_then(|data| data.decode_to_vec().ok())
                 .map(|(bytes, _)| bytes)
                 .unwrap_or_default();
+            handler.bytes(url, Bytes::from(bytes));
+        } else if request.url.scheme() == "cid" {
+            let bytes = self.inline.get(&url).map(|b| b.to_vec()).unwrap_or_default();
             handler.bytes(url, Bytes::from(bytes));
         } else if !self.blocked
             && remote_url(&request.url)

@@ -28,10 +28,9 @@ impl MailApp {
     }
     fn save_unsubscribed(&self) {
         if let Ok(json) = serde_json::to_string(&self.unsubscribed) {
-            let _ = self
+            self
                 .backend
-                .store
-                .set_preference(subs::UNSUBSCRIBED_PREFERENCE, &json);
+                .store.set_preference_soon(subs::UNSUBSCRIBED_PREFERENCE, &json);
         }
     }
     /// Finds the subscriptions in mail cached before they were detected.

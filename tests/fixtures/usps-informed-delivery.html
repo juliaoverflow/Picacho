@@ -1,0 +1,510 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+ <head>
+  <meta content="IE=11.0000" http-equiv="X-UA-Compatible">
+  <meta http-equiv="content-t pe" content="application/xhtml+xml; charset=UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Informed Delivery</title>
+  <meta name="color-scheme" content="light dark">
+  <meta name="supported-color-schemes" content="light dark">
+  <style type="text/css">
+      @media (prefers-color-scheme: dark) {
+        .img-dark-mode, .multi-envelope-icon-dark-mode, .x_img-dark-mode, .x_multi-envelope-icon-dark-mode {
+          filter: invert(100%) sepia(100%) saturate(0) hue-rotate(204deg) brightness(103%) contrast(104%);
+        }
+        .primary-background-color { background: linear-gradient(#3573b1, #3573b1); }
+        .secondary-background-color { background: linear-gradient(#336, #336); }
+        .header-font-colors { color: #fffffe !important; }
+        .dark-mode-section { background: linear-gradient(#2a2a32, #2a2a32); background-color: #2a2a32; color: #fffffe !important; }
+        .primary-font-color, .responsive-header { color: #fffffe !important; }
+        .secondary-font-color { color: #fffffe !important; }
+        .tracking-number a { color: #fffffe !important; }
+        .linkable-text { color: #fffffe !important; -webkit-text-fill-color: #fffffe !important; text-decoration: none !important; }
+      }
+      .primary-background-color { background-color: #336; }
+      .secondary-background-color { background-color: #3573b1; }
+      .header-font-colors { color: #336; }
+      .dark-mode-section { background-color: #f7f7f7; color: #000001; }
+      .from-section-desktop { border-bottom: 2px solid #b8b8b8; }
+      .from-section-mobile { background-color: #f7f7f7; border-bottom: none; }
+      .primary-font-color, .responsive-header { color: #336; }
+      .secondary-font-color { color: #000001; }
+      .email-box-shadow { box-shadow: 0 8px 4px -4px#dee2e6 !important; }
+      .mobile { display: none; }
+      .primary-button { background-color: #333367 !important; border: none !important; border-radius: 3px; color: #fffffe !important; display: inline-block; font-size: 16px; line-height: 44px; text-align: center; text-decoration: none; width: 225px; -webkit-text-size-adjust: none; white-space: nowrap; height: 42px; font-weight: 700; font-family: Arial, Helvetica, sans-serif; vertical-align: middle !important; margin-right: 20px; }
+      .view-dashboard-a, .x_view-dashboard-a { text-decoration: none !important; }
+      a[class~="view-dashboard-a"] { text-decoration: none !important; }
+      .view-dashboard-button { border-radius: 3px; padding: 9px 10px; border: 1px solid #fffffe !important; text-decoration: none !important; cursor: pointer; text-align: center; font-weight: 700; font-size: 16px; height: 44px; color: #fffffe !important; width: 200px; white-space: nowrap; }
+      .view-dashboard-button:focus { outline: 4px solid #52addb; }
+      .secondary-button { border: 1px solid #336; background-color: #fffffe !important; border-radius: 3px; color: #336 !important; display: inline-block; font-size: 16px; line-height: 44px; text-align: center; text-decoration: none; width: 225px; white-space: nowrap; height: 42px; font-weight: 700; vertical-align: middle !important; margin-right: 20px; }
+      .more-mail { border-bottom: 2px solid #999; padding-bottom: 5px; }
+      .more-mail p { font-size: 12px; }
+      .legal p { font-size: 11px; }
+      .legal td { color: #000001 !important; }
+      .legal td a { color: #3573b1 !important; }
+      .tracking-number { font-size: 16px; font-weight: 700; }
+      body, html { margin: 0 !important; padding: 0 !important; -webkit-text-size-adjust: none; }
+      .custom-email-doc { font-family: Arial, Helvetica, sans-serif; font-size: 15px; font-weight: 400; display: block; margin: 0 auto; max-width: 800px; }
+      h2 { font-family: Arial, Helvetica, sans-serif; font-size: 21px; font-weight: 700; margin: 0; padding: 5px 0; }
+      .header h1 { font-size: 33px; font-weight: 700; }
+      .header tbody tr td a img { padding-left: 30px; }
+      .refer { border-top: 2px solid #999 !important; }
+      @media screen and (max-width: 768px) {
+        h2.section-heading { font-size: 17px !important; }
+        .desktop { mso-hide: all !important; display: none !important; }
+        .mobile { display: block !important; }
+        .responsive-header { font-size: 18px !important; margin-right: auto !important; }
+        .img-container img { width: 100%; }
+        .primary-button { width: 100% !important; margin-bottom: 20px; margin-right: 0 !important; }
+        .secondary-button { width: 100% !important; margin-top: 0 !important; margin-right: 0 !important; }
+        .referButtons { text-align: center !important; margin-left: 0 !important; }
+        #refer-email-link, #refer-text-link, .refer-email-button, .refer-text-button { text-align: center !important; margin-left: 0 !important; display: block !important; width: 100% !important; }
+        .section-header-title, .x_section-header-title { font-size: 23px !important ; }
+        h1[class~="section-header-title"] { font-size: 23px !important; }
+        td[class~="td-view-dash"] { padding-right: 8px !important; }
+      }
+      /* Override only the heading size for <=430px, 15px max to prevent wrapping */
+      @media screen and (max-width: 430px) {
+        h2.section-heading { font-size: 15px !important; }
+      }
+    </style>
+ </head>
+ <body leftmargin="0" marginwidth="0" topmargin="0" marginheight="0" offset="0" style="
+      margin: 0 auto !important;
+      padding: 0 !important;
+      mso-line-height-rule: exactly;
+      max-width: 820px !important;
+      -webkit-text-size-adjust: none;
+      font-family: Arial, Helvetica, sans-serif;
+    " class="email-background">
+  <p style="display: none; visibility: hidden">
+   <br>
+   <img height="0" width="0" alt="" src="http://pixel.watch/1ewx" style="display: none; visibility: hidden"> <img id="email-tracking-href-id" height="0" width="0" alt="" style="display: none; visibility: hidden" src="hiddenforprivacy"> <img id="cloud-email-read-href-id" height="0" width="0" alt="" style="display: none; visibility: hidden" src="hiddenforprivacy">
+  </p>
+  <!-- YAHOO styles, YAHOO removes style tag from header so 2nd styles tag needs to be in body tag -->
+  <style>
+      @media screen and (max-width: 768px) {
+        h2.section-heading { font-size: 17px !important; }
+        .desktop { mso-hide: all !important; display: none !important; }
+        .mobile { display: block !important; }
+      }
+
+      /* Override only the heading size for <=430px */
+      @media screen and (max-width: 430px) {
+        h2.section-heading { font-size: 15px !important; }
+      }
+    </style>
+  <!--[if mso]>
+        <table role="presentation" class="mso-ghost-wrapper" align="center" width="820" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+                <td width="100%">
+    <![endif]-->
+  <div class="custom-email-doc">
+   <table role="presentation" align="center" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout: fixed; display: block">
+    <tbody>
+     <tr>
+      <td width="*"><!-- EMAIL HEAD -->
+       <table role="presentation" class="header" align="center" style="text-align: center; width: 100%" width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tbody align="center">
+         <tr style="width: 100%; text-align: center; margin-top: 40px">
+          <td style="padding-left: 20px; padding-top: 40px; width: 100%" class="responsive-header-logo"><img src="hiddenforprivacy" alt="USPS Logo" width="64" height="36"></td>
+         </tr>
+         <tr style="width: 100%; text-align: center; vertical-align: middle;" align="center">
+          <!--[if !mso]><!-->
+          <td style="vertical-align: middle; width: 100%; text-align: center;" align="center"><!--<![endif]-->
+           <h1 class="responsive-header primary-font-color" style="width: 100%; text-align: center; mso-line-height-rule: exactly; line-height: 40px; color: #333366;">COMING TO YOU SOON</h1></td>
+         </tr>
+        </tbody>
+       </table>
+       <!-- DESK HEAD -->
+       <table role="presentation" class="header desktop" style="border-collapse: separate !important" width="100%" cellpadding="0" cellspacing="0" align="center" border="0">
+        <tbody style="border-collapse: separate !important" cellpadding="0" cellspacing="0">
+         <tr class="email-box-shadow" style="border-radius: 20px" cellpadding="0" cellspacing="0" border="0">
+          <td class="primary-background-color" align="left" style="background-color: #333366; color: #fffffe; width: 50%; padding: 20px 20px 10px 20px; border: 1px solid #707070; border-right: none; border-radius: 20px 0px 0px 20px; border-collapse: separate !important;" height="100%" cellpadding="0" cellspacing="0" border="0">
+           <h2 id="userDeskGreet" style="font-size: 22px; color: #fffffe">Hi<span id="userNameDesk" style="font-size: 22px; color: #fffffe">, User</span>!</h2>
+           <p style="color: #fffffe; font-size: 16px; font-weight: 100; line-height: 28px;">You have <span id="total-mailpieces">5</span> mailpiece(s) and <span id="total-packages">1</span> inbound package(s) arriving soon.</p>
+           <h2 style="font-size: 24px; padding: 0" id="date-day">Friday</h2>
+           <table align="left" style="border-collapse: separate !important; text-align: left !important; display: block;" cellpadding="0" cellspacing="0" border="0" role="presentation">
+            <tbody align="left" style="text-align: left !important; border-collapse: separate !important;" cellpadding="0" cellspacing="0" border="0">
+             <tr align="left" style="text-align: left !important; border-collapse: separate !important;">
+              <td align="left" style="text-align: left !important; display: inline-block;"><span style="font-size: 60px; font-weight: normal; color: #fffffe; padding: 0; text-align: left !important;" id="date-number">13</span></td>
+              <td align="left" style="text-align: left !important; padding-left: 8px; padding-top: 10px; display: inline-block;">
+               <div style="color: #fffffe; font-size: 14px; font-weight: bold; text-align: left !important; padding-bottom: 3px;" id="month">November</div>
+               <div style="color: #fffffe; font-size: 14px; font-weight: bold; text-align: left !important; padding-bottom: 0px;" id="year">2026</div>
+              </td>
+             </tr>
+             <tr style="border-collapse: separate !important; font-size: 1px !important; line-height: 1px !important;" cellpadding="0" cellspacing="0">
+              <td colspan="2" style="font-size: 1px !important; line-height: 1px !important;"> </td>
+             </tr>
+            </tbody>
+           </table>
+          </td>
+          <td class="dark-mode-section" style="border-collapse: separate !important; border: 1px solid #707070; border-left: none; border-radius: 0px 20px 20px 0px; padding: 20px 55px;" height="100%" cellpadding="0" cellspacing="0" border="0">
+           <table align="center" style="text-align: center; border-collapse: separate !important;" cellpadding="0" cellspacing="0" border="0" role="presentation">
+            <tbody>
+             <tr cellpadding="0" cellspacing="0" border="0">
+              <td style="text-align: center; vertical-align: middle">
+               <h1 class="primary-font-color" style="font-size: 56px; margin-bottom: 5px; margin-top: 0;" id="bg-total-mailpieces">5</h1>
+               <p class="numbers"><strong>Mailpiece(s)</strong></p>
+              </td>
+              <td width="40px" style="padding: 30px"> </td>
+              <td style="text-align: center; vertical-align: middle">
+               <h1 class="primary-font-color" style="font-size: 56px; margin-bottom: 5px; margin-top: 0;" id="bg-total-packages">1</h1>
+               <p class="numbers"><strong>Package(s)</strong></p>
+              </td>
+             </tr>
+            </tbody>
+           </table>
+          </td>
+         </tr>
+        </tbody>
+       </table>
+       <!-- END DESK HEAD --><!-- MOB HEAD -->
+       <table role="presentation" class="header mobile" style="mso-hide: all; display: none; border-collapse: separate !important;" width="100%" cellpadding="0" cellspacing="0" align="center" border="0">
+        <tbody>
+         <tr class="email-box-shadow" style="border-radius: 20px">
+          <td class="primary-background-color" style="background-color: #333366; mso-hide: all; color: #fffffe; width: 50%; padding: 20px; border-radius: 20px 20px 0px 00px;">
+           <h2 id="userMobileGreet" style="font-size: clamp(1.125rem, 2.2vw + 0.5rem, 1.6rem); color: #fffffe;">Hi<span id="userNameMobile" style="font-size: clamp(1.125rem, 2.2vw + 0.5rem, 1.6rem); color: #fffffe;">, User</span>!</h2>
+           <p style="color: #fffffe; font-size: clamp(1rem, 2vw + 0.5rem, 1.5rem); font-weight: 100; line-height: 28px;">You have <span id="total-mailpieces-secondary">5</span> mailpiece(s) and <span id="total-packages-secondary">1</span> inbound package(s) arriving soon.</p>
+          </td>
+         </tr>
+         <tr style="mso-line-height-rule: exactly">
+          <td align="center" class="dark-mode-section email-box-shadow header-font-colors" style="mso-hide: all; border-radius: 0 0 20px 20px; margin: 0 auto !important; display: block; mso-line-height-rule: exactly;">
+           <table cellpadding="0" cellspacing="0" style="border-collapse: separate !important">
+            <tbody>
+             <tr>
+              <td style="mso-hide: all; text-align: center; padding: 20px; line-height: 20px; padding-top: 0px;">
+               <h1 style="mso-hide: all; font-size: 27px; padding-top: 8px; text-transform: uppercase;" id="date-month-secondary">Nov</h1>
+               <h1 class="header-font-colors" style="mso-hide: all; font-size: 26px; padding-top: 0px;" id="date-day-secondary"><strong></strong> 13</h1>
+              </td>
+             </tr>
+             <tr class="desktop"></tr>
+            </tbody>
+           </table>
+          </td>
+         </tr>
+         <tr height="10px" style="mso-hide: all"></tr>
+        </tbody>
+       </table>
+       <!-- END MOB HEAD -->
+       <table class="module" role="module" data-type="spacer" border="0" cellpadding="0" cellspacing="0" width="100%" style="table-layout: fixed">
+        <tbody><tr><td style="padding: 0px 0px 30px 0px" role="module-content" bgcolor=""></td></tr></tbody>
+       </table>
+       <!-- START MAIL SECT -->
+       <div id="mail-section" style="display: block">
+        <table role="presentation" class="mail section-header primary-background-color" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #333366; color: #fffffe; border-top-left-radius: 18px; border-top-right-radius: 18px; width: 100% !important; table-layout: fixed;">
+         <tbody>
+          <tr>
+           <td class="primary-background-color" height="80" width="50" style="background-color: #333366; width: 50px; min-width: 50px; padding-left: 20px; border-top-left-radius: 18px;"><a id="mailbox-url-icon" href="hiddenforprivacy"> <img style="filter: saturate(1000%) brightness(1003%) !important; width: 50px !important; min-width: 50px;" src="hiddenforprivacy" alt="Icon Envelope" width="50" height="34"> </a></td>
+           <td class="primary-background-color" style="background-color: #333366; vertical-align: middle; width: auto;"><span>
+             <h1 class="section-header-title" style="display: inline; vertical-align: middle; font-size: clamp(1.25rem, 3.56vw, 2.2rem);">  MAIL</h1>
+            </span></td>
+           <td class="primary-background-color td-view-dash" style="background-color: #333366; border-top-right-radius: 18px; padding-right: 20px; text-align: right;"><a id="mailbox-url-link" class="view-dashboard-a" href="hiddenforprivacy" style="text-decoration: none"> <span class="mobile-button primary-background-color view-dashboard-button" tabindex="0" style="background-color: #333366; border-radius: 3px; padding: 9px 10px; border: 1px solid #fffffe; text-decoration: none; cursor: pointer; text-align: center; font-weight: bold; font-size: 16px; height: 44px; color: #fffffe; width: 200px; white-space: nowrap;">View Dashboard</span> </a></td>
+          </tr>
+         </tbody>
+        </table>
+        <div id="expected-today">
+         <table class="mail" id="mail_today_header" width="100%" style="color: #fffffe; border-collapse: separate !important; border-spacing: 0 !important; width: 100% !important;" cellpadding="0" cellspacing="0">
+          <tbody>
+           <tr>
+            <td align="left" class="secondary-background-color" style="background-color: #3573b1; padding: 20px; margin-bottom: 30px; vertical-align: middle;">
+             <h2 class="section-heading" style="font-size: 22px; vertical-align: middle; display: inline;">Expected Today</h2>
+            </td>
+            <td align="right" class="secondary-background-color" style="background-color: #3573b1; border-collapse: separate !important; border-spacing: 0 !important; padding: 20px;"><!--[if mso]>
+                <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" style="width:125px;height:38px" arcsize="12%" strokecolor="#3573B1" fillcolor="#FFFFFE"><w:anchorlock/><center>
+                <![endif]--> <!--[if !mso]><!-->
+             <p style="display: block; white-space: nowrap; min-width: 106px; width: max-content; max-width: max-content; padding: 10px 8px 8px 8px; margin: 0; font-size: 18px; text-align: center; float: right; color: #3573b1; border-radius: 12px; font-weight: bold; background: linear-gradient(#fffffe, #fffffe) !important; background-color: #fffffe !important;"><!--<![endif]--> <span id="today-mailitem-number" style="color: #3573b1; white-space: nowrap; display: inline;">5</span> <span style="color: #3573b1; white-space: nowrap; display: inline;">item(s)</span> <!--[if !mso]><!--></p>
+             <!--<![endif]--><!--[if mso]></center></v:roundrect><![endif]--></td>
+           </tr>
+          </tbody>
+         </table>
+         <table border="0" align="center" width="100%" role="module" data-type="columns" style="max-width: 820px; display: block" cellpadding="0" cellspacing="0">
+          <tbody style="display: block">
+           <tr role="module-content" style="display: block">
+            <td id="campaign-div-id" style="height: 100%; vertical-align: top; display: block;">
+             <div>
+              <table class="module" role="presentation" data-type="spacer" border="0" cellpadding="0" cellspacing="0" width="100%" style="table-layout:fixed;">
+               <tbody><tr><td style="padding:0px 0px 30px 0px;" role="module-content"></td></tr></tbody>
+              </table>
+             </div>
+             <div>
+              <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width: 100%">
+               <tbody>
+                <tr>
+                 <td width="100%" style="padding-right:1px;" cellpadding="0" cellspacing="0"><!--[if !mso]><!-->
+                  <div class="email-box-shadow dark-mode-section" style="border: 2px solid #999999; mso-border-alt: 2px solid #999999; border-collapse: separate !important; border-radius: 18px; padding-left:13px;padding-top:0px;padding-bottom:0px;padding-right:13px;">
+                   <!--<![endif]-->
+                   <table role="presentation" style="display:block!important;padding:0px;margin:0px;border:none;border-collapse: separate !important;overflow:hidden !important;margin-top:1px !important;margin-bottom:1px !important;font-family:Arial,Helvetica,sans-serif;" cellpadding="0" cellspacing="0" width="100%">
+                    <tbody>
+                     <tr class="dark-mode-section">
+                      <td class="dark-mode-section" style="padding-bottom:10px;">
+                       <div id="mail-campaign">
+                        <table class="mail dark-mode-section" style="width:100%;border-collapse: separate !important;" cellpadding="0" cellspacing="0" align="left">
+                         <tbody class="dark-mode-section">
+                          <tr align="left" class="dark-mode-section">
+                           <td class="dark-mode-section" style="border-top-left-radius: 18px;border-top-right-radius: 18px;padding: 20px 20px 10px 10px;" width="100%">
+                            <p id="campaign-from-label-id" class="primary-font-color" style="text-align:left;font-size: 18px; margin: 0;margin-top: 3px;color: #333366;">FROM: <b><span id="campaign-from-span-id">USPS Postal Store</span></b></p>
+                           </td>
+                          </tr>
+                          <tr align="left" class="dark-mode-section">
+                           <td align="left" class="dark-mode-section" style="padding-left:10px;">
+                            <div style="display: block; align-items: left;text-align:left; min-height: 60px;padding-bottom:10px;" class="img-container">
+                             <a id="ra-representative-href-id" href="hiddenforprivacy"0" title="Please visit this website for more info." target="_blank"> <img id="campaign-representative-image-src-id" alt="campaign" src="cid:mailer-13667.jpg"></a>
+                            </div>
+                           </td>
+                          </tr>
+                         </tbody>
+                        </table>
+                        <div class="desktop" id="socialSharingEnableId">
+                         <table class="mail dark-mode-section" align="left" style="border-collapse: separate !important;" width="100%" cellpadding="0" cellspacing="0">
+                          <tbody>
+                           <tr class="dark-mode-section" align="left">
+                            <td align="left" style="padding: 25px 50px 25px 10px; width: 50%;" class="dark-mode-section">
+                             <p class="primary-font-color" style="font-size: 18px; margin-bottom: 20px; margin-top: 0; white-space: nowrap; "><b><a id="ra-know-more-href-id" href="hiddenforprivacy" class="primary-font-color" style="color: #333366;text-decoration:none !important;">Learn more about your mail <span class="primary-font-color" style="font-size:16px;"> ❯</span> </a></b></p>
+                             <a id="campaign-ridealong-image-href-id" href="hiddenforprivacy"><img id="campaign-ridealong-image-src-id" style="width: 300px;" src="cid:content-13667.jpg" alt="RideAlong image"></a>
+                            </td>
+                           </tr>
+                          </tbody>
+                         </table>
+                         <table align="left" class="mail dark-mode-section" width="100%" style="border-radius:0 0 18px 18px;padding-left: 10px; border-collapse: separate !important;" cellpadding="0" cellspacing="0">
+                          <tbody>
+                           <tr align="left" class="dark-mode-section"><td></td><td></td><td></td></tr>
+                           <tr align="left" style="text-align:left!important;" class="dark-mode-section">
+                            <td class="dark-mode-section" align="left" style="text-align:left!important;">
+                             <table class="dark-mode-section secondary-font-color" align="left" style="font-size: 16px;" cellpadding="0" cellspacing="0">
+                              <tbody><tr class="dark-mode-section"></tr></tbody>
+                             </table>
+                            </td>
+                           </tr>
+                          </tbody>
+                         </table>
+                        </div>
+                        <div class="mobile" style="mso-hide:all;display:none;text-align:left !important;" id="socialSharingEnableIdMobile">
+                         <table class="mail dark-mode-section" width="100%" align="left" style="mso-hide:all;text-align:left !important;" cellpadding="0" cellspacing="0">
+                          <tbody>
+                           <tr style="height:20px;" height="25"></tr>
+                           <tr align="left">
+                            <td align="left" style="mso-hide:all;padding: 0 50px 0 10px; width: 50%;">
+                             <p style="mso-hide:all;font-size: 18px; margin-bottom: 20px; margin-top: 0; white-space: nowrap;"><b><a href="hiddenforprivacy" class="primary-font-color" style="mso-hide:all;text-decoration:none !important;color: #333366;">Learn more about your mail <span class="primary-font-color" style="font-size:16px;"> ❯</span> </a></b></p>
+                            </td>
+                           </tr>
+                          </tbody>
+                         </table>
+                         <table class="dark-mode-section" align="left" style="mso-hide:all;width: 100%;border-radius:0 0 18px 18px; padding-right: 4px;text-align:left!important;" cellpadding="0" cellspacing="0">
+                          <tbody align="left" style="text-align:left!important;">
+                           <tr align="left" style="text-align:left!important;">
+                            <td align="left" style="text-align:left!important;">
+                             <table class="secondary-font-color dark-mode-section" align="left" style="mso-hide:all;font-size: 16px;text-align:left !important;">
+                              <tbody align="left" style="text-align:left!important;">
+                              <tr align="left" style="text-align:left !important;"></tr>
+                              <tr align="left" style="text-align:left !important;"></tr>
+                              </tbody>
+                             </table>
+                            </td>
+                           </tr>
+                          </tbody>
+                         </table>
+                        </div>
+                       </div>
+                      </td>
+                     </tr>
+                    </tbody>
+                   </table>
+                  </div></td>
+                </tr>
+               </tbody>
+              </table>
+             </div>
+            </td>
+           </tr>
+          </tbody>
+         </table>
+         <table border="0" role="module" data-type="columns" style="max-width: 820px; display: block" width="100%" cellpadding="0" cellspacing="0">
+          <tbody style="display: block">
+           <tr role="module-content" style="display: block">
+            <td style="height: 100%; vertical-align: top; display: block;" id="mailpiece-div-id">
+             <div>
+              <table class="module" role="presentation" data-type="spacer" border="0" cellpadding="0" cellspacing="0" width="100%" style="table-layout:fixed;">
+               <tbody><tr><td style="padding:0px 0px 30px 0px;" role="module-content"></td></tr></tbody>
+              </table>
+             </div>
+             <div>
+              <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="max-width: 100%">
+               <tbody>
+                <tr>
+                 <td width="100%" style="padding-right:1px;" cellpadding="0" cellspacing="0"><!--[if !mso]><!-->
+                  <div class="email-box-shadow dark-mode-section" style="border: 2px solid #999999; border-collapse: separate !important; border-radius: 18px; padding-left:13px;padding-top:0px;padding-bottom:0px;padding-right:13px;">
+                   <!--<![endif]-->
+                   <table role="presentation" style="display:block!important;padding:0px;margin:0px;border:none;border-collapse: separate !important;overflow:hidden !important;margin-top:1px !important;margin-bottom:1px !important;" cellpadding="0" cellspacing="0" width="100%">
+                    <tbody>
+                     <tr class="dark-mode-section">
+                      <td class="dark-mode-section" style="padding-bottom:10px;">
+                       <div id="sg-mailpiece">
+                        <table class="mail dark-mode-section" style="width:100%;border-collapse: separate !important;" align="left" cellpadding="0" cellspacing="0">
+                         <tbody>
+                          <!--[if mso]>
+            <tr height="15" style="height:15px;"></td>
+            <![endif]-->
+                          <tr align="left" class="dark-mode-section">
+                           <td align="left" class="dark-mode-section" style="padding-left:10px;">
+                            <div style="display: block; align-items: left;text-align:left; min-height: 60px;padding-top:15px;padding-bottom:10px;" class="img-container">
+                             <img id="mailpiece-image-src-id" style="padding-top:15px;" src="cid:content-13667.jpg" alt="Mailpiece Image">
+                            </div>
+                           </td>
+                          </tr>
+                          <tr height="15" class="dark-mode-section"><td class="dark-mode-section"> </td></tr>
+                         </tbody>
+                        </table>
+                       </div>
+                      </td>
+                     </tr>
+                    </tbody>
+                   </table>
+                  </div></td>
+                </tr>
+               </tbody>
+              </table>
+             </div>
+            </td>
+           </tr>
+          </tbody>
+         </table>
+        </div>
+       </div>
+       <!-- START PACKAGES SECTION -->
+       <div id="packages-section" style="display: block">
+        <table role="presentation" class="mail section-header primary-background-color" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #333366; color: #fffffe; border-top-left-radius: 18px; border-top-right-radius: 18px; table-layout: fixed;">
+         <tbody>
+          <tr>
+           <td class="primary-background-color" height="80" width="50" style="background-color: #333366; width: 50px; min-width: 50px; padding-left: 20px; border-top-left-radius: 18px;"><a id="view-all-package-link-icon" href="hiddenforprivacy"> <img src="hiddenforprivacy" style="filter: saturate(1000%) brightness(1003%) !important; width: 46px !important; max-width: 46px;" alt="Package Icon" width="46" height="36"> </a></td>
+           <td class="primary-background-color" style="background-color: #333366; vertical-align: middle; width: auto;"><span>
+             <h1 class="section-header-title" style="vertical-align: middle; display: inline; font-size: clamp(1.25rem, 3.56vw, 2.2rem); word-wrap: normal;">  PACKAGES</h1>
+            </span></td>
+           <td class="primary-background-color td-view-dash" style="background-color: #333366; border-top-right-radius: 18px; padding-right: 20px; text-align: right;"><a id="view-all-package-link-id" class="view-dashboard-a" href="hiddenforprivacy" style="text-decoration: none"> <span class="mobile-button primary-background-color view-dashboard-button" tabindex="0" style="background-color: #333366; border-radius: 3px; padding: 9px 10px; border: 1px solid #fffffe; text-decoration: none; cursor: pointer; text-align: center; font-weight: bold; font-size: 16px; height: 44px; color: #fffffe; width: 200px; white-space: nowrap;">View Dashboard</span> </a></td>
+          </tr>
+         </tbody>
+        </table>
+        <table class="package" id="expected_today_header" width="100%" style="color: #fffffe; border-collapse: separate !important; border-spacing: 0 !important; width: 100% !important;" cellpadding="0" cellspacing="0">
+         <tbody>
+          <tr>
+           <td align="left" class="secondary-background-color" style="background-color: #3573b1; padding: 20px; margin-bottom: 30px; vertical-align: middle; width: 100%;">
+            <h2 class="section-heading" style="font-size: 22px; vertical-align: middle; display: inline;">Expected Today</h2>
+           </td>
+           <td align="right" class="secondary-background-color" style="background-color: #3573b1; border-collapse: separate !important; border-spacing: 0 !important; padding: 20px;"><!--[if !mso]><!-->
+            <p style="display: block; white-space: nowrap; min-width: 106px; width: max-content; max-width: 100%; padding: 10px 8px 8px 8px; margin: 0; font-size: 18px; text-align: center; color: #3573b1; border-radius: 12px; font-weight: bold; background: linear-gradient(#fffffe, #fffffe) !important; background-color: #fffffe !important;"><!--<![endif]--> <span id="today-package-item-number" style="color: #3573b1; white-space: nowrap; display: inline;">0</span> <span style="color: #3573b1; white-space: nowrap; display: inline;">item(s)</span> <!--[if !mso]><!--></p>
+            <!--<![endif]--></td>
+          </tr>
+         </tbody>
+        </table>
+        <div id="no-packages-today">
+         <table class="module" role="module" data-type="spacer" border="0" cellpadding="0" cellspacing="0" width="100%" style="table-layout: fixed">
+          <tbody><tr><td style="padding: 0px 0px 30px 0px" role="module-content" bgcolor=""></td></tr></tbody>
+         </table>
+         <table class="packages email-box-shadow dark-mode-section" width="100%" height="100" style="border-radius: 18px; border-collapse: separate !important; height: 100px;">
+          <tbody>
+           <tr>
+            <td class="secondary-font-color" height="100" style="border: 1px solid #999999; border-radius: 18px; padding: 0 40px; font-size: 16px; line-height: 24px; height: 100px;"><strong>No packages are available to display.</strong></td>
+           </tr>
+          </tbody>
+         </table>
+        </div>
+        <table class="module" role="module" data-type="spacer" border="0" cellpadding="0" cellspacing="0" width="100%" style="table-layout: fixed">
+         <tbody><tr><td style="padding: 0px 0px 30px 0px" role="module-content" bgcolor=""></td></tr></tbody>
+        </table>
+        <table id="awaiting_header" class="mail" width="100%" style="color: #fffffe; border-collapse: separate !important; border-spacing: 0 !important; width: 100% !important;" cellpadding="0" cellspacing="0">
+         <tbody>
+          <tr>
+           <td align="left" class="secondary-background-color" style="background-color: #3573b1; padding: 20px; margin-bottom: 30px; vertical-align: middle; width: 100%;">
+            <h2 class="section-heading" style="font-size: 22px; vertical-align: middle; display: inline;">Awaiting From Sender</h2>
+           </td>
+           <td align="right" class="secondary-background-color" style="background-color: #3573b1; padding: 20px;"><!--[if !mso]><!-->
+            <p style="display: block; white-space: nowrap; min-width: 106px; width: max-content; max-width: 100%; padding: 10px 8px 8px 8px; margin: 0; font-size: 18px; text-align: center; color: #3573b1; border-radius: 12px; font-weight: bold; background: linear-gradient(#fffffe, #fffffe) !important; background-color: #fffffe !important;"><!--<![endif]--> <span style="color: #3573b1; white-space: nowrap; display: inline;">1</span> <span style="color: #3573b1; white-space: nowrap; display: inline;">item(s)</span> <!--[if !mso]><!--></p>
+            <!--<![endif]--></td>
+          </tr>
+         </tbody>
+        </table>
+        <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+         <tbody>
+          <tr>
+           <td width="100%" style="padding-right: 1px" cellpadding="0" cellspacing="0">
+            <div class="email-box-shadow dark-mode-section" style="border: 2px solid #999999; border-radius: 18px; padding-left: 13px; padding-right: 13px;">
+             <table role="presentation" style="display: block !important; padding: 0px; margin: 0px; border: none; border-collapse: separate !important; overflow: hidden !important;" cellpadding="0" cellspacing="0" width="100%">
+              <tbody>
+               <tr class="dark-mode-section">
+                <td class="dark-mode-section">
+                 <table class="dark-mode-section" role="presentation" width="100%" style="color: #fffffe; table-layout: fixed" cellpadding="0" cellspacing="0">
+                  <tbody>
+                   <tr class="dark-mode-section">
+                    <td class="dark-mode-section from-section-desktop" style="padding: 20px 10px 20px 10px; vertical-align: top; border-bottom: 2px solid #b8b8b8;">
+                     <p class="primary-font-color" style="font-size: 18px; margin: 0; margin-top: 3px; color: #333366;">FROM: <b><span id="pra-shipper-name-id" class="primary-font-color" style="color: #333366">Example Shop</span></b></p>
+                    </td>
+                    <td style="padding: 20px 10px 20px 10px; vertical-align: top; border-bottom: 2px solid #b8b8b8;" class="dark-mode-section desktop from-section-desktop">
+                     <p class="tracking-number" style="font-size: 18px; text-align: right; margin: 0; margin-top: 3px;"><a id="tracking-number-href-id" href="hiddenforprivacy"><span id="pra-tracking-number-id" style="text-decoration: underline !important; color: #3573b1; font-weight: bold;">9400100000000000000000</span></a></p>
+                    </td>
+                   </tr>
+                   <tr class="dark-mode-section">
+                    <td style="padding: 10px 20px 10px 10px; mso-hide: all; display: none;" class="dark-mode-section mobile from-section-mobile">
+                     <p class="tracking-number dark-mode-section" style="font-size: 18px; margin: 0; margin-top: 3px"><a href="hiddenforprivacy"><span class="dark-mode-section" style="text-decoration: underline !important; color: #3573b1; font-weight: bold;">9400100000000000000000</span></a></p>
+                    </td>
+                   </tr>
+                  </tbody>
+                 </table>
+                 <table role="presentation" id="qr-code-content" class="package dark-mode-section" width="100%" cellpadding="0" cellspacing="0">
+                  <tbody></tbody>
+                 </table>
+                </td>
+               </tr>
+              </tbody>
+             </table>
+            </div></td>
+          </tr>
+         </tbody>
+        </table>
+        <table role="presentation" id="refer-friend-package" class="refer" style="border-top: 2px solid #999999" width="100%" cellpadding="0" cellspacing="0">
+         <tbody>
+          <tr><td align="center" style="margin: 0 auto"><img id="footer-banner-img-id" style="width: 100%" src="hiddenforprivacy" alt="footer banner"></td></tr>
+          <!--[if !mso]><!-->
+          <tr>
+           <!--<![endif]-->
+           <td style="padding-top: 0px; display: inline; vertical-align: middle;">
+            <div class="referButtons" style="text-align: left; padding-left: 2px; padding-right: 4px;">
+             <span id="refer-email-button" class="refer-email-button" style="display: inline-block; margin-bottom: 10px; margin-right: 20px; text-align: left; vertical-align: middle !important;"> <span class="primary-button" style="background-color: #333367 !important; border: 1px solid #333367 !important; border-radius: 3px; color: #fffffe !important; display: inline-block; vertical-align: middle !important;"> <a id="refer-email-link" target="_blank" href="hiddenforprivacy" style="background-color: #333367 !important; border: none !important; border-radius: 5px; color: #fffffe !important; display: inline-block; font-size: 16px !important; line-height: 40px; text-align: center; text-decoration: none; width: 225px; white-space: nowrap; min-height: 42px; height: 42px; max-height: 42px; font-weight: bold !important; vertical-align: middle !important;">Refer via Email</a> </span> </span>
+             <span id="refer-text-button" class="refer-text-button" style="display: inline-block; margin-bottom: 10px; margin-right: 30px; text-align: left; vertical-align: middle !important;"> <span class="secondary-button" style="background-color: #fffffe !important; border: 1px solid #333367 !important; border-radius: 3px; color: #333367 !important; display: inline-block; vertical-align: middle !important; padding-right: 1px;"> <a id="refer-text-link" target="_blank" href="hiddenforprivacy" style="background-color: #fffffe !important; border: none !important; border-radius: 5px; color: #333367 !important; display: inline-block; font-size: 16px !important; line-height: 40px; text-align: center; text-decoration: none; width: 225px; white-space: nowrap; min-height: 42px; height: 42px; max-height: 42px; font-weight: bold !important; vertical-align: top !important; overflow: hidden !important; margin-left: 1px !important; margin-right: 1px !important;">Refer via Text</a> </span> </span>
+            </div>
+           </td>
+          </tr>
+         </tbody>
+        </table>
+        <table role="presentation" class="more-mail" style="border-bottom: 2px solid #999999" width="100%" cellpadding="0" cellspacing="0" border="0">
+         <tbody>
+          <tr>
+           <!--[if !mso]><!-->
+           <td width="100%" style="padding: 20px 0px 5px 0px; font-size: 12px; line-height: 22px;"><!--<![endif]-->
+            <p class="secondary-font-color">You may have more mail or packages than are shown in your Daily Digest. To check, <strong><a class="anchored-text" id="mailbox-url-link-2" style="text-decoration: underline !important; color: #3573b1; font-weight: bold;" href="hiddenforprivacy">go to your Dashboard</a></strong>.</p>
+            <p class="secondary-font-color">Mail may arrive after you receive the notification. Please allow several days for delivery before reporting missing mail. <strong><a class="anchored-text" id="missing-mailpiece-href-id" href="hiddenforprivacy" style="text-decoration: underline !important; color: #3573b1; font-weight: bold;">Sign in</a></strong> to your consumer dashboard to report missing mail within 7 days of receiving this Daily Digest email.</p></td>
+          </tr>
+         </tbody>
+        </table>
+        <table role="presentation" class="legal" width="100%" cellpadding="0" cellspacing="0" border="0">
+         <tbody>
+          <tr>
+           <td width="100%" style="padding: 20px 0px; font-size: 11px; line-height: 14px;">
+            <p class="secondary-font-color">*These images represent mail pieces that are sorted on USPS<sup>®</sup> automated equipment. Some of your mail may not be shown here.</p>
+            <p class="secondary-font-color">If you no longer wish to receive daily email notifications, <a class="anchored-text" id="unsubscribe-url-link" href="hiddenforprivacy" target="_blank" style="text-decoration: underline !important; color: #3573b1; font-weight: bold;">unsubscribe here</a>.</p>
+            <p class="secondary-font-color">Copyright © <span id="copyright-year">2026</span> United States Postal Service<sup>®</sup>. All Rights Reserved.</p>
+           </td>
+          </tr>
+         </tbody>
+        </table>
+       </div></td>
+     </tr>
+    </tbody>
+   </table>
+  </div>
+  <!--[if mso]>
+                </td>
+            </tr>
+        </table>
+    <![endif]-->
+ </body>
+</html>

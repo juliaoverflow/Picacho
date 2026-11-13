@@ -305,7 +305,7 @@ impl MailApp {
                     _ => html.as_str(),
                 };
                 self.html_view.update(cx, |view, cx| {
-                    view.set_content(shown, options.block_remote, dark, cx)
+                    view.set_content(shown, &m.inline, options.block_remote, dark, cx)
                 });
                 content = content.child(self.html_view.clone());
             } else {
@@ -389,6 +389,11 @@ impl MailApp {
                 content = content.child(div().mt_8().children(later));
             }
             if let Some(reply) = self.inline_composer(&m.id) {
+                if self.reader_to_end.get() > 0 {
+                    self.reader_to_end.set(self.reader_to_end.get() - 1);
+                    self.reader_scroll.scroll_to_bottom();
+                    window.refresh();
+                }
                 content = content.child(
                     div()
                         .id("inline-reply")
