@@ -520,9 +520,10 @@ impl MailApp {
             return d;
         }
         d.child(
+            // The window's cursor can only be set while painting.
             canvas(
-                |_, w, _| w.set_window_cursor_style(CursorStyle::ResizeLeftRight),
-                |_, _, _, _| {},
+                |_, _, _| {},
+                |_, _, w, _| w.set_window_cursor_style(CursorStyle::ResizeLeftRight),
             )
             .absolute()
             .size_0(),

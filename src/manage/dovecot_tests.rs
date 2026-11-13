@@ -1,6 +1,10 @@
 //! Opt-in comparison with Dovecot and Python's independent protocol clients.
 use super::*;
 use sha2::{Digest, Sha256};
+/// A SHA-256 digest in lowercase hex.
+fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
 use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, Command, Stdio},
@@ -65,7 +69,7 @@ fn dovecot_matches_independent_imap_and_pop_clients() -> Result<()> {
         assert!(read.body.unwrap().contains(".dot"));
         let raw = b.store.raw(&mail.id)?.unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(&raw)),
+            sha256_hex(&raw),
             expected["sha256"].as_str().unwrap()
         );
     }
@@ -95,7 +99,7 @@ fn dovecot_matches_independent_imap_and_pop_clients() -> Result<()> {
             .find(|r| mail.id.ends_with(r["uid"].as_str().unwrap()))
             .unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(b.store.raw(&mail.id)?.unwrap())),
+            sha256_hex(b.store.raw(&mail.id)?.unwrap()),
             expected["sha256"].as_str().unwrap()
         );
     }

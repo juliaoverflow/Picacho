@@ -6,10 +6,10 @@ description = "Picacho: a fast, native email client for macOS, Windows, and Linu
 license = "MIT"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
-argon2 = "0.5"
-base64 = "0.22"
+argon2 = "0.6"
+base64 = "0.23"
 # Embed Blitz without its standalone window/event loop or unrestricted network client.
 blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff"] }
 blitz-html = { version = "=0.3.0-beta.4", default-features = false }
@@ -30,24 +30,32 @@ kurbo = "0.13"
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
-hkdf = "0.12"
+hkdf = "0.13"
+# Tokio runs mail-auth's DNS lookups (hickory) for checking senders.
+tokio = { version = "1", features = ["rt"] }
 imap = "2.4"
 # Parses responses that imap 2.4 cannot (CONDSTORE SELECT, Gmail ids); patched below.
 imap-proto = "=0.10.2"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# The v1 feature keeps keyring 3's stores: Keychain, Credential Manager and the
+# Secret Service, which finds items saved by keyring 3 by service and user.
+keyring = "4"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
-mailparse = "0.16"
+# Checks DKIM, SPF and DMARC. Pure-Rust crypto, without aws-lc's C build.
+mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory"] }
+# 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
+mailparse = "0.18"
 markdown = "1.0.0"
 native-tls = "0.2"
 notify-rust = "4"
 open = "5"
 pgp = "0.21"
-rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
+# fallible_uint: sizes and counts bind as integers, failing rather than wrapping when too large.
+rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 unicode-normalization = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -175,6 +183,8 @@ objc = "0.2"
 fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
 
 [patch.crates-io]
+# An email's unresolvable image or link address no longer panics; see the patch README.
+blitz-dom = { path = "vendor/blitz-dom" }
 # ToCss error inference with GPUI's log/serde feature; see the patch README.
 stylo_derive = { path = "vendor/stylo_derive" }
 # Parses Gmail's X-GM-MSGID; see the patch README.

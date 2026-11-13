@@ -132,6 +132,13 @@ impl AssetSource for Assets {
             "mail/inboxes.svg" => Some(
                 "<path d='M22 12h-6l-2 3h-4l-2-3H2'/><path d='M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1Z'/><path d='M7 1h10'/>",
             ),
+            "mail/pin.svg" => Some(
+                "<path d='M12 17v5M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V17h14v-1.8a2 2 0 0 0-1.1-1.7l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1Z'/>",
+            ),
+            "mail/subscriptions.svg" => Some(
+                "<path d='M4 4h12v15a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2Z'/><path d='M16 8h4v11a2 2 0 0 1-4 0M8 8h4M8 12h4M8 16h3'/>",
+            ),
+            "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
             _ => None,
         };
         if let Some(shape) = shape {

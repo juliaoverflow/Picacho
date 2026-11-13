@@ -53,6 +53,29 @@ impl ForwardingService {
     pub fn can_send(self) -> bool {
         !matches!(self, Self::FirefoxRelay)
     }
+    /// Whether an alias can have a display name, the name recipients see
+    /// on mail sent from it: SimpleLogin's `name`, addy.io's `from_name`.
+    pub fn has_display_name(self) -> bool {
+        !matches!(self, Self::FirefoxRelay)
+    }
+    /// Whether aliases can be pinned to the top of the list.
+    pub fn can_pin(self) -> bool {
+        !matches!(self, Self::FirefoxRelay)
+    }
+    /// What the service calls the real addresses an alias forwards to
+    /// (SimpleLogin's mailboxes, addy.io's recipients), if it lets them be
+    /// chosen per alias.
+    pub fn mailboxes_label(self) -> Option<&'static str> {
+        match self {
+            Self::SimpleLogin => Some("Mailboxes"),
+            Self::Addy => Some("Recipients"),
+            Self::FirefoxRelay => None,
+        }
+    }
+    /// Whether aliases list their reverse aliases (contacts).
+    pub fn has_contacts(self) -> bool {
+        matches!(self, Self::SimpleLogin)
+    }
     /// Where the API key is made, in one sentence, and the page.
     pub fn key_help(self) -> (&'static str, &'static str) {
         match self {
@@ -82,7 +105,7 @@ pub enum AliasDisplay {
     Separate,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Alias {
     /// The service's id for it.
     pub id: String,
@@ -94,9 +117,58 @@ pub struct Alias {
     pub note: String,
     #[serde(default)]
     pub display: AliasDisplay,
+    /// The name recipients see on mail sent from it; empty for none.
+    #[serde(default)]
+    pub name: String,
+    /// Listed first.
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub stats: AliasStats,
+    /// Ids of the service's mailboxes (or recipients) it forwards to.
+    #[serde(default)]
+    pub mailboxes: Vec<String>,
+    /// SimpleLogin: whether forwarded mail is PGP-encrypted, when one of
+    /// its mailboxes has a key; `None` when that isn't possible.
+    #[serde(default)]
+    pub pgp: Option<bool>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How much mail an alias has handled, as its service counts it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasStats {
+    pub forwarded: u64,
+    pub blocked: u64,
+    pub replied: u64,
+    /// addy.io also counts mail sent from the alias.
+    pub sent: Option<u64>,
+}
+impl AliasStats {
+    /// "12 forwarded · 1 blocked · 3 replied", leaving out zeros; empty
+    /// when nothing was counted.
+    pub fn summary(&self) -> String {
+        [
+            (self.forwarded, "forwarded"),
+            (self.blocked, "blocked"),
+            (self.replied, "replied"),
+            (self.sent.unwrap_or(0), "sent"),
+        ]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+}
+
+/// One of a service's real addresses that aliases forward to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceMailbox {
+    pub id: String,
+    pub email: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardingAccount {
     pub id: String,
     pub service: ForwardingService,
@@ -111,15 +183,11 @@ pub struct ForwardingAccount {
     pub deliver_to: Option<String>,
     #[serde(default)]
     pub aliases: Vec<Alias>,
+    /// The service's mailboxes or recipients, where it has them.
+    #[serde(default)]
+    pub mailboxes: Vec<ServiceMailbox>,
 }
 impl ForwardingAccount {
-    pub fn title(&self) -> String {
-        if self.name.is_empty() {
-            self.service.label().into()
-        } else {
-            format!("{} · {}", self.service.label(), self.name)
-        }
-    }
     fn secret_id(&self) -> String {
         secret_id(&self.id)
     }
@@ -171,6 +239,8 @@ pub fn connect(
     let client = Client::new(service, server, key)?;
     let profile = client.profile()?;
     let aliases = client.aliases()?;
+    // Only needed to choose them per alias; the account works without.
+    let mailboxes = client.mailboxes().unwrap_or_default();
     let account = ForwardingAccount {
         id: uuid::Uuid::new_v4().to_string(),
         service,
@@ -187,6 +257,7 @@ pub fn connect(
             .find(|a| a.email.eq_ignore_ascii_case(&profile.mailbox))
             .map(|a| a.id.clone()),
         aliases,
+        mailboxes,
     };
     store::write_secret(
         &account.secret_id(),
@@ -197,9 +268,48 @@ pub fn connect(
     )?;
     Ok(account)
 }
-/// The account's aliases as the service lists them now.
-pub fn refresh(account: &ForwardingAccount) -> Result<Vec<Alias>> {
-    Ok(account.merge(account.client()?.aliases()?))
+/// What a service lists now: its aliases, and its mailboxes (None when
+/// they couldn't be listed, so the ones known are kept).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refreshed {
+    pub aliases: Vec<Alias>,
+    pub mailboxes: Option<Vec<ServiceMailbox>>,
+}
+/// The account's aliases and mailboxes as the service lists them now.
+pub fn refresh(account: &ForwardingAccount) -> Result<Refreshed> {
+    let client = account.client()?;
+    Ok(Refreshed {
+        aliases: account.merge(client.aliases()?),
+        mailboxes: client.mailboxes().ok(),
+    })
+}
+/// Changes the name recipients see on mail from an alias; empty for none.
+pub fn set_name(account: &ForwardingAccount, alias: &Alias, name: &str) -> Result<()> {
+    account.client()?.set_name(alias, name)
+}
+pub fn set_pinned(account: &ForwardingAccount, alias: &Alias, pinned: bool) -> Result<()> {
+    account.client()?.set_pinned(alias, pinned)
+}
+/// Chooses which of the service's mailboxes an alias forwards to.
+pub fn set_mailboxes(account: &ForwardingAccount, alias: &Alias, ids: &[String]) -> Result<()> {
+    account.client()?.set_mailboxes(alias, ids)
+}
+/// SimpleLogin: turns PGP encryption of an alias's forwarded mail on or off.
+pub fn set_pgp(account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
+    account.client()?.set_pgp(alias, enabled)
+}
+/// SimpleLogin: blocks or unblocks mail from a contact; returns whether it
+/// is blocked now.
+pub fn toggle_contact(account: &ForwardingAccount, contact: &ReverseAlias) -> Result<bool> {
+    account.client()?.toggle_contact(contact)
+}
+pub fn delete_contact(account: &ForwardingAccount, contact: &ReverseAlias) -> Result<()> {
+    account.client()?.delete_contact(contact)
+}
+/// SimpleLogin: the reverse alias for writing to `address` as the alias,
+/// made unless it exists.
+pub fn add_contact(account: &ForwardingAccount, alias: &Alias, address: &str) -> Result<ReverseAlias> {
+    account.client()?.add_contact(alias, address)
 }
 pub fn create(account: &ForwardingAccount, new: &NewAlias) -> Result<Alias> {
     account.client()?.create(new)
@@ -211,6 +321,53 @@ pub fn options(account: &ForwardingAccount) -> Result<AliasOptions> {
 /// Changes an alias's description at the service.
 pub fn set_note(account: &ForwardingAccount, alias: &Alias, note: &str) -> Result<()> {
     account.client()?.set_note(alias, note)
+}
+
+/// One of a SimpleLogin alias's contacts: someone it has mail with, and
+/// the reverse alias that writes to them as the alias.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReverseAlias {
+    /// The service's id for the contact.
+    pub id: String,
+    /// The contact's own address.
+    pub contact: String,
+    /// The reverse alias, lowercase. Shown only as `obscure` makes it.
+    pub address: String,
+    /// Whether mail from the contact to the alias is blocked.
+    pub blocked: bool,
+    /// When the alias last wrote to the contact, in Unix seconds.
+    pub last_sent: Option<i64>,
+}
+/// A SimpleLogin alias's reverse aliases, as the service lists them now.
+pub fn reverse_aliases(account: &ForwardingAccount, alias: &Alias) -> Result<Vec<ReverseAlias>> {
+    account.client()?.contacts(alias)
+}
+/// An address with most of it hidden, for showing a reverse alias without
+/// revealing it: `ra+x7k2abcd@simplelogin.co` reads `ra•••cd@s•••n.co`.
+/// The local part keeps two characters at each end, the domain name one,
+/// and the top-level domain stays readable.
+pub fn obscure(address: &str) -> String {
+    fn hide(text: &str, keep: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() > keep * 2 + 1 {
+            let head: String = chars[..keep].iter().collect();
+            let tail: String = chars[chars.len() - keep..].iter().collect();
+            format!("{head}•••{tail}")
+        } else {
+            let head: String = chars.iter().take(1).collect();
+            format!("{head}•••")
+        }
+    }
+    match address.rsplit_once('@') {
+        Some((local, domain)) => {
+            let domain = match domain.rsplit_once('.') {
+                Some((name, tld)) => format!("{}.{tld}", hide(name, 1)),
+                None => hide(domain, 1),
+            };
+            format!("{}@{domain}", hide(local, 2))
+        }
+        None => hide(address, 2),
+    }
 }
 
 /// What kind of domain an alias can be made at.
@@ -304,7 +461,7 @@ const WORDS: [&str; 64] = [
 ];
 /// A random prefix made here, for services that take the prefix as given.
 pub fn random_prefix(format: AliasFormat) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     match format {
         AliasFormat::RandomWords => {
@@ -726,8 +883,7 @@ mod tests {
             id: email.into(),
             email: email.into(),
             enabled,
-            note: String::new(),
-            display: AliasDisplay::Included,
+            ..Alias::default()
         };
         save(
             &store,
@@ -735,21 +891,17 @@ mod tests {
                 ForwardingAccount {
                     id: "addy".into(),
                     service: ForwardingService::Addy,
-                    server: String::new(),
-                    name: String::new(),
-                    deliver_to: None,
                     aliases: vec![
                         alias("shop@me.anonaddy.com", true),
                         alias("old@me.anonaddy.com", false),
                     ],
+                    ..ForwardingAccount::default()
                 },
                 ForwardingAccount {
                     id: "relay".into(),
                     service: ForwardingService::FirefoxRelay,
-                    server: String::new(),
-                    name: String::new(),
-                    deliver_to: None,
                     aliases: vec![alias("x@mozmail.com", true)],
+                    ..ForwardingAccount::default()
                 },
             ],
         )?;
@@ -820,21 +972,20 @@ mod tests {
             id: id.into(),
             email: email.into(),
             enabled: true,
-            note: String::new(),
             display,
+            ..Alias::default()
         }
     }
     fn service(deliver_to: Option<&str>) -> ForwardingAccount {
         ForwardingAccount {
             id: "sl".into(),
             service: ForwardingService::SimpleLogin,
-            server: String::new(),
-            name: String::new(),
             deliver_to: deliver_to.map(Into::into),
             aliases: vec![
                 alias("1", "shop@sl.io", AliasDisplay::Separate),
                 alias("2", "news@sl.io", AliasDisplay::Included),
             ],
+            ..ForwardingAccount::default()
         }
     }
     fn mail(account: &str, to: &str) -> Mail {
@@ -918,6 +1069,42 @@ mod tests {
         assert_eq!(get(&alias_view("sl", "1"), "inbox"), 1);
         assert_eq!(get(ALL_MAIL, "inbox"), 5);
         assert_eq!(get(ALL_MAIL, "junk"), 1);
+    }
+
+    #[test]
+    fn services_saved_before_names_and_pins_still_load() {
+        let saved = r#"[{"id":"sl","service":"SimpleLogin","deliver_to":null,
+            "aliases":[{"id":"1","email":"a@b.c","enabled":true,"note":"x","display":"Separate"}]}]"#;
+        let loaded: Vec<ForwardingAccount> = serde_json::from_str(saved).unwrap();
+        let a = &loaded[0].aliases[0];
+        assert_eq!((a.name.as_str(), a.pinned, a.pgp), ("", false, None));
+        assert_eq!(a.display, AliasDisplay::Separate);
+        assert!(loaded[0].mailboxes.is_empty());
+    }
+
+    #[test]
+    fn stats_read_briefly_without_zeros() {
+        let stats = AliasStats {
+            forwarded: 12,
+            blocked: 0,
+            replied: 3,
+            sent: Some(1),
+        };
+        assert_eq!(stats.summary(), "12 forwarded · 3 replied · 1 sent");
+        assert_eq!(AliasStats::default().summary(), "");
+    }
+
+    #[test]
+    fn reverse_aliases_are_shown_mostly_hidden() {
+        assert_eq!(obscure("ra+x7k2abcd@simplelogin.co"), "ra•••cd@s•••n.co");
+        assert_eq!(obscure("reply+a1b2c3@sl.local"), "re•••c3@s•••.local");
+        // Short parts keep only their first character.
+        assert_eq!(obscure("ab@x.cc"), "a•••@x•••.cc");
+        let shown = obscure("ra+secretpart@simplelogin.cc");
+        assert!(!shown.contains("secretpart") && !shown.contains("simplelogin"));
+        assert!(shown.ends_with(".cc"));
+        // Non-ASCII is cut on character boundaries.
+        assert_eq!(obscure("ñandú+ñ@dominio.es"), "ña•••+ñ@d•••o.es");
     }
 
     #[test]

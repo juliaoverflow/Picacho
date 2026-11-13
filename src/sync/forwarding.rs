@@ -7,8 +7,8 @@
 //!
 //! These helpers only talk to the service; Manage keeps the result.
 use crate::manage::forwarding::{
-    Alias, AliasDomain, AliasFormat, AliasOptions, DomainKind, ForwardingService, NewAlias,
-    random_prefix,
+    Alias, AliasDomain, AliasFormat, AliasOptions, AliasStats, DomainKind, ForwardingService,
+    NewAlias, ReverseAlias, ServiceMailbox, random_prefix,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -379,29 +379,198 @@ impl Client {
     /// SimpleLogin: the reverse aliases of an alias's contacts. Mail sent
     /// to one of these from your mailbox goes out as the alias.
     pub fn reverse_aliases(&self, alias: &Alias) -> Result<std::collections::HashSet<String>> {
-        use reqwest::Method;
+        Ok(self
+            .contacts(alias)?
+            .into_iter()
+            .map(|r| r.address)
+            .collect())
+    }
+
+    /// SimpleLogin: an alias's contacts, each with its reverse alias.
+    ///
+    /// SimpleLogin lists 20 a page, so hundreds take dozens of requests; a
+    /// few pages are asked for at once, until one comes back empty.
+    pub fn contacts(&self, alias: &Alias) -> Result<Vec<ReverseAlias>> {
+        /// Pages asked for together: quicker, and gentle on the server.
+        const AT_ONCE: usize = 4;
+        /// 2,000 contacts.
+        const MAX_PAGES: usize = 100;
         ensure!(
             self.service == ForwardingService::SimpleLogin,
             "Only SimpleLogin has reverse aliases"
         );
-        let mut out = std::collections::HashSet::new();
-        for page in 0..100 {
-            let v = self.send(self.request(
-                Method::GET,
-                &format!("/api/aliases/{}/contacts?page_id={page}", alias.id),
-            ))?;
-            let contacts = v["contacts"].as_array().cloned().unwrap_or_default();
-            if contacts.is_empty() {
-                break;
+        let mut out: Vec<ReverseAlias> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut first = 0;
+        while first < MAX_PAGES {
+            let pages: Vec<Result<Vec<ReverseAlias>>> = std::thread::scope(|scope| {
+                let running: Vec<_> = (first..(first + AT_ONCE).min(MAX_PAGES))
+                    .map(|page| scope.spawn(move || self.contacts_page(alias, page)))
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|page| {
+                        page.join()
+                            .unwrap_or_else(|_| bail!("Listing the reverse aliases failed"))
+                    })
+                    .collect()
+            });
+            for page in pages {
+                let page = page?;
+                if page.is_empty() {
+                    return Ok(out);
+                }
+                // A contact made meanwhile can shift one onto the next page.
+                out.extend(page.into_iter().filter(|r| seen.insert(r.address.clone())));
             }
-            out.extend(
-                contacts
-                    .iter()
-                    .map(|c| str_of(&c["reverse_alias_address"]).to_lowercase())
-                    .filter(|a| !a.is_empty()),
-            );
+            first += AT_ONCE;
         }
         Ok(out)
+    }
+    fn contacts_page(&self, alias: &Alias, page: usize) -> Result<Vec<ReverseAlias>> {
+        let v = self.send(self.request(
+            reqwest::Method::GET,
+            &format!("/api/aliases/{}/contacts?page_id={page}", alias.id),
+        ))?;
+        Ok(parse_contacts(&v))
+    }
+
+    /// SimpleLogin: blocks or unblocks mail from a contact to its alias.
+    /// Returns whether it is blocked now.
+    pub fn toggle_contact(&self, contact: &ReverseAlias) -> Result<bool> {
+        ensure!(
+            self.service == ForwardingService::SimpleLogin && !contact.id.is_empty(),
+            "Only SimpleLogin contacts can be blocked"
+        );
+        let v = self.send(self.request(
+            reqwest::Method::POST,
+            &format!("/api/contacts/{}/toggle", contact.id),
+        ))?;
+        v["block_forward"]
+            .as_bool()
+            .context("SimpleLogin did not say whether the contact is blocked")
+    }
+    /// SimpleLogin: deletes a contact and its reverse alias.
+    pub fn delete_contact(&self, contact: &ReverseAlias) -> Result<()> {
+        ensure!(
+            self.service == ForwardingService::SimpleLogin && !contact.id.is_empty(),
+            "Only SimpleLogin contacts can be deleted"
+        );
+        self.send(self.request(
+            reqwest::Method::DELETE,
+            &format!("/api/contacts/{}", contact.id),
+        ))?;
+        Ok(())
+    }
+    /// SimpleLogin: the contact for writing to `address` as the alias, made
+    /// unless it exists.
+    pub fn add_contact(&self, alias: &Alias, address: &str) -> Result<ReverseAlias> {
+        ensure!(
+            self.service == ForwardingService::SimpleLogin,
+            "Only SimpleLogin has reverse aliases"
+        );
+        let v = self.send(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/api/aliases/{}/contacts", alias.id),
+            )
+            .json(&json!({ "contact": address.trim() })),
+        )?;
+        parse_contact(&v).context("SimpleLogin did not give an address for the contact")
+    }
+
+    /// The service's mailboxes (SimpleLogin) or recipients (addy.io) that
+    /// aliases can forward to.
+    pub fn mailboxes(&self) -> Result<Vec<ServiceMailbox>> {
+        use reqwest::Method;
+        let v = match self.service {
+            ForwardingService::SimpleLogin => {
+                self.send(self.request(Method::GET, "/api/v2/mailboxes"))?
+            }
+            ForwardingService::Addy => self.send(self.request(
+                Method::GET,
+                "/api/v1/recipients?filter[verified]=true&filter[alias_count]=false",
+            ))?,
+            ForwardingService::FirefoxRelay => return Ok(Vec::new()),
+        };
+        Ok(parse_mailboxes(self.service, &v))
+    }
+    /// Sets the name recipients see on mail from the alias; empty clears it.
+    pub fn set_name(&self, alias: &Alias, name: &str) -> Result<()> {
+        use reqwest::Method;
+        let name = name.trim();
+        let value = if name.is_empty() { Value::Null } else { json!(name) };
+        let (path, body) = match self.service {
+            ForwardingService::SimpleLogin => {
+                (format!("/api/aliases/{}", alias.id), json!({ "name": value }))
+            }
+            ForwardingService::Addy => (
+                format!("/api/v1/aliases/{}", alias.id),
+                json!({ "from_name": value }),
+            ),
+            ForwardingService::FirefoxRelay => bail!("Firefox Relay aliases have no display name"),
+        };
+        self.send(self.request(Method::PATCH, &path).json(&body))?;
+        Ok(())
+    }
+    /// Pins the alias to the top of the list, or unpins it.
+    pub fn set_pinned(&self, alias: &Alias, pinned: bool) -> Result<()> {
+        use reqwest::Method;
+        let id = &alias.id;
+        match self.service {
+            ForwardingService::SimpleLogin => self.send(
+                self.request(Method::PATCH, &format!("/api/aliases/{id}"))
+                    .json(&json!({ "pinned": pinned })),
+            )?,
+            ForwardingService::Addy if pinned => self.send(
+                self.request(Method::POST, "/api/v1/pinned-aliases")
+                    .json(&json!({ "id": id })),
+            )?,
+            ForwardingService::Addy => {
+                self.send(self.request(Method::DELETE, &format!("/api/v1/pinned-aliases/{id}")))?
+            }
+            ForwardingService::FirefoxRelay => bail!("Firefox Relay aliases can't be pinned"),
+        };
+        Ok(())
+    }
+    /// Chooses the mailboxes (or recipients) the alias forwards to.
+    pub fn set_mailboxes(&self, alias: &Alias, ids: &[String]) -> Result<()> {
+        use reqwest::Method;
+        ensure!(!ids.is_empty(), "An alias needs somewhere to forward to.");
+        match self.service {
+            ForwardingService::SimpleLogin => {
+                // SimpleLogin's ids are numbers.
+                let ids: Vec<Value> = ids
+                    .iter()
+                    .map(|id| id.parse::<i64>().map_or_else(|_| json!(id), |n| json!(n)))
+                    .collect();
+                self.send(
+                    self.request(Method::PATCH, &format!("/api/aliases/{}", alias.id))
+                        .json(&json!({ "mailbox_ids": ids })),
+                )?;
+            }
+            ForwardingService::Addy => {
+                self.send(
+                    self.request(Method::POST, "/api/v1/alias-recipients")
+                        .json(&json!({ "alias_id": alias.id, "recipient_ids": ids })),
+                )?;
+            }
+            ForwardingService::FirefoxRelay => bail!("Firefox Relay forwards to your account's address"),
+        }
+        Ok(())
+    }
+    /// SimpleLogin: encrypts the alias's forwarded mail with its mailboxes'
+    /// PGP keys, or stops doing so.
+    pub fn set_pgp(&self, alias: &Alias, enabled: bool) -> Result<()> {
+        ensure!(
+            self.service == ForwardingService::SimpleLogin,
+            "Only SimpleLogin encrypts forwarded mail per alias"
+        );
+        self.send(
+            self.request(reqwest::Method::PATCH, &format!("/api/aliases/{}", alias.id))
+                .json(&json!({ "disable_pgp": !enabled })),
+        )?;
+        Ok(())
     }
 
     /// SimpleLogin: the reverse alias for writing to `contact` as `alias`,
@@ -462,11 +631,37 @@ fn alias(id: &Value, email: &Value, enabled: Option<bool>, note: &Value) -> Opti
         email,
         enabled: enabled.unwrap_or(true),
         note: str_of(note),
-        display: Default::default(),
+        ..Alias::default()
     })
 }
+/// A count from a reply; absent or null is none.
+fn count(v: &Value) -> u64 {
+    v.as_u64().unwrap_or(0)
+}
+/// The `id`s of a list of objects, such as an alias's mailboxes.
+fn ids(v: &Value) -> Vec<String> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| str_of(&m["id"]))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
 fn parse_simplelogin_alias(v: &Value) -> Option<Alias> {
-    alias(&v["id"], &v["email"], v["enabled"].as_bool(), &v["note"])
+    let mut a = alias(&v["id"], &v["email"], v["enabled"].as_bool(), &v["note"])?;
+    a.name = str_of(&v["name"]);
+    a.pinned = v["pinned"].as_bool().unwrap_or(false);
+    a.stats = AliasStats {
+        forwarded: count(&v["nb_forward"]),
+        blocked: count(&v["nb_block"]),
+        replied: count(&v["nb_reply"]),
+        sent: None,
+    };
+    a.mailboxes = ids(&v["mailboxes"]);
+    // PGP can only be turned on when one of its mailboxes has a key.
+    a.pgp = (v["support_pgp"].as_bool() == Some(true))
+        .then(|| v["disable_pgp"].as_bool() != Some(true));
+    Some(a)
 }
 fn parse_simplelogin(v: &Value) -> Vec<Alias> {
     v["aliases"]
@@ -475,6 +670,34 @@ fn parse_simplelogin(v: &Value) -> Vec<Alias> {
         .flatten()
         .filter_map(parse_simplelogin_alias)
         .collect()
+}
+fn parse_contacts(v: &Value) -> Vec<ReverseAlias> {
+    v["contacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(parse_contact)
+        .collect()
+}
+/// One contact. Older replies leave out `reverse_alias_address`; the
+/// address is then the one in `reverse_alias`'s angle brackets.
+fn parse_contact(c: &Value) -> Option<ReverseAlias> {
+    let mut address = str_of(&c["reverse_alias_address"]).trim().to_lowercase();
+    if address.is_empty() {
+        let full = str_of(&c["reverse_alias"]);
+        address = full
+            .rsplit_once('<')
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(inner, _)| inner.trim().to_lowercase())
+            .unwrap_or_default();
+    }
+    (!address.is_empty() && address.contains('@')).then(|| ReverseAlias {
+        id: str_of(&c["id"]),
+        contact: str_of(&c["contact"]).trim().to_owned(),
+        address,
+        blocked: c["block_forward"].as_bool().unwrap_or(false),
+        last_sent: c["last_email_sent_timestamp"].as_i64(),
+    })
 }
 /// Whether a service's reply about one alias shows it still in use.
 /// addy.io keeps deleted aliases for a while, marked as deleted.
@@ -583,12 +806,22 @@ fn parse_addy_options(v: &Value, custom: &Value, username: &str) -> AliasOptions
     }
 }
 fn parse_addy_alias(v: &Value) -> Option<Alias> {
-    alias(
+    let mut a = alias(
         &v["id"],
         &v["email"],
         v["active"].as_bool(),
         &v["description"],
-    )
+    )?;
+    a.name = str_of(&v["from_name"]);
+    a.pinned = v["pinned"].as_bool().unwrap_or(false);
+    a.stats = AliasStats {
+        forwarded: count(&v["emails_forwarded"]),
+        blocked: count(&v["emails_blocked"]),
+        replied: count(&v["emails_replied"]),
+        sent: Some(count(&v["emails_sent"])),
+    };
+    a.mailboxes = ids(&v["recipients"]);
+    Some(a)
 }
 fn parse_addy(v: &Value) -> Vec<Alias> {
     v.as_array()
@@ -600,12 +833,38 @@ fn parse_addy(v: &Value) -> Vec<Alias> {
         .collect()
 }
 fn parse_relay_alias(v: &Value) -> Option<Alias> {
-    alias(
+    let mut a = alias(
         &v["id"],
         &v["full_address"],
         v["enabled"].as_bool(),
         &v["description"],
-    )
+    )?;
+    a.stats = AliasStats {
+        forwarded: count(&v["num_forwarded"]),
+        blocked: count(&v["num_blocked"]),
+        replied: count(&v["num_replied"]),
+        sent: None,
+    };
+    Some(a)
+}
+/// A service's mailboxes (SimpleLogin) or recipients (addy.io). Mailboxes
+/// not yet verified can't receive aliases, so they are left out: SimpleLogin
+/// marks them, and addy.io is asked for verified ones only.
+fn parse_mailboxes(service: ForwardingService, v: &Value) -> Vec<ServiceMailbox> {
+    let list = match service {
+        ForwardingService::SimpleLogin => &v["mailboxes"],
+        ForwardingService::Addy => &v["data"],
+        ForwardingService::FirefoxRelay => return Vec::new(),
+    };
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["verified"].as_bool() != Some(false))
+        .filter_map(|m| {
+            let (id, email) = (str_of(&m["id"]), str_of(&m["email"]).trim().to_lowercase());
+            (!id.is_empty() && !email.is_empty()).then_some(ServiceMailbox { id, email })
+        })
+        .collect()
 }
 fn parse_relay(v: &Value) -> Vec<Alias> {
     v.as_array()
@@ -648,6 +907,84 @@ mod tests {
         let got = parse_relay(&relay);
         assert_eq!(got[0].email, "abc@mozmail.com");
         assert_eq!(got[0].note, "news");
+    }
+
+    #[test]
+    fn reads_names_pins_counts_and_mailboxes() {
+        // As SimpleLogin's API documentation shows them.
+        let sl = parse_simplelogin_alias(&json!({
+            "id": 3, "email": "prefix1.cat@sl.lan", "name": "A Name", "enabled": true,
+            "mailboxes": [{"email": "m1@cd.ef", "id": 2}, {"email": "john@wick.com", "id": 1}],
+            "nb_block": 1, "nb_forward": 12, "nb_reply": 3, "note": null, "pinned": true,
+            "support_pgp": true, "disable_pgp": false
+        }))
+        .unwrap();
+        assert_eq!(sl.name, "A Name");
+        assert!(sl.pinned);
+        assert_eq!(sl.note, "");
+        assert_eq!(sl.mailboxes, ["2", "1"]);
+        assert_eq!(sl.pgp, Some(true));
+        assert_eq!(sl.stats.summary(), "12 forwarded · 1 blocked · 3 replied");
+        let no_key = parse_simplelogin_alias(&json!({"id": 4, "email": "x@sl.lan", "support_pgp": false}))
+            .unwrap();
+        assert_eq!(no_key.pgp, None, "PGP isn't offered without a key");
+
+        let addy = parse_addy_alias(&json!({
+            "id": "50c9e585", "email": "first@johndoe.anonaddy.com", "active": true, "pinned": true,
+            "description": null, "from_name": "John", "emails_forwarded": 5, "emails_blocked": 0,
+            "emails_replied": 0, "emails_sent": 2, "recipients": [{"id": "46eebc50", "email": "me@example.com"}]
+        }))
+        .unwrap();
+        assert_eq!((addy.name.as_str(), addy.pinned), ("John", true));
+        assert_eq!(addy.mailboxes, ["46eebc50"]);
+        assert_eq!(addy.stats.sent, Some(2));
+        assert_eq!(addy.pgp, None);
+
+        let mailboxes = parse_mailboxes(
+            ForwardingService::SimpleLogin,
+            &json!({"mailboxes": [
+                {"email": "a@b.c", "id": 1, "default": true, "verified": true},
+                {"email": "m1@example.com", "id": 2, "default": false, "verified": false}
+            ]}),
+        );
+        assert_eq!(
+            mailboxes,
+            [ServiceMailbox {
+                id: "1".into(),
+                email: "a@b.c".into()
+            }],
+            "unverified mailboxes can't be chosen"
+        );
+        let recipients = parse_mailboxes(
+            ForwardingService::Addy,
+            &json!({"data": [{"id": "46eebc50", "email": "Me@Example.com"}]}),
+        );
+        assert_eq!(recipients[0].email, "me@example.com");
+        assert!(parse_mailboxes(ForwardingService::FirefoxRelay, &json!({})).is_empty());
+    }
+
+    #[test]
+    fn reads_an_aliass_contacts_and_their_reverse_aliases() {
+        let v = json!({"contacts": [
+            {"id": 1, "contact": "ana@example.org", "reverse_alias_address": "RA+Ana.xyz@SimpleLogin.co",
+             "block_forward": true, "last_email_sent_timestamp": 1700000000},
+            {"id": 2, "contact": "bo@example.org", "reverse_alias_address": "ra+bo@simplelogin.co",
+             "block_forward": false, "last_email_sent_timestamp": null},
+            {"id": 3, "contact": "nobody", "reverse_alias_address": ""},
+            // As SimpleLogin's documentation shows it: no reverse_alias_address.
+            {"id": 4, "contact": "marketing@example.com", "block_forward": false,
+             "reverse_alias": "marketing at example.com <reply+bzvpaz@sl.co>"}
+        ]});
+        let got = parse_contacts(&v);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[2].address, "reply+bzvpaz@sl.co");
+        assert_eq!(got[2].id, "4");
+        assert_eq!(got[0].id, "1");
+        assert_eq!(got[0].contact, "ana@example.org");
+        assert_eq!(got[0].address, "ra+ana.xyz@simplelogin.co");
+        assert!(got[0].blocked);
+        assert_eq!(got[0].last_sent, Some(1700000000));
+        assert_eq!(got[1].last_sent, None);
     }
 
     #[test]

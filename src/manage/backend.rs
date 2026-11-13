@@ -387,6 +387,14 @@ impl Backend {
             .insert(a.id.clone(), keys.clone());
         Ok(Some(keys))
     }
+    /// Whether this computer can decrypt the message: it is encrypted, and
+    /// the account's keys opened it.
+    pub fn decrypts(&self, a: &Account, raw: &[u8]) -> bool {
+        matches!(
+            self.plaintext(a, raw),
+            Ok((crate::manage::crypto::Protection::Pinal, _))
+        )
+    }
     /// The readable message: decrypted here when Pinal stored it encrypted.
     fn plaintext(
         &self,
@@ -1428,6 +1436,15 @@ impl Backend {
             }
             Ok(stored)
         })
+    }
+    /// Asks a subscription's sender to stop: one click, or a message sent
+    /// from `a`, or the page to open.
+    pub fn unsubscribe(
+        &self,
+        a: &Account,
+        sub: &crate::manage::subscriptions::Subscription,
+    ) -> Result<crate::manage::subscriptions::Outcome> {
+        crate::manage::subscriptions::unsubscribe(sub, |d| self.send(a, d))
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
         // Sending as an alias asks its service for the routed addresses

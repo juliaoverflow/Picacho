@@ -296,3 +296,44 @@ fn opening_a_message_keeps_the_list_scroll_and_the_message_listed(cx: &mut TestA
         assert_eq!(y, offset.y - px(ROW_HEIGHT));
     });
 }
+#[gpui::test]
+fn typing_a_search_scrolls_the_list_to_the_top(cx: &mut TestAppContext) {
+    let store = store();
+    let mut a = Account::new(Provider::Imap);
+    a.name = "Search".into();
+    a.email = "search@example.com".into();
+    store.save_account(&a).unwrap();
+    let template = demo_mail().remove(0);
+    let mails: Vec<Mail> = (0..80)
+        .map(|i| Mail {
+            id: format!("{}:INBOX:1:{i}", a.id),
+            account: a.id.clone(),
+            folder: Folder::Inbox,
+            date: 1_800_000_000 - i * 60,
+            ..template.clone()
+        })
+        .collect();
+    store.save_messages(&mails).unwrap();
+    let (view, cx) = open(store, cx);
+    resize(cx, 1440., 900.);
+    view.update(cx, |this, _| {
+        assert_eq!(this.visible.len(), 80);
+        this.list_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-ROW_HEIGHT * 30.)));
+    });
+    frame(cx);
+    // Matches every message, so keeping the old place would be possible.
+    let query = template.subject.chars().take(3).collect::<String>();
+    view.update_in(cx, |this, w, cx| {
+        let search = this.search.clone();
+        search.update(cx, |s, cx| s.set_value(query.clone(), w, cx));
+    });
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(!this.visible.is_empty());
+        assert_eq!(this.list_scroll.0.borrow().base_handle.offset().y, px(0.));
+    });
+}

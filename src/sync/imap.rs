@@ -259,7 +259,7 @@ fn starttls(socket: &mut Wire) -> Result<()> {
 /// and ARC chains that are often several times larger, and are only needed
 /// once a message is opened (its whole source is downloaded then).
 pub(crate) const LIST_HEADERS: &str =
-    "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID CONTENT-TYPE)]";
+    "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]";
 
 /// Extensions beyond IMAP4rev1 that change how a mailbox is synchronized.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

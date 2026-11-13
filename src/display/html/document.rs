@@ -404,10 +404,13 @@ impl EmailDocument {
             }
             next = node.parent.and_then(|id| self.doc.get_node(id));
         }
-        // Only addresses that can be opened or copied usefully.
-        target.link = target.link.filter(|href| {
-            url::Url::parse(href).is_ok_and(|u| resources::remote_url(&u) || u.scheme() == "mailto")
-        });
+        // Only addresses that are safe to open: web pages and email links, and
+        // for images only web pages. A `file:` or `smb:` source could open or
+        // run a program from this computer or a network share.
+        target.link = target.link.filter(|href| super::openable_url(href).is_some());
+        target.image = target
+            .image
+            .filter(|src| url::Url::parse(src.trim()).is_ok_and(|u| resources::remote_url(&u)));
         target
     }
 }

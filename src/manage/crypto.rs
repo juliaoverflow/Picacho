@@ -125,12 +125,13 @@ pub fn hkdf(ikm: &[u8], info: &str) -> Zeroizing<[u8; 32]> {
 fn open(key: &[u8; 32], nonce: &str, ciphertext: &str, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let nonce = B64.decode(nonce).map_err(|_| WrongSecret)?;
     let ciphertext = B64.decode(ciphertext).map_err(|_| WrongSecret)?;
-    ensure!(nonce.len() == 12 && ciphertext.len() >= 16, WrongSecret);
+    let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| WrongSecret)?;
+    ensure!(ciphertext.len() >= 16, WrongSecret);
     let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
     Ok(Zeroizing::new(
         cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: &ciphertext,
                     aad,

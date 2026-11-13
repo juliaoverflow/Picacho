@@ -16,6 +16,8 @@ mod devdriver;
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
+#[path = "forwarding.rs"]
+mod forwarding;
 #[path = "message_window.rs"]
 mod message_window;
 #[path = "panes.rs"]
@@ -31,6 +33,8 @@ mod reading_tests;
 mod responsive_tests;
 #[path = "settings.rs"]
 mod settings;
+#[path = "subscriptions.rs"]
+mod subscriptions;
 #[path = "thread.rs"]
 mod thread;
 #[path = "tree.rs"]
@@ -42,6 +46,7 @@ mod window;
 use super::html::{HtmlContextMenu, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
+use crate::manage::subscriptions::Subscription as MailSubscription;
 use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
 use crate::{
     manage::{
@@ -310,6 +315,23 @@ enum Modal {
     /// (why, the address From was reset to).
     AliasGone(String, String),
 }
+/// What the Original Message window shows of the open message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SourceView {
+    Headers,
+    Html,
+    Original,
+}
+impl SourceView {
+    pub(super) const ALL: [Self; 3] = [Self::Headers, Self::Html, Self::Original];
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Headers => "Headers",
+            Self::Html => "HTML",
+            Self::Original => "Original",
+        }
+    }
+}
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
     All,
@@ -479,6 +501,13 @@ enum Action {
     /// Lists every message of a long conversation.
     ExpandThread,
     ShowOriginal,
+    /// Lists the subscriptions detected in an account, or in every account
+    /// (All Mail's id).
+    OpenSubscriptions(String),
+    /// Asks a subscription's sender to stop, from the list or an email.
+    Unsubscribe(MailSubscription),
+    /// Opens the open message's headers, HTML or whole source.
+    ShowSource(SourceView),
     CopyOriginal,
     SaveOriginal,
     CopyText(String),
@@ -531,12 +560,34 @@ enum Action {
     /// A random prefix: made here, or left to the service to make.
     RandomPrefix(fwd::AliasFormat),
     SetAliasPrefix(String),
-    /// Edits an alias's description: (service, alias).
-    EditAliasNote(String, String),
-    SaveAliasNote,
-    CancelAliasNote,
-    /// Lists every alias of a service rather than the first few.
-    ShowAllAliases(String),
+    /// Edits an alias's description, or the name recipients see on mail
+    /// from it, below its row: (service, alias, which).
+    EditAlias(String, String, forwarding::AliasField),
+    SaveAliasEdit,
+    CancelAliasEdit,
+    /// (service, alias, pinned)
+    SetAliasPinned(String, String, bool),
+    /// The menu of a service's mailboxes (or recipients) for an alias,
+    /// and one of them turned on or off for it: (service, alias[, mailbox]).
+    AliasMailboxMenu(String, String),
+    ToggleAliasMailbox(String, String, String),
+    /// SimpleLogin: PGP-encrypt an alias's forwarded mail: (service, alias, on).
+    SetAliasPgp(String, String, bool),
+    /// Shows or hides a SimpleLogin alias's reverse aliases, and fetches
+    /// them again: (service, alias).
+    ToggleReverseAliases(String, String),
+    LoadReverseAliases(String, String),
+    /// A reverse alias's menu, blocking or unblocking its contact, and
+    /// deleting it (asked first): (service, alias, contact).
+    ContactMenu(String, String, String),
+    ToggleContactBlock(String, String, String),
+    DeleteContact(String, String, String),
+    /// Makes a reverse alias for the address typed in the panel: (service, alias).
+    AddContact(String, String),
+    /// Shows a page of a service's aliases: (service, page).
+    AliasPage(String, usize),
+    /// Shows a page of the open reverse aliases.
+    ContactPage(usize),
     /// (service account, alias, on)
     SetAliasEnabled(String, String, bool),
     SetAliasDisplay(String, String, AliasDisplay),
@@ -731,6 +782,18 @@ pub struct MailApp {
     /// Whether the open message's details are expanded, and what was read
     /// from its original source.
     details_open: bool,
+    /// What the Original Message window shows.
+    source_view: SourceView,
+    /// The open subscriptions list (in place of the message list), for an
+    /// account or All Mail's id, and what it lists.
+    subs_open: bool,
+    subs: Vec<MailSubscription>,
+    subs_loading: bool,
+    subs_generation: u64,
+    subs_scroll: UniformListScrollHandle,
+    /// Subscriptions being, or already, unsubscribed from.
+    unsubscribing: HashSet<String>,
+    unsubscribed: HashSet<String>,
     details: Option<MessageInfo>,
     original_scroll: UniformListScrollHandle,
     list_scroll: UniformListScrollHandle,
@@ -776,14 +839,27 @@ pub struct MailApp {
     fwd_domain: Option<String>,
     fwd_format: Option<fwd::AliasFormat>,
     fwd_mailbox: Option<String>,
-    /// The alias whose description is being edited: (service, alias).
-    fwd_editing: Option<(String, String)>,
+    /// The alias whose description or display name is being edited:
+    /// (service, alias, which), and the field it is edited in.
+    fwd_editing: Option<(String, String, forwarding::AliasField)>,
     fwd_description: Entity<InputState>,
     /// A new alias form asked for by a composer whose subscription had no window.
     pending_new_alias: Option<(String, String)>,
     /// When each service's aliases were last fetched.
     fwd_refreshed: HashMap<String, std::time::Instant>,
-    fwd_expanded: HashSet<String>,
+    /// The alias ("service:alias") whose reverse aliases are shown, and
+    /// each alias's as last fetched (or why they could not be), ready to
+    /// list. The panel's search and new-contact fields.
+    fwd_reverse: Option<String>,
+    fwd_contacts: HashMap<String, Result<forwarding::Contacts, String>>,
+    fwd_contact_search: Entity<InputState>,
+    fwd_contact_new: Entity<InputState>,
+    /// The reverse aliases subpage's own scroll, so Forwarding settings'
+    /// stays where it was underneath.
+    fwd_reverse_scroll: ScrollHandle,
+    /// The page of each service's aliases shown, and of the open reverse aliases.
+    fwd_pages: HashMap<String, usize>,
+    fwd_contact_page: usize,
     /// Forwarding services whose details are open in the list.
     fwd_open: HashSet<String>,
     fwd_adding: bool,
@@ -853,7 +929,10 @@ impl MailApp {
         }
         subscriptions.extend([cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
-                this.filter(cx);
+                // A new search lists other mail: start from its top rather
+                // than keeping the place in the old list.
+                this.apply_filter(cx);
+                this.scroll_list_to_top();
                 cx.notify();
             }
         })]);
@@ -899,13 +978,34 @@ impl MailApp {
         subscriptions.push(
             cx.subscribe_in(&fwd_description, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.handle(Action::SaveAliasNote, w, cx);
+                    this.handle(Action::SaveAliasEdit, w, cx);
+                }
+            }),
+        );
+        let fwd_contact_search = input("Find a contact", false, false, window, cx);
+        subscriptions.push(cx.subscribe(&fwd_contact_search, |this, input, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                let query = input.read(cx).value().to_string();
+                this.filter_contacts(&query);
+                this.fwd_contact_page = 0;
+                cx.notify();
+            }
+        }));
+        let fwd_contact_new = input("Write to a new address", false, false, window, cx);
+        subscriptions.push(
+            cx.subscribe_in(&fwd_contact_new, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && let Some((id, alias)) = this.fwd_reverse.as_ref().and_then(|k| k.split_once(':'))
+                {
+                    let action = Action::AddContact(id.to_owned(), alias.to_owned());
+                    this.handle(action, w, cx);
                 }
             }),
         );
         let fwd_search = input("Find an alias", false, false, window, cx);
-        subscriptions.push(cx.subscribe(&fwd_search, |_, _, event, cx| {
+        subscriptions.push(cx.subscribe(&fwd_search, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
+                this.fwd_pages.clear();
                 cx.notify();
             }
         }));
@@ -1143,6 +1243,14 @@ impl MailApp {
             switch_anim: 0,
             switch_at: None,
             details_open: false,
+            source_view: SourceView::Original,
+            subs_open: false,
+            subs: Vec::new(),
+            subs_loading: false,
+            subs_generation: 0,
+            subs_scroll: UniformListScrollHandle::new(),
+            unsubscribing: HashSet::new(),
+            unsubscribed: Default::default(),
             details: None,
             original_scroll: UniformListScrollHandle::new(),
             list_scroll: UniformListScrollHandle::new(),
@@ -1180,11 +1288,20 @@ impl MailApp {
             fwd_description,
             pending_new_alias: None,
             fwd_refreshed: HashMap::new(),
-            fwd_expanded: HashSet::new(),
+            fwd_reverse: None,
+            fwd_contacts: HashMap::new(),
+            fwd_contact_search,
+            fwd_contact_new,
+            fwd_reverse_scroll: ScrollHandle::new(),
+            fwd_pages: HashMap::new(),
+            fwd_contact_page: 0,
             fwd_open: HashSet::new(),
             fwd_adding: false,
         };
         this.update_scope();
+        this.load_unsubscribed();
+        this.backfill_subscriptions(cx);
+        this.refresh_previews(cx);
         this.filter(cx);
         this.apply_theme(window, cx);
         #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -1274,6 +1391,15 @@ impl MailApp {
         if let Some(anchor) = anchor {
             self.restore_scroll(anchor);
         }
+    }
+    /// Scrolls the message list to its first row now.
+    fn scroll_list_to_top(&self) {
+        self.list_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
+        self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
     fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
@@ -1743,9 +1869,18 @@ impl MailApp {
         self.busy += 1;
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
+            // A panic in a job is reported as its error; left alone, it would
+            // end the background thread and then the app awaiting it.
             let result = cx
                 .background_executor()
-                .spawn(async move { job(backend) })
+                .spawn(async move {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(backend)))
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "Something went wrong while doing this. Please try again."
+                            ))
+                        })
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = this.busy.saturating_sub(1);
@@ -1875,6 +2010,7 @@ impl MailApp {
     ) {
         self.html_view.update(cx, |view, cx| view.clear(cx));
         Self::set(&self.unlock_input, "", w, cx);
+        self.subs_open = false;
         self.account = account;
         self.folder = mailbox.folder();
         self.remote = match &mailbox {
@@ -2003,6 +2139,8 @@ impl MailApp {
                                 message_id: String::new(),
                                 has_attachments: !d.attachments.is_empty(),
                                 gmail_id: 0,
+                                list_unsubscribe: String::new(),
+                                one_click: false,
                                 pending: false,
                                 reply_to: String::new(),
                             })
@@ -2565,7 +2703,8 @@ impl MailApp {
             cx,
             move |b| {
                 let raw = b.original(&account, &m)?;
-                let details = crate::sync::mime::details(&raw);
+                let mut details = crate::sync::mime::details(&raw, b.decrypts(&account, &raw));
+                crate::sync::auth::check(&raw, &mut details);
                 Ok(Original::new(details, &raw))
             },
             move |this, result, cx| {
@@ -3068,6 +3207,7 @@ impl MailApp {
             Action::Settings => {
                 if !self.reveal_settings_window(cx) && self.modal != Some(Modal::Settings) {
                     self.settings_scroll.set_offset(point(px(0.), px(0.)));
+                    self.fwd_reverse = None;
                     self.page = Page::General;
                     self.modal = Some(Modal::Settings);
                     self.anim += 1;
@@ -3088,6 +3228,7 @@ impl MailApp {
             Action::SubmitReconnect(id) => self.reconnect(id, w, cx),
             Action::AccountSettings(id) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
+                self.fwd_reverse = None;
                 self.page = Page::Account(id);
                 if !self.reveal_settings_window(cx) && self.modal != Some(Modal::Settings) {
                     self.modal = Some(Modal::Settings);
@@ -3108,6 +3249,7 @@ impl MailApp {
             }
             Action::SettingsPage(page) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
+                self.fwd_reverse = None;
                 if page == Page::Forwarding {
                     self.refresh_aliases_due(views::ALIAS_REFRESH_SOON, cx);
                 }
@@ -3164,7 +3306,11 @@ impl MailApp {
                     self.load_details(cx);
                 }
             }
-            Action::ShowOriginal => {
+            Action::OpenSubscriptions(id) => self.open_subscriptions(id, w, cx),
+            Action::Unsubscribe(sub) => self.unsubscribe(sub, cx),
+            Action::ShowOriginal => self.handle(Action::ShowSource(SourceView::Original), w, cx),
+            Action::ShowSource(view) => {
+                self.source_view = view;
                 self.load_details(cx);
                 self.original_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 self.modal = Some(Modal::Original);
@@ -3173,8 +3319,17 @@ impl MailApp {
             }
             Action::CopyOriginal => {
                 if let Some(raw) = self.original_source() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(raw.text.to_string()));
-                    self.notice("Original message copied", false, cx);
+                    let view = self.source_view;
+                    let Some((text, _)) = raw.view(view) else {
+                        return;
+                    };
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                    let what = match view {
+                        SourceView::Headers => "Headers",
+                        SourceView::Html => "HTML",
+                        SourceView::Original => "Original message",
+                    };
+                    self.notice(format!("{what} copied"), false, cx);
                 }
             }
             Action::SaveOriginal => self.save_original(cx),
@@ -3184,7 +3339,12 @@ impl MailApp {
             }
             Action::OpenUrl(url) => {
                 self.menu = None;
-                cx.open_url(&url);
+                // Addresses can come from an email; only web and email links
+                // are handed to the system.
+                match super::html::openable_url(&url) {
+                    Some(url) => cx.open_url(url.as_str()),
+                    None => self.notice("Picacho only opens web and email links.", true, cx),
+                }
             }
             Action::Reveal(fraction) => {
                 self.reveal = Some(fraction.clamp(0., 1.));
@@ -3346,22 +3506,39 @@ impl MailApp {
                 self.fwd_format = None;
                 Self::set(&self.fwd_prefix, prefix, w, cx);
             }
-            Action::EditAliasNote(id, alias) => {
-                let note = self
-                    .forwarding
-                    .iter()
-                    .find(|f| f.id == id)
-                    .and_then(|f| f.aliases.iter().find(|a| a.id == alias))
-                    .map(|a| a.note.clone())
-                    .unwrap_or_default();
-                self.fwd_editing = Some((id, alias));
-                Self::set(&self.fwd_description, note, w, cx);
-                self.fwd_description.update(cx, |s, cx| s.focus(w, cx));
+            Action::EditAlias(id, alias, which) => self.edit_alias(id, alias, which, w, cx),
+            Action::SaveAliasEdit => self.save_alias_edit(cx),
+            Action::CancelAliasEdit => self.fwd_editing = None,
+            Action::SetAliasPinned(id, alias, pinned) => self.set_alias_pinned(id, alias, pinned, cx),
+            Action::AliasMailboxMenu(id, alias) => {
+                let entries = self.alias_mailbox_entries(&id, &alias);
+                self.open_menu_here(entries, w, cx);
+                return;
             }
-            Action::SaveAliasNote => self.save_alias_note(cx),
-            Action::CancelAliasNote => self.fwd_editing = None,
-            Action::ShowAllAliases(id) => {
-                self.fwd_expanded.insert(id);
+            Action::ToggleAliasMailbox(id, alias, mailbox) => {
+                self.toggle_alias_mailbox(id, alias, mailbox, cx)
+            }
+            Action::SetAliasPgp(id, alias, on) => self.set_alias_pgp(id, alias, on, cx),
+            Action::ToggleReverseAliases(id, alias) => {
+                self.toggle_reverse_aliases(id, alias, w, cx)
+            }
+            Action::LoadReverseAliases(id, alias) => self.load_reverse_aliases(id, alias, cx),
+            Action::ContactMenu(id, alias, contact) => {
+                let entries = self.contact_entries(&id, &alias, &contact);
+                self.open_menu_here(entries, w, cx);
+                return;
+            }
+            Action::ToggleContactBlock(id, alias, contact) => {
+                self.toggle_contact_block(id, alias, contact, cx)
+            }
+            Action::DeleteContact(id, alias, contact) => self.delete_contact(id, alias, contact, cx),
+            Action::AddContact(id, alias) => self.add_contact(id, alias, w, cx),
+            Action::AliasPage(id, page) => {
+                self.fwd_pages.insert(id, page);
+            }
+            Action::ContactPage(page) => {
+                self.fwd_contact_page = page;
+                self.fwd_reverse_scroll.set_offset(point(px(0.), px(0.)));
             }
             Action::SetAliasEnabled(id, alias, on) => self.set_alias_enabled(id, alias, on, cx),
             Action::SetAliasDisplay(id, alias, display) => {
@@ -3637,7 +3814,9 @@ impl MailApp {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let c = self.colors();
-        let active = self.account.as_deref() == Some(account) && self.mailbox() == mailbox;
+        let active = self.account.as_deref() == Some(account)
+            && self.mailbox() == mailbox
+            && !self.subs_open;
         let count = self.unread_for(account, &mailbox);
         let entries = self.mailbox_entries(account, mailbox.clone());
         let action = Action::OpenMailbox(account.to_owned(), mailbox.clone());
@@ -4622,7 +4801,7 @@ impl MailApp {
                             .truncate()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child(m.snippet.clone()),
+                            .child(preview(&m.snippet)),
                     ),
             )
             .on_mouse_down(MouseButton::Right, {
@@ -5563,7 +5742,11 @@ impl MailApp {
             Modal::About => "About Picacho",
             Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
-            Modal::Original => "Original Message",
+            Modal::Original => match self.source_view {
+                SourceView::Headers => "Message Headers",
+                SourceView::Html => "Message HTML",
+                SourceView::Original => "Original Message",
+            },
             Modal::AvatarPresets(_) => "Choose a Picture",
             Modal::AliasGone(..) => "Alias No Longer Exists",
         };
@@ -6005,7 +6188,12 @@ impl MailApp {
                         d.child(self.resize_handle(Pane::Sidebar, cx))
                     })
                     .when(show_list, |d| {
-                        d.child(self.message_list(single, list_corners, cx))
+                        d.child(if self.subs_open {
+                            self.subscription_list(single, list_corners, cx)
+                                .into_any_element()
+                        } else {
+                            self.message_list(single, list_corners, cx).into_any_element()
+                        })
                     })
                     .when(show_reader && resizable, |d| {
                         d.child(self.resize_handle(Pane::Reader, cx))
@@ -6154,6 +6342,17 @@ fn folder_icon(f: Folder) -> &'static str {
 fn field(input: Input, c: Colors, disabled: bool) -> Input {
     input.when(!disabled, |i| i.bg(rgb(c.bg)))
 }
+/// A message's preview as the list shows it. Previews are cleaned when
+/// made; any that still carry a character reference or invisible padding
+/// (cached by an older version, say) are cleaned here.
+fn preview(snippet: &str) -> String {
+    let clean = snippet.is_ascii() && !snippet.contains('&');
+    if clean {
+        snippet.to_owned()
+    } else {
+        crate::sync::mime::snippet(snippet)
+    }
+}
 fn icon_el(name: &str, size: f32, color: u32) -> Div {
     let path = if [
         "logo",
@@ -6206,6 +6405,9 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "grid",
         "alias",
         "inboxes",
+        "pin",
+        "ban",
+        "subscriptions",
     ]
     .contains(&name)
     {
@@ -6597,14 +6799,41 @@ struct MessageInfo {
 pub(super) struct Original {
     details: crate::sync::mime::Details,
     raw: Vec<u8>,
-    text: SharedString,
-    /// Display lines, wrapped so every row has the same height.
-    lines: Vec<SharedString>,
+    /// The whole source, its header block, and its decoded HTML part (if
+    /// it has one), each with its display lines, wrapped so every row has
+    /// the same height.
+    source: (SharedString, Vec<SharedString>),
+    headers: (SharedString, Vec<SharedString>),
+    html: Option<(SharedString, Vec<SharedString>)>,
 }
 impl Original {
     const WRAP: usize = 110;
     fn new(details: crate::sync::mime::Details, raw: &[u8]) -> Self {
         let text = String::from_utf8_lossy(raw).into_owned();
+        // Headers end at the first blank line.
+        let end = [text.find("\r\n\r\n"), text.find("\n\n")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(text.len());
+        let headers = text[..end].to_owned();
+        let html = mailparse::parse_mail(raw).ok().and_then(|p| {
+            let mut leaves = Vec::new();
+            crate::sync::mime::collect_leaves(&p, &mut leaves);
+            leaves
+                .iter()
+                .find(|l| l.ctype.mimetype.eq_ignore_ascii_case("text/html"))
+                .and_then(|l| l.get_body().ok())
+        });
+        Self {
+            details,
+            raw: raw.to_vec(),
+            headers: Self::prepare(headers),
+            html: html.map(Self::prepare),
+            source: Self::prepare(text),
+        }
+    }
+    fn prepare(text: String) -> (SharedString, Vec<SharedString>) {
         let mut lines = Vec::new();
         for line in text.lines() {
             let chars: Vec<char> = line.chars().collect();
@@ -6615,12 +6844,16 @@ impl Original {
                 lines.push(chunk.iter().collect::<String>().into());
             }
         }
-        Self {
-            details,
-            raw: raw.to_vec(),
-            text: text.into(),
-            lines,
-        }
+        (text.into(), lines)
+    }
+    /// A view's text and lines; `None` for HTML when there is none.
+    pub(super) fn view(&self, view: SourceView) -> Option<(&SharedString, &Vec<SharedString>)> {
+        let (text, lines) = match view {
+            SourceView::Headers => &self.headers,
+            SourceView::Html => self.html.as_ref()?,
+            SourceView::Original => &self.source,
+        };
+        Some((text, lines))
     }
 }
 trait IfEmpty {
@@ -6637,6 +6870,22 @@ mod tests {
     use super::*;
     // `gpui::*` exports a `test` macro that would shadow the built-in one.
     use std::prelude::v1::test;
+
+    #[test]
+    fn original_splits_headers_and_html() {
+        let raw = b"From: a@example.com\r\nSubject: Hi\r\nContent-Type: multipart/alternative; boundary=X\r\n\r\n--X\r\nContent-Type: text/plain\r\n\r\nHello\r\n--X\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>\r\n--X--\r\n";
+        let o = Original::new(Default::default(), raw);
+        let (headers, _) = o.view(SourceView::Headers).unwrap();
+        assert!(headers.starts_with("From: a@example.com"));
+        assert!(headers.contains("boundary=X"));
+        assert!(!headers.contains("Hello"));
+        let (html, _) = o.view(SourceView::Html).unwrap();
+        assert_eq!(html.trim(), "<p>Hello</p>");
+        let (source, _) = o.view(SourceView::Original).unwrap();
+        assert_eq!(source.as_bytes(), raw);
+        let plain = Original::new(Default::default(), b"Subject: Hi\r\n\r\nJust text\r\n");
+        assert!(plain.view(SourceView::Html).is_none());
+    }
 
     pub(super) fn open(
         store: Arc<Store>,
