@@ -6419,6 +6419,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "url",
+ "url-sanitize-core",
  "uuid",
  "zeroize",
 ]
@@ -7131,6 +7132,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -9593,6 +9600,20 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "url-sanitize-core"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de28bc04e53d02621c41195bf4d148a3294967122e7a3698928080edac355b2c"
+dependencies = [
+ "base64 0.23.1",
+ "percent-encoding",
+ "regex-lite",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

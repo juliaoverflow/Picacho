@@ -951,6 +951,9 @@ impl MailApp {
         let all_mail = fwd::all_mail_enabled(&store);
         let alias_routes = fwd::routes(&store);
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        if clean_links {
+            crate::manage::tracking::warm_up();
+        }
         let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
         let account = tree::account_order(&tree)
             .into_iter()
@@ -3775,6 +3778,9 @@ impl MailApp {
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
+                if on {
+                    crate::manage::tracking::warm_up();
+                }
                 self.backend
                     .store
                     .set_preference_soon("clean_links", if on { "true" } else { "false" });
