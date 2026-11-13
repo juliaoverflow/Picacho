@@ -151,6 +151,7 @@ impl Backend {
             account = Account {
                 id: account.id.clone(),
                 sync: account.sync,
+                nickname: account.nickname.clone(),
                 name: if account.name.is_empty() {
                     issued.name.clone()
                 } else {

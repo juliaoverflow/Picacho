@@ -232,7 +232,7 @@ impl MailApp {
         for (i, a) in self.accounts.iter().enumerate() {
             nav = nav.child(self.settings_nav(
                 format!("settings-account-{}", a.id),
-                a.name.clone(),
+                a.label().to_owned(),
                 self.account_avatar(a, i, 20.),
                 Page::Account(a.id.clone()),
                 cx,
@@ -788,7 +788,7 @@ impl MailApp {
                                     .text_size(px(16.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .truncate()
-                                    .child(a.name.clone()),
+                                    .child(a.label().to_owned()),
                             )
                             .child(
                                 div()
@@ -802,6 +802,19 @@ impl MailApp {
             .when(self.settings_page_has_errors(), |page| {
                 page.child(self.account_error_details(a, cx))
             })
+            .child(self.section("Nickname"))
+            .child(self.setting(
+                "Nickname",
+                &format!(
+                    "Shown for this mailbox in the sidebar and Settings. Leave empty to show {}.",
+                    a.name
+                ),
+                div()
+                    .id("account-nickname")
+                    .debug_selector(|| "account-nickname".into())
+                    .max_w(px(320.))
+                    .child(field(Input::new(&self.nickname_input), c, false)),
+            ))
             .child(self.section("Profile picture"))
             .child(self.setting(
                 "Picture",
@@ -1255,6 +1268,7 @@ impl Render for SettingsWindow {
         window.set_window_title("Settings");
         let id = window.window_handle().window_id();
         let (content, menu, status, error) = self.app.update(cx, |app, cx| {
+            app.sync_nickname_input(window, cx);
             let menu = app
                 .menu
                 .as_ref()
