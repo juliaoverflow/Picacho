@@ -25,6 +25,9 @@ pub struct Subscription {
     pub name: String,
     /// Messages detected from it, each counted once across folders.
     pub count: usize,
+    /// How many of those are unread.
+    #[serde(default)]
+    pub unread: usize,
     /// Its latest message's List-Unsubscribe header and one-click support.
     pub unsubscribe: String,
     pub one_click: bool,
@@ -50,6 +53,7 @@ impl Subscription {
             address: m.from.trim().to_lowercase(),
             name: m.sender.clone(),
             count: 1,
+            unread: usize::from(m.unread),
             unsubscribe: m.list_unsubscribe.clone(),
             one_click: m.one_click,
             latest: m.date,
@@ -80,6 +84,7 @@ pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
         match by.get_mut(&sub.key()) {
             Some(existing) => {
                 existing.count += 1;
+                existing.unread += sub.unread;
                 if sub.latest > existing.latest {
                     existing.latest = sub.latest;
                     existing.name = sub.name;
@@ -100,6 +105,40 @@ pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
             .then_with(|| a.address.cmp(&b.address))
     });
     list
+}
+
+/// What makes copies of one message (in several folders, or Gmail labels)
+/// the same message.
+pub fn identity(m: &Mail) -> &str {
+    if m.message_id.is_empty() { &m.id } else { &m.message_id }
+}
+
+/// One copy of each message, in the order given. Of several copies, the
+/// Inbox's is kept, then any but the archive's (Gmail's All Mail), so a
+/// move acts on the copy a person sees.
+pub fn one_copy_each(mails: Vec<Mail>) -> Vec<Mail> {
+    let rank = |m: &Mail| match m.folder {
+        Folder::Inbox => 0,
+        Folder::Archive => 2,
+        _ => 1,
+    };
+    let mut at: HashMap<(String, String), usize> = HashMap::new();
+    let mut out: Vec<Mail> = Vec::new();
+    for m in mails {
+        let key = (m.account.clone(), identity(&m).to_owned());
+        match at.get(&key) {
+            Some(&i) => {
+                if rank(&m) < rank(&out[i]) {
+                    out[i] = m;
+                }
+            }
+            None => {
+                at.insert(key, out.len());
+                out.push(m);
+            }
+        }
+    }
+    out
 }
 
 /// How to ask a sender to stop.

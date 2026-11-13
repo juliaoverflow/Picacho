@@ -169,6 +169,29 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
     out.sort_by_key(|f| f.name.to_lowercase());
     out
 }
+/// Whether a server folder may be deleted: one of the account's own
+/// folders (not the inbox, a standard mailbox, or Gmail's system labels)
+/// without subfolders, which servers treat differently (some refuse, some
+/// leave them behind).
+pub(crate) fn deletable(names: &[Name], provider: Provider, name: &str) -> Result<()> {
+    let Some(folder) = names.iter().find(|n| n.name == name) else {
+        bail!("“{name}” is no longer on the server.");
+    };
+    ensure!(
+        custom_folders(names).iter().any(|f| f.name == name)
+            && !(provider == Provider::Gmail && name.starts_with("[Gmail]")),
+        "“{name}” is one of the mailbox's standard folders and can't be deleted."
+    );
+    let delimiter = folder.delimiter.as_deref().filter(|d| !d.is_empty());
+    if let Some(d) = delimiter {
+        let prefix = format!("{name}{d}");
+        ensure!(
+            !names.iter().any(|n| n.name.starts_with(&prefix)),
+            "“{name}” has folders inside it. Delete those first."
+        );
+    }
+    Ok(())
+}
 pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> Result<String> {
     if folder == Folder::Inbox {
         return Ok("INBOX".into());
@@ -478,6 +501,33 @@ mod extension_tests {
             internal_date(" 7-Jul-2026 02:44:25 -0700"),
             Some(1783417465)
         );
+    }
+    #[test]
+    fn only_own_leaf_folders_can_be_deleted() {
+        let name = |name: &str, attributes: &[&str]| Name {
+            name: name.into(),
+            attributes: attributes.iter().map(|a| (*a).into()).collect(),
+            delimiter: Some("/".into()),
+        };
+        let names = [
+            name("INBOX", &[]),
+            name("Sent", &["Sent"]),
+            name("Receipts", &[]),
+            name("Projects", &[]),
+            name("Projects/2024", &[]),
+            name("[Gmail]", &["NoSelect"]),
+            name("[Gmail]/Starred", &[]),
+        ];
+        assert!(deletable(&names, Provider::Imap, "Receipts").is_ok());
+        assert!(deletable(&names, Provider::Imap, "Projects/2024").is_ok());
+        let refused = |n: &str, provider| {
+            deletable(&names, provider, n).unwrap_err().to_string()
+        };
+        assert!(refused("INBOX", Provider::Imap).contains("standard"));
+        assert!(refused("Sent", Provider::Imap).contains("standard"));
+        assert!(refused("Projects", Provider::Imap).contains("folders inside"));
+        assert!(refused("[Gmail]/Starred", Provider::Gmail).contains("standard"));
+        assert!(refused("Gone", Provider::Imap).contains("no longer"));
     }
     #[test]
     fn uid_ranges_are_compact() {

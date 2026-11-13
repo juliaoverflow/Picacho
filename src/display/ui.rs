@@ -47,7 +47,7 @@ use super::html::{HtmlContextMenu, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::subscriptions::Subscription as MailSubscription;
-use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource};
+use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource, SignInStep};
 use crate::{
     manage::{
         backend::{Backend, Change},
@@ -306,6 +306,8 @@ enum Modal {
     About,
     Help,
     RemoveAccount(String),
+    /// Confirms deleting a folder on an account's server: (account, folder).
+    DeleteFolder(String, String),
     Reconnect(String),
     /// The raw source of the open message.
     Original,
@@ -453,6 +455,10 @@ enum Action {
     NewSeparator(Option<String>),
     RenameFolder(String),
     DeleteFolder(String),
+    /// Asks to delete an account's folder on its server: (account, folder).
+    DeleteRemoteFolder(String, String),
+    /// Deletes it, as confirmed in the dialog.
+    ConfirmDeleteFolder(String, String),
     RemoveSeparator(String),
     ConfirmRemove(String),
     ToggleSidebar,
@@ -508,6 +514,16 @@ enum Action {
     OpenSubscriptions(String),
     /// Asks a subscription's sender to stop, from the list or an email.
     Unsubscribe(MailSubscription),
+    /// Lists a subscription's mail in place of the subscriptions.
+    OpenSubscription(MailSubscription),
+    /// Back from a subscription's mail to the subscriptions.
+    CloseSubscription,
+    /// Shows subscribed (false) or unsubscribed (true) senders.
+    SubscriptionsTab(bool),
+    /// Marks or moves all of a subscription's mail.
+    ChangeSubscription(MailSubscription, Change),
+    /// What can be done with all of a subscription's mail.
+    SubscriptionMenu(MailSubscription),
     /// Opens the open message's headers, HTML or whole source.
     ShowSource(SourceView),
     CopyOriginal,
@@ -524,6 +540,7 @@ enum Action {
     Start,
     Discover,
     SetupBack,
+    RetrySignIn,
     Manual,
     Finish,
     #[cfg(feature = "sample-data")]
@@ -702,6 +719,10 @@ pub struct MailApp {
     provider: Provider,
     oauth: bool,
     connecting: bool,
+    /// The last sign-in failed after the browser and can be retried as is.
+    sign_in_retry: bool,
+    /// How far the running sign-in has come, followed from the backend.
+    sign_in_step: SignInStep,
     cancel: Arc<AtomicBool>,
     onboarding: bool,
     step: Step,
@@ -795,6 +816,18 @@ pub struct MailApp {
     subs_loading: bool,
     subs_generation: u64,
     subs_scroll: UniformListScrollHandle,
+    /// Subscribed or Unsubscribed senders.
+    subs_tab: subscriptions::SubsTab,
+    /// The subscription whose mail is listed, in place of the subscriptions.
+    subs_sender: Option<MailSubscription>,
+    subs_sender_loading: bool,
+    /// Subscriptions whose mail is being marked or moved, by key.
+    subs_busy: HashSet<String>,
+    /// Server folders being deleted: (account, folder).
+    deleting_folders: HashSet<(String, String)>,
+    /// Where the sender's mail list was scrolled when a message opened over
+    /// it, put back when the message closes.
+    subs_return: Cell<Option<Point<Pixels>>>,
     /// Subscriptions being, or already, unsubscribed from.
     unsubscribing: HashSet<String>,
     unsubscribed: HashSet<String>,
@@ -1197,6 +1230,8 @@ impl MailApp {
             provider: Provider::Gmail,
             oauth: false,
             connecting: false,
+            sign_in_retry: false,
+            sign_in_step: SignInStep::Browser,
             cancel: Arc::new(AtomicBool::new(false)),
             onboarding,
             step: Step::Welcome,
@@ -1254,6 +1289,12 @@ impl MailApp {
             subs_loading: false,
             subs_generation: 0,
             subs_scroll: UniformListScrollHandle::new(),
+            subs_tab: subscriptions::SubsTab::Subscribed,
+            subs_sender: None,
+            subs_sender_loading: false,
+            subs_busy: HashSet::new(),
+            deleting_folders: HashSet::new(),
+            subs_return: Cell::new(None),
             unsubscribing: HashSet::new(),
             unsubscribed: Default::default(),
             details: None,
@@ -1427,7 +1468,8 @@ impl MailApp {
             .filter(|(_, m)| m.matches(&query))
             // Views leave out mail of aliases shown on their own, or list
             // only an alias's mail.
-            .filter(|(_, m)| m.pending || self.scope.admits(m))
+            // A subscription's mail is listed whole, as its counts are.
+            .filter(|(_, m)| m.pending || self.subs_open || self.scope.admits(m))
             .map(|(i, _)| i)
             .collect();
         if self.oldest_first {
@@ -1704,10 +1746,126 @@ impl MailApp {
             entries.push(entry(
                 "Mark All as Read",
                 "mail-open",
-                Action::MarkAllRead(id.into(), mailbox),
+                Action::MarkAllRead(id.into(), mailbox.clone()),
+            ));
+        }
+        if let Mailbox::Remote(name) = mailbox
+            && self.folder_deletable(id, &name)
+        {
+            entries.push(Entry::Separator);
+            entries.push(danger(
+                "Delete Folder…",
+                "trash",
+                Action::DeleteRemoteFolder(id.into(), name),
             ));
         }
         entries
+    }
+    /// Whether a server folder can be offered for deleting: one of the
+    /// account's own, on a server that keeps folders. The server has the
+    /// last word (subfolders, access rights).
+    fn folder_deletable(&self, id: &str, name: &str) -> bool {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id) else {
+            return false;
+        };
+        Backend::can_delete_folders(a)
+            && !(a.provider == Provider::Gmail && name.starts_with("[Gmail]"))
+            && self
+                .folders
+                .get(id)
+                .is_some_and(|fs| fs.iter().any(|f| f.name == name))
+    }
+    /// A folder's name as the sidebar shows it.
+    fn folder_label(&self, id: &str, name: &str) -> String {
+        self.folders
+            .get(id)
+            .and_then(|fs| fs.iter().find(|f| f.name == name))
+            .map_or_else(|| name.to_owned(), |f| f.label.clone())
+    }
+    /// The Delete Folder dialog: what deleting does on this account's server.
+    fn delete_folder_modal(&self, id: &str, name: &str) -> AnyElement {
+        let c = self.colors();
+        let label = self.folder_label(id, name);
+        let (email, gmail) = self
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| (a.email.clone(), a.provider == Provider::Gmail))
+            .unwrap_or_default();
+        div()
+            .id("delete-folder")
+            .debug_selector(|| "delete-folder".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format!("Delete “{label}”?")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if gmail {
+                        format!("The label is removed from {email}. Its messages stay in All Mail.")
+                    } else {
+                        format!(
+                            "The folder and the messages in it are deleted from {email}'s server. This can't be undone."
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+    /// Deletes a folder on the account's server, as confirmed in the dialog,
+    /// and forgets its cached mail. Its view closes if it was open.
+    fn delete_remote_folder(&mut self, id: String, name: String, cx: &mut Context<Self>) {
+        if !self.folder_deletable(&id, &name) || !self.deleting_folders.insert((id.clone(), name.clone())) {
+            return;
+        }
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            self.deleting_folders.remove(&(id, name));
+            return;
+        };
+        let label = self.folder_label(&id, &name);
+        let deleting = name.clone();
+        self.task(
+            cx,
+            move |b| b.delete_remote_folder(&a, &deleting),
+            move |this, result, cx| {
+                this.deleting_folders.remove(&(id.clone(), name.clone()));
+                // The dialog stays up, showing progress, until it is done.
+                if this.modal == Some(Modal::DeleteFolder(id.clone(), name.clone())) {
+                    this.modal = None;
+                }
+                match result {
+                    Ok(folders) => {
+                        this.folders.insert(id.clone(), folders);
+                        this.notice(format!("Deleted “{label}”"), false, cx);
+                        // Its view is gone; show the account's inbox.
+                        if this.account.as_ref() == Some(&id)
+                            && this.mailbox() == Mailbox::Remote(name.clone())
+                        {
+                            this.load_generation += 1;
+                            this.subs_open = false;
+                            this.remote.clear();
+                            this.folder = Folder::Inbox;
+                            this.update_scope();
+                            this.selected = None;
+                            this.messages.clear();
+                            this.filter(cx);
+                            this.reload_cached(cx);
+                            this.refresh(cx);
+                        }
+                        this.refresh_counts(cx);
+                    }
+                    Err(e) => this.notice(format!("Couldn't delete “{label}”: {e:#}"), true, cx),
+                }
+                cx.notify();
+            },
+        );
+        cx.notify();
     }
     fn mail_entries(&self, id: &str) -> Vec<Entry> {
         if self.folder == Folder::Drafts {
@@ -1994,7 +2152,9 @@ impl MailApp {
                     }
                     if visible {
                         this.reload_cached(cx);
-                        if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
+                        if !this.subs_open
+                            && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
+                        {
                             this.catalog_mailbox(a, catalog, cx);
                         }
                     }
@@ -2016,6 +2176,8 @@ impl MailApp {
         self.html_view.update(cx, |view, cx| view.clear(cx));
         Self::set(&self.unlock_input, "", w, cx);
         self.subs_open = false;
+        self.subs_sender = None;
+        self.subs_return.set(None);
         self.account = account;
         self.folder = mailbox.folder();
         self.remote = match &mailbox {
@@ -2073,6 +2235,11 @@ impl MailApp {
     /// Reload confirmed cache state after a failed or partly applied operation.
     /// A generation check prevents an old request from replacing a newer view.
     fn reload_cached(&mut self, cx: &mut Context<Self>) {
+        if self.subs_open {
+            // Subscriptions list their own mail, not the mailbox under them.
+            self.reload_subscriptions(cx);
+            return;
+        }
         if self.account.is_none() {
             return;
         }
@@ -2167,6 +2334,11 @@ impl MailApp {
             return;
         }
         self.html_view.update(cx, |view, cx| view.clear(cx));
+        // A subscription's mail list gives way to the message; keep its place.
+        if self.subs_open && self.selected.is_none() {
+            self.subs_return
+                .set(Some(self.list_scroll.0.borrow().base_handle.offset()));
+        }
         self.selected = Some(id.clone());
         self.details_open = false;
         self.quotes_open = false;
@@ -2278,8 +2450,12 @@ impl MailApp {
                 Change::Move(folder) => m.folder = folder,
             }
         }
-        let leaves = matches!(change, Change::Move(_))
-            || (self.folder == Folder::Starred && change == Change::Star(false));
+        // A subscription lists its mail in every folder but Spam and Trash.
+        let leaves = match change {
+            Change::Move(folder) if self.subs_open => matches!(folder, Folder::Junk | Folder::Trash),
+            Change::Move(_) => true,
+            _ => self.folder == Folder::Starred && change == Change::Star(false),
+        };
         if leaves {
             self.messages.retain(|m| !ids.contains(&m.id));
             if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
@@ -2386,6 +2562,10 @@ impl MailApp {
                 self.sync_selecting();
             } else if self.search_open {
                 self.close_search(w, cx);
+            } else if self.subs_open && self.selected.is_some() {
+                self.handle(Action::BackToList, w, cx);
+            } else if self.subs_open && self.subs_sender.is_some() {
+                self.close_subscription(w, cx);
             } else if w.viewport_size().width < px(900.) {
                 self.selected = None;
                 self.read_generation += 1;
@@ -2395,6 +2575,8 @@ impl MailApp {
         }
         self.cancel.store(true, Ordering::Relaxed);
         self.connecting = false;
+        self.sign_in_retry = false;
+        self.backend.forget_sign_in();
         self.discovering = false;
         self.setup_generation += 1;
         self.modal = None;
@@ -2412,6 +2594,8 @@ impl MailApp {
             Self::set(&self.form[i], "", w, cx);
         }
         self.cancel.store(true, Ordering::Relaxed);
+        self.sign_in_retry = false;
+        self.backend.forget_sign_in();
         self.setup_generation += 1;
         self.step = step;
         self.discovering = false;
@@ -2634,16 +2818,52 @@ impl MailApp {
             self.notice("This account is already added.", true, cx);
             return;
         }
+        self.sign_in_step = SignInStep::Browser;
+        self.start_connect(cx, move |b, cancel| b.connect(&a, password, &taken, cancel));
+    }
+    /// Follows the backend's progress on this sign-in until it ends or is
+    /// replaced, so the waiting text moves on once the browser answers.
+    pub(super) fn follow_sign_in(&mut self, cx: &mut Context<Self>) {
+        let cancel = self.cancel.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(150)).await;
+                let running = this.update(cx, |this, cx| {
+                    if !this.connecting || !Arc::ptr_eq(&this.cancel, &cancel) {
+                        return false;
+                    }
+                    let step = this.backend.sign_in_step();
+                    if step != this.sign_in_step {
+                        this.sign_in_step = step;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    /// Runs a new-account sign-in (or its retry) and applies the result.
+    fn start_connect(
+        &mut self,
+        cx: &mut Context<Self>,
+        sign_in: impl FnOnce(&Backend, Arc<AtomicBool>) -> anyhow::Result<Account> + Send + 'static,
+    ) {
         self.connecting = true;
+        self.sign_in_retry = false;
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let cancelled = cancel.clone();
         self.status.clear();
         self.error = false;
+        self.follow_sign_in(cx);
         self.task(
             cx,
             move |b| {
-                let saved = b.connect(&a, password, &taken, cancel)?;
+                let saved = sign_in(&b, cancel)?;
                 let encrypted = saved.service == Service::Pinal && b.encrypted(&saved);
                 Ok((saved, encrypted))
             },
@@ -2679,10 +2899,30 @@ impl MailApp {
                         }
                         this.refresh(cx);
                     }
-                    Err(e) => this.notice(e.to_string(), true, cx),
+                    // The whole chain: a bare "Sign-in needs attention" hides
+                    // whether the token step or the mail server refused.
+                    Err(e) => {
+                        this.sign_in_retry = this.backend.can_retry_sign_in();
+                        this.notice(format!("{e:#}"), true, cx)
+                    }
                 }
             },
         );
+    }
+    /// Repeats the step after the browser that failed, in the open setup or
+    /// sign-in-again form.
+    fn retry_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.connecting || !self.sign_in_retry {
+            return;
+        }
+        match self.modal.clone() {
+            Some(Modal::Reconnect(id)) => self.retry_reconnect(id, cx),
+            _ if self.step == Step::Credentials => {
+                self.sign_in_step = SignInStep::Finishing;
+                self.start_connect(cx, |b, cancel| b.retry_sign_in(cancel))
+            }
+            _ => {}
+        }
     }
     /// Reads the open message's original source and its details once.
     fn load_details(&mut self, cx: &mut Context<Self>) {
@@ -3009,6 +3249,13 @@ impl MailApp {
             Action::NewSeparator(parent) => self.new_separator(parent, w, cx),
             Action::RenameFolder(id) => self.start_rename(id, w, cx),
             Action::DeleteFolder(id) => self.delete_folder(&id),
+            Action::DeleteRemoteFolder(id, name) => {
+                if self.folder_deletable(&id, &name) {
+                    self.modal = Some(Modal::DeleteFolder(id, name));
+                    self.anim += 1;
+                }
+            }
+            Action::ConfirmDeleteFolder(id, name) => self.delete_remote_folder(id, name, cx),
             Action::RemoveSeparator(id) => self.remove_separator(&id),
             Action::ToggleSubfolders(id) => {
                 let key = format!("folders:{id}");
@@ -3129,7 +3376,25 @@ impl MailApp {
                     self.discover(w, cx);
                 }
             }
+            Action::RetrySignIn => self.retry_sign_in(cx),
+            Action::OpenSubscription(sub) => self.open_subscription(sub, cx),
+            Action::CloseSubscription => self.close_subscription(w, cx),
+            Action::SubscriptionsTab(unsubscribed) => {
+                self.subs_tab = if unsubscribed {
+                    subscriptions::SubsTab::Unsubscribed
+                } else {
+                    subscriptions::SubsTab::Subscribed
+                };
+                self.subs_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+            Action::ChangeSubscription(sub, change) => self.change_subscription(sub, change, cx),
+            Action::SubscriptionMenu(sub) => {
+                let entries = self.subscription_entries(&sub);
+                self.open_menu(w.mouse_position(), entries, cx);
+            }
             Action::SetupBack => {
+                self.sign_in_retry = false;
+                self.backend.forget_sign_in();
                 if self.connecting {
                     self.cancel.store(true, Ordering::Relaxed);
                     self.connecting = false;
@@ -3260,6 +3525,8 @@ impl MailApp {
                 }
                 self.cancel.store(true, Ordering::Relaxed);
                 self.connecting = false;
+                self.sign_in_retry = false;
+                self.backend.forget_sign_in();
                 self.status.clear();
                 Self::set(&self.form[PASSWORD], "", w, cx);
                 self.modal = Some(Modal::Reconnect(id));
@@ -5290,7 +5557,9 @@ impl MailApp {
             ),
             Step::Credentials if browser => (
                 format!("Sign in to {label}"),
-                if self.connecting {
+                if self.connecting && self.sign_in_step != SignInStep::Browser {
+                    "Picacho has your sign-in and is setting up the account.".into()
+                } else if self.connecting {
                     "Continue in the browser window that just opened.".into()
                 } else {
                     "Sign in with your browser. Picacho never sees your password.".into()
@@ -5399,7 +5668,7 @@ impl MailApp {
                         .text_size(px(13.))
                         .text_color(rgb(c.muted))
                         .child(spinner(16., c.accent))
-                        .child("Waiting for your browser…"),
+                        .child(self.sign_in_step.label()),
                 )
             }
             _ => {}
@@ -5425,6 +5694,11 @@ impl MailApp {
             ),
             Step::Provider => None,
             Step::Credentials if browser && self.connecting => None,
+            Step::Credentials if self.sign_in_retry => Some(
+                self.button("setup-retry", "Retry", "", Action::RetrySignIn, true, cx)
+                    .min_w(px(120.))
+                    .into_any_element(),
+            ),
             _ => Some(self.setup_submit(cx)),
         };
         let mut actions = div()
@@ -5444,6 +5718,19 @@ impl MailApp {
             }),
             _ => None,
         };
+        if self.step == Step::Credentials && self.sign_in_retry && !self.connecting {
+            // Retry reuses what the browser returned; this starts over.
+            actions = actions.child(self.link(
+                "setup-start-over",
+                if browser {
+                    "Open Browser Again"
+                } else {
+                    "Connect Again"
+                },
+                Action::SubmitAccount,
+                cx,
+            ));
+        }
         if let Some(back) = back {
             actions = actions.child(self.link("onboard-back", back, Action::SetupBack, cx));
         }
@@ -5783,6 +6070,7 @@ impl MailApp {
             Modal::About => "About Picacho",
             Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
+            Modal::DeleteFolder(..) => "Delete Folder",
             Modal::Original => match self.source_view {
                 SourceView::Headers => "Message Headers",
                 SourceView::Html => "Message HTML",
@@ -5798,6 +6086,7 @@ impl MailApp {
             Modal::About => self.about_modal(),
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
+            Modal::DeleteFolder(id, name) => self.delete_folder_modal(id, name),
             Modal::Original => self.original_modal(cx),
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
@@ -5814,6 +6103,7 @@ impl MailApp {
                 Modal::Help => 460.,
                 Modal::AvatarPresets(_) => 560.,
                 Modal::RemoveAccount(_)
+                | Modal::DeleteFolder(..)
                 | Modal::Reconnect(_)
                 | Modal::About
                 | Modal::AliasGone(..) => 400.,
@@ -5949,13 +6239,43 @@ impl MailApp {
                     )
                     .bg(rgb(c.danger)),
                 );
+        } else if let Modal::DeleteFolder(id, name) = modal {
+            let deleting = self.deleting_folders.contains(&(id.clone(), name.clone()));
+            footer = footer
+                .child(div().flex_1())
+                .child(self.button("delete-folder-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(
+                    self.button(
+                        "delete-folder-confirm",
+                        if deleting { "Deleting…" } else { "Delete" },
+                        "",
+                        Action::ConfirmDeleteFolder(id.clone(), name.clone()),
+                        true,
+                        cx,
+                    )
+                    .bg(rgb(c.danger))
+                    .when(deleting, |d| d.opacity(0.7)),
+                );
         } else if let Modal::Reconnect(id) = modal {
-            footer = footer.child(div().flex_1()).child(self.button(
+            footer = footer.child(div().flex_1());
+            if self.sign_in_retry && !self.connecting {
+                footer = footer.child(self.button(
+                    "reconnect-retry",
+                    "Retry",
+                    "",
+                    Action::RetrySignIn,
+                    false,
+                    cx,
+                ));
+            }
+            footer = footer.child(self.button(
                 "reconnect-submit",
-                if self.connecting {
+                if !self.connecting {
+                    "Sign In"
+                } else if self.sign_in_step == SignInStep::Browser {
                     "Signing in…"
                 } else {
-                    "Sign In"
+                    self.sign_in_step.label()
                 },
                 "",
                 Action::SubmitReconnect(id.clone()),
@@ -6188,8 +6508,15 @@ impl MailApp {
         // corners they touch; GPUI clips children only to rectangles.
         let corners = window::window_corners(window);
         let show_sidebar = !(single && self.selected.is_some() && width < px(480.));
-        let show_list = !single || self.selected.is_none();
-        let show_reader = !single || self.selected.is_some();
+        // Subscriptions list senders in the middle and one sender's mail
+        // (or a message of it) on the right.
+        let open = if self.subs_open {
+            self.subs_sender.is_some()
+        } else {
+            self.selected.is_some()
+        };
+        let show_list = !single || !open;
+        let show_reader = !single || open;
         let list_corners = Corners {
             bottom_left: if show_sidebar {
                 px(0.)
@@ -6240,12 +6567,28 @@ impl MailApp {
                         d.child(self.resize_handle(Pane::Reader, cx))
                     })
                     .when(show_reader, |d| {
-                        d.child(self.reader_pane(
-                            resizable.then_some(layout.reader),
-                            reader_corners,
-                            window,
-                            cx,
-                        ))
+                        d.child(if self.subs_open {
+                            // A collapsed reader still gives a sender's mail room.
+                            let room = if self.reader_collapsed {
+                                (f32::from(width) - layout.sidebar - LIST_MIN).max(panes::READER_MIN)
+                            } else {
+                                layout.reader
+                            };
+                            self.subscription_mail_pane(
+                                resizable.then_some(room),
+                                reader_corners,
+                                single,
+                                window,
+                                cx,
+                            )
+                        } else {
+                            self.reader_pane(
+                                resizable.then_some(layout.reader),
+                                reader_corners,
+                                window,
+                                cx,
+                            )
+                        })
                     }),
             )
             .when(self.modal.is_none() && !self.status.is_empty(), |d| {
@@ -7126,6 +7469,51 @@ mod tests {
         cx.debug_bounds(selector)
             .unwrap_or_else(|| panic!("{selector} was not rendered"))
             .center()
+    }
+
+    #[gpui::test]
+    fn only_server_folders_offer_deleting(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        let labels = |mailbox: Mailbox, cx: &mut VisualTestContext| {
+            view.read_with(cx, |this, _| {
+                this.mailbox_entries(&id, mailbox)
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        Entry::Item { label, .. } => Some(label.to_string()),
+                        Entry::Separator => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let receipts = labels(Mailbox::Remote("INBOX/Receipts".into()), cx);
+        assert_eq!(receipts.last().map(String::as_str), Some("Delete Folder…"));
+        for standard in [Folder::Inbox, Folder::Sent, Folder::Trash] {
+            assert!(!labels(standard.into(), cx).contains(&"Delete Folder…".to_owned()));
+        }
+        // Choosing it asks in the app's own dialog; Cancel changes nothing.
+        act(&view, Action::DeleteRemoteFolder(id.clone(), "INBOX/Receipts".into()), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert!(
+                this.modal == Some(Modal::DeleteFolder(id.clone(), "INBOX/Receipts".into()))
+            )
+        });
+        for part in ["modal-panel", "delete-folder", "delete-folder-confirm", "delete-folder-cancel"] {
+            assert!(cx.debug_bounds(part).is_some(), "{part}");
+        }
+        act(&view, Action::Close, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.modal.is_none());
+            assert!(this.deleting_folders.is_empty());
+        });
+        // Standard folders don't open it.
+        act(&view, Action::DeleteRemoteFolder(id.clone(), "INBOX".into()), cx);
+        view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+        // POP mailboxes have no folders on the server to delete.
+        view.update(cx, |this, _| this.accounts[0].provider = Provider::Pop3);
+        assert!(!labels(Mailbox::Remote("INBOX/Receipts".into()), cx)
+            .contains(&"Delete Folder…".to_owned()));
     }
 
     #[gpui::test]

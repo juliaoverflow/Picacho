@@ -333,12 +333,26 @@ fn identity(id_token: &str) -> Identity {
     }
 }
 
+/// What the browser handed back: an authorization code and the values that
+/// redeem it. Kept so a failed token request can be sent again without
+/// another trip through the browser while the code is still unused.
+pub struct Grant {
+    code: String,
+    redirect: String,
+    verifier: String,
+}
+impl std::fmt::Debug for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Grant { .. }")
+    }
+}
+
 /// Signs in to Gmail or Outlook in the browser. The account's email may be
 /// empty: the provider's ID token says which account was chosen.
-pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<(Secret, Identity)> {
+pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     let microsoft = account.provider == Provider::Outlook;
     let browser = Browser::new(if microsoft { "localhost" } else { "127.0.0.1" }, "/")?;
-    let (auth, token, scope) = endpoints(account.provider);
+    let (auth, _, scope) = endpoints(account.provider);
     let mut url = url::Url::parse(auth)?;
     url.query_pairs_mut().extend_pairs([
         ("client_id", account.client_id.as_str()),
@@ -361,12 +375,24 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<(Secret, 
             .append_pair("prompt", "select_account");
     }
     let code = browser.code(&url, &cancel)?;
+    Ok(Grant {
+        code,
+        redirect: browser.redirect.clone(),
+        verifier: browser.verifier.clone(),
+    })
+}
+
+/// Exchanges the browser's code for tokens and says who signed in. A
+/// provider rejection (`AccessFailure::Authentication`) means the code is
+/// spent; any other failure may be retried with the same grant.
+pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
+    let (_, token, _) = endpoints(account.provider);
     let mut fields = vec![
         ("client_id", account.client_id.as_str()),
-        ("code", &code),
-        ("redirect_uri", &browser.redirect),
+        ("code", &grant.code),
+        ("redirect_uri", &grant.redirect),
         ("grant_type", "authorization_code"),
-        ("code_verifier", &browser.verifier),
+        ("code_verifier", &grant.verifier),
     ];
     if !account.client_secret.is_empty() {
         fields.push(("client_secret", &account.client_secret));
@@ -420,7 +446,8 @@ impl PinalMailbox {
 }
 /// Signs in to Pinal Accounts with OpenID Connect, then exchanges the
 /// access token for the primary mailbox's settings and an app password.
-pub fn pinal(cancel: Arc<AtomicBool>) -> Result<PinalMailbox> {
+/// `answered` runs once the browser hands back its code.
+pub fn pinal(cancel: Arc<AtomicBool>, answered: &dyn Fn()) -> Result<PinalMailbox> {
     let origin = pinal_accounts();
     let client_id = pinal_client_id();
     let http = http()?;
@@ -467,6 +494,7 @@ pub fn pinal(cancel: Arc<AtomicBool>) -> Result<PinalMailbox> {
         ("code_challenge_method", "S256"),
     ]);
     let code = browser.code(&url, &cancel)?;
+    answered();
     let (secret, _) = exchange(
         token.as_str(),
         &[
@@ -499,10 +527,17 @@ fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_js
     let response = http()?.post(endpoint).form(fields).send()?;
     let status = response.status();
     let value: serde_json::Value = response.json()?;
-    // Do not include the provider response: it can contain credentials or codes.
+    // Do not include the whole provider response: it can contain credentials
+    // or codes. The error code and Microsoft's AADSTS number are safe to show.
     if !status.is_success() {
-        let error =
-            anyhow::anyhow!("Sign-in failed at the token step ({status}). Please try again.");
+        let code = value["error"].as_str().unwrap_or("unknown");
+        let aadsts = value["error_codes"][0]
+            .as_i64()
+            .map(|n| format!(", AADSTS{n}"))
+            .unwrap_or_default();
+        let error = anyhow::anyhow!(
+            "Sign-in failed at the token step ({status}: {code}{aadsts}). Please try again."
+        );
         return Err(
             if matches!(
                 value["error"].as_str(),

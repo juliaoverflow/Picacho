@@ -9,6 +9,27 @@ pub struct DownloadStatus {
     pub paused: bool,
 }
 
+/// How far a sign-in has come, so the waiting text can follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignInStep {
+    /// Waiting for the person to finish in the browser.
+    #[default]
+    Browser,
+    /// The browser answered; exchanging its code with the provider.
+    Finishing,
+    /// Signing in to the incoming mail server.
+    Mailbox,
+}
+impl SignInStep {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Browser => "Waiting for your browser…",
+            Self::Finishing => "Signed in. Finishing up…",
+            Self::Mailbox => "Connecting to your mailbox…",
+        }
+    }
+}
+
 /// Typed boundaries keep transport failures distinct from rejected credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessFailure {

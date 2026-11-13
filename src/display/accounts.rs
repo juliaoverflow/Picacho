@@ -54,16 +54,35 @@ impl MailApp {
             return;
         }
         Self::set(&self.form[PASSWORD], "", w, cx);
+        self.sign_in_step = SignInStep::Browser;
+        self.start_reconnect(id, cx, move |b, cancel| b.reconnect(&a, password, cancel));
+    }
+    /// Repeats a sign-in-again that failed after the browser.
+    pub(super) fn retry_reconnect(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.connecting || !self.accounts.iter().any(|a| a.id == id) {
+            return;
+        }
+        self.sign_in_step = SignInStep::Finishing;
+        self.start_reconnect(id, cx, |b, cancel| b.retry_sign_in(cancel));
+    }
+    fn start_reconnect(
+        &mut self,
+        id: String,
+        cx: &mut Context<Self>,
+        sign_in: impl FnOnce(&Backend, Arc<AtomicBool>) -> anyhow::Result<Account> + Send + 'static,
+    ) {
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let cancelled = cancel.clone();
         self.connecting = true;
+        self.sign_in_retry = false;
         self.retrying.insert(id.clone());
         self.status.clear();
+        self.follow_sign_in(cx);
         self.task(
             cx,
             move |b| {
-                let next = b.reconnect(&a, password, cancel)?;
+                let next = sign_in(&b, cancel)?;
                 let encrypted = next.service == Service::Pinal && b.encrypted(&next);
                 Ok((next, encrypted))
             },
@@ -96,7 +115,10 @@ impl MailApp {
                         this.page = Page::Account(id.clone());
                         this.retry_account(id, cx);
                     }
-                    Err(error) => this.notice(format!("{error:#}"), true, cx),
+                    Err(error) => {
+                        this.sign_in_retry = this.backend.can_retry_sign_in();
+                        this.notice(format!("{error:#}"), true, cx)
+                    }
                 }
             },
         );

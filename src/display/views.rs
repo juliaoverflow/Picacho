@@ -1520,4 +1520,100 @@ mod tests {
             assert!(!this.unsubscribed.contains(&other.key()));
         });
     }
+
+    #[gpui::test]
+    fn subscription_opens_its_mail_and_comes_back_to_it(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        // More mail from The Browser: enough to scroll, one of it unread.
+        view.update(cx, |this, _| {
+            let base = this
+                .backend
+                .store
+                .message(&format!("{work}:demo-9"))
+                .unwrap()
+                .unwrap();
+            let extra: Vec<Mail> = (0..30)
+                .map(|i| Mail {
+                    id: format!("{work}:browser-{i}"),
+                    uid: 100 + i,
+                    message_id: format!("<browser-{i}@thebrowser.com>"),
+                    unread: i == 0,
+                    date: base.date - 10_000 - i as i64 * 60,
+                    ..base.clone()
+                })
+                .collect();
+            this.backend.store.save_messages(&extra).unwrap();
+        });
+        act(&view, Action::OpenSubscriptions(work.clone()), cx);
+        frame(cx);
+        let sub = view.read_with(cx, |this, _| {
+            assert_eq!(this.subs[0].count, 31);
+            assert_eq!(this.subs[0].unread, 1);
+            this.subs[0].clone()
+        });
+        assert!(cx.debug_bounds("subs-tab-unsubscribed").is_some());
+        // What to do with all of its mail is in a menu, not beside it.
+        assert!(cx.debug_bounds("subscription-0-menu").is_some());
+        assert!(cx.debug_bounds("subscription-0-read").is_none());
+        view.read_with(cx, |this, _| {
+            let labels: Vec<String> = this
+                .subscription_entries(&sub)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                ["Mark All as Read", "Move All to Inbox", "Archive All", "Move All to Spam", "Move All to Trash"]
+            );
+        });
+        // Clicking it lists its mail on the right, beside the subscriptions.
+        act(&view, Action::OpenSubscription(sub.clone()), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.messages.len(), 31);
+            assert_eq!(this.visible.len(), 31);
+        });
+        let list = cx.debug_bounds("subscription-list").unwrap();
+        let mail = cx.debug_bounds("subscription-mail-pane").unwrap();
+        assert!(mail.left() >= list.right(), "{list:?} {mail:?}");
+        assert!(cx.debug_bounds("sender-menu").is_some());
+        // A message opens in place of the list, which keeps its place.
+        let offset = point(px(0.), px(-400.));
+        view.update(cx, |this, _| {
+            this.list_scroll.0.borrow().base_handle.set_offset(offset)
+        });
+        frame(cx);
+        let id = view.read_with(cx, |this, _| this.messages[this.visible[10]].id.clone());
+        act(&view, Action::Select(id.clone()), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| assert_eq!(this.selected.as_ref(), Some(&id)));
+        assert!(cx.debug_bounds("subscription-mail-back").is_some());
+        view.read_with(cx, |this, _| assert!(this.selected_ref().is_some(), "the message shows"));
+        act(&view, Action::BackToList, cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selected.is_none());
+            assert_eq!(this.messages.len(), 31);
+            assert_eq!(this.list_scroll.0.borrow().base_handle.offset(), offset);
+        });
+        assert!(cx.debug_bounds("subscription-list").is_some());
+        // Back to the subscriptions; unsubscribed senders have their own tab.
+        act(&view, Action::CloseSubscription, cx);
+        view.update(cx, |this, _| {
+            this.unsubscribed.insert(sub.key());
+        });
+        view.read_with(cx, |this, _| {
+            assert!(this.subs_sender.is_none());
+            assert!(this.subs_shown().iter().all(|&i| this.subs[i].key() != sub.key()));
+        });
+        act(&view, Action::SubscriptionsTab(true), cx);
+        view.read_with(cx, |this, _| {
+            let shown = this.subs_shown();
+            assert_eq!(shown.len(), 1);
+            assert_eq!(this.subs[shown[0]].key(), sub.key());
+        });
+    }
 }

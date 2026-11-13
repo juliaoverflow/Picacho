@@ -755,3 +755,87 @@ fn catalog_lists_the_whole_mailbox_in_batches_without_refetching() -> Result<()>
     std::fs::remove_dir_all(path)?;
     result
 }
+
+/// Deleting a server folder: refused when the server withholds the right
+/// (nothing changes), done when it allows it, and its cached mail forgotten.
+#[test]
+fn imap_folder_delete_follows_the_servers_rights() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut deleted = Vec::new();
+        // The first sign-in lacks the right; the refusal drops its connection.
+        for allowed in [false, true] {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+            r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+            let mut gone = false;
+            loop {
+                let mut line = String::new();
+                // A failed operation drops its connection without LOGOUT.
+                if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                let upper = command.to_ascii_uppercase();
+                let mut out = String::new();
+                if upper.starts_with("LOGIN") {
+                } else if upper.starts_with("LIST") {
+                    out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                    out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");
+                    if !gone {
+                        out.push_str("* LIST () \"/\" \"Receipts\"\r\n");
+                    }
+                } else if upper.starts_with("DELETE") {
+                    if !allowed {
+                        r.get_mut()
+                            .write_all(format!("{tag} NO [NOPERM] Permission denied\r\n").as_bytes())
+                            .unwrap();
+                        continue;
+                    }
+                    deleted.push(command.to_owned());
+                    gone = true;
+                } else if upper.starts_with("LOGOUT") {
+                    r.get_mut()
+                        .write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes())
+                        .unwrap();
+                    break;
+                } else {
+                    panic!("Unexpected IMAP command: {line}");
+                }
+                out.push_str(&format!("{tag} OK done\r\n"));
+                r.get_mut().write_all(out.as_bytes()).unwrap();
+            }
+        }
+        deleted
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let cached = Mail {
+        id: format!("{}:Receipts:1:1", a.id),
+        account: a.id.clone(),
+        folder: Folder::Other,
+        remote_folder: "Receipts".into(),
+        uid: 1,
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&cached))?;
+    let refused = b.delete_remote_folder(&a, "Receipts").unwrap_err();
+    assert!(format!("{refused:#}").contains("didn't allow"), "{refused:#}");
+    assert!(b.store.message(&cached.id)?.is_some());
+    let left = b.delete_remote_folder(&a, "Receipts")?;
+    assert!(left.is_empty(), "{left:?}");
+    assert!(b.store.message(&cached.id)?.is_none(), "its cached mail is forgotten");
+    // Standard folders are never sent to the server to delete.
+    let standard = b.delete_remote_folder(&a, "Trash").unwrap_err();
+    assert!(format!("{standard:#}").contains("standard"), "{standard:#}");
+    b.disconnect(&a.id);
+    assert_eq!(server.join().unwrap(), ["DELETE \"Receipts\""]);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

@@ -1,10 +1,10 @@
 //! Account operations serialize protocol work and commit results to the local cache.
-use crate::manage::status::AccessFailure;
+use crate::manage::status::{AccessFailure, SignInStep};
 use crate::manage::{
     model::*,
     store::{self, Store},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::HashMap,
     sync::{
@@ -67,6 +67,19 @@ impl Catalog {
     }
 }
 
+/// Where a sign-in stopped after the browser answered.
+enum Stage {
+    /// The token request failed before the provider judged the code.
+    Redeem(crate::sync::oauth::Grant),
+    /// Tokens or a password were issued, but the mail server refused them.
+    Verify(Secret),
+}
+struct Pending {
+    account: Account,
+    taken: Vec<String>,
+    stage: Stage,
+}
+
 pub struct Backend {
     pub store: Arc<Store>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -81,6 +94,10 @@ pub struct Backend {
     limits: Mutex<Limits>,
     /// Mailbox layouts by (account, mailbox key), from the latest search.
     layouts: Mutex<HashMap<(String, String), Layout>>,
+    /// A sign-in that failed after the browser, kept for one retry.
+    pending: Mutex<Option<Pending>>,
+    /// How far the current sign-in has come; see `sign_in_step`.
+    sign_in_step: Mutex<SignInStep>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -97,6 +114,8 @@ impl Backend {
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
             layouts: Mutex::new(HashMap::new()),
+            pending: Mutex::new(None),
+            sign_in_step: Mutex::new(SignInStep::Browser),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -132,7 +151,9 @@ impl Backend {
     }
     /// Signs in and checks the incoming server, then saves the account. For
     /// browser and Pinal sign-in, the returned account names the address
-    /// that was chosen; `taken` lists addresses already added.
+    /// that was chosen; `taken` lists addresses already added. When a step
+    /// after the browser fails in a way that can be tried again, the sign-in
+    /// is kept for `retry_sign_in` (see `can_retry_sign_in`).
     pub fn connect(
         &self,
         account: &Account,
@@ -140,9 +161,13 @@ impl Backend {
         taken: &[String],
         cancel: Arc<AtomicBool>,
     ) -> Result<Account> {
+        self.forget_sign_in();
+        self.step(&cancel, SignInStep::Browser);
         let mut account = account.clone();
-        let mut secret = if account.service == crate::manage::model::Service::Pinal {
-            let mailbox = crate::sync::oauth::pinal(cancel.clone())?;
+        if account.service == crate::manage::model::Service::Pinal {
+            let mailbox = crate::sync::oauth::pinal(cancel.clone(), &|| {
+                self.step(&cancel, SignInStep::Finishing)
+            })?;
             let issued = mailbox.account();
             ensure!(
                 account.email.is_empty() || account.email.eq_ignore_ascii_case(&issued.email),
@@ -159,7 +184,7 @@ impl Backend {
                 },
                 ..issued
             };
-            Secret {
+            let secret = Secret {
                 password: mailbox.password,
                 mail_bundle: mailbox
                     .encryption
@@ -168,46 +193,126 @@ impl Backend {
                     .transpose()?
                     .unwrap_or_default(),
                 ..Default::default()
-            }
+            };
+            self.verify(account, secret, taken, &cancel, true)
         } else if account.oauth {
-            let (secret, who) = crate::sync::oauth::authorize(&account, cancel.clone())?;
-            ensure!(
-                account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
-                "Choose the same email address to reconnect this mailbox."
-            );
-            if account.email.is_empty() {
-                account.email = who.email;
-            }
-            if account.name.is_empty() || account.name == account.email {
-                account.name = if who.name.is_empty() {
-                    account.email.clone()
-                } else {
-                    who.name
-                };
-            }
-            secret
+            let grant = crate::sync::oauth::authorize(&account, cancel.clone())?;
+            self.redeem(account, grant, taken, &cancel)
         } else {
             ensure!(!password.is_empty(), "Enter your password or app password.");
-            Secret {
+            let secret = Secret {
                 password,
                 ..Default::default()
+            };
+            self.verify(account, secret, taken, &cancel, false)
+        }
+    }
+    /// How far the running sign-in has come.
+    pub fn sign_in_step(&self) -> SignInStep {
+        *self.sign_in_step.lock().unwrap()
+    }
+    /// Records progress unless this sign-in was abandoned, so a stale one
+    /// finishing in the background cannot relabel a newer one.
+    fn step(&self, cancel: &AtomicBool, step: SignInStep) {
+        if !cancel.load(Ordering::Relaxed) {
+            *self.sign_in_step.lock().unwrap() = step;
+        }
+    }
+    /// Whether the last `connect` failed after the browser and can be tried
+    /// again without signing in again.
+    pub fn can_retry_sign_in(&self) -> bool {
+        self.pending.lock().unwrap().is_some()
+    }
+    /// Drops a sign-in kept for retrying, along with its tokens.
+    pub fn forget_sign_in(&self) {
+        self.pending.lock().unwrap().take();
+    }
+    /// Repeats the step of the last sign-in that failed after the browser.
+    pub fn retry_sign_in(&self, cancel: Arc<AtomicBool>) -> Result<Account> {
+        let Pending {
+            account,
+            taken,
+            stage,
+        } = self
+            .pending
+            .lock()
+            .unwrap()
+            .take()
+            .context("This sign-in can no longer be retried. Sign in again.")?;
+        match stage {
+            Stage::Redeem(grant) => self.redeem(account, grant, &taken, &cancel),
+            Stage::Verify(secret) => self.verify(account, secret, &taken, &cancel, true),
+        }
+    }
+    /// Turns the browser's code into tokens, keeping it for a retry when the
+    /// provider never answered (a rejected code is spent).
+    fn redeem(
+        &self,
+        mut account: Account,
+        grant: crate::sync::oauth::Grant,
+        taken: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<Account> {
+        self.step(cancel, SignInStep::Finishing);
+        let (secret, who) = match crate::sync::oauth::redeem(&account, &grant) {
+            Ok(signed_in) => signed_in,
+            Err(e) => {
+                if e.downcast_ref::<AccessFailure>().is_none() {
+                    *self.pending.lock().unwrap() = Some(Pending {
+                        account,
+                        taken: taken.to_vec(),
+                        stage: Stage::Redeem(grant),
+                    });
+                }
+                return Err(e);
             }
         };
+        ensure!(
+            account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
+            "Choose the same email address to reconnect this mailbox."
+        );
+        if account.email.is_empty() {
+            account.email = who.email;
+        }
+        if account.name.is_empty() || account.name == account.email {
+            account.name = if who.name.is_empty() {
+                account.email.clone()
+            } else {
+                who.name
+            };
+        }
+        self.verify(account, secret, taken, cancel, true)
+    }
+    /// Signs in to the incoming server and saves the account. With `keep`,
+    /// a failed check keeps the credentials so the user can fix the mailbox
+    /// (for example, turn on IMAP) and retry without the browser.
+    fn verify(
+        &self,
+        account: Account,
+        mut secret: Secret,
+        taken: &[String],
+        cancel: &AtomicBool,
+        keep: bool,
+    ) -> Result<Account> {
         account.validate()?;
         ensure!(
             !taken.iter().any(|e| e.eq_ignore_ascii_case(&account.email)),
             "{} is already added.",
             account.email
         );
+        self.step(cancel, SignInStep::Mailbox);
         let lock = self.account_lock(&account.id);
         let _operation = lock.lock().unwrap();
         secret.client_secret = account.client_secret.clone();
-        if account.provider == Provider::Pop3 {
-            let mut pop = self.pop_login(&account, &secret.password)?;
-            let _ = pop.command("QUIT");
-        } else {
-            let mut session = self.imap_login(&account, &secret)?;
-            let _ = session.logout();
+        if let Err(e) = self.check_login(&account, &mut secret) {
+            if keep {
+                *self.pending.lock().unwrap() = Some(Pending {
+                    account,
+                    taken: taken.to_vec(),
+                    stage: Stage::Verify(secret),
+                });
+            }
+            return Err(e);
         }
         ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
         // A replaced sign-in must not keep using the old session.
@@ -215,6 +320,37 @@ impl Backend {
         self.save_credentials(&account.id, &secret)?;
         self.store.save_account(&account)?;
         Ok(account)
+    }
+    fn check_login(&self, account: &Account, secret: &mut Secret) -> Result<()> {
+        if account.provider == Provider::Pop3 {
+            let mut pop = self.pop_login(account, &secret.password)?;
+            let _ = pop.command("QUIT");
+            return Ok(());
+        }
+        // A retry can come long after the browser; renew an expiring token.
+        crate::sync::oauth::refresh(account, secret)?;
+        let mut session = match self.imap_login(account, secret) {
+            Err(e)
+                if account.oauth
+                    && account.provider == Provider::Outlook
+                    && e.downcast_ref::<AccessFailure>().is_some() =>
+            {
+                // Microsoft issued a token, but its IMAP server refused the
+                // mailbox: IMAP is off in Outlook's settings (new accounts),
+                // or the sign-in address is not the mailbox address.
+                return Err(e.context(format!(
+                    "Microsoft signed you in, but Outlook's mail server refused {}. \
+                     Outlook.com turns IMAP off for new accounts: at outlook.live.com, open \
+                     Settings → Mail → Forwarding and IMAP, turn on IMAP, save, then choose Retry. If you sign in to \
+                     Microsoft with a different address than your Outlook address, make the \
+                     Outlook address your primary alias.",
+                    account.email
+                )));
+            }
+            other => other?,
+        };
+        let _ = session.logout();
+        Ok(())
     }
     pub(super) fn credentials(&self, a: &Account) -> Result<Secret> {
         #[cfg(test)]
@@ -1188,6 +1324,38 @@ impl Backend {
         Ok(next)
     }
     /// Applies one change to several messages, with one IMAP command per mailbox.
+    /// Whether the account's folders live on a server that can delete them.
+    pub fn can_delete_folders(a: &Account) -> bool {
+        a.provider != Provider::Pop3
+    }
+    /// Deletes one of the account's own folders on the server, then
+    /// forgets its cached mail. Whether this sign-in may is the server's to
+    /// say: DELETE is refused (NO) without the right, changing nothing.
+    /// Returns the folders left.
+    pub fn delete_remote_folder(&self, a: &Account, name: &str) -> Result<Vec<RemoteFolder>> {
+        ensure!(
+            Self::can_delete_folders(a),
+            "This account's folders aren't kept on the server."
+        );
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let folders = self.with_imap(a, |c| {
+            let names = c.names(true)?.to_vec();
+            deletable(&names, a.provider, name)?;
+            c.leave(name)?;
+            match c.session.delete(name) {
+                Ok(()) => {}
+                Err(imap::error::Error::No(why)) => {
+                    bail!("The server didn't allow this account to delete “{name}”: {why}")
+                }
+                Err(e) => return Err(e).with_context(|| format!("Couldn't delete “{name}”")),
+            }
+            Ok(custom_folders(c.names(true)?))
+        })?;
+        self.store.save_folders(&a.id, &folders)?;
+        self.store.forget_mailbox(&a.id, name)?;
+        Ok(folders)
+    }
     pub fn change_many(&self, a: &Account, mails: &[Mail], change: Change) -> Result<()> {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();

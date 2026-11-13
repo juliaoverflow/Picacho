@@ -73,6 +73,15 @@ impl Connection {
             _ => self.select(name),
         }
     }
+    /// Leaves `name` if it is the selected mailbox, so it can be deleted:
+    /// some servers refuse to delete the mailbox a session has open.
+    pub(super) fn leave(&mut self, name: &str) -> Result<()> {
+        if self.selected.as_ref().is_some_and(|s| s.name == name) {
+            self.selected = None;
+            self.session.close()?;
+        }
+        Ok(())
+    }
     /// Selects a cached message's mailbox and checks its generation.
     pub(super) fn select_for(&mut self, mail: &Mail) -> Result<Selected> {
         let selected = self.selected(&mail.remote_folder)?;

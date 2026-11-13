@@ -244,6 +244,24 @@ impl Store {
         }
         Ok(crate::manage::subscriptions::group(mails))
     }
+    /// Every copy of the mail from `address` in `account` that offers to
+    /// unsubscribe, outside Junk and Trash, newest first. Copies of one
+    /// message are all listed; `subscriptions::one_copy_each` picks one.
+    pub fn subscription_mail(&self, account: &str, address: &str) -> Result<Vec<Mail>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND lower(trim(json_extract(data,'$.from')))=?2 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL ORDER BY json_extract(data,'$.date') DESC",
+        )?;
+        let mut out = Vec::new();
+        for row in q.query_map(params![account, address.trim().to_lowercase()], |r| r.get::<_, String>(0))? {
+            if let Ok(mail) = serde_json::from_str::<Mail>(&row?)
+                && crate::manage::subscriptions::Subscription::of(&mail).is_some()
+            {
+                out.push(mail);
+            }
+        }
+        Ok(out)
+    }
     /// The newest `limit` messages from `address` in `account` that offer
     /// to unsubscribe, newest first, each once, outside Junk and Trash.
     pub fn subscription_messages(&self, account: &str, address: &str, limit: usize) -> Result<Vec<Mail>> {
@@ -720,6 +738,21 @@ impl Store {
         self.preference(&format!("folders:{account}"))
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+    /// Forgets a deleted server folder: its cached mail and sync state.
+    pub fn forget_mailbox(&self, account: &str, remote: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE account=?1 AND json_extract(data,'$.remote_folder')=?2",
+            params![account, remote],
+        )?;
+        tx.execute(
+            "DELETE FROM mailbox_state WHERE account=?1 AND remote=?2",
+            params![account, remote],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn save_folders(&self, account: &str, folders: &[RemoteFolder]) -> Result<()> {
         self.set_preference(
