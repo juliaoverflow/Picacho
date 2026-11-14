@@ -194,6 +194,8 @@ def parity(model):
         ("Код подтверждения", "Ваш код: 7731. Заказ №558120 отправлен."),
         ("รหัส OTP", "รหัส OTP ของคุณคือ 482913 (อ้างอิง: SAVE20)"),
         ("Order", "Ref 123456AB, code x123456y, and 4829 1301"),
+        ("We received a sign in request for your account", "Sign in to Bluesky\nWe received a sign-in request for the account\n@juliaoverflow.com.\nUse the code below to sign in.\nBAJ6K-654XM\nIf this wasn't you, we recommend taking steps to\nprotect your account by\nchanging your password.\nBluesky, the social internet"),
+        ("Your license key", "License key: AB12C-DE34F-GH56J\nCall 800-555-0199. ZIP 94043-1351."),
         ("Roblox", "こんにちは。\n\n293393は、ご自身またはお子様のアカウントに対してリクエストされたRobloxのワンタイムコードです。ログインするには、このコードをログイン画面に入力してください。このコードは15分で期限切れになります。"),
         ("", "Hallo,\n\ndies ist ein einmaliger Roblox-Code, der für ein Konto angefordert wurde, das dir oder deinem Kind gehört: 456360. Gib ihn im Anmeldebildschirm ein, um dich anzumelden. Der Code ist 15 Minuten lang gültig."),
     ]

@@ -22,18 +22,23 @@ const MAX_TEXT: usize = 20_000;
 /// than standing out as a large black circle (●) does.
 pub const BULLET: char = '•';
 
-/// Two groups of 3-4 digits split by a space or hyphen, or 4-10 uppercase
-/// letters and digits (at least one digit), or 4-10 digits in any script
-/// (fullwidth, Arabic-Indic...); optionally after a short uppercase prefix and
-/// hyphen, as in Google's "G-123456". The candidate is the group: what comes
-/// before it is the start of the text or a character that isn't an ASCII
-/// letter or digit, so it can follow Chinese or Japanese without a space.
+/// 2-4 groups of 3-6 uppercase letters and digits split by hyphens, with a
+/// letter in them (Bluesky's "BAJ6K-654XM"), or two groups of 3-4 digits split
+/// by a space or hyphen, or 4-10 uppercase letters and digits (at least one
+/// digit), or 4-10 digits in any script (fullwidth, Arabic-Indic...);
+/// optionally after a short uppercase prefix and hyphen, as in Google's
+/// "G-123456". The candidate is the group: what comes before it is the start
+/// of the text or a character that isn't an ASCII letter or digit, so it can
+/// follow Chinese or Japanese without a space.
 static CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?:^|[^A-Za-z0-9])((?:[A-Z]{1,3}-)?(?:\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10}|\d{4,10}))",
+        r"(?:^|[^A-Za-z0-9])((?:[A-Z]{1,3}-)?(?:[A-Z0-9]{3,6}(?:-[A-Z0-9]{3,6}){1,3}|\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10}|\d{4,10}))",
     )
     .expect("pattern")
 });
+/// The two digit groups a code may be split into.
+static DIGIT_GROUPS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{3,4}[ \-]\d{3,4}$").expect("pattern"));
 /// Letters, marks, digits and underscores make words.
 static WORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\p{L}\p{N}\p{M}_]+").expect("pattern"));
@@ -136,6 +141,15 @@ impl Text {
                 _ => code,
             };
             if !core.chars().any(char::is_numeric) {
+                continue;
+            }
+            // Hyphenated groups need a letter, unless they are two digit
+            // groups: "94043-1351" or "12345-678" are a postcode or part of
+            // a number.
+            if core.contains('-')
+                && !core.bytes().any(|b| b.is_ascii_uppercase())
+                && !DIGIT_GROUPS.is_match(core)
+            {
                 continue;
             }
             // Part of a longer number: a phone number, a date, an amount.
@@ -637,6 +651,18 @@ mod tests {
             assert_eq!(detector.codes("", body), [code], "{body}");
             assert_eq!(detector.codes("Roblox", body), [code], "{body}");
         }
+    }
+
+    /// Codes in hyphenated groups of letters and digits, as Bluesky sends.
+    #[test]
+    fn finds_codes_in_hyphenated_groups() {
+        let detector = Detector::new(Box::new(model()), super::super::OTP.threshold);
+        let body = "Sign in to Bluesky\nWe received a sign-in request for the account\n@juliaoverflow.com.\nUse the code below to sign in.\nBAJ6K-654XM\nIf this wasn't you, we recommend taking steps to\nprotect your account by\nchanging your password.\nBluesky, the social internet";
+        for subject in ["We received a sign in request for your account", ""] {
+            assert_eq!(detector.codes(subject, body), ["BAJ6K-654XM"], "{subject}");
+        }
+        let text = Text::new("", "Call 800-555-0199, ZIP 94043-1351, on 2026-03-04.");
+        assert!(text.candidates().is_empty());
     }
 
     #[test]

@@ -31,8 +31,10 @@ Persian, Devanagari, Bengali and Thai digits. Copy Code gives ASCII digits.
 
 ## How it works
 
-1. **Candidates.** A pattern finds numbers that could be codes: two groups of
-   3–4 digits (`482 913`, `482-913`), 4–10 uppercase letters and digits
+1. **Candidates.** A pattern finds numbers that could be codes: 2–4
+   hyphenated groups of 3–6 uppercase letters and digits with a letter among
+   them (`BAJ6K-654XM`), two groups of 3–4 digits (`482 913`, `482-913`),
+   4–10 uppercase letters and digits
    (`AB12CD`, `482913`), or 4–10 digits in any script (`４８２９１３`,
    `٤٨٢٩١٣`), optionally with a short prefix (`G-482913`). A candidate may
    touch Chinese or Japanese text but not a Latin letter or another digit;
@@ -74,14 +76,14 @@ python3 train.py --coreml   # also otp-v1.mlmodel (pip install coremltools)
 The training mail is synthetic (`data.py`): sign-in messages in the languages
 above, mail full of numbers that aren't codes (orders, invoices, tracking and
 booking references, phone numbers, addresses, account endings, coupons,
-meeting IDs) in many of them, and sign-in messages with another number beside
+license keys, meeting IDs) in many of them, and sign-in messages with another number beside
 the code. Training is deterministic.
 
 On messages built from templates held out of training:
 
 | Held-out wording | Precision | Recall | Messages exactly right |
 | --- | --- | --- | --- |
-| English (and other Latin-script) templates | 92% | 99% | 95% |
+| English (and other Latin-script) templates | 95% | 100% | 97% |
 | Templates in the newer languages | 97% | 96% | 96% |
 
 Those are the honest figures for wording the model hasn't seen; on familiar

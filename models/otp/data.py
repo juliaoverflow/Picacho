@@ -36,7 +36,7 @@ MINUTES = ["5", "10", "15", "30", "60"]
 
 def code(rng, kind=None):
     kind = kind or rng.choice(["d6", "d6", "d6", "d6", "d4", "d5", "d7", "d8",
-                               "g6", "split", "alnum6", "alnum8"])
+                               "g6", "split", "alnum6", "alnum8", "dashed"])
     d = lambda n: "".join(rng.choice(string.digits) for _ in range(n))
     if kind == "d4":
         return d(4)
@@ -53,10 +53,23 @@ def code(rng, kind=None):
     if kind == "split":
         return d(3) + rng.choice([" ", "-"]) + d(3)
     chars = string.ascii_uppercase + string.digits
+    if kind == "dashed":
+        # Groups of letters and digits, as Bluesky's "BAJ6K-654XM".
+        return dashed(rng, rng.choice([(5, 5), (5, 5), (4, 4), (3, 3, 3), (4, 4, 4)]))
     n = 6 if kind == "alnum6" else 8
     while True:
         c = "".join(rng.choice(chars) for _ in range(n))
         if sum(ch.isdigit() for ch in c) >= 2 and any(ch.isalpha() for ch in c):
+            return c
+
+
+def dashed(rng, groups):
+    """Letters and digits in hyphenated groups of the given sizes, with at
+    least one of each."""
+    chars = string.ascii_uppercase + string.digits
+    while True:
+        c = "-".join("".join(rng.choice(chars) for _ in range(n)) for n in groups)
+        if any(ch.isdigit() for ch in c) and any(ch.isalpha() for ch in c):
             return c
 
 
@@ -67,6 +80,8 @@ def number(rng, n):
 
 def ref(rng):
     chars = string.ascii_uppercase + string.digits
+    if rng.random() < 0.15:
+        return dashed(rng, rng.choice([(3, 4), (4, 4), (5, 5), (3, 6, 3)]))
     while True:
         c = "".join(rng.choice(chars) for _ in range(rng.choice([6, 7, 8, 10])))
         if any(ch.isdigit() for ch in c):
@@ -111,6 +126,8 @@ POSITIVE = [
     ("Your {svc} code", "{code}\nEnter this code in {svc} to verify your identity. It expires soon."),
     ("Your {svc} one-time code", "Hello,\n\n{code} is the one-time {svc} code that was requested for an account that belongs to you or your child. To log in, enter it on the login screen. This code will expire in {min} minutes."),
     ("{svc} account", "Hi {name},\n\nhere is the one-time code that was just requested for the account you or someone in your family uses on {svc}: {code}. Enter it on the screen where you are signing in."),
+    ("We received a sign in request for your account", "Sign in to {svc}\nWe received a sign-in request for the account\n@{name}.example.com.\nUse the code below to sign in.\n{code}\nIf this wasn't you, we recommend taking steps to\nprotect your account by\nchanging your password.\n{svc}, the social internet"),
+    ("Confirm your email", "Hi {name},\nTo confirm the email address for your {svc} account, enter this code in the app:\n{code}\nIf you didn't ask for this, you can ignore this email."),
     ("Password reset code", "We received a request to reset your password. Your reset code is {code}. If you didn't ask for this, ignore this message."),
     ("Account verification", "Dear customer,\n\nPlease use the following One Time Password (OTP) to complete your transaction: {code}\n\nDo not disclose this OTP to anyone. Valid for {min} minutes.\n\nRegards,\n{svc}"),
     ("New sign-in to your account", "To complete your sign-in, enter the following code: {code}\nRequest from {city_short}, {date}.\nIf this wasn't you, contact {phone}."),
@@ -188,6 +205,10 @@ NEGATIVE = [
     ("Votre commande {num6}", "Votre commande n° {num6} a été expédiée. Suivi: {ref}."),
     ("Happy birthday!", "Happy birthday {name}! Use promo code {promo} for {pct}% off your next order, valid until {date}."),
     ("Your coupon", "Here's {pct}% off: enter coupon code {promo} at checkout. Expires {date}."),
+    ("Your license key", "Thanks for purchasing {svc} Pro.\nLicense key: {key}\nOrder number: {num8}\nKeep this key safe; you'll need it to reinstall."),
+    ("Your {svc} gift code", "{name} sent you a gift! Redeem code {key} at checkout for {amount} of credit. Expires {date}."),
+    ("Activation key", "Product: {svc} Studio\nSerial: {key}\nSeats: {num3}\nInvoice {ref}"),
+    ("Order {key} confirmed", "Your order {key} is confirmed and will ship from warehouse {num4} on {date}. Total {amount}."),
     ("Gift card", "You received a {svc} gift card worth {amount}. Gift card number: {num8} PIN: {num4}."),
     ("Security alert", "We noticed a new sign-in to your {svc} account from {city_short} on {date}. If this was you, no action is needed. Account ID {num7}."),
     ("Password changed", "The password for your {svc} account was changed on {date}. If you didn't do this, call {phone}."),
@@ -427,6 +448,7 @@ def fill(rng, templates, the_code):
         "amount": amount(rng),
         "ref": ref(rng),
         "ref2": ref(rng),
+        "key": dashed(rng, rng.choice([(5, 5), (5, 5, 5), (4, 4, 4, 4), (4, 4), (3, 3, 3)])),
         "num3": number(rng, 3),
         "num4": number(rng, 4),
         "num5": number(rng, 5),

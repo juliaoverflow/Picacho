@@ -21,15 +21,19 @@ SUBJECT_WORDS = 16
 MAX_CANDIDATES = 40
 MAX_TEXT = 20000
 
-# Two groups of 3-4 digits split by a space or hyphen, or 4-10 uppercase
-# letters and digits (at least one digit), or 4-10 digits in any script
-# (fullwidth, Arabic-Indic...); optionally after a short uppercase prefix and
-# hyphen, as in Google's "G-123456". The candidate is the group: what comes
-# before it is the start of the text or a character that isn't an ASCII
-# letter or digit, so it can follow Chinese or Japanese without a space.
+# 2-4 groups of 3-6 uppercase letters and digits split by hyphens, with a
+# letter in them (Bluesky's "BAJ6K-654XM"), or two groups of 3-4 digits split
+# by a space or hyphen, or 4-10 uppercase letters and digits (at least one
+# digit), or 4-10 digits in any script (fullwidth, Arabic-Indic...);
+# optionally after a short uppercase prefix and hyphen, as in Google's
+# "G-123456". The candidate is the group: what comes before it is the start
+# of the text or a character that isn't an ASCII letter or digit, so it can
+# follow Chinese or Japanese without a space.
 CANDIDATE = re.compile(
-    r"(?:^|[^A-Za-z0-9])((?:[A-Z]{1,3}-)?(?:\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10}|\d{4,10}))"
+    r"(?:^|[^A-Za-z0-9])((?:[A-Z]{1,3}-)?(?:[A-Z0-9]{3,6}(?:-[A-Z0-9]{3,6}){1,3}|\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10}|\d{4,10}))"
 )
+# The two digit groups a code may be split into.
+DIGIT_GROUPS = re.compile(r"\d{3,4}[ \-]\d{3,4}")
 
 # Scripts written without spaces between words: Hiragana, Katakana, CJK
 # ideographs, Thai, Lao, Khmer and Myanmar. Their words are taken as
@@ -77,6 +81,10 @@ def candidates(text):
             continue
         core = code.split("-", 1)[1] if re.match(r"[A-Z]{1,3}-", code) else code
         if not any(c.isdigit() for c in core):
+            continue
+        # Hyphenated groups need a letter, unless they are two digit groups:
+        # "94043-1351" or "12345-678" are a postcode or part of a number.
+        if "-" in core and not any("A" <= c <= "Z" for c in core) and not DIGIT_GROUPS.fullmatch(core):
             continue
         # Part of a longer number: a phone number, a date, an amount.
         before = text[s - 1] if s > 0 else ""
