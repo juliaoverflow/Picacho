@@ -7095,9 +7095,12 @@ impl MailApp {
         } else {
             400.
         };
+        // A fixed width (narrower windows shrink it), not a share of the
+        // parent: measured as a share, the wrapped text in the form came
+        // out taller than it is, leaving empty space to scroll into.
         let mut card = div()
-            .w_full()
-            .max_w(px(width))
+            .w(px(width))
+            .max_w_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -7227,7 +7230,7 @@ impl MailApp {
                 cx,
             ));
         }
-        card.child(actions)
+        card.child(actions.debug_selector(|| "setup-actions".into()))
             .with_animation(
                 ("onboard-step", self.anim),
                 Animation::new(Duration::from_millis(320)).with_easing(|t| 1. - (1. - t).powi(3)),
@@ -7303,7 +7306,8 @@ impl MailApp {
                             .w_full()
                             .flex_shrink_0()
                             .flex()
-                            .justify_center()
+                            .flex_col()
+                            .items_center()
                             .child(self.setup_view(cx)),
                     ),
             )

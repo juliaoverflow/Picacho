@@ -337,3 +337,33 @@ fn typing_a_search_scrolls_the_list_to_the_top(cx: &mut TestAppContext) {
         assert_eq!(this.list_scroll.0.borrow().base_handle.offset().y, px(0.));
     });
 }
+#[gpui::test]
+fn app_password_sign_in_scrolls_only_when_it_does_not_fit(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    for service in [Service::Gmail, Service::Outlook, Service::Fastmail] {
+        act(&view, Action::ChooseService(service), cx);
+        // Everything in view: nothing to scroll into.
+        resize(cx, 1280., 1000.);
+        frame(cx);
+        let max = view.read_with(cx, |this, _| this.onboarding_scroll.max_offset().height);
+        assert_eq!(max, px(0.), "{service:?} scrolls in a tall window");
+        // A short window scrolls just far enough to show the last control.
+        resize(cx, 1280., 480.);
+        frame(cx);
+        let (max, body) = view.read_with(cx, |this, _| {
+            (
+                this.onboarding_scroll.max_offset().height,
+                this.onboarding_scroll.bounds(),
+            )
+        });
+        let actions = bounds(cx, "setup-actions");
+        let overflow = actions.bottom() - body.bottom();
+        assert!(max > px(0.), "{service:?} can't scroll in a short window");
+        assert!(
+            max >= overflow && max <= overflow + px(40.),
+            "{service:?}: scrolls {max:?} for {overflow:?} of overflow"
+        );
+        act(&view, Action::SetupBack, cx);
+    }
+}
