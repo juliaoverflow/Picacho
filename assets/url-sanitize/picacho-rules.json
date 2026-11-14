@@ -49,7 +49,7 @@
     "kind": "strip-param",
     "source": "custom",
     "provider": "aliexpress-email",
-    "urlPattern": "^https?:\\/\\/www\\.aliexpress\\.com\\/ssr\\/[0-9-]+\\/[a-zA-Z0-9-]+\\",
+    "urlPattern": "^https?:\\/\\/www\\.aliexpress\\.com\\/ssr\\/[0-9-]+\\/[a-zA-Z0-9-]+(?:[/?#]|$)",
     "paramPattern": "(?:disableNav|pha_manifest|_immersiveMode|businessCode|edm_log_data|edm_click_module|tracelog|rowan_id[0-9]|rowan_msg_id|ck|mem_info)",
     "exceptions": [],
     "isReferralMarketing": false

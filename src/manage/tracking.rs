@@ -212,6 +212,50 @@ mod tests {
         );
     }
 
+    /// Every one of Picacho's own rules works: url-sanitize drops a rule
+    /// whose pattern doesn't compile without saying so.
+    #[test]
+    fn each_own_rule_cleans_its_links() {
+        let samples = [
+            (
+                "aliexpress-email",
+                "https://www.aliexpress.com/ssr/300000512/BundleDeals2?productIds=5&disableNav=YES&edm_log_data=x",
+                "https://www.aliexpress.com/ssr/300000512/BundleDeals2?productIds=5",
+            ),
+            (
+                "nextdoor-email",
+                "https://www.nextdoor.com/p/abc?post=1&ct=x&mar=y",
+                "https://www.nextdoor.com/p/abc?post=1",
+            ),
+            (
+                "productreportcard-email",
+                "https://panel.productreportcard.com/survey?id=3&qg=1&cn=2",
+                "https://panel.productreportcard.com/survey?id=3",
+            ),
+            (
+                "bestbuy-email",
+                "https://www.bestbuy.com/ease/email?eut=1&dest=https%3A%2F%2Fwww.bestbuy.com%2Fsite%2Fdeals",
+                "https://www.bestbuy.com/site/deals",
+            ),
+            (
+                "messagegears-click",
+                "https://trk.email.example.com/c/m/?T=abc&mg_x_url=aHR0cHM6Ly9leGFtcGxlLmNvbS9wYWdl&m=false",
+                "https://example.com/page",
+            ),
+        ];
+        let own: Vec<serde_json::Value> = serde_json::from_str(OWN_RULES_JSON).unwrap();
+        for rule in &own {
+            let provider = rule["provider"].as_str().unwrap();
+            assert!(
+                samples.iter().any(|(p, ..)| *p == provider),
+                "add a sample link for {provider}"
+            );
+        }
+        for (provider, link, clean) in samples {
+            assert_eq!(clean_url(link).as_deref(), Some(clean), "{provider}");
+        }
+    }
+
     #[test]
     fn cleans_links_in_html_and_text() {
         let html = r#"<p><a class=x href="https://a.example/?id=1&amp;utm_source=n">A</a>
