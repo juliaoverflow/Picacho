@@ -450,8 +450,15 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
     let foreign = "From: QA <qa@example.com>\r\nTo: bo@example.com\r\nSubject: From my phone\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nWritten elsewhere.\r\n--b\r\nContent-Type: image/png; name=dot.png\r\nContent-Disposition: attachment; filename=dot.png\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--b--\r\n";
     let drafts: FixtureFolder = Arc::new(Mutex::new(vec![(1, foreign.as_bytes().to_vec())]));
     let folder = drafts.clone();
+    // Whether the server searches by header; without, the app reads the
+    // newest messages' headers instead.
+    let header_search = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let searches = header_search.clone();
+    // Another app saves a draft just as Picacho uploads its first.
+    let racer = "From: QA <qa@example.com>\r\nSubject: Saved elsewhere at once\r\n\r\nHi\r\n";
     let server = std::thread::spawn(move || {
         let mut next = 2;
+        let mut raced = false;
         'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
             while let Some((tag, command, literal)) = p.command() {
                 let upper = command.to_ascii_uppercase();
@@ -468,6 +475,32 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
                     ));
                 } else if upper == "UID SEARCH ALL" {
                     let uids: String = drafts.iter().map(|(u, _)| format!(" {u}")).collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if let Some(id) = upper.strip_prefix("UID SEARCH HEADER X-PICACHO-DRAFT ") {
+                    if !searches.load(std::sync::atomic::Ordering::SeqCst) {
+                        p.send(&format!("{tag} BAD not searchable\r\n"));
+                        continue;
+                    }
+                    let id = id.trim_matches('"').to_ascii_lowercase();
+                    let uids: String = drafts
+                        .iter()
+                        .filter(|(_, raw)| {
+                            String::from_utf8_lossy(raw)
+                                .to_ascii_lowercase()
+                                .contains(&format!("x-picacho-draft: {id}"))
+                        })
+                        .map(|(u, _)| format!(" {u}"))
+                        .collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if let Some(range) = upper.strip_prefix("UID SEARCH UID ") {
+                    let from: u32 = range.trim_end_matches(":*").parse().unwrap();
+                    let highest = drafts.iter().map(|(u, _)| *u).max();
+                    let uids: String = drafts
+                        .iter()
+                        .map(|(u, _)| *u)
+                        .filter(|u| *u >= from || Some(*u) == highest)
+                        .map(|u| format!(" {u}"))
+                        .collect();
                     p.send(&format!("* SEARCH{uids}\r\n"));
                 } else if upper.starts_with("UID FETCH") {
                     let set = command.split(' ').nth(2).unwrap();
@@ -501,6 +534,11 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
                     assert!(command.contains("\\Draft"), "{command}");
                     drafts.push((next, literal));
                     next += 1;
+                    if !raced {
+                        raced = true;
+                        drafts.push((next, racer.as_bytes().to_vec()));
+                        next += 1;
+                    }
                 } else if let Some(set) = upper.strip_prefix("UID EXPUNGE ") {
                     let gone = super::protocol_tests::expand(set);
                     drafts.retain(|(u, _)| !gone.contains(u));
@@ -545,9 +583,27 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
     let copies = uploaded(&drafts);
     assert_eq!(copies.len(), 1);
     assert!(copies[0].contains("First version") && copies[0].contains("Bcc: secret@example.com"));
-    // Unchanged drafts aren't uploaded again; a new version replaces the old.
+    // The other app's draft, saved at once with a higher UID, isn't taken
+    // for Picacho's upload.
+    let racer_uid = |drafts: &FixtureFolder| {
+        drafts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, raw)| raw.as_slice() == racer.as_bytes())
+            .map(|(u, _)| *u)
+    };
+    let raced = racer_uid(&drafts).expect("the other app's draft is there");
+    let remote = b.store.draft("draft-here")?.unwrap().remote.unwrap();
+    assert_ne!(remote.uid, raced);
+    // The next sync takes it in as a draft written elsewhere.
+    assert_eq!(b.sync_drafts(&a)?, 1);
+    assert_eq!(drafts.lock().unwrap().len(), 3);
+    // Unchanged drafts aren't uploaded again; a new version replaces the
+    // old, also on a server that can't search by header.
     b.sync_drafts(&a)?;
-    assert_eq!(drafts.lock().unwrap().len(), 2);
+    assert_eq!(drafts.lock().unwrap().len(), 3);
+    header_search.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut edited = b.store.draft("draft-here")?.unwrap();
     edited.body = "Second version".into();
     b.store.save_draft(&edited)?;
@@ -555,8 +611,16 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
     let copies = uploaded(&drafts);
     assert_eq!(copies.len(), 1);
     assert!(copies[0].contains("Second version"));
+    assert_eq!(racer_uid(&drafts), Some(raced), "another app's draft stays");
     // Deleted here: gone from the server.
     b.discard_draft(&phone.id)?;
+    let saved_elsewhere = b
+        .store
+        .drafts(&a.id)?
+        .into_iter()
+        .find(|d| d.subject == "Saved elsewhere at once")
+        .unwrap();
+    b.discard_draft(&saved_elsewhere.id)?;
     b.sync_drafts(&a)?;
     assert_eq!(drafts.lock().unwrap().len(), 1);
     // Sent from another device: gone from here, as it was unchanged.

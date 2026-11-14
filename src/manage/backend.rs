@@ -2307,6 +2307,8 @@ impl Backend {
             }
             // Drafts written or changed here.
             let limit = c.extensions()?.append_limit;
+            // UIDs only grow: anything uploaded from here on is above this.
+            let mut floor = on_server.last().copied().unwrap_or(0);
             for d in &locals {
                 let fingerprint = d.fingerprint();
                 if d.remote.is_some() && d.uploaded == fingerprint {
@@ -2317,28 +2319,33 @@ impl Backend {
                     // Too large for the server; it stays here.
                     continue;
                 }
-                let before: std::collections::HashSet<u32> =
-                    c.session.uid_search("ALL")?.into_iter().collect();
                 c.session.append_with_flags(
                     &mailbox,
                     &raw,
                     &[imap::types::Flag::Seen, imap::types::Flag::Draft],
                 )?;
-                let after: std::collections::HashSet<u32> =
-                    c.session.uid_search("ALL")?.into_iter().collect();
-                let Some(uid) = after.difference(&before).max().copied() else {
+                // The new copy is the newest message carrying this draft's
+                // id: mail another app added meanwhile can't be taken for it.
+                let copies = draft_copies(&mut c.session, &d.id, floor)?;
+                let Some(uid) = copies.iter().copied().filter(|u| *u > floor).max() else {
                     bail!("The server didn't keep the uploaded draft.");
                 };
+                floor = floor.max(uid);
                 // Earlier copies of this draft, by its id or where it was.
-                let old: Vec<u32> = after
+                let mut old: Vec<u32> = copies
                     .iter()
                     .copied()
-                    .filter(|u| {
-                        *u != uid
-                            && (tagged.get(u) == Some(&d.id)
-                                || d.remote.as_ref().is_some_and(|r| here(r) && r.uid == *u))
-                    })
+                    .chain(
+                        tagged
+                            .iter()
+                            .filter(|(_, id)| **id == d.id)
+                            .map(|(u, _)| *u),
+                    )
+                    .chain(d.remote.as_ref().filter(|r| here(r)).map(|r| r.uid))
+                    .filter(|u| *u != uid)
                     .collect();
+                old.sort_unstable();
+                old.dedup();
                 c.erase(&old)?;
                 // A composer may have saved a newer version meanwhile; it
                 // keeps its words, and uploads again next time.
@@ -2411,6 +2418,49 @@ impl Backend {
     }
 }
 
+/// The UIDs of the selected Drafts folder's copies of draft `id`, by its
+/// `X-Picacho-Draft` header. The server is asked to search for the header;
+/// one that finds nothing (some don't search arbitrary headers) has the
+/// messages above `floor` read instead, keeping those that carry the id.
+fn draft_copies(session: &mut ImapSession, id: &str, floor: u32) -> Result<Vec<u32>> {
+    let header = crate::sync::smtp::DRAFT_HEADER;
+    let found = match session.uid_search(format!("HEADER {header} {}", quote(id)?)) {
+        Ok(found) => found,
+        Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => Default::default(),
+        Err(e) => return Err(e.into()),
+    };
+    if !found.is_empty() {
+        let mut found: Vec<u32> = found.into_iter().collect();
+        found.sort_unstable();
+        return Ok(found);
+    }
+    // `n:*` always includes the highest UID, even below n.
+    let newer: Vec<u32> = session
+        .uid_search(format!("UID {}:*", floor.saturating_add(1)))?
+        .into_iter()
+        .filter(|u| *u > floor)
+        .collect();
+    if newer.is_empty() {
+        return Ok(vec![]);
+    }
+    let items = format!("(UID BODY.PEEK[HEADER.FIELDS ({header})])");
+    let mut out: Vec<u32> = uid_fetch_rows(session, &uid_ranges(&newer), &items)?
+        .into_iter()
+        .filter(|row| newer.contains(&row.uid) && draft_id(row.header.as_deref()) == Some(id))
+        .map(|row| row.uid)
+        .collect();
+    out.sort_unstable();
+    Ok(out)
+}
+/// The draft id in a fetched `X-Picacho-Draft` header, if any.
+fn draft_id(header: Option<&[u8]>) -> Option<&str> {
+    let text = std::str::from_utf8(header?).ok()?;
+    let (name, value) = text.split_once(':')?;
+    name.trim()
+        .eq_ignore_ascii_case(crate::sync::smtp::DRAFT_HEADER)
+        .then(|| value.trim())
+        .filter(|v| !v.is_empty())
+}
 /// What a flags-only FETCH asks for: with Gmail, its labels too.
 fn flag_items(gmail: bool) -> &'static str {
     if gmail {
