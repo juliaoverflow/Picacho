@@ -145,8 +145,13 @@ pub(crate) struct Name {
     delimiter: Option<String>,
 }
 impl Name {
+    /// Whether the server gave this mailbox `attribute`. Attributes are
+    /// case-insensitive (\\Noselect, \\NoSelect…).
     fn has(&self, attribute: &str) -> bool {
-        self.attributes.iter().any(|a| a.contains(attribute))
+        let attribute = attribute.to_ascii_lowercase();
+        self.attributes
+            .iter()
+            .any(|a| a.to_ascii_lowercase().contains(&attribute))
     }
     fn delimiter(&self) -> Option<&str> {
         self.delimiter.as_deref().filter(|d| !d.is_empty())
@@ -221,8 +226,11 @@ const STANDARD_NAMES: [&str; 14] = [
 pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
     let mut out: Vec<RemoteFolder> = names
         .iter()
-        .filter(|n| !n.has("NoSelect") && !n.has("Noselect"))
+        // Placeholders in the hierarchy can't be opened: \\Noselect, and
+        // \\NonExistent from servers with LIST-EXTENDED.
+        .filter(|n| !n.has("NoSelect") && !n.has("NonExistent"))
         .filter(|n| !STANDARD_ATTRIBUTES.iter().any(|a| n.has(a)))
+        .filter(|n| !gmail_system(&n.name))
         .filter_map(|n| {
             let delimiter = n.delimiter.as_deref().filter(|d| !d.is_empty());
             let mut parts: Vec<&str> = match delimiter {
@@ -246,6 +254,17 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
         .collect();
     out.sort_by_key(|f| f.name.to_lowercase());
     out
+}
+/// Whether `name` is Gmail's system container ("[Gmail]", or "[Google
+/// Mail]" in some countries) or a mailbox inside it. The container can't be
+/// opened, everything in it is a standard mailbox, and Gmail allows no
+/// labels of one's own there, so none of it is listed as a folder.
+pub(crate) fn gmail_system(name: &str) -> bool {
+    ["[Gmail]", "[Google Mail]"].iter().any(|root| {
+        name.get(..root.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(root))
+            && matches!(name.as_bytes().get(root.len()), None | Some(b'/' | b'.'))
+    })
 }
 /// Whether a server folder may be deleted: one of the account's own
 /// folders (not the inbox, a standard mailbox, or Gmail's system labels)
@@ -1153,6 +1172,20 @@ mod extension_tests {
             name("[Gmail]", &["NoSelect"]),
             name("[Gmail]/Starred", &[]),
         ];
+        // Gmail's container and its mailboxes are never listed as folders,
+        // however the server marks them.
+        let listed: Vec<String> = custom_folders(&[
+            name("[Gmail]", &["\\HasChildren"]),
+            name("[Google Mail]/Important", &[]),
+            name("Placeholder", &["\\NONEXISTENT"]),
+            name("Old", &["\\noselect"]),
+            name("[Gmail] Receipts", &[]),
+            name("Receipts", &[]),
+        ])
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+        assert_eq!(listed, ["[Gmail] Receipts", "Receipts"]);
         assert!(deletable(&names, Provider::Imap, "Receipts").is_ok());
         assert!(deletable(&names, Provider::Imap, "Projects/2024").is_ok());
         let refused = |n: &str, provider| {

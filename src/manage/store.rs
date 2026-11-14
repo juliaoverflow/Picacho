@@ -890,8 +890,12 @@ impl Store {
     }
     pub fn folders(&self, account: &str) -> Vec<RemoteFolder> {
         self.preference(&format!("folders:{account}"))
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str::<Vec<RemoteFolder>>(&s).ok())
             .unwrap_or_default()
+            .into_iter()
+            // Lists saved before Gmail's system container was left out.
+            .filter(|f| !crate::sync::transport::gmail_system(&f.name))
+            .collect()
     }
     /// Forgets a deleted server folder: its cached mail and sync state.
     pub fn forget_mailbox(&self, account: &str, remote: &str) -> Result<()> {
