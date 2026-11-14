@@ -51,11 +51,17 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
     } else {
         ensure!(count > 0, "Add at least one recipient.");
     }
-    // Replies go where the message, or else the account, says.
-    let reply_to = if d.reply_to.trim().is_empty() {
+    // Sent as an alias, the forwarding service puts the alias in From; the
+    // mailbox's own address must not show up elsewhere in the message.
+    let alias = d.send_as.trim();
+    // Replies go where the message, or else the account, says. The
+    // account's Reply-To is its own and isn't used for alias mail.
+    let reply_to = if !d.reply_to.trim().is_empty() {
+        &d.reply_to
+    } else if alias.is_empty() {
         &a.reply_to
     } else {
-        &d.reply_to
+        ""
     };
     for (name, address) in recipients(reply_to).context("Enter a valid Reply-To address.")? {
         builder = builder.reply_to(Mailbox::new(name, address.parse()?));
@@ -64,7 +70,7 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
         // RFC 8098: the recipient's app may offer to say it was read.
         builder = builder.raw_header(raw_header(
             "Disposition-Notification-To",
-            format!("<{}>", a.email),
+            format!("<{}>", if alias.is_empty() { &a.email } else { alias }),
         ));
     }
     if !d.reply_id.is_empty() {
@@ -369,6 +375,44 @@ mod tests {
         assert!(html.contains("<em>there</em><br />"));
         assert!(html.contains("<li>one</li>"));
         assert!(!html.contains("<script>"));
+    }
+
+    /// Mail sent as an alias asks for read receipts at the alias and
+    /// doesn't take the account's Reply-To: neither shows the mailbox's own
+    /// address, which the alias exists to keep private.
+    #[test]
+    fn alias_mail_never_names_the_mailbox() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        a.name = "Me".into();
+        a.read_receipts = true;
+        a.reply_to = "me@example.com".into();
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Hi".into(),
+            body: "Hello".into(),
+            send_as: "shop@alias.example".into(),
+            ..Draft::default()
+        };
+        let headers = |m: Message| {
+            let text = String::from_utf8_lossy(&m.formatted()).into_owned();
+            text.split("\r\n\r\n").next().unwrap_or_default().to_owned()
+        };
+        let sent = headers(build(&a, &d, false)?);
+        assert!(
+            sent.contains("Disposition-Notification-To: <shop@alias.example>"),
+            "{sent}"
+        );
+        assert!(!sent.contains("Reply-To"), "{sent}");
+        // As the account itself, both are its own.
+        let own = Draft {
+            send_as: String::new(),
+            ..d
+        };
+        let sent = headers(build(&a, &own, false)?);
+        assert!(sent.contains("Disposition-Notification-To: <me@example.com>"));
+        assert!(sent.contains("Reply-To: me@example.com"), "{sent}");
+        Ok(())
     }
 
     #[test]
