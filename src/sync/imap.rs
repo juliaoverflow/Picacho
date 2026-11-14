@@ -843,7 +843,7 @@ pub(crate) fn keyword(label: &str) -> Result<String> {
     ensure!(
         label.bytes().all(|b| b > b' '
             && b < 0x7f
-            && !matches!(b, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']')),
+            && !matches!(b, b'(' | b')' | b'{' | b'}' | b'%' | b'*' | b'"' | b'\\' | b']')),
         "Labels on this server can't contain spaces, accents or ( ) {{ }} % * \" \\ ] — try “{}”.",
         label
             .chars()
@@ -1312,6 +1312,10 @@ mod extension_tests {
         assert_eq!(Row::default().labels(true), None);
         assert_eq!(keyword(" Work ").unwrap(), "Work");
         assert!(keyword("two words").is_err());
+        // Each character the message names is refused.
+        for refused in ["a(b", "a)b", "a{b", "a}b", "a%b", "a*b", "a\"b", "a\\b", "a]b", "café"] {
+            assert!(keyword(refused).is_err(), "{refused}");
+        }
         assert!(keyword("$MDNSent").is_err());
         assert_eq!(gmail_label("Caf&AOk-").unwrap(), "\"Caf&AOk-\"");
         assert!(gmail_label("\\Starred").is_err());
