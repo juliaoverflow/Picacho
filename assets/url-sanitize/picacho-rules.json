@@ -3,7 +3,7 @@
     "kind": "unwrap-redirect",
     "source": "custom",
     "provider": "messagegears-click",
-    "urlPattern": "^https?:\\/\\/[^/?#]+\\/c\\/m\\/?\\?.*$",
+    "urlPattern": "^https?:\\/\\/[^/?#]+\\/c\\/m\\/?\\?T=[^&#]+&.*$",
     "exceptions": [],
     "pattern": "[?&]mg_x_url=([^&#]+)",
     "captureGroup": 1,

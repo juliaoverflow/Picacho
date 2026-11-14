@@ -254,6 +254,12 @@ mod tests {
         for (provider, link, clean) in samples {
             assert_eq!(clean_url(link).as_deref(), Some(clean), "{provider}");
         }
+        // Only MessageGears' own click addresses are unwrapped, not any
+        // `/c/m` address naming a destination.
+        assert_eq!(
+            clean_url("https://example.org/c/m?mg_x_url=aHR0cHM6Ly9leGFtcGxlLmNvbS9wYWdl"),
+            None
+        );
     }
 
     #[test]
