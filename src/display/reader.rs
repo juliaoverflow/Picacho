@@ -402,7 +402,7 @@ impl MailApp {
                                     .text_size(px(23.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .line_height(relative(1.35))
-                                    .child(m.subject.clone()),
+                                    .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
                             .children(self.label_chips(m, cx)),
                     )
@@ -489,7 +489,8 @@ impl MailApp {
             .when(!locked, |d| {
                 d.child(self.rendering_controls(m, options, narrow, cx))
             })
-            .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
+            .child(div().h(px(1.)).bg(rgb(c.border)).mb_6())
+            .children((!locked).then(|| self.codes_banner(m, cx)).flatten());
         if locked {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
@@ -506,6 +507,8 @@ impl MailApp {
                 };
                 let masked = mask.as_ref().map(|k| k.apply(shown));
                 let shown = masked.as_deref().unwrap_or(shown);
+                let shown = self.hide_codes_html(m, shown);
+                let shown = shown.as_ref();
                 self.html_view.update(cx, |view, cx| {
                     view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
@@ -853,7 +856,9 @@ impl MailApp {
             panel_rows.push(row("cc:", text(recipients(&v))).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
-        panel_rows.push(row("subject:", text(m.subject.clone())).into_any_element());
+        panel_rows.push(
+            row("subject:", text(self.hide_codes(m, &m.subject).into_owned())).into_any_element(),
+        );
         match info.and_then(|i| i.result.as_ref()) {
             None => panel_rows.push(
                 row(
@@ -1604,7 +1609,7 @@ impl MailApp {
                                     .truncate()
                                     .text_size(px(12.))
                                     .text_color(rgb(c.muted))
-                                    .child(super::preview(&x.snippet)),
+                                    .child(super::preview(&self.hide_codes(x, &x.snippet))),
                             ),
                     )
                     .child(
@@ -1704,13 +1709,15 @@ impl MailApp {
     /// unless it is open; and whether there is quoted history.
     pub(super) fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
         let mask = self.mask_for(m);
+        let codes = self.hidden_codes(m);
         let key = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             m.id,
             self.quotes_open,
             self.clean_links,
             mask.as_ref().map_or("", |k| k.alias.as_str()),
-            m.body.as_ref().map_or(0, String::len)
+            m.body.as_ref().map_or(0, String::len),
+            codes.join("\u{1}")
         );
         if let Some((k, text, quoted)) = &*self.plain_cache.borrow()
             && k == &key
@@ -1730,6 +1737,11 @@ impl MailApp {
         let shown = match &mask {
             Some(k) => k.apply(shown),
             None => shown.into(),
+        };
+        let shown: std::borrow::Cow<str> = if codes.is_empty() {
+            shown
+        } else {
+            crate::manage::local_ai::otp::mask(&shown, &codes).into_owned().into()
         };
         let shown = if self.clean_links {
             crate::manage::tracking::clean_text(&shown).into_owned().into()

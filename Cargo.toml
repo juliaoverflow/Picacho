@@ -57,6 +57,8 @@ notify-rust = "4"
 open = "5"
 pgp = "0.21"
 rand = "0.10"
+# Finds candidate sign-in codes for the local model (Local AI).
+regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
 # fallible_uint: sizes and counts bind as integers, failing rather than wrapping when too large.
 rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
@@ -186,6 +188,10 @@ opt-level = 3
 core-graphics = "0.24"
 # Debug builds only: the development driver sends the window real mouse events.
 objc = "0.2"
+# Local AI runs its models with Core ML.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSObject"] }
+objc2-core-ml = { version = "0.3", default-features = false, features = ["std", "MLModel", "MLModel_MLModelCompilation", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLMultiArray", "MLFeatureValue", "MLModelConfiguration"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 # GPUI enables Fontconfig's dlopen API; select the matching API in Blitz's font backend.

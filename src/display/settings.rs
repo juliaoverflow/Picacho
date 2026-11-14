@@ -316,6 +316,13 @@ impl MailApp {
                 Page::Forwarding,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-local-ai".into(),
+                "Local AI".into(),
+                icon_el("sparkle", 15., c.muted).into_any_element(),
+                Page::LocalAi,
+                cx,
+            ))
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -1532,6 +1539,7 @@ impl MailApp {
             Page::Reading => self.reading_page(cx),
             Page::Composing => self.composing_page(cx),
             Page::Forwarding => self.forwarding_page(cx),
+            Page::LocalAi => self.local_ai_page(cx),
         }
     }
 }

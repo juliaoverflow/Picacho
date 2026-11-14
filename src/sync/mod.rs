@@ -5,6 +5,7 @@ pub mod discover;
 pub mod forwarding;
 mod imap;
 pub mod mime;
+pub mod models;
 pub mod oauth;
 mod pop;
 pub(crate) mod retry;

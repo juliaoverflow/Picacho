@@ -135,6 +135,9 @@ impl AssetSource for Assets {
             "mail/all-mail.svg" => Some(
                 "<rect x='6' y='7' width='16' height='12' rx='2'/><path d='m6 8 8 6 8-6'/><path d='M2 15V5a2 2 0 0 1 2-2h14'/>",
             ),
+            "mail/sparkle.svg" => Some(
+                "<path d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z'/><path d='M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8Z'/>",
+            ),
             "mail/pin.svg" => Some(
                 "<path d='M12 17v5M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V17h14v-1.8a2 2 0 0 0-1.1-1.7l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1Z'/>",
             ),

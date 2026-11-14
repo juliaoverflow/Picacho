@@ -95,7 +95,14 @@ impl Render for MessageWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors;
         let m = &self.mail;
-        window.set_window_title(&m.subject);
+        // Sign-in codes found by Local AI are hidden here too.
+        let codes = self
+            .app
+            .upgrade()
+            .map(|app| app.read(cx).hidden_codes(m))
+            .unwrap_or_default();
+        let subject = crate::manage::local_ai::otp::mask(&m.subject, &codes).into_owned();
+        window.set_window_title(&subject);
         // A mailbox kept to its aliases shows the alias used in its place.
         let mask = self.app.upgrade().and_then(|app| app.read(cx).mask_for(m));
         let (sender, from) = match &mask {
@@ -136,6 +143,8 @@ impl Render for MessageWindow {
             };
             let masked = mask.as_ref().map(|k| k.apply(shown));
             let shown = masked.as_deref().unwrap_or(shown);
+            let shown = crate::manage::local_ai::otp::mask_html(shown, &codes);
+            let shown = shown.as_ref();
             let blocked = self.options.block_remote;
             let clean = self.clean_links(cx);
             self.html.update(cx, |view, cx| {
@@ -153,6 +162,8 @@ impl Render for MessageWindow {
             };
             let masked = mask.as_ref().map(|k| k.apply(shown));
             let shown = masked.as_deref().unwrap_or(shown);
+            let shown = crate::manage::local_ai::otp::mask(shown, &codes);
+            let shown = shown.as_ref();
             body = body.child(
                 gpui_component::text::TextView::markdown(
                     SharedString::from(format!("window-body-{}-{}", m.id, self.quotes_open)),
@@ -226,7 +237,7 @@ impl Render for MessageWindow {
                     .truncate()
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(m.subject.clone()),
+                    .child(subject.clone()),
             )
             .child(self.button("w-reply", "Reply", "reply", cx, |t, _, cx| t.reply(1, cx)))
             .child(
@@ -289,7 +300,7 @@ impl Render for MessageWindow {
                             .mb_5()
                             .text_size(px(22.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(m.subject.clone()),
+                            .child(subject.clone()),
                     )
                     .child(
                         div()
@@ -406,7 +417,10 @@ impl MailApp {
         let out = made.clone();
         let bounds = Bounds::centered(None, size(px(880.), px(780.)), cx);
         let opened = cx.open_window(
-            window::detached_options(SharedString::from(mail.subject.clone()), bounds),
+            window::detached_options(
+                SharedString::from(self.hide_codes(&mail, &mail.subject).into_owned()),
+                bounds,
+            ),
             {
                 let mail = mail.clone();
                 move |window, cx| {

@@ -18,6 +18,11 @@ mod devdriver;
 mod error_tests;
 #[path = "forwarding.rs"]
 mod forwarding;
+#[path = "local_ai.rs"]
+mod ai;
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "local_ai_tests.rs"]
+mod local_ai_tests;
 #[path = "message_window.rs"]
 mod message_window;
 #[path = "panes.rs"]
@@ -456,6 +461,7 @@ enum Page {
     Reading,
     Composing,
     Forwarding,
+    LocalAi,
     Account(String),
 }
 /// What a folder picker moves into the chosen folder.
@@ -547,6 +553,12 @@ enum Action {
     SetReadingDefaults(ReadingOptions),
     /// Removes tracking from links in mail, or stops.
     SetCleanLinks(bool),
+    /// Turns Local AI on, or off (deleting its models).
+    SetLocalAi(bool),
+    /// Hides sign-in codes (downloading the model), or stops (deleting it).
+    SetHideCodes(bool),
+    /// Shows a message's hidden sign-in codes, or hides them again.
+    ShowCodes(String, bool),
     ToggleHtml,
     ToggleRemote,
     /// Shows the open email's body in light or dark colors.
@@ -968,6 +980,19 @@ pub struct MailApp {
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
+    /// Local AI and its sign-in code hiding (Settings → Local AI).
+    local_ai: bool,
+    hide_codes: bool,
+    /// The sign-in code model, loaded while codes are hidden.
+    otp: Option<Rc<crate::manage::local_ai::otp::Detector>>,
+    /// Codes found per message, with the lengths of the subject and text
+    /// they were found in.
+    otp_found: std::cell::RefCell<HashMap<String, ai::Found>>,
+    /// Messages whose codes were shown on request.
+    codes_shown: HashSet<String>,
+    /// A model downloading, and why the last download or load failed.
+    model_busy: bool,
+    model_error: Option<String>,
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
@@ -1048,6 +1073,8 @@ impl MailApp {
         let alias_routes = fwd::routes(&store);
         let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        let local_ai = crate::manage::local_ai::enabled(&store);
+        let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         if clean_links {
             crate::manage::tracking::warm_up();
         }
@@ -1544,6 +1571,13 @@ impl MailApp {
             reverse_contacts,
             contacts_fetched: HashSet::new(),
             clean_links,
+            local_ai,
+            hide_codes,
+            otp: None,
+            otp_found: Default::default(),
+            codes_shown: HashSet::new(),
+            model_busy: false,
+            model_error: None,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -1598,6 +1632,7 @@ impl MailApp {
         for a in this.accounts.clone() {
             this.load_avatar(a, cx);
         }
+        this.start_local_ai(cx);
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_secs(20)).await;
@@ -1875,9 +1910,11 @@ impl MailApp {
             return;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
+            // A sign-in code in the subject isn't shown on the lock screen.
+            let subject = self.hide_codes(latest, &latest.subject);
             crate::display::notify::new_mail(
                 &a.email,
-                (&latest.sender, &latest.subject),
+                (&latest.sender, &subject),
                 fresh.len(),
             );
         }
@@ -4689,6 +4726,9 @@ impl MailApp {
                 self.backend.store.set_preference_soon("accent", accent.key());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
+            Action::SetLocalAi(on) => self.set_local_ai(on, cx),
+            Action::SetHideCodes(on) => self.set_hide_codes(on, cx),
+            Action::ShowCodes(id, show) => self.show_codes(id, show, cx),
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
                 if on {
@@ -6521,7 +6561,7 @@ impl MailApp {
                                     } else {
                                         FontWeight::NORMAL
                                     })
-                                    .child(m.subject.clone()),
+                                    .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
                             .when(m.has_attachments(), |d| {
                                 d.child(icon_el("paperclip", 13., c.muted))
@@ -6566,7 +6606,7 @@ impl MailApp {
                             .truncate()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child(preview(&m.snippet)),
+                            .child(preview(&self.hide_codes(m, &m.snippet))),
                     ),
             )
             .on_mouse_down(MouseButton::Right, {
@@ -8339,6 +8379,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "alias",
         "inboxes",
         "all-mail",
+        "sparkle",
         "pin",
         "ban",
         "subscriptions",
