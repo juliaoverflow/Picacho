@@ -1,7 +1,7 @@
 //! The byte stream an IMAP session runs over: verified TLS on a bounded
 //! [`Wire`], optionally compressed (COMPRESS=DEFLATE, RFC 4978), and able to
 //! wait longer for the server while a session is in IDLE.
-use super::wire::Wire;
+use super::wire::{RESPONSE_LIMIT, Wire};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::{
     io::{self, Read, Write},
@@ -21,6 +21,10 @@ struct Deflate {
     /// Inflated bytes not yet handed to the reader.
     output: Vec<u8>,
     taken: usize,
+    /// Inflated bytes the current response may still grow by. The wire
+    /// below counts compressed bytes, which deflate can expand about a
+    /// thousandfold, so the same limit is kept here on what they inflate to.
+    remaining: usize,
 }
 impl Deflate {
     fn new() -> Self {
@@ -31,7 +35,18 @@ impl Deflate {
             input: Vec::new(),
             output: Vec::new(),
             taken: 0,
+            remaining: RESPONSE_LIMIT,
         }
+    }
+    /// Counts `made` freshly inflated bytes against the response's budget.
+    fn spend(&mut self, made: usize) -> io::Result<()> {
+        self.remaining = self.remaining.checked_sub(made).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mail server response exceeds the 32 MB session-command limit",
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -101,6 +116,7 @@ impl Read for ImapStream {
                 let used = (d.decompress.total_in() - before_in) as usize;
                 let made = (d.decompress.total_out() - before_out) as usize;
                 d.input.drain(..used);
+                d.spend(made)?;
                 out.truncate(made);
                 d.output = out;
                 if status == Status::StreamEnd {
@@ -132,6 +148,10 @@ impl Write for ImapStream {
         let Some(d) = self.deflate() else {
             return self.tls.write(buf);
         };
+        // A new command: its response gets a fresh budget, as on the wire.
+        if !buf.is_empty() {
+            d.remaining = RESPONSE_LIMIT;
+        }
         // Each write is a whole command line or literal; a sync flush sends
         // it at once, as the server must see it to answer.
         let mut out = Vec::with_capacity(buf.len() / 2 + 64);
@@ -165,6 +185,15 @@ impl imap::extensions::idle::SetReadTimeout for ImapStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// What a response inflates to is bounded, not just what it costs on
+    /// the wire: a few compressed megabytes can inflate to gigabytes.
+    #[test]
+    fn inflated_responses_are_bounded() {
+        let mut d = Deflate::new();
+        d.spend(RESPONSE_LIMIT - 1).unwrap();
+        d.spend(1).unwrap();
+        assert_eq!(d.spend(1).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
     /// What one side compresses, the other inflates, across many small
     /// writes (as IMAP commands are) and reads of any size.
     #[test]

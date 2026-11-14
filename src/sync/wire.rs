@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
+pub(crate) const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
