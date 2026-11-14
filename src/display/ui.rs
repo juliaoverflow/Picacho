@@ -110,6 +110,7 @@ actions!(
         GoArchive,
         GoSpam,
         GoTrash,
+        GoAllMail,
         ShowAllMail,
         ShowUnread,
         ShowStarred,
@@ -563,7 +564,7 @@ enum Action {
     ExpandThread,
     ShowOriginal,
     /// Lists the subscriptions detected in an account, or in every account
-    /// (All Mail's id).
+    /// (All Accounts' id).
     OpenSubscriptions(String),
     /// Asks a subscription's sender to stop, from the list or an email.
     Unsubscribe(MailSubscription),
@@ -626,7 +627,7 @@ enum Action {
     /// Puts back a message whose sending was delayed for undo.
     UndoSend(u64),
     SetComposeOptions(ComposeOptions),
-    /// Lists All Mail when there are several accounts.
+    /// Lists All Accounts when there are several accounts.
     SetAllMail(bool),
     /// The service picked in Forwarding settings' add form.
     ForwardingService(ForwardingService),
@@ -907,7 +908,7 @@ pub struct MailApp {
     /// What the Original Message window shows.
     source_view: SourceView,
     /// The open subscriptions list (in place of the message list), for an
-    /// account or All Mail's id, and what it lists.
+    /// account or All Accounts' id, and what it lists.
     subs_open: bool,
     subs: Vec<MailSubscription>,
     subs_loading: bool,
@@ -963,7 +964,7 @@ pub struct MailApp {
     unlock_errors: HashMap<String, String>,
     /// Alias forwarding services and their aliases.
     forwarding: Vec<ForwardingAccount>,
-    /// All Mail is listed when there are several accounts.
+    /// All Accounts is listed when there are several accounts.
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
@@ -1619,7 +1620,7 @@ impl MailApp {
     fn account_of(&self, m: &Mail) -> Option<Account> {
         self.accounts.iter().find(|a| a.id == m.account).cloned()
     }
-    /// The open mailbox's account. In All Mail or an alias's view, the
+    /// The open mailbox's account. In All Accounts or an alias's view, the
     /// first mailbox it draws from, which new messages are sent from.
     fn current_account(&self) -> Option<Account> {
         let id = self.account.as_ref()?;
@@ -2815,6 +2816,8 @@ impl MailApp {
                 .filter(|m| {
                     if folder == Folder::Starred {
                         m.starred
+                    } else if folder == Folder::All {
+                        m.folder != Folder::Drafts
                     } else {
                         m.folder == folder
                     }
@@ -3092,6 +3095,8 @@ impl MailApp {
         let leaves = match change {
             Change::Move(folder) if self.subs_open => matches!(folder, Folder::Junk | Folder::Trash),
             Change::MoveTo(_) if self.subs_open => false,
+            // All Mail lists every mailbox: moved mail stays where it is.
+            Change::Move(_) | Change::MoveTo(_) if self.folder == Folder::All => false,
             Change::Move(_) | Change::MoveTo(_) => true,
             _ => self.folder == Folder::Starred && change == Change::Star(false),
         };
@@ -3133,6 +3138,10 @@ impl MailApp {
                     this.account_result(&account_id, IssueSource::Change, &result);
                     match result {
                         Ok(()) => {
+                            // Moved mail has new identities in its new mailbox.
+                            if change.moves() && this.folder == Folder::All {
+                                this.reload_cached(cx);
+                            }
                             if let Some(to) = this.destination_label(&account_id, &change) {
                                 this.notice(
                                     if count == 1 {
@@ -5292,7 +5301,8 @@ impl MailApp {
         })
     }
     fn unread_for(&self, account: &str, mailbox: &Mailbox) -> usize {
-        if mailbox == &Mailbox::Standard(Folder::Starred) {
+        // Starred and All Mail show no count: their mail is counted where it is.
+        if mailbox.folder().is_virtual() {
             return 0;
         }
         self.unread
@@ -5776,7 +5786,7 @@ impl MailApp {
             })
     }
     /// Accounts the open mailbox is still being fetched from: a sync, a
-    /// sign-in retry or a listing in flight. A view (All Mail, an alias)
+    /// sign-in retry or a listing in flight. A view (All Accounts, an alias)
     /// lists several accounts, each fetched on its own.
     fn fetching_accounts(&self) -> Vec<&Account> {
         if self.account.is_none() || self.folder == Folder::Drafts {
@@ -5956,7 +5966,7 @@ impl MailApp {
         }
         let loaded = self.loaded_unread;
         match &self.account {
-            Some(id) if self.folder != Folder::Starred => {
+            Some(id) if !self.folder.is_virtual() => {
                 self.unread_for(id, &self.mailbox()).max(loaded)
             }
             _ => loaded,
@@ -6965,7 +6975,7 @@ impl MailApp {
                     ("Reply all", "⌘ ⌥ R"),
                     ("Forward", "⌘ ⇧ F"),
                     ("Mark read / unread", "⌘ ⇧ U"),
-                    ("Go to Inbox … Trash", "⌘ 1 … ⌘ 7"),
+                    ("Go to Inbox … All Mail", "⌘ 1 … ⌘ 8"),
                     ("Settings", "⌘ ,"),
                     ("Star message", "⌘ ⇧ S"),
                     ("Archive message", "⌘ ⇧ A"),
@@ -7993,6 +8003,7 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &GoArchive, w, cx| this.go(Folder::Archive, w, cx)))
             .on_action(cx.listener(|this, _: &GoSpam, w, cx| this.go(Folder::Junk, w, cx)))
             .on_action(cx.listener(|this, _: &GoTrash, w, cx| this.go(Folder::Trash, w, cx)))
+            .on_action(cx.listener(|this, _: &GoAllMail, w, cx| this.go(Folder::All, w, cx)))
             .on_action(cx.listener(|this, _: &ShowAllMail, w, cx| {
                 this.handle(Action::SetFilter(Filter::All), w, cx)
             }))
@@ -8250,6 +8261,7 @@ fn folder_icon(f: Folder) -> &'static str {
         Folder::Junk => "spam",
         Folder::Trash => "trash",
         Folder::Other => "folder",
+        Folder::All => "all-mail",
     }
 }
 /// A text field on the app's background. Inputs otherwise take the theme's
@@ -8322,6 +8334,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "grid",
         "alias",
         "inboxes",
+        "all-mail",
         "pin",
         "ban",
         "subscriptions",
@@ -8534,6 +8547,7 @@ pub fn run(store: Arc<Store>) {
             KeyBinding::new("secondary-5", GoArchive, Some("Mail")),
             KeyBinding::new("secondary-6", GoSpam, Some("Mail")),
             KeyBinding::new("secondary-7", GoTrash, Some("Mail")),
+            KeyBinding::new("secondary-8", GoAllMail, Some("Mail")),
             KeyBinding::new("secondary-m", Minimize, Some("Mail")),
             KeyBinding::new("secondary-o", OpenInWindow, Some("Mail")),
             KeyBinding::new("secondary-w", CloseWindow, Some("Detached")),
@@ -8666,6 +8680,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Archive", GoArchive),
                 MenuItem::action("Spam", GoSpam),
                 MenuItem::action("Trash", GoTrash),
+                MenuItem::action("All Mail", GoAllMail),
                 MenuItem::separator(),
                 MenuItem::action("Mark All as Read", MarkAllRead),
                 MenuItem::action("Refresh", Refresh),
@@ -9755,7 +9770,7 @@ mod tests {
             frame(cx);
             frame(cx);
         };
-        // All Mail's spam is empty in the cache; both accounts are asked.
+        // All Accounts' spam is empty in the cache; both accounts are asked.
         view.update_in(cx, |this, w, cx| {
             this.open_mailbox(Some(ALL_MAIL.into()), Folder::Junk.into(), w, cx)
         });

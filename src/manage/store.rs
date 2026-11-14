@@ -226,12 +226,13 @@ impl Store {
         } else {
             "data"
         };
-        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred'))) ORDER BY date DESC, id DESC LIMIT ?3"))?;
+        // All Mail is everything but drafts; Starred, the starred mail.
+        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred')) OR (?2='all' AND folder<>'drafts')) ORDER BY date DESC, id DESC LIMIT ?3"))?;
         let rows = q.query_map(
             params![
                 account,
                 mailbox.key(),
-                if folder == Folder::Starred {
+                if folder.is_virtual() {
                     usize::MAX >> 1
                 } else {
                     limit
@@ -244,7 +245,8 @@ impl Store {
         for row in rows {
             let mail: Mail = serde_json::from_str(&row?)?;
             if folder != Folder::Starred || mail.starred {
-                if folder == Folder::Starred
+                // A message in several mailboxes (Gmail's labels) is listed once.
+                if folder.is_virtual()
                     && !seen.insert(if mail.message_id.is_empty() {
                         mail.id.clone()
                     } else {
@@ -1188,6 +1190,42 @@ mod tests {
         assert!(s.preference_saved("sort", older).is_ok());
         // The value saved before is what reads back.
         assert_eq!(s.preference("sort").as_deref(), Some("newest"));
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    #[test]
+    fn all_mail_lists_every_folder_once_without_drafts() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        let mail = |id: &str, folder: Folder, remote: &str, message_id: &str, date: i64| Mail {
+            id: id.into(),
+            account: "a".into(),
+            folder,
+            remote_folder: remote.into(),
+            message_id: message_id.into(),
+            date,
+            ..Mail::default()
+        };
+        s.save_messages(&[
+            mail("a:INBOX:1:1", Folder::Inbox, "INBOX", "<1@x>", 5),
+            mail("a:Sent:1:1", Folder::Sent, "Sent", "<2@x>", 4),
+            mail("a:Trash:1:1", Folder::Trash, "Trash", "<3@x>", 3),
+            mail("a:Projects:1:1", Folder::Other, "Projects", "<4@x>", 2),
+            // The same message under another label is listed once.
+            mail("a:All:1:1", Folder::Archive, "[Gmail]/All Mail", "<1@x>", 5),
+            mail("a:Drafts:1:1", Folder::Drafts, "Drafts", "<5@x>", 6),
+            Mail {
+                account: "b".into(),
+                ..mail("b:INBOX:1:1", Folder::Inbox, "INBOX", "<6@x>", 7)
+            },
+        ])?;
+        let all = s.summaries("a", Folder::All)?;
+        let ids: Vec<&str> = all.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(ids, ["<1@x>", "<2@x>", "<3@x>", "<4@x>"]);
+        // Each keeps its real place, so its actions apply where it is.
+        assert_eq!(all[2].folder, Folder::Trash);
+        assert_eq!(s.messages("a", Folder::All, 2)?.len(), 2);
         drop(s);
         std::fs::remove_dir_all(p)?;
         Ok(())

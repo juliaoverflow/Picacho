@@ -1,4 +1,4 @@
-//! Views that list more than one mailbox, or part of one: All Mail across
+//! Views that list more than one mailbox, or part of one: All Accounts across
 //! every account, and aliases from forwarding services shown as accounts of
 //! their own, and the work behind the Forwarding settings page (drawn in
 //! `forwarding.rs`) that manages those aliases.
@@ -6,7 +6,7 @@ use super::tree::Dragged;
 use super::*;
 use crate::manage::backend::Layout;
 
-/// Where the person was: the open mailbox (an account's, All Mail's or an
+/// Where the person was: the open mailbox (an account's, All Accounts' or an
 /// alias's), and whether its subscriptions (and one sender's mail) were
 /// shown. Saved as it changes and opened again at launch.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -133,7 +133,7 @@ impl MailApp {
                         .is_some_and(|folders| folders.iter().any(|f| &f.name == name))
             }
         };
-        // Subscriptions are listed per account and for All Mail.
+        // Subscriptions are listed per account and for All Accounts.
         let subscriptions_listed = !place.subscriptions || id == ALL_MAIL || !fwd::is_view(id);
         (mailbox_listed && subscriptions_listed).then_some(place)
     }
@@ -283,7 +283,7 @@ impl MailApp {
             }
         }
     }
-    /// Marks a view's mailbox read: All Mail in each account, an alias's
+    /// Marks a view's mailbox read: All Accounts in each account, an alias's
     /// view only the messages sent to it.
     pub(super) fn mark_view_read(
         &mut self,
@@ -341,7 +341,7 @@ impl MailApp {
     fn view_title(&self, id: &str) -> Option<(String, String, &'static str)> {
         if id == ALL_MAIL {
             return Some((
-                "All Mail".into(),
+                "All Accounts".into(),
                 "Mail from every account".into(),
                 "inboxes",
             ));
@@ -387,7 +387,7 @@ impl MailApp {
             ),
         ];
         if id == ALL_MAIL {
-            entries.push(entry("Hide All Mail", "eye-off", Action::SetAllMail(false)));
+            entries.push(entry("Hide All Accounts", "eye-off", Action::SetAllMail(false)));
         } else if let Some((f, alias)) = fwd::find_alias(&self.forwarding, &id) {
             entries.push(entry(
                 "Copy Address",
@@ -425,7 +425,7 @@ impl MailApp {
                 if current { c.on_accent } else { c.accent },
             ))
     }
-    /// All Mail or an alias in the expanded sidebar, like an account.
+    /// All Accounts or an alias in the expanded sidebar, like an account.
     pub(super) fn view_block(
         &self,
         id: &str,
@@ -548,13 +548,13 @@ impl MailApp {
                 ));
             }
         }
-        // All Mail stands apart from the accounts below it.
+        // All Accounts stands apart from the accounts below it.
         if !movable {
             block = block.child(div().mt(px(6.)).mx_2().h(px(1.)).bg(rgb(c.border)));
         }
         Some(block.into_any_element())
     }
-    /// All Mail or an alias in the collapsed sidebar.
+    /// All Accounts or an alias in the collapsed sidebar.
     pub(super) fn rail_view(
         &self,
         id: &str,
@@ -687,7 +687,7 @@ impl MailApp {
             .store.set_preference_soon(fwd::ALL_MAIL_PREFERENCE, if on { "true" } else { "false" });
         self.views_changed(cx);
     }
-    /// After aliases, services or All Mail change: saves them, updates the
+    /// After aliases, services or All Accounts change: saves them, updates the
     /// sidebar, and leaves a view that is no longer listed.
     pub(super) fn views_changed(&mut self, cx: &mut Context<Self>) {
         if let Err(e) = fwd::save(&self.backend.store, &self.forwarding) {
@@ -1330,6 +1330,29 @@ mod tests {
         cx.run_until_parked();
         view.read_with(cx, |this, _| assert_eq!(this.visible.len(), 20));
 
+        // All Mail, under each account and under All Accounts, lists every
+        // folder's mail but drafts.
+        let all: &'static str = Box::leak(format!("nav-{work}-all").into_boxed_str());
+        assert!(cx.debug_bounds(all).is_some());
+        assert!(cx.debug_bounds("nav-all-mail-all").is_some());
+        act(&view, Action::OpenMailbox(work.clone(), Folder::All.into()), cx);
+        cx.run_until_parked();
+        let work_all = view.read_with(cx, |this, _| {
+            assert!(this.visible.len() >= 8, "{}", this.visible.len());
+            assert!(this.visible.iter().all(|i| {
+                let m = &this.messages[*i];
+                m.account == work && m.folder != Folder::Drafts
+            }));
+            this.visible.len()
+        });
+        act(&view, Action::OpenMailbox(ALL_MAIL.into(), Folder::All.into()), cx);
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert!(this.visible.len() > work_all);
+            assert!(this.visible.iter().any(|i| this.messages[*i].account != work));
+            assert!(this.visible.iter().all(|i| this.messages[*i].folder != Folder::Drafts));
+        });
+
         // Showing the alias in its mailbox again puts its mail back there.
         act(
             &view,
@@ -1347,7 +1370,7 @@ mod tests {
             assert!(!tree::account_order(&this.tree).contains(&alias));
         });
 
-        // Turning All Mail off while it is open goes back to an account,
+        // Turning All Accounts off while it is open goes back to an account,
         // and the accounts move up into its place.
         act(
             &view,

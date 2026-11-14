@@ -694,7 +694,11 @@ impl Backend {
         self.with_imap(a, |c| {
             // One LIST per sync keeps the folder list current.
             let names = c.names(true)?.to_vec();
-            let _ = self.store.save_folders(&a.id, &custom_folders(&names));
+            let folders = custom_folders(&names);
+            let _ = self.store.save_folders(&a.id, &folders);
+            if folder == Folder::All {
+                return self.sync_all(c, a, &names, &folders, limit);
+            }
             if folder != Folder::Starred {
                 let remote = remote_name(&names, a, mailbox)?;
                 return self.sync_remote(c, a, mailbox, &remote, limit);
@@ -743,6 +747,50 @@ impl Backend {
             result.truncate(limit);
             Ok(result)
         })
+    }
+    /// All Mail: brings each of the account's mailboxes up to date (Gmail's
+    /// labels are in its All Mail already, so its own folders are left out),
+    /// then lists the newest of everything cached but drafts.
+    fn sync_all(
+        &self,
+        c: &mut Connection,
+        a: &Account,
+        names: &[Name],
+        folders: &[crate::manage::model::RemoteFolder],
+        limit: usize,
+    ) -> Result<Vec<Mail>> {
+        let mut visited = std::collections::HashSet::new();
+        for source in [
+            Folder::Inbox,
+            Folder::Sent,
+            Folder::Archive,
+            Folder::Junk,
+            Folder::Trash,
+        ] {
+            let remote = match resolve_in(names, a.provider, source) {
+                Ok(remote) => remote,
+                Err(_) if source != Folder::Inbox => continue,
+                Err(e) => return Err(e),
+            };
+            if visited.insert(remote.clone()) {
+                self.sync_remote(c, a, &source.into(), &remote, limit)?;
+            }
+        }
+        if a.provider != Provider::Gmail {
+            for folder in folders {
+                if !visited.insert(folder.name.clone()) {
+                    continue;
+                }
+                let mailbox = Mailbox::Remote(folder.name.clone());
+                // One folder that can't be read doesn't keep the rest from showing.
+                if let Err(e) = self.sync_remote(c, a, &mailbox, &folder.name, limit)
+                    && crate::sync::retry::transient(&e)
+                {
+                    return Err(e);
+                }
+            }
+        }
+        self.store.messages(&a.id, Folder::All, limit)
     }
     /// Brings one server mailbox's cache up to date. After a first full
     /// synchronization, later ones ask only for what changed: messages past
@@ -873,8 +921,9 @@ impl Backend {
     }
     fn catalog_once(&self, a: &Account, mailbox: &Mailbox, batch: usize) -> Result<Catalog> {
         let folder = mailbox.folder();
-        // Drafts are local; Starred is assembled from the other mailboxes.
-        if matches!(folder, Folder::Drafts | Folder::Starred) {
+        // Drafts are local; Starred and All Mail are assembled from the
+        // other mailboxes.
+        if folder == Folder::Drafts || folder.is_virtual() {
             return Ok(Catalog::default());
         }
         self.ensure_background(a)?;
@@ -959,7 +1008,7 @@ impl Backend {
     pub fn listed(&self, account: &str, mailbox: &Mailbox) -> Result<(Vec<Mail>, Option<Layout>)> {
         let mut messages = self.store.summaries(account, mailbox.clone())?;
         let layout = self.layout(account, mailbox);
-        let saved = if layout.is_none() && mailbox.folder() != Folder::Starred {
+        let saved = if layout.is_none() && !mailbox.folder().is_virtual() {
             match messages.first().map(|m| m.remote_folder.clone()) {
                 Some(remote) => self
                     .store
@@ -1339,7 +1388,7 @@ impl Backend {
         limit: usize,
         password: &str,
     ) -> Result<Vec<Mail>> {
-        if folder != Folder::Inbox && folder != Folder::Starred {
+        if !matches!(folder, Folder::Inbox | Folder::Starred | Folder::All) {
             return self.store.messages(&a.id, folder, limit);
         }
         let mut pop = self.pop_login(a, password)?;
@@ -1940,9 +1989,14 @@ impl Backend {
     }
     /// Marks every message in a mailbox read, on the server and in the cache.
     pub fn mark_all_read(&self, a: &Account, mailbox: &Mailbox) -> Result<()> {
-        if mailbox.folder() == Folder::Starred {
-            let starred = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
-            return self.change_many(a, &starred, Change::Read(true));
+        if mailbox.folder().is_virtual() {
+            let unread: Vec<Mail> = self
+                .store
+                .messages(&a.id, mailbox, usize::MAX >> 1)?
+                .into_iter()
+                .filter(|m| m.unread)
+                .collect();
+            return self.change_many(a, &unread, Change::Read(true));
         }
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();

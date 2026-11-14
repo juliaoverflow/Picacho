@@ -132,6 +132,9 @@ impl AssetSource for Assets {
             "mail/inboxes.svg" => Some(
                 "<path d='M22 12h-6l-2 3h-4l-2-3H2'/><path d='M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1Z'/><path d='M7 1h10'/>",
             ),
+            "mail/all-mail.svg" => Some(
+                "<rect x='6' y='7' width='16' height='12' rx='2'/><path d='m6 8 8 6 8-6'/><path d='M2 15V5a2 2 0 0 1 2-2h14'/>",
+            ),
             "mail/pin.svg" => Some(
                 "<path d='M12 17v5M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V17h14v-1.8a2 2 0 0 0-1.1-1.7l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1Z'/>",
             ),

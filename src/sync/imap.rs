@@ -521,6 +521,8 @@ pub(crate) fn encode_name(name: &str) -> String {
     out
 }
 pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> Result<String> {
+    // All Mail is every mailbox at once, not a server folder.
+    ensure!(folder != Folder::All, "All Mail is not a folder on the server.");
     if folder == Folder::Inbox {
         return Ok("INBOX".into());
     }

@@ -364,9 +364,12 @@ pub enum Folder {
     Trash,
     /// A server folder outside the standard set. `Mail::remote_folder` names it.
     Other,
+    /// Every message of the account, whatever folder it is in (drafts
+    /// aside). Like Starred, it is assembled from the other mailboxes.
+    All,
 }
 impl Folder {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Inbox,
         Self::Starred,
         Self::Sent,
@@ -374,7 +377,12 @@ impl Folder {
         Self::Archive,
         Self::Junk,
         Self::Trash,
+        Self::All,
     ];
+    /// Mailboxes assembled from the others rather than kept on a server.
+    pub fn is_virtual(self) -> bool {
+        matches!(self, Self::Starred | Self::All)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Inbox => "Inbox",
@@ -385,6 +393,7 @@ impl Folder {
             Self::Junk => "Spam",
             Self::Trash => "Trash",
             Self::Other => "Folder",
+            Self::All => "All Mail",
         }
     }
     pub fn key(self) -> &'static str {
@@ -397,6 +406,7 @@ impl Folder {
             Self::Junk => "junk",
             Self::Trash => "trash",
             Self::Other => "other",
+            Self::All => "all",
         }
     }
 }

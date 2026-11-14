@@ -465,7 +465,7 @@ impl MailApp {
             ))
             .child(self.section("Mailboxes"))
             .child(self.toggle_row(
-                "All Mail",
+                "All Accounts",
                 "With more than one account, list every account's inbox, drafts, spam and other mail together at the top of the sidebar.",
                 self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
                     .debug_selector(|| "all-mail".into()),

@@ -404,7 +404,7 @@ fn the_last_open_mailbox_opens_again_after_a_restart(cx: &mut TestAppContext) {
         assert_eq!(this.account.as_ref(), Some(&second));
         assert_eq!(this.mailbox(), receipts);
     });
-    // All Mail's Starred.
+    // All Accounts' Starred.
     act(&restarted, Action::OpenMailbox(fwd::ALL_MAIL.into(), Folder::Starred.into()), cx);
     cx.run_until_parked();
     store.flush();

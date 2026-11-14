@@ -53,6 +53,7 @@ POP3 downloads are identified by stable UIDL values, cached, and deduplicated. R
 ## Implemented interactions
 
 - A sidebar listing every account as a collapsible group with its standard mailboxes and server folders (nested beneath the inbox). It collapses to an icon rail with ⌃⌘S.
+- **All Mail** under each account lists every message in the account at once: the inbox, sent, archive, spam, trash and the account's own server folders (drafts aside), newest first, with each message listed once even when it is in several folders (Gmail's labels). Refreshing it checks each of those folders; on Gmail, its own All Mail plus Spam and Trash. Moving a message there keeps it in the list. With more than one account, **All Accounts** (formerly All Mail; Settings → General → Mailboxes) lists every account's mailboxes together at the top of the sidebar, its All Mail included.
 - On IMAP accounts, server folders are made and renamed the way the sidebar's own folders are: right-click the inbox for **New Folder**, or one of your own server folders for **Rename…**, **New Folder Inside** and **Delete Folder…**. A new folder appears in place as "New Folder" with its name selected; names are edited in place (double-click a folder to rename it), Enter or clicking away saves, and Escape keeps the name (a new folder is still made). A new folder goes at the end of its folder (or of the list) and stays there, and a renamed one keeps its place, as with top folders; folders made in other apps follow, by name. Changes are made on the server, and the sidebar shows the new name meanwhile; renaming a folder downloads its mail again under the new name. Deleting a server folder asks first, since it deletes the folder's mail on the server.
 - Right-click menus for accounts, mailboxes, and messages.
 - **Delete Permanently…** for messages in Trash or Spam (one or a selection), and **Empty Trash…**/**Empty Spam…** on those mailboxes; both ask first. Only the named messages are removed (`UID EXPUNGE`); on servers without UIDPLUS, nothing is changed while another app has left messages marked for deletion there.
@@ -74,7 +75,7 @@ POP3 downloads are identified by stable UIDL values, cached, and deduplicated. R
 - Server read/star flags and atomic IMAP moves where the server supports `MOVE`; elsewhere, a copy and removal of just the moved messages (`UID EXPUNGE`).
 - New inbox mail shows as it arrives on servers with IMAP `IDLE`; scheduled checks continue as before.
 - Light, dark, and automatic appearance with seven theme colors; tooltips, keyboard shortcuts, and animated reader/dialog entrances.
-- A full macOS menu bar: the Picacho menu (About, Settings ⌘,, Services, Hide, Quit), File, Edit, View, Mailbox (⌘1–⌘7), Message, Window, and Help. Shortcuts use Ctrl in place of ⌘ on Windows and Linux.
+- A full macOS menu bar: the Picacho menu (About, Settings ⌘,, Services, Hide, Quit), File, Edit, View, Mailbox (⌘1–⌘8, ⌘8 being All Mail), Message, Window, and Help. Shortcuts use Ctrl in place of ⌘ on Windows and Linux.
 - Per-mailbox refresh schedules and new-mail notifications.
 
 ## Performance and storage

@@ -18,9 +18,10 @@ use std::collections::{HashMap, HashSet};
 
 /// Preference holding the service accounts.
 const PREFERENCE: &str = "forwarding";
-/// Preference: list All Mail when there are several accounts ("true"/"false").
+/// Preference: list All Accounts when there are several accounts ("true"/"false").
 pub const ALL_MAIL_PREFERENCE: &str = "all_mail";
-/// The All Mail view's id, used where an account id goes.
+/// The All Accounts view's id, used where an account id goes. (It kept
+/// its old name, "all-mail", so saved places and preferences still work.)
 pub const ALL_MAIL: &str = "all-mail";
 const ALIAS_PREFIX: &str = "alias:";
 
@@ -1048,7 +1049,7 @@ fn addy_route(alias: &str, recipient: &str) -> Result<String> {
 pub fn alias_view(account: &str, alias: &str) -> String {
     format!("{ALIAS_PREFIX}{account}:{alias}")
 }
-/// Whether `id` is All Mail or an alias rather than a real mailbox.
+/// Whether `id` is All Accounts or an alias rather than a real mailbox.
 pub fn is_view(id: &str) -> bool {
     id == ALL_MAIL || id.starts_with(ALIAS_PREFIX)
 }
@@ -1125,7 +1126,7 @@ fn hidden_from(forwarding: &[ForwardingAccount], account: &str) -> HashSet<Strin
         .map(|a| a.email.clone())
         .collect()
 }
-/// What the mailbox `folder` of `view` (an account, All Mail or an alias) lists.
+/// What the mailbox `folder` of `view` (an account, All Accounts or an alias) lists.
 pub fn scope(
     view: &str,
     folder: Folder,
@@ -1165,7 +1166,7 @@ pub fn scope(
 pub type UnreadRow = (String, String, String, String);
 
 /// Sidebar unread counts for every view: mailboxes less the mail of aliases
-/// shown on their own, those aliases, and All Mail.
+/// shown on their own, those aliases, and All Accounts.
 pub fn view_counts(
     raw: HashMap<(String, String), usize>,
     rows: &[UnreadRow],

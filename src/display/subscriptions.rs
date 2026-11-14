@@ -75,7 +75,7 @@ impl MailApp {
         );
     }
     /// The mailboxes a subscriptions list covers: one account, or every
-    /// account for All Mail's.
+    /// account for All Accounts'.
     fn subscription_accounts(&self, id: &str) -> Vec<String> {
         if id == ALL_MAIL {
             self.accounts.iter().map(|a| a.id.clone()).collect()
@@ -554,7 +554,7 @@ impl MailApp {
                 .into_any_element(),
         )
     }
-    /// "Subscriptions" under an account, or "All Subscriptions" under All Mail.
+    /// "Subscriptions" under an account, or "All Subscriptions" under All Accounts.
     pub(super) fn subscriptions_nav(&self, id: &str, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
         let active = self.subs_open && self.account.as_deref() == Some(id);
