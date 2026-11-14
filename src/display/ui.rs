@@ -1290,7 +1290,11 @@ impl MailApp {
         }));
         let login_input = input("Same as the email address", false, false, window, cx);
         subscriptions.push(cx.subscribe(&login_input, |this, input, e, cx| {
-            if matches!(e, InputEvent::Change)
+            // Applied once typed (Enter or leaving the field), not on every
+            // key: each change signs the account out, and its connections
+            // would sign in again with half a name, failing until the
+            // server throttles or locks the account.
+            if matches!(e, InputEvent::PressEnter { .. } | InputEvent::Blur)
                 && let Some(id) = this.nickname_for.clone()
             {
                 let value = input.read(cx).value().trim().to_owned();
