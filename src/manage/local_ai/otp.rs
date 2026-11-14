@@ -40,7 +40,9 @@ static WORD: LazyLock<Regex> =
 
 /// Concepts that carry across languages ("code", "verify", "order"...), each
 /// with the word stems that name it; "=" marks a stem that must be the whole
-/// word. The model was trained with this same file.
+/// word and "^" one the word must start with ("^order" names "orders" but not
+/// German "angefordert", requested). The model was trained with this same
+/// file.
 static LEXICON: LazyLock<Vec<(String, Vec<String>)>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../../../models/otp/lexicon.json")).expect("lexicon")
 });
@@ -50,9 +52,14 @@ fn concepts(words: &[String]) -> Vec<&'static str> {
     LEXICON
         .iter()
         .filter(|(_, stems)| {
-            stems.iter().any(|st| match st.strip_prefix('=') {
-                Some(whole) => words.iter().any(|w| w == whole),
-                None => words.iter().any(|w| w.contains(st.as_str())),
+            stems.iter().any(|st| {
+                if let Some(whole) = st.strip_prefix('=') {
+                    words.iter().any(|w| w == whole)
+                } else if let Some(start) = st.strip_prefix('^') {
+                    words.iter().any(|w| w.starts_with(start))
+                } else {
+                    words.iter().any(|w| w.contains(st.as_str()))
+                }
             })
         })
         .map(|(name, _)| name.as_str())
@@ -159,9 +166,9 @@ impl Text {
         let code = self.slice(start, end);
         let left = self.slice(start.saturating_sub(WINDOW), start);
         let right = self.slice(end, end + WINDOW);
-        let lw = words(&left);
+        let lw = words(&left, true);
         let lw = &lw[lw.len().saturating_sub(CONTEXT)..];
-        let rw = words(&right);
+        let rw = words(&right, true);
         let rw = &rw[..rw.len().min(CONTEXT)];
         let mut f = Vec::new();
         for w in lw {
@@ -220,7 +227,7 @@ impl Text {
         if start < self.subject_len {
             f.push("insubject".into());
         }
-        let sw = words(subject);
+        let sw = words(subject, true);
         let sw = &sw[..sw.len().min(SUBJECT_WORDS)];
         for w in sw {
             f.push(format!("S:{w}"));
@@ -240,13 +247,29 @@ impl Text {
                 f.push(format!("{region}:{name}"));
             }
         }
+        // And what the whole window on each side, and the subject, are
+        // about, with words in scripts written without spaces kept whole: a
+        // code often sits far from the words that say what it is ("dies ist
+        // ein einmaliger Roblox-Code, der für ein Konto angefordert wurde,
+        // ...: 456360", or "293393は、...ワンタイムコードです").
+        for (region, t) in [
+            ("CWL", left.as_str()),
+            ("CWR", right.as_str()),
+            ("CWS", subject),
+        ] {
+            for name in concepts(&words(t, false)) {
+                f.push(format!("{region}:{name}"));
+            }
+        }
         f
     }
 }
 
 /// Lowercase words: runs of letters, marks, digits and underscores, with
-/// runs in scripts written without spaces split into pairs of characters.
-fn words(text: &str) -> Vec<String> {
+/// runs in scripts written without spaces split into pairs of characters
+/// (or, without `pairs`, kept whole, so that concepts can be looked for in
+/// them: "ワンタイムコード" names *once* and *code*).
+fn words(text: &str, pairs: bool) -> Vec<String> {
     let lower = text.to_lowercase();
     let mut out = Vec::new();
     for run in WORD.find_iter(&lower) {
@@ -258,7 +281,7 @@ fn words(text: &str) -> Vec<String> {
                 continue;
             }
             let seg = &chars[start..i];
-            if dense(seg[0]) && seg.len() > 1 {
+            if pairs && dense(seg[0]) && seg.len() > 1 {
                 out.extend(seg.windows(2).map(|w| w.iter().collect::<String>()));
             } else {
                 out.push(seg.iter().collect());
@@ -594,6 +617,26 @@ mod tests {
                 .codes("ご注文の確認", "注文番号：58194433\n合計金額：¥4,500")
                 .is_empty()
         );
+    }
+
+    /// Codes far from the words that say what they are, as Roblox writes.
+    #[test]
+    fn finds_codes_far_from_the_words_naming_them() {
+        let detector = Detector::new(Box::new(model()), super::super::OTP.threshold);
+        let cases = [
+            (
+                "こんにちは。\n\n293393は、ご自身またはお子様のアカウントに対してリクエストされたRobloxのワンタイムコードです。ログインするには、このコードをログイン画面に入力してください。このコードは15分で期限切れになります。",
+                "293393",
+            ),
+            (
+                "Hallo,\n\ndies ist ein einmaliger Roblox-Code, der für ein Konto angefordert wurde, das dir oder deinem Kind gehört: 456360. Gib ihn im Anmeldebildschirm ein, um dich anzumelden. Der Code ist 15 Minuten lang gültig.",
+                "456360",
+            ),
+        ];
+        for (body, code) in cases {
+            assert_eq!(detector.codes("", body), [code], "{body}");
+            assert_eq!(detector.codes("Roblox", body), [code], "{body}");
+        }
     }
 
     #[test]

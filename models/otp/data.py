@@ -109,6 +109,8 @@ POSITIVE = [
     ("Two-factor authentication code", "Your two-factor authentication code is {code}. Enter it on the login page to continue."),
     ("{svc}: confirm it's you", "Hi {name},\nSomeone is trying to sign in to your account from a new device. If it's you, enter the code below.\n\n{code}\n\n— {svc} Security"),
     ("Your {svc} code", "{code}\nEnter this code in {svc} to verify your identity. It expires soon."),
+    ("Your {svc} one-time code", "Hello,\n\n{code} is the one-time {svc} code that was requested for an account that belongs to you or your child. To log in, enter it on the login screen. This code will expire in {min} minutes."),
+    ("{svc} account", "Hi {name},\n\nhere is the one-time code that was just requested for the account you or someone in your family uses on {svc}: {code}. Enter it on the screen where you are signing in."),
     ("Password reset code", "We received a request to reset your password. Your reset code is {code}. If you didn't ask for this, ignore this message."),
     ("Account verification", "Dear customer,\n\nPlease use the following One Time Password (OTP) to complete your transaction: {code}\n\nDo not disclose this OTP to anyone. Valid for {min} minutes.\n\nRegards,\n{svc}"),
     ("New sign-in to your account", "To complete your sign-in, enter the following code: {code}\nRequest from {city_short}, {date}.\nIf this wasn't you, contact {phone}."),
@@ -332,6 +334,26 @@ POSITIVE_MORE = [
     ("Eenmalige code", "Je eenmalige inlogcode is {code}. Deel deze code met niemand.", ""),
     ("Kod do logowania", "Twój jednorazowy kod do logowania: {code}", ""),
     ("Inloggningskod", "Ange koden {code} för att logga in på {svc}.", ""),
+    # The code far from the words that say what it is: at the start of a
+    # long sentence that names it only at the end, or at the end of one that
+    # named it at the start (as Roblox writes in every language).
+    ("{svc}のワンタイムコード", "こんにちは。\n\n{code}は、ご自身またはお子様のアカウントに対してリクエストされた{svc}のワンタイムコードです。ログインするには、このコードをログイン画面に入力してください。このコードは{min}分で期限切れになります。", "fullwidth"),
+    ("{svc}からのお知らせ", "{name}様\n\n{code}が、先ほどお客様のアカウントでのサインインのためにリクエストされた確認用のコードです。画面に入力して手続きを完了してください。", "fullwidth"),
+    ("{svc}-Code", "Hallo,\n\ndies ist ein einmaliger {svc}-Code, der für ein Konto angefordert wurde, das dir oder deinem Kind gehört: {code}. Gib ihn im Anmeldebildschirm ein, um dich anzumelden. Der Code ist {min} Minuten lang gültig.", ""),
+    ("Ihr Anmeldecode", "Guten Tag {name},\n\nSie haben soeben über die App oder die Website eine Anmeldung bei Ihrem Konto angefordert, hier ist der Bestätigungscode dafür: {code}. Er läuft in {min} Minuten ab.", ""),
+    ("{svc}", "{code} ist der einmalige Code, den du vor kurzem für dein Konto bei {svc} angefordert hast. Gib ihn ein, um fortzufahren.", ""),
+    ("Votre code {svc}", "Bonjour,\n\nvoici un code {svc} à usage unique demandé pour un compte qui vous appartient ou qui appartient à votre enfant : {code}. Saisissez-le sur l'écran de connexion pour vous connecter. Ce code expire dans {min} minutes.", ""),
+    ("Tu código de {svc}", "Hola:\n\n{code} es el código de un solo uso de {svc} solicitado para una cuenta tuya o de tu hijo. Introdúcelo en la pantalla de inicio de sesión para iniciar sesión. Este código caduca en {min} minutos.", ""),
+    ("Seu código {svc}", "Olá,\n\neste é um código único do {svc} solicitado para uma conta que pertence a você ou ao seu filho: {code}. Insira-o na tela de login para entrar. O código expira em {min} minutos.", ""),
+    ("Il tuo codice {svc}", "Ciao,\n\n{code} è il codice monouso di {svc} richiesto per un account che appartiene a te o a tuo figlio. Inseriscilo nella schermata di accesso per accedere. Il codice scade tra {min} minuti.", ""),
+    ("Je {svc}-code", "Hallo,\n\ndit is een eenmalige {svc}-code die is aangevraagd voor een account van jou of je kind: {code}. Voer hem in op het inlogscherm om in te loggen. De code verloopt over {min} minuten.", ""),
+    ("Twój kod {svc}", "Cześć,\n\n{code} to jednorazowy kod {svc}, o który poproszono dla konta należącego do Ciebie lub Twojego dziecka. Wpisz go na ekranie logowania, aby się zalogować. Kod wygaśnie za {min} minut.", ""),
+    ("Ваш код {svc}", "Здравствуйте!\n\nЭто одноразовый код {svc}, запрошенный для учётной записи, принадлежащей вам или вашему ребёнку: {code}. Введите его на экране входа. Код действителен {min} минут.", ""),
+    ("{svc} 일회용 코드", "안녕하세요.\n\n{code}은(는) 회원님 또는 자녀의 계정에 대해 요청된 {svc} 일회용 코드입니다. 로그인하려면 로그인 화면에 이 코드를 입력하세요. 이 코드는 {min}분 후에 만료됩니다.", ""),
+    ("{svc} 一次性代码", "您好！\n\n{code} 是为您或您孩子的账户申请的 {svc} 一次性代码。请在登录界面输入此代码进行登录。此代码将在 {min} 分钟后过期。", "fullwidth"),
+    ("{svc} 一次性代碼", "您好：\n\n這是為您或您孩子的帳戶所要求的 {svc} 一次性代碼：{code}。請在登入畫面輸入此代碼。此代碼將於 {min} 分鐘後失效。", ""),
+    ("{svc} kodunuz", "Merhaba,\n\n{code}, size veya çocuğunuza ait bir hesap için istenen tek kullanımlık {svc} kodudur. Giriş yapmak için bu kodu giriş ekranına girin. Kod {min} dakika içinde sona erer.", ""),
+    ("Din {svc}-kod", "Hej,\n\nhär är en engångskod från {svc} som har begärts för ett konto som tillhör dig eller ditt barn: {code}. Ange den på inloggningsskärmen för att logga in. Koden upphör att gälla om {min} minuter.", ""),
 ]
 
 # Mail with numbers that aren't codes, in more languages.

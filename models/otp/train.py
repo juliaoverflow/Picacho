@@ -194,6 +194,8 @@ def parity(model):
         ("Код подтверждения", "Ваш код: 7731. Заказ №558120 отправлен."),
         ("รหัส OTP", "รหัส OTP ของคุณคือ 482913 (อ้างอิง: SAVE20)"),
         ("Order", "Ref 123456AB, code x123456y, and 4829 1301"),
+        ("Roblox", "こんにちは。\n\n293393は、ご自身またはお子様のアカウントに対してリクエストされたRobloxのワンタイムコードです。ログインするには、このコードをログイン画面に入力してください。このコードは15分で期限切れになります。"),
+        ("", "Hallo,\n\ndies ist ein einmaliger Roblox-Code, der für ein Konto angefordert wurde, das dir oder deinem Kind gehört: 456360. Gib ihn im Anmeldebildschirm ein, um dich anzumelden. Der Code ist 15 Minuten lang gültig."),
     ]
     out = []
     for subject, body in cases:

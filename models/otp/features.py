@@ -42,7 +42,9 @@ DENSE = [
 
 # Concepts that carry across languages ("code", "verify", "order"...), each
 # with the word stems that name it; "=" marks a stem that must be the whole
-# word. The app builds the same features from the same file.
+# word and "^" one the word must start with ("^order" names "orders" but not
+# German "angefordert", requested). The app builds the same features from
+# the same file.
 LEXICON = json.loads((Path(__file__).parent / "lexicon.json").read_text(encoding="utf-8"))
 
 
@@ -53,6 +55,8 @@ def concepts(ws):
         for st in stems:
             if st.startswith("="):
                 hit = st[1:] in ws
+            elif st.startswith("^"):
+                hit = any(w.startswith(st[1:]) for w in ws)
             else:
                 hit = any(st in w for w in ws)
             if hit:
@@ -100,9 +104,11 @@ def is_dense(c):
     return any(a <= o <= b for a, b in DENSE)
 
 
-def words(text):
+def words(text, pairs=True):
     """Lowercase words: runs of letters, marks, digits and underscores, with
-    runs in scripts written without spaces split into pairs of characters."""
+    runs in scripts written without spaces split into pairs of characters
+    (or, without `pairs`, kept whole, so that concepts can be looked for in
+    them: "ワンタイムコード" names *once* and *code*)."""
     out = []
     run = []
 
@@ -112,7 +118,7 @@ def words(text):
         for i in range(1, len(run) + 1):
             if i == len(run) or is_dense(run[i]) != is_dense(run[start]):
                 seg = "".join(run[start:i])
-                if is_dense(run[start]) and len(seg) > 1:
+                if pairs and is_dense(run[start]) and len(seg) > 1:
                     out.extend(seg[j:j + 2] for j in range(len(seg) - 1))
                 else:
                     out.append(seg)
@@ -194,6 +200,14 @@ def features(subject, text, start, end):
     # What the nearby words are about, whatever the language.
     for region, ws in (("CL", lw), ("CR", rw), ("CS", sw), ("CNL", lw[-NEAR:]), ("CNR", rw[:NEAR])):
         for name in concepts(ws):
+            f.append(f"{region}:{name}")
+    # And what the whole window on each side, and the subject, are about,
+    # with words in scripts written without spaces kept whole: a code often
+    # sits far from the words that say what it is ("dies ist ein einmaliger
+    # Roblox-Code, der für ein Konto angefordert wurde, ...: 456360", or
+    # "293393は、...ワンタイムコードです").
+    for region, t in (("CWL", left), ("CWR", right), ("CWS", subject)):
+        for name in concepts(words(t, pairs=False)):
             f.append(f"{region}:{name}")
     return f
 

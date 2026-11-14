@@ -47,7 +47,12 @@ Persian, Devanagari, Bengali and Thai digits. Copy Code gives ASCII digits.
    nearby words and the subject name. Concepts (`lexicon.json`: code,
    verify, sign in, one-time, expiry, don't share, order, money, shipping,
    contact, promotion, reference) list word stems in every language above,
-   so "код", "コード" and "kód" all count as *code*. Everything is hashed
+   so "код", "コード" and "kód" all count as *code* (`=` marks a stem that
+   must be the whole word, `^` one the word must start with). Concepts are
+   also taken from the whole 200 characters on each side of the candidate
+   and from the subject, with Chinese, Japanese and Thai runs kept whole
+   rather than split into pairs, because a code often sits far from the
+   words naming it (`293393は、…ワンタイムコードです`). Everything is hashed
    into 16,384 slots.
 4. **Model.** A bag-of-features network (fastText style): one hidden layer of
    16 units and a logistic output, about 260,000 weights (1 MB). A candidate
@@ -76,8 +81,8 @@ On messages built from templates held out of training:
 
 | Held-out wording | Precision | Recall | Messages exactly right |
 | --- | --- | --- | --- |
-| English (and other Latin-script) templates | 96% | 95% | 95% |
-| Templates in the newer languages | 99% | 90% | 94% |
+| English (and other Latin-script) templates | 92% | 99% | 95% |
+| Templates in the newer languages | 97% | 96% | 96% |
 
 Those are the honest figures for wording the model hasn't seen; on familiar
 wording it is right nearly every time. The lexicon was written knowing every
