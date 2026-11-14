@@ -286,6 +286,7 @@ impl Store {
             starred: current.starred,
             folder: current.folder,
             remote_folder: current.remote_folder,
+            labels: current.labels,
             ..read.clone()
         };
         write_messages(&tx, std::slice::from_ref(&next))?;

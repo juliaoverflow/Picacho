@@ -1071,3 +1071,32 @@ fn imap_mail_moves_into_server_folders() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Labels and Gmail ids come from the server's listing, not the message's
+/// source: opening a downloaded message keeps them, in what is shown and in
+/// the cache.
+#[test]
+fn opening_a_message_keeps_its_labels() -> Result<()> {
+    let path = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+    let b = Backend::new(Arc::new(Store::open(&path)?));
+    let mut a = Account::new(Provider::Gmail);
+    a.email = "qa@example.com".into();
+    let mut m = parse_message(MESSAGE, &a, "labelled", Folder::Inbox, "INBOX", 1)?;
+    m.labels = vec!["Receipts".into(), "Work".into()];
+    m.gmail_id = 42;
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    b.store.save_raw("labelled", MESSAGE)?;
+    // An older copy, as the list may hold one, still opens with the cache's.
+    let stale = Mail {
+        labels: vec![],
+        ..m.clone()
+    };
+    let read = b.read(&a, &stale)?;
+    assert_eq!(read.labels, ["Receipts", "Work"]);
+    let cached = b.store.message("labelled")?.unwrap();
+    assert_eq!(cached.labels, ["Receipts", "Work"]);
+    assert_eq!(cached.gmail_id, 42);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

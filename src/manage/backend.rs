@@ -1410,12 +1410,16 @@ impl Backend {
         if let Some(raw) = self.store.raw(&m.id)? {
             let latest = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
             let (next, kept) = self.parse_read(a, &latest, &raw)?;
-            // Flags or a move may have been committed meanwhile; those stay.
+            // Flags, labels or a move may have been committed meanwhile;
+            // those stay. The body comes from `next`: zero-access mail keeps
+            // none in the cache.
             return Ok(self.store.refresh_message(&kept)?.map_or(next.clone(), |current| {
                 Mail {
                     unread: current.unread,
                     starred: current.starred,
                     folder: current.folder,
+                    remote_folder: current.remote_folder,
+                    labels: current.labels,
                     ..next
                 }
             }));
@@ -1471,6 +1475,11 @@ impl Backend {
         next.unread = m.unread;
         next.starred = m.starred;
         next.size = m.size;
+        // What only the server's listing says, not the message's source.
+        next.labels = m.labels.clone();
+        if next.gmail_id == 0 {
+            next.gmail_id = m.gmail_id;
+        }
         if protection == crate::manage::crypto::Protection::Pinal {
             let mut kept = next.clone();
             kept.body = None;
