@@ -209,6 +209,184 @@ NEGATIVE = [
     ("Conference registration", "Registration ID: {num6}. Badge pickup at Hall {num4}. Event code {promo}."),
 ]
 
+# Sign-in messages in more languages. A third element names the digits the
+# code may be written in besides ASCII ("arab", "persian", "fullwidth",
+# "deva", "thai", "beng").
+POSITIVE_MORE = [
+    # Japanese
+    ("{svc} 認証コード", "{name}様\n\n{svc}の認証コードは {code} です。\nこのコードの有効期限は{min}分です。心当たりがない場合は、このメールを破棄してください。", "fullwidth"),
+    ("ログイン確認コードのお知らせ", "ログインするには、次の確認コードを入力してください：{code}\n他の人には教えないでください。", "fullwidth"),
+    ("【{svc}】ワンタイムパスワード", "ワンタイムパスワード：{code}\n有効期限：{min}分", "fullwidth"),
+    # Chinese (Simplified)
+    ("{svc}验证码", "您的验证码是{code}，{min}分钟内有效。请勿将验证码告诉他人。", "fullwidth"),
+    ("登录验证", "您正在登录{svc}，验证码：{code}。如非本人操作，请忽略本邮件。", "fullwidth"),
+    ("安全验证码", "【{svc}】动态密码{code}，用于身份验证，有效期{min}分钟。", ""),
+    # Chinese (Traditional)
+    ("{svc} 驗證碼", "您的驗證碼為 {code}，請於{min}分鐘內輸入。請勿與他人分享此驗證碼。", "fullwidth"),
+    ("登入驗證碼", "您好，您的登入驗證碼是：{code}\n若非本人操作，請立即變更密碼。", ""),
+    # Korean
+    ("{svc} 인증번호", "{svc} 인증번호는 [{code}] 입니다. {min}분 이내에 입력해 주세요.", ""),
+    ("로그인 인증 코드", "로그인을 완료하려면 다음 인증 코드를 입력하세요: {code}\n본인이 요청하지 않았다면 이 메일을 무시하세요.", ""),
+    # Russian
+    ("Код подтверждения {svc}", "Ваш код подтверждения: {code}\nКод действителен {min} минут. Никому не сообщайте этот код.", ""),
+    ("Вход в аккаунт", "Здравствуйте, {name}!\nДля входа в {svc} введите код {code}. Если это были не вы, смените пароль.", ""),
+    ("Одноразовый пароль", "Одноразовый пароль для входа: {code}", ""),
+    # Ukrainian
+    ("Код підтвердження", "Ваш код підтвердження {svc}: {code}. Код дійсний протягом {min} хвилин.", ""),
+    ("Вхід до облікового запису", "Щоб увійти, введіть цей код: {code}\nНікому не повідомляйте його.", ""),
+    # Turkish
+    ("{svc} doğrulama kodu", "{svc} doğrulama kodunuz: {code}\nBu kod {min} dakika geçerlidir. Kodu kimseyle paylaşmayın.", ""),
+    ("Giriş kodunuz", "Hesabınıza giriş yapmak için tek kullanımlık şifreniz {code}.", ""),
+    # Arabic
+    ("رمز التحقق من {svc}", "رمز التحقق الخاص بك هو {code}\nصالح لمدة {min} دقائق. لا تشارك هذا الرمز مع أي شخص.", "arab"),
+    ("تسجيل الدخول", "مرحباً {name}، استخدم الرمز {code} لتسجيل الدخول إلى حسابك.", "arab"),
+    ("كلمة المرور لمرة واحدة", "كلمة المرور لمرة واحدة: {code}\nإذا لم تطلب هذا الرمز، يرجى تجاهل هذه الرسالة.", "arab"),
+    # Persian
+    ("کد تأیید {svc}", "کد تأیید شما: {code}\nاین کد تا {min} دقیقه معتبر است. آن را در اختیار دیگران قرار ندهید.", "persian"),
+    ("ورود به حساب", "برای ورود به حساب کاربری خود، رمز یکبار مصرف {code} را وارد کنید.", "persian"),
+    # Hebrew
+    ("קוד האימות שלך", "קוד האימות שלך ל-{svc} הוא {code}. הקוד בתוקף ל-{min} דקות.", ""),
+    ("כניסה לחשבון", "להשלמת הכניסה הזן את הקוד הבא: {code}\nאל תשתף קוד זה עם אף אחד.", ""),
+    # Hindi
+    ("{svc} सत्यापन कोड", "आपका सत्यापन कोड {code} है। यह {min} मिनट के लिए मान्य है। इसे किसी के साथ साझा न करें।", "deva"),
+    ("लॉगिन ओटीपी", "{svc} में लॉगिन करने के लिए आपका OTP {code} है।", "deva"),
+    # Bengali
+    ("যাচাইকরণ কোড", "আপনার {svc} যাচাইকরণ কোড হলো {code}। এটি {min} মিনিটের জন্য বৈধ।", "beng"),
+    # Indonesian
+    ("Kode verifikasi {svc}", "Kode verifikasi Anda adalah {code}. Kode berlaku selama {min} menit. Jangan berikan kode ini kepada siapa pun.", ""),
+    ("Kode masuk Anda", "Gunakan kode OTP {code} untuk masuk ke akun {svc} Anda.", ""),
+    # Malay
+    ("Kod pengesahan", "Kod pengesahan {svc} anda ialah {code}. Sah selama {min} minit.", ""),
+    # Vietnamese
+    ("Mã xác minh {svc}", "Mã xác minh của bạn là {code}. Mã có hiệu lực trong {min} phút. Không chia sẻ mã này với bất kỳ ai.", ""),
+    ("Mã đăng nhập", "Nhập mã OTP {code} để đăng nhập vào tài khoản {svc}.", ""),
+    # Thai
+    ("รหัสยืนยัน {svc}", "รหัสยืนยันของคุณคือ {code} รหัสนี้ใช้ได้ภายใน {min} นาที ห้ามบอกรหัสนี้กับผู้อื่น", "thai"),
+    ("รหัส OTP สำหรับเข้าสู่ระบบ", "รหัส OTP ของคุณคือ {code} (อ้างอิง: {promo})", "thai"),
+    # Greek
+    ("Κωδικός επαλήθευσης", "Ο κωδικός επαλήθευσης για το {svc} είναι {code}. Ισχύει για {min} λεπτά.", ""),
+    ("Σύνδεση στον λογαριασμό", "Για να συνδεθείτε, εισαγάγετε τον κωδικό μίας χρήσης: {code}", ""),
+    # Czech
+    ("Ověřovací kód", "Váš ověřovací kód pro {svc} je {code}. Platí {min} minut.", ""),
+    ("Přihlašovací kód", "Pro přihlášení zadejte tento kód: {code}\nKód nikomu nesdělujte.", ""),
+    # Slovak
+    ("Overovací kód", "Váš overovací kód je {code}. Kód je platný {min} minút.", ""),
+    # Danish
+    ("Din bekræftelseskode", "Din {svc} bekræftelseskode er {code}. Koden udløber om {min} minutter.", ""),
+    # Norwegian
+    ("Engangskode", "Din engangskode for innlogging er {code}. Ikke del koden med andre.", ""),
+    # Finnish
+    ("Vahvistuskoodi", "{svc}-vahvistuskoodisi on {code}. Koodi on voimassa {min} minuuttia.", ""),
+    ("Kirjautumiskoodi", "Kirjaudu sisään syöttämällä koodi {code}.", ""),
+    # Romanian
+    ("Cod de verificare", "Codul tău de verificare {svc} este {code}. Este valabil {min} minute.", ""),
+    ("Codul de autentificare", "Folosește codul {code} pentru a te autentifica. Nu împărtăși acest cod.", ""),
+    # Hungarian
+    ("Ellenőrző kód", "A(z) {svc} ellenőrző kódod: {code}. A kód {min} percig érvényes.", ""),
+    ("Bejelentkezési kód", "A bejelentkezéshez add meg ezt a kódot: {code}", ""),
+    # Catalan
+    ("Codi de verificació", "El teu codi de verificació de {svc} és {code}. Caduca en {min} minuts.", ""),
+    # Croatian / Serbian (Latin)
+    ("Kod za potvrdu", "Vaš kod za potvrdu je {code}. Kod vrijedi {min} minuta.", ""),
+    # Bulgarian
+    ("Код за потвърждение", "Вашият код за потвърждение е {code}. Валиден е {min} минути.", ""),
+    # Tagalog
+    ("Iyong verification code", "Ang iyong {svc} verification code ay {code}. Huwag itong ibahagi kahit kanino.", ""),
+    # Swahili
+    ("Msimbo wa uthibitisho", "Msimbo wako wa uthibitisho wa {svc} ni {code}. Usimpe mtu yeyote.", ""),
+    # Second wordings
+    ("আপনার লগইন কোড", "লগইন করতে এই কোডটি ব্যবহার করুন: {code}। কোডটি কারো সাথে শেয়ার করবেন না।", "beng"),
+    ("Kod log masuk", "Gunakan kod {code} untuk log masuk ke akaun {svc} anda.", ""),
+    ("Prihlasovací kód", "Na prihlásenie zadajte kód {code}. Kód nikomu neposielajte.", ""),
+    ("Log ind på {svc}", "Brug koden {code} til at logge ind. Del ikke koden med andre.", ""),
+    ("Bekreftelseskode", "Din bekreftelseskode for {svc} er {code}. Koden er gyldig i {min} minutter.", ""),
+    ("Codi d'inici de sessió", "Introdueix el codi {code} per iniciar la sessió a {svc}.", ""),
+    ("Kod za prijavu", "Za prijavu unesite kod {code}. Ne dijelite ga ni s kim.", ""),
+    ("Код за вход", "Използвайте код {code}, за да влезете в профила си в {svc}.", ""),
+    ("Code para mag-login", "Gamitin ang code na {code} para mag-login sa {svc}. Mag-e-expire ito sa loob ng {min} minuto.", ""),
+    ("Msimbo wa kuingia", "Tumia msimbo {code} kuingia kwenye akaunti yako ya {svc}.", ""),
+    ("{svc} 로그인 코드", "인증번호 {code}를 입력하여 로그인을 완료하세요.", ""),
+    ("ログインコード", "{svc}のログインコード：{code}\nこのコードは{min}分間有効です。", "fullwidth"),
+    ("验证码通知", "【{svc}】{code}（登录验证码），请勿泄露。", ""),
+    ("رمز الدخول", "رمز الدخول إلى {svc}: {code}\nلا تشارك هذا الرمز.", "arab"),
+    ("کد ورود", "کد ورود شما به {svc}: {code}", "persian"),
+    ("קוד חד פעמי", "הקוד החד פעמי שלך: {code}", ""),
+    ("ओटीपी कोड", "{svc} के लिए आपका वन टाइम पासवर्ड {code} है। यह {min} मिनट में समाप्त हो जाएगा।", "deva"),
+    ("Mã OTP của bạn", "Mã OTP {svc} của bạn là {code}, hết hạn sau {min} phút.", ""),
+    ("รหัสเข้าสู่ระบบ", "ใช้รหัส {code} เพื่อเข้าสู่ระบบ {svc}", "thai"),
+    ("Κωδικός ασφαλείας {svc}", "Ο κωδικός ασφαλείας σας: {code}. Μην τον κοινοποιήσετε σε κανέναν.", ""),
+    ("Kod jednorázový", "Váš jednorázový kód je {code}.", ""),
+    ("Kertakäyttöinen koodi", "Kertakäyttöinen koodisi: {code}. Älä jaa koodia kenellekään.", ""),
+    ("Egyszer használatos kód", "Az egyszer használatos kódod: {code}", ""),
+    ("Cod unic", "Codul tău unic de acces este {code}.", ""),
+    ("Tek kullanımlık kod", "{svc} hesabınız için doğrulama kodu {code}. {min} dakika içinde kullanın.", ""),
+    ("Код для входу", "Ваш одноразовий код для входу до {svc}: {code}", ""),
+    ("Код безопасности", "Код безопасности {svc}: {code}. Не сообщайте его никому, даже сотрудникам поддержки.", ""),
+    ("Kode OTP", "JANGAN BERIKAN kode ini kepada siapa pun. Kode OTP {svc}: {code}", ""),
+    # More in the languages already covered
+    ("Ihr Einmalpasswort", "Ihr Einmalpasswort (OTP) lautet: {code}\nEs verliert nach {min} Minuten seine Gültigkeit.", ""),
+    ("Votre mot de passe à usage unique", "Votre code à usage unique est le {code}. Ne le partagez avec personne.", ""),
+    ("Tu código de un solo uso", "Tu contraseña de un solo uso es {code}. No la compartas con nadie.", ""),
+    ("Seu código de login", "Use o código {code} para entrar na sua conta {svc}. Válido por {min} minutos.", ""),
+    ("Codice di sicurezza", "Inserisci il codice {code} per completare l'accesso a {svc}.", ""),
+    ("Eenmalige code", "Je eenmalige inlogcode is {code}. Deel deze code met niemand.", ""),
+    ("Kod do logowania", "Twój jednorazowy kod do logowania: {code}", ""),
+    ("Inloggningskod", "Ange koden {code} för att logga in på {svc}.", ""),
+]
+
+# Mail with numbers that aren't codes, in more languages.
+NEGATIVE_MORE = [
+    ("ご注文の確認（注文番号 {num8}）", "{name}様\nご注文ありがとうございます。注文番号：{num8}\nお届け予定日：{date}\n合計金額：{amount}\nお問い合わせ：{phone}"),
+    ("発送のお知らせ", "ご注文の商品を発送しました。追跡番号：{num10}\n配送業者のサイトで状況をご確認いただけます。"),
+    ("您的订单已发货", "您的订单{num8}已发货，运单号：{num10}。预计{date}送达。订单金额：{amount}。"),
+    ("发票通知", "发票号码：{num8}\n开票日期：{date}\n金额：{amount}\n客服电话：{phone}"),
+    ("訂單確認", "感謝您的訂購！訂單編號：{num8}，總金額：{amount}，預計出貨日期：{date}。"),
+    ("주문 확인", "주문해 주셔서 감사합니다. 주문번호: {num8}\n결제 금액: {amount}\n배송 예정일: {date}"),
+    ("Ваш заказ {num7} отправлен", "Ваш заказ №{num7} отправлен. Трек-номер: {ref}. Сумма: {amount}. Телефон поддержки: {phone}."),
+    ("Счёт на оплату", "Счёт №{num6} от {date}. Сумма к оплате: {amount}. Лицевой счёт: {num10}."),
+    ("Замовлення {num6}", "Ваше замовлення №{num6} доставлено. Номер відправлення: {num10}."),
+    ("Siparişiniz kargoya verildi", "{num8} numaralı siparişiniz kargoya verildi. Takip numarası: {num10}. Toplam: {amount}."),
+    ("تأكيد الطلب", "شكراً لطلبك. رقم الطلب: {num8}\nالمبلغ الإجمالي: {amount}\nتاريخ التسليم المتوقع: {date}"),
+    ("فاتورة رقم {num6}", "فاتورتك رقم {num6} بتاريخ {date} بمبلغ {amount}. رقم الحساب: {num10}."),
+    ("سفارش شما ارسال شد", "سفارش شماره {num7} ارسال شد. کد رهگیری: {num10}."),
+    ("ההזמנה שלך נשלחה", "הזמנה מספר {num8} נשלחה. מספר מעקב: {ref}. סה\"כ: {amount}."),
+    ("आपका ऑर्डर भेज दिया गया है", "आपका ऑर्डर {num8} भेज दिया गया है। ट्रैकिंग नंबर: {num10}। कुल राशि: {amount}।"),
+    ("Pesanan Anda telah dikirim", "Pesanan {num8} telah dikirim. Nomor resi: {ref}. Total: {amount}. Hubungi kami di {phone}."),
+    ("Đơn hàng {num7} đã được giao", "Đơn hàng số {num7} đã được giao. Mã vận đơn: {num10}. Tổng cộng: {amount}."),
+    ("คำสั่งซื้อของคุณถูกจัดส่งแล้ว", "หมายเลขคำสั่งซื้อ {num8} หมายเลขพัสดุ {ref} ยอดรวม {amount}"),
+    ("Η παραγγελία σας", "Η παραγγελία {num7} απεστάλη. Αριθμός αποστολής: {num10}. Σύνολο: {amount}."),
+    ("Vaše objednávka {num7}", "Objednávka č. {num7} byla odeslána. Číslo zásilky: {num10}. Celkem: {amount}."),
+    ("Din ordre {num6}", "Tak for din ordre {num6}. Forventet levering: {date}. Ordrenummer {num6}."),
+    ("Tilauksesi {num7}", "Tilauksesi {num7} on lähetetty. Seurantanumero: {ref}."),
+    ("Comanda ta {num7}", "Comanda nr. {num7} a fost expediată. AWB: {num10}. Total: {amount}."),
+    ("Számla {num7}", "Számlaszám: {num7}\nÖsszeg: {amount}\nFizetési határidő: {date}"),
+    ("Kupon kode", "Gunakan kode promo {promo} untuk diskon {pct}% sampai {date}."),
+    ("优惠券", "使用优惠码{promo}即可享受{pct}%折扣，有效期至{date}。"),
+    ("クーポンのご案内", "クーポンコード「{promo}」で{pct}%オフ。{date}まで有効です。"),
+    ("Промокод", "Используйте промокод {promo} и получите скидку {pct}% до {date}."),
+    ("Ordrebekræftelse", "Ordrenummer: {num7}\nBeløb: {amount}\nLevering: {date}"),
+    ("Tilausvahvistus", "Tilausnumero {num8}. Summa {amount}. Toimitus {date}."),
+    ("Faktura {num6}", "Faktura nr {num6}. Kwota do zapłaty: {amount}. Termin: {date}."),
+    ("Bestillingsbekreftelse", "Takk for bestillingen. Ordrenummer {num7}, totalt {amount}."),
+    ("Potvrda narudžbe", "Broj narudžbe: {num7}. Ukupno: {amount}. Dostava: {date}."),
+    ("Поръчка {num6}", "Вашата поръчка №{num6} е изпратена. Номер на пратката: {num10}."),
+    ("Rendelés visszaigazolása", "Rendelésszám: {num8}. Végösszeg: {amount}."),
+    ("Comanda confirmată", "Comanda {num7} a fost confirmată. Total de plată: {amount}."),
+    ("Confirmació de la comanda", "Número de comanda: {num7}. Import: {amount}."),
+    ("Kumpirmasyon ng order", "Ang iyong order {num7} ay naipadala na. Tracking number: {ref}."),
+    ("Agizo lako", "Agizo lako namba {num7} limetumwa. Jumla: {amount}."),
+    ("订单号 {num8}", "订单号：{num8}\n客服电话：{phone}\n地址：{street}"),
+    ("会員番号のお知らせ", "会員番号：{num8}\nお客様番号：{num7}\nお問い合わせ：{phone}"),
+    ("예약 확인", "예약번호: {num8}\n체크인: {date}\n고객센터: {phone}"),
+    ("Номер договора", "Номер договора: {num8}. Лицевой счёт: {num10}. Телефон: {phone}."),
+    ("Rezervasyon onayı", "Rezervasyon numaranız: {ref}. Giriş tarihi: {date}."),
+    ("رقم الحجز", "رقم الحجز: {ref}\nرقم العميل: {num7}"),
+    ("Mã đặt chỗ", "Mã đặt chỗ của bạn: {ref}. Ngày nhận phòng: {date}."),
+    ("หมายเลขการจอง", "หมายเลขการจองของคุณคือ {ref} วันที่เข้าพัก {date}"),
+    ("Nomor pelanggan", "Nomor pelanggan: {num8}. Tagihan bulan ini: {amount}."),
+    ("बुकिंग की पुष्टि", "आपकी बुकिंग संख्या {ref} है। यात्रा की तारीख {date}।"),
+]
+
 AIR = ["BA", "LH", "AF", "UA", "DL", "IB", "KL"]
 
 
@@ -274,13 +452,57 @@ def split(templates, seed=7):
     return [templates[i] for i in idx[:cut]], [templates[i] for i in idx[cut:]]
 
 
+# Other numbers that turn up beside a code (an order, a size, a customer
+# number), in many languages: they stay unlabelled in a sign-in message.
+DISTRACTORS = [
+    "Order #{num6} is unaffected.", "Your order {num7} has shipped.", "Customer ID: {num7}.",
+    "Ticket {num6} remains open.", "Reference: {ref}.", "Account ending in {num4}.",
+    "Pedido {num5} enviado.", "Número de cliente: {num7}.", "Bestellung {num7} versendet.",
+    "Größe {num4}.", "Kundennummer: {num6}.", "Commande n° {num6} expédiée.", "Ordine {num6} spedito.",
+    "Bestelling {num7} verzonden.", "Zamówienie {num6} wysłane.", "Заказ №{num6} отправлен.",
+    "Номер договора {num8}.", "Замовлення {num6} доставлено.", "Sipariş {num7} kargoda.",
+    "订单号：{num8}。", "会員番号：{num8}", "주문번호: {num8}", "رقم الطلب: {num7}",
+    "سفارش {num6}", "הזמנה {num7}", "ऑर्डर {num7}", "Pesanan {num7} dikirim.",
+    "Đơn hàng {num7}.", "คำสั่งซื้อ {num7}", "Παραγγελία {num7}.", "Objednávka {num7}.",
+    "Ordre {num6}.", "Tilaus {num7}.", "Comanda {num7}.", "Rendelés {num7}.",
+    "Call {phone}.", "Room {num4}.", "Since {year}.",
+]
+
+
+def distractor(rng):
+    return DISTRACTORS[rng.randrange(len(DISTRACTORS))].format(
+        num4=number(rng, 4), num5=number(rng, 5), num6=number(rng, 6), num7=number(rng, 7),
+        num8=number(rng, 8), ref=ref(rng), phone=phone(rng),
+        year=str(rng.choice([2019, 2021, 2024, 2026])))
+
+
+# The zero of each digit script codes may be written in.
+ZEROS = {"arab": 0x0660, "persian": 0x06F0, "deva": 0x0966, "beng": 0x09E6,
+         "thai": 0x0E50, "fullwidth": 0xFF10}
+
+
+def in_script(code, script):
+    """`code` with its ASCII digits written in `script`."""
+    zero = ZEROS[script]
+    return "".join(chr(zero + int(c)) if c.isascii() and c.isdigit() else c for c in code)
+
+
 def messages(rng, positive, negative, count):
     """(subject, body, code or None) triples, about half with a code."""
     out = []
     for _ in range(count):
-        if rng.random() < 0.5:
+        if rng.random() < 0.55:
+            template = rng.choice(positive)
             c = code(rng)
-            out.append((*vary(rng, *fill(rng, rng.choice(positive), c)), c))
+            script = template[2] if len(template) > 2 else ""
+            if script and rng.random() < 0.35:
+                c = in_script(code(rng, rng.choice(["d4", "d6", "d6", "d8"])), script)
+            subject, body = fill(rng, template[:2], c)
+            # Another number beside the code, before or after it.
+            if rng.random() < 0.35:
+                body = (body + rng.choice([" ", "\n"]) + distractor(rng)
+                        if rng.random() < 0.6 else distractor(rng) + "\n" + body)
+            out.append((*vary(rng, subject, body), c))
         else:
             out.append((*vary(rng, *fill(rng, rng.choice(negative), "")), None))
     return out

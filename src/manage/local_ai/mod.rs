@@ -13,19 +13,26 @@ use crate::manage::store::Store;
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 
 /// Preference: Local AI is on ("true"/"false"; off when unset).
 pub const ENABLED_PREFERENCE: &str = "local_ai";
 /// Preference: sign-in codes are found and hidden.
 pub const OTP_PREFERENCE: &str = "local_ai_otp";
 
-/// Where the models are published; `PICACHO_MODELS_URL` points elsewhere
-/// (a mirror, or a local server while developing).
-const MODELS_URL: &str = "https://github.com/juliaoverflow/Picacho/releases/download/models-otp-v1";
+/// Where the models are published: `models/otp` at a commit that has the
+/// files named below (a commit, so they never change under their digests).
+/// `PICACHO_MODELS_URL` points elsewhere (a mirror, or a local server while
+/// developing).
+const MODELS_URL: &str = "https://raw.githubusercontent.com/juliaoverflow/Picacho/1ba510f3dfd79dda2815957adb0b7fcb447d4e1a/models/otp";
 
 /// A downloadable model: its file there and here, and what it must be.
 pub struct Model {
+    /// Names the model in actions and settings.
+    pub id: &'static str,
     pub label: &'static str,
+    /// The features that need it, as Settings names them.
+    pub features: &'static [&'static str],
     /// The published file.
     file: &'static str,
     /// What is kept in the models directory once installed: the file
@@ -49,24 +56,36 @@ pub const OTP: Model = OTP_NATIVE;
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const OTP_COREML: Model = Model {
+    id: "otp",
     label: "Sign-in code model",
+    features: &["Hide sign-in codes"],
     file: "otp-v1.mlmodel",
     installed: "otp-v1.mlmodelc",
-    sha256: "d07059c7d5318e2274b584b1eab60d27212332b94138f09d17f46848cf4b03d7",
+    sha256: "5d55ae1933f3b769640f1e3ca0f52a3d65e65d604cbb8239a2ce0f99f38d897c",
     size: 1_049_025,
     dim: otp::DIM,
     threshold: 0.3,
 };
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const OTP_NATIVE: Model = Model {
+    id: "otp",
     label: "Sign-in code model",
+    features: &["Hide sign-in codes"],
     file: "otp-v1.bin",
     installed: "otp-v1.bin",
-    sha256: "ef4a7114b5eb19de3a6d874fee9ec4378c8d459df685739f557296864b41f54f",
+    sha256: "9f29e61cb02bfd1a78b305cc8018ad46da3c39140ebe53d157042f6d3543c00b",
     size: 1_048_728,
     dim: otp::DIM,
     threshold: 0.3,
 };
+
+/// Every model Local AI can download.
+pub const MODELS: [&Model; 1] = [&OTP];
+
+/// The model with this id.
+pub fn model(id: &str) -> Option<&'static Model> {
+    MODELS.into_iter().find(|m| m.id == id)
+}
 
 /// Whether Local AI is turned on.
 pub fn enabled(store: &Store) -> bool {
@@ -93,12 +112,12 @@ impl Model {
     }
 
     /// Downloads the model, checks it is exactly the published file, and
-    /// keeps it (compiled for Core ML on macOS). Blocks; run off the main
-    /// thread.
-    pub fn install(&self, store: &Store) -> Result<()> {
+    /// keeps it (compiled for Core ML on macOS). `received` counts the bytes
+    /// downloaded so far. Blocks; run off the main thread.
+    pub fn install(&self, store: &Store, received: &AtomicU64) -> Result<()> {
         let base = std::env::var("PICACHO_MODELS_URL").unwrap_or_else(|_| MODELS_URL.into());
         let url = format!("{}/{}", base.trim_end_matches('/'), self.file);
-        let bytes = crate::sync::models::download(&url, self.size)?;
+        let bytes = crate::sync::models::download(&url, self.size, received)?;
         let digest: String = Sha256::digest(&bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -147,6 +166,11 @@ impl Model {
         Ok(scorer)
     }
 
+    /// The space the installed model takes, in bytes (0 when it isn't).
+    pub fn installed_size(&self, store: &Store) -> u64 {
+        size_of(&self.path(store))
+    }
+
     /// Deletes the model from this computer.
     pub fn remove(&self, store: &Store) -> Result<()> {
         let path = self.path(store);
@@ -166,6 +190,29 @@ pub fn otp_detector(store: &Store) -> Result<otp::Detector> {
     Ok(otp::Detector::new(OTP.load(store)?, OTP.threshold))
 }
 
+/// Deletes models left from earlier versions (an `otp-v1.bin` once
+/// `otp-v1.bin` is what's used), and downloads that never finished.
+pub fn remove_stale(store: &Store) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(models_dir(store)) else {
+        return Ok(());
+    };
+    let current: Vec<&str> = MODELS.iter().map(|m| m.installed).collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if current.iter().any(|c| name.to_str() == Some(c)) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("Couldn't delete {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Deletes every installed model.
 pub fn remove_all(store: &Store) -> Result<()> {
     let dir = models_dir(store);
@@ -178,19 +225,21 @@ pub fn remove_all(store: &Store) -> Result<()> {
 
 /// The space the installed models take, in bytes.
 pub fn installed_size(store: &Store) -> u64 {
-    fn size(path: &std::path::Path) -> u64 {
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_dir() => std::fs::read_dir(path)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| size(&e.path()))
-                .sum(),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        }
+    size_of(&models_dir(store))
+}
+
+/// The size of a file, or of everything in a directory.
+fn size_of(path: &std::path::Path) -> u64 {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| size_of(&e.path()))
+            .sum(),
+        Ok(m) => m.len(),
+        Err(_) => 0,
     }
-    size(&models_dir(store))
 }
 
 #[cfg(test)]
@@ -228,6 +277,9 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         {
             assert!(OTP.is_installed(&store));
+            assert_eq!(OTP.installed_size(&store), OTP.size);
+            assert_eq!(model("otp").unwrap().id, OTP.id);
+            assert!(model("nope").is_none());
             let detector = otp_detector(&store)?;
             assert_eq!(
                 detector.codes("Your code", "Your verification code is 482913."),
@@ -236,6 +288,15 @@ mod tests {
             OTP.remove(&store)?;
             assert!(!OTP.is_installed(&store));
         }
+        // An older version's file goes; the current one stays.
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.bin"),
+            models_dir(&store).join(OTP.installed),
+        )?;
+        std::fs::write(models_dir(&store).join("otp-v1.bin"), b"old")?;
+        remove_stale(&store)?;
+        assert!(!models_dir(&store).join("otp-v1.bin").exists());
+        assert!(OTP.is_installed(&store) || cfg!(target_os = "macos"));
         assert!(installed_size(&store) > 0 || cfg!(not(target_os = "macos")));
         remove_all(&store)?;
         assert!(!models_dir(&store).exists());

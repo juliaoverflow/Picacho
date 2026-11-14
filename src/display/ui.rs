@@ -559,6 +559,12 @@ enum Action {
     SetHideCodes(bool),
     /// Shows a message's hidden sign-in codes, or hides them again.
     ShowCodes(String, bool),
+    /// Copies a message's sign-in code without showing it.
+    CopyCode(String),
+    /// Asks before deleting a Local AI model; deletes it once confirmed.
+    AskDeleteModel(String),
+    DeleteModel(String),
+    CloseModelSheet,
     ToggleHtml,
     ToggleRemote,
     /// Shows the open email's body in light or dark colors.
@@ -993,6 +999,10 @@ pub struct MailApp {
     /// A model downloading, and why the last download or load failed.
     model_busy: bool,
     model_error: Option<String>,
+    /// Bytes of the model downloaded so far.
+    model_progress: Arc<std::sync::atomic::AtomicU64>,
+    /// The model whose deletion is being confirmed over Settings.
+    model_confirm: Option<String>,
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
@@ -1578,6 +1588,8 @@ impl MailApp {
             codes_shown: HashSet::new(),
             model_busy: false,
             model_error: None,
+            model_progress: Arc::default(),
+            model_confirm: None,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -3570,7 +3582,10 @@ impl MailApp {
         );
     }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() || self.presets_for.take().is_some() {
+        if self.menu.take().is_some()
+            || self.presets_for.take().is_some()
+            || self.model_confirm.take().is_some()
+        {
             cx.notify();
             return;
         }
@@ -4729,6 +4744,12 @@ impl MailApp {
             Action::SetLocalAi(on) => self.set_local_ai(on, cx),
             Action::SetHideCodes(on) => self.set_hide_codes(on, cx),
             Action::ShowCodes(id, show) => self.show_codes(id, show, cx),
+            Action::CopyCode(id) => self.copy_code(id, cx),
+            Action::AskDeleteModel(id) => self.ask_delete_model(id, cx),
+            Action::DeleteModel(id) => self.delete_model(id, cx),
+            Action::CloseModelSheet => {
+                self.model_confirm = None;
+            }
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
                 if on {

@@ -2,12 +2,14 @@
 //! for: nothing about the person or their mail is sent.
 use anyhow::{Context, Result, ensure};
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// The file at `url`, refused if it is larger than `max` bytes. GitHub
-/// release assets redirect to a download host, so redirects are followed,
-/// over HTTPS only.
-pub fn download(url: &str, max: u64) -> Result<Vec<u8>> {
+/// The file at `url`, refused if it is larger than `max` bytes. `received`
+/// counts the bytes as they arrive, for showing progress. GitHub release
+/// assets redirect to a download host, so redirects are followed, over
+/// HTTPS only.
+pub fn download(url: &str, max: u64, received: &AtomicU64) -> Result<Vec<u8>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(120))
         .https_only(true)
@@ -27,10 +29,19 @@ pub fn download(url: &str, max: u64) -> Result<Vec<u8>> {
         ensure!(length <= max, "The model download is larger than expected");
     }
     let mut bytes = Vec::new();
-    response
-        .take(max + 1)
-        .read_to_end(&mut bytes)
-        .context("The model download was interrupted")?;
+    let mut body = response.take(max + 1);
+    let mut chunk = [0u8; 16 * 1024];
+    received.store(0, Ordering::Relaxed);
+    loop {
+        let n = body
+            .read(&mut chunk)
+            .context("The model download was interrupted")?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        received.store(bytes.len() as u64, Ordering::Relaxed);
+    }
     ensure!(
         bytes.len() as u64 <= max,
         "The model download is larger than expected"

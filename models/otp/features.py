@@ -6,7 +6,10 @@ them scores the same numbers in the app. `parity.json`, written by
 `train.py`, holds examples both must agree on.
 """
 
+import json
 import re
+import unicodedata
+from pathlib import Path
 
 # Hashed feature space (a power of two) and context sizes.
 DIM = 1 << 14
@@ -18,11 +21,44 @@ SUBJECT_WORDS = 16
 MAX_CANDIDATES = 40
 MAX_TEXT = 20000
 
-# 4-10 digits, or uppercase letters and digits (at least one digit), or two
-# groups of 3-4 digits split by a space or hyphen; optionally after a short
-# uppercase prefix and hyphen, as in Google's "G-123456".
-CANDIDATE = re.compile(r"\b(?:[A-Z]{1,3}-)?(?:\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10})\b")
-WORD = re.compile(r"\w+")
+# Two groups of 3-4 digits split by a space or hyphen, or 4-10 uppercase
+# letters and digits (at least one digit), or 4-10 digits in any script
+# (fullwidth, Arabic-Indic...); optionally after a short uppercase prefix and
+# hyphen, as in Google's "G-123456". The candidate is the group: what comes
+# before it is the start of the text or a character that isn't an ASCII
+# letter or digit, so it can follow Chinese or Japanese without a space.
+CANDIDATE = re.compile(
+    r"(?:^|[^A-Za-z0-9])((?:[A-Z]{1,3}-)?(?:\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10}|\d{4,10}))"
+)
+
+# Scripts written without spaces between words: Hiragana, Katakana, CJK
+# ideographs, Thai, Lao, Khmer and Myanmar. Their words are taken as
+# overlapping pairs of characters.
+DENSE = [
+    (0x0E00, 0x0EFF), (0x1000, 0x109F), (0x1780, 0x17FF), (0x3040, 0x30FF),
+    (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0xFF66, 0xFF9F),
+]
+
+
+# Concepts that carry across languages ("code", "verify", "order"...), each
+# with the word stems that name it; "=" marks a stem that must be the whole
+# word. The app builds the same features from the same file.
+LEXICON = json.loads((Path(__file__).parent / "lexicon.json").read_text(encoding="utf-8"))
+
+
+def concepts(ws):
+    """The concepts named by any of the words, in lexicon order."""
+    found = []
+    for name, stems in LEXICON:
+        for st in stems:
+            if st.startswith("="):
+                hit = st[1:] in ws
+            else:
+                hit = any(st in w for w in ws)
+            if hit:
+                found.append(name)
+                break
+    return found
 
 
 def candidates(text):
@@ -30,8 +66,11 @@ def candidates(text):
     text = text[:MAX_TEXT]
     out = []
     for m in CANDIDATE.finditer(text):
-        s, e = m.start(), m.end()
-        code = m.group(0)
+        s, e = m.start(1), m.end(1)
+        code = m.group(1)
+        # Ends where a word would: not before an ASCII letter or digit.
+        if e < len(text) and text[e].isascii() and text[e].isalnum():
+            continue
         core = code.split("-", 1)[1] if re.match(r"[A-Z]{1,3}-", code) else code
         if not any(c.isdigit() for c in core):
             continue
@@ -52,8 +91,42 @@ def candidates(text):
     return out
 
 
+def is_word(c):
+    return c == "_" or unicodedata.category(c)[0] in "LNM"
+
+
+def is_dense(c):
+    o = ord(c)
+    return any(a <= o <= b for a, b in DENSE)
+
+
 def words(text):
-    return WORD.findall(text.lower())
+    """Lowercase words: runs of letters, marks, digits and underscores, with
+    runs in scripts written without spaces split into pairs of characters."""
+    out = []
+    run = []
+
+    def flush():
+        # Split the run where it moves in or out of a dense script.
+        start = 0
+        for i in range(1, len(run) + 1):
+            if i == len(run) or is_dense(run[i]) != is_dense(run[start]):
+                seg = "".join(run[start:i])
+                if is_dense(run[start]) and len(seg) > 1:
+                    out.extend(seg[j:j + 2] for j in range(len(seg) - 1))
+                else:
+                    out.append(seg)
+                start = i
+        run.clear()
+
+    for c in text.lower():
+        if is_word(c):
+            run.append(c)
+        elif run:
+            flush()
+    if run:
+        flush()
+    return out
 
 
 def shape(code):
@@ -114,9 +187,14 @@ def features(subject, text, start, end):
     f.append(f"line:{min(len(line) // 10, 10)}")
     if start < len(subject):
         f.append("insubject")
-    for w in words(subject)[:SUBJECT_WORDS]:
+    sw = words(subject)[:SUBJECT_WORDS]
+    for w in sw:
         f.append("S:" + w)
         f.append("SP:" + w[:4])
+    # What the nearby words are about, whatever the language.
+    for region, ws in (("CL", lw), ("CR", rw), ("CS", sw), ("CNL", lw[-NEAR:]), ("CNR", rw[:NEAR])):
+        for name in concepts(ws):
+            f.append(f"{region}:{name}")
     return f
 
 

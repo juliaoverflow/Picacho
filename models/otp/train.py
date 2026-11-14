@@ -75,7 +75,7 @@ class Model:
         return [self.E, self.b1, self.w2, np.array([self.b2])]
 
 
-def train(feats, ys, epochs=8, lr=0.01, l2=1e-5, drop=0.3, seed=1):
+def train(feats, ys, epochs=8, lr=0.01, l2=1e-5, drop=0.1, seed=1):
     """Trains on feature lists; each epoch leaves out a random `drop` share
     of every candidate's features, so no one word decides."""
     rng = np.random.default_rng(seed)
@@ -188,6 +188,12 @@ def parity(model):
         ("Código de verificación", "Tu código es 773 210. Caduca pronto. Pedido 99120 enviado."),
         ("Ihr Bestätigungscode", "Ihr Code lautet: AB12CD\nÜbermittelt am 2026-03-04 – Größe 9000"),
         ("", "Join Zoom meeting ID 812 3456 7890 Passcode: 123456"),
+        ("登录验证", "您的验证码是482913，5分钟内有效。订单号：20260304"),
+        ("認証コード", "認証コードは ４８２９１３ です。お問い合わせ：0120-123-456"),
+        ("رمز التحقق", "رمز التحقق الخاص بك هو ١٢٣٤٥٦ صالح لمدة 10 دقائق"),
+        ("Код подтверждения", "Ваш код: 7731. Заказ №558120 отправлен."),
+        ("รหัส OTP", "รหัส OTP ของคุณคือ 482913 (อ้างอิง: SAVE20)"),
+        ("Order", "Ref 123456AB, code x123456y, and 4829 1301"),
     ]
     out = []
     for subject, body in cases:
@@ -206,20 +212,26 @@ def parity(model):
 
 def main():
     rng = random.Random(20261114)
-    pos_train, pos_test = data.split(data.POSITIVE)
-    neg_train, neg_test = data.split(data.NEGATIVE)
-    train_msgs = data.messages(rng, pos_train, neg_train, 24000)
-    test_msgs = data.messages(rng, pos_test, neg_test, 4000)
+    # Held out from English and from the other languages alike.
+    halves = [data.split(t) for t in
+              (data.POSITIVE, data.POSITIVE_MORE, data.NEGATIVE, data.NEGATIVE_MORE)]
+    pos_train = halves[0][0] + halves[1][0]
+    neg_train = halves[2][0] + halves[3][0]
+    train_msgs = data.messages(rng, pos_train, neg_train, 40000)
+    test_msgs = data.messages(rng, halves[0][1], halves[2][1], 3000)
+    test_more = data.messages(rng, halves[1][1], halves[3][1], 3000)
     xs, ys, missed = examples(train_msgs)
     print(f"{len(xs)} candidates, {int(ys.sum())} codes, {missed} codes not found as candidates")
     model = train(xs, ys)
     evaluate(model, train_msgs[:4000], "seen wording")
-    evaluate(model, test_msgs, "held-out wording")
+    evaluate(model, test_msgs, "held-out wording, English")
+    evaluate(model, test_more, "held-out wording, other languages")
     # The published model learns from every template.
-    all_msgs = data.messages(rng, data.POSITIVE, data.NEGATIVE, 30000)
+    everything = (data.POSITIVE + data.POSITIVE_MORE, data.NEGATIVE + data.NEGATIVE_MORE)
+    all_msgs = data.messages(rng, *everything, 50000)
     xs, ys, _ = examples(all_msgs)
     model = train(xs, ys)
-    evaluate(model, data.messages(rng, data.POSITIVE, data.NEGATIVE, 3000), "final, fresh messages")
+    evaluate(model, data.messages(rng, *everything, 3000), "final, fresh messages")
     write_bin(model, HERE / "otp-v1.bin")
     (HERE / "parity.json").write_text(json.dumps(parity(model), ensure_ascii=False, indent=1))
     if "--coreml" in sys.argv:

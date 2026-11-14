@@ -96,8 +96,46 @@ impl MailApp {
                     Action::ShowCodes(m.id.clone(), !shown),
                     cx,
                 ))
+                .child(div().text_color(rgb(c.muted)).child("·"))
+                // Copies without showing it.
+                .child(self.link(
+                    "codes-copy",
+                    "Copy Code",
+                    Action::CopyCode(m.id.clone()),
+                    cx,
+                ))
                 .into_any_element(),
         )
+    }
+    /// Copies a message's sign-in code, as it is typed into a sign-in form.
+    pub(super) fn copy_code(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(m) = self
+            .messages
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+            .or_else(|| self.selected_mail().filter(|m| m.id == id))
+        else {
+            return;
+        };
+        // The reader's copy has the body; the list's only the preview.
+        let m = self
+            .backend
+            .store
+            .message(&id)
+            .ok()
+            .flatten()
+            .filter(|full| full.body.is_some())
+            .map(|full| Mail {
+                folder: m.folder,
+                ..full
+            })
+            .unwrap_or(m);
+        let Some(code) = self.found_codes(&m).first().cloned() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(otp::copyable(&code)));
+        self.notice("Code copied", false, cx);
     }
     pub(super) fn show_codes(&mut self, id: String, show: bool, cx: &mut Context<Self>) {
         if show {
@@ -115,6 +153,8 @@ impl MailApp {
         if !self.hide_codes {
             return;
         }
+        // An earlier version of the model is replaced, not kept beside it.
+        let _ = local_ai::remove_stale(&self.backend.store);
         if local_ai::OTP.is_installed(&self.backend.store) {
             self.load_otp(cx);
         } else {
@@ -141,10 +181,12 @@ impl MailApp {
         }
         self.model_busy = true;
         self.model_error = None;
+        self.model_progress.store(0, Ordering::Relaxed);
+        let received = self.model_progress.clone();
         cx.notify();
         self.task(
             cx,
-            |b| local_ai::OTP.install(&b.store),
+            move |b| local_ai::OTP.install(&b.store, &received),
             |this, result, cx| {
                 this.model_busy = false;
                 match result {
@@ -161,6 +203,55 @@ impl MailApp {
                 cx.notify();
             },
         );
+        // The progress ring follows the download.
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(100)).await;
+                let busy = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.model_busy
+                    })
+                    .unwrap_or(false);
+                if !busy {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// How far the model download has got, from 0 to 1.
+    pub(super) fn model_fraction(&self, model: &local_ai::Model) -> f32 {
+        (self.model_progress.load(Ordering::Relaxed) as f32 / model.size.max(1) as f32).min(1.)
+    }
+
+    /// Asks before deleting a model, saying which features go with it.
+    pub(super) fn ask_delete_model(&mut self, id: String, cx: &mut Context<Self>) {
+        if local_ai::model(&id).is_some() {
+            self.model_confirm = Some(id);
+            self.menu_anim += 1;
+            cx.notify();
+        }
+    }
+    /// Deletes a model, turning off the features that need it.
+    pub(super) fn delete_model(&mut self, id: String, cx: &mut Context<Self>) {
+        self.model_confirm = None;
+        let Some(model) = local_ai::model(&id) else {
+            return;
+        };
+        if model.id == local_ai::OTP.id {
+            self.set_hide_codes(false, cx);
+        }
+        match model.remove(&self.backend.store) {
+            Ok(()) => self.notice(
+                format!("Deleted the {}", model.label.to_lowercase()),
+                false,
+                cx,
+            ),
+            Err(e) => self.notice(format!("{e:#}"), true, cx),
+        }
+        cx.notify();
     }
 
     pub(super) fn set_local_ai(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -201,30 +292,7 @@ impl MailApp {
     pub(super) fn local_ai_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let model = &local_ai::OTP;
-        let mb = |bytes: u64| format!("{:.1} MB", bytes as f64 / 1_000_000.);
-        let status: Option<(String, bool)> = if self.model_busy {
-            Some((
-                format!(
-                    "Downloading the {} ({})…",
-                    model.label.to_lowercase(),
-                    mb(model.size)
-                ),
-                false,
-            ))
-        } else if let Some(e) = &self.model_error {
-            Some((e.clone(), true))
-        } else if self.hide_codes && self.otp.is_some() {
-            Some((
-                format!(
-                    "{} installed ({}). It runs on this computer; mail isn't sent anywhere.",
-                    model.label,
-                    mb(local_ai::installed_size(&self.backend.store))
-                ),
-                false,
-            ))
-        } else {
-            None
-        };
+        let error = self.model_error.clone();
         div()
             .flex()
             .flex_col()
@@ -253,22 +321,21 @@ impl MailApp {
                     .child(self.switch_setting(
                         "Hide sign-in codes",
                         &format!(
-                            "Find two-factor, verification and sign-in codes in received mail, and \
-                             show them as ●●●●●● in subjects, message text and notifications. \
-                             Downloads a {} model; turning this off deletes it.",
-                            mb(model.size)
+                            "Find two-factor, verification and sign-in codes in received mail (in 37 \
+                             languages), and \
+                             show them as {b}{b}{b}{b}{b}{b} in subjects, message text and \
+                             notifications. Downloads the {} ({}).",
+                            model.label.to_lowercase(),
+                            mb(model.size),
+                            b = otp::BULLET,
                         ),
                         "local-ai-otp".into(),
                         self.hide_codes,
                         // Needs Local AI on first.
-                        if self.local_ai {
-                            Action::SetHideCodes(!self.hide_codes)
-                        } else {
-                            Action::SetHideCodes(false)
-                        },
+                        Action::SetHideCodes(self.local_ai && !self.hide_codes),
                         cx,
                     ))
-                    .when_some(status, |d, (status, error)| {
+                    .when_some(error, |d, error| {
                         d.child(
                             div()
                                 .id("local-ai-status")
@@ -277,10 +344,9 @@ impl MailApp {
                                 .items_center()
                                 .gap_2()
                                 .text_size(px(12.))
-                                .text_color(rgb(if error { c.danger } else { c.muted }))
-                                .when(self.model_busy, |d| d.child(spinner(12., c.muted)))
-                                .child(div().flex_1().min_w_0().child(status))
-                                .when(error && self.local_ai, |d| {
+                                .text_color(rgb(c.danger))
+                                .child(div().flex_1().min_w_0().child(error))
+                                .when(self.local_ai, |d| {
                                     d.child(self.link(
                                         "local-ai-retry",
                                         "Try Again",
@@ -291,6 +357,267 @@ impl MailApp {
                         )
                     }),
             )
+            .child(self.section("Models"))
+            .child(
+                div()
+                    .id("local-ai-models")
+                    .debug_selector(|| "local-ai-models".into())
+                    .flex()
+                    .flex_col()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .children(
+                        local_ai::MODELS
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, m)| self.model_row(m, i > 0, cx)),
+                    ),
+            )
+            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child({
+                let total = local_ai::installed_size(&self.backend.store);
+                let used = if total > 0 {
+                    format!("{} on this computer. ", mb(total))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{used}Models download when a feature that needs them is turned on. \
+                     They run on this computer; your mail isn't sent anywhere."
+                )
+            }))
             .into_any_element()
     }
+
+    /// A model in Settings: installed or not (or how far its download has
+    /// got), its size, what uses it, and a way to delete it.
+    fn model_row(
+        &self,
+        model: &'static local_ai::Model,
+        divided: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = self.colors();
+        let store = &self.backend.store;
+        let installed = model.is_installed(store);
+        let downloading = self.model_busy && model.id == local_ai::OTP.id;
+        let status: AnyElement = if downloading {
+            let fraction = self.model_fraction(model);
+            div()
+                .id(SharedString::from(format!("model-progress-{}", model.id)))
+                .debug_selector(|| "model-progress".into())
+                .relative()
+                .size(px(22.))
+                .flex_shrink_0()
+                .child(ring(fraction, c.border, c.accent).absolute().inset_0())
+                .into_any_element()
+        } else if installed {
+            div()
+                .size(px(22.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(rgb(c.accent))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon_el("check", 13., c.on_accent))
+                .into_any_element()
+        } else {
+            div()
+                .size(px(22.))
+                .flex_shrink_0()
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(c.border))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon_el("close", 12., c.muted))
+                .into_any_element()
+        };
+        let detail = if downloading {
+            let fraction = self.model_fraction(model);
+            if fraction >= 1. {
+                "Installing…".to_owned()
+            } else {
+                format!("Downloading… {:.0}% of {}", fraction * 100., mb(model.size))
+            }
+        } else if installed {
+            format!("Installed · {}", mb(model.installed_size(store)))
+        } else {
+            format!("Not installed · {} download", mb(model.size))
+        };
+        let id = model.id;
+        div()
+            .id(SharedString::from(format!("model-{id}")))
+            .debug_selector(move || format!("model-{id}"))
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .when(divided, |d| d.border_t_1().border_color(rgb(c.border)))
+            .child(status)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(model.label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(format!(
+                                "{} · Used by {}",
+                                detail,
+                                model.features.join(", ")
+                            )),
+                    ),
+            )
+            .when(installed && !downloading, |d| {
+                d.child(
+                    self.button(
+                        format!("model-delete-{id}"),
+                        "@Delete model",
+                        "trash",
+                        Action::AskDeleteModel(id.into()),
+                        false,
+                        cx,
+                    )
+                    .debug_selector(move || format!("model-delete-{id}")),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The confirmation over Settings before a model is deleted.
+    pub(super) fn delete_model_sheet(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let Some(model) = local_ai::model(id) else {
+            return div().into_any_element();
+        };
+        let features: Vec<&str> = model.features.to_vec();
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x101c2c55))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .id("delete-model-sheet")
+                    .debug_selector(|| "delete-model-sheet".into())
+                    .w(px(400.))
+                    .max_w_full()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.surface))
+                    .shadow_2xl()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_5()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(rgb(c.border))
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Delete Model"),
+                    )
+                    .child(
+                        div()
+                            .p_5()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!(
+                                        "Delete the {} ({})?",
+                                        model.label.to_lowercase(),
+                                        mb(model.installed_size(&self.backend.store))
+                                    )),
+                            )
+                            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(
+                                if features.len() == 1 {
+                                    "Deleting it turns off this feature:"
+                                } else {
+                                    "Deleting it turns off these features:"
+                                },
+                            ))
+                            .children(features.into_iter().map(|f| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(13.))
+                                    .child(icon_el("close", 12., c.danger))
+                                    .child(f)
+                            }))
+                            .child(
+                                div().text_size(px(12.)).text_color(rgb(c.muted)).child(
+                                    "Turning the feature on again downloads the model again.",
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px_5()
+                            .py_3()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(rgb(c.border))
+                            .child(div().flex_1())
+                            .child(self.button(
+                                "delete-model-cancel",
+                                "Cancel",
+                                "",
+                                Action::CloseModelSheet,
+                                false,
+                                cx,
+                            ))
+                            .child(
+                                self.button(
+                                    "delete-model-confirm",
+                                    "Delete",
+                                    "",
+                                    Action::DeleteModel(model.id.into()),
+                                    true,
+                                    cx,
+                                )
+                                .bg(rgb(c.danger)),
+                            ),
+                    ),
+            )
+            .with_animation(
+                ("delete-model-sheet", self.menu_anim),
+                Animation::new(Duration::from_millis(140)).with_easing(|t| 1. - (1. - t).powi(3)),
+                |d, t| d.opacity(t),
+            )
+            .into_any_element()
+    }
+}
+
+/// Megabytes, as Settings shows sizes.
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.)
 }

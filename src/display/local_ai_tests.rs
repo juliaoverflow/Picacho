@@ -100,14 +100,14 @@ fn codes_are_hidden_until_shown_and_the_model_goes_when_turned_off(cx: &mut Test
             .unwrap();
         assert_eq!(
             this.hide_codes(code, &code.subject),
-            "●●●●●● is your Acme verification code"
+            "•••••• is your Acme verification code"
         );
         // The list holds summaries; the reader has the body.
-        assert!(this.hide_codes(code, &code.snippet).contains("is ●●●●●●."));
+        assert!(this.hide_codes(code, &code.snippet).contains("is ••••••."));
         let full = this.backend.store.message(&code.id).unwrap().unwrap();
         assert_eq!(
             this.hide_codes(&full, full.body.as_deref().unwrap()),
-            "Hi,\n\nYour verification code is ●●●●●●.\nIt expires in 10 minutes."
+            "Hi,\n\nYour verification code is ••••••.\nIt expires in 10 minutes."
         );
         let order = this
             .messages
@@ -126,6 +126,13 @@ fn codes_are_hidden_until_shown_and_the_model_goes_when_turned_off(cx: &mut Test
     act(&view, Action::Select(id.clone()), cx);
     frame(cx);
     assert!(cx.debug_bounds("codes-banner").is_some());
+    // Copied as typed, while it stays hidden.
+    act(&view, Action::CopyCode(id.clone()), cx);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("482913")
+    );
+    view.read_with(cx, |this, _| assert!(!this.codes_shown.contains(&id)));
     act(&view, Action::ShowCodes(id.clone(), true), cx);
     view.read_with(cx, |this, _| {
         let m = this.messages.iter().find(|m| m.id == id).unwrap();
@@ -134,7 +141,7 @@ fn codes_are_hidden_until_shown_and_the_model_goes_when_turned_off(cx: &mut Test
     act(&view, Action::ShowCodes(id.clone(), false), cx);
     view.read_with(cx, |this, _| {
         let m = this.messages.iter().find(|m| m.id == id).unwrap();
-        assert!(this.hide_codes(m, &m.subject).contains('●'));
+        assert!(this.hide_codes(m, &m.subject).contains('•'));
     });
 
     // Turning Local AI off turns the feature off and deletes the model.
@@ -169,5 +176,59 @@ fn turning_code_hiding_off_deletes_its_model_and_it_loads_again_at_launch(cx: &m
     });
     act(&view, Action::SetHideCodes(false), cx);
     view.read_with(cx, |this, _| assert!(this.local_ai && this.otp.is_none()));
+    assert!(!local_ai::OTP.is_installed(&store));
+}
+
+#[gpui::test]
+fn the_models_list_shows_progress_and_deleting_asks_which_features_stop(cx: &mut TestAppContext) {
+    let (store, _) = mailbox();
+    let (view, cx) = open(store.clone(), cx);
+    act(&view, Action::Settings, cx);
+    act(&view, Action::SettingsPage(Page::LocalAi), cx);
+    act(&view, Action::SetLocalAi(true), cx);
+    frame(cx);
+    // Listed before it is installed, with nothing to delete.
+    assert!(cx.debug_bounds("model-otp").is_some());
+    assert!(cx.debug_bounds("model-delete-otp").is_none());
+
+    // Downloading: a ring shows how far it has got.
+    view.update(cx, |this, cx| {
+        this.model_busy = true;
+        this.model_progress
+            .store(local_ai::OTP.size / 2, std::sync::atomic::Ordering::Relaxed);
+        assert!((this.model_fraction(&local_ai::OTP) - 0.5).abs() < 0.01);
+        cx.notify();
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("model-progress").is_some());
+    view.update(cx, |this, _| this.model_busy = false);
+
+    // Installed and in use: it can be deleted, after saying what stops.
+    install(&store);
+    act(&view, Action::SetHideCodes(true), cx);
+    view.read_with(cx, |this, _| assert!(this.otp.is_some()));
+    frame(cx);
+    assert!(cx.debug_bounds("model-delete-otp").is_some());
+    act(&view, Action::AskDeleteModel("otp".into()), cx);
+    frame(cx);
+    assert!(cx.debug_bounds("delete-model-sheet").is_some());
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.model_confirm.as_deref(), Some("otp"));
+        assert!(this.modal == Some(Modal::Settings), "Settings stays open");
+    });
+    // Escape keeps the model.
+    act(&view, Action::Close, cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.model_confirm.is_none() && this.modal == Some(Modal::Settings))
+    });
+    assert!(local_ai::OTP.is_installed(&store));
+
+    act(&view, Action::AskDeleteModel("otp".into()), cx);
+    act(&view, Action::DeleteModel("otp".into()), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.model_confirm.is_none());
+        assert!(this.local_ai, "Local AI itself stays on");
+        assert!(!this.hide_codes && this.otp.is_none(), "its feature is off");
+    });
     assert!(!local_ai::OTP.is_installed(&store));
 }

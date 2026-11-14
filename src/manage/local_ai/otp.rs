@@ -17,15 +17,64 @@ const NEAR: usize = 3;
 const SUBJECT_WORDS: usize = 16;
 const MAX_CANDIDATES: usize = 40;
 const MAX_TEXT: usize = 20_000;
-/// What a hidden code's letters and digits are shown as.
-pub const BULLET: char = '●';
+/// What a hidden code's letters and digits are shown as: the light bullet
+/// password fields use, which sits in text like a lowercase letter rather
+/// than standing out as a large black circle (●) does.
+pub const BULLET: char = '•';
 
-/// 4-10 digits, or uppercase letters and digits, or two groups of 3-4
-/// digits split by a space or hyphen; optionally after a short uppercase
-/// prefix and hyphen, as in Google's "G-123456".
+/// Two groups of 3-4 digits split by a space or hyphen, or 4-10 uppercase
+/// letters and digits (at least one digit), or 4-10 digits in any script
+/// (fullwidth, Arabic-Indic...); optionally after a short uppercase prefix and
+/// hyphen, as in Google's "G-123456". The candidate is the group: what comes
+/// before it is the start of the text or a character that isn't an ASCII
+/// letter or digit, so it can follow Chinese or Japanese without a space.
 static CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:[A-Z]{1,3}-)?(?:\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10})\b").expect("pattern")
+    Regex::new(
+        r"(?:^|[^A-Za-z0-9])((?:[A-Z]{1,3}-)?(?:\d{3,4}[ \-]\d{3,4}|[A-Z0-9]{4,10}|\d{4,10}))",
+    )
+    .expect("pattern")
 });
+/// Letters, marks, digits and underscores make words.
+static WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\p{L}\p{N}\p{M}_]+").expect("pattern"));
+
+/// Concepts that carry across languages ("code", "verify", "order"...), each
+/// with the word stems that name it; "=" marks a stem that must be the whole
+/// word. The model was trained with this same file.
+static LEXICON: LazyLock<Vec<(String, Vec<String>)>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../../models/otp/lexicon.json")).expect("lexicon")
+});
+
+/// The concepts named by any of the words, in lexicon order.
+fn concepts(words: &[String]) -> Vec<&'static str> {
+    LEXICON
+        .iter()
+        .filter(|(_, stems)| {
+            stems.iter().any(|st| match st.strip_prefix('=') {
+                Some(whole) => words.iter().any(|w| w == whole),
+                None => words.iter().any(|w| w.contains(st.as_str())),
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
+/// Scripts written without spaces between words: Hiragana, Katakana, CJK
+/// ideographs, Thai, Lao, Khmer and Myanmar. Their words are taken as
+/// overlapping pairs of characters.
+fn dense(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x0E00..=0x0EFF
+            | 0x1000..=0x109F
+            | 0x1780..=0x17FF
+            | 0x3040..=0x30FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0xFF66..=0xFF9F
+    )
+}
 
 /// A message's text as the model sees it, and its candidates' places.
 struct Text {
@@ -62,9 +111,14 @@ impl Text {
         let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
         let char_at = |byte: usize| starts.partition_point(|&b| b < byte);
         let mut out = Vec::new();
-        for m in CANDIDATE.find_iter(&text) {
+        for caps in CANDIDATE.captures_iter(&text) {
+            let Some(m) = caps.get(1) else { continue };
             let (s, e) = (char_at(m.start()), char_at(m.end()));
             let code = m.as_str();
+            // Ends where a word would: not before an ASCII letter or digit.
+            if self.at(e).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
             let core = match code.find('-') {
                 Some(p)
                     if (1..=3).contains(&p)
@@ -166,22 +220,53 @@ impl Text {
         if start < self.subject_len {
             f.push("insubject".into());
         }
-        for w in words(subject).iter().take(SUBJECT_WORDS) {
+        let sw = words(subject);
+        let sw = &sw[..sw.len().min(SUBJECT_WORDS)];
+        for w in sw {
             f.push(format!("S:{w}"));
             f.push(format!("SP:{}", prefix(w)));
+        }
+        // What the nearby words are about, whatever the language.
+        let near_left = &lw[lw.len().saturating_sub(NEAR)..];
+        let near_right = &rw[..rw.len().min(NEAR)];
+        for (region, ws) in [
+            ("CL", lw),
+            ("CR", rw),
+            ("CS", sw),
+            ("CNL", near_left),
+            ("CNR", near_right),
+        ] {
+            for name in concepts(ws) {
+                f.push(format!("{region}:{name}"));
+            }
         }
         f
     }
 }
 
-/// Lowercase words: runs of letters, digits and underscores.
+/// Lowercase words: runs of letters, marks, digits and underscores, with
+/// runs in scripts written without spaces split into pairs of characters.
 fn words(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
-    lower
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut out = Vec::new();
+    for run in WORD.find_iter(&lower) {
+        let chars: Vec<char> = run.as_str().chars().collect();
+        // Split the run where it moves in or out of a dense script.
+        let mut start = 0;
+        for i in 1..=chars.len() {
+            if i < chars.len() && dense(chars[i]) == dense(chars[start]) {
+                continue;
+            }
+            let seg = &chars[start..i];
+            if dense(seg[0]) && seg.len() > 1 {
+                out.extend(seg.windows(2).map(|w| w.iter().collect::<String>()));
+            } else {
+                out.push(seg.iter().collect());
+            }
+            start = i;
+        }
+    }
+    out
 }
 
 fn prefix(w: &str) -> String {
@@ -267,6 +352,43 @@ impl Detector {
     }
 }
 
+/// A code as it is typed into a sign-in form: without the spaces or hyphens
+/// that split it for reading, without a prefix before digits (Google's
+/// "G-123456" is entered as "123456"), and in ASCII digits (forms take
+/// "482913" for "４８２９１３" or "٤٨٢٩١٣").
+pub fn copyable(code: &str) -> String {
+    let code = code.trim();
+    let code = match code.split_once('-') {
+        Some((prefix, rest))
+            if (1..=3).contains(&prefix.len())
+                && prefix.bytes().all(|b| b.is_ascii_uppercase())
+                && rest.chars().all(|c| c.is_numeric() || c == ' ' || c == '-') =>
+        {
+            rest
+        }
+        _ => code,
+    };
+    code.chars()
+        .filter(|&c| c != ' ' && c != '-')
+        .map(ascii_digit)
+        .collect()
+}
+
+/// A digit of another script as its ASCII digit; other characters as they are.
+fn ascii_digit(c: char) -> char {
+    /// The zero of each script's digits.
+    const ZEROS: [u32; 19] = [
+        0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+        0x0D66, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x17E0, 0x1810, 0xFF10,
+    ];
+    let code = u32::from(c);
+    ZEROS
+        .iter()
+        .find(|&&zero| (zero..zero + 10).contains(&code))
+        .and_then(|zero| char::from_digit(code - zero, 10))
+        .unwrap_or(c)
+}
+
 /// `code` with its letters and digits replaced by bullets; separators stay.
 fn bullets(code: &str) -> String {
     code.chars()
@@ -275,7 +397,7 @@ fn bullets(code: &str) -> String {
 }
 
 /// `text` with every whole occurrence of each code replaced by bullets.
-/// Occurrences inside a longer word or number are left alone.
+/// Occurrences inside a longer number or Latin word are left alone.
 pub fn mask<'a>(text: &'a str, codes: &[String]) -> Cow<'a, str> {
     let pairs: Vec<(String, String)> = codes.iter().map(|c| (c.clone(), bullets(c))).collect();
     replace_whole(text, &pairs)
@@ -326,8 +448,10 @@ fn replace_whole<'a>(text: &'a str, pairs: &[(String, String)]) -> Cow<'a, str> 
         for (at, _) in current.match_indices(from.as_str()) {
             let before = current[..at].chars().next_back();
             let after = current[at + from.len()..].chars().next();
-            let whole = !before.is_some_and(char::is_alphanumeric)
-                && !after.is_some_and(char::is_alphanumeric);
+            // As candidates are found: a code can touch Chinese or
+            // Japanese text, but not another Latin letter or any digit.
+            let joined = |c: char| c.is_ascii_alphanumeric() || c.is_numeric();
+            let whole = !before.is_some_and(joined) && !after.is_some_and(joined);
             if whole && at >= last {
                 out.push_str(&current[last..at]);
                 out.push_str(to);
@@ -422,19 +546,91 @@ mod tests {
     }
 
     #[test]
+    fn finds_codes_in_many_languages_and_scripts() {
+        let detector = Detector::new(Box::new(model()), super::super::OTP.threshold);
+        let cases = [
+            (
+                "登录验证",
+                "您的验证码是739204，5分钟内有效。订单号：20260304",
+                "739204",
+            ),
+            (
+                "認証コード",
+                "ログイン確認コード：４８２９１３\n有効期限：10分",
+                "４８２９１３",
+            ),
+            (
+                "인증번호",
+                "로그인 인증번호는 [551203] 입니다. 5분 이내에 입력해 주세요.",
+                "551203",
+            ),
+            (
+                "رمز التحقق",
+                "رمز التحقق الخاص بك هو ٧٣٩٢٠٤ صالح لمدة 10 دقائق",
+                "٧٣٩٢٠٤",
+            ),
+            (
+                "Код подтверждения",
+                "Ваш код подтверждения: 7731. Заказ №558120 отправлен.",
+                "7731",
+            ),
+            (
+                "सत्यापन कोड",
+                "आपका सत्यापन कोड 482913 है। इसे किसी के साथ साझा न करें।",
+                "482913",
+            ),
+            (
+                "Doğrulama kodu",
+                "Doğrulama kodunuz: 615 204. Kodu kimseyle paylaşmayın.",
+                "615 204",
+            ),
+            ("รหัสยืนยัน", "รหัสยืนยันของคุณคือ 902817 ห้ามบอกรหัสนี้กับผู้อื่น", "902817"),
+        ];
+        for (subject, body, code) in cases {
+            assert_eq!(detector.codes(subject, body), [code], "{subject}");
+        }
+        assert!(
+            detector
+                .codes("ご注文の確認", "注文番号：58194433\n合計金額：¥4,500")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn codes_are_copied_as_they_are_typed() {
+        assert_eq!(copyable("482913"), "482913");
+        assert_eq!(copyable("482 913"), "482913");
+        assert_eq!(copyable("482-913"), "482913");
+        assert_eq!(copyable("G-551203"), "551203");
+        assert_eq!(copyable("AB12CD"), "AB12CD");
+        assert_eq!(copyable("AB-12CD"), "AB12CD");
+        assert_eq!(copyable("４８２９１３"), "482913");
+        assert_eq!(copyable("١٢٣ ٤٥٦"), "123456");
+        assert_eq!(copyable("۸۲۵۶"), "8256");
+    }
+
+    #[test]
     fn masks_whole_codes_in_text_and_html_text() {
         let codes = vec!["482 913".to_owned(), "G-551203".to_owned()];
         assert_eq!(
             mask("Code 482 913 or G-551203; not 1482 9130.", &codes),
-            "Code ●●● ●●● or ●-●●●●●●; not 1482 9130."
+            "Code ••• ••• or •-••••••; not 1482 9130."
         );
         assert!(matches!(mask("nothing", &codes), Cow::Borrowed(_)));
+        let cjk = vec!["739204".to_owned(), "４８２９１３".to_owned()];
+        assert_eq!(
+            mask(
+                "您的验证码是739204，请勿泄露。コード：４８２９１３です",
+                &cjk
+            ),
+            "您的验证码是••••••，请勿泄露。コード：••••••です"
+        );
         assert_eq!(
             mask_html(
                 r#"<a href="https://x.test/?c=G-551203">G-551203</a><td>482&nbsp;913</td>"#,
                 &codes
             ),
-            r#"<a href="https://x.test/?c=G-551203">●-●●●●●●</a><td>●●●&nbsp;●●●</td>"#
+            r#"<a href="https://x.test/?c=G-551203">•-••••••</a><td>•••&nbsp;•••</td>"#
         );
     }
 }

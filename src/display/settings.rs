@@ -398,6 +398,9 @@ impl MailApp {
             .when_some(self.presets_for.as_deref(), |d, id| {
                 d.child(self.presets_sheet(id, cx))
             })
+            .when_some(self.model_confirm.as_deref(), |d, id| {
+                d.child(self.delete_model_sheet(id, cx))
+            })
             .into_any_element()
     }
     pub(super) fn general_page(&self, cx: &Context<Self>) -> AnyElement {
