@@ -61,9 +61,11 @@ impl Backend {
             .spawn(move || {
                 let mut retry = FIRST_RETRY;
                 while !stop.load(Ordering::Acquire) {
+                    // Whether this attempt got as far as waiting in IDLE.
+                    let mut watched = false;
                     // A misbehaving server must not take the app down with it.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend.idle(&a, &stop, &socket, &changed)
+                        backend.idle(&a, &stop, &socket, &changed, &mut watched)
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("IDLE failed")));
                     match outcome {
@@ -72,6 +74,11 @@ impl Backend {
                         Err(error) => {
                             if stop.load(Ordering::Acquire) {
                                 break;
+                            }
+                            // A watch that worked and then dropped (the
+                            // network went away) starts backing off afresh.
+                            if watched {
+                                retry = FIRST_RETRY;
                             }
                             // Wrong credentials won't improve by retrying soon;
                             // the inbox checks report them.
@@ -125,6 +132,7 @@ impl Backend {
         stop: &AtomicBool,
         socket: &Mutex<Option<TcpStream>>,
         changed: &dyn Fn(),
+        watched: &mut bool,
     ) -> Result<Ended> {
         let secret = self.credentials(a)?;
         let (session, interrupter) = imap_login_interruptible(a, &secret, &self.tls_connector()?)?;
@@ -138,6 +146,7 @@ impl Backend {
             return Ok(Ended::Unsupported);
         }
         c.session.examine("INBOX")?;
+        *watched = true;
         while !stop.load(Ordering::Acquire) {
             let outcome = {
                 let handle = c.session.idle()?;
