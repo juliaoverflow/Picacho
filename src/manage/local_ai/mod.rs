@@ -24,7 +24,7 @@ pub const OTP_PREFERENCE: &str = "local_ai_otp";
 /// files named below (a commit, so they never change under their digests).
 /// `PICACHO_MODELS_URL` points elsewhere (a mirror, or a local server while
 /// developing).
-const MODELS_URL: &str = "https://raw.githubusercontent.com/juliaoverflow/Picacho/1ba510f3dfd79dda2815957adb0b7fcb447d4e1a/models/otp";
+const MODELS_URL: &str = "https://raw.githubusercontent.com/juliaoverflow/Picacho/b658d9add415638ab6a34defc0009a5dda324469/models/otp";
 
 /// A downloadable model: its file there and here, and what it must be.
 pub struct Model {
@@ -190,8 +190,9 @@ pub fn otp_detector(store: &Store) -> Result<otp::Detector> {
     Ok(otp::Detector::new(OTP.load(store)?, OTP.threshold))
 }
 
-/// Deletes models left from earlier versions (an `otp-v1.bin` once
-/// `otp-v1.bin` is what's used), and downloads that never finished.
+/// Deletes what isn't a current model: one left from an earlier version
+/// (an `otp-v1.bin` once a later one is used), or a download that never
+/// finished.
 pub fn remove_stale(store: &Store) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(models_dir(store)) else {
         return Ok(());
@@ -288,14 +289,17 @@ mod tests {
             OTP.remove(&store)?;
             assert!(!OTP.is_installed(&store));
         }
-        // An older version's file goes; the current one stays.
+        // An older version's file and an unfinished download go; the
+        // current model stays.
         std::fs::copy(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.bin"),
             models_dir(&store).join(OTP.installed),
         )?;
-        std::fs::write(models_dir(&store).join("otp-v1.bin"), b"old")?;
+        std::fs::write(models_dir(&store).join("otp-v0.bin"), b"old")?;
+        std::fs::write(models_dir(&store).join("otp-v1.bin.partial"), b"half")?;
         remove_stale(&store)?;
-        assert!(!models_dir(&store).join("otp-v1.bin").exists());
+        assert!(!models_dir(&store).join("otp-v0.bin").exists());
+        assert!(!models_dir(&store).join("otp-v1.bin.partial").exists());
         assert!(OTP.is_installed(&store) || cfg!(target_os = "macos"));
         assert!(installed_size(&store) > 0 || cfg!(not(target_os = "macos")));
         remove_all(&store)?;

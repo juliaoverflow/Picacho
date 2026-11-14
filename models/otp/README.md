@@ -21,7 +21,7 @@ Both hold the same network.
 
 ## Languages
 
-Version 2 is trained on sign-in mail in English, Spanish, German, French,
+The model is trained on sign-in mail in English, Spanish, German, French,
 Portuguese, Italian, Dutch, Swedish, Polish, Japanese, Chinese (simplified
 and traditional), Korean, Russian, Ukrainian, Turkish, Arabic, Persian,
 Hebrew, Hindi, Bengali, Indonesian, Malay, Vietnamese, Thai, Greek, Czech,
