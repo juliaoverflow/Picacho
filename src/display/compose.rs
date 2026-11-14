@@ -358,14 +358,20 @@ impl MailApp {
             ComposerEvent::Send => self.queue_send(composer, cx),
             ComposerEvent::Close => {
                 composer.update(cx, |c, cx| c.save_now(cx));
+                let account = composer.read(cx).draft.account.clone();
                 self.close_composer(&composer, cx);
                 self.refresh_drafts(cx);
+                self.sync_drafts_soon(&account, cx);
             }
             ComposerEvent::Discard => {
-                let id = composer.read(cx).draft.id.clone();
-                let _ = self.backend.store.delete_draft(&id);
+                let (id, account) = {
+                    let d = &composer.read(cx).draft;
+                    (d.id.clone(), d.account.clone())
+                };
+                let _ = self.backend.discard_draft(&id);
                 self.close_composer(&composer, cx);
                 self.refresh_drafts(cx);
+                self.sync_drafts_soon(&account, cx);
             }
             ComposerEvent::Place(placement) => self.place_composer(composer, *placement, w, cx),
             ComposerEvent::Saved => self.refresh_drafts(cx),
@@ -402,6 +408,33 @@ impl MailApp {
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
         }
+    }
+    /// Brings an account's drafts and its server's Drafts folder in step,
+    /// in the background; the Drafts list reloads if anything changed.
+    pub(super) fn sync_drafts_soon(&mut self, account: &str, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
+            return;
+        };
+        if a.provider == Provider::Pop3
+            || self.account_blocked(&a.id)
+            || !self.draft_syncs.insert(a.id.clone())
+        {
+            return;
+        }
+        self.draft_synced
+            .insert(a.id.clone(), std::time::Instant::now());
+        let id = a.id.clone();
+        self.task(
+            cx,
+            move |b| b.sync_drafts(&a),
+            move |this, result, cx| {
+                this.draft_syncs.remove(&id);
+                this.account_result(&id, IssueSource::Sync(Folder::Drafts.key().into()), &result);
+                if result.is_ok() {
+                    this.refresh_drafts(cx);
+                }
+            },
+        );
     }
 
     /// Moves a composer. Within the main window it only changes how it is
@@ -586,7 +619,7 @@ impl MailApp {
         let account_id = a.id.clone();
         self.task(
             cx,
-            move |b| b.send(&a, &draft),
+            move |b| b.send_noting(&a, &draft),
             move |this, result, cx| {
                 let gone = result
                     .as_ref()
@@ -598,12 +631,17 @@ impl MailApp {
                     this.account_result(&account_id, IssueSource::Send, &result);
                 }
                 match (result, gone) {
-                    (Ok(()), _) => {
+                    (Ok(notes), _) => {
                         // Sent as an alias: its routed addresses are known now.
                         this.alias_routes = fwd::routes(&this.backend.store);
                         this.outbox.retain(|o| o.id != id);
-                        this.notice("Message sent", false, cx);
+                        if notes.is_empty() {
+                            this.notice("Message sent", false, cx);
+                        } else {
+                            this.notice(format!("Message sent. {}", notes.join(" ")), false, cx);
+                        }
                         this.refresh_drafts(cx);
+                        this.sync_drafts_soon(&account_id, cx);
                     }
                     (Err(_), Some(gone)) => this.alias_gone(id, gone, cx),
                     (Err(e), None) => this.send_failed(id, format!("{e:#}"), cx),
@@ -698,14 +736,20 @@ impl MailApp {
                 ComposerEvent::Send => this.queue_send(composer, cx),
                 ComposerEvent::Close => {
                     composer.update(cx, |c, cx| c.save_now(cx));
+                    let account = composer.read(cx).draft.account.clone();
                     this.close_composer(&composer, cx);
                     this.refresh_drafts(cx);
+                    this.sync_drafts_soon(&account, cx);
                 }
                 ComposerEvent::Discard => {
-                    let id = composer.read(cx).draft.id.clone();
-                    let _ = this.backend.store.delete_draft(&id);
+                    let (id, account) = {
+                        let d = &composer.read(cx).draft;
+                        (d.id.clone(), d.account.clone())
+                    };
+                    let _ = this.backend.discard_draft(&id);
                     this.close_composer(&composer, cx);
                     this.refresh_drafts(cx);
+                    this.sync_drafts_soon(&account, cx);
                 }
                 // Moving needs the window; the next render applies it.
                 ComposerEvent::Place(p) => {

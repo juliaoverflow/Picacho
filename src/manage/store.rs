@@ -800,7 +800,7 @@ impl Store {
         account: &str,
         prefix: &str,
         fresh: &[Mail],
-        flags: &[(u32, bool, bool)],
+        flags: &[FlagUpdate],
         before: Option<i64>,
     ) -> Result<()> {
         ensure!(
@@ -812,7 +812,13 @@ impl Store {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         write_messages(&tx, fresh)?;
-        for (uid, unread, starred) in flags {
+        for FlagUpdate {
+            uid,
+            unread,
+            starred,
+            labels,
+        } in flags
+        {
             let id = format!("{prefix}{uid}");
             let data: Option<String> = {
                 use rusqlite::OptionalExtension;
@@ -821,9 +827,13 @@ impl Store {
             };
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
-                if (mail.unread, mail.starred) != (*unread, *starred) {
+                let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels);
+                if (mail.unread, mail.starred) != (*unread, *starred) || labels_changed {
                     mail.unread = *unread;
                     mail.starred = *starred;
+                    if let Some(labels) = labels {
+                        mail.labels = labels.clone();
+                    }
                     write_messages(&tx, &[mail])?;
                 }
             }
@@ -836,6 +846,17 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+    /// The labels on an account's cached mail, sorted.
+    pub fn labels(&self, account: &str) -> Result<Vec<String>> {
+        let db = self.read();
+        let mut q = db.prepare(
+            "SELECT DISTINCT l.value FROM messages, json_each(json_extract(messages.data,'$.labels')) AS l
+             WHERE messages.account=?1 ORDER BY l.value",
+        )?;
+        q.query_map([account], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(r?))
+            .collect()
     }
     /// Unread counts keyed by (account, mailbox key).
     pub fn unread_counts(&self) -> Result<HashMap<(String, String), usize>> {
@@ -903,6 +924,17 @@ impl Store {
         q.query_map([account], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
+    }
+    pub fn draft(&self, id: &str) -> Result<Option<Draft>> {
+        use rusqlite::OptionalExtension;
+        let data: Option<String> = self
+            .read()
+            .query_row("SELECT data FROM drafts WHERE id=?1", [id], |r| r.get(0))
+            .optional()?;
+        Ok(match data {
+            Some(data) => Some(serde_json::from_str(&data)?),
+            None => None,
+        })
     }
     pub fn delete_draft(&self, id: &str) -> Result<()> {
         self.db
@@ -1225,6 +1257,15 @@ mod tests {
 }
 
 /// Inputs validated before a mailbox snapshot is committed.
+/// A cached message's state as the server reports it now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlagUpdate {
+    pub uid: u32,
+    pub unread: bool,
+    pub starred: bool,
+    /// Its labels, when the server said (`None` leaves them as they were).
+    pub labels: Option<Vec<String>>,
+}
 /// A server mailbox as of its last synchronization: enough to ask only for
 /// what changed since (new UIDs, CONDSTORE flag changes, removals).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

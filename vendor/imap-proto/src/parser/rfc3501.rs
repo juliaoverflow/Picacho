@@ -424,6 +424,7 @@ named!(msg_att<AttributeValue>, alt!(
     msg_att_flags |
     rfc4551::msg_att_mod_seq |
     gmail::msg_att_gmail_msgid |
+    gmail::msg_att_gmail_labels |
     msg_att_rfc822 |
     msg_att_rfc822_header |
     msg_att_rfc822_size |
@@ -507,6 +508,27 @@ named!(resp_cond<Response>, do_parse!(
     })
 ));
 
+// Untagged data from extensions this parser doesn't model (Picacho patch):
+// NAMESPACE (RFC 2342), QUOTA/QUOTAROOT (RFC 9208), MYRIGHTS/ACL (RFC 4314),
+// ID (RFC 2971) and ENABLED (RFC 5161). The line is kept as text for the
+// client to read; without this, `imap` treats it as the server hanging up.
+named!(resp_other<Response>, map_res!(
+    recognize!(pair!(
+        alt!(
+            tag_no_case!("NAMESPACE") |
+            tag_no_case!("QUOTAROOT") |
+            tag_no_case!("QUOTA") |
+            tag_no_case!("MYRIGHTS") |
+            tag_no_case!("LISTRIGHTS") |
+            tag_no_case!("ACL") |
+            tag_no_case!("ID") |
+            tag_no_case!("ENABLED")
+        ),
+        text
+    )),
+    |line| str::from_utf8(line).map(Response::Other)
+));
+
 named!(response_data<Response>, do_parse!(
     tag!("* ") >>
     contents: alt!(
@@ -515,7 +537,8 @@ named!(response_data<Response>, do_parse!(
         message_data_expunge |
         message_data_fetch |
         resp_capability |
-        resp_metadata
+        resp_metadata |
+        resp_other
     ) >>
     tag!("\r\n") >>
     (contents)

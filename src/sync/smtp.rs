@@ -1,25 +1,27 @@
 //! Build a MIME message and deliver it once. Acceptance is the send boundary.
 use crate::manage::model::{Account, Draft, Secret};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header};
 use std::time::Duration;
 
-pub(crate) fn deliver(
-    a: &Account,
-    d: &Draft,
-    secret: &Secret,
-    tls: lettre::transport::smtp::client::TlsParameters,
-) -> Result<lettre::Message> {
-    use lettre::{
-        Message, Transport,
-        message::{Attachment, Mailbox, MultiPart, SinglePart},
-        transport::smtp::{
-            authentication::{Credentials, Mechanism},
-            client::Tls,
-        },
-    };
-    let mut builder = Message::builder()
-        .from(Mailbox::new(Some(a.name.clone()), a.email.parse()?))
-        .subject(&d.subject);
+/// Without a SIZE limit from the server, messages larger than this aren't
+/// sent: most servers refuse them, often only after the upload.
+pub(crate) const DEFAULT_LIMIT: usize = crate::sync::transport::MAX_MESSAGE;
+/// Identifies a draft's copy on the server, so later versions replace it
+/// and other devices running Picacho find the same draft.
+pub(crate) const DRAFT_HEADER: &str = "X-Picacho-Draft";
+/// Marks a draft written in Markdown, whose text part is its source.
+pub(crate) const FORMAT_HEADER: &str = "X-Picacho-Format";
+
+fn raw_header(name: &'static str, value: String) -> header::HeaderValue {
+    header::HeaderValue::new(header::HeaderName::new_from_ascii_str(name), value)
+}
+/// The message a draft makes, as sent (`draft: false`) or as saved in the
+/// server's Drafts folder: then incomplete drafts are allowed, Bcc is kept,
+/// and Picacho's own headers let it be found again.
+pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
+    let from = Mailbox::new(Some(a.name.clone()), a.email.parse()?);
+    let mut builder = Message::builder().from(from.clone()).subject(&d.subject);
     let mut count = 0;
     for (field, list) in [(0, &d.to), (1, &d.cc), (2, &d.bcc)] {
         for (name, address) in recipients(list)? {
@@ -34,7 +36,37 @@ pub(crate) fn deliver(
             count += 1;
         }
     }
-    ensure!(count > 0, "Add at least one recipient.");
+    if draft {
+        // Drafts may have no recipients yet; nothing is sent.
+        builder = builder
+            .keep_bcc()
+            .envelope(lettre::address::Envelope::new(
+                Some(from.email.clone()),
+                vec![from.email.clone()],
+            )?)
+            .raw_header(raw_header(DRAFT_HEADER, d.id.clone()));
+        if d.formatted {
+            builder = builder.raw_header(raw_header(FORMAT_HEADER, "markdown".into()));
+        }
+    } else {
+        ensure!(count > 0, "Add at least one recipient.");
+    }
+    // Replies go where the message, or else the account, says.
+    let reply_to = if d.reply_to.trim().is_empty() {
+        &a.reply_to
+    } else {
+        &d.reply_to
+    };
+    for (name, address) in recipients(reply_to).context("Enter a valid Reply-To address.")? {
+        builder = builder.reply_to(Mailbox::new(name, address.parse()?));
+    }
+    if a.read_receipts && !draft {
+        // RFC 8098: the recipient's app may offer to say it was read.
+        builder = builder.raw_header(raw_header(
+            "Disposition-Notification-To",
+            format!("<{}>", a.email),
+        ));
+    }
     if !d.reply_id.is_empty() {
         builder = builder.in_reply_to(d.reply_id.clone());
         let references = if d.references.trim().is_empty() {
@@ -52,11 +84,14 @@ pub(crate) fn deliver(
     let mut multipart = MultiPart::mixed().multipart(text);
     let mut total = d.body.len();
     for path in &d.attachments {
-        let meta = std::fs::metadata(path)?;
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("The attachment {} can't be read.", path.display()))?;
         total += meta.len() as usize;
+        // The server's own limit is checked once connected; this only
+        // keeps absurd files out of memory.
         ensure!(
-            total < 18 * 1024 * 1024,
-            "Attachments exceed the 18 MB sending limit."
+            total < 4 * DEFAULT_LIMIT,
+            "Attachments are too large to send by email. Share them by link instead."
         );
         let bytes = std::fs::read(path)?;
         multipart = multipart.singlepart(
@@ -66,36 +101,187 @@ pub(crate) fn deliver(
                     .to_string_lossy()
                     .into_owned(),
             )
-            .body(bytes, "application/octet-stream".parse()?),
+            .body(bytes, content_type(path)),
         );
     }
-    let message = builder.multipart(multipart)?;
-    let transport = lettre::SmtpTransport::builder_dangerous(&a.smtp_host)
-        .port(a.smtp_port)
-        .tls(if a.smtp_port == 465 {
-            Tls::Wrapper(tls)
+    Ok(builder.multipart(multipart)?)
+}
+/// An attachment's type from its name (image/png, application/pdf…), so
+/// recipients' apps show it; unknown kinds are sent as plain bytes.
+pub(crate) fn content_type(path: &std::path::Path) -> header::ContentType {
+    let guess = mime_guess::from_path(path).first_or_octet_stream();
+    header::ContentType::parse(guess.essence_str())
+        .unwrap_or(header::ContentType::parse("application/octet-stream").unwrap())
+}
+/// What the server said about itself after EHLO that lettre doesn't keep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ServerLimits {
+    /// SIZE (RFC 1870): the largest message it accepts, if it says.
+    pub(crate) size: Option<usize>,
+    /// DSN (RFC 3461): it can report delivery.
+    pub(crate) dsn: bool,
+    pub(crate) eight_bit: bool,
+    pub(crate) utf8: bool,
+}
+pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerLimits {
+    let mut limits = ServerLimits::default();
+    for line in lines {
+        let mut words = line.split_whitespace();
+        match words.next().map(str::to_ascii_uppercase).as_deref() {
+            // "SIZE 0" (or no number) means no fixed limit.
+            Some("SIZE") => {
+                limits.size = words.next().and_then(|n| n.parse().ok()).filter(|n| *n > 0)
+            }
+            Some("DSN") => limits.dsn = true,
+            Some("8BITMIME") => limits.eight_bit = true,
+            Some("SMTPUTF8") => limits.utf8 = true,
+            _ => {}
+        }
+    }
+    limits
+}
+/// What happened to a message the server accepted.
+pub(crate) struct Delivered {
+    pub(crate) message: Message,
+    /// Delivery receipts were asked for, but this server can't send them.
+    pub(crate) receipts_unsupported: bool,
+}
+fn megabytes(bytes: usize) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+}
+
+pub(crate) fn deliver(
+    a: &Account,
+    d: &Draft,
+    secret: &Secret,
+    tls: lettre::transport::smtp::client::TlsParameters,
+) -> Result<Delivered> {
+    use lettre::transport::smtp::{
+        authentication::{Credentials, Mechanism},
+        client::SmtpConnection,
+        commands::{Data, Ehlo, Mail, Quit, Rcpt},
+        extension::{ClientId, MailBodyParameter, MailParameter, RcptParameter},
+    };
+    let message = build(a, d, false)?;
+    let bytes = message.formatted();
+    let hello = ClientId::default();
+    let timeout = Some(Duration::from_secs(45));
+    let implicit = a.smtp_port == 465;
+    let failed =
+        "SMTP delivery failed. Your draft has been kept; check the server and account settings.";
+    let mut conn = SmtpConnection::connect(
+        (a.smtp_host.as_str(), a.smtp_port),
+        timeout,
+        &hello,
+        implicit.then_some(&tls),
+        None,
+    )
+    .context(failed)?;
+    if !implicit {
+        // Never send credentials or mail unencrypted.
+        ensure!(
+            conn.can_starttls(),
+            "{} doesn't offer STARTTLS on port {}; Picacho only sends over encrypted connections.",
+            a.smtp_host,
+            a.smtp_port
+        );
+        conn.starttls(&tls, &hello).context(failed)?;
+    }
+    // lettre keeps only some EHLO keywords; ask again for SIZE and DSN.
+    let ehlo = conn.command(Ehlo::new(hello)).context(failed)?;
+    let limits = server_limits(ehlo.message().skip(1));
+    let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
+    if bytes.len() > limit {
+        bail!(
+            "This message is {} with its attachments; {} accepts up to {}. Remove an attachment or share it by link.",
+            megabytes(bytes.len()),
+            a.smtp_host,
+            megabytes(limit)
+        );
+    }
+    let credentials = Credentials::new(
+        if a.oauth {
+            a.email.clone()
         } else {
-            Tls::Required(tls)
-        })
-        .timeout(Some(Duration::from_secs(45)))
-        .credentials(Credentials::new(
-            a.email.clone(),
-            if a.oauth {
-                secret.access_token.clone()
-            } else {
-                secret.password.clone()
-            },
-        ))
-        .authentication(if a.oauth {
-            vec![Mechanism::Xoauth2]
+            a.login().to_owned()
+        },
+        if a.oauth {
+            secret.access_token.clone()
         } else {
-            vec![Mechanism::Plain, Mechanism::Login]
+            secret.password.clone()
+        },
+    );
+    let mechanisms: &[Mechanism] = if a.oauth {
+        &[Mechanism::Xoauth2]
+    } else {
+        &[Mechanism::Plain, Mechanism::Login]
+    };
+    conn.auth(mechanisms, &credentials).context(failed)?;
+    let envelope = message.envelope();
+    let mut mail_options = vec![];
+    if limits.size.is_some() {
+        mail_options.push(MailParameter::Size(bytes.len()));
+    }
+    let non_ascii = envelope
+        .from()
+        .into_iter()
+        .chain(envelope.to())
+        .any(|address| !AsRef::<str>::as_ref(address).is_ascii());
+    if non_ascii {
+        ensure!(
+            limits.utf8,
+            "{} can't send to or from addresses with accents or non-Latin letters (no SMTPUTF8).",
+            a.smtp_host
+        );
+        mail_options.push(MailParameter::SmtpUtfEight);
+    }
+    if !bytes.is_ascii() && limits.eight_bit {
+        mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+    }
+    let receipts = a.delivery_receipts && limits.dsn;
+    if receipts {
+        // RFC 3461: return headers only, identified by the draft.
+        mail_options.push(MailParameter::Other {
+            keyword: "RET".into(),
+            value: Some("HDRS".into()),
+        });
+        mail_options.push(MailParameter::Other {
+            keyword: "ENVID".into(),
+            value: Some(xtext(&d.id)),
+        });
+    }
+    conn.command(Mail::new(envelope.from().cloned(), mail_options))
+        .context(failed)?;
+    for to in envelope.to() {
+        let params = if receipts {
+            vec![RcptParameter::Other {
+                keyword: "NOTIFY".into(),
+                value: Some("SUCCESS,FAILURE,DELAY".into()),
+            }]
+        } else {
+            vec![]
+        };
+        conn.command(Rcpt::new(to.clone(), params))
+            .with_context(|| format!("The server refused the recipient {to}."))?;
+    }
+    conn.command(Data).context(failed)?;
+    conn.message(&bytes).context(failed)?;
+    // Accepted; a failed goodbye doesn't matter.
+    let _ = conn.command(Quit);
+    Ok(Delivered {
+        message,
+        receipts_unsupported: a.delivery_receipts && !limits.dsn,
+    })
+}
+/// A value as RFC 3461's xtext: printable ASCII but + and =, else +XX.
+fn xtext(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'!'..=b'~' if b != b'+' && b != b'=' => (b as char).to_string(),
+            b => format!("+{b:02X}"),
         })
-        .build();
-    transport.send(&message).context(
-        "SMTP delivery failed. Your draft has been kept; check the server and account settings.",
-    )?;
-    Ok(message)
+        .collect()
 }
 
 /// Addresses in a comma-separated recipient field, with display names.
@@ -183,6 +369,32 @@ mod tests {
         assert!(html.contains("<em>there</em><br />"));
         assert!(html.contains("<li>one</li>"));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn ehlo_limits_and_attachment_types() {
+        let limits = server_limits(
+            [
+                "PIPELINING",
+                "SIZE 35882577",
+                "DSN",
+                "8BITMIME",
+                "AUTH PLAIN",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(limits.size, Some(35882577));
+        assert!(limits.dsn && limits.eight_bit && !limits.utf8);
+        assert_eq!(server_limits(["SIZE 0"].into_iter()).size, None);
+        let ty = |name: &str| format!("{:?}", content_type(std::path::Path::new(name)));
+        assert!(
+            ty("photo.JPG").contains("image/jpeg"),
+            "{}",
+            ty("photo.JPG")
+        );
+        assert!(ty("report.pdf").contains("application/pdf"));
+        assert!(ty("notes").contains("application/octet-stream"));
+        assert_eq!(xtext("a+b=c d"), "a+2Bb+3Dc+20d");
     }
 
     #[test]

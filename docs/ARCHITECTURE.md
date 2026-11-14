@@ -14,6 +14,7 @@ Display invokes Manage on GPUI's background executor. Manage coordinates Sync an
 
 - New provider: start with Sync discovery/OAuth and Manage's `Service`/`Account`. Keep server-specific behavior out of views.
 - Incoming protocol: change Sync's `imap.rs` or `pop.rs`; update the coordinator in `manage/backend.rs` for persistence policy.
+- IMAP extensions and the session stream (COMPRESS, IDLE waits): `sync/imap.rs` and `sync/stream.rs`; Manage's `connection.rs` caches capabilities, namespace and rights per connection. Push for new mail lives in `manage/watch.rs`; draft sync in `Backend::sync_drafts`. See [SYNCHRONIZATION.md](SYNCHRONIZATION.md).
 - Database/cache: change `manage/store.rs`. Existing profiles open without a migration or data-directory rename in this reorganization.
 - Encryption: change `manage/crypto.rs`; plaintext from encrypted mail must stay in memory.
 - HTML renderer: `display/html/` is a reusable component with no mailbox, database, or MailApp dependencies. `document.rs` owns Blitz layout and vector painting, `view.rs` adapts GPUI input and visible-tile painting, and `resources.rs` is the only resource-loading boundary. The reader supplies HTML and a per-email remote-content policy. Reading defaults live in `manage/reading.rs`; both defaults and overrides use Store preferences. See `vendor/stylo_derive/README.md` for the scoped upstream compatibility patch.

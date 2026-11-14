@@ -25,6 +25,8 @@ bytemuck = "1"
 chrono = { version = "0.4", features = ["serde"] }
 cursor-icon = "1"
 directories = "6"
+# IMAP COMPRESS=DEFLATE (RFC 4978): raw deflate over the TLS stream.
+flate2 = "1"
 futures = "0.3"
 data-url = "0.3"
 keyboard-types = "0.8"
@@ -48,6 +50,8 @@ mail-auth = { version = "0.15", default-features = false, features = ["rust-cryp
 # 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
 mailparse = "0.18"
 markdown = "1.0.0"
+# Attachment content types from their file names.
+mime_guess = "2"
 native-tls = "0.2"
 notify-rust = "4"
 open = "5"

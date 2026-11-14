@@ -48,13 +48,15 @@ The window adapts down to 360 × 320 logical pixels. At narrow widths, opening a
 
 ## POP3 behavior
 
-POP3 downloads are identified by stable UIDL values, cached, and deduplicated. Read/star flags and folder moves are local. Refresh preserves these local changes. Originals remain on the server; the app never issues POP3 `DELE`. Sent messages are saved locally after SMTP acceptance.
+POP3 downloads are identified by stable UIDL values, cached, and deduplicated. Read/star flags and folder moves are local. Refresh preserves these local changes. Originals remain on the server; the app never issues POP3 `DELE`. Mail deleted permanently here is remembered so it doesn't download again. Sent messages are saved locally after SMTP acceptance.
 
 ## Implemented interactions
 
 - A sidebar listing every account as a collapsible group with its standard mailboxes and server folders (nested beneath the inbox). It collapses to an icon rail with ⌃⌘S.
 - On IMAP accounts, right-click the inbox for **New Folder…**, or one of your own server folders for **New Folder Inside…**, **Rename Folder…** and **Delete Folder…**. Changes are made on the server; renaming a folder downloads its mail again under the new name.
 - Right-click menus for accounts, mailboxes, and messages.
+- **Delete Permanently…** for messages in Trash or Spam (one or a selection), and **Empty Trash…**/**Empty Spam…** on those mailboxes; both ask first. Only the named messages are removed (`UID EXPUNGE`); on servers without UIDPLUS, nothing is changed while another app has left messages marked for deletion there.
+- **Labels…** in a message's (or a selection's) menu: IMAP keywords, or Gmail's labels. Labels in use are listed, checked where set; **New Label…** adds one. Labels show under the reader's subject, where they can be removed or clicked to find mail with them (`label:`). Keyword servers only take one-word labels, and only where the folder keeps new keywords.
 - Multi-select with the list's Select button, ⌘-click, ⇧-click, ⌘A, the avatar checkboxes, or a message's right-click menu (Select, Select All From Sender), with a bulk toolbar for read/unread, star, archive, spam, and trash. While several messages are selected, the reader pane summarizes them and offers the same actions; ⌘⇧U and ⌘⇧S mark or star the whole selection.
 - A filter menu for unread, starred, and attachment-bearing mail, plus newest/oldest ordering.
 - Star, read, and move changes apply instantly and roll back if the server rejects them.
@@ -65,8 +67,12 @@ POP3 downloads are identified by stable UIDL values, cached, and deduplicated. R
 - Native selectable message text, interactive HTML rendered with Blitz, MIME decoding, attachment listing and saving.
 - Compose, reply, reply all, forward, and file attachments.
 - SMTP delivery; failed sends retain the draft.
-- Automatic local draft saving and reopening; save on window close and quit.
-- Server read/star flags and atomic IMAP moves where the server supports `MOVE`.
+- Automatic local draft saving and reopening; save on window close and quit. On IMAP accounts drafts sync with the server's Drafts folder: drafts written here are uploaded when a composer closes and with inbox checks (a new version replaces the old), drafts written in other apps appear here with their attachments, and a draft sent or deleted on one side goes from the other. A draft changed here since its last upload is never discarded.
+- A Reply-To per message (Reply-To in the composer, beside Cc and Bcc) and per mailbox (Settings → account → Sending), and optional read receipts (Disposition-Notification-To) and delivery receipts (SMTP DSN, where the server offers it) per mailbox.
+- A sign-in name for servers that don't use the email address (Settings → account → Sign-in, or when entering server settings by hand), used for IMAP, POP3 and SMTP.
+- Storage use and limit for IMAP mailboxes whose server has quotas (Settings → account → Storage).
+- Server read/star flags and atomic IMAP moves where the server supports `MOVE`; elsewhere, a copy and removal of just the moved messages (`UID EXPUNGE`).
+- New inbox mail shows as it arrives on servers with IMAP `IDLE`; scheduled checks continue as before.
 - Light, dark, and automatic appearance with seven theme colors; tooltips, keyboard shortcuts, and animated reader/dialog entrances.
 - A full macOS menu bar: the Picacho menu (About, Settings ⌘,, Services, Hide, Quit), File, Edit, View, Mailbox (⌘1–⌘7), Message, Window, and Help. Shortcuts use Ctrl in place of ⌘ on Windows and Linux.
 - Per-mailbox refresh schedules and new-mail notifications.
@@ -81,13 +87,13 @@ Data lives in the platform directory selected by `directories::ProjectDirs` for 
 
 ## Current boundaries
 
-- Drafts are local to this device. They do not synchronize with the provider's Drafts folder.
+- POP3 drafts stay on this device. IMAP drafts sync as described above; drafts written elsewhere keep their text, recipients and attachments but not HTML formatting made in other apps.
 - Search covers loaded message summaries, not a server-wide search index. Starred refresh searches the standard inbox/sent/archive/spam/trash mailboxes; Gmail uses its All Mail mailbox. Other server folders are listed under each account's inbox; messages can be moved between the standard mailboxes and, on IMAP accounts, into the account's own folders with **Move to Folder…** (in a message's or a selection's menu, the selection summary, and a subscription's **Move All to Folder…**).
 - HTML email uses Blitz for CSS layouts, links, text selection, and disclosures. **HTML on/off** and **Remote blocked/allowed** controls above each message are saved per email. HTML is on and remote content is blocked by default; Settings → Reading changes the defaults for all accounts. Remote images, CSS and fonts only load when allowed. Scripts, forms, embedded frames and filesystem resources are disabled. CID attachment images and original-message forwarding attachments are not reproduced.
-- Attachment forwarding is manual: save an attachment and attach it to the new message. Downloaded messages are limited to 25 MB; outgoing content and attachments to 18 MB before MIME encoding.
-- IMAP archive/trash moves require the server's `MOVE` capability. The app avoids broad `EXPUNGE` operations that could remove unrelated messages.
-- Gmail/Outlook save their own sent mail. For custom IMAP, the app attempts to append a sent copy; an append failure does not report an already accepted SMTP message as unsent.
-- New mail is found by polling on each mailbox's schedule while Picacho is open; there is no background daemon or IMAP IDLE push yet.
+- Attachment forwarding is manual: save an attachment and attach it to the new message. Downloaded messages are limited to 25 MB. Outgoing messages are limited to the SMTP server's advertised `SIZE` (25 MB where it doesn't say), checked before anything is sent; attachments go with their type (image/png, application/pdf…).
+- IMAP moves use `MOVE` where offered; otherwise a copy and `UID EXPUNGE` of just those messages, or, without UIDPLUS, a plain `EXPUNGE` only when no other message there is marked deleted. The app never expunges unrelated messages.
+- Gmail/Outlook save their own sent mail. For custom IMAP, the app attempts to append a sent copy (within the server's `APPENDLIMIT`); if that fails, the "Message sent" notice says so, and the accepted message is not reported as unsent. Likewise when delivery receipts were asked for and the server can't send them.
+- New mail is pushed with IMAP `IDLE` (one extra connection per account, renewed every nine minutes) and also found by polling on each mailbox's schedule, while Picacho is open; there is no background daemon. POP3 has no push.
 - The app is verified on macOS. The code builds for Windows and Linux (native title bar, Ctrl shortcuts, platform keychains, notifications), but those platforms are not yet packaged or tested.
 
 ## Verification

@@ -235,8 +235,32 @@ pub struct Account {
     pub incoming_starttls: bool,
     #[serde(default)]
     pub sync: SyncSettings,
+    /// The name the servers know this sign-in by, when it isn't the email
+    /// address (some hosts use a plain user name). Empty: the address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    /// Where replies go unless a message names somewhere else; empty for
+    /// the sending address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply_to: String,
+    /// Ask recipients' mail apps to confirm when a message is read
+    /// (Disposition-Notification-To, RFC 8098).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_receipts: bool,
+    /// Ask the receiving servers to report delivery (SMTP DSN, RFC 3461),
+    /// where the sending server supports it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivery_receipts: bool,
 }
 impl Account {
+    /// The name to sign in to the mail servers with.
+    pub fn login(&self) -> &str {
+        if self.username.trim().is_empty() {
+            &self.email
+        } else {
+            self.username.trim()
+        }
+    }
     pub fn new(provider: Provider) -> Self {
         let (host, smtp) = match provider {
             Provider::Gmail => ("imap.gmail.com", "smtp.gmail.com"),
@@ -263,6 +287,10 @@ impl Account {
             },
             incoming_starttls: false,
             sync: SyncSettings::default(),
+            username: String::new(),
+            reply_to: String::new(),
+            read_receipts: false,
+            delivery_receipts: false,
         }
     }
     /// The name shown for the account: its nickname, if it has one.
@@ -310,6 +338,15 @@ impl Account {
             !self.incoming_starttls
                 || matches!(self.incoming_host.as_str(), "127.0.0.1" | "localhost"),
             "STARTTLS is only used with Proton Mail Bridge on this computer."
+        );
+        anyhow::ensure!(
+            !self.username.chars().any(char::is_control),
+            "The sign-in name can't contain line breaks."
+        );
+        anyhow::ensure!(
+            self.reply_to.trim().is_empty()
+                || crate::sync::smtp::recipients(&self.reply_to).is_ok_and(|r| !r.is_empty()),
+            "Enter a valid Reply-To address."
         );
         Ok(())
     }
@@ -456,6 +493,10 @@ pub struct Mail {
     /// The sender accepts a one-click unsubscribe (RFC 8058).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub one_click: bool,
+    /// Its labels: IMAP keywords set on it, or Gmail's labels (`X-GM-LABELS`),
+    /// as the server names them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     /// A row the list knows exists on the server but has not listed yet.
     /// Never stored; the list draws it as a placeholder until it loads.
     #[serde(skip)]
@@ -628,6 +669,23 @@ pub struct Draft {
     #[serde(default)]
     pub references: String,
     pub attachments: Vec<std::path::PathBuf>,
+    /// Where replies go, for this message; empty for the account's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply_to: String,
+    /// Its copy in the server's Drafts folder, once uploaded or found there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteDraft>,
+    /// A fingerprint of what was last uploaded, so unchanged drafts aren't
+    /// uploaded again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uploaded: String,
+}
+/// Where a draft is in the server's Drafts folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDraft {
+    pub mailbox: String,
+    pub validity: u32,
+    pub uid: u32,
 }
 impl Draft {
     /// Whether anything has been written: an untouched draft is not kept.
@@ -638,6 +696,32 @@ impl Draft {
             && self.subject.trim().is_empty()
             && self.body.trim().is_empty()
             && self.attachments.is_empty()
+    }
+    /// What the message says, to tell whether the server's copy is current.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for part in [
+            &self.send_as,
+            &self.to,
+            &self.cc,
+            &self.bcc,
+            &self.subject,
+            &self.body,
+            &self.reply_id,
+            &self.references,
+            &self.reply_to,
+        ] {
+            h.update(part.as_bytes());
+            h.update([0]);
+        }
+        h.update([u8::from(self.formatted)]);
+        for path in &self.attachments {
+            h.update(path.to_string_lossy().as_bytes());
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            h.update(size.to_le_bytes());
+        }
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -758,6 +842,7 @@ pub fn demo_mail() -> Vec<Mail> {
             one_click: false,
             pending: false,
             reply_to: String::new(),
+            labels: vec![],
             inline: Default::default(),
         })
         .collect()

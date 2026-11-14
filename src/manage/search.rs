@@ -22,6 +22,8 @@ enum Field {
     To,
     Cc,
     Subject,
+    /// A label (IMAP keyword or Gmail label) on it.
+    Label,
     Unread,
     Read,
     Starred,
@@ -49,6 +51,7 @@ pub const OPERATORS: &[(&str, &str)] = &[
     ("reply-to:", "Where replies go"),
     ("to:", "Recipients, copied too"),
     ("subject:", "Subject"),
+    ("label:", "Mail with a label"),
     ("is:unread", "Unread mail"),
     ("is:starred", "Starred mail"),
     ("has:attachment", "Mail with attachments"),
@@ -79,6 +82,10 @@ impl Term {
             Field::To => has(&m.to) || has(&m.cc),
             Field::Cc => has(&m.cc),
             Field::Subject => has(&m.subject),
+            Field::Label => m
+                .labels
+                .iter()
+                .any(|l| has(l) || has(&crate::sync::transport::decode_name(l))),
             Field::Unread => m.unread,
             Field::Read => !m.unread,
             Field::Starred => m.starred,
@@ -161,6 +168,7 @@ fn term(raw: &str, phrase: bool) -> Option<Term> {
         "to" => Field::To,
         "cc" => Field::Cc,
         "subject" => Field::Subject,
+        "label" | "tag" | "keyword" => Field::Label,
         "is" => {
             return match value {
                 "unread" => flag(Field::Unread),

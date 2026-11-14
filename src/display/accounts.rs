@@ -100,6 +100,8 @@ impl MailApp {
                         if let Some(old) = this.accounts.iter_mut().find(|a| a.id == id) {
                             *old = a;
                         }
+                        // The inbox watch signs in again with the new sign-in.
+                        this.backend.stop_watching(&id);
                         if encrypted {
                             this.encrypted.insert(id.clone());
                         }

@@ -70,6 +70,75 @@ connection except by sync, which refreshes the folder list, and a mailbox stays
 selected between operations. Replacing an account's sign-in or removing it
 signs the connection out.
 
+## Server extensions
+
+After signing in, a session sends `ID` where offered and turns on
+`COMPRESS=DEFLATE` (raw deflate in both directions above TLS,
+`sync/stream.rs`); neither is required. `CAPABILITY` decides the rest:
+
+- `SPECIAL-USE`: LIST asks servers to mark standard folders by role
+  (`RETURN (SPECIAL-USE)`), rather than guessing from names.
+- `NAMESPACE`: new top-level folders go in the personal namespace's prefix
+  (`INBOX.` on servers that keep everything inside the inbox); without it,
+  the folder list's own shape decides.
+- `ACL`: `MYRIGHTS` is checked before folder changes (k, x), moves (i on the
+  target, t and e on the source), deleting messages (t, e) and labels (w), so
+  a refusal changes nothing and says which right is missing. RFC 2086's older
+  `c` and `d` letters count too.
+- `MOVE` (RFC 6851) is used when offered; otherwise `UID COPY`, then the moved
+  messages are marked `\Deleted` and removed with `UID EXPUNGE` (UIDPLUS).
+  Without UIDPLUS, a plain `EXPUNGE` is used only when `UID SEARCH DELETED`
+  shows no other marked message; else the move is refused before the copy.
+  Permanent deletion and emptying Trash/Spam use the same removal.
+- `QUOTA`: `GETQUOTAROOT INBOX` reports storage for Settings.
+- `APPENDLIMIT`: drafts and sent copies larger than the server keeps are not
+  uploaded.
+- Labels: Gmail's `X-GM-LABELS` (fetched with headers and flags, set with
+  `UID STORE ±X-GM-LABELS`), else keywords among `FLAGS` (set with
+  `±FLAGS.SILENT`, refused where `PERMANENTFLAGS` lacks `\*`). System
+  keywords (`$Forwarded`, `$MDNSent`, junk markers…) aren't shown. Labels
+  travel in the server's form; Gmail's are modified UTF-7 like folder names.
+
+`imap-proto` doesn't model NAMESPACE, QUOTA, MYRIGHTS, ID or ENABLED replies,
+and `imap` 2.4 mistakes any untagged line it can't parse for the server
+leaving; the vendored patch keeps them as text (`Response::Other`).
+
+## Push (IDLE)
+
+Each IMAP account whose server offers `IDLE` has one more connection
+(`manage/watch.rs`), outside the connection pool and the account lock. It
+opens the inbox read-only (`EXAMINE`) and waits in IDLE, renewed every nine
+minutes. Any change it hears makes Display run the regular inbox check, so
+the cache only changes under the usual rules. While waiting, the wire allows
+reads to wait for the IDLE period instead of its usual limits; sending
+anything restores them. Stopping a watch closes its socket from another
+thread. Failures back off from 30 seconds to 15 minutes (the longest for
+rejected sign-ins and server limits) and trigger a check, since mail may
+have arrived meanwhile. Polling continues as the fallback.
+
+## Drafts
+
+`Backend::sync_drafts` pairs local drafts with the server's Drafts folder
+(`\Drafts`, or by name). Each uploaded copy carries an `X-Picacho-Draft`
+header with the draft's id, and the draft records its copy's mailbox,
+UIDVALIDITY and UID plus a fingerprint of what was uploaded. In order:
+
+1. Copies of drafts sent or discarded here (queued by `discard_draft`, which
+   reads the stored draft since a composer's copy may predate an upload) are
+   removed with the safe expunge above.
+2. A local draft whose copy is gone is deleted if unchanged since upload (it
+   was sent or deleted elsewhere); a changed one uploads again.
+3. Server messages no local draft claims (by UID or header id) become drafts,
+   with recipients, Bcc, Reply-To, threading headers, text and attachments
+   (saved under `draft-files/` in the data directory).
+4. Drafts not uploaded in their current form are appended (`\Draft \Seen`);
+   the new copy is found as the UID that appeared, and earlier copies of the
+   same draft (by UID or header id) are removed. If a composer saved a newer
+   version meanwhile, it keeps its words and uploads next time.
+
+It runs when the Drafts view opens or refreshes, when a composer closes or
+is discarded, after sending, and with inbox checks at most every two minutes.
+
 ## Catalog and placeholder rows
 
 There is no "Load more" step. The first full snapshot's SEARCH is the
@@ -141,7 +210,9 @@ connection failure.
 
 TCP attempts have a shared 12-second budget after name resolution, with at most three seconds per address. Verified TLS is mandatory, including STARTTLS; rejection never falls back to plaintext. The socket has a 30-second inactivity timeout. A wire wrapper adds a 90-second response budget and a 32 MiB byte budget between outgoing writes, including TLS framing. This bounds the IMAP library's otherwise unbounded response buffering, even when a peer lies about RFC822.SIZE. TLS handshake writes can also restart this wire budget. The decoded-message limit remains 25 MiB. POP3 status lines and multiline responses have separate length/completeness checks.
 
-System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. IDLE, QRESYNC, ESEARCH and COMPRESS=DEFLATE (neither `imap` 2.4 nor its parser support the last two), resumable partial MIME downloads, and an offline mutation queue remain future work. Removals still cost one full SEARCH, since Gmail offers no QRESYNC.
+System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. QRESYNC, ESEARCH, `UTF8=ACCEPT` (folder names stay in modified UTF-7), resumable partial MIME downloads, and an offline mutation queue remain future work. Removals still cost one full SEARCH, since Gmail offers no QRESYNC.
+
+SMTP delivery reads the server's EHLO itself (lettre keeps only some of it): `SIZE` limits the message, checked before `MAIL FROM` and declared on it; `DSN` lets delivery receipts ask for `NOTIFY=SUCCESS,FAILURE,DELAY` with `RET=HDRS`; `SMTPUTF8` and `8BITMIME` are declared where needed. STARTTLS is required unless the port is 465 (implicit TLS).
 
 ## Reference implementation review
 

@@ -786,6 +786,8 @@ fn imap_folder_delete_follows_the_servers_rights() -> Result<()> {
                 let upper = command.to_ascii_uppercase();
                 let mut out = String::new();
                 if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    out.push_str("* CAPABILITY IMAP4rev1\r\n");
                 } else if upper.starts_with("LIST") {
                     out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
                     out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");
@@ -874,6 +876,8 @@ fn imap_folder_create_and_rename() -> Result<()> {
                 let mut out = String::new();
                 let unquote = |s: &str| s.trim_matches('"').to_owned();
                 if upper.starts_with("LOGIN") || upper.starts_with("SUBSCRIBE") {
+                } else if upper == "CAPABILITY" {
+                    out.push_str("* CAPABILITY IMAP4rev1\r\n");
                 } else if upper.starts_with("LIST") {
                     out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
                     out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");

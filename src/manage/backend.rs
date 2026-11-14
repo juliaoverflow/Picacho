@@ -18,6 +18,9 @@ use crate::sync::transport::*;
 #[path = "connection.rs"]
 mod connection;
 use connection::{Connection, Limits};
+#[path = "watch.rs"]
+mod watch;
+use watch::Watcher;
 #[cfg(test)]
 #[path = "dovecot_tests.rs"]
 mod dovecot_tests;
@@ -28,6 +31,9 @@ mod incremental_tests;
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
 #[cfg(test)]
+#[path = "extension_tests.rs"]
+mod extension_tests;
+#[cfg(test)]
 #[path = "reliability_tests.rs"]
 mod reliability_tests;
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +43,8 @@ pub enum Change {
     Move(Folder),
     /// Moves mail into one of the account's own server folders, by name.
     MoveTo(String),
+    /// Adds (true) or removes a label: a Gmail label or an IMAP keyword.
+    Label(String, bool),
 }
 impl Change {
     /// Whether this moves mail to another mailbox.
@@ -60,6 +68,13 @@ impl Change {
             Self::MoveTo(name) => {
                 m.folder = Folder::Other;
                 m.remote_folder = name.clone();
+            }
+            Self::Label(label, add) => {
+                m.labels.retain(|l| l != label);
+                if *add {
+                    m.labels.push(label.clone());
+                    m.labels.sort();
+                }
             }
         }
     }
@@ -158,6 +173,8 @@ pub struct Backend {
     /// Messages being opened that wait for their account's connection, by
     /// account. Background downloads give way to them.
     waiting: Mutex<HashMap<String, usize>>,
+    /// Inboxes watched for new mail with IDLE, by account; see `watch.rs`.
+    watchers: Mutex<HashMap<String, Watcher>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -193,6 +210,7 @@ impl Backend {
             pending: Mutex::new(None),
             sign_in_step: Mutex::new(SignInStep::Browser),
             waiting: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -501,6 +519,7 @@ impl Backend {
         let lock = self.account_lock(id);
         let _operation = lock.lock().unwrap();
         self.disconnect(id);
+        self.stop_watching(id);
         self.layouts
             .lock()
             .unwrap()
@@ -772,7 +791,10 @@ impl Backend {
             return self.full_sync(c, a, mailbox, remote, &selected, false, limit);
         }
         let prefix = format!("{}:{remote}:{validity}:", a.id);
-        let condstore = c.extensions()?.condstore;
+        let Extensions {
+            condstore, gmail, ..
+        } = c.extensions()?;
+        let items = flag_items(gmail);
         let rows = match (state.modseq, selected.modseq) {
             (Some(old), Some(new)) if condstore => {
                 if new == old {
@@ -781,7 +803,7 @@ impl Backend {
                     uid_fetch_rows(
                         &mut c.session,
                         "1:*",
-                        &format!("(UID FLAGS) (CHANGEDSINCE {old})"),
+                        &format!("{items} (CHANGEDSINCE {old})"),
                     )?
                 }
             }
@@ -796,14 +818,19 @@ impl Backend {
                 if newest.is_empty() {
                     Vec::new()
                 } else {
-                    uid_fetch_rows(&mut c.session, &uid_ranges(&newest), "(UID FLAGS)")?
+                    uid_fetch_rows(&mut c.session, &uid_ranges(&newest), items)?
                 }
             }
         };
-        let flags: Vec<(u32, bool, bool)> = rows
+        let flags: Vec<store::FlagUpdate> = rows
             .iter()
             .filter(|r| r.flags.is_some())
-            .map(|r| (r.uid, !r.seen(), r.flagged()))
+            .map(|r| store::FlagUpdate {
+                uid: r.uid,
+                unread: !r.seen(),
+                starred: r.flagged(),
+                labels: r.labels(gmail),
+            })
             .collect();
         let before = (a.sync.days > 0)
             .then(|| chrono::Utc::now().timestamp() - i64::from(a.sync.days) * 86_400);
@@ -1048,6 +1075,13 @@ impl Backend {
     ) {
         self.set_layout(a, mailbox, remote, validity, uids);
     }
+    /// Drops a mailbox's layout, so its next check lays it out again.
+    fn forget_layout(&self, a: &Account, mailbox: &Mailbox) {
+        self.layouts
+            .lock()
+            .unwrap()
+            .remove(&(a.id.clone(), mailbox.key()));
+    }
     /// Adds new and removes moved messages in a known layout.
     fn extend_layout(
         &self,
@@ -1145,8 +1179,9 @@ impl Backend {
         let (known, unknown): (Vec<u32>, Vec<u32>) =
             newest.iter().partition(|uid| cached.contains_key(uid));
         let mut result = self.list_uids(c, a, folder, remote, validity, &unknown)?;
+        let gmail = c.extensions()?.gmail;
         for chunk in known.chunks(500) {
-            for row in uid_fetch_rows(&mut c.session, &uid_ranges(chunk), "(UID FLAGS)")? {
+            for row in uid_fetch_rows(&mut c.session, &uid_ranges(chunk), flag_items(gmail))? {
                 // Unsolicited updates for other messages are not part of this.
                 if !chunk.contains(&row.uid) || row.flags.is_none() {
                     continue;
@@ -1161,6 +1196,9 @@ impl Backend {
                 let mut m = old.clone();
                 m.unread = !row.seen();
                 m.starred = row.flagged();
+                if let Some(labels) = row.labels(gmail) {
+                    m.labels = labels;
+                }
                 result.push(m);
             }
         }
@@ -1265,7 +1303,7 @@ impl Backend {
         let gmail = c.extensions()?.gmail;
         let items = format!(
             "(UID FLAGS RFC822.SIZE INTERNALDATE{} {LIST_HEADERS})",
-            if gmail { " X-GM-MSGID" } else { "" }
+            if gmail { " X-GM-MSGID X-GM-LABELS" } else { "" }
         );
         let rows = uid_fetch_rows(&mut c.session, set, &items)?;
         let mut result: Vec<Mail> = Vec::new();
@@ -1287,6 +1325,7 @@ impl Backend {
             m.starred = row.flagged();
             m.size = row.size.unwrap_or(0);
             m.gmail_id = row.gmail_id.unwrap_or(0);
+            m.labels = row.labels(gmail).unwrap_or_default();
             if m.date == 0 {
                 m.date = row.internal_date.unwrap_or_default();
             }
@@ -1307,8 +1346,23 @@ impl Backend {
         }
         let mut pop = self.pop_login(a, password)?;
         let ids = pop.uidl()?;
+        let mut erased = self.pop_erased(&a.id);
+        // Forget deletions of mail no longer on the server.
+        let before = erased.len();
+        erased.retain(|uid| ids.iter().any(|(_, u)| u == uid));
+        if erased.len() != before {
+            self.store.set_preference(
+                &format!("pop_erased:{}", a.id),
+                &serde_json::to_string(&erased)?,
+            )?;
+        }
         let mut messages = Vec::new();
-        for (number, uid) in ids.iter().rev().take(limit) {
+        for (number, uid) in ids
+            .iter()
+            .rev()
+            .filter(|(_, uid)| !erased.contains(uid))
+            .take(limit)
+        {
             let id = format!("{}:pop:{uid}", a.id);
             let cached = self.store.message(&id)?;
             let complete = cached.is_some() && self.store.raw(&id)?.is_some();
@@ -1466,7 +1520,11 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
-            let name = new_folder_name(&names, a.provider, parent, leaf)?;
+            let namespace = c.namespace()?;
+            let name = new_folder_name(&names, a.provider, parent, leaf, namespace.as_deref())?;
+            if let Some(parent) = parent {
+                c.require_rights(parent, "k", "make folders")?;
+            }
             let label = decode_name(&name);
             allowed(
                 c.session
@@ -1501,7 +1559,11 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
-            let next = renamed_folder_name(&names, a.provider, name, leaf)?;
+            let namespace = c.namespace()?;
+            let next = renamed_folder_name(&names, a.provider, name, leaf, namespace.as_deref())?;
+            if next != name {
+                c.require_rights(name, "x", "rename the folder")?;
+            }
             if next == name {
                 return Ok(FolderChange {
                     folders: custom_folders(&names),
@@ -1557,6 +1619,7 @@ impl Backend {
         let folders = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             deletable(&names, a.provider, name)?;
+            c.require_rights(name, "x", "delete the folder")?;
             c.leave(name)?;
             let label = decode_name(name);
             allowed(c.session.delete(name), || format!("delete “{label}”"))?;
@@ -1565,6 +1628,136 @@ impl Backend {
         self.store.save_folders(&a.id, &folders)?;
         self.store.forget_mailbox(&a.id, name)?;
         Ok(folders)
+    }
+    /// Deletes messages for good: on the server (marked \\Deleted and
+    /// expunged, just these) and from this computer. Offered in Trash and
+    /// Spam, where Gmail too deletes rather than removes a label.
+    pub fn delete_forever(&self, a: &Account, mails: &[Mail]) -> Result<()> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        ensure!(
+            mails.iter().all(|m| m.account == a.id),
+            "Message belongs to another account"
+        );
+        ensure!(
+            a.provider != Provider::Gmail
+                || mails
+                    .iter()
+                    .all(|m| matches!(m.folder, Folder::Trash | Folder::Junk)),
+            "Gmail deletes mail for good only from Trash and Spam. Move it to Trash first."
+        );
+        if mails.is_empty() {
+            return Ok(());
+        }
+        if a.provider == Provider::Pop3 {
+            // Copies stay on the server (Picacho never sends DELE); remember
+            // them so they don't download again.
+            let mut erased = self.pop_erased(&a.id);
+            for m in mails {
+                if let Some(uidl) = m.id.strip_prefix(&format!("{}:pop:", a.id)) {
+                    erased.insert(uidl.to_owned());
+                }
+            }
+            self.store.set_preference(
+                &format!("pop_erased:{}", a.id),
+                &serde_json::to_string(&erased)?,
+            )?;
+            return self.store.commit_changes(mails, true);
+        }
+        self.with_imap(a, |c| {
+            let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
+            for m in mails {
+                match groups.iter_mut().find(|(first, _)| {
+                    first.remote_folder == m.remote_folder && same_validity(first, m)
+                }) {
+                    Some((_, uids)) => uids.push(m.uid),
+                    None => groups.push((m, vec![m.uid])),
+                }
+            }
+            for (first, uids) in groups {
+                let selected = c.select_for(first)?;
+                c.require_rights(&first.remote_folder, "te", "delete messages")?;
+                for chunk in uids.chunks(200) {
+                    c.erase(chunk)?;
+                    if let Some(mut state) = self.store.mailbox_state(&a.id, &first.remote_folder)?
+                        && state.validity == selected.validity
+                    {
+                        state.exists = state.exists.saturating_sub(chunk.len() as u32);
+                        self.store
+                            .save_mailbox_state(&a.id, &first.remote_folder, Some(&state))?;
+                    }
+                    self.extend_layout(
+                        a,
+                        &first.mailbox(),
+                        selected.validity,
+                        std::iter::empty(),
+                        chunk,
+                    );
+                    let gone: Vec<Mail> = mails
+                        .iter()
+                        .filter(|m| {
+                            m.remote_folder == first.remote_folder
+                                && same_validity(m, first)
+                                && chunk.contains(&m.uid)
+                        })
+                        .cloned()
+                        .collect();
+                    self.store.commit_changes(&gone, true)?;
+                }
+            }
+            Ok(())
+        })
+    }
+    /// Deletes everything in Trash or Spam for good. Returns how many
+    /// messages were removed.
+    pub fn empty_mailbox(&self, a: &Account, folder: Folder) -> Result<usize> {
+        ensure!(
+            matches!(folder, Folder::Trash | Folder::Junk),
+            "Only Trash and Spam can be emptied."
+        );
+        if a.provider == Provider::Pop3 {
+            let mails = self.store.messages(&a.id, folder, usize::MAX >> 1)?;
+            self.delete_forever(a, &mails)?;
+            return Ok(mails.len());
+        }
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let mailbox = Mailbox::Standard(folder);
+        let count = self.with_imap(a, |c| {
+            let remote = resolve_in(c.names(false)?, a.provider, folder)?;
+            c.select(&remote)?;
+            c.require_rights(&remote, "te", "delete messages")?;
+            let uids: Vec<u32> = c.session.uid_search("ALL")?.into_iter().collect();
+            for chunk in uids.chunks(500) {
+                c.erase(chunk)?;
+            }
+            // The folder is empty; its cached mail and state go too.
+            self.store.forget_mailbox(&a.id, &remote)?;
+            self.forget_layout(a, &mailbox);
+            Ok(uids.len())
+        })?;
+        Ok(count)
+    }
+    /// UIDLs of POP3 mail deleted here for good, which stays on the server.
+    fn pop_erased(&self, account: &str) -> std::collections::BTreeSet<String> {
+        self.store
+            .preference(&format!("pop_erased:{account}"))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    /// The account's storage use and limit, where the server has quotas.
+    pub fn quota(&self, a: &Account) -> Result<Option<Quota>> {
+        if a.provider == Provider::Pop3 {
+            return Ok(None);
+        }
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            if !c.extensions()?.quota {
+                return Ok(None);
+            }
+            quota(&mut c.session)
+        })
     }
     pub fn change_many(&self, a: &Account, mails: &[Mail], change: Change) -> Result<()> {
         let lock = self.account_lock(&a.id);
@@ -1597,21 +1790,8 @@ impl Backend {
         change: Change,
     ) -> Result<()> {
         let target = match change {
-            Change::Move(folder) => {
-                // UID MOVE is atomic and does not expunge unrelated deleted messages.
-                let caps = c.session.capabilities()?;
-                ensure!(
-                    caps.has_str("MOVE"),
-                    "This server does not support safe message moves (IMAP MOVE)."
-                );
-                Some(resolve_in(c.names(false)?, a.provider, folder)?)
-            }
+            Change::Move(folder) => Some(resolve_in(c.names(false)?, a.provider, folder)?),
             Change::MoveTo(ref name) => {
-                let caps = c.session.capabilities()?;
-                ensure!(
-                    caps.has_str("MOVE"),
-                    "This server does not support safe message moves (IMAP MOVE)."
-                );
                 // Listed afresh: the folder may have gone since the last sync.
                 let names = c.names(true)?;
                 ensure!(
@@ -1621,6 +1801,15 @@ impl Backend {
                 );
                 Some(name.clone())
             }
+            _ => None,
+        };
+        if let Some(target) = &target {
+            c.require_rights(target, "i", "put messages")?;
+        }
+        let gmail = c.extensions()?.gmail;
+        let label = match &change {
+            Change::Label(label, _) if gmail => Some(gmail_label(label)?),
+            Change::Label(label, _) => Some(keyword(label)?),
             _ => None,
         };
         let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
@@ -1634,6 +1823,20 @@ impl Backend {
         }
         for (first, uids) in groups {
             let selected = c.select_for(first)?;
+            if target.is_some() {
+                c.require_rights(&first.remote_folder, "te", "remove messages")?;
+            }
+            if matches!(change, Change::Label(_, true)) && !gmail {
+                // Servers say in SELECT whether new keywords stick.
+                ensure!(
+                    selected.keywords,
+                    "This server doesn't allow new labels in “{}”.",
+                    decode_name(&first.remote_folder)
+                );
+            }
+            if label.is_some() {
+                c.require_rights(&first.remote_folder, "w", "change labels")?;
+            }
             for chunk in uids.chunks(200) {
                 let set = uid_set(chunk);
                 match change {
@@ -1657,11 +1860,32 @@ impl Backend {
                             },
                         )?;
                     }
+                    Change::Label(_, add) => {
+                        let label = label.as_deref().unwrap_or_default();
+                        let sign = if add { '+' } else { '-' };
+                        if gmail {
+                            c.session.run_command_and_check_ok(format!(
+                                "UID STORE {set} {sign}X-GM-LABELS ({label})"
+                            ))?;
+                        } else {
+                            c.session
+                                .uid_store(&set, format!("{sign}FLAGS.SILENT ({label})"))?;
+                        }
+                    }
                     Change::Move(_) | Change::MoveTo(_) => {
-                        c.session.run_command_and_check_ok(format!(
-                            "UID MOVE {set} {}",
-                            quote(target.as_deref().unwrap_or_default())?
-                        ))?;
+                        let target = quote(target.as_deref().unwrap_or_default())?;
+                        if c.extensions()?.moves {
+                            // Atomic, and leaves other deleted messages alone.
+                            c.session
+                                .run_command_and_check_ok(format!("UID MOVE {set} {target}"))?;
+                        } else {
+                            // RFC 6851's fallback: copy, then remove just these
+                            // (refused up front where that can't be done).
+                            c.can_erase(chunk)?;
+                            c.session
+                                .run_command_and_check_ok(format!("UID COPY {set} {target}"))?;
+                            c.erase(chunk)?;
+                        }
                         // The source mailbox now has fewer messages; keep its
                         // saved state in step so the next check stays incremental.
                         if let Some(mut state) =
@@ -1870,6 +2094,11 @@ impl Backend {
         crate::manage::subscriptions::unsubscribe(plan, &a.id, |d| self.send(a, d))
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
+        self.send_noting(a, d).map(|_| ())
+    }
+    /// Sends a draft. Once the server accepts it, it is sent: anything that
+    /// then didn't work (a copy in Sent, receipts) is a note, not an error.
+    pub fn send_noting(&self, a: &Account, d: &Draft) -> Result<Vec<String>> {
         // Sending as an alias asks its service for the routed addresses
         // first, outside the account's lock, once it knows the alias is
         // still there.
@@ -1900,18 +2129,34 @@ impl Backend {
         } else {
             tls
         };
-        let message = crate::sync::smtp::deliver(a, d, &secret, tls)?;
+        let delivered = crate::sync::smtp::deliver(a, d, &secret, tls)?;
+        let message = delivered.message;
+        let mut notes = Vec::new();
+        if delivered.receipts_unsupported {
+            notes.push(format!(
+                "{} can't request delivery receipts, so none were asked for.",
+                a.smtp_host
+            ));
+        }
         // Gmail and Outlook save sent messages themselves. Custom IMAP servers do not.
         if a.provider == Provider::Imap {
-            let _ = self.with_imap(a, |c| {
+            let raw = message.formatted();
+            let saved = self.with_imap(a, |c| {
+                if let Some(limit) = c.extensions()?.append_limit {
+                    ensure!(
+                        raw.len() as u64 <= limit,
+                        "it's larger than the server keeps ({} KB)",
+                        limit / 1024
+                    );
+                }
                 let sent = resolve_in(c.names(false)?, a.provider, Folder::Sent)?;
-                c.session.append_with_flags(
-                    sent,
-                    message.formatted(),
-                    &[imap::types::Flag::Seen],
-                )?;
+                c.session
+                    .append_with_flags(sent, &raw, &[imap::types::Flag::Seen])?;
                 Ok(())
             });
+            if let Err(e) = saved {
+                notes.push(format!("A copy wasn't saved in Sent: {e:#}"));
+            }
         }
         // SMTP acceptance is the delivery boundary. Do not report a send failure
         // after this point, which could encourage a duplicate transmission.
@@ -1924,8 +2169,227 @@ impl Backend {
                 let _ = self.store.save_raw(&id, &raw);
             }
         }
-        let _ = self.store.delete_draft(&d.id);
-        Ok(())
+        let _ = self.discard_draft(&d.id);
+        Ok(notes)
+    }
+    /// Deletes a draft here, and its copy on the server at the next draft
+    /// sync (it may have been uploaded since a composer last saved it).
+    pub fn discard_draft(&self, id: &str) -> Result<()> {
+        if let Some(d) = self.store.draft(id)? {
+            if let Some(remote) = d.remote {
+                let mut pending = self.draft_removals(&d.account);
+                if !pending.contains(&remote) {
+                    pending.push(remote);
+                }
+                self.save_draft_removals(&d.account, &pending)?;
+            }
+            // Files taken from a server draft were kept for it alone.
+            let _ = std::fs::remove_dir_all(self.draft_files(id));
+        }
+        self.store.delete_draft(id)
+    }
+    fn draft_removals(&self, account: &str) -> Vec<RemoteDraft> {
+        self.store
+            .preference(&format!("draft_removals:{account}"))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    fn save_draft_removals(&self, account: &str, pending: &[RemoteDraft]) -> Result<()> {
+        self.store.set_preference(
+            &format!("draft_removals:{account}"),
+            &serde_json::to_string(pending)?,
+        )
+    }
+    /// Where the attachments of a draft found on the server are kept.
+    fn draft_files(&self, id: &str) -> std::path::PathBuf {
+        let safe: String = id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        self.store.path.join("draft-files").join(safe)
+    }
+    /// Keeps the account's drafts and its server's Drafts folder in step:
+    /// drafts written here are uploaded (replacing their earlier copy),
+    /// drafts written elsewhere appear here, and drafts sent or deleted on
+    /// either side go from the other. A draft changed here since its last
+    /// upload is never thrown away. Returns how many drafts changed here.
+    pub fn sync_drafts(&self, a: &Account) -> Result<usize> {
+        if a.provider == Provider::Pop3 {
+            return Ok(0);
+        }
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            let Ok(mailbox) = resolve_in(c.names(false)?, a.provider, Folder::Drafts) else {
+                // No Drafts folder on the server: drafts stay here.
+                return Ok(0);
+            };
+            let selected = c.select(&mailbox)?;
+            let here = |r: &RemoteDraft| r.mailbox == mailbox && r.validity == selected.validity;
+            // Drafts sent or deleted here: their server copies go.
+            let pending = self.draft_removals(&a.id);
+            let gone: Vec<u32> = pending.iter().filter(|r| here(r)).map(|r| r.uid).collect();
+            c.erase(&gone)?;
+            if !pending.is_empty() {
+                self.save_draft_removals(&a.id, &[])?;
+            }
+            // What the server has, and which of Picacho's drafts each is.
+            let mut on_server: Vec<u32> = c.session.uid_search("ALL")?.into_iter().collect();
+            on_server.sort_unstable();
+            let mut tagged: HashMap<u32, String> = HashMap::new();
+            if !on_server.is_empty() {
+                let items = format!(
+                    "(UID BODY.PEEK[HEADER.FIELDS ({})])",
+                    crate::sync::smtp::DRAFT_HEADER
+                );
+                for row in uid_fetch_rows(&mut c.session, &uid_ranges(&on_server), &items)? {
+                    let id = row.header.as_deref().and_then(|h| {
+                        mailparse::parse_headers(h).ok().and_then(|(headers, _)| {
+                            use mailparse::MailHeaderMap;
+                            headers.get_first_value(crate::sync::smtp::DRAFT_HEADER)
+                        })
+                    });
+                    if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+                        tagged.insert(row.uid, id.trim().to_owned());
+                    }
+                }
+            }
+            let mut changed = 0;
+            let mut locals = self.store.drafts(&a.id)?;
+            // Copies removed from the server (sent or deleted elsewhere):
+            // unchanged drafts go here too; changed ones upload again.
+            for d in &mut locals {
+                let Some(remote) = d.remote.clone() else {
+                    continue;
+                };
+                if here(&remote) && on_server.contains(&remote.uid) {
+                    continue;
+                }
+                if here(&remote) && d.uploaded == d.fingerprint() {
+                    self.store.delete_draft(&d.id)?;
+                    let _ = std::fs::remove_dir_all(self.draft_files(&d.id));
+                    d.id.clear();
+                    changed += 1;
+                } else {
+                    d.remote = None;
+                }
+            }
+            locals.retain(|d| !d.id.is_empty());
+            // Drafts written elsewhere.
+            for &uid in &on_server {
+                let claimed = locals.iter().any(|d| {
+                    d.remote.as_ref().is_some_and(|r| here(r) && r.uid == uid)
+                        || tagged.get(&uid) == Some(&d.id)
+                });
+                if claimed {
+                    continue;
+                }
+                let rows = uid_fetch_rows(&mut c.session, &uid.to_string(), "(UID RFC822.SIZE BODY.PEEK[])")?;
+                let Some(raw) = rows.into_iter().find(|r| r.uid == uid).and_then(|r| r.header) else {
+                    continue;
+                };
+                ensure!(raw.len() <= MAX_MESSAGE, "A draft on the server is too large to open here.");
+                let id = tagged.get(&uid).cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let mut d = self.draft_from(a, &id, &raw)?;
+                d.remote = Some(RemoteDraft {
+                    mailbox: mailbox.clone(),
+                    validity: selected.validity,
+                    uid,
+                });
+                d.uploaded = d.fingerprint();
+                self.store.save_draft(&d)?;
+                locals.push(d);
+                changed += 1;
+            }
+            // Drafts written or changed here.
+            let limit = c.extensions()?.append_limit;
+            for d in &locals {
+                let fingerprint = d.fingerprint();
+                if d.remote.is_some() && d.uploaded == fingerprint {
+                    continue;
+                }
+                let raw = crate::sync::smtp::build(a, d, true)?.formatted();
+                if limit.is_some_and(|l| raw.len() as u64 > l) {
+                    // Too large for the server; it stays here.
+                    continue;
+                }
+                let before: std::collections::HashSet<u32> =
+                    c.session.uid_search("ALL")?.into_iter().collect();
+                c.session.append_with_flags(
+                    &mailbox,
+                    &raw,
+                    &[imap::types::Flag::Seen, imap::types::Flag::Draft],
+                )?;
+                let after: std::collections::HashSet<u32> =
+                    c.session.uid_search("ALL")?.into_iter().collect();
+                let Some(uid) = after.difference(&before).max().copied() else {
+                    bail!("The server didn't keep the uploaded draft.");
+                };
+                // Earlier copies of this draft, by its id or where it was.
+                let old: Vec<u32> = after
+                    .iter()
+                    .copied()
+                    .filter(|u| {
+                        *u != uid
+                            && (tagged.get(u) == Some(&d.id)
+                                || d.remote.as_ref().is_some_and(|r| here(r) && r.uid == *u))
+                    })
+                    .collect();
+                c.erase(&old)?;
+                // A composer may have saved a newer version meanwhile; it
+                // keeps its words, and uploads again next time.
+                let mut current = self.store.draft(&d.id)?.unwrap_or_else(|| d.clone());
+                current.remote = Some(RemoteDraft {
+                    mailbox: mailbox.clone(),
+                    validity: selected.validity,
+                    uid,
+                });
+                current.uploaded = fingerprint;
+                self.store.save_draft(&current)?;
+            }
+            Ok(changed)
+        })
+    }
+    /// A draft from a message in the server's Drafts folder.
+    fn draft_from(&self, a: &Account, id: &str, raw: &[u8]) -> Result<Draft> {
+        use mailparse::MailHeaderMap;
+        let parsed = mailparse::parse_mail(raw)?;
+        let header = |name: &str| parsed.headers.get_first_value(name).unwrap_or_default();
+        let m = parse_message(raw, a, id, Folder::Drafts, "", 0)?;
+        let mut d = Draft {
+            id: id.into(),
+            account: a.id.clone(),
+            to: header("To"),
+            cc: header("Cc"),
+            bcc: header("Bcc"),
+            subject: m.subject.clone(),
+            body: m.body.clone().unwrap_or_default(),
+            formatted: header(crate::sync::smtp::FORMAT_HEADER).trim() == "markdown",
+            reply_id: header("In-Reply-To").trim().to_owned(),
+            references: header("References").trim().to_owned(),
+            reply_to: header("Reply-To").trim().to_owned(),
+            ..Draft::default()
+        };
+        if !m.attachments.is_empty() {
+            let dir = self.draft_files(id);
+            std::fs::create_dir_all(&dir)?;
+            let mut leaves = Vec::new();
+            collect_leaves(&parsed, &mut leaves);
+            for (i, attachment) in m.attachments.iter().enumerate() {
+                let Some(leaf) = leaves.get(attachment.part) else {
+                    continue;
+                };
+                let name: String = std::path::Path::new(&attachment.name)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| !n.is_empty() && n != "." && n != "..")
+                    .unwrap_or_else(|| format!("attachment-{}", i + 1));
+                let path = dir.join(name);
+                std::fs::write(&path, leaf.get_body_raw()?)?;
+                d.attachments.push(path);
+            }
+        }
+        Ok(d)
     }
     pub fn attachment(&self, a: &Account, m: &Mail, part: usize) -> Result<Vec<u8>> {
         let lock = self.account_lock(&a.id);
@@ -1943,6 +2407,14 @@ impl Backend {
     }
 }
 
+/// What a flags-only FETCH asks for: with Gmail, its labels too.
+fn flag_items(gmail: bool) -> &'static str {
+    if gmail {
+        "(UID FLAGS X-GM-LABELS)"
+    } else {
+        "(UID FLAGS)"
+    }
+}
 /// UIDs of the selected mailbox's messages within the account's sync
 /// window (only flagged ones for Starred), oldest first.
 fn search(session: &mut ImapSession, a: &Account, starred_only: bool) -> Result<Vec<u32>> {

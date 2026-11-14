@@ -230,7 +230,7 @@ impl MailApp {
         } else {
             sub.unread > 0
         };
-        let change = |change| Action::ChangeSubscription(sub.clone(), change);
+        let change = |change| Action::ChangeSubscription(Box::new(sub.clone()), change);
         let moved = |folder| change(Change::Move(folder));
         vec![
             if unread {
@@ -247,7 +247,7 @@ impl MailApp {
         .into_iter()
         .chain(self.move_folder_entry(
             "Move All to Folder…",
-            MoveTarget::Subscription(sub.clone()),
+            MoveTarget::Subscription(Box::new(sub.clone())),
         ))
         .collect()
     }
@@ -268,7 +268,7 @@ impl MailApp {
             move |m: &Mail| match &change {
                 Change::Read(read) => m.unread == *read,
                 Change::Move(_) | Change::MoveTo(_) => !change.moved_already(m),
-                Change::Star(_) => false,
+                Change::Star(_) | Change::Label(..) => false,
             }
         };
         // The open subscription's list, and its row, change at once.
@@ -357,7 +357,7 @@ impl MailApp {
                                 "Moved {messages} from {who} to {}",
                                 this.destination_label(&account_id, &change).unwrap_or_default()
                             ),
-                            Change::Star(_) => String::new(),
+                            Change::Star(_) | Change::Label(..) => String::new(),
                         };
                         this.notice(done, false, cx);
                     }

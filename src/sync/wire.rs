@@ -17,6 +17,9 @@ pub(crate) struct Wire {
     socket: TcpStream,
     remaining: usize,
     deadline: Instant,
+    /// While waiting for the server to speak first (IDLE), how long a read
+    /// may wait instead of the usual limits. Sending anything ends it.
+    patience: Option<Duration>,
 }
 impl Wire {
     pub(crate) fn new(socket: TcpStream) -> Self {
@@ -24,7 +27,19 @@ impl Wire {
             socket,
             remaining: RESPONSE_LIMIT,
             deadline: Instant::now() + COMMAND_TIMEOUT,
+            patience: None,
         }
+    }
+    /// Lets the next reads wait up to `wait` for the server, as IDLE does;
+    /// `None` restores the usual command limits.
+    pub(crate) fn wait_for(&mut self, wait: Option<Duration>) {
+        self.patience = wait;
+        self.deadline = Instant::now() + wait.unwrap_or(COMMAND_TIMEOUT);
+    }
+    /// A handle that can close the connection from another thread, ending
+    /// a read that is waiting on it.
+    pub(crate) fn interrupter(&self) -> io::Result<TcpStream> {
+        self.socket.try_clone()
     }
 }
 impl Read for Wire {
@@ -45,8 +60,9 @@ impl Read for Wire {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::TimedOut, "Mail server command timed out")
             })?;
+        let idle = self.patience.unwrap_or(IDLE_TIMEOUT);
         self.socket
-            .set_read_timeout(Some(remaining_time.min(IDLE_TIMEOUT)))?;
+            .set_read_timeout(Some(remaining_time.min(idle)))?;
         let capacity = buf.len().min(self.remaining);
         let read = self.socket.read(&mut buf[..capacity])?;
         self.remaining -= read;
@@ -57,6 +73,7 @@ impl Write for Wire {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.socket.write(buf)?;
         if written > 0 {
+            self.patience = None;
             self.remaining = RESPONSE_LIMIT;
             self.deadline = Instant::now() + COMMAND_TIMEOUT;
         }

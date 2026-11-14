@@ -112,6 +112,105 @@ impl MailApp {
             )
             .child(control)
     }
+    /// A setting turned on and off with a switch beside its description.
+    pub(super) fn switch_setting(
+        &self,
+        title: &str,
+        caption: &str,
+        id: String,
+        on: bool,
+        action: Action,
+        cx: &Context<Self>,
+    ) -> Div {
+        let c = self.colors();
+        div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    // Wraps the caption instead of pushing the switch out.
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(caption.to_owned()),
+                    ),
+            )
+            .child({
+                let selector = id.clone();
+                self.switch(id, on, action, cx)
+                    .debug_selector(move || selector)
+            })
+    }
+    /// How much of the account's server storage is used, where it has a quota.
+    fn storage(&self, a: &Account) -> Stateful<Div> {
+        let c = self.colors();
+        let size = |kib: u64| {
+            let bytes = kib as f64 * 1024.0;
+            if bytes >= 1024.0 * 1024.0 * 1024.0 {
+                format!("{:.1} GB", bytes / (1024.0 * 1024.0 * 1024.0))
+            } else {
+                format!("{:.0} MB", bytes / (1024.0 * 1024.0))
+            }
+        };
+        let (text, share) = match self.quotas.get(&a.id) {
+            None => ("Checking with the server…".to_owned(), None),
+            Some(None) => ("The server doesn't limit this mailbox's storage, or doesn't say.".to_owned(), None),
+            Some(Some(q)) if q.limit_kib == 0 => (format!("{} used", size(q.used_kib)), None),
+            Some(Some(q)) => {
+                let share = (q.used_kib as f64 / q.limit_kib as f64).clamp(0., 1.);
+                (
+                    format!(
+                        "{} of {} used ({:.0}%)",
+                        size(q.used_kib),
+                        size(q.limit_kib),
+                        share * 100.
+                    ),
+                    Some(share),
+                )
+            }
+        };
+        div()
+            .id("account-storage")
+            .debug_selector(|| "account-storage".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(text),
+            )
+            .when_some(share, |d, share| {
+                d.child(
+                    div()
+                        .h(px(6.))
+                        .max_w(px(320.))
+                        .rounded_full()
+                        .bg(rgb(c.border))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(share as f32))
+                                .rounded_full()
+                                .bg(rgb(if share > 0.9 { c.danger } else { c.accent })),
+                        ),
+                )
+            })
+    }
     pub(super) fn section(&self, title: &str) -> Div {
         let c = self.colors();
         div()
@@ -828,6 +927,53 @@ impl MailApp {
                     .max_w(px(320.))
                     .child(field(Input::new(&self.nickname_input), c, false)),
             ))
+            .when(!a.oauth && a.service != Service::Pinal, |page| {
+                page.child(self.section("Sign-in")).child(self.setting(
+                    "Sign-in name",
+                    &format!(
+                        "The user name your mail servers know you by, if it isn't {}. Leave empty to use the address.",
+                        a.email
+                    ),
+                    div()
+                        .id("account-login")
+                        .debug_selector(|| "account-login".into())
+                        .max_w(px(320.))
+                        .child(field(Input::new(&self.login_input), c, false)),
+                ))
+            })
+            .child(self.section("Sending"))
+            .child(self.setting(
+                "Reply-To",
+                if crate::sync::smtp::recipients(&a.reply_to).is_err() {
+                    "This isn't a valid address; messages can't be sent until it is fixed or removed."
+                } else {
+                    "Where replies to your messages go, if not to the address they're sent from. A message can set its own in the composer."
+                },
+                div()
+                    .id("account-reply-to")
+                    .debug_selector(|| "account-reply-to".into())
+                    .max_w(px(320.))
+                    .child(field(Input::new(&self.reply_to_input), c, false)),
+            ))
+            .child(self.switch_setting(
+                "Ask for read receipts",
+                "Recipients' mail apps may offer to tell you when they open your messages. Many people decline.",
+                format!("read-receipts-{}", a.id),
+                a.read_receipts,
+                Action::ToggleReadReceipts(a.id.clone()),
+                cx,
+            ))
+            .child(self.switch_setting(
+                "Ask for delivery receipts",
+                "The receiving mail servers report when your messages arrive, where your outgoing server supports it.",
+                format!("delivery-receipts-{}", a.id),
+                a.delivery_receipts,
+                Action::ToggleDeliveryReceipts(a.id.clone()),
+                cx,
+            ))
+            .when(a.provider != Provider::Pop3, |page| {
+                page.child(self.section("Storage")).child(self.storage(a))
+            })
             .child(self.section("Profile picture"))
             .child(self.setting(
                 "Picture",

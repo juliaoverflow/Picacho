@@ -32,6 +32,8 @@ pub enum Response<'a> {
     Fetch(u32, Vec<AttributeValue<'a>>),
     MailboxData(MailboxDatum<'a>),
     IDs(Vec<u32>),
+    /// An extension's untagged data, as text (Picacho patch; see `resp_other`).
+    Other(&'a str),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -146,6 +148,7 @@ pub enum AttributeValue<'a> {
     InternalDate(&'a str),
     ModSeq(u64), // RFC 4551, section 3.3.2
     GmailMsgId(u64), // Gmail X-GM-EXT-1 (Picacho patch)
+    GmailLabels(Vec<&'a str>), // Gmail X-GM-EXT-1 (Picacho patch)
     Rfc822(Option<&'a [u8]>),
     Rfc822Header(Option<&'a [u8]>),
     Rfc822Size(u32),

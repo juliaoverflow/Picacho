@@ -112,7 +112,7 @@ pub(crate) fn pop_login(
     let tcp = tcp(&a.incoming_host, a.incoming_port)?;
     let stream = tls.connect(&a.incoming_host, tcp)?;
     let mut s = PopSession::new(stream)?;
-    for command in [format!("USER {}", a.email), format!("PASS {password}")] {
+    for command in [format!("USER {}", a.login()), format!("PASS {password}")] {
         s.command(&command).map_err(|error| {
             if error.is::<Rejected>() {
                 error.context(crate::manage::status::AccessFailure::Authentication)

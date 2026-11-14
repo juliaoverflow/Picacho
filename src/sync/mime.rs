@@ -102,6 +102,7 @@ pub fn parse_message(
             .contains("list-unsubscribe=one-click"),
         pending: false,
         reply_to: header("Reply-To"),
+        labels: vec![],
         inline: std::sync::Arc::new(inline),
     })
 }

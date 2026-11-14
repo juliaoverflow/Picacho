@@ -394,10 +394,17 @@ impl MailApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(23.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(relative(1.35))
-                            .child(m.subject.clone()),
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(23.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .line_height(relative(1.35))
+                                    .child(m.subject.clone()),
+                            )
+                            .children(self.label_chips(m, cx)),
                     )
                     .child(
                         self.button(
@@ -1757,5 +1764,69 @@ impl MailApp {
             })
             .on_click(cx.listener(|this, _, w, cx| this.handle(Action::ToggleQuotes, w, cx)))
             .into_any_element()
+    }
+}
+
+impl MailApp {
+    /// A message's labels, each removable; choosing one shows the mail
+    /// that has it.
+    fn label_chips(&self, m: &Mail, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        if m.labels.is_empty() {
+            return None;
+        }
+        let c = self.colors();
+        let gmail = self
+            .account_of(m)
+            .is_some_and(|a| a.provider == Provider::Gmail);
+        let mut row = div()
+            .id("reader-labels")
+            .debug_selector(|| "reader-labels".into())
+            .flex()
+            .flex_wrap()
+            .gap_1();
+        for (i, label) in m.labels.iter().enumerate() {
+            let shown = if gmail {
+                crate::sync::transport::decode_name(label)
+            } else {
+                label.clone()
+            };
+            let search = Action::SearchFor(search_term("label", &shown));
+            let remove = Action::Apply(vec![m.id.clone()], Change::Label(label.clone(), false));
+            row = row.child(
+                div()
+                    .id(("reader-label", i))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .pr_1()
+                    .h(px(22.))
+                    .rounded_full()
+                    .bg(rgb(c.soft))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.accent))
+                    .cursor_pointer()
+                    .child(icon_el("tag", 11., c.accent))
+                    .child(shown.clone())
+                    .tooltip(move |w, cx| Tooltip::new(format!("Show mail labeled “{shown}”")).build(w, cx))
+                    .on_click(cx.listener(move |this, _, w, cx| this.handle(search.clone(), w, cx)))
+                    .child(
+                        div()
+                            .id(("reader-label-remove", i))
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .hover(move |s| s.bg(rgb(c.border)))
+                            .child(icon_el("close", 9., c.muted))
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                cx.stop_propagation();
+                                this.handle(remove.clone(), w, cx)
+                            })),
+                    ),
+            );
+        }
+        Some(row)
     }
 }
