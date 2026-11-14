@@ -864,3 +864,15 @@ fn idle_reports_new_mail() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Attachments of a server draft that share a name are each kept, as
+/// their own files.
+#[test]
+fn same_named_attachments_get_their_own_files() {
+    let mut used = std::collections::HashSet::new();
+    assert_eq!(distinct_name("scan.pdf", &mut used), "scan.pdf");
+    assert_eq!(distinct_name("Scan.PDF", &mut used), "Scan (2).PDF");
+    assert_eq!(distinct_name("scan.pdf", &mut used), "scan (3).pdf");
+    assert_eq!(distinct_name("notes", &mut used), "notes");
+    assert_eq!(distinct_name("notes", &mut used), "notes (2)");
+}

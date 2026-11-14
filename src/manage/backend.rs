@@ -2386,6 +2386,8 @@ impl Backend {
             std::fs::create_dir_all(&dir)?;
             let mut leaves = Vec::new();
             collect_leaves(&parsed, &mut leaves);
+            // Names already given, lowercase as case-insensitive disks see them.
+            let mut used = std::collections::HashSet::new();
             for (i, attachment) in m.attachments.iter().enumerate() {
                 let Some(leaf) = leaves.get(attachment.part) else {
                     continue;
@@ -2395,6 +2397,8 @@ impl Backend {
                     .map(|n| n.to_string_lossy().into_owned())
                     .filter(|n| !n.is_empty() && n != "." && n != "..")
                     .unwrap_or_else(|| format!("attachment-{}", i + 1));
+                // Two attachments of one name each keep their own file.
+                let name = distinct_name(&name, &mut used);
                 let path = dir.join(name);
                 std::fs::write(&path, leaf.get_body_raw()?)?;
                 d.attachments.push(path);
@@ -2418,6 +2422,25 @@ impl Backend {
     }
 }
 
+/// `name`, or "name (2).ext" and so on when one in `used` is the same
+/// ignoring case; the name returned is added to `used`.
+fn distinct_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let path = std::path::Path::new(name);
+    let (stem, ext) = match (path.file_stem(), path.extension()) {
+        (Some(stem), Some(ext)) => (
+            stem.to_string_lossy().into_owned(),
+            format!(".{}", ext.to_string_lossy()),
+        ),
+        _ => (name.to_owned(), String::new()),
+    };
+    let mut candidate = name.to_owned();
+    let mut n = 2;
+    while !used.insert(candidate.to_lowercase()) {
+        candidate = format!("{stem} ({n}){ext}");
+        n += 1;
+    }
+    candidate
+}
 /// The UIDs of the selected Drafts folder's copies of draft `id`, by its
 /// `X-Picacho-Draft` header. The server is asked to search for the header;
 /// one that finds nothing (some don't search arbitrary headers) has the
