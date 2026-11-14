@@ -842,9 +842,15 @@ impl MailApp {
         if let Some(v) = header(details.map(|d| &d.details.reply_to)) {
             panel_rows.push(row("reply-to:", text(masked(&v))).into_any_element());
         }
-        panel_rows.push(row("to:", text(masked(&m.to))).into_any_element());
+        // Recipients a mailbox kept to its aliases wrote to through a
+        // reverse alias show as the contacts themselves.
+        let recipients = |v: &str| match &mask {
+            Some(k) => k.recipients(v),
+            None => v.to_owned(),
+        };
+        panel_rows.push(row("to:", text(recipients(&m.to))).into_any_element());
         if let Some(v) = header(details.map(|d| &d.details.cc)) {
-            panel_rows.push(row("cc:", text(masked(&v))).into_any_element());
+            panel_rows.push(row("cc:", text(recipients(&v))).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
         panel_rows.push(row("subject:", text(m.subject.clone())).into_any_element());
@@ -1541,7 +1547,7 @@ impl MailApp {
             |index: usize| {
                 let x = &self.messages[index];
                 let id = x.id.clone();
-                let to = super::thread::short_names(&x.to, &own);
+                let to = super::thread::short_names(&self.unreversed(x, &x.to), &own);
                 div()
                     .id(SharedString::from(format!("thread-{}", x.id)))
                     .debug_selector(|| "thread-card".into())
@@ -1666,8 +1672,8 @@ impl MailApp {
                 names.join(", ")
             }
         };
-        let to = super::thread::short_names(&m.to, &own);
-        let cc = super::thread::short_names(&m.cc, &own);
+        let to = super::thread::short_names(&self.unreversed(m, &m.to), &own);
+        let cc = super::thread::short_names(&self.unreversed(m, &m.cc), &own);
         let mut line = if to.is_empty() {
             "to undisclosed recipients".to_string()
         } else {

@@ -30,11 +30,19 @@ pub(super) struct Mask {
     pub alias_name: Option<String>,
     /// The mailbox sent it, so its sender is the alias.
     pub sent: bool,
+    /// SimpleLogin reverse aliases and the contacts they forward to.
+    pub contacts: Arc<HashMap<String, String>>,
 }
 impl Mask {
     /// `text` with the mailbox's address replaced by the alias.
     pub fn apply<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         fwd::mask_address(text, &self.address, &self.alias)
+    }
+    /// A recipient list (To, Cc) as `apply` shows it, with each known
+    /// reverse alias in it shown as the contact it forwards to.
+    pub fn recipients(&self, list: &str) -> String {
+        let list = fwd::unreverse(list, &self.contacts);
+        self.apply(&list).into_owned()
     }
     /// What the alias is called as a sender: its name, else its address.
     pub fn sender(&self) -> String {
@@ -176,7 +184,57 @@ impl MailApp {
             alias_name: fwd::alias_name(&self.forwarding, &alias),
             alias,
             sent,
+            contacts: self.reverse_contacts.clone(),
         })
+    }
+    /// A recipient list of `m` (To, Cc) with, for mail of a mailbox kept to
+    /// its aliases, each known reverse alias shown as its contact.
+    pub(super) fn unreversed<'a>(&self, m: &Mail, list: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.mask_for(m) {
+            Some(k) => fwd::unreverse(list, &k.contacts).into_owned().into(),
+            None => list.into(),
+        }
+    }
+    /// Fetches, once a session, the contacts of the aliases whose reverse
+    /// aliases `m` is addressed to but whose contacts aren't known, so they
+    /// show in their place. Only mail of a mailbox kept to its aliases.
+    pub(super) fn learn_contacts(&mut self, m: &Mail, cx: &mut Context<Self>) {
+        if cfg!(test) || self.mask_for(m).is_none() {
+            return;
+        }
+        let wanted: HashSet<String> = [&m.to, &m.cc]
+            .into_iter()
+            .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
+            .map(|(_, email)| email.trim().to_lowercase())
+            .filter(|email| !self.reverse_contacts.contains_key(email))
+            .filter_map(|email| self.alias_routes.get(&email).cloned())
+            .collect();
+        for alias in wanted {
+            let Some((account, a)) = self
+                .forwarding
+                .iter()
+                .filter(|f| f.service == ForwardingService::SimpleLogin)
+                .find_map(|f| {
+                    let a = f.aliases.iter().find(|a| a.email.eq_ignore_ascii_case(&alias))?;
+                    Some((f.clone(), a.clone()))
+                })
+            else {
+                continue;
+            };
+            if !self.contacts_fetched.insert(alias) {
+                continue;
+            }
+            self.task(
+                cx,
+                move |b| fwd::learn_contacts(&b.store, &account, &a),
+                |this, result, cx| {
+                    if result.is_ok() {
+                        this.reverse_contacts = Arc::new(fwd::reverse_contacts(&this.backend.store));
+                        cx.notify();
+                    }
+                },
+            );
+        }
     }
     /// The alias a sent message went out as, for mail in Sent.
     pub(super) fn sent_alias(&self, m: &Mail) -> Option<String> {

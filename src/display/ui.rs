@@ -970,6 +970,13 @@ pub struct MailApp {
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
+    /// The contacts SimpleLogin reverse aliases stand for, shown in their
+    /// place on mail of a mailbox kept to its aliases (see
+    /// `fwd::reverse_contacts`).
+    reverse_contacts: Arc<HashMap<String, String>>,
+    /// Aliases whose contacts were fetched this session to name the
+    /// reverse aliases on mail being read.
+    contacts_fetched: HashSet<String>,
     /// What the open view lists: its mailboxes and address filters.
     scope: fwd::Scope,
     /// Forwarding settings' add form, and the work running there.
@@ -1038,6 +1045,7 @@ impl MailApp {
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
         let alias_routes = fwd::routes(&store);
+        let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
         if clean_links {
             crate::manage::tracking::warm_up();
@@ -1532,6 +1540,8 @@ impl MailApp {
             forwarding,
             all_mail,
             alias_routes,
+            reverse_contacts,
+            contacts_fetched: HashSet::new(),
             clean_links,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
@@ -2974,6 +2984,8 @@ impl MailApp {
         let Some(m) = self.selected_mail() else {
             return;
         };
+        // Its reverse aliases show as their contacts once those are known.
+        self.learn_contacts(&m, cx);
         // Opening marks the message read immediately; the server catches up.
         for m in self
             .messages

@@ -122,6 +122,10 @@ impl MailApp {
                     Some(k) => k.apply(text).into_owned(),
                     None => text.to_owned(),
                 };
+                let recipients = |list: &str| match &mask {
+                    Some(k) => k.recipients(list),
+                    None => list.to_owned(),
+                };
                 let sender = match &mask {
                     Some(k) if k.sent => k.sender(),
                     _ => m.sender.clone(),
@@ -129,6 +133,15 @@ impl MailApp {
                 if !forward {
                     let (to, cc) =
                         reply_recipients(m, mode == 2, &[own.as_str(), draft.send_as.as_str()]);
+                    // Reverse aliases show as the contacts they stand for;
+                    // sending routes them through the alias again.
+                    let (to, cc) = match &mask {
+                        Some(k) => (
+                            fwd::unreverse(&to, &k.contacts).into_owned(),
+                            fwd::unreverse(&cc, &k.contacts).into_owned(),
+                        ),
+                        None => (to, cc),
+                    };
                     draft.to = to;
                     draft.cc = cc;
                     draft.reply_id = m.message_id.clone();
@@ -144,11 +157,11 @@ impl MailApp {
                         masked(&m.from),
                         date_full(m.date),
                         m.subject,
-                        masked(&m.to),
+                        recipients(&m.to),
                         if m.cc.is_empty() {
                             String::new()
                         } else {
-                            format!("Cc: {}\n", masked(&m.cc))
+                            format!("Cc: {}\n", recipients(&m.cc))
                         },
                         quoted
                     )
@@ -634,6 +647,8 @@ impl MailApp {
                     (Ok(notes), _) => {
                         // Sent as an alias: its routed addresses are known now.
                         this.alias_routes = fwd::routes(&this.backend.store);
+                        this.reverse_contacts =
+                            Arc::new(fwd::reverse_contacts(&this.backend.store));
                         this.outbox.retain(|o| o.id != id);
                         if notes.is_empty() {
                             this.notice("Message sent", false, cx);

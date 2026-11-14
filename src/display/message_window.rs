@@ -106,8 +106,14 @@ impl Render for MessageWindow {
             None => (m.sender.clone(), m.from.clone()),
         };
         let dark = self.options.theme.is_dark(self.app_dark);
-        let to = super::thread::short_names(&m.to, &self.own);
-        let cc = super::thread::short_names(&m.cc, &self.own);
+        // Reverse aliases a mailbox kept to its aliases wrote to show as
+        // the contacts they forward to.
+        let unreversed = |list: &str| match &mask {
+            Some(k) => crate::manage::forwarding::unreverse(list, &k.contacts).into_owned(),
+            None => list.to_owned(),
+        };
+        let to = super::thread::short_names(&unreversed(&m.to), &self.own);
+        let cc = super::thread::short_names(&unreversed(&m.cc), &self.own);
         let mut body = div().flex().flex_col();
         let mut has_quotes = false;
         if self.loading {
@@ -362,6 +368,7 @@ impl MailApp {
         else {
             return;
         };
+        self.learn_contacts(&mail, cx);
         let mail = if mail.body.is_none() {
             self.backend
                 .store
