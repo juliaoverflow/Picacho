@@ -704,6 +704,9 @@ enum Action {
 /// A conversation's rows for one message at one list revision.
 type ThreadRows = (String, u64, Rc<Vec<usize>>);
 
+/// How long typing in the sign-in name field pauses before the name applies.
+const LOGIN_PAUSE: Duration = Duration::from_millis(1500);
+
 pub struct MailApp {
     backend: Arc<Backend>,
     accounts: Vec<Account>,
@@ -832,6 +835,12 @@ pub struct MailApp {
     /// The account page's sign-in name and Reply-To fields.
     login_input: Entity<InputState>,
     reply_to_input: Entity<InputState>,
+    /// A sign-in name being typed and not yet applied: (account, name).
+    /// Each change signs the account out, so it applies once typing pauses
+    /// or ends, not on every key; see `apply_login`.
+    login_pending: Option<(String, String)>,
+    /// Counts edits of the sign-in name, so only the latest pause applies.
+    login_revision: u64,
     /// Storage use by account, once asked (None: no quota).
     quotas: HashMap<String, Option<crate::sync::transport::Quota>>,
     nickname_for: Option<String>,
@@ -1290,23 +1299,37 @@ impl MailApp {
         }));
         let login_input = input("Same as the email address", false, false, window, cx);
         subscriptions.push(cx.subscribe(&login_input, |this, input, e, cx| {
-            // Applied once typed (Enter or leaving the field), not on every
-            // key: each change signs the account out, and its connections
-            // would sign in again with half a name, failing until the
-            // server throttles or locks the account.
-            if matches!(e, InputEvent::PressEnter { .. } | InputEvent::Blur)
-                && let Some(id) = this.nickname_for.clone()
-            {
-                let value = input.read(cx).value().trim().to_owned();
-                let changed = this
-                    .accounts
-                    .iter()
-                    .any(|a| a.id == id && a.username != value);
-                if changed {
-                    this.edit_account(&id, |a| a.username = value, cx);
-                    // The next connections sign in with it.
-                    this.backend.reconnect_later(&id);
+            // Applied once typed (a pause, Enter or leaving the field), not
+            // on every key: each change signs the account out, and its
+            // connections would sign in again with half a name, failing
+            // until the server throttles or locks the account.
+            match e {
+                InputEvent::Change => {
+                    let Some(id) = this.nickname_for.clone() else {
+                        return;
+                    };
+                    let value = input.read(cx).value().trim().to_owned();
+                    let saved = this.accounts.iter().find(|a| a.id == id);
+                    if saved.is_none_or(|a| a.username == value) {
+                        this.login_pending = None;
+                        return;
+                    }
+                    this.login_pending = Some((id, value));
+                    this.login_revision += 1;
+                    let revision = this.login_revision;
+                    cx.spawn(async move |this, cx| {
+                        // The executor's timer, which tests can move on.
+                        cx.background_executor().timer(LOGIN_PAUSE).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.login_revision == revision {
+                                this.apply_login(cx);
+                            }
+                        });
+                    })
+                    .detach();
                 }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.apply_login(cx),
+                _ => {}
             }
         }));
         let reply_to_input = input("Replies come to the sending address", false, false, window, cx);
@@ -1432,6 +1455,8 @@ impl MailApp {
             nickname_input,
             login_input,
             reply_to_input,
+            login_pending: None,
+            login_revision: 0,
             quotas: HashMap::new(),
             nickname_for: None,
             presets_for: None,
@@ -5066,21 +5091,42 @@ impl MailApp {
     }
     /// Shows the open account page's nickname in its field, also after it
     /// was changed elsewhere, unless the field is being typed in.
+    /// Applies a sign-in name being typed (see `login_pending`): saves it
+    /// and signs the account's connections out, so the next sign in with it.
+    fn apply_login(&mut self, cx: &mut Context<Self>) {
+        let Some((id, value)) = self.login_pending.take() else {
+            return;
+        };
+        if self.accounts.iter().any(|a| a.id == id && a.username != value) {
+            self.edit_account(&id, |a| a.username = value, cx);
+            self.backend.reconnect_later(&id);
+        }
+    }
     pub(super) fn sync_nickname_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let shown = match &self.page {
             Page::Account(id) => self.accounts.iter().find(|a| &a.id == id),
             _ => None,
         };
-        let Some((id, values)) = shown.map(|a| {
+        let shown = shown.map(|a| {
             (
                 a.id.clone(),
                 [a.nickname.clone(), a.username.clone(), a.reply_to.clone()],
             )
-        }) else {
+        });
+        // Leaving the page, or another account's: a name being typed for
+        // the one shown before applies now.
+        if self.login_pending.as_ref().map(|(id, _)| id) != shown.as_ref().map(|(id, _)| id) {
+            self.apply_login(cx);
+        }
+        let Some((id, mut values)) = shown else {
             self.nickname_for = None;
             return;
         };
         let same = self.nickname_for.as_ref() == Some(&id);
+        // What is being typed stays in its field until it applies.
+        if same && let Some((_, typed)) = &self.login_pending {
+            values[1] = typed.clone();
+        }
         if !same {
             self.nickname_for = Some(id.clone());
             self.load_quota(&id, cx);
@@ -9362,7 +9408,22 @@ mod tests {
             assert!(switch.size.width >= px(38.), "{switch:?}");
         }
         view.update_in(cx, |this, w, cx| {
+            // Typed, so the field has focus.
+            this.login_input.read(cx).focus_handle(cx).focus(w);
             MailApp::set(&this.login_input, "work-user", w, cx);
+        });
+        frame(cx);
+        // Typing alone changes nothing: each change would sign out.
+        view.read_with(cx, |this, _| {
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_ne!(a.login(), "work-user");
+        });
+        // Enter applies it.
+        view.update(cx, |this, cx| {
+            this.login_input
+                .update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+        });
+        view.update_in(cx, |this, w, cx| {
             MailApp::set(&this.reply_to_input, "desk@example.com", w, cx);
             this.handle(Action::ToggleReadReceipts(work.clone()), w, cx);
         });
@@ -9375,6 +9436,27 @@ mod tests {
             let saved = saved.iter().find(|s| s.id == work).unwrap();
             assert_eq!(saved.username, "work-user");
             assert!(saved.read_receipts);
+        });
+        // Left unfinished, what was typed stays in the field (the page
+        // refreshes fields from the account it shows), and applies once
+        // typing has paused.
+        view.update_in(cx, |this, w, cx| {
+            this.login_input.read(cx).focus_handle(cx).focus(w);
+            MailApp::set(&this.login_input, "work-user2", w, cx);
+        });
+        frame(cx);
+        view.update_in(cx, |this, w, _| this.focus.focus(w));
+        frame(cx);
+        view.read_with(cx, |this, cx| {
+            assert_eq!(MailApp::value(&this.login_input, cx), "work-user2");
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_eq!(a.login(), "work-user");
+        });
+        cx.executor().advance_clock(LOGIN_PAUSE);
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+            assert_eq!(a.login(), "work-user2");
         });
         // POP mailboxes: deleting for good, but no labels.
         view.update(cx, |this, cx| {
