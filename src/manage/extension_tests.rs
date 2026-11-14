@@ -163,8 +163,11 @@ fn capable_server_extensions_are_used() -> Result<()> {
                     p.send("* LIST (\\Sent) \".\" \"INBOX.Sent\"\r\n");
                     p.send("* LIST () \".\" \"INBOX.Receipts\"\r\n");
                     p.send("* LIST () \".\" \"Archive\"\r\n");
+                    p.send("* LIST () \".\" \"Projects\"\r\n");
                 } else if upper == "NAMESPACE" {
                     p.send("* NAMESPACE ((\"INBOX.\" \".\")) NIL NIL\r\n");
+                } else if upper.starts_with("MYRIGHTS \"PROJECTS\"") {
+                    p.send("* MYRIGHTS \"Projects\" lrswik\r\n");
                 } else if upper.starts_with("MYRIGHTS") {
                     p.send("* MYRIGHTS \"INBOX.Receipts\" lrswi\r\n");
                 } else if upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
@@ -192,6 +195,9 @@ fn capable_server_extensions_are_used() -> Result<()> {
         .create_remote_folder(&a, Some("INBOX.Receipts"), "2026")
         .unwrap_err();
     assert!(format!("{refused:#}").contains("permission"), "{refused:#}");
+    // Where it may, it does; the rights are asked once, not per folder.
+    b.create_remote_folder(&a, Some("Projects"), "2025")?;
+    b.create_remote_folder(&a, Some("Projects"), "2026")?;
     assert_eq!(
         b.quota(&a)?,
         Some(Quota {
@@ -202,7 +208,19 @@ fn capable_server_extensions_are_used() -> Result<()> {
     b.disconnect(&a.id);
     let (seen, compressed) = server.join().unwrap();
     let creates: Vec<_> = seen.iter().filter(|c| c.starts_with("CREATE")).collect();
-    assert_eq!(creates, ["CREATE \"INBOX.Travel\""]);
+    assert_eq!(
+        creates,
+        [
+            "CREATE \"INBOX.Travel\"",
+            "CREATE \"Projects.2025\"",
+            "CREATE \"Projects.2026\""
+        ]
+    );
+    let asked = seen
+        .iter()
+        .filter(|c| c.starts_with("MYRIGHTS \"Projects\""))
+        .count();
+    assert_eq!(asked, 1, "{seen:?}");
     // Each sign-in introduced itself and compressed what followed.
     let logins = seen.iter().filter(|c| c.starts_with("LOGIN")).count();
     assert_eq!(compressed, logins);

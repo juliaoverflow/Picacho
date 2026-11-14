@@ -24,6 +24,9 @@ pub(super) const GMAIL_DAILY_BUDGET: u64 = 1024 * 1024 * 1024;
 /// First pause after the server reports a limit; doubles while it persists.
 const FIRST_PAUSE: Duration = Duration::from_secs(10 * 60);
 const LONGEST_PAUSE: Duration = Duration::from_secs(4 * 60 * 60);
+/// How long a mailbox's rights (MYRIGHTS) are trusted before asking again.
+/// They rarely change, and the server still refuses what isn't allowed.
+const RIGHTS_FOR: Duration = Duration::from_secs(5 * 60);
 
 pub(super) struct Connection {
     pub(super) session: ImapSession,
@@ -31,6 +34,8 @@ pub(super) struct Connection {
     names: Option<Vec<Name>>,
     /// The personal namespace's prefix, once asked (NAMESPACE).
     namespace: Option<Option<String>>,
+    /// Rights by mailbox, as MYRIGHTS gave them and when.
+    rights: std::collections::HashMap<String, (Option<String>, Instant)>,
     selected: Option<Selected>,
     used: Instant,
 }
@@ -41,6 +46,7 @@ impl Connection {
             extensions: None,
             names: None,
             namespace: None,
+            rights: std::collections::HashMap::new(),
             selected: None,
             used: Instant::now(),
         }
@@ -84,7 +90,16 @@ impl Connection {
         if !self.extensions()?.acl {
             return Ok(());
         }
-        let Some(rights) = crate::sync::transport::my_rights(&mut self.session, mailbox)? else {
+        let rights = match self.rights.get(mailbox) {
+            Some((rights, at)) if at.elapsed() < RIGHTS_FOR => rights.clone(),
+            _ => {
+                let rights = crate::sync::transport::my_rights(&mut self.session, mailbox)?;
+                self.rights
+                    .insert(mailbox.to_owned(), (rights.clone(), Instant::now()));
+                rights
+            }
+        };
+        let Some(rights) = rights else {
             return Ok(());
         };
         if let Some(missing) = crate::sync::transport::lacks_rights(&rights, needed) {
