@@ -136,7 +136,25 @@ impl MailApp {
                             "trash",
                             Change::Move(Folder::Trash),
                         ))
-                    }),
+                    })
+                    .when(
+                        self.move_folder_entry("", MoveTarget::Selection).is_some(),
+                        |d| {
+                            d.child(
+                                self.button(
+                                    "summary-folder",
+                                    "Move to folder…",
+                                    "folder",
+                                    Action::MoveMenu(MoveTarget::Selection),
+                                    false,
+                                    cx,
+                                )
+                                .w(px(220.))
+                                .justify_start()
+                                .bg(rgb(c.bg)),
+                            )
+                        },
+                    ),
             )
             .child(
                 div()

@@ -964,3 +964,107 @@ fn imap_folder_create_and_rename() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Mail moves into the account's own folders with UID MOVE, only once the
+/// server still lists the folder; the moved copies leave the cache until
+/// that folder syncs.
+#[test]
+fn imap_mail_moves_into_server_folders() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut moves = Vec::new();
+        // A refused move drops its connection; the next signs in again.
+        'connections: loop {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+            r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+            loop {
+                let mut line = String::new();
+                if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                let upper = command.to_ascii_uppercase();
+                let mut out = String::new();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    out.push_str("* CAPABILITY IMAP4rev1 MOVE\r\n");
+                } else if upper.starts_with("LIST") {
+                    out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                    out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");
+                    out.push_str("* LIST () \"/\" \"Receipts\"\r\n");
+                } else if upper.starts_with("SELECT") {
+                    out.push_str("* 2 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.starts_with("UID MOVE") {
+                    moves.push(command.to_owned());
+                } else if upper.starts_with("LOGOUT") {
+                    r.get_mut()
+                        .write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes())
+                        .unwrap();
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {line}");
+                }
+                out.push_str(&format!("{tag} OK done\r\n"));
+                r.get_mut().write_all(out.as_bytes()).unwrap();
+            }
+        }
+        moves
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let mail = |uid: u32| Mail {
+        id: format!("{}:INBOX:42:{uid}", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid,
+        ..Mail::default()
+    };
+    let mails = [mail(7), mail(8)];
+    b.store.save_messages(&mails)?;
+    // Folders the server no longer lists, and standard ones, aren't sent.
+    let gone = b
+        .change_many(&a, &mails, Change::MoveTo("Gone".into()))
+        .unwrap_err();
+    assert!(format!("{gone:#}").contains("no longer"), "{gone:#}");
+    let standard = b
+        .change_many(&a, &mails, Change::MoveTo("Trash".into()))
+        .unwrap_err();
+    assert!(
+        format!("{standard:#}").contains("no longer"),
+        "{standard:#}"
+    );
+    let moved = b.change(&a, &mails[0], Change::MoveTo("Receipts".into()))?;
+    assert_eq!(moved.mailbox(), Mailbox::Remote("Receipts".into()));
+    b.change_many(&a, &mails[1..], Change::MoveTo("Receipts".into()))?;
+    for m in &mails {
+        assert!(
+            b.store.message(&m.id)?.is_none(),
+            "moved copies leave the cache"
+        );
+    }
+    b.disconnect(&a.id);
+    // POP3 mailboxes have no server folders.
+    let mut pop = a.clone();
+    pop.provider = Provider::Pop3;
+    let refused = b
+        .change_many(&pop, &[mail(9)], Change::MoveTo("Receipts".into()))
+        .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("aren't kept"),
+        "{refused:#}"
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        ["UID MOVE 7 \"Receipts\"", "UID MOVE 8 \"Receipts\""]
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

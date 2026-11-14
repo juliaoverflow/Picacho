@@ -30,11 +30,39 @@ mod protocol_tests;
 #[cfg(test)]
 #[path = "reliability_tests.rs"]
 mod reliability_tests;
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Change {
     Read(bool),
     Star(bool),
     Move(Folder),
+    /// Moves mail into one of the account's own server folders, by name.
+    MoveTo(String),
+}
+impl Change {
+    /// Whether this moves mail to another mailbox.
+    pub fn moves(&self) -> bool {
+        matches!(self, Self::Move(_) | Self::MoveTo(_))
+    }
+    /// Whether `m` is already in the mailbox this change moves mail to.
+    pub fn moved_already(&self, m: &Mail) -> bool {
+        match self {
+            Self::Move(folder) => m.folder == *folder,
+            Self::MoveTo(name) => m.folder == Folder::Other && &m.remote_folder == name,
+            _ => false,
+        }
+    }
+    /// Applies the change to a copy of a message.
+    pub fn apply(&self, m: &mut Mail) {
+        match self {
+            Self::Read(read) => m.unread = !read,
+            Self::Star(star) => m.starred = *star,
+            Self::Move(folder) => m.folder = *folder,
+            Self::MoveTo(name) => {
+                m.folder = Folder::Other;
+                m.remote_folder = name.clone();
+            }
+        }
+    }
 }
 /// How much of a mailbox has been listed on this computer.
 #[derive(Clone, Debug, Default)]
@@ -1407,10 +1435,10 @@ impl Backend {
         }
     }
     pub fn change(&self, a: &Account, m: &Mail, change: Change) -> Result<Mail> {
-        self.change_many(a, std::slice::from_ref(m), change)?;
+        self.change_many(a, std::slice::from_ref(m), change.clone())?;
         let mut next = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
-        if let Change::Move(folder) = change {
-            next.folder = folder;
+        if change.moves() {
+            change.apply(&mut next);
         }
         Ok(next)
     }
@@ -1545,13 +1573,17 @@ impl Backend {
         for m in mails {
             ensure!(m.account == a.id, "Message belongs to another account");
             let next = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
-            if !matches!(change, Change::Move(folder) if next.folder == folder) {
+            if !change.moved_already(&next) {
                 current.push(next);
             }
         }
         if current.is_empty() {
             return Ok(());
         }
+        ensure!(
+            !matches!(change, Change::MoveTo(_)) || Self::can_manage_folders(a),
+            "This account's folders aren't kept on the server."
+        );
         if a.provider != Provider::Pop3 {
             return self.with_imap(a, |c| self.change_remote(c, a, &current, change));
         }
@@ -1573,6 +1605,21 @@ impl Backend {
                     "This server does not support safe message moves (IMAP MOVE)."
                 );
                 Some(resolve_in(c.names(false)?, a.provider, folder)?)
+            }
+            Change::MoveTo(ref name) => {
+                let caps = c.session.capabilities()?;
+                ensure!(
+                    caps.has_str("MOVE"),
+                    "This server does not support safe message moves (IMAP MOVE)."
+                );
+                // Listed afresh: the folder may have gone since the last sync.
+                let names = c.names(true)?;
+                ensure!(
+                    custom_folders(names).iter().any(|f| &f.name == name),
+                    "The folder “{}” is no longer on the server.",
+                    decode_name(name)
+                );
+                Some(name.clone())
             }
             _ => None,
         };
@@ -1610,7 +1657,7 @@ impl Backend {
                             },
                         )?;
                     }
-                    Change::Move(_) => {
+                    Change::Move(_) | Change::MoveTo(_) => {
                         c.session.run_command_and_check_ok(format!(
                             "UID MOVE {set} {}",
                             quote(target.as_deref().unwrap_or_default())?
@@ -1646,7 +1693,7 @@ impl Backend {
                     })
                     .cloned()
                     .collect();
-                self.commit_change(&confirmed, change, true)?;
+                self.commit_change(&confirmed, change.clone(), true)?;
             }
         }
         Ok(())
@@ -1656,16 +1703,12 @@ impl Backend {
             .iter()
             .cloned()
             .map(|mut next| {
-                match change {
-                    Change::Read(read) => next.unread = !read,
-                    Change::Star(star) => next.starred = star,
-                    Change::Move(folder) => next.folder = folder,
-                }
+                change.apply(&mut next);
                 next
             })
             .collect();
         self.store
-            .commit_changes(&updated, remote && matches!(change, Change::Move(_)))
+            .commit_changes(&updated, remote && change.moves())
     }
     /// Marks every message in a mailbox read, on the server and in the cache.
     pub fn mark_all_read(&self, a: &Account, mailbox: &Mailbox) -> Result<()> {

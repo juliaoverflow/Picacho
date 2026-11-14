@@ -244,6 +244,12 @@ impl MailApp {
             entry("Move All to Spam", "spam", moved(Folder::Junk)),
             danger("Move All to Trash", "trash", moved(Folder::Trash)),
         ]
+        .into_iter()
+        .chain(self.move_folder_entry(
+            "Move All to Folder…",
+            MoveTarget::Subscription(sub.clone()),
+        ))
+        .collect()
     }
     /// Marks or moves every message from a subscription, at once here and
     /// then on the server; the lists reload from the cache when it is done.
@@ -257,10 +263,13 @@ impl MailApp {
         if !self.subs_busy.insert(key.clone()) {
             return;
         }
-        let touches = move |m: &Mail| match change {
-            Change::Read(read) => m.unread == read,
-            Change::Move(folder) => m.folder != folder,
-            Change::Star(_) => false,
+        let touches = {
+            let change = change.clone();
+            move |m: &Mail| match &change {
+                Change::Read(read) => m.unread == *read,
+                Change::Move(_) | Change::MoveTo(_) => !change.moved_already(m),
+                Change::Star(_) => false,
+            }
         };
         // The open subscription's list, and its row, change at once.
         if self.subs_sender.as_ref().is_some_and(|s| s.key() == key) {
@@ -273,9 +282,9 @@ impl MailApp {
                 self.messages.clear();
                 self.selected = None;
                 self.selection.clear();
-            } else if let Change::Move(folder) = change {
+            } else if change.moves() {
                 for m in &mut self.messages {
-                    m.folder = folder;
+                    change.apply(m);
                 }
             }
             self.filter(cx);
@@ -303,10 +312,8 @@ impl MailApp {
                 .iter_mut()
                 .filter(|m| MailSubscription::of(m).is_some_and(|s| s.key() == key))
             {
-                match change {
-                    Change::Read(read) => m.unread = !read,
-                    Change::Move(folder) => m.folder = folder,
-                    Change::Star(_) => {}
+                if !matches!(change, Change::Star(_)) {
+                    change.apply(m);
                 }
             }
             self.subs_busy.remove(&key);
@@ -314,14 +321,17 @@ impl MailApp {
             return;
         };
         let account_id = a.id.clone();
+        let sending = change.clone();
         self.task(
             cx,
             move |b| {
+                let change = sending;
                 let mails = b.store.subscription_mail(&a.id, &sub.address)?;
                 // Flags go to every copy; a move to the one copy shown.
-                let todo: Vec<Mail> = match change {
-                    Change::Move(_) => subs::one_copy_each(mails),
-                    _ => mails,
+                let todo: Vec<Mail> = if change.moves() {
+                    subs::one_copy_each(mails)
+                } else {
+                    mails
                 }
                 .into_iter()
                 .filter(|m| touches(m))
@@ -340,12 +350,13 @@ impl MailApp {
                     Ok(0) => {}
                     Ok(n) => {
                         let messages = format!("{} message{}", fmt_count(n), if n == 1 { "" } else { "s" });
-                        let done = match change {
+                        let done = match &change {
                             Change::Read(true) => format!("Marked {messages} from {who} as read"),
                             Change::Read(false) => format!("Marked {messages} from {who} as unread"),
-                            Change::Move(folder) => {
-                                format!("Moved {messages} from {who} to {}", folder.label())
-                            }
+                            Change::Move(_) | Change::MoveTo(_) => format!(
+                                "Moved {messages} from {who} to {}",
+                                this.destination_label(&account_id, &change).unwrap_or_default()
+                            ),
                             Change::Star(_) => String::new(),
                         };
                         this.notice(done, false, cx);

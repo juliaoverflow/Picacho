@@ -445,6 +445,16 @@ enum Page {
     Forwarding,
     Account(String),
 }
+/// What a folder picker moves into the chosen folder.
+#[derive(Clone)]
+enum MoveTarget {
+    /// These messages.
+    Mail(Vec<String>),
+    /// The selected messages.
+    Selection,
+    /// Every message from a subscription.
+    Subscription(MailSubscription),
+}
 #[derive(Clone)]
 enum Action {
     Compose,
@@ -555,6 +565,8 @@ enum Action {
     SubscriptionsTab(bool),
     /// Marks or moves all of a subscription's mail.
     ChangeSubscription(MailSubscription, Change),
+    /// Lists the account's server folders to move mail into.
+    MoveMenu(MoveTarget),
     /// What can be done with all of a subscription's mail.
     SubscriptionMenu(MailSubscription),
     /// Opens the open message's headers, HTML or whole source.
@@ -2230,10 +2242,15 @@ impl MailApp {
                     "trash",
                     Action::ApplySelection(Change::Move(Folder::Trash)),
                 ),
+            ]
+            .into_iter()
+            .chain(self.move_folder_entry(format!("Move {n} to Folder…"), MoveTarget::Selection))
+            .chain([
                 Entry::Separator,
                 entry("Select All", "select", Action::SelectAll),
                 entry("Clear Selection", "close", Action::StopSelecting),
-            ];
+            ])
+            .collect();
         }
         let Some(m) = self.messages.iter().find(|m| m.id == id) else {
             return vec![];
@@ -2295,9 +2312,10 @@ impl MailApp {
             entries.push(danger(
                 "Move to Trash",
                 "trash",
-                Action::Apply(ids, Change::Move(Folder::Trash)),
+                Action::Apply(ids.clone(), Change::Move(Folder::Trash)),
             ));
         }
+        entries.extend(self.move_folder_entry("Move to Folder…", MoveTarget::Mail(ids)));
         entries.push(Entry::Separator);
         entries.push(entry(
             "Select",
@@ -2834,16 +2852,13 @@ impl MailApp {
             .chain(self.demo.iter_mut())
             .filter(|m| ids.contains(&m.id))
         {
-            match change {
-                Change::Read(read) => m.unread = !read,
-                Change::Star(star) => m.starred = star,
-                Change::Move(folder) => m.folder = folder,
-            }
+            change.apply(m);
         }
         // A subscription lists its mail in every folder but Spam and Trash.
         let leaves = match change {
             Change::Move(folder) if self.subs_open => matches!(folder, Folder::Junk | Folder::Trash),
-            Change::Move(_) => true,
+            Change::MoveTo(_) if self.subs_open => false,
+            Change::Move(_) | Change::MoveTo(_) => true,
             _ => self.folder == Folder::Starred && change == Change::Star(false),
         };
         if leaves {
@@ -2874,20 +2889,22 @@ impl MailApp {
             let count = before.len();
             let sent = before.clone();
             let account_id = a.id.clone();
+            let change = change.clone();
+            let sending = change.clone();
             self.task(
                 cx,
-                move |b| b.change_many(&a, &sent, change),
+                move |b| b.change_many(&a, &sent, sending),
                 move |this, result, cx| {
                     this.refresh_counts(cx);
                     this.account_result(&account_id, IssueSource::Change, &result);
                     match result {
                         Ok(()) => {
-                            if let Change::Move(folder) = change {
+                            if let Some(to) = this.destination_label(&account_id, &change) {
                                 this.notice(
                                     if count == 1 {
-                                        format!("Moved to {}", folder.label())
+                                        format!("Moved to {to}")
                                     } else {
-                                        format!("Moved {count} messages to {}", folder.label())
+                                        format!("Moved {count} messages to {to}")
                                     },
                                     false,
                                     cx,
@@ -2911,6 +2928,85 @@ impl MailApp {
                 },
             );
         }
+    }
+    /// Where a move puts an account's mail, as the sidebar names it.
+    pub(super) fn destination_label(&self, account: &str, change: &Change) -> Option<String> {
+        match change {
+            Change::Move(folder) => Some(folder.label().into()),
+            Change::MoveTo(name) => Some(self.folder_label(account, name)),
+            _ => None,
+        }
+    }
+    /// The account whose server folders `target` can move into: the one
+    /// all of its mail is in, when that account keeps folders on its
+    /// server and has some of its own. Also the server folder all of it is
+    /// in already, if any, which isn't offered.
+    fn move_account(&self, target: &MoveTarget) -> Option<(String, Option<String>)> {
+        let (account, mails): (String, Vec<&Mail>) = match target {
+            MoveTarget::Subscription(sub) => (sub.account.clone(), vec![]),
+            MoveTarget::Mail(ids) => {
+                let mails: Vec<&Mail> =
+                    self.messages.iter().filter(|m| ids.contains(&m.id)).collect();
+                (mails.first()?.account.clone(), mails)
+            }
+            MoveTarget::Selection => {
+                let mails: Vec<&Mail> = self
+                    .messages
+                    .iter()
+                    .filter(|m| self.selection.contains(&m.id))
+                    .collect();
+                (mails.first()?.account.clone(), mails)
+            }
+        };
+        if mails.iter().any(|m| m.account != account)
+            || !self.manages_folders(&account)
+            || self.folders.get(&account).is_none_or(|fs| fs.is_empty())
+        {
+            return None;
+        }
+        let first = mails.first();
+        let within = first
+            .filter(|f| {
+                f.folder == Folder::Other
+                    && mails
+                        .iter()
+                        .all(|m| m.folder == Folder::Other && m.remote_folder == f.remote_folder)
+            })
+            .map(|f| f.remote_folder.clone());
+        Some((account, within))
+    }
+    /// The "Move to Folder…" entry for a menu, when there are folders to offer.
+    fn move_folder_entry(&self, label: impl Into<SharedString>, target: MoveTarget) -> Option<Entry> {
+        let (account, within) = self.move_account(&target)?;
+        let others = self.folders.get(&account)?.iter().any(|f| Some(&f.name) != within.as_ref());
+        others.then(|| entry(label, "folder", Action::MoveMenu(target)))
+    }
+    /// The folder picker: the account's own server folders, nested as in
+    /// the sidebar, each moving `target` there.
+    fn move_folder_entries(&self, target: &MoveTarget) -> Vec<Entry> {
+        let Some((account, within)) = self.move_account(target) else {
+            return vec![];
+        };
+        let Some(folders) = self.folders.get(&account) else {
+            return vec![];
+        };
+        folders
+            .iter()
+            .filter(|f| Some(&f.name) != within.as_ref())
+            .map(|f| {
+                let change = Change::MoveTo(f.name.clone());
+                let action = match target {
+                    MoveTarget::Mail(ids) => Action::Apply(ids.clone(), change),
+                    MoveTarget::Selection => Action::ApplySelection(change),
+                    MoveTarget::Subscription(sub) => {
+                        Action::ChangeSubscription(sub.clone(), change)
+                    }
+                };
+                // Em spaces indent subfolders beneath their parents.
+                let label = format!("{}{}", "\u{2003}".repeat(f.depth), f.label);
+                entry(label, "folder", action)
+            })
+            .collect()
     }
     fn mark_all_read(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
         if fwd::is_view(&id) {
@@ -3590,7 +3686,7 @@ impl MailApp {
             Action::Apply(ids, change) => self.apply(ids, change, cx),
             Action::ApplySelection(change) => {
                 let ids: Vec<String> = self.selection.iter().cloned().collect();
-                if matches!(change, Change::Move(_)) {
+                if change.moves() {
                     self.selection.clear();
                 }
                 self.apply(ids, change, cx);
@@ -3831,6 +3927,13 @@ impl MailApp {
                 self.subs_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             Action::ChangeSubscription(sub, change) => self.change_subscription(sub, change, cx),
+            Action::MoveMenu(target) => {
+                let entries = self.move_folder_entries(&target);
+                if !entries.is_empty() {
+                    self.open_menu_here(entries, w, cx);
+                }
+                return;
+            }
             Action::SubscriptionMenu(sub) => {
                 let entries = self.subscription_entries(&sub);
                 self.open_menu(w.mouse_position(), entries, cx);
@@ -6561,7 +6664,11 @@ impl MailApp {
             return div().into_any_element();
         };
         let mut panel = div()
+            .id("menu-panel")
             .min_w(px(200.))
+            // A long folder list scrolls rather than run off the window.
+            .max_h(px(520.))
+            .overflow_y_scroll()
             // Long addresses end in an ellipsis rather than widen the menu.
             .max_w(px(380.))
             .p_1()
@@ -6583,7 +6690,14 @@ impl MailApp {
         for (i, e) in menu.entries.iter().enumerate() {
             match e {
                 Entry::Separator => {
-                    panel = panel.child(div().h(px(1.)).mx_2().my_1().bg(rgb(c.border)));
+                    panel = panel.child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(1.))
+                            .mx_2()
+                            .my_1()
+                            .bg(rgb(c.border)),
+                    );
                 }
                 Entry::Item {
                     label,
@@ -6598,6 +6712,7 @@ impl MailApp {
                         div()
                             .id(("menu-item", i))
                             .debug_selector(|| format!("menu-item-{i}"))
+                            .flex_shrink_0()
                             .h(px(28.))
                             .px_2()
                             .flex()
@@ -8348,6 +8463,124 @@ mod tests {
         assert!(!has(&labels(Mailbox::Remote("INBOX/Receipts".into()), cx), "Rename Folder…"));
         act(&view, Action::NewRemoteFolder(id.clone(), None), cx);
         view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+    }
+
+    #[gpui::test]
+    fn mail_moves_into_server_folders_from_menus(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let (work, home) =
+            view.read_with(cx, |this, _| (this.accounts[0].id.clone(), this.accounts[1].id.clone()));
+        let mail = |id: &str, account: &str, mailbox: Mailbox| {
+            let mut m = Mail {
+                id: id.into(),
+                account: account.into(),
+                from: "news@example.com".into(),
+                ..Mail::default()
+            };
+            m.folder = mailbox.folder();
+            if let Mailbox::Remote(name) = mailbox {
+                m.remote_folder = name;
+            }
+            m
+        };
+        view.update(cx, |this, _| {
+            this.folders.get_mut(&work).unwrap().push(RemoteFolder {
+                name: "INBOX/Receipts/2026".into(),
+                label: "2026".into(),
+                depth: 1,
+                nestable: true,
+            });
+            this.messages = vec![
+                mail("w1", &work, Folder::Inbox.into()),
+                mail("w2", &work, Folder::Inbox.into()),
+                mail("w3", &work, Mailbox::Remote("INBOX/Receipts".into())),
+                mail("h1", &home, Folder::Inbox.into()),
+            ];
+        });
+        let labels = |entries: Vec<Entry>| -> Vec<String> {
+            entries
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect()
+        };
+        let has = |labels: &[String], label: &str| labels.iter().any(|l| l == label);
+        view.read_with(cx, |this, _| {
+            // One message: its menu offers the folders, nested as in the sidebar.
+            assert!(has(&labels(this.mail_entries("w1")), "Move to Folder…"));
+            let target = MoveTarget::Mail(vec!["w1".into()]);
+            assert_eq!(
+                labels(this.move_folder_entries(&target)),
+                ["Receipts", "\u{2003}2026"]
+            );
+            match &this.move_folder_entries(&target)[0] {
+                Entry::Item {
+                    action: Action::Apply(ids, change),
+                    ..
+                } => {
+                    assert_eq!(ids, &["w1".to_owned()]);
+                    assert_eq!(change, &Change::MoveTo("INBOX/Receipts".into()));
+                }
+                _ => panic!("not a move"),
+            }
+            // Not the folder it is already in.
+            let inside = MoveTarget::Mail(vec!["w3".into()]);
+            assert_eq!(labels(this.move_folder_entries(&inside)), ["\u{2003}2026"]);
+            // The other account has its own folders.
+            assert!(has(&labels(this.mail_entries("h1")), "Move to Folder…"));
+            // A subscription's mail moves all at once.
+            let sub = MailSubscription {
+                account: work.clone(),
+                address: "news@example.com".into(),
+                ..MailSubscription::default()
+            };
+            let entries = labels(this.subscription_entries(&sub));
+            assert_eq!(entries.last().map(String::as_str), Some("Move All to Folder…"));
+            match &this.move_folder_entries(&MoveTarget::Subscription(sub.clone()))[0] {
+                Entry::Item {
+                    action: Action::ChangeSubscription(s, change),
+                    ..
+                } => {
+                    assert_eq!(s, &sub);
+                    assert_eq!(change, &Change::MoveTo("INBOX/Receipts".into()));
+                }
+                _ => panic!("not a move"),
+            }
+        });
+        // Several selected messages from one account move together.
+        view.update(cx, |this, _| {
+            this.selection = ["w1".to_owned(), "w2".to_owned()].into_iter().collect();
+        });
+        view.read_with(cx, |this, _| {
+            assert!(has(&labels(this.mail_entries("w1")), "Move 2 to Folder…"));
+            assert!(matches!(
+                &this.move_folder_entries(&MoveTarget::Selection)[0],
+                Entry::Item { action: Action::ApplySelection(Change::MoveTo(_)), .. }
+            ));
+        });
+        // Folders belong to one account: a selection across two has none.
+        view.update(cx, |this, _| {
+            this.selection = ["w1".to_owned(), "h1".to_owned()].into_iter().collect();
+        });
+        view.read_with(cx, |this, _| {
+            assert!(!has(&labels(this.mail_entries("w1")), "Move 2 to Folder…"));
+            assert!(this.move_folder_entries(&MoveTarget::Selection).is_empty());
+        });
+        // Choosing a folder moves the message out of the list at once.
+        view.update(cx, |this, _| this.selection.clear());
+        act(
+            &view,
+            Action::Apply(vec!["w1".into()], Change::MoveTo("INBOX/Receipts".into())),
+            cx,
+        );
+        view.read_with(cx, |this, _| assert!(!this.messages.iter().any(|m| m.id == "w1")));
+        // POP mailboxes have no server folders.
+        view.update(cx, |this, _| this.accounts[0].provider = Provider::Pop3);
+        view.read_with(cx, |this, _| {
+            assert!(!has(&labels(this.mail_entries("w2")), "Move to Folder…"));
+        });
     }
 
     #[gpui::test]
