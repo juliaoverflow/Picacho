@@ -60,6 +60,35 @@ impl Layout {
         format!("{account}:{}:{}:{uid}", self.remote, self.validity)
     }
 }
+/// A folder made or renamed on the server.
+#[derive(Clone, Debug)]
+pub struct FolderChange {
+    /// The folder's name on the server now.
+    pub name: String,
+    /// Renamed folders, the one asked for and those inside it: (old, new).
+    pub moved: Vec<(String, String)>,
+    /// The account's folders afterwards.
+    pub folders: Vec<RemoteFolder>,
+}
+/// A folder command's result, with a refusal (NO or BAD, say for lacking
+/// the right) told as the server's own reason.
+fn allowed(result: imap::error::Result<()>, what: impl FnOnce() -> String) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(imap::error::Error::No(why) | imap::error::Error::Bad(why)) => {
+            bail!("The server didn't allow this account to {}: {why}", what())
+        }
+        Err(e) => Err(e).with_context(|| format!("Couldn't {}", what())),
+    }
+}
+/// Subscribes to a new folder so other mail apps, which often list only
+/// subscribed folders, show it too. A server that refuses is no matter.
+fn subscribe(session: &mut ImapSession, name: &str) -> Result<()> {
+    match session.run_command_and_check_ok(format!("SUBSCRIBE {}", quote(name)?)) {
+        Ok(()) | Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 impl Catalog {
     #[cfg(test)]
     pub fn complete(&self) -> bool {
@@ -1386,9 +1415,105 @@ impl Backend {
         Ok(next)
     }
     /// Applies one change to several messages, with one IMAP command per mailbox.
-    /// Whether the account's folders live on a server that can delete them.
-    pub fn can_delete_folders(a: &Account) -> bool {
+    /// Whether the account's folders live on a server that can create,
+    /// rename and delete them: any IMAP server (CREATE, RENAME and DELETE
+    /// are part of IMAP4rev1), but not POP3, which has only the inbox.
+    pub fn can_manage_folders(a: &Account) -> bool {
         a.provider != Provider::Pop3
+    }
+    /// Makes a folder called `leaf` on the server, inside `parent` (one of
+    /// the account's own folders) or at the top level. Whether this
+    /// sign-in may is the server's to say.
+    pub fn create_remote_folder(
+        &self,
+        a: &Account,
+        parent: Option<&str>,
+        leaf: &str,
+    ) -> Result<FolderChange> {
+        ensure!(
+            Self::can_manage_folders(a),
+            "This account's folders aren't kept on the server."
+        );
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let change = self.with_imap(a, |c| {
+            let names = c.names(true)?.to_vec();
+            let name = new_folder_name(&names, a.provider, parent, leaf)?;
+            let label = decode_name(&name);
+            allowed(
+                c.session
+                    .run_command_and_check_ok(format!("CREATE {}", quote(&name)?)),
+                || format!("create “{label}”"),
+            )?;
+            subscribe(&mut c.session, &name)?;
+            Ok(FolderChange {
+                folders: custom_folders(c.names(true)?),
+                name,
+                moved: vec![],
+            })
+        })?;
+        self.store.save_folders(&a.id, &change.folders)?;
+        Ok(change)
+    }
+    /// Renames one of the account's own folders on the server to `leaf`,
+    /// keeping its place; the folders inside it move with it. Their
+    /// cached mail is forgotten, since its identity names the old folder,
+    /// and syncs again from the new one.
+    pub fn rename_remote_folder(
+        &self,
+        a: &Account,
+        name: &str,
+        leaf: &str,
+    ) -> Result<FolderChange> {
+        ensure!(
+            Self::can_manage_folders(a),
+            "This account's folders aren't kept on the server."
+        );
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let change = self.with_imap(a, |c| {
+            let names = c.names(true)?.to_vec();
+            let next = renamed_folder_name(&names, a.provider, name, leaf)?;
+            if next == name {
+                return Ok(FolderChange {
+                    folders: custom_folders(&names),
+                    name: next,
+                    moved: vec![],
+                });
+            }
+            let moved: Vec<(String, String)> = folder_and_inside(&names, name)
+                .into_iter()
+                .map(|old| {
+                    let new = format!("{next}{}", &old[name.len()..]);
+                    (old, new)
+                })
+                .collect();
+            for (old, _) in &moved {
+                c.leave(old)?;
+            }
+            let label = decode_name(name);
+            allowed(
+                c.session.run_command_and_check_ok(format!(
+                    "RENAME {} {}",
+                    quote(name)?,
+                    quote(&next)?
+                )),
+                || format!("rename “{label}”"),
+            )?;
+            for (_, new) in &moved {
+                subscribe(&mut c.session, new)?;
+            }
+            Ok(FolderChange {
+                folders: custom_folders(c.names(true)?),
+                name: next,
+                moved,
+            })
+        })?;
+        self.store.save_folders(&a.id, &change.folders)?;
+        for (old, _) in &change.moved {
+            self.store.forget_mailbox(&a.id, old)?;
+        }
+        Ok(change)
     }
     /// Deletes one of the account's own folders on the server, then
     /// forgets its cached mail. Whether this sign-in may is the server's to
@@ -1396,7 +1521,7 @@ impl Backend {
     /// Returns the folders left.
     pub fn delete_remote_folder(&self, a: &Account, name: &str) -> Result<Vec<RemoteFolder>> {
         ensure!(
-            Self::can_delete_folders(a),
+            Self::can_manage_folders(a),
             "This account's folders aren't kept on the server."
         );
         let lock = self.account_lock(&a.id);
@@ -1405,13 +1530,8 @@ impl Backend {
             let names = c.names(true)?.to_vec();
             deletable(&names, a.provider, name)?;
             c.leave(name)?;
-            match c.session.delete(name) {
-                Ok(()) => {}
-                Err(imap::error::Error::No(why)) => {
-                    bail!("The server didn't allow this account to delete “{name}”: {why}")
-                }
-                Err(e) => return Err(e).with_context(|| format!("Couldn't delete “{name}”")),
-            }
+            let label = decode_name(name);
+            allowed(c.session.delete(name), || format!("delete “{label}”"))?;
             Ok(custom_folders(c.names(true)?))
         })?;
         self.store.save_folders(&a.id, &folders)?;

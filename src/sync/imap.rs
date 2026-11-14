@@ -101,6 +101,14 @@ impl Name {
     fn has(&self, attribute: &str) -> bool {
         self.attributes.iter().any(|a| a.contains(attribute))
     }
+    fn delimiter(&self) -> Option<&str> {
+        self.delimiter.as_deref().filter(|d| !d.is_empty())
+    }
+    /// Whether folders can be made inside this one: the server has a
+    /// hierarchy and has not marked it \Noinferiors.
+    fn nestable(&self) -> bool {
+        self.delimiter().is_some() && !self.has("NoInferiors") && !self.has("Noinferiors")
+    }
 }
 pub(crate) fn list(session: &mut ImapSession) -> Result<Vec<Name>> {
     Ok(session
@@ -161,8 +169,9 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
             }
             Some(RemoteFolder {
                 name: n.name.clone(),
-                label: (*leaf).into(),
+                label: decode_name(leaf),
                 depth: parts.len() - 1,
+                nestable: n.nestable(),
             })
         })
         .collect();
@@ -191,6 +200,239 @@ pub(crate) fn deletable(names: &[Name], provider: Provider, name: &str) -> Resul
         );
     }
     Ok(())
+}
+/// The server's hierarchy delimiter, as the inbox (or else any folder) reports it.
+fn hierarchy(names: &[Name]) -> Option<&str> {
+    names
+        .iter()
+        .find(|n| n.name.eq_ignore_ascii_case("INBOX"))
+        .and_then(Name::delimiter)
+        .or_else(|| names.iter().find_map(Name::delimiter))
+}
+/// Where top-level folders go. Some servers (Courier, older Cyrus) keep
+/// every folder inside the inbox ("INBOX.Receipts"); new ones follow suit.
+fn top_prefix(names: &[Name]) -> String {
+    let Some(d) = hierarchy(names) else {
+        return String::new();
+    };
+    let prefix = format!("INBOX{d}");
+    let mut others = names
+        .iter()
+        .filter(|n| !n.name.eq_ignore_ascii_case("INBOX"))
+        .peekable();
+    let inside = others.peek().is_some()
+        && others.all(|n| {
+            n.name.len() > prefix.len()
+                && n.name.is_char_boundary(prefix.len())
+                && n.name[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        });
+    if inside {
+        names
+            .iter()
+            .find(|n| n.name.eq_ignore_ascii_case("INBOX"))
+            .map_or(prefix, |n| format!("{}{d}", n.name))
+    } else {
+        String::new()
+    }
+}
+/// A folder name as typed, checked for what servers refuse or would
+/// misread (wildcards, the hierarchy delimiter), and encoded for IMAP.
+fn leaf_name(leaf: &str, delimiter: Option<&str>) -> Result<String> {
+    let leaf = leaf.trim();
+    ensure!(!leaf.is_empty(), "Enter a name for the folder.");
+    ensure!(
+        !leaf.chars().any(char::is_control),
+        "Folder names can't contain line breaks or control characters."
+    );
+    ensure!(
+        !leaf.contains(['*', '%']),
+        "Folder names can't contain * or %."
+    );
+    if let Some(d) = delimiter {
+        ensure!(!leaf.contains(d), "Folder names can't contain “{d}”.");
+    }
+    let encoded = encode_name(leaf);
+    ensure!(encoded.len() <= 200, "That folder name is too long.");
+    Ok(encoded)
+}
+/// Refuses a full folder name that the server already has, or that would
+/// be taken for one of the standard mailboxes.
+fn check_new_name(names: &[Name], provider: Provider, prefix: &str, leaf: &str) -> Result<String> {
+    let name = format!("{prefix}{leaf}");
+    let top = prefix.is_empty()
+        || (prefix.chars().count() == 6
+            && prefix
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case("INBOX")));
+    let label = decode_name(leaf);
+    ensure!(
+        !(top
+            && (leaf.eq_ignore_ascii_case("INBOX")
+                || STANDARD_NAMES.iter().any(|s| s.eq_ignore_ascii_case(leaf))
+                || (provider == Provider::Gmail && leaf.eq_ignore_ascii_case("[Gmail]")))),
+        "“{label}” is the name of a standard folder. Choose another name."
+    );
+    ensure!(
+        !names.iter().any(|n| n.name == name
+            || (n.name.eq_ignore_ascii_case("INBOX") && name.eq_ignore_ascii_case("INBOX"))),
+        "There's already a folder named “{label}” there."
+    );
+    Ok(name)
+}
+/// The server name for a new folder called `leaf`: inside `parent` (one of
+/// the account's own folders) or at the top level.
+pub(crate) fn new_folder_name(
+    names: &[Name],
+    provider: Provider,
+    parent: Option<&str>,
+    leaf: &str,
+) -> Result<String> {
+    let prefix = match parent {
+        None => top_prefix(names),
+        Some(parent) => {
+            let Some(folder) = names.iter().find(|n| n.name == parent) else {
+                bail!("“{}” is no longer on the server.", decode_name(parent));
+            };
+            ensure!(
+                custom_folders(names).iter().any(|f| f.name == parent)
+                    && !(provider == Provider::Gmail && parent.starts_with("[Gmail]")),
+                "Folders can't be made inside “{}”.",
+                decode_name(parent)
+            );
+            let Some(d) = folder.delimiter().filter(|_| folder.nestable()) else {
+                bail!(
+                    "The server doesn't allow folders inside “{}”.",
+                    decode_name(parent)
+                );
+            };
+            format!("{parent}{d}")
+        }
+    };
+    let leaf = leaf_name(leaf, hierarchy(names))?;
+    check_new_name(names, provider, &prefix, &leaf)
+}
+/// The server name a folder would have as `leaf`, in the same parent, if
+/// it may be renamed: one of the account's own folders, as for deleting.
+/// The folder's own subfolders move with it.
+pub(crate) fn renamed_folder_name(
+    names: &[Name],
+    provider: Provider,
+    name: &str,
+    leaf: &str,
+) -> Result<String> {
+    let Some(folder) = names.iter().find(|n| n.name == name) else {
+        bail!("“{}” is no longer on the server.", decode_name(name));
+    };
+    ensure!(
+        custom_folders(names).iter().any(|f| f.name == name)
+            && !(provider == Provider::Gmail && name.starts_with("[Gmail]")),
+        "“{}” is one of the mailbox's standard folders and can't be renamed.",
+        decode_name(name)
+    );
+    let delimiter = folder.delimiter().or_else(|| hierarchy(names));
+    let prefix = delimiter
+        .and_then(|d| name.rfind(d).map(|i| &name[..i + d.len()]))
+        .unwrap_or_default();
+    let leaf = leaf_name(leaf, delimiter)?;
+    if format!("{prefix}{leaf}") == name {
+        return Ok(name.into());
+    }
+    check_new_name(names, provider, prefix, &leaf)
+}
+/// A folder and the folders inside it, which move or go with it.
+pub(crate) fn folder_and_inside(names: &[Name], name: &str) -> Vec<String> {
+    let delimiter = names
+        .iter()
+        .find(|n| n.name == name)
+        .and_then(Name::delimiter)
+        .or_else(|| hierarchy(names));
+    let mut out = vec![name.to_owned()];
+    if let Some(d) = delimiter {
+        let prefix = format!("{name}{d}");
+        out.extend(
+            names
+                .iter()
+                .filter(|n| n.name.starts_with(&prefix))
+                .map(|n| n.name.clone()),
+        );
+    }
+    out
+}
+/// A mailbox name as people read it. IMAP sends names in modified UTF-7
+/// (RFC 3501, 5.1.3); a name that isn't valid is shown as it is.
+pub(crate) fn decode_name(name: &str) -> String {
+    use base64::Engine as _;
+    if !name.contains('&') {
+        return name.into();
+    }
+    let mut out = String::new();
+    let mut rest = name;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('-') else {
+            return name.into();
+        };
+        let encoded = &after[..end];
+        if encoded.is_empty() {
+            out.push('&');
+        } else {
+            let Ok(bytes) =
+                base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded.replace(',', "/"))
+            else {
+                return name.into();
+            };
+            if bytes.len() % 2 != 0 {
+                return name.into();
+            }
+            let units: Vec<u16> = bytes
+                .chunks(2)
+                .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                .collect();
+            let Ok(text) = String::from_utf16(&units) else {
+                return name.into();
+            };
+            out.push_str(&text);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+/// A name as IMAP's modified UTF-7, the form servers expect in commands.
+pub(crate) fn encode_name(name: &str) -> String {
+    use base64::Engine as _;
+    let mut out = String::new();
+    let mut pending: Vec<u16> = Vec::new();
+    let flush = |pending: &mut Vec<u16>, out: &mut String| {
+        if pending.is_empty() {
+            return;
+        }
+        let bytes: Vec<u8> = pending.iter().flat_map(|u| u.to_be_bytes()).collect();
+        out.push('&');
+        out.push_str(
+            &base64::engine::general_purpose::STANDARD_NO_PAD
+                .encode(bytes)
+                .replace('/', ","),
+        );
+        out.push('-');
+        pending.clear();
+    };
+    for c in name.chars() {
+        if (' '..='~').contains(&c) {
+            flush(&mut pending, &mut out);
+            if c == '&' {
+                out.push_str("&-");
+            } else {
+                out.push(c);
+            }
+        } else {
+            let mut units = [0u16; 2];
+            pending.extend_from_slice(c.encode_utf16(&mut units));
+        }
+    }
+    flush(&mut pending, &mut out);
+    out
 }
 pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> Result<String> {
     if folder == Folder::Inbox {
@@ -529,6 +771,108 @@ mod extension_tests {
         assert!(refused("Projects", Provider::Imap).contains("folders inside"));
         assert!(refused("[Gmail]/Starred", Provider::Gmail).contains("standard"));
         assert!(refused("Gone", Provider::Imap).contains("no longer"));
+    }
+    #[test]
+    fn folder_names_are_modified_utf7() {
+        for (text, wire) in [
+            ("Receipts", "Receipts"),
+            ("Tom & Jerry", "Tom &- Jerry"),
+            ("Café", "Caf&AOk-"),
+            ("日本語", "&ZeVnLIqe-"),
+            ("~peter/mail/台北/日本語", "~peter/mail/&U,BTFw-/&ZeVnLIqe-"),
+        ] {
+            assert_eq!(encode_name(text), wire);
+            assert_eq!(decode_name(wire), text);
+        }
+        assert_eq!(decode_name("Broken &AOk"), "Broken &AOk");
+    }
+    #[test]
+    fn new_and_renamed_folders_are_named_like_their_neighbours() {
+        let name = |name: &str, attributes: &[&str], d: Option<&str>| Name {
+            name: name.into(),
+            attributes: attributes.iter().map(|a| (*a).into()).collect(),
+            delimiter: d.map(Into::into),
+        };
+        let slash = [
+            name("INBOX", &[], Some("/")),
+            name("Sent", &["Sent"], Some("/")),
+            name("Receipts", &[], Some("/")),
+            name("Projects", &[], Some("/")),
+            name("Projects/2024", &[], Some("/")),
+            name("Flat", &["NoInferiors"], Some("/")),
+        ];
+        let new = |parent, leaf: &str| new_folder_name(&slash, Provider::Imap, parent, leaf);
+        assert_eq!(new(None, " Travel ").unwrap(), "Travel");
+        assert_eq!(new(Some("Projects"), "2025").unwrap(), "Projects/2025");
+        assert_eq!(new(None, "Café").unwrap(), "Caf&AOk-");
+        assert!(
+            new(Some("Projects"), "2024")
+                .unwrap_err()
+                .to_string()
+                .contains("already")
+        );
+        assert!(
+            new(None, "sent")
+                .unwrap_err()
+                .to_string()
+                .contains("standard")
+        );
+        assert!(new(None, "a/b").unwrap_err().to_string().contains("“/”"));
+        assert!(new(None, "  ").unwrap_err().to_string().contains("Enter"));
+        assert!(
+            new(Some("Flat"), "x")
+                .unwrap_err()
+                .to_string()
+                .contains("doesn't allow")
+        );
+        assert!(new(Some("Sent"), "x").is_err());
+        let rename = |n, leaf: &str| renamed_folder_name(&slash, Provider::Imap, n, leaf);
+        assert_eq!(rename("Projects/2024", "Old").unwrap(), "Projects/Old");
+        assert_eq!(rename("Receipts", "Bills").unwrap(), "Bills");
+        assert_eq!(rename("Receipts", "Receipts").unwrap(), "Receipts");
+        assert!(
+            rename("Receipts", "Projects")
+                .unwrap_err()
+                .to_string()
+                .contains("already")
+        );
+        assert!(
+            rename("Sent", "Posted")
+                .unwrap_err()
+                .to_string()
+                .contains("standard")
+        );
+        assert_eq!(
+            folder_and_inside(&slash, "Projects"),
+            ["Projects", "Projects/2024"]
+        );
+        // Servers that keep every folder inside the inbox.
+        let dotted = [
+            name("INBOX", &[], Some(".")),
+            name("INBOX.Sent", &["Sent"], Some(".")),
+            name("INBOX.Receipts", &[], Some(".")),
+        ];
+        assert_eq!(
+            new_folder_name(&dotted, Provider::Imap, None, "Travel").unwrap(),
+            "INBOX.Travel"
+        );
+        assert!(
+            new_folder_name(&dotted, Provider::Imap, None, "Trash")
+                .unwrap_err()
+                .to_string()
+                .contains("standard")
+        );
+        assert_eq!(
+            renamed_folder_name(&dotted, Provider::Imap, "INBOX.Receipts", "Bills").unwrap(),
+            "INBOX.Bills"
+        );
+        // Without a hierarchy, folders can't be nested.
+        let flat = [name("INBOX", &[], None), name("Receipts", &[], None)];
+        assert!(new_folder_name(&flat, Provider::Imap, Some("Receipts"), "x").is_err());
+        assert_eq!(
+            new_folder_name(&flat, Provider::Imap, None, "a/b").unwrap(),
+            "a/b"
+        );
     }
     #[test]
     fn uid_ranges_are_compact() {

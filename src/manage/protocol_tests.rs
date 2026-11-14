@@ -229,12 +229,14 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
                 RemoteFolder {
                     name: "Projects".into(),
                     label: "Projects".into(),
-                    depth: 0
+                    depth: 0,
+                    nestable: true,
                 },
                 RemoteFolder {
                     name: "Projects/2026".into(),
                     label: "2026".into(),
-                    depth: 1
+                    depth: 1,
+                    nestable: true,
                 },
             ],
             "Standard and non-selectable mailboxes are not listed as folders"
@@ -835,6 +837,129 @@ fn imap_folder_delete_follows_the_servers_rights() -> Result<()> {
     assert!(format!("{standard:#}").contains("standard"), "{standard:#}");
     b.disconnect(&a.id);
     assert_eq!(server.join().unwrap(), ["DELETE \"Receipts\""]);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Folders are made and renamed on the server in the folder list's own
+/// form (parent, delimiter, modified UTF-7); a rename takes the folders
+/// inside along and forgets their cached mail; refusals are explained.
+#[test]
+fn imap_folder_create_and_rename() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut folders: Vec<String> = vec!["Projects".into(), "Projects/2024".into()];
+        let mut commands = Vec::new();
+        // A refusal drops its connection, so the client signs in again.
+        loop {
+            let Ok((socket, _)) = listener.accept() else {
+                break;
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+            r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+            let mut done = false;
+            loop {
+                let mut line = String::new();
+                if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                let upper = command.to_ascii_uppercase();
+                let mut out = String::new();
+                let unquote = |s: &str| s.trim_matches('"').to_owned();
+                if upper.starts_with("LOGIN") || upper.starts_with("SUBSCRIBE") {
+                } else if upper.starts_with("LIST") {
+                    out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                    out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");
+                    for f in &folders {
+                        out.push_str(&format!("* LIST () \"/\" \"{f}\"\r\n"));
+                    }
+                } else if upper.starts_with("CREATE") {
+                    commands.push(command.to_owned());
+                    let name = unquote(&command[7..]);
+                    if name.contains("Forbidden") {
+                        r.get_mut()
+                            .write_all(format!("{tag} NO [NOPERM] Permission denied\r\n").as_bytes())
+                            .unwrap();
+                        continue;
+                    }
+                    folders.push(name);
+                } else if upper.starts_with("RENAME") {
+                    commands.push(command.to_owned());
+                    let (from, to) = command[7..].split_once("\" \"").unwrap();
+                    let (from, to) = (unquote(from), unquote(to));
+                    for f in &mut folders {
+                        if *f == from || f.starts_with(&format!("{from}/")) {
+                            *f = format!("{to}{}", &f[from.len()..]);
+                        }
+                    }
+                } else if upper.starts_with("LOGOUT") {
+                    r.get_mut()
+                        .write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes())
+                        .unwrap();
+                    done = true;
+                    break;
+                } else {
+                    panic!("Unexpected IMAP command: {line}");
+                }
+                out.push_str(&format!("{tag} OK done\r\n"));
+                r.get_mut().write_all(out.as_bytes()).unwrap();
+            }
+            if done {
+                break;
+            }
+        }
+        (commands, folders)
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let made = b.create_remote_folder(&a, None, "Café")?;
+    assert_eq!(made.name, "Caf&AOk-");
+    assert!(made.folders.iter().any(|f| f.name == "Caf&AOk-" && f.label == "Café"));
+    let inside = b.create_remote_folder(&a, Some("Projects"), "2025")?;
+    assert_eq!(inside.name, "Projects/2025");
+    assert_eq!(b.store.folders(&a.id), inside.folders);
+    // Names the server would misread, or that are taken, never reach it.
+    let taken = b.create_remote_folder(&a, Some("Projects"), "2024").unwrap_err();
+    assert!(format!("{taken:#}").contains("already"), "{taken:#}");
+    let refused = b.create_remote_folder(&a, None, "Forbidden").unwrap_err();
+    assert!(format!("{refused:#}").contains("didn't allow"), "{refused:#}");
+    let cached = Mail {
+        id: format!("{}:Projects/2024:1:1", a.id),
+        account: a.id.clone(),
+        folder: Folder::Other,
+        remote_folder: "Projects/2024".into(),
+        uid: 1,
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&cached))?;
+    let renamed = b.rename_remote_folder(&a, "Projects", "Work")?;
+    assert_eq!(renamed.name, "Work");
+    assert!(renamed.moved.contains(&("Projects/2024".into(), "Work/2024".into())));
+    assert!(renamed.folders.iter().any(|f| f.name == "Work/2025"));
+    assert!(b.store.message(&cached.id)?.is_none(), "its cached mail is forgotten");
+    let standard = b.rename_remote_folder(&a, "Trash", "Bin").unwrap_err();
+    assert!(format!("{standard:#}").contains("standard"), "{standard:#}");
+    // Keeping the name changes nothing on the server.
+    assert_eq!(b.rename_remote_folder(&a, "Work", "Work")?.name, "Work");
+    b.disconnect(&a.id);
+    let (commands, folders) = server.join().unwrap();
+    assert_eq!(
+        commands,
+        [
+            "CREATE \"Caf&AOk-\"",
+            "CREATE \"Projects/2025\"",
+            "CREATE \"Forbidden\"",
+            "RENAME \"Projects\" \"Work\"",
+        ]
+    );
+    assert_eq!(folders, ["Work", "Work/2024", "Caf&AOk-", "Work/2025"]);
     drop(b);
     std::fs::remove_dir_all(path)?;
     Ok(())

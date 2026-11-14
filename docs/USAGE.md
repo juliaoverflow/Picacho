@@ -53,6 +53,7 @@ POP3 downloads are identified by stable UIDL values, cached, and deduplicated. R
 ## Implemented interactions
 
 - A sidebar listing every account as a collapsible group with its standard mailboxes and server folders (nested beneath the inbox). It collapses to an icon rail with ⌃⌘S.
+- On IMAP accounts, right-click the inbox for **New Folder…**, or one of your own server folders for **New Folder Inside…**, **Rename Folder…** and **Delete Folder…**. Changes are made on the server; renaming a folder downloads its mail again under the new name.
 - Right-click menus for accounts, mailboxes, and messages.
 - Multi-select with the list's Select button, ⌘-click, ⇧-click, ⌘A, the avatar checkboxes, or a message's right-click menu (Select, Select All From Sender), with a bulk toolbar for read/unread, star, archive, spam, and trash. While several messages are selected, the reader pane summarizes them and offers the same actions; ⌘⇧U and ⌘⇧S mark or star the whole selection.
 - A filter menu for unread, starred, and attachment-bearing mail, plus newest/oldest ordering.

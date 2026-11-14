@@ -1194,6 +1194,7 @@ mod tests {
             name: "Projects/2026".into(),
             label: "2026".into(),
             depth: 1,
+            nestable: true,
         }];
         s.save_folders("demo", &folders)?;
         assert_eq!(s.folders("demo"), folders);

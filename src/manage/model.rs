@@ -401,6 +401,9 @@ pub struct RemoteFolder {
     pub name: String,
     pub label: String,
     pub depth: usize,
+    /// Whether the server allows folders inside this one.
+    #[serde(default)]
+    pub nestable: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attachment {
