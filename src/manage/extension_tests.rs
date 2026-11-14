@@ -802,6 +802,9 @@ fn idle_reports_new_mail() -> Result<()> {
     let (cert, acceptor) = tls_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
+    // How many IDLEs the server has had, for the test to check.
+    let idles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = idles.clone();
     let server = std::thread::spawn(move || {
         let mut seen = Vec::new();
         let Some(mut p) = Peer::accept(&listener, &acceptor) else {
@@ -816,8 +819,12 @@ fn idle_reports_new_mail() -> Result<()> {
                 p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
             } else if upper == "IDLE" {
                 p.send("+ idling\r\n");
-                if seen.iter().filter(|c| *c == "IDLE").count() == 1 {
-                    std::thread::sleep(Duration::from_millis(200));
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                std::thread::sleep(Duration::from_millis(200));
+                if n == 1 {
+                    // A keepalive in this server's words: no new mail.
+                    p.send("* OK Still connected\r\n");
+                } else if n == 2 {
                     p.send("* 2 EXISTS\r\n");
                 }
                 // Waits for DONE (or the client going away).
@@ -846,6 +853,10 @@ fn idle_reports_new_mail() -> Result<()> {
     });
     rx.recv_timeout(Duration::from_secs(10))
         .expect("the new mail was reported");
+    assert!(
+        idles.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the keepalive wasn't reported as new mail"
+    );
     assert_eq!(b.watching(), [a.id.clone()]);
     let started = std::time::Instant::now();
     b.stop_watching(&a.id);

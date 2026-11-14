@@ -135,7 +135,8 @@ impl Backend {
         watched: &mut bool,
     ) -> Result<Ended> {
         let secret = self.credentials(a)?;
-        let (session, interrupter) = imap_login_interruptible(a, &secret, &self.tls_connector()?)?;
+        let (session, interrupter, tap) =
+            imap_login_interruptible(a, &secret, &self.tls_connector()?)?;
         let mut c = Connection::new(session);
         *socket.lock().unwrap() = Some(interrupter);
         if stop.load(Ordering::Acquire) {
@@ -148,21 +149,62 @@ impl Backend {
         c.session.examine("INBOX")?;
         *watched = true;
         while !stop.load(Ordering::Acquire) {
+            tap.start();
             let outcome = {
                 let handle = c.session.idle()?;
                 handle.wait_with_timeout(RENEW_IDLE)?
                 // Dropping the handle ends the IDLE (DONE).
             };
+            let heard = tap.take();
             // What the server said is acted on by the inbox check.
             while c.session.unsolicited_responses.try_recv().is_ok() {}
             if stop.load(Ordering::Acquire) {
                 break;
             }
-            if outcome == imap::extensions::idle::WaitOutcome::MailboxChanged {
+            // Any line ends the wait, keepalives too ("* OK still here"
+            // in each server's words); only mailbox data is a change.
+            if outcome == imap::extensions::idle::WaitOutcome::MailboxChanged
+                && heard.as_deref().is_none_or(reports_change)
+            {
                 changed();
             }
         }
         let _ = c.session.logout();
         Ok(Ended::Stopped)
+    }
+}
+
+/// Whether what a server sent during IDLE reports a change: untagged
+/// mailbox data (`* 3 EXISTS`, `* 2 EXPUNGE`, `* 5 FETCH`…), not status
+/// lines (`* OK`, `* NO`, `* BYE`), the `+ idling` go-ahead, or the tagged
+/// reply that ends the IDLE. A copy cut off at its limit is taken to.
+fn reports_change(heard: &[u8]) -> bool {
+    if heard.len() >= crate::sync::stream::Tap::LIMIT {
+        return true;
+    }
+    String::from_utf8_lossy(heard).lines().any(|line| {
+        let mut words = line.split_ascii_whitespace();
+        words.next() == Some("*")
+            && words.next().is_some_and(|w| {
+                !["OK", "NO", "BAD", "BYE", "PREAUTH"]
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(w))
+            })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reports_change;
+
+    #[test]
+    fn keepalives_are_not_new_mail() {
+        let quiet = b"+ idling\r\n* OK Still here\r\n* OK NOOP\r\na7 OK IDLE terminated\r\n";
+        assert!(!reports_change(quiet));
+        assert!(!reports_change(b"+ idling\r\n* BYE going down\r\n"));
+        assert!(reports_change(b"+ idling\r\n* 4 EXISTS\r\na7 OK done\r\n"));
+        assert!(reports_change(b"* 2 EXPUNGE\r\n"));
+        assert!(reports_change(b"* 1 FETCH (FLAGS (\\Seen))\r\n"));
+        assert!(reports_change(&vec![b'x'; crate::sync::stream::Tap::LIMIT]));
     }
 }

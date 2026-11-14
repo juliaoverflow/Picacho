@@ -6,7 +6,7 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, 
 use std::{
     io::{self, Read, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -50,9 +50,34 @@ impl Deflate {
     }
 }
 
+/// Keeps a copy of what the server sends while it is on, so a session can
+/// see the lines the imap crate reads and drops (those IDLE wakes on).
+#[derive(Clone, Default)]
+pub(crate) struct Tap(Arc<Mutex<Option<Vec<u8>>>>);
+impl Tap {
+    /// More than this is never kept: the copy is only read for what kind
+    /// of lines it holds, and a long one is taken to report a change.
+    pub(crate) const LIMIT: usize = 64 * 1024;
+    /// Starts keeping a copy, from the next byte read.
+    pub(crate) fn start(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+    /// Stops keeping a copy, returning what was read since `start`.
+    pub(crate) fn take(&self) -> Option<Vec<u8>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+    fn record(&self, bytes: &[u8]) {
+        if let Some(copy) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            let room = Self::LIMIT.saturating_sub(copy.len());
+            copy.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        }
+    }
+}
+
 pub(crate) struct ImapStream {
     tls: native_tls::TlsStream<Wire>,
     deflate: Option<Box<Deflate>>,
+    tap: Tap,
     /// Set once the server accepted COMPRESS; compression starts with the
     /// next byte in either direction.
     compressing: Arc<AtomicBool>,
@@ -62,8 +87,13 @@ impl ImapStream {
         Self {
             tls,
             deflate: None,
+            tap: Tap::default(),
             compressing: Arc::new(AtomicBool::new(false)),
         }
+    }
+    /// A handle on the copy of what the server sends; see [`Tap`].
+    pub(crate) fn tap(&self) -> Tap {
+        self.tap.clone()
     }
     /// Turns compression on, from the session that negotiated it.
     pub(crate) fn compression_switch(&self) -> Arc<AtomicBool> {
@@ -88,6 +118,14 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 }
 impl Read for ImapStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.read_plain(buf)?;
+        self.tap.record(&buf[..read]);
+        Ok(read)
+    }
+}
+impl ImapStream {
+    /// Reads what the server sent, inflated where compressed.
+    fn read_plain(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }

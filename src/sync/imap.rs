@@ -36,15 +36,16 @@ pub(crate) fn imap_login(
     s: &Secret,
     tls: &native_tls::TlsConnector,
 ) -> Result<ImapSession> {
-    imap_login_interruptible(a, s, tls).map(|(session, _)| session)
+    imap_login_interruptible(a, s, tls).map(|(session, ..)| session)
 }
 /// Signs in, also returning a handle that closes the connection from
-/// another thread (to end a session waiting in IDLE).
+/// another thread (to end a session waiting in IDLE), and one that copies
+/// what the server sends (to see what woke an IDLE).
 pub(crate) fn imap_login_interruptible(
     a: &Account,
     s: &Secret,
     tls: &native_tls::TlsConnector,
-) -> Result<(ImapSession, TcpStream)> {
+) -> Result<(ImapSession, TcpStream, super::stream::Tap)> {
     let mut socket = tcp(&a.incoming_host, a.incoming_port)?;
     if a.incoming_starttls {
         // The imap crate's secure() only accepts TcpStream. Perform the small
@@ -57,6 +58,7 @@ pub(crate) fn imap_login_interruptible(
     );
     let compressing = stream.compression_switch();
     let interrupter = stream.interrupter()?;
+    let tap = stream.tap();
     let mut client = imap::Client::new(stream);
     if a.incoming_starttls {
         client.greeting_read = true; // IMAP sends no second greeting after STARTTLS.
@@ -84,7 +86,7 @@ pub(crate) fn imap_login_interruptible(
         }
     })?;
     prepare(&mut session, &compressing)?;
-    Ok((session, interrupter))
+    Ok((session, interrupter, tap))
 }
 /// What the app tells servers that ask who is connecting (ID, RFC 2971).
 const CLIENT_ID: &str = concat!(
