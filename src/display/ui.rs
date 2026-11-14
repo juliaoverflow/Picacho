@@ -319,8 +319,6 @@ enum Modal {
     RemoveAccount(String),
     /// Confirms deleting a folder on an account's server: (account, folder).
     DeleteFolder(String, String),
-    /// Names a new or renamed folder on an account's server.
-    EditFolder(String, FolderEdit),
     /// Confirms deleting mail for good.
     Erase(Erase),
     /// Names a new label for messages.
@@ -342,7 +340,7 @@ enum Erase {
     /// Everything in an account's Trash or Spam.
     Mailbox(String, Folder),
 }
-/// What the folder dialog does on the account's server.
+/// A server folder being named in the sidebar, as top folders are.
 #[derive(Clone, Debug, PartialEq)]
 enum FolderEdit {
     /// Makes a folder inside this one, or at the top level.
@@ -506,8 +504,6 @@ enum Action {
     NewRemoteFolder(String, Option<String>),
     /// Asks for a new name for an account's folder: (account, folder).
     RenameRemoteFolder(String, String),
-    /// Makes or renames the folder, as named in the dialog.
-    SaveRemoteFolder,
     RemoveSeparator(String),
     ConfirmRemove(String),
     ToggleSidebar,
@@ -719,6 +715,10 @@ pub struct MailApp {
     folder: Folder,
     remote: String,
     folders: HashMap<String, Vec<RemoteFolder>>,
+    /// The order server folders are shown in, by account, once one was made
+    /// or renamed here: like top folders, they stay where they were put.
+    /// Folders not in it (made elsewhere) follow, by name.
+    folder_order: HashMap<String, Vec<String>>,
     unread: HashMap<(String, String), usize>,
     collapsed: HashSet<String>,
     /// The sidebar's accounts, folders and separators, in order.
@@ -920,12 +920,12 @@ pub struct MailApp {
     pushed: futures::channel::mpsc::UnboundedSender<String>,
     /// When each account's drafts were last synced.
     draft_synced: HashMap<String, std::time::Instant>,
-    /// The name in the new or renamed folder dialog.
-    folder_input: Entity<InputState>,
     /// The name in the new label dialog.
     label_input: Entity<InputState>,
-    /// Whether the folder dialog's change is being made on the server.
-    saving_folder: bool,
+    /// The server folder being named in the sidebar: (account, edit).
+    folder_edit: Option<(String, FolderEdit)>,
+    /// A server folder change being made: (account, edit, its new name).
+    folder_saving: Option<(String, FolderEdit, String)>,
     /// Where the sender's mail list was scrolled when a message opened over
     /// it, put back when the message closes.
     subs_return: Cell<Option<Point<Pixels>>>,
@@ -1095,14 +1095,6 @@ impl MailApp {
                 }
             }),
         );
-        let folder_input = input("Folder name", false, false, window, cx);
-        subscriptions.push(
-            cx.subscribe_in(&folder_input, window, |this, _, event, w, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.handle(Action::SaveRemoteFolder, w, cx);
-                }
-            }),
-        );
         let label_input = input("Label name", false, false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&label_input, window, |this, _, event, w, cx| {
@@ -1226,6 +1218,13 @@ impl MailApp {
             .iter()
             .map(|a| (a.id.clone(), backend.store.folders(&a.id)))
             .collect();
+        let folder_order = accounts
+            .iter()
+            .filter_map(|a| {
+                let order = backend.store.preference(&format!("folder_order:{}", a.id))?;
+                Some((a.id.clone(), serde_json::from_str(&order).ok()?))
+            })
+            .collect();
         let collapsed = backend
             .store
             .preference("collapsed_accounts")
@@ -1344,6 +1343,7 @@ impl MailApp {
             folder: Folder::Inbox,
             remote: String::new(),
             folders,
+            folder_order,
             unread: HashMap::new(),
             collapsed,
             tree,
@@ -1477,9 +1477,9 @@ impl MailApp {
             draft_syncs: HashSet::new(),
             pushed,
             draft_synced: HashMap::new(),
-            folder_input,
             label_input,
-            saving_folder: false,
+            folder_edit: None,
+            folder_saving: None,
             subs_return: Cell::new(None),
             unsubscribing: HashSet::new(),
             unsubscribed: Default::default(),
@@ -2027,10 +2027,11 @@ impl MailApp {
                 Action::EmptyMailbox(id.into(), folder),
             ));
         }
+        // The same entries, in the same order, as top folders have.
         if mailbox == Mailbox::Standard(Folder::Inbox) && self.manages_folders(id) {
             entries.push(Entry::Separator);
             entries.push(entry(
-                "New Folder…",
+                "New Folder",
                 "folder-closed",
                 Action::NewRemoteFolder(id.into(), None),
             ));
@@ -2039,18 +2040,20 @@ impl MailApp {
             && self.folder_deletable(id, &name)
         {
             entries.push(Entry::Separator);
+            entries.push(entry(
+                "Rename…",
+                "compose",
+                Action::RenameRemoteFolder(id.into(), name.clone()),
+            ));
             if self.folder_nestable(id, &name) {
+                entries.push(Entry::Separator);
                 entries.push(entry(
-                    "New Folder Inside…",
+                    "New Folder Inside",
                     "folder-closed",
                     Action::NewRemoteFolder(id.into(), Some(name.clone())),
                 ));
             }
-            entries.push(entry(
-                "Rename Folder…",
-                "compose",
-                Action::RenameRemoteFolder(id.into(), name.clone()),
-            ));
+            entries.push(Entry::Separator);
             entries.push(danger(
                 "Delete Folder…",
                 "trash",
@@ -2190,7 +2193,42 @@ impl MailApp {
         self.refresh(cx);
         self.save_place();
     }
-    /// Opens the dialog that names a new or renamed folder on the server.
+    /// The sidebar row key of a server folder being named.
+    fn folder_edit_key(account: &str, edit: &FolderEdit) -> String {
+        match edit {
+            FolderEdit::New(parent) => {
+                format!("new-folder\u{1f}{account}\u{1f}{}", parent.as_deref().unwrap_or(""))
+            }
+            FolderEdit::Rename(name) => format!("rename-folder\u{1f}{account}\u{1f}{name}"),
+        }
+    }
+    /// Whether this row of the sidebar is being named now.
+    fn editing_folder(&self, account: &str, edit: &FolderEdit) -> bool {
+        self.tree_ui.renaming.as_deref() == Some(Self::folder_edit_key(account, edit).as_str())
+    }
+    /// A name for a new folder that its neighbours don't have yet: "New
+    /// Folder", else "New Folder 2"…
+    fn new_folder_name(&self, account: &str, parent: Option<&str>) -> String {
+        let depth = parent.map_or(0, |p| {
+            self.folders
+                .get(account)
+                .and_then(|fs| fs.iter().find(|f| f.name == p))
+                .map_or(0, |f| f.depth + 1)
+        });
+        let taken = |label: &str| {
+            self.folders.get(account).is_some_and(|fs| {
+                fs.iter()
+                    .any(|f| f.depth == depth && f.label.eq_ignore_ascii_case(label))
+            })
+        };
+        (1..)
+            .map(|n| if n == 1 { "New Folder".to_owned() } else { format!("New Folder {n}") })
+            .find(|name| !taken(name))
+            .unwrap_or_default()
+    }
+    /// Names a new server folder, or renames one, in place in the sidebar,
+    /// just as top folders are: a new one starts as "New Folder" with its
+    /// name selected; Enter or clicking away saves, Escape keeps the name.
     fn edit_remote_folder(
         &mut self,
         id: String,
@@ -2203,18 +2241,30 @@ impl MailApp {
             FolderEdit::New(Some(parent)) => self.folder_nestable(&id, parent),
             FolderEdit::Rename(name) => self.folder_deletable(&id, name),
         };
-        if !allowed || self.saving_folder {
+        if !allowed || self.folder_saving.is_some() {
             return;
+        }
+        // Finish any other name being edited first.
+        if self.tree_ui.renaming.is_some() {
+            self.commit_rename(w, cx);
+        }
+        // The row is in the full sidebar, inside the account's open folders.
+        if self.sidebar_collapsed {
+            self.set_sidebar_collapsed(false, cx);
+        }
+        for key in [id.clone(), format!("folders:{id}")] {
+            if self.collapsed.remove(&key) {
+                self.save_collapsed();
+            }
         }
         let value = match &edit {
             FolderEdit::Rename(name) => self.folder_label(&id, name),
-            FolderEdit::New(_) => String::new(),
+            FolderEdit::New(parent) => self.new_folder_name(&id, parent.as_deref()),
         };
-        self.status.clear();
-        self.error = false;
-        self.modal = Some(Modal::EditFolder(id, edit));
-        self.anim += 1;
-        self.folder_input.update(cx, |s, cx| {
+        self.tree_ui.renaming = Some(Self::folder_edit_key(&id, &edit));
+        self.folder_edit = Some((id, edit));
+        self.rename_input.update(cx, |s, cx| {
+            s.set_placeholder("Folder name", w, cx);
             s.set_value(value, w, cx);
             s.focus(w, cx);
         });
@@ -2222,27 +2272,32 @@ impl MailApp {
         w.on_next_frame(|w, cx| w.dispatch_action(Box::new(gpui_component::input::SelectAll), cx));
         cx.notify();
     }
-    /// Makes or renames the folder named in the dialog. The dialog stays
-    /// up, showing progress, until the server answers; a refusal is shown
-    /// in it so the name can be changed.
-    fn save_remote_folder(&mut self, cx: &mut Context<Self>) {
-        let Some(Modal::EditFolder(id, edit)) = self.modal.clone() else {
-            return;
+    /// Ends naming a server folder: saves the name typed, or (`cancel`, as
+    /// Escape does for top folders) keeps the old name; a new folder is
+    /// still made, with its starting name.
+    pub(super) fn finish_remote_folder(&mut self, cancel: bool, cx: &mut Context<Self>) -> bool {
+        let Some((id, edit)) = self.folder_edit.take() else {
+            return false;
         };
-        if self.saving_folder {
-            return;
-        }
+        let typed = Self::value(&self.rename_input, cx).trim().to_owned();
+        let leaf = match &edit {
+            FolderEdit::New(parent) if cancel || typed.is_empty() => {
+                self.new_folder_name(&id, parent.as_deref())
+            }
+            FolderEdit::Rename(_) if cancel || typed.is_empty() => return true,
+            FolderEdit::Rename(name) if typed == self.folder_label(&id, name) => return true,
+            _ => typed,
+        };
+        self.save_remote_folder(id, edit, leaf, cx);
+        true
+    }
+    /// Makes or renames a server folder. Until the server answers, the
+    /// sidebar shows it by its new name; a refusal is said in a notice.
+    fn save_remote_folder(&mut self, id: String, edit: FolderEdit, leaf: String, cx: &mut Context<Self>) {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
-        let leaf = Self::value(&self.folder_input, cx).trim().to_owned();
-        if leaf.is_empty() {
-            self.notice("Enter a name for the folder.", true, cx);
-            return;
-        }
-        self.saving_folder = true;
-        self.status.clear();
-        self.error = false;
+        self.folder_saving = Some((id.clone(), edit.clone(), leaf.clone()));
         let job = edit.clone();
         self.task(
             cx,
@@ -2251,33 +2306,30 @@ impl MailApp {
                 FolderEdit::Rename(name) => b.rename_remote_folder(&a, name, &leaf),
             },
             move |this, result, cx| {
-                this.saving_folder = false;
-                let open = this.modal == Some(Modal::EditFolder(id.clone(), edit.clone()));
+                if this
+                    .folder_saving
+                    .as_ref()
+                    .is_some_and(|(a, e, _)| *a == id && *e == edit)
+                {
+                    this.folder_saving = None;
+                }
                 match result {
                     Ok(change) => {
-                        if open {
-                            this.modal = None;
-                        }
+                        // The folder stays where it was shown while it was
+                        // named, rather than moving to where its name sorts.
+                        this.place_folders(&id, &edit, &change);
                         this.folders.insert(id.clone(), change.folders.clone());
-                        let label = this.folder_label(&id, &change.name);
-                        match &edit {
-                            FolderEdit::New(_) => {
-                                // Show it: the inbox's folders open.
-                                this.collapsed.remove(&format!("folders:{id}"));
-                                this.notice(format!("Created “{label}”"), false, cx);
-                            }
-                            FolderEdit::Rename(_) => {
-                                this.notice(format!("Renamed to “{label}”"), false, cx);
-                                // An open folder that moved is shown by its new name.
-                                let showing = this.mailbox();
-                                let moved = change.moved.iter().find(|(old, _)| {
-                                    showing == Mailbox::Remote(old.clone())
-                                });
-                                if this.account.as_ref() == Some(&id)
-                                    && let Some((_, new)) = moved
-                                {
-                                    this.show_mailbox_instead(Mailbox::Remote(new.clone()), cx);
-                                }
+                        if let FolderEdit::Rename(_) = &edit {
+                            // An open folder that moved is shown by its new name.
+                            let showing = this.mailbox();
+                            let moved = change
+                                .moved
+                                .iter()
+                                .find(|(old, _)| showing == Mailbox::Remote(old.clone()));
+                            if this.account.as_ref() == Some(&id)
+                                && let Some((_, new)) = moved
+                            {
+                                this.show_mailbox_instead(Mailbox::Remote(new.clone()), cx);
                             }
                         }
                         this.refresh_counts(cx);
@@ -2294,51 +2346,6 @@ impl MailApp {
             },
         );
         cx.notify();
-    }
-    /// The new or renamed folder dialog: where the folder goes, and its name.
-    fn edit_folder_modal(&self, id: &str, edit: &FolderEdit) -> AnyElement {
-        let c = self.colors();
-        let email = self
-            .accounts
-            .iter()
-            .find(|a| a.id == id)
-            .map(|a| a.email.clone())
-            .unwrap_or_default();
-        let note = match edit {
-            FolderEdit::New(None) => format!("A new folder in {email}, beside the inbox."),
-            FolderEdit::New(Some(parent)) => format!(
-                "A new folder inside “{}”, in {email}.",
-                self.folder_label(id, parent)
-            ),
-            FolderEdit::Rename(name) => format!(
-                "“{}” and the folders inside it are renamed on {email}'s server. Their mail downloads again.",
-                self.folder_label(id, name)
-            ),
-        };
-        div()
-            .id("edit-folder")
-            .debug_selector(|| "edit-folder".into())
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(note),
-            )
-            .child(
-                div()
-                    .id("edit-folder-name")
-                    .debug_selector(|| "edit-folder-name".into())
-                    .child(
-                        field(Input::new(&self.folder_input), c, self.saving_folder)
-                            .disabled(self.saving_folder)
-                            .h(px(39.))
-                            .text_size(px(13.)),
-                    ),
-            )
-            .into_any_element()
     }
     fn mail_entries(&self, id: &str) -> Vec<Entry> {
         if self.folder == Folder::Drafts {
@@ -3429,10 +3436,8 @@ impl MailApp {
         let Some((account, within)) = self.move_account(target) else {
             return vec![];
         };
-        let Some(folders) = self.folders.get(&account) else {
-            return vec![];
-        };
-        folders
+        // In the sidebar's order.
+        self.ordered_folders(&account)
             .iter()
             .filter(|f| Some(&f.name) != within.as_ref())
             .map(|f| {
@@ -4197,7 +4202,6 @@ impl MailApp {
             Action::RenameRemoteFolder(id, name) => {
                 self.edit_remote_folder(id, FolderEdit::Rename(name), w, cx)
             }
-            Action::SaveRemoteFolder => self.save_remote_folder(cx),
             Action::RemoveSeparator(id) => self.remove_separator(&id),
             Action::ToggleSubfolders(id) => {
                 let key = format!("folders:{id}");
@@ -5251,6 +5255,44 @@ impl MailApp {
         let entries = self.mailbox_entries(account, mailbox.clone());
         let action = Action::OpenMailbox(account.to_owned(), mailbox.clone());
         let selector = format!("nav-{account}-{}", mailbox.key());
+        // A server folder is renamed in place, as top folders are.
+        let rename = match &mailbox {
+            Mailbox::Remote(name) => Some(FolderEdit::Rename(name.clone())),
+            Mailbox::Standard(_) => None,
+        };
+        let editing = rename
+            .as_ref()
+            .is_some_and(|edit| self.editing_folder(account, edit));
+        let saving = rename.as_ref().and_then(|edit| {
+            self.folder_saving
+                .as_ref()
+                .filter(|(a, e, _)| a == account && e == edit)
+                .map(|(_, _, name)| name.clone())
+        });
+        let label_el = if editing {
+            self.rename_field()
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .when(saving.is_some(), |d| d.opacity(0.6))
+                .child(saving.unwrap_or(label))
+                .into_any_element()
+        };
+        let renamable = matches!(&mailbox, Mailbox::Remote(name) if self.folder_deletable(account, name));
+        let double = match &mailbox {
+            Mailbox::Remote(name) if renamable => {
+                Some(Action::RenameRemoteFolder(account.to_owned(), name.clone()))
+            }
+            _ => None,
+        };
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(|| selector)
@@ -5266,19 +5308,7 @@ impl MailApp {
             .hover(move |s| s.bg(rgb(if active { c.soft } else { c.surface })))
             .text_color(rgb(if active { c.text } else { c.muted }))
             .child(icon_el(icon, 16., if active { c.accent } else { c.muted }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(13.))
-                    .font_weight(if active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .child(label),
-            )
+            .child(label_el)
             .when(count > 0, |d| {
                 d.child(
                     div()
@@ -5288,7 +5318,16 @@ impl MailApp {
                         .child(fmt_count(count)),
                 )
             })
-            .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
+            .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
+                if editing {
+                    return;
+                }
+                // Double-clicking a server folder renames it, as with top folders.
+                match &double {
+                    Some(rename) if e.click_count() >= 2 => this.handle(rename.clone(), w, cx),
+                    _ => this.handle(action.clone(), w, cx),
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -7452,8 +7491,6 @@ impl MailApp {
             Modal::Erase(Erase::Mailbox(_, Folder::Junk)) => "Empty Spam",
             Modal::Erase(Erase::Mailbox(..)) => "Empty Trash",
             Modal::NewLabel(_) => "New Label",
-            Modal::EditFolder(_, FolderEdit::New(_)) => "New Folder",
-            Modal::EditFolder(_, FolderEdit::Rename(_)) => "Rename Folder",
             Modal::Original => match self.source_view {
                 SourceView::Headers => "Message Headers",
                 SourceView::Html => "Message HTML",
@@ -7470,7 +7507,6 @@ impl MailApp {
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
             Modal::DeleteFolder(id, name) => self.delete_folder_modal(id, name),
-            Modal::EditFolder(id, edit) => self.edit_folder_modal(id, edit),
             Modal::Erase(erase) => self.erase_modal(erase),
             Modal::NewLabel(target) => self.new_label_modal(target),
             Modal::Original => self.original_modal(cx),
@@ -7490,7 +7526,6 @@ impl MailApp {
                 Modal::AvatarPresets(_) => 560.,
                 Modal::RemoveAccount(_)
                 | Modal::DeleteFolder(..)
-                | Modal::EditFolder(..)
                 | Modal::Erase(_)
                 | Modal::NewLabel(_)
                 | Modal::Reconnect(_)
@@ -7669,27 +7704,6 @@ impl MailApp {
                 .child(div().flex_1())
                 .child(self.button("new-label-cancel", "Cancel", "", Action::Close, false, cx))
                 .child(self.button("new-label-save", "Add Label", "", Action::SaveLabel, true, cx));
-        } else if let Modal::EditFolder(_, edit) = modal {
-            let label = match (edit, self.saving_folder) {
-                (FolderEdit::New(_), false) => "Create",
-                (FolderEdit::New(_), true) => "Creating…",
-                (FolderEdit::Rename(_), false) => "Rename",
-                (FolderEdit::Rename(_), true) => "Renaming…",
-            };
-            footer = footer
-                .child(div().flex_1())
-                .child(self.button("edit-folder-cancel", "Cancel", "", Action::Close, false, cx))
-                .child(
-                    self.button(
-                        "edit-folder-save",
-                        label,
-                        "",
-                        Action::SaveRemoteFolder,
-                        true,
-                        cx,
-                    )
-                    .when(self.saving_folder, |d| d.opacity(0.7)),
-                );
         } else if let Modal::Reconnect(id) = modal {
             footer = footer.child(div().flex_1());
             if self.sign_in_retry && !self.connecting {
@@ -9007,48 +9021,116 @@ mod tests {
             })
         };
         let has = |labels: &[String], label: &str| labels.iter().any(|l| l == label);
-        let inbox = labels(Folder::Inbox.into(), cx);
-        assert!(has(&inbox, "New Folder…"));
-        assert!(!has(&labels(Folder::Sent.into(), cx), "New Folder…"));
+        // The same entries as top folders: New Folder, Rename…, New Folder Inside.
+        assert!(has(&labels(Folder::Inbox.into(), cx), "New Folder"));
+        assert!(!has(&labels(Folder::Sent.into(), cx), "New Folder"));
         let receipts = labels(Mailbox::Remote("INBOX/Receipts".into()), cx);
-        assert!(has(&receipts, "New Folder Inside…"));
-        assert!(has(&receipts, "Rename Folder…"));
-        // Renaming starts from the folder's name, in the app's own dialog.
+        assert!(has(&receipts, "Rename…") && has(&receipts, "New Folder Inside"), "{receipts:?}");
+        // Renaming edits the name in place in the sidebar, with no dialog.
         act(&view, Action::RenameRemoteFolder(id.clone(), "INBOX/Receipts".into()), cx);
         frame(cx);
+        let rename = FolderEdit::Rename("INBOX/Receipts".into());
         view.read_with(cx, |this, cx| {
-            assert!(
-                this.modal
-                    == Some(Modal::EditFolder(
-                        id.clone(),
-                        FolderEdit::Rename("INBOX/Receipts".into())
-                    ))
-            );
-            assert_eq!(MailApp::value(&this.folder_input, cx), "Receipts");
+            assert!(this.modal.is_none());
+            assert!(this.editing_folder(&id, &rename));
+            assert_eq!(MailApp::value(&this.rename_input, cx), "Receipts");
         });
-        for part in ["modal-panel", "edit-folder", "edit-folder-name", "edit-folder-save", "edit-folder-cancel"] {
-            assert!(cx.debug_bounds(part).is_some(), "{part}");
-        }
+        assert!(cx.debug_bounds(Box::leak(format!("nav-{id}-remote:INBOX/Receipts").into_boxed_str())).is_some());
+        // Escape keeps the name; nothing goes to the server.
         act(&view, Action::Close, cx);
-        view.read_with(cx, |this, _| assert!(this.modal.is_none()));
-        // A new folder starts empty; an empty name isn't sent.
+        view.read_with(cx, |this, _| {
+            assert!(this.folder_edit.is_none() && this.folder_saving.is_none());
+            assert!(this.tree_ui.renaming.is_none());
+        });
+        // A new folder appears in place as "New Folder", its name selected.
+        view.update(cx, |this, _| this.collapsed.insert(format!("folders:{id}")));
         act(&view, Action::NewRemoteFolder(id.clone(), None), cx);
-        view.update(cx, |this, cx| {
-            assert_eq!(MailApp::value(&this.folder_input, cx), "");
-            this.save_remote_folder(cx);
-            assert!(!this.saving_folder);
-            assert!(this.error);
+        frame(cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.modal.is_none());
+            assert!(this.editing_folder(&id, &FolderEdit::New(None)));
+            assert_eq!(MailApp::value(&this.rename_input, cx), "New Folder");
+            // Its folders opened to show it.
+            assert!(!this.collapsed.contains(&format!("folders:{id}")));
         });
-        act(&view, Action::Close, cx);
+        assert!(cx.debug_bounds(Box::leak(format!("new-folder-{id}").into_boxed_str())).is_some());
+        // Enter makes it on the server; the row shows the name meanwhile.
+        view.update_in(cx, |this, w, cx| {
+            MailApp::set(&this.rename_input, "Travel", w, cx);
+            this.commit_rename(w, cx);
+            assert_eq!(
+                this.folder_saving,
+                Some((id.clone(), FolderEdit::New(None), "Travel".into()))
+            );
+            assert!(this.tree_ui.renaming.is_none());
+        });
+        frame(cx);
+        assert!(cx.debug_bounds(Box::leak(format!("new-folder-{id}").into_boxed_str())).is_some());
+        // This account has no server here: the attempt ends, and says why.
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert!(this.folder_saving.is_none());
+            assert!(this.error && this.status.contains("Couldn't create the folder"));
+        });
+        // Escape on a new folder still makes it, with its starting name, as
+        // a top folder made with New Folder stays.
+        view.update_in(cx, |this, w, cx| {
+            this.handle(Action::NewRemoteFolder(id.clone(), Some("INBOX/Receipts".into())), w, cx);
+            assert!(this.editing_folder(&id, &FolderEdit::New(Some("INBOX/Receipts".into()))));
+            this.handle(Action::Close, w, cx);
+            assert_eq!(
+                this.folder_saving,
+                Some((id.clone(), FolderEdit::New(Some("INBOX/Receipts".into())), "New Folder".into()))
+            );
+        });
+        cx.run_until_parked();
+        // A new folder's row is where it stays: at the end of its level,
+        // like a top folder's, not where its name sorts.
+        let names = |this: &MailApp| -> Vec<String> {
+            this.ordered_folders(&id).into_iter().map(|f| f.name).collect()
+        };
+        let folder = |name: &str| RemoteFolder {
+            name: name.into(),
+            label: name.rsplit('/').next().unwrap().into(),
+            depth: 0,
+            nestable: true,
+        };
+        view.update_in(cx, |this, w, cx| {
+            this.folders.get_mut(&id).unwrap().push(folder("INBOX/Zebra"));
+            this.handle(Action::NewRemoteFolder(id.clone(), None), w, cx);
+            let rows = this.folder_rows(&id);
+            assert!(matches!(rows.last(), Some(tree::FolderRow::New { parent: None, depth: 0 })));
+            this.cancel_rename(w, cx);
+            // The server made "Aardvark", which sorts first; it stays last.
+            let change = crate::manage::backend::FolderChange {
+                folders: vec![folder("INBOX/Receipts"), folder("INBOX/Zebra"), folder("INBOX/Aardvark")],
+                moved: vec![],
+            };
+            this.place_folders(&id, &FolderEdit::New(None), &change);
+            this.folders.insert(id.clone(), change.folders);
+            this.folder_saving = None;
+            assert_eq!(names(this), ["INBOX/Receipts", "INBOX/Zebra", "INBOX/Aardvark"]);
+            // Renamed, a folder keeps its place.
+            let change = crate::manage::backend::FolderChange {
+                folders: vec![folder("INBOX/Zzz"), folder("INBOX/Zebra"), folder("INBOX/Aardvark")],
+                moved: vec![("INBOX/Receipts".into(), "INBOX/Zzz".into())],
+            };
+            this.place_folders(&id, &FolderEdit::Rename("INBOX/Receipts".into()), &change);
+            this.folders.insert(id.clone(), change.folders);
+            assert_eq!(names(this), ["INBOX/Zzz", "INBOX/Zebra", "INBOX/Aardvark"]);
+            // And it's remembered.
+            let saved = this.backend.store.preference(&format!("folder_order:{id}")).unwrap();
+            assert_eq!(saved, r#"["INBOX/Zzz","INBOX/Zebra","INBOX/Aardvark"]"#);
+        });
         // Standard folders can't be renamed.
         act(&view, Action::RenameRemoteFolder(id.clone(), "INBOX".into()), cx);
-        view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+        view.read_with(cx, |this, _| assert!(this.folder_edit.is_none()));
         // POP mailboxes have no folders on the server.
         view.update(cx, |this, _| this.accounts[0].provider = Provider::Pop3);
-        assert!(!has(&labels(Folder::Inbox.into(), cx), "New Folder…"));
-        assert!(!has(&labels(Mailbox::Remote("INBOX/Receipts".into()), cx), "Rename Folder…"));
+        assert!(!has(&labels(Folder::Inbox.into(), cx), "New Folder"));
+        assert!(!has(&labels(Mailbox::Remote("INBOX/Receipts".into()), cx), "Rename…"));
         act(&view, Action::NewRemoteFolder(id.clone(), None), cx);
-        view.read_with(cx, |this, _| assert!(this.modal.is_none()));
+        view.read_with(cx, |this, _| assert!(this.folder_edit.is_none()));
     }
 
     #[gpui::test]

@@ -106,8 +106,6 @@ impl Layout {
 /// A folder made or renamed on the server.
 #[derive(Clone, Debug)]
 pub struct FolderChange {
-    /// The folder's name on the server now.
-    pub name: String,
     /// Renamed folders, the one asked for and those inside it: (old, new).
     pub moved: Vec<(String, String)>,
     /// The account's folders afterwards.
@@ -1534,7 +1532,6 @@ impl Backend {
             subscribe(&mut c.session, &name)?;
             Ok(FolderChange {
                 folders: custom_folders(c.names(true)?),
-                name,
                 moved: vec![],
             })
         })?;
@@ -1567,7 +1564,6 @@ impl Backend {
             if next == name {
                 return Ok(FolderChange {
                     folders: custom_folders(&names),
-                    name: next,
                     moved: vec![],
                 });
             }
@@ -1595,7 +1591,6 @@ impl Backend {
             }
             Ok(FolderChange {
                 folders: custom_folders(c.names(true)?),
-                name: next,
                 moved,
             })
         })?;

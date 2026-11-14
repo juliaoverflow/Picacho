@@ -924,10 +924,9 @@ fn imap_folder_create_and_rename() -> Result<()> {
     let (b, mut a, path) = backend(&cert)?;
     a.incoming_port = port;
     let made = b.create_remote_folder(&a, None, "Café")?;
-    assert_eq!(made.name, "Caf&AOk-");
     assert!(made.folders.iter().any(|f| f.name == "Caf&AOk-" && f.label == "Café"));
     let inside = b.create_remote_folder(&a, Some("Projects"), "2025")?;
-    assert_eq!(inside.name, "Projects/2025");
+    assert!(inside.folders.iter().any(|f| f.name == "Projects/2025"));
     assert_eq!(b.store.folders(&a.id), inside.folders);
     // Names the server would misread, or that are taken, never reach it.
     let taken = b.create_remote_folder(&a, Some("Projects"), "2024").unwrap_err();
@@ -944,14 +943,14 @@ fn imap_folder_create_and_rename() -> Result<()> {
     };
     b.store.save_messages(std::slice::from_ref(&cached))?;
     let renamed = b.rename_remote_folder(&a, "Projects", "Work")?;
-    assert_eq!(renamed.name, "Work");
+    assert_eq!(renamed.moved[0], ("Projects".into(), "Work".into()));
     assert!(renamed.moved.contains(&("Projects/2024".into(), "Work/2024".into())));
     assert!(renamed.folders.iter().any(|f| f.name == "Work/2025"));
     assert!(b.store.message(&cached.id)?.is_none(), "its cached mail is forgotten");
     let standard = b.rename_remote_folder(&a, "Trash", "Bin").unwrap_err();
     assert!(format!("{standard:#}").contains("standard"), "{standard:#}");
     // Keeping the name changes nothing on the server.
-    assert_eq!(b.rename_remote_folder(&a, "Work", "Work")?.name, "Work");
+    assert!(b.rename_remote_folder(&a, "Work", "Work")?.moved.is_empty());
     b.disconnect(&a.id);
     let (commands, folders) = server.join().unwrap();
     assert_eq!(

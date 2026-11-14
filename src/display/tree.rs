@@ -504,6 +504,12 @@ impl MailApp {
         let Some(id) = self.tree_ui.renaming.take() else {
             return;
         };
+        // A server folder is named the same way, then made on its server.
+        if self.finish_remote_folder(false, cx) {
+            self.focus.focus(w);
+            cx.notify();
+            return;
+        }
         let value = self.rename_input.read(cx).value().trim().to_owned();
         if matches!(find(&self.tree, &id), Some(Node::Account { .. })) {
             self.set_nickname(&id, &value, cx);
@@ -521,6 +527,7 @@ impl MailApp {
         if self.tree_ui.renaming.take().is_none() {
             return false;
         }
+        self.finish_remote_folder(true, cx);
         self.focus.focus(w);
         cx.notify();
         true
@@ -1059,6 +1066,7 @@ impl MailApp {
             return Some(block.into_any_element());
         }
         let folders = self.folders.get(id).cloned().unwrap_or_default();
+        let rows = self.folder_rows(id);
         let sub_open = !self.collapsed.contains(&format!("folders:{id}"));
         let mut index = 0;
         let mut add = |block: Stateful<Div>, el: Stateful<Div>| {
@@ -1107,17 +1115,25 @@ impl MailApp {
                 );
             }
             block = add(block, nav);
-            if folder == Folder::Inbox && sub_open {
-                for f in &folders {
-                    let nav = self.nav_row(
-                        id,
-                        Mailbox::Remote(f.name.clone()),
-                        f.label.clone(),
-                        "folder",
-                        14. + f.depth as f32 * 14.,
-                        cx,
-                    );
-                    block = add(block, nav);
+            if folder == Folder::Inbox && (sub_open || self.adding_folder(id, None)) {
+                for row in &rows {
+                    let el = match row {
+                        FolderRow::Folder(f) => self.nav_row(
+                            id,
+                            Mailbox::Remote(f.name.clone()),
+                            f.label.clone(),
+                            "folder",
+                            14. + f.depth as f32 * 14.,
+                            cx,
+                        ),
+                        FolderRow::New { parent, depth } => {
+                            match self.new_folder_row(id, parent.as_deref(), 14. + *depth as f32 * 14.) {
+                                Some(el) => el,
+                                None => continue,
+                            }
+                        }
+                    };
+                    block = add(block, el);
                 }
             }
         }
@@ -1269,7 +1285,7 @@ impl MailApp {
         block.into_any_element()
     }
     /// The field that edits a folder's name or an account's nickname in place.
-    fn rename_field(&self) -> AnyElement {
+    pub(super) fn rename_field(&self) -> AnyElement {
         let c = self.colors();
         div()
             .flex_1()
@@ -1619,6 +1635,256 @@ impl MailApp {
     }
 }
 
+impl MailApp {
+    /// Whether a new server folder is being named, or made, inside `parent`.
+    fn adding_folder(&self, account: &str, parent: Option<&str>) -> bool {
+        let edit = FolderEdit::New(parent.map(str::to_owned));
+        self.editing_folder(account, &edit)
+            || self
+                .folder_saving
+                .as_ref()
+                .is_some_and(|(a, e, _)| a == account && *e == edit)
+    }
+    /// The row of a new server folder inside `parent`: its name being
+    /// typed, then, until the server has it, the name given.
+    fn new_folder_row(
+        &self,
+        account: &str,
+        parent: Option<&str>,
+        indent: f32,
+    ) -> Option<Stateful<Div>> {
+        if !self.adding_folder(account, parent) {
+            return None;
+        }
+        let c = self.colors();
+        let edit = FolderEdit::New(parent.map(str::to_owned));
+        let label = if self.editing_folder(account, &edit) {
+            self.rename_field()
+        } else {
+            let name = self
+                .folder_saving
+                .as_ref()
+                .map(|(_, _, name)| name.clone())
+                .unwrap_or_default();
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .opacity(0.6)
+                .child(name)
+                .into_any_element()
+        };
+        let selector = format!("new-folder-{account}");
+        Some(
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(|| selector)
+                .h(px(30.))
+                .pl(px(30. + indent))
+                .pr_2()
+                .rounded(px(7.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_color(rgb(c.muted))
+                .child(icon_el("folder", 16., c.muted))
+                .child(label)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+        )
+    }
+}
+
+/// A row among an account's server folders in the sidebar.
+pub(super) enum FolderRow {
+    Folder(RemoteFolder),
+    /// A new folder being named or made, inside `parent`.
+    New {
+        parent: Option<String>,
+        depth: usize,
+    },
+}
+/// Whether `child` is inside `parent`: its name is the parent's, a
+/// delimiter, and more, one or more levels down.
+fn inside(parent: &RemoteFolder, child: &RemoteFolder) -> bool {
+    child.depth > parent.depth
+        && child.name.len() > parent.name.len() + 1
+        && child.name.starts_with(&parent.name)
+        && !child.name[parent.name.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric)
+}
+/// Server folders in the order the sidebar shows them: nested under their
+/// parents; among siblings, those in `order` where it puts them, then the
+/// rest by name.
+pub(super) fn ordered_folders(folders: &[RemoteFolder], order: &[String]) -> Vec<RemoteFolder> {
+    let parent_of = |f: &RemoteFolder| {
+        folders
+            .iter()
+            .filter(|p| p.depth + 1 == f.depth && inside(p, f))
+            .max_by_key(|p| p.name.len())
+            .map(|p| p.name.clone())
+    };
+    let rank = |f: &RemoteFolder| {
+        (
+            order.iter().position(|n| *n == f.name).unwrap_or(usize::MAX),
+            f.name.to_lowercase(),
+        )
+    };
+    let mut children: HashMap<Option<String>, Vec<&RemoteFolder>> = HashMap::new();
+    for f in folders {
+        children.entry(parent_of(f)).or_default().push(f);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by_key(|f| rank(f));
+    }
+    fn walk(
+        parent: Option<String>,
+        children: &HashMap<Option<String>, Vec<&RemoteFolder>>,
+        out: &mut Vec<RemoteFolder>,
+    ) {
+        for f in children.get(&parent).into_iter().flatten() {
+            out.push((*f).clone());
+            walk(Some(f.name.clone()), children, out);
+        }
+    }
+    let mut out = Vec::with_capacity(folders.len());
+    walk(None, &children, &mut out);
+    out
+}
+/// Where a new folder inside `parent` goes in `ordered`: after the parent's
+/// last folder, as a top folder's new folder goes at the end of its folder.
+fn end_of(ordered: &[RemoteFolder], parent: Option<&str>) -> usize {
+    let Some(parent) = parent else {
+        return ordered.len();
+    };
+    let Some(at) = ordered.iter().position(|f| f.name == parent) else {
+        return ordered.len();
+    };
+    let p = &ordered[at];
+    ordered[at + 1..]
+        .iter()
+        .position(|f| !inside(p, f))
+        .map_or(ordered.len(), |n| at + 1 + n)
+}
+impl MailApp {
+    /// An account's server folders in the sidebar's order.
+    pub(super) fn ordered_folders(&self, account: &str) -> Vec<RemoteFolder> {
+        ordered_folders(
+            self.folders.get(account).map(Vec::as_slice).unwrap_or_default(),
+            self.folder_order.get(account).map(Vec::as_slice).unwrap_or_default(),
+        )
+    }
+    /// The rows under an account's inbox: its server folders, and a new one
+    /// being named or made where it will stay, at the end of its parent.
+    pub(super) fn folder_rows(&self, account: &str) -> Vec<FolderRow> {
+        let ordered = self.ordered_folders(account);
+        let adding = match (&self.folder_edit, &self.folder_saving) {
+            (Some((a, FolderEdit::New(parent))), _) if a == account => Some(parent.clone()),
+            (_, Some((a, FolderEdit::New(parent), _))) if a == account => Some(parent.clone()),
+            _ => None,
+        };
+        let at = adding.as_ref().map(|parent| end_of(&ordered, parent.as_deref()));
+        let mut rows: Vec<FolderRow> = ordered.into_iter().map(FolderRow::Folder).collect();
+        if let (Some(parent), Some(at)) = (adding, at) {
+            let depth = parent
+                .as_ref()
+                .and_then(|p| {
+                    rows.iter().find_map(|r| match r {
+                        FolderRow::Folder(f) if f.name == *p => Some(f.depth + 1),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(0);
+            rows.insert(at, FolderRow::New { parent, depth });
+        }
+        rows
+    }
+    /// Remembers where a folder just made or renamed is shown: a new one
+    /// where its row was while it was named, a renamed one where it was.
+    pub(super) fn place_folders(
+        &mut self,
+        account: &str,
+        edit: &FolderEdit,
+        change: &crate::manage::backend::FolderChange,
+    ) {
+        let before = self.ordered_folders(account);
+        let mut order: Vec<String> = before.iter().map(|f| f.name.clone()).collect();
+        match edit {
+            FolderEdit::New(parent) => {
+                let at = end_of(&before, parent.as_deref());
+                let made: Vec<String> = change
+                    .folders
+                    .iter()
+                    .filter(|f| !before.iter().any(|b| b.name == f.name))
+                    .map(|f| f.name.clone())
+                    .collect();
+                for (i, name) in made.into_iter().enumerate() {
+                    order.insert((at + i).min(order.len()), name);
+                }
+            }
+            FolderEdit::Rename(_) => {
+                for (old, new) in &change.moved {
+                    if let Some(n) = order.iter_mut().find(|n| *n == old) {
+                        *n = new.clone();
+                    }
+                }
+            }
+        }
+        order.retain(|n| change.folders.iter().any(|f| f.name == *n));
+        let _ = self.backend.store.set_preference(
+            &format!("folder_order:{account}"),
+            &serde_json::to_string(&order).unwrap_or_default(),
+        );
+        self.folder_order.insert(account.to_owned(), order);
+    }
+}
+
+#[cfg(test)]
+mod folder_order_tests {
+    use super::{RemoteFolder, end_of, ordered_folders};
+    fn folder(name: &str, depth: usize) -> RemoteFolder {
+        RemoteFolder {
+            name: name.into(),
+            label: name.rsplit('/').next().unwrap().into(),
+            depth,
+            nestable: true,
+        }
+    }
+    fn names(folders: &[RemoteFolder]) -> Vec<&str> {
+        folders.iter().map(|f| f.name.as_str()).collect()
+    }
+    #[test]
+    fn folders_keep_the_order_they_were_given() {
+        let folders = [
+            folder("Zebra", 0),
+            folder("Projects", 0),
+            folder("Projects/2024", 1),
+            folder("Projects-old", 0),
+            folder("Alpha", 0),
+            folder("Projects/2023", 1),
+        ];
+        // By name, children under their parents (not after "Projects-old").
+        assert_eq!(
+            names(&ordered_folders(&folders, &[])),
+            ["Alpha", "Projects", "Projects/2023", "Projects/2024", "Projects-old", "Zebra"]
+        );
+        // Placed folders stay where they were put; others follow by name.
+        let order = ["Zebra".to_owned(), "Projects".into(), "Projects/2024".into()];
+        let ordered = ordered_folders(&folders, &order);
+        assert_eq!(
+            names(&ordered),
+            ["Zebra", "Projects", "Projects/2024", "Projects/2023", "Alpha", "Projects-old"]
+        );
+        // New folders go at the end of their parent, or of the list.
+        assert_eq!(end_of(&ordered, Some("Projects")), 4);
+        assert_eq!(end_of(&ordered, None), 6);
+        assert_eq!(end_of(&ordered, Some("Zebra")), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DropAt, Node, account_order, move_node, parent_if_last, reconcile, unwrap_folder};
@@ -1694,3 +1960,4 @@ mod tests {
         assert_eq!(serde_json::from_str::<Vec<Node>>(&json).unwrap(), t);
     }
 }
+
