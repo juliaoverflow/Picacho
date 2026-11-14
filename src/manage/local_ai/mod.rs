@@ -24,7 +24,7 @@ pub const OTP_PREFERENCE: &str = "local_ai_otp";
 /// files named below (a commit, so they never change under their digests).
 /// `PICACHO_MODELS_URL` points elsewhere (a mirror, or a local server while
 /// developing).
-const MODELS_URL: &str = "https://raw.githubusercontent.com/juliaoverflow/Picacho/b658d9add415638ab6a34defc0009a5dda324469/models/otp";
+const MODELS_URL: &str = "https://raw.githubusercontent.com/juliaoverflow/Picacho/8da3e8092700520c447cabef2c9b3ba054345e08/models/otp";
 
 /// A downloadable model: its file there and here, and what it must be.
 pub struct Model {
