@@ -1,5 +1,9 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[path = "proton_login.rs"]
+mod proton_login;
+use crate::manage::backend::{KeyMethod, KeyPrompt};
+use proton_login::ProtonStage;
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "compose.rs"]
@@ -13,11 +17,23 @@ use composer::{Composer, ComposerDrag, Placement};
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[path = "devdriver.rs"]
 mod devdriver;
+#[path = "datetime.rs"]
+mod datetime;
+#[path = "later.rs"]
+mod later;
+#[path = "filters.rs"]
+mod filters;
+use datetime::{DateTimePicker, PickerEvent};
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
 #[path = "forwarding.rs"]
 mod forwarding;
+#[path = "local_ai.rs"]
+mod ai;
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "local_ai_tests.rs"]
+mod local_ai_tests;
 #[path = "message_window.rs"]
 mod message_window;
 #[path = "panes.rs"]
@@ -110,6 +126,7 @@ actions!(
         GoArchive,
         GoSpam,
         GoTrash,
+        GoAllMail,
         ShowAllMail,
         ShowUnread,
         ShowStarred,
@@ -145,6 +162,12 @@ const SMTP_HOST: usize = 4;
 const SMTP_PORT: usize = 5;
 /// The servers' user name, when it isn't the email address.
 const LOGIN: usize = 6;
+/// Proton: the authenticator app's code, when two-factor is on.
+const TOTP: usize = 7;
+/// Proton: the mailbox password, in two-password mode.
+const MAILBOX_PASSWORD: usize = 8;
+/// Proton: a security key's PIN, once the key asks for it.
+const KEY_PIN: usize = 9;
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -160,6 +183,8 @@ struct Colors {
     on_accent: u32,
     soft: u32,
     danger: u32,
+    /// Problems that don't stop the account (yellow).
+    warning: u32,
 }
 impl Colors {
     fn new(dark: bool, accent: Accent) -> Self {
@@ -177,6 +202,7 @@ impl Colors {
                 on_accent,
                 soft,
                 danger: 0xff9aa7,
+                warning: 0xf2c14e,
             }
         } else {
             Self {
@@ -191,6 +217,7 @@ impl Colors {
                 on_accent,
                 soft,
                 danger: 0xa8313e,
+                warning: 0xb7791f,
             }
         }
     }
@@ -331,6 +358,8 @@ enum Modal {
     /// A message wasn't sent because the alias in From no longer exists:
     /// (why, the address From was reset to).
     AliasGone(String, String),
+    /// When to bring these messages back.
+    Snooze(Vec<String>),
 }
 /// What is deleted for good, once confirmed.
 #[derive(Clone, Debug, PartialEq)]
@@ -455,6 +484,7 @@ enum Page {
     Reading,
     Composing,
     Forwarding,
+    LocalAi,
     Account(String),
 }
 /// What a folder picker moves into the chosen folder.
@@ -469,6 +499,12 @@ enum MoveTarget {
 }
 #[derive(Clone)]
 enum Action {
+    /// Proton sign-in: a security key or passkey, this way.
+    ProtonKey(KeyMethod),
+    /// Proton sign-in: Direct (its API) or Bridge.
+    ProtonMode(Service),
+    /// Proton sign-in: back to the password.
+    ProtonBack,
     Compose,
     Reply(bool),
     Forward,
@@ -537,6 +573,8 @@ enum Action {
     /// Edits an account's nickname: in the sidebar (true) or on its Settings page.
     EditNickname(String, bool),
     RetryAccount(String),
+    /// Hides a warning (not a sign-in problem) of an account's.
+    DismissIssue(String, IssueSource),
     Reconnect(String),
     SubmitReconnect(String),
     SettingsPage(Page),
@@ -546,6 +584,18 @@ enum Action {
     SetReadingDefaults(ReadingOptions),
     /// Removes tracking from links in mail, or stops.
     SetCleanLinks(bool),
+    /// Turns Local AI on, or off (deleting its models).
+    SetLocalAi(bool),
+    /// Hides sign-in codes (downloading the model), or stops (deleting it).
+    SetHideCodes(bool),
+    /// Shows a message's hidden sign-in codes, or hides them again.
+    ShowCodes(String, bool),
+    /// Copies a message's sign-in code without showing it.
+    CopyCode(String),
+    /// Asks before deleting a Local AI model; deletes it once confirmed.
+    AskDeleteModel(String),
+    DeleteModel(String),
+    CloseModelSheet,
     ToggleHtml,
     ToggleRemote,
     /// Shows the open email's body in light or dark colors.
@@ -563,7 +613,7 @@ enum Action {
     ExpandThread,
     ShowOriginal,
     /// Lists the subscriptions detected in an account, or in every account
-    /// (All Mail's id).
+    /// (All Accounts' id).
     OpenSubscriptions(String),
     /// Asks a subscription's sender to stop, from the list or an email.
     Unsubscribe(MailSubscription),
@@ -581,6 +631,19 @@ enum Action {
     ToggleReadReceipts(String),
     /// Turns asking for delivery receipts on or off for an account.
     ToggleDeliveryReceipts(String),
+    /// Turns requiring encryption all the way (REQUIRETLS) on or off.
+    ToggleRequireTls(String),
+    /// Starts adding a sending address to an account.
+    AddIdentity(String),
+    /// Edits one of an account's sending addresses: (account, identity).
+    EditIdentity(String, String),
+    /// Removes one of an account's sending addresses: (account, identity).
+    RemoveIdentity(String, String),
+    /// Switches the address being edited between the mailbox's outgoing
+    /// server and one of its own.
+    ToggleIdentityServer,
+    SaveIdentity,
+    CancelIdentity,
     /// Asks before deleting messages for good.
     DeleteForever(Vec<String>),
     /// Asks before emptying an account's Trash or Spam.
@@ -626,7 +689,7 @@ enum Action {
     /// Puts back a message whose sending was delayed for undo.
     UndoSend(u64),
     SetComposeOptions(ComposeOptions),
-    /// Lists All Mail when there are several accounts.
+    /// Lists All Accounts when there are several accounts.
     SetAllMail(bool),
     /// The service picked in Forwarding settings' add form.
     ForwardingService(ForwardingService),
@@ -699,6 +762,18 @@ enum Action {
     PlaceSettings(SettingsPlace),
     ClosePresets,
     Dismiss,
+    /// Asks when to bring messages back: these, or the selection (empty).
+    SnoozeMenu(Vec<String>),
+    /// Brings a snoozed message back now: (account, Message-ID).
+    Unsnooze(String, String),
+    /// Searches the open mailbox on the server for what is typed.
+    SearchServer,
+    /// Back to searching the mail on this computer.
+    ClearServerSearch,
+    /// Answers a read receipt request: (message, send it).
+    Receipt(String, bool),
+    /// Server-side filters and vacation replies in an account's Settings.
+    Filters(filters::FilterAction),
 }
 
 /// A conversation's rows for one message at one list revision.
@@ -789,6 +864,10 @@ pub struct MailApp {
     active: bool,
     last_check: HashMap<String, std::time::Instant>,
     account_issues: HashMap<String, HashMap<IssueSource, AccountIssue>>,
+    /// Warnings dismissed in Settings, by account and source, with what
+    /// they said: the same failure again stays hidden until that check
+    /// succeeds or fails some other way.
+    dismissed_issues: HashMap<String, HashMap<IssueSource, String>>,
     sync_requests: HashSet<(String, String)>,
     downloading: HashSet<String>,
     retrying: HashSet<String>,
@@ -809,6 +888,15 @@ pub struct MailApp {
     sign_in_retry: bool,
     /// How far the running sign-in has come, followed from the backend.
     sign_in_step: SignInStep,
+    /// Whether this build offers Proton without Bridge (Direct): it needs
+    /// Proton's app token or version. Without it, Proton Mail is Bridge.
+    proton_direct: bool,
+    /// The Proton sign-in's step after the password, while it has one.
+    proton_stage: Option<ProtonStage>,
+    /// The way a security key or passkey is being used, while it is.
+    key_method: Option<KeyMethod>,
+    /// What that key or phone waits for, followed from the backend.
+    key_prompt: KeyPrompt,
     cancel: Arc<AtomicBool>,
     onboarding: bool,
     step: Step,
@@ -835,6 +923,11 @@ pub struct MailApp {
     /// The account page's sign-in name and Reply-To fields.
     login_input: Entity<InputState>,
     reply_to_input: Entity<InputState>,
+    /// The sending address being added or changed in Settings, if any.
+    identity_edit: Option<settings::IdentityEdit>,
+    /// Its fields: address, name, Reply-To, server, port, sign-in name and
+    /// password.
+    identity_inputs: [Entity<InputState>; 7],
     /// A sign-in name being typed and not yet applied: (account, name).
     /// Each change signs the account out, so it applies once typing pauses
     /// or ends, not on every key; see `apply_login`.
@@ -907,7 +1000,7 @@ pub struct MailApp {
     /// What the Original Message window shows.
     source_view: SourceView,
     /// The open subscriptions list (in place of the message list), for an
-    /// account or All Mail's id, and what it lists.
+    /// account or All Accounts' id, and what it lists.
     subs_open: bool,
     subs: Vec<MailSubscription>,
     subs_loading: bool,
@@ -924,9 +1017,28 @@ pub struct MailApp {
     deleting_folders: HashSet<(String, String)>,
     /// Accounts whose drafts are being synced with the server now.
     draft_syncs: HashSet<String>,
-    /// Inbox watchers (IDLE) send their account's id here when the server
-    /// reports a change.
-    pushed: futures::channel::mpsc::UnboundedSender<String>,
+    /// Scheduled drafts being sent now (Send Later).
+    scheduled_sending: HashSet<String>,
+    /// Scheduled drafts that couldn't reach their server, and when to try
+    /// them again.
+    scheduled_retry: HashMap<String, std::time::Instant>,
+    /// The date and time picker of the open dialog (Snooze).
+    picker: Option<Entity<DateTimePicker>>,
+    picker_subscription: Option<Subscription>,
+    /// Each account's snoozed messages.
+    snoozed: HashMap<String, Vec<crate::manage::backend::Snoozed>>,
+    /// Accounts whose snoozed messages are being brought back now.
+    waking: HashSet<String>,
+    /// A search of the whole mailbox on the server.
+    server_search: Option<later::ServerSearch>,
+    /// Server-side filters by account, as loaded in Settings.
+    filters: HashMap<String, filters::FiltersUi>,
+    filter_inputs: filters::FilterInputs,
+    /// What each account's server says about itself (METADATA).
+    server_notes: HashMap<String, crate::manage::backend::ServerNotes>,
+    /// Watchers (IDLE, NOTIFY) send their account's id and the mailbox
+    /// here when the server reports a change.
+    pushed: futures::channel::mpsc::UnboundedSender<(String, Mailbox)>,
     /// When each account's drafts were last synced.
     draft_synced: HashMap<String, std::time::Instant>,
     /// The name in the new label dialog.
@@ -963,13 +1075,37 @@ pub struct MailApp {
     unlock_errors: HashMap<String, String>,
     /// Alias forwarding services and their aliases.
     forwarding: Vec<ForwardingAccount>,
-    /// All Mail is listed when there are several accounts.
+    /// All Accounts is listed when there are several accounts.
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
+    /// Local AI and its sign-in code hiding (Settings → Local AI).
+    local_ai: bool,
+    hide_codes: bool,
+    /// The sign-in code model, loaded while codes are hidden.
+    otp: Option<Rc<crate::manage::local_ai::otp::Detector>>,
+    /// Codes found per message, with the lengths of the subject and text
+    /// they were found in.
+    otp_found: std::cell::RefCell<HashMap<String, ai::Found>>,
+    /// Messages whose codes were shown on request.
+    codes_shown: HashSet<String>,
+    /// A model downloading, and why the last download or load failed.
+    model_busy: bool,
+    model_error: Option<String>,
+    /// Bytes of the model downloaded so far.
+    model_progress: Arc<std::sync::atomic::AtomicU64>,
+    /// The model whose deletion is being confirmed over Settings.
+    model_confirm: Option<String>,
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
+    /// The contacts SimpleLogin reverse aliases stand for, shown in their
+    /// place on mail of a mailbox kept to its aliases (see
+    /// `fwd::reverse_contacts`).
+    reverse_contacts: Arc<HashMap<String, String>>,
+    /// Aliases whose contacts were fetched this session to name the
+    /// reverse aliases on mail being read.
+    contacts_fetched: HashSet<String>,
     /// What the open view lists: its mailboxes and address filters.
     scope: fwd::Scope,
     /// Forwarding settings' add form, and the work running there.
@@ -1038,7 +1174,10 @@ impl MailApp {
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
         let alias_routes = fwd::routes(&store);
+        let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        let local_ai = crate::manage::local_ai::enabled(&store);
+        let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         if clean_links {
             crate::manage::tracking::warm_up();
         }
@@ -1066,11 +1205,17 @@ impl MailApp {
             "smtp.example.com",
             "587",
             "Same as the email address",
+            "123456",
+            "Mailbox password",
+            "PIN",
         ];
         let form: Vec<_> = placeholders
             .iter()
             .enumerate()
-            .map(|(i, p)| input(p, false, i == PASSWORD, window, cx))
+            .map(|(i, p)| {
+                let masked = matches!(i, PASSWORD | MAILBOX_PASSWORD | KEY_PIN);
+                input(p, false, masked, window, cx)
+            })
             .collect();
         let mut subscriptions = vec![];
         for state in &form {
@@ -1088,6 +1233,9 @@ impl MailApp {
             }));
         }
         subscriptions.extend([cx.subscribe(&search, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.search_server(cx);
+            }
             if matches!(event, InputEvent::Change) {
                 // A new search lists other mail: start from its top rather
                 // than keeping the place in the old list.
@@ -1096,6 +1244,7 @@ impl MailApp {
                 cx.notify();
             }
         })]);
+        let filter_inputs = filters::FilterInputs::new(window, cx);
         let rename_input = input("Folder name", false, false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
@@ -1343,17 +1492,26 @@ impl MailApp {
                 }
             }
         }));
+        let identity_inputs = [
+            input("name@example.com", false, false, window, cx),
+            input("Your name, as recipients see it", false, false, window, cx),
+            input("Replies come to this address", false, false, window, cx),
+            input("smtp.example.com", false, false, window, cx),
+            input("587", false, false, window, cx),
+            input("Same as the address", false, false, window, cx),
+            input("Password or app password", false, true, window, cx),
+        ];
         let html_view = cx.new(HtmlView::new);
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
                 this.html_menu(menu, cx)
             }),
         );
-        let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<String>();
+        let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<(String, Mailbox)>();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
-            while let Some(id) = pushes.next().await {
-                if this.update(cx, |this, cx| this.on_push(id, cx)).is_err() {
+            while let Some((id, mailbox)) = pushes.next().await {
+                if this.update(cx, |this, cx| this.on_push(id, mailbox, cx)).is_err() {
                     break;
                 }
             }
@@ -1420,6 +1578,7 @@ impl MailApp {
             active: true,
             last_check: HashMap::new(),
             account_issues: HashMap::new(),
+            dismissed_issues: HashMap::new(),
             sync_requests: HashSet::new(),
             downloading: HashSet::new(),
             retrying: HashSet::new(),
@@ -1436,6 +1595,10 @@ impl MailApp {
             connecting: false,
             sign_in_retry: false,
             sign_in_step: SignInStep::Browser,
+            proton_direct: crate::sync::proton::available(),
+            proton_stage: None,
+            key_method: None,
+            key_prompt: KeyPrompt::Idle,
             cancel: Arc::new(AtomicBool::new(false)),
             onboarding,
             step: Step::Welcome,
@@ -1455,6 +1618,8 @@ impl MailApp {
             nickname_input,
             login_input,
             reply_to_input,
+            identity_edit: None,
+            identity_inputs,
             login_pending: None,
             login_revision: 0,
             quotas: HashMap::new(),
@@ -1504,6 +1669,8 @@ impl MailApp {
             subs_busy: HashSet::new(),
             deleting_folders: HashSet::new(),
             draft_syncs: HashSet::new(),
+            scheduled_sending: HashSet::new(),
+            scheduled_retry: HashMap::new(),
             pushed,
             draft_synced: HashMap::new(),
             label_input,
@@ -1532,7 +1699,18 @@ impl MailApp {
             forwarding,
             all_mail,
             alias_routes,
+            reverse_contacts,
+            contacts_fetched: HashSet::new(),
             clean_links,
+            local_ai,
+            hide_codes,
+            otp: None,
+            otp_found: Default::default(),
+            codes_shown: HashSet::new(),
+            model_busy: false,
+            model_error: None,
+            model_progress: Arc::default(),
+            model_confirm: None,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -1561,8 +1739,17 @@ impl MailApp {
             fwd_contact_page: 0,
             fwd_open: HashSet::new(),
             fwd_adding: false,
+            picker: None,
+            picker_subscription: None,
+            snoozed: HashMap::new(),
+            waking: HashSet::new(),
+            server_search: None,
+            filters: HashMap::new(),
+            filter_inputs,
+            server_notes: HashMap::new(),
         };
         this.update_scope();
+        this.load_snoozed();
         this.load_unsubscribed();
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
@@ -1587,12 +1774,15 @@ impl MailApp {
         for a in this.accounts.clone() {
             this.load_avatar(a, cx);
         }
+        this.start_local_ai(cx);
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_secs(20)).await;
                 let checked = this.update(cx, |this, cx| {
                     this.watch_inboxes();
                     this.check_due(cx);
+                    this.send_due(cx);
+                    this.wake_snoozed(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
                 });
                 if checked.is_err() {
@@ -1609,7 +1799,7 @@ impl MailApp {
     fn account_of(&self, m: &Mail) -> Option<Account> {
         self.accounts.iter().find(|a| a.id == m.account).cloned()
     }
-    /// The open mailbox's account. In All Mail or an alias's view, the
+    /// The open mailbox's account. In All Accounts or an alias's view, the
     /// first mailbox it draws from, which new messages are sent from.
     fn current_account(&self) -> Option<Account> {
         let id = self.account.as_ref()?;
@@ -1677,6 +1867,10 @@ impl MailApp {
     fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
         let search = crate::manage::search::Search::parse(&query);
+        let server = self
+            .current_server_search(Self::value(&self.search, cx).trim())
+            .filter(|s| !s.running && s.error.is_none())
+            .map(|s| s.ids.clone());
         let filter = self.filter_by;
         let open = self.selected.clone();
         self.visible = self
@@ -1693,7 +1887,11 @@ impl MailApp {
                 Filter::Starred => m.starred,
                 Filter::Attachments => m.has_attachments(),
             })
-            .filter(|(_, m)| search.matches(m))
+            .filter(|(_, m)| match &server {
+                // Found by the server's search, in its own syntax.
+                Some(ids) => ids.contains(&m.id),
+                None => search.matches(m),
+            })
             // Views leave out mail of aliases shown on their own, or list
             // only an alias's mail.
             // A subscription's mail is listed whole, as its counts are.
@@ -1822,23 +2020,47 @@ impl MailApp {
                 continue;
             }
             let (pushed, id) = (self.pushed.clone(), a.id.clone());
-            self.backend
-                .watch_inbox(a, move || drop(pushed.unbounded_send(id.clone())));
+            self.backend.watch_inbox(a, move |mailbox| {
+                drop(pushed.unbounded_send((id.clone(), mailbox)))
+            });
+        }
+        self.watch_open_folder();
+    }
+    /// Pushes the mailbox open in the window too (IDLE on a connection of
+    /// its own), unless its account's inbox watcher already hears about
+    /// every mailbox (NOTIFY). Other accounts' folder watches end.
+    fn watch_open_folder(&mut self) {
+        let open = self
+            .account
+            .clone()
+            .filter(|id| !fwd::is_view(id))
+            .filter(|_| !self.folder.is_virtual() && self.folder != Folder::Drafts);
+        for a in self.accounts.iter().filter(|a| !a.incoming_host.is_empty()) {
+            let mailbox = (open.as_ref() == Some(&a.id) && !self.account_blocked(&a.id))
+                .then(|| self.mailbox());
+            let (pushed, id) = (self.pushed.clone(), a.id.clone());
+            self.backend.watch_folder(a, mailbox, move |mailbox| {
+                drop(pushed.unbounded_send((id.clone(), mailbox)))
+            });
         }
     }
-    /// The server reported a change in an account's inbox (IDLE): check it
-    /// now, as the regular check would.
-    fn on_push(&mut self, id: String, cx: &mut Context<Self>) {
+    /// The server reported a change in one of an account's mailboxes (IDLE,
+    /// NOTIFY): check it now, as the regular check would.
+    fn on_push(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
         if self.account_blocked(&id) {
             return;
         }
-        if self.account.as_ref() == Some(&id) && self.folder == Folder::Inbox {
+        let open = self.shows(&id) && self.mailbox() == mailbox;
+        if open && self.account.as_ref() == Some(&id) {
             self.refresh(cx);
-        } else {
+        } else if mailbox == Mailbox::Standard(Folder::Inbox) {
             self.check_inbox(a, cx);
+        } else if mailbox.folder() != Folder::Drafts {
+            // Other mailboxes keep their counts current.
+            self.sync_mailbox(a, mailbox, 100, cx);
         }
     }
     fn check_inbox(&mut self, a: Account, cx: &mut Context<Self>) {
@@ -1864,9 +2086,11 @@ impl MailApp {
             return;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
+            // A sign-in code in the subject isn't shown on the lock screen.
+            let subject = self.hide_codes(latest, &latest.subject);
             crate::display::notify::new_mail(
                 &a.email,
-                (&latest.sender, &latest.subject),
+                (&latest.sender, &subject),
                 fresh.len(),
             );
         }
@@ -2431,6 +2655,7 @@ impl MailApp {
                     "trash",
                     Action::ApplySelection(Change::Move(Folder::Trash)),
                 ),
+                entry(format!("Snooze {n}…"), "snooze", Action::SnoozeMenu(vec![])),
             ]
             .into_iter()
             .chain(self.move_folder_entry(format!("Move {n} to Folder…"), MoveTarget::Selection))
@@ -2466,6 +2691,11 @@ impl MailApp {
             entry("Reply", "reply", Action::ReplyTo(m.id.clone(), 1)),
             entry("Reply All", "reply-all", Action::ReplyTo(m.id.clone(), 2)),
             entry("Forward", "forward", Action::ReplyTo(m.id.clone(), 3)),
+            entry(
+                "Forward as Attachment",
+                "paperclip",
+                Action::ReplyTo(m.id.clone(), 4),
+            ),
             Entry::Separator,
             if m.unread {
                 entry(
@@ -2514,6 +2744,19 @@ impl MailApp {
                 "trash",
                 Action::Apply(ids.clone(), Change::Move(Folder::Trash)),
             ));
+        }
+        if self.account_of(m).is_some_and(|a| a.provider != Provider::Pop3) {
+            match self.snoozed_until(m) {
+                Some(_) => entries.push(entry(
+                    "Unsnooze",
+                    "inbox",
+                    Action::Unsnooze(m.account.clone(), m.message_id.clone()),
+                )),
+                None if !matches!(m.folder, Folder::Drafts | Folder::Sent) => {
+                    entries.push(entry("Snooze…", "snooze", Action::SnoozeMenu(ids.clone())))
+                }
+                None => {}
+            }
         }
         entries.extend(self.move_folder_entry("Move to Folder…", MoveTarget::Mail(ids.clone())));
         entries.extend(self.label_entry("Labels…", MoveTarget::Mail(ids.clone())));
@@ -2791,6 +3034,7 @@ impl MailApp {
         self.filter_by = Filter::All;
         Self::set(&self.search, "", w, cx);
         self.search_open = false;
+        self.server_search = None;
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
@@ -2805,6 +3049,8 @@ impl MailApp {
                 .filter(|m| {
                     if folder == Folder::Starred {
                         m.starred
+                    } else if folder == Folder::All {
+                        m.folder != Folder::Drafts
                     } else {
                         m.folder == folder
                     }
@@ -2828,6 +3074,7 @@ impl MailApp {
             });
         }
         self.save_place();
+        self.watch_open_folder();
         self.anim += 1;
         cx.notify();
     }
@@ -2897,8 +3144,26 @@ impl MailApp {
                                 } else {
                                     d.subject.clone()
                                 },
-                                snippet: d.body.clone(),
-                                date: chrono::Utc::now().timestamp(),
+                                // Scheduled ones say when they go, or why
+                                // they didn't.
+                                snippet: match d.send_at {
+                                    Some(at) => {
+                                        let when = crate::manage::composing::describe_later(
+                                            at,
+                                            chrono::Local::now(),
+                                        );
+                                        if d.send_error.is_empty() {
+                                            format!("Scheduled to send {when} · {}", d.body)
+                                        } else {
+                                            format!(
+                                                "Not sent {when}: {} · {}",
+                                                d.send_error, d.body
+                                            )
+                                        }
+                                    }
+                                    None => d.body.clone(),
+                                },
+                                date: d.send_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
                                 unread: false,
                                 starred: false,
                                 size: 0,
@@ -2916,6 +3181,7 @@ impl MailApp {
                                 reply_to: String::new(),
                                 labels: vec![],
                                 inline: Default::default(),
+                                ..Mail::default()
                             })
                             .collect();
                         this.filter(cx);
@@ -2974,6 +3240,8 @@ impl MailApp {
         let Some(m) = self.selected_mail() else {
             return;
         };
+        // Its reverse aliases show as their contacts once those are known.
+        self.learn_contacts(&m, cx);
         // Opening marks the message read immediately; the server catches up.
         for m in self
             .messages
@@ -3080,6 +3348,8 @@ impl MailApp {
         let leaves = match change {
             Change::Move(folder) if self.subs_open => matches!(folder, Folder::Junk | Folder::Trash),
             Change::MoveTo(_) if self.subs_open => false,
+            // All Mail lists every mailbox: moved mail stays where it is.
+            Change::Move(_) | Change::MoveTo(_) if self.folder == Folder::All => false,
             Change::Move(_) | Change::MoveTo(_) => true,
             _ => self.folder == Folder::Starred && change == Change::Star(false),
         };
@@ -3121,6 +3391,10 @@ impl MailApp {
                     this.account_result(&account_id, IssueSource::Change, &result);
                     match result {
                         Ok(()) => {
+                            // Moved mail has new identities in its new mailbox.
+                            if change.moves() && this.folder == Folder::All {
+                                this.reload_cached(cx);
+                            }
                             if let Some(to) = this.destination_label(&account_id, &change) {
                                 this.notice(
                                     if count == 1 {
@@ -3512,7 +3786,10 @@ impl MailApp {
         );
     }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() || self.presets_for.take().is_some() {
+        if self.menu.take().is_some()
+            || self.presets_for.take().is_some()
+            || self.model_confirm.take().is_some()
+        {
             cx.notify();
             return;
         }
@@ -3546,7 +3823,10 @@ impl MailApp {
         self.modal = None;
         self.status.clear();
         self.error = false;
-        Self::set(&self.form[PASSWORD], "", w, cx);
+        self.drop_proton_login(cx);
+        for i in [PASSWORD, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
+            Self::set(&self.form[i], "", w, cx);
+        }
         self.focus.focus(w);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
@@ -3554,7 +3834,8 @@ impl MailApp {
         cx.notify();
     }
     fn begin_setup(&mut self, step: Step, w: &mut Window, cx: &mut Context<Self>) {
-        for i in [EMAIL, PASSWORD, LOGIN] {
+        self.drop_proton_login(cx);
+        for i in [EMAIL, PASSWORD, LOGIN, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
             Self::set(&self.form[i], "", w, cx);
         }
         self.cancel.store(true, Ordering::Relaxed);
@@ -3580,6 +3861,13 @@ impl MailApp {
         if self.connecting {
             return;
         }
+        // Without Direct in this build, Proton Mail is its Bridge sign-in.
+        let service = if service == Service::Proton && !self.proton_direct {
+            Service::ProtonBridge
+        } else {
+            service
+        };
+        self.drop_proton_login(cx);
         self.status.clear();
         self.manual = false;
         self.anim += 1;
@@ -3606,7 +3894,7 @@ impl MailApp {
                 cx,
             );
         }
-        if service.sign_in() == SignIn::Password {
+        if service.sign_in().typed() {
             let field = if Self::value(&self.form[EMAIL], cx).is_empty() {
                 EMAIL
             } else {
@@ -3721,7 +4009,7 @@ impl MailApp {
                 a.email = email.clone();
                 a
             }
-            SignIn::Password => {
+            SignIn::Password | SignIn::Proton => {
                 let mut a = self
                     .service
                     .account(&email)
@@ -3751,6 +4039,9 @@ impl MailApp {
         if self.connecting {
             return;
         }
+        if self.service == Service::Proton {
+            return self.proton_continue(None, cx);
+        }
         let a = self.setup_account(cx);
         let password = Self::value(&self.form[PASSWORD], cx);
         let password = if a.service == Service::Gmail {
@@ -3758,7 +4049,7 @@ impl MailApp {
         } else {
             password
         };
-        if self.service.sign_in() == SignIn::Password {
+        if self.service.sign_in().typed() {
             if let Err(e) = a.validate() {
                 self.notice(e.to_string(), true, cx);
                 return;
@@ -3802,6 +4093,13 @@ impl MailApp {
                         this.sign_in_step = step;
                         cx.notify();
                     }
+                    if this.key_method.is_some() {
+                        let prompt = this.backend.proton_prompt();
+                        if prompt != this.key_prompt {
+                            this.key_prompt = prompt;
+                            cx.notify();
+                        }
+                    }
                     true
                 });
                 if !matches!(running, Ok(true)) {
@@ -3838,32 +4136,7 @@ impl MailApp {
                 }
                 this.connecting = false;
                 match result {
-                    Ok((saved, encrypted)) => {
-                        if encrypted {
-                            this.encrypted.insert(saved.id.clone());
-                        }
-                        this.accounts.push(saved.clone());
-                        this.sync_tree();
-                        this.load_avatar(saved.clone(), cx);
-                        this.account = Some(saved.id.clone());
-                        this.update_scope();
-                        if this.onboarding {
-                            this.step = Step::Done;
-                            this.anim += 1;
-                        } else {
-                            this.notice(format!("Added {}", saved.email), false, cx);
-                        }
-                        this.modal = None;
-                        this.folder = Folder::Inbox;
-                        this.messages.clear();
-                        this.selected = None;
-                        this.load_generation += 1;
-                        this.filter(cx);
-                        if this.onboarding {
-                            this.status.clear();
-                        }
-                        this.refresh(cx);
-                    }
+                    Ok((saved, encrypted)) => this.connected(saved, encrypted, cx),
                     // The whole chain: a bare "Sign-in needs attention" hides
                     // whether the token step or the mail server refused.
                     Err(e) => {
@@ -3873,6 +4146,33 @@ impl MailApp {
                 }
             },
         );
+    }
+    /// Shows a newly added account and starts syncing it.
+    pub(super) fn connected(&mut self, saved: Account, encrypted: bool, cx: &mut Context<Self>) {
+        if encrypted {
+            self.encrypted.insert(saved.id.clone());
+        }
+        self.accounts.push(saved.clone());
+        self.sync_tree();
+        self.load_avatar(saved.clone(), cx);
+        self.account = Some(saved.id.clone());
+        self.update_scope();
+        if self.onboarding {
+            self.step = Step::Done;
+            self.anim += 1;
+        } else {
+            self.notice(format!("Added {}", saved.email), false, cx);
+        }
+        self.modal = None;
+        self.folder = Folder::Inbox;
+        self.messages.clear();
+        self.selected = None;
+        self.load_generation += 1;
+        self.filter(cx);
+        if self.onboarding {
+            self.status.clear();
+        }
+        self.refresh(cx);
     }
     /// Repeats the step after the browser that failed, in the open setup or
     /// sign-in-again form.
@@ -4303,12 +4603,9 @@ impl MailApp {
                     self.selection.clear();
                     self.select_mode = false;
                 } else if self.folder != Folder::Drafts {
+                    // Nothing is picked until a message is clicked; the open
+                    // one isn't taken for a pick.
                     self.select_mode = true;
-                    // The open message is the likely first pick.
-                    if let Some(open) = self.selected.clone() {
-                        self.selection.insert(open.clone());
-                        self.select_anchor = Some(open);
-                    }
                 }
             }
             Action::SelectFromSender(id) => {
@@ -4413,6 +4710,19 @@ impl MailApp {
             Action::ToggleDeliveryReceipts(id) => {
                 self.edit_account(&id, |a| a.delivery_receipts = !a.delivery_receipts, cx)
             }
+            Action::ToggleRequireTls(id) => {
+                self.edit_account(&id, |a| a.require_tls = !a.require_tls, cx)
+            }
+            Action::AddIdentity(account) => self.start_identity(account, None, w, cx),
+            Action::EditIdentity(account, id) => self.start_identity(account, Some(id), w, cx),
+            Action::RemoveIdentity(account, id) => self.remove_identity(account, id, cx),
+            Action::ToggleIdentityServer => {
+                if let Some(edit) = &mut self.identity_edit {
+                    edit.own_server = !edit.own_server;
+                }
+            }
+            Action::SaveIdentity => self.save_identity(cx),
+            Action::CancelIdentity => self.identity_edit = None,
             Action::DeleteForever(ids) => {
                 if !ids.is_empty() {
                     self.modal = Some(Modal::Erase(Erase::Mail(ids)));
@@ -4479,6 +4789,7 @@ impl MailApp {
                 let entries = self.subscription_entries(&sub);
                 self.open_menu(w.mouse_position(), entries, cx);
             }
+            Action::SetupBack if self.proton_stage.is_some() => self.proton_back(w, cx),
             Action::SetupBack => {
                 self.sign_in_retry = false;
                 self.backend.forget_sign_in();
@@ -4606,6 +4917,7 @@ impl MailApp {
                 }
             }
             Action::RetryAccount(id) => self.retry_account(id, cx),
+            Action::DismissIssue(id, source) => self.dismiss_issue(&id, source),
             Action::Reconnect(id) => {
                 if self.retrying.contains(&id) {
                     return;
@@ -4615,11 +4927,27 @@ impl MailApp {
                 self.sign_in_retry = false;
                 self.backend.forget_sign_in();
                 self.status.clear();
-                Self::set(&self.form[PASSWORD], "", w, cx);
+                self.drop_proton_login(cx);
+                for i in [PASSWORD, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
+                    Self::set(&self.form[i], "", w, cx);
+                }
                 self.modal = Some(Modal::Reconnect(id));
                 self.anim += 1;
             }
             Action::SubmitReconnect(id) => self.reconnect(id, w, cx),
+            Action::ProtonKey(method) => {
+                let reconnect = self.proton_reconnecting();
+                self.proton_use_key(method, reconnect, cx)
+            }
+            Action::ProtonMode(service) => {
+                if !self.connecting
+                    && self.service != service
+                    && (service != Service::Proton || self.proton_direct)
+                {
+                    self.choose_service(service, w, cx)
+                }
+            }
+            Action::ProtonBack => self.proton_back(w, cx),
             Action::AccountSettings(id) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
                 self.fwd_reverse = None;
@@ -4668,6 +4996,15 @@ impl MailApp {
                 self.backend.store.set_preference_soon("accent", accent.key());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
+            Action::SetLocalAi(on) => self.set_local_ai(on, cx),
+            Action::SetHideCodes(on) => self.set_hide_codes(on, cx),
+            Action::ShowCodes(id, show) => self.show_codes(id, show, cx),
+            Action::CopyCode(id) => self.copy_code(id, cx),
+            Action::AskDeleteModel(id) => self.ask_delete_model(id, cx),
+            Action::DeleteModel(id) => self.delete_model(id, cx),
+            Action::CloseModelSheet => {
+                self.model_confirm = None;
+            }
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
                 if on {
@@ -4817,7 +5154,7 @@ impl MailApp {
                 if self.step == Step::Credentials
                     && (self.onboarding || self.modal == Some(Modal::Connect))
                 {
-                    if self.service.sign_in() == SignIn::Password {
+                    if self.service.sign_in().typed() {
                         self.connect(cx)
                     } else {
                         // Try the browser again after an error or a closed tab.
@@ -4845,6 +5182,7 @@ impl MailApp {
                                 this.forget_mailbox(&id);
                                 this.sync_tree();
                                 this.account_issues.remove(&id);
+                                this.dismissed_issues.remove(&id);
                                 this.folders.remove(&id);
                                 this.known.remove(&id);
                                 this.last_check.remove(&id);
@@ -5000,6 +5338,15 @@ impl MailApp {
             Action::PlaceSettings(place) => self.place_settings(place, w, cx),
             Action::ClosePresets => self.presets_for = None,
             Action::Dismiss => self.status.clear(),
+            Action::SnoozeMenu(ids) => self.snooze_menu(ids, w, cx),
+            Action::Unsnooze(account, message_id) => self.unsnooze(account, message_id, cx),
+            Action::SearchServer => self.search_server(cx),
+            Action::ClearServerSearch => {
+                self.server_search = None;
+                self.apply_filter(cx);
+            }
+            Action::Receipt(id, send) => self.answer_receipt(id, send, cx),
+            Action::Filters(action) => self.filter_action(action, w, cx),
         }
         self.sync_selecting();
         cx.notify();
@@ -5042,6 +5389,153 @@ impl MailApp {
             self.download_account(account, cx);
         }
         self.refresh_counts(cx);
+    }
+    /// Opens the form for a new sending address of `account`, or for
+    /// changing one (`id`).
+    fn start_identity(
+        &mut self,
+        account: String,
+        id: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = id.as_ref().and_then(|id| {
+            self.accounts
+                .iter()
+                .find(|a| a.id == account)?
+                .identity(id)
+                .cloned()
+        });
+        let i = existing.clone().unwrap_or_default();
+        let server = i.smtp.clone().unwrap_or_default();
+        let values = [
+            i.email.clone(),
+            i.name.clone(),
+            i.reply_to.clone(),
+            server.host.clone(),
+            if server.port == 0 {
+                "587".into()
+            } else {
+                server.port.to_string()
+            },
+            server.username.clone(),
+            String::new(),
+        ];
+        for (input, value) in self.identity_inputs.clone().iter().zip(values) {
+            Self::set(input, value, w, cx);
+        }
+        self.identity_edit = Some(settings::IdentityEdit {
+            account,
+            id: existing.map(|i| i.id),
+            own_server: i.smtp.is_some(),
+            had_password: i.smtp.is_some(),
+            saving: false,
+            error: None,
+        });
+        let first = self.identity_inputs[0].clone();
+        first.update(cx, |s, cx| s.focus(w, cx));
+    }
+    /// Checks and saves the sending address being edited, signing in to
+    /// its own server first if it has one.
+    fn save_identity(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.identity_edit.clone() else {
+            return;
+        };
+        if edit.saving {
+            return;
+        }
+        let value = |i: usize| Self::value(&self.identity_inputs[i], cx).trim().to_owned();
+        let smtp = if edit.own_server {
+            let port = match value(4).parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    self.identity_failed("Enter a port between 1 and 65535.".into(), cx);
+                    return;
+                }
+            };
+            Some(crate::manage::model::OutgoingServer {
+                host: value(3),
+                port,
+                username: value(5),
+            })
+        } else {
+            None
+        };
+        let identity = crate::manage::model::Identity {
+            id: edit
+                .id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            email: value(0),
+            name: value(1),
+            reply_to: value(2),
+            smtp,
+        };
+        if let Err(e) = identity.validate() {
+            self.identity_failed(e.to_string(), cx);
+            return;
+        }
+        let password = Self::value(&self.identity_inputs[6], cx).to_string();
+        if edit.own_server && password.is_empty() && !edit.had_password {
+            self.identity_failed("Enter the password for its outgoing server.".into(), cx);
+            return;
+        }
+        if let Some(e) = &mut self.identity_edit {
+            e.saving = true;
+            e.error = None;
+        }
+        let account = edit.account.clone();
+        let password = (!password.is_empty()).then_some(password);
+        self.task(
+            cx,
+            move |b| b.save_identity(&account, identity, password),
+            move |this, result, cx| match result {
+                Ok(a) => {
+                    this.identity_edit = None;
+                    this.account_saved(a, cx);
+                    this.notice("Address saved.", false, cx);
+                }
+                Err(e) => this.identity_failed(format!("{e:#}"), cx),
+            },
+        );
+    }
+    fn identity_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(e) = &mut self.identity_edit {
+            e.saving = false;
+            e.error = Some(error);
+        }
+        cx.notify();
+    }
+    fn remove_identity(&mut self, account: String, id: String, cx: &mut Context<Self>) {
+        if self
+            .identity_edit
+            .as_ref()
+            .is_some_and(|e| e.id.as_deref() == Some(id.as_str()))
+        {
+            self.identity_edit = None;
+        }
+        self.task(
+            cx,
+            move |b| b.remove_identity(&account, &id),
+            |this, result, cx| match result {
+                Ok(a) => this.account_saved(a, cx),
+                Err(e) => this.notice(format!("{e:#}"), true, cx),
+            },
+        );
+    }
+    /// Takes an account as the backend saved it, here and in open composers.
+    fn account_saved(&mut self, a: Account, cx: &mut Context<Self>) {
+        if let Some(existing) = self.accounts.iter_mut().find(|x| x.id == a.id) {
+            *existing = a;
+        }
+        let accounts = self.accounts.clone();
+        for composer in self.composers.clone() {
+            composer.update(cx, |c, cx| {
+                c.set_accounts(accounts.clone());
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
     /// Saves an account's nickname; an empty one goes back to its name.
     /// Changes an account's settings and saves them.
@@ -5130,7 +5624,9 @@ impl MailApp {
         if !same {
             self.nickname_for = Some(id.clone());
             self.load_quota(&id, cx);
+            self.load_account_extras(&id, cx);
         }
+        self.populate_filter_inputs(&id, w, cx);
         let inputs = [
             self.nickname_input.clone(),
             self.login_input.clone(),
@@ -5280,7 +5776,8 @@ impl MailApp {
         })
     }
     fn unread_for(&self, account: &str, mailbox: &Mailbox) -> usize {
-        if mailbox == &Mailbox::Standard(Folder::Starred) {
+        // Starred and All Mail show no count: their mail is counted where it is.
+        if mailbox.folder().is_virtual() {
             return 0;
         }
         self.unread
@@ -5764,7 +6261,7 @@ impl MailApp {
             })
     }
     /// Accounts the open mailbox is still being fetched from: a sync, a
-    /// sign-in retry or a listing in flight. A view (All Mail, an alias)
+    /// sign-in retry or a listing in flight. A view (All Accounts, an alias)
     /// lists several accounts, each fetched on its own.
     fn fetching_accounts(&self) -> Vec<&Account> {
         if self.account.is_none() || self.folder == Folder::Drafts {
@@ -5944,7 +6441,7 @@ impl MailApp {
         }
         let loaded = self.loaded_unread;
         match &self.account {
-            Some(id) if self.folder != Folder::Starred => {
+            Some(id) if !self.folder.is_virtual() => {
                 self.unread_for(id, &self.mailbox()).max(loaded)
             }
             _ => loaded,
@@ -6136,6 +6633,7 @@ impl MailApp {
             if Self::value(&self.search, cx).trim().is_empty() {
                 header = header.child(self.search_hints(cx));
             }
+            header = header.children(self.server_search_bar(cx));
         }
         if self.selecting {
             header = header.child(
@@ -6306,6 +6804,20 @@ impl MailApp {
                     "trash",
                     Change::Move(Folder::Trash),
                 ))
+                .child(
+                    self.button(
+                        "bulk-snooze",
+                        "@Snooze until…",
+                        "snooze",
+                        Action::SnoozeMenu(vec![]),
+                        false,
+                        cx,
+                    )
+                    .h(px(28.))
+                    .w(px(28.))
+                    .rounded(px(7.))
+                    .bg(rgb(c.soft)),
+                )
             })
             .child(
                 self.button(
@@ -6499,8 +7011,15 @@ impl MailApp {
                                     } else {
                                         FontWeight::NORMAL
                                     })
-                                    .child(m.subject.clone()),
+                                    .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
+                            // Replied to, forwarded (here or in other apps)
+                            // and snoozed.
+                            .when(m.answered, |d| d.child(icon_el("answered", 13., c.muted)))
+                            .when(m.forwarded, |d| d.child(icon_el("forwarded", 13., c.muted)))
+                            .when(self.snoozed_until(m).is_some(), |d| {
+                                d.child(icon_el("snooze", 13., c.accent))
+                            })
                             .when(m.has_attachments(), |d| {
                                 d.child(icon_el("paperclip", 13., c.muted))
                             })
@@ -6544,7 +7063,7 @@ impl MailApp {
                             .truncate()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child(preview(&m.snippet)),
+                            .child(preview(&self.hide_codes(m, &m.snippet))),
                     ),
             )
             .on_mouse_down(MouseButton::Right, {
@@ -6672,7 +7191,7 @@ impl MailApp {
             Service::ICloud => "icloud",
             Service::Fastmail => "fastmail",
             Service::Zoho => "zoho",
-            Service::ProtonBridge => "proton",
+            Service::ProtonBridge | Service::Proton => "proton",
             _ => "other",
         };
         div()
@@ -6809,7 +7328,20 @@ impl MailApp {
                 .child(self.field("Email address", EMAIL))
                 .into_any_element();
         }
+        // Proton's steps after the password replace the form.
+        if self.service == Service::Proton
+            && let Some(step) = self.proton_step_view(false, cx)
+        {
+            return step;
+        }
         let mut content = div().flex().flex_col().gap_4();
+        if matches!(self.service, Service::Proton | Service::ProtonBridge) {
+            content = content.child(if self.proton_direct {
+                self.proton_tabs(cx)
+            } else {
+                notice_box(crate::sync::proton::UNAVAILABLE, c)
+            });
+        }
         if self.service == Service::Other {
             let email = Self::value(&self.form[EMAIL], cx);
             content = content.child(
@@ -6884,16 +7416,30 @@ impl MailApp {
                     .child(help)
                     .child(
                         div().flex().child(
-                            self.link("password-help", "Make one now", Action::OpenLink(url), cx)
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(icon_el("external-link", 12., c.accent)),
+                            self.link(
+                                "password-help",
+                                if self.service == Service::Proton {
+                                    "Open your Proton account"
+                                } else {
+                                    "Make one now"
+                                },
+                                Action::OpenLink(url),
+                                cx,
+                            )
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(icon_el(
+                                "external-link",
+                                12.,
+                                c.accent,
+                            )),
                         ),
                     ),
             );
         }
-        if !self.manual {
+        // Proton's API has no server settings to change.
+        if !self.manual && self.service != Service::Proton {
             content = content.child(div().flex().justify_end().child(self.link(
                 "setup-manual",
                 "Server settings",
@@ -6953,7 +7499,7 @@ impl MailApp {
                     ("Reply all", "⌘ ⌥ R"),
                     ("Forward", "⌘ ⇧ F"),
                     ("Mark read / unread", "⌘ ⇧ U"),
-                    ("Go to Inbox … Trash", "⌘ 1 … ⌘ 7"),
+                    ("Go to Inbox … All Mail", "⌘ 1 … ⌘ 8"),
                     ("Settings", "⌘ ,"),
                     ("Star message", "⌘ ⇧ S"),
                     ("Archive message", "⌘ ⇧ A"),
@@ -6994,7 +7540,7 @@ impl MailApp {
     fn setup_view(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let in_modal = self.modal == Some(Modal::Connect);
-        let browser = self.service.sign_in() != SignIn::Password;
+        let browser = !self.service.sign_in().typed();
         let label = self.service.label();
         let (title, subtitle): (String, String) = match self.step {
             Step::Welcome => (
@@ -7019,6 +7565,13 @@ impl MailApp {
                     "Sign in with your browser. Picacho never sees your password.".into()
                 },
             ),
+            // Proton's steps after the password name themselves.
+            Step::Credentials
+                if self.service == Service::Proton && self.proton_heading().is_some() =>
+            {
+                let (title, about) = self.proton_heading().unwrap_or_default();
+                (title.into(), about.into())
+            }
             Step::Credentials => (
                 if self.service == Service::Other {
                     "Sign in".into()
@@ -7073,9 +7626,12 @@ impl MailApp {
         } else {
             400.
         };
+        // A fixed width (narrower windows shrink it), not a share of the
+        // parent: measured as a share, the wrapped text in the form came
+        // out taller than it is, leaving empty space to scroll into.
         let mut card = div()
-            .w_full()
-            .max_w(px(width))
+            .w(px(width))
+            .max_w_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -7148,6 +7704,12 @@ impl MailApp {
             ),
             Step::Provider => None,
             Step::Credentials if browser && self.connecting => None,
+            // A security key alone: its own buttons.
+            Step::Credentials
+                if self.service == Service::Proton && self.proton_submit_label().is_none() =>
+            {
+                None
+            }
             Step::Credentials if self.sign_in_retry => Some(
                 self.button("setup-retry", "Retry", "", Action::RetrySignIn, true, cx)
                     .min_w(px(120.))
@@ -7167,6 +7729,9 @@ impl MailApp {
             Step::Provider if !in_modal => Some("Back"),
             Step::Email | Step::Credentials => Some(if self.connecting {
                 "Cancel"
+            } else if self.proton_stage.is_some() {
+                // Back to the password (SetupBack leaves Proton's step).
+                "Back"
             } else {
                 "Choose another provider"
             }),
@@ -7205,7 +7770,7 @@ impl MailApp {
                 cx,
             ));
         }
-        card.child(actions)
+        card.child(actions.debug_selector(|| "setup-actions".into()))
             .with_animation(
                 ("onboard-step", self.anim),
                 Animation::new(Duration::from_millis(320)).with_easing(|t| 1. - (1. - t).powi(3)),
@@ -7281,7 +7846,8 @@ impl MailApp {
                             .w_full()
                             .flex_shrink_0()
                             .flex()
-                            .justify_center()
+                            .flex_col()
+                            .items_center()
                             .child(self.setup_view(cx)),
                     ),
             )
@@ -7300,17 +7866,23 @@ impl MailApp {
             .child(div().h(px(56.)).flex().items_center().child(dots))
             .into_any_element()
     }
-    fn popup_menu(&self, cx: &Context<Self>) -> AnyElement {
+    fn popup_menu(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let Some(menu) = &self.menu else {
             return div().into_any_element();
         };
+        // The whole menu fits in the window where it can: rows get shorter
+        // when there are many, and only a menu that still doesn't fit (a
+        // long folder list) scrolls.
+        let (height, row) = menu_size(&menu.entries, f32::from(window.viewport_size().height));
         let mut panel = div()
             .id("menu-panel")
             .min_w(px(200.))
-            // A long folder list scrolls rather than run off the window.
-            .max_h(px(520.))
+            .max_h(px(height))
             .overflow_y_scroll()
+            // Scrolling the menu scrolls it, rather than closing it as a
+            // scroll elsewhere does.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             // Long addresses end in an ellipsis rather than widen the menu.
             .max_w(px(380.))
             .p_1()
@@ -7355,7 +7927,7 @@ impl MailApp {
                             .id(("menu-item", i))
                             .debug_selector(|| format!("menu-item-{i}"))
                             .flex_shrink_0()
-                            .h(px(28.))
+                            .h(px(row))
                             .px_2()
                             .flex()
                             .items_center()
@@ -7499,9 +8071,16 @@ impl MailApp {
         let busy = self.discovering || self.connecting;
         let (label, action) = if self.step == Step::Credentials {
             (
-                if self.connecting {
+                if let Some(label) = self
+                    .proton_submit_label()
+                    .filter(|_| self.service == Service::Proton)
+                {
+                    label
+                } else if self.connecting && self.sign_in_step == SignInStep::Verifying {
+                    "Waiting for Proton's check…"
+                } else if self.connecting {
                     "Connecting…"
-                } else if self.service.sign_in() != SignIn::Password {
+                } else if !self.service.sign_in().typed() {
                     "Open Browser Again"
                 } else {
                     "Connect"
@@ -7548,10 +8127,12 @@ impl MailApp {
             },
             Modal::AvatarPresets(_) => "Choose a Picture",
             Modal::AliasGone(..) => "Alias No Longer Exists",
+            Modal::Snooze(ids) if ids.len() > 1 => "Snooze Messages",
+            Modal::Snooze(_) => "Snooze",
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
-            Modal::Reconnect(id) => self.reconnect_form(id),
+            Modal::Reconnect(id) => self.reconnect_form(id, cx),
             Modal::Settings => self.settings_modal(window, cx),
             Modal::About => self.about_modal(),
             Modal::Help => self.help_modal(),
@@ -7562,6 +8143,7 @@ impl MailApp {
             Modal::Original => self.original_modal(cx),
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
+            Modal::Snooze(_) => self.snooze_modal(),
         };
         let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
         let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
@@ -7574,6 +8156,7 @@ impl MailApp {
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
                 Modal::AvatarPresets(_) => 560.,
+                Modal::Snooze(_) => 600.,
                 Modal::RemoveAccount(_)
                 | Modal::DeleteFolder(..)
                 | Modal::Erase(_)
@@ -7695,7 +8278,7 @@ impl MailApp {
             .flex()
             .items_center()
             .gap_2();
-        if matches!(modal, Modal::Connect | Modal::Settings) {
+        if matches!(modal, Modal::Connect | Modal::Settings | Modal::Snooze(_)) {
             // These carry their own buttons.
             return self.modal_frame(panel, window);
         } else if let Modal::RemoveAccount(id) = modal {
@@ -7766,6 +8349,32 @@ impl MailApp {
                     cx,
                 ));
             }
+            if self.proton_reconnecting().is_some() && self.proton_stage.is_some() {
+                footer = footer.child(self.button(
+                    "proton-back",
+                    if self.connecting { "Cancel" } else { "Back" },
+                    "",
+                    Action::ProtonBack,
+                    false,
+                    cx,
+                ));
+            }
+            let proton = self
+                .proton_reconnecting()
+                .and_then(|_| self.proton_submit_label().map(|l| (l, true)))
+                .or_else(|| self.proton_reconnecting().map(|_| ("", false)));
+            if proton == Some(("", false)) {
+                // A security key alone: its own buttons.
+            } else if let Some((label, _)) = proton {
+                footer = footer.child(self.button(
+                    "reconnect-submit",
+                    label,
+                    "",
+                    Action::SubmitReconnect(id.clone()),
+                    true,
+                    cx,
+                ));
+            } else {
             footer = footer.child(self.button(
                 "reconnect-submit",
                 if !self.connecting {
@@ -7780,6 +8389,7 @@ impl MailApp {
                 true,
                 cx,
             ));
+            }
         } else {
             footer = footer.child(div().flex_1()).child(self.button(
                 "done",
@@ -7981,6 +8591,7 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &GoArchive, w, cx| this.go(Folder::Archive, w, cx)))
             .on_action(cx.listener(|this, _: &GoSpam, w, cx| this.go(Folder::Junk, w, cx)))
             .on_action(cx.listener(|this, _: &GoTrash, w, cx| this.go(Folder::Trash, w, cx)))
+            .on_action(cx.listener(|this, _: &GoAllMail, w, cx| this.go(Folder::All, w, cx)))
             .on_action(cx.listener(|this, _: &ShowAllMail, w, cx| {
                 this.handle(Action::SetFilter(Filter::All), w, cx)
             }))
@@ -8014,7 +8625,7 @@ impl MailApp {
             .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
             .when(
                 self.menu.as_ref().is_some_and(|m| m.window.is_none()),
-                |d| d.child(self.popup_menu(cx)),
+                |d| d.child(self.popup_menu(window, cx)),
             )
     }
 }
@@ -8238,6 +8849,7 @@ fn folder_icon(f: Folder) -> &'static str {
         Folder::Junk => "spam",
         Folder::Trash => "trash",
         Folder::Other => "folder",
+        Folder::All => "all-mail",
     }
 }
 /// A text field on the app's background. Inputs otherwise take the theme's
@@ -8264,6 +8876,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "mail",
         "compose",
         "send",
+        "clock",
         "archive",
         "trash",
         "reply",
@@ -8310,10 +8923,15 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "grid",
         "alias",
         "inboxes",
+        "all-mail",
+        "sparkle",
         "pin",
         "ban",
         "subscriptions",
         "tag",
+        "snooze",
+        "answered",
+        "forwarded",
     ]
     .contains(&name)
     {
@@ -8327,6 +8945,24 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .size_full()
             .text_color(rgb(color)),
     )
+}
+/// A popup menu's largest height and its rows' height, for a window
+/// `viewport` tall: the menu fits when it can, with rows from 28 down to 22
+/// points high; beyond that it scrolls.
+fn menu_size(entries: &[Entry], viewport: f32) -> (f32, f32) {
+    // The window margin it keeps (8 each side), and its padding and border.
+    const CHROME: f32 = 16. + 10.;
+    const SEPARATOR: f32 = 9.;
+    let items = entries.iter().filter(|e| matches!(e, Entry::Item { .. })).count() as f32;
+    let separators = entries.len() as f32 - items;
+    let available = (viewport - CHROME).max(120.);
+    let row = if items == 0. {
+        28.
+    } else {
+        ((available - separators * SEPARATOR) / items).clamp(22., 28.)
+    };
+    let needed = items * row + separators * SEPARATOR + 10.;
+    (needed.min(available + 10.), row)
 }
 /// The alias a sent message went out as: its icon and address.
 fn alias_tag(id: &str, alias: String, c: Colors) -> Stateful<Div> {
@@ -8522,6 +9158,7 @@ pub fn run(store: Arc<Store>) {
             KeyBinding::new("secondary-5", GoArchive, Some("Mail")),
             KeyBinding::new("secondary-6", GoSpam, Some("Mail")),
             KeyBinding::new("secondary-7", GoTrash, Some("Mail")),
+            KeyBinding::new("secondary-8", GoAllMail, Some("Mail")),
             KeyBinding::new("secondary-m", Minimize, Some("Mail")),
             KeyBinding::new("secondary-o", OpenInWindow, Some("Mail")),
             KeyBinding::new("secondary-w", CloseWindow, Some("Detached")),
@@ -8654,6 +9291,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Archive", GoArchive),
                 MenuItem::action("Spam", GoSpam),
                 MenuItem::action("Trash", GoTrash),
+                MenuItem::action("All Mail", GoAllMail),
                 MenuItem::separator(),
                 MenuItem::action("Mark All as Read", MarkAllRead),
                 MenuItem::action("Refresh", Refresh),
@@ -8839,6 +9477,23 @@ mod tests {
     }
 
     #[gpui::test]
+    fn proton_is_bridge_alone_without_directs_registration(cx: &mut TestAppContext) {
+        let (view, cx) = open(store(), cx);
+        act(&view, Action::Start, cx);
+        view.update(cx, |this, _| this.proton_direct = false);
+        act(&view, Action::ChooseService(Service::Proton), cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.step == Step::Credentials);
+            assert_eq!(this.service, Service::ProtonBridge);
+        });
+        // The Direct tab can't be chosen either.
+        act(&view, Action::ProtonMode(Service::Proton), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.service, Service::ProtonBridge)
+        });
+    }
+
+    #[gpui::test]
     fn onboarding_offers_services_then_discovers_others(cx: &mut TestAppContext) {
         let (view, cx) = open(store(), cx);
         view.read_with(cx, |this, _| {
@@ -8853,7 +9508,9 @@ mod tests {
             cfg!(feature = "pinal"),
             "Pinal Mail is offered only with the pinal feature"
         );
-        assert!(cx.debug_bounds("service-ProtonBridge").is_some());
+        // Proton Mail is one item; Bridge is a tab inside it.
+        assert!(cx.debug_bounds("service-Proton").is_some());
+        assert!(cx.debug_bounds("service-ProtonBridge").is_none());
         // Password services use fixed servers and never ask for them.
         act(&view, Action::ChooseService(Service::ICloud), cx);
         view.read_with(cx, |this, cx| {
@@ -8867,13 +9524,70 @@ mod tests {
         // Validation stops before any network connection is attempted.
         act(&view, Action::SubmitAccount, cx);
         view.read_with(cx, |this, _| assert!(!this.connecting && this.error));
+        // Proton Mail: Direct (Proton's API) first, with Bridge a tab away.
         act(&view, Action::SetupBack, cx);
-        act(&view, Action::ChooseService(Service::ProtonBridge), cx);
+        act(&view, Action::ChooseService(Service::Proton), cx);
         type_email(&view, "me@proton.me", cx);
+        frame(cx);
+        assert!(cx.debug_bounds("proton-mode-0").is_some());
+        assert!(cx.debug_bounds("proton-mode-1").is_some());
         view.read_with(cx, |this, cx| {
+            assert!(this.step == Step::Credentials && !this.manual);
+            let a = this.setup_account(cx);
+            assert_eq!(a.provider, Provider::Proton);
+            assert_eq!(a.service, Service::Proton);
+            assert!(!a.incoming_starttls && !a.oauth);
+            assert!(a.validate().is_ok());
+        });
+        // No password: stopped here, before Proton is asked anything.
+        act(&view, Action::SubmitAccount, cx);
+        view.read_with(cx, |this, _| assert!(!this.connecting && this.error));
+        act(&view, Action::ProtonMode(Service::ProtonBridge), cx);
+        view.read_with(cx, |this, cx| {
+            assert_eq!(this.service, Service::ProtonBridge);
+            assert_eq!(MailApp::value(&this.form[EMAIL], cx), "me@proton.me");
             let a = this.setup_account(cx);
             assert!(a.incoming_starttls && a.incoming_port == 1143 && a.smtp_port == 1025);
             assert!(a.validate().is_ok());
+        });
+        act(&view, Action::ProtonMode(Service::Proton), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.service, Service::Proton);
+            assert!(this.step == Step::Credentials);
+        });
+        // The steps after the password replace the form, and Back leaves them.
+        view.update(cx, |this, _| {
+            this.proton_stage = Some(ProtonStage::SecondFactor {
+                code: true,
+                key: true,
+                pin: false,
+            })
+        });
+        frame(cx);
+        // The step names itself in the card's title, and the setup's own
+        // link goes back to the password.
+        view.read_with(cx, |this, _| {
+            assert_eq!(
+                this.proton_heading().map(|h| h.0),
+                Some("Two-factor authentication")
+            )
+        });
+        let first = KeyMethod::offered()[0];
+        assert!(cx.debug_bounds(format!("proton-key-{first:?}").leak()).is_some());
+        view.read_with(cx, |this, _| assert_eq!(this.proton_submit_label(), Some("Verify")));
+        // With a key alone, the key's buttons are the way on.
+        view.update(cx, |this, _| {
+            this.proton_stage = Some(ProtonStage::SecondFactor {
+                code: false,
+                key: true,
+                pin: false,
+            })
+        });
+        view.read_with(cx, |this, _| assert_eq!(this.proton_submit_label(), None));
+        act(&view, Action::SetupBack, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.proton_stage.is_none());
+            assert!(this.step == Step::Credentials, "Back from a step returns to the password");
         });
         // Another provider: look the address up.
         act(&view, Action::SetupBack, cx);
@@ -9743,7 +10457,7 @@ mod tests {
             frame(cx);
             frame(cx);
         };
-        // All Mail's spam is empty in the cache; both accounts are asked.
+        // All Accounts' spam is empty in the cache; both accounts are asked.
         view.update_in(cx, |this, w, cx| {
             this.open_mailbox(Some(ALL_MAIL.into()), Folder::Junk.into(), w, cx)
         });
@@ -9809,6 +10523,21 @@ mod tests {
         view.read_with(cx, |this, _| {
             assert!(!this.mailbox_loading());
             assert!(this.unreachable_accounts().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_doesnt_pick_the_open_message(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let open = view.read_with(cx, |this, _| this.messages[0].id.clone());
+        act(&view, Action::Select(open.clone()), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.selected.as_ref(), Some(&open))
+        });
+        act(&view, Action::ToggleSelectMode, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selecting);
+            assert!(this.selection.is_empty(), "nothing is picked until clicked");
         });
     }
 

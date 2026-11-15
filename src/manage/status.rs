@@ -19,6 +19,9 @@ pub enum SignInStep {
     Finishing,
     /// Signing in to the incoming mail server.
     Mailbox,
+    /// Waiting for the person to pass Proton's human verification (its
+    /// CAPTCHA) in the window it opened.
+    Verifying,
 }
 impl SignInStep {
     pub fn label(self) -> &'static str {
@@ -26,6 +29,7 @@ impl SignInStep {
             Self::Browser => "Waiting for your browser…",
             Self::Finishing => "Signed in. Finishing up…",
             Self::Mailbox => "Connecting to your mailbox…",
+            Self::Verifying => "Finish Proton's check in the window that opened…",
         }
     }
 }
@@ -114,6 +118,13 @@ impl AccountIssue {
             details: format!("{error:#}"),
             occurred_at: chrono::Utc::now().timestamp(),
         }
+    }
+    /// Whether it needs the person before the account works again: its
+    /// sign-in was refused, or its saved credentials couldn't be read.
+    /// Anything else (a dropped connection, a refused command, a message
+    /// that wouldn't send) is a warning, and can be dismissed.
+    pub fn critical(&self) -> bool {
+        self.access.is_some()
     }
     pub fn guidance(&self, source: &IssueSource) -> &'static str {
         if *source == IssueSource::Send {

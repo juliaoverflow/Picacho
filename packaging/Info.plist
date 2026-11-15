@@ -11,6 +11,7 @@
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Picacho uses Bluetooth to check that your phone is nearby when you sign in with a passkey on it.</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>NSHumanReadableCopyright</key><string>© 2026 Pinal</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>

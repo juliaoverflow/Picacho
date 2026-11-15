@@ -5,6 +5,7 @@ pub mod backend;
 pub mod composing;
 pub mod crypto;
 pub mod forwarding;
+pub mod local_ai;
 pub mod model;
 pub mod search;
 pub mod status;

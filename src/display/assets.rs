@@ -24,6 +24,12 @@ impl AssetSource for Assets {
                 "<path d='M12 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-7M16 3a2.1 2.1 0 0 1 3 3L10 15l-4 1 1-4Z'/>",
             ),
             "mail/send.svg" => Some("<path d='m22 2-7 20-4-9-9-4Z M22 2 11 13'/>"),
+            "mail/clock.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>"),
+            "mail/snooze.svg" => Some(
+                "<circle cx='12' cy='13' r='8'/><path d='M12 9v4l2 2M5 3 2 6M19 3l3 3M10 2h4'/>",
+            ),
+            "mail/answered.svg" => Some("<path d='m9 6-6 6 6 6M3 12h11a7 7 0 0 1 7 7'/>"),
+            "mail/forwarded.svg" => Some("<path d='m15 6 6 6-6 6M21 12H10a7 7 0 0 0-7 7'/>"),
             "mail/archive.svg" => Some(
                 "<rect x='3' y='3' width='18' height='4' rx='1'/><path d='M5 7v13h14V7M10 11h4'/>",
             ),
@@ -131,6 +137,12 @@ impl AssetSource for Assets {
             ),
             "mail/inboxes.svg" => Some(
                 "<path d='M22 12h-6l-2 3h-4l-2-3H2'/><path d='M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1Z'/><path d='M7 1h10'/>",
+            ),
+            "mail/all-mail.svg" => Some(
+                "<rect x='6' y='7' width='16' height='12' rx='2'/><path d='m6 8 8 6 8-6'/><path d='M2 15V5a2 2 0 0 1 2-2h14'/>",
+            ),
+            "mail/sparkle.svg" => Some(
+                "<path d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z'/><path d='M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8Z'/>",
             ),
             "mail/pin.svg" => Some(
                 "<path d='M12 17v5M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.2V17h14v-1.8a2 2 0 0 0-1.1-1.7l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1Z'/>",

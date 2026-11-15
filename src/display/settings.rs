@@ -1,6 +1,21 @@
 //! Settings view components.
 use super::*;
 
+/// A sending address being added or changed in Settings.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct IdentityEdit {
+    pub(super) account: String,
+    /// The address being changed; `None` while adding one.
+    pub(super) id: Option<String>,
+    /// It goes through an outgoing server of its own.
+    pub(super) own_server: bool,
+    /// It had its own server (and password) before: an empty password
+    /// keeps the saved one.
+    pub(super) had_password: bool,
+    pub(super) saving: bool,
+    pub(super) error: Option<String>,
+}
+
 impl MailApp {
     pub(super) fn segmented(
         &self,
@@ -316,6 +331,13 @@ impl MailApp {
                 Page::Forwarding,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-local-ai".into(),
+                "Local AI".into(),
+                icon_el("sparkle", 15., c.muted).into_any_element(),
+                Page::LocalAi,
+                cx,
+            ))
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -391,6 +413,9 @@ impl MailApp {
             .when_some(self.presets_for.as_deref(), |d, id| {
                 d.child(self.presets_sheet(id, cx))
             })
+            .when_some(self.model_confirm.as_deref(), |d, id| {
+                d.child(self.delete_model_sheet(id, cx))
+            })
             .into_any_element()
     }
     pub(super) fn general_page(&self, cx: &Context<Self>) -> AnyElement {
@@ -465,7 +490,7 @@ impl MailApp {
             ))
             .child(self.section("Mailboxes"))
             .child(self.toggle_row(
-                "All Mail",
+                "All Accounts",
                 "With more than one account, list every account's inbox, drafts, spam and other mail together at the top of the sidebar.",
                 self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
                     .debug_selector(|| "all-mail".into()),
@@ -524,6 +549,9 @@ impl MailApp {
         });
         let busy =
             self.retrying.contains(&a.id) || self.sync_requests.iter().any(|(id, _)| id == &a.id);
+        // Red for a sign-in problem; otherwise yellow warnings.
+        let critical = self.issues_critical(&a.id);
+        let tone = if critical { c.danger } else { c.warning };
         div()
             .id("account-error-details")
             .debug_selector(|| "account-error-details".into())
@@ -532,7 +560,7 @@ impl MailApp {
             .p_3()
             .rounded(px(10.))
             .border_1()
-            .border_color(rgb(c.danger))
+            .border_color(rgb(tone))
             .flex()
             .flex_col()
             .gap_3()
@@ -542,9 +570,13 @@ impl MailApp {
                     .items_center()
                     .gap_2()
                     .text_size(px(13.))
-                    .text_color(rgb(c.danger))
-                    .child(icon_el("warning", 16., c.danger))
-                    .child("Mailbox needs attention"),
+                    .text_color(rgb(tone))
+                    .child(icon_el("warning", 16., tone))
+                    .child(if critical {
+                        "Mailbox needs attention"
+                    } else {
+                        "Something didn't work"
+                    }),
             )
             .children(issues.into_iter().map(|(source, issue)| {
                 let label = match source {
@@ -572,6 +604,21 @@ impl MailApp {
                             .child(issue.details.clone()),
                     )
                     .child(div().text_color(rgb(c.muted)).child(issue.guidance(source)))
+                    .when(!issue.critical(), |d| {
+                        d.child(
+                            div().flex().child(
+                                self.button(
+                                    format!("dismiss-issue-{}", source.label()),
+                                    "Dismiss",
+                                    "",
+                                    Action::DismissIssue(a.id.clone(), source.clone()),
+                                    false,
+                                    cx,
+                                )
+                                .h(px(28.)),
+                            ),
+                        )
+                    })
             }))
             .child(
                 div()
@@ -589,14 +636,17 @@ impl MailApp {
                         )
                         .when(busy, |d| d.opacity(0.6)),
                     )
-                    .child(self.button(
-                        "account-reconnect",
-                        "Sign In Again",
-                        "",
-                        Action::Reconnect(a.id.clone()),
-                        false,
-                        cx,
-                    )),
+                    // Signing in again fixes sign-in problems, not warnings.
+                    .when(critical, |d| {
+                        d.child(self.button(
+                            "account-reconnect",
+                            "Sign In Again",
+                            "",
+                            Action::Reconnect(a.id.clone()),
+                            false,
+                            cx,
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -971,8 +1021,24 @@ impl MailApp {
                 Action::ToggleDeliveryReceipts(a.id.clone()),
                 cx,
             ))
+            .child(self.switch_setting(
+                "Require encryption in transit",
+                "Messages only go if every server on the way can use encryption (REQUIRETLS); where that can't be promised they bounce instead. Your outgoing server has to support it, and Picacho tells you when a recipient's domain publishes no policy (MTA-STS or DANE) to insist on it by.",
+                format!("require-tls-{}", a.id),
+                a.require_tls,
+                Action::ToggleRequireTls(a.id.clone()),
+                cx,
+            ))
+            .child(self.identities_setting(a, cx))
             .when(a.provider != Provider::Pop3, |page| {
-                page.child(self.section("Storage")).child(self.storage(a))
+                page.child(self.section("Storage"))
+                    .child(self.storage(a))
+                    .children(self.server_notes_view(a))
+                    .children(self.offline_note(a))
+            })
+            .when(Backend::may_filter(a), |page| {
+                page.child(self.section("Filters & vacation"))
+                    .child(self.filters_setting(a, cx))
             })
             .child(self.section("Profile picture"))
             .child(self.setting(
@@ -1188,6 +1254,232 @@ impl MailApp {
 }
 
 impl MailApp {
+    /// An account's other sending addresses, and the form for adding or
+    /// changing one.
+    fn identities_setting(&self, a: &Account, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let editing = self.identity_edit.as_ref().filter(|e| e.account == a.id);
+        let adding = editing.is_some_and(|e| e.id.is_none());
+        let mut list = div().flex().flex_col().gap_2();
+        for (i, identity) in a.identities.iter().enumerate() {
+            if editing.is_some_and(|e| e.id.as_deref() == Some(identity.id.as_str())) {
+                list = list.child(self.identity_form(cx));
+                continue;
+            }
+            let through = match &identity.smtp {
+                Some(s) => format!("Through {}", s.host),
+                None => format!("Through {}'s server", a.email),
+            };
+            let caption = if identity.name.is_empty() {
+                through
+            } else {
+                format!("{} · {through}", identity.name)
+            };
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("identity-{}-{i}", a.id)))
+                    .debug_selector(move || format!("identity-{i}"))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(9.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .truncate()
+                                    .child(identity.email.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(c.muted))
+                                    .truncate()
+                                    .child(caption),
+                            ),
+                    )
+                    .child(
+                        self.button(
+                            format!("edit-identity-{i}"),
+                            "Edit",
+                            "",
+                            Action::EditIdentity(a.id.clone(), identity.id.clone()),
+                            false,
+                            cx,
+                        )
+                        .h(px(30.)),
+                    )
+                    .child(
+                        self.button(
+                            format!("remove-identity-{i}"),
+                            "@Remove address",
+                            "trash",
+                            Action::RemoveIdentity(a.id.clone(), identity.id.clone()),
+                            false,
+                            cx,
+                        )
+                        .h(px(30.)),
+                    ),
+            );
+        }
+        if adding {
+            list = list.child(self.identity_form(cx));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                self.setting(
+                    "Other addresses",
+                    &format!(
+                        "Addresses {} also sends as, chosen in From when writing. Each can go through this mailbox's outgoing server, if it lets you send as that address, or through a server of its own.",
+                        a.email
+                    ),
+                    if adding {
+                        div().into_any_element()
+                    } else {
+                        self.button(
+                            format!("add-identity-{}", a.id),
+                            "Add Address",
+                            "",
+                            Action::AddIdentity(a.id.clone()),
+                            false,
+                            cx,
+                        )
+                        .border_1()
+                        .border_color(rgb(c.border))
+                        .into_any_element()
+                    },
+                ),
+            )
+            .child(list)
+    }
+
+    /// The fields of the sending address being added or changed.
+    fn identity_form(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let Some(edit) = &self.identity_edit else {
+            return div().into_any_element();
+        };
+        let labeled = |label: &str, index: usize, id: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .flex_1()
+                .min_w(px(140.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(c.muted))
+                        .child(label.to_owned()),
+                )
+                .child(div().id(id).debug_selector(move || id.into()).child(field(
+                    Input::new(&self.identity_inputs[index]),
+                    c,
+                    edit.saving,
+                )))
+        };
+        let row = || div().flex().flex_wrap().gap_3();
+        let mut form = div()
+            .id("identity-form")
+            .debug_selector(|| "identity-form".into())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.raised))
+            .child(row().child(labeled("Address", 0, "identity-email")).child(labeled("Name", 1, "identity-name")))
+            .child(row().child(labeled("Reply-To (optional)", 2, "identity-reply-to")))
+            .child(self.switch_setting(
+                "Use its own outgoing server",
+                "Send through another provider's SMTP server, signing in there, instead of this mailbox's.",
+                "identity-own-server".into(),
+                edit.own_server,
+                Action::ToggleIdentityServer,
+                cx,
+            ));
+        if edit.own_server {
+            form = form
+                .child(
+                    row()
+                        .child(labeled("Outgoing server", 3, "identity-host"))
+                        .child(labeled("Port", 4, "identity-port").max_w(px(100.)).min_w(px(80.))),
+                )
+                .child(
+                    row()
+                        .child(labeled("Sign-in name", 5, "identity-login"))
+                        .child(labeled(
+                            if edit.had_password { "Password (empty keeps the saved one)" } else { "Password" },
+                            6,
+                            "identity-password",
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Port 465 uses TLS from the start; other ports must offer STARTTLS. Picacho signs in once to check before saving."),
+                );
+        }
+        if let Some(error) = &edit.error {
+            form = form.child(
+                div()
+                    .id("identity-error")
+                    .debug_selector(|| "identity-error".into())
+                    .text_size(px(12.))
+                    .text_color(rgb(c.danger))
+                    .child(error.clone()),
+            );
+        }
+        form.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1())
+                .child(self.button(
+                    "identity-cancel",
+                    "Cancel",
+                    "",
+                    Action::CancelIdentity,
+                    false,
+                    cx,
+                ))
+                .child(
+                    self.button(
+                        "identity-save",
+                        if edit.saving {
+                            "Checking…"
+                        } else {
+                            "Save Address"
+                        },
+                        "",
+                        Action::SaveIdentity,
+                        true,
+                        cx,
+                    )
+                    .when(edit.saving, |d| d.opacity(0.7)),
+                ),
+        )
+        .into_any_element()
+    }
+
     /// Moves Settings between a dialog, the full main window and a window
     /// of its own, keeping the page and everything on it.
     pub(super) fn place_settings(
@@ -1432,7 +1724,7 @@ impl Render for SettingsWindow {
                 .menu
                 .as_ref()
                 .is_some_and(|m| m.window == Some(id))
-                .then(|| app.popup_menu(cx));
+                .then(|| app.popup_menu(window, cx));
             (
                 app.settings_modal(window, cx),
                 menu,
@@ -1532,6 +1824,7 @@ impl MailApp {
             Page::Reading => self.reading_page(cx),
             Page::Composing => self.composing_page(cx),
             Page::Forwarding => self.forwarding_page(cx),
+            Page::LocalAi => self.local_ai_page(cx),
         }
     }
 }

@@ -12,6 +12,11 @@ The suite exercises real TCP/TLS protocol exchanges with local servers. Test roo
 | --- | --- |
 | `imap_tls_sync_read_flags_move_and_reconcile` | Authenticated IMAP over TLS, header-only sync, lazy body download, read/star flag updates, atomic UID MOVE, UIDVALIDITY-aware IDs, and removal of messages no longer in a mailbox |
 | `smtp_starttls_auth_delivery_and_attachment` | STARTTLS upgrade, authentication, sender and recipient envelopes, MIME delivery with an attachment, draft removal after acceptance, and local POP3 Sent copy |
+| `smtp_pipelining_chunking_requiretls_and_sign_in_methods` | Pipelined MAIL/RCPT (the fixture answers only once all have arrived), BDAT without dot-stuffing, DATA with dot-stuffing on servers without CHUNKING, REQUIRETLS on MAIL and refusal where it isn't offered, CRAM-MD5 and LOGIN sign-in |
+| `scram_sha_1_matches_rfc_5802`, `scram_sha_256_matches_rfc_7677_and_checks_the_server`, `cram_md5_matches_rfc_2195` | SASL mechanisms against the RFCs' examples, and refusal of a server that can't sign SCRAM or extend the nonce |
+| `other_addresses_send_through_their_own_server` | A sending address's own SMTP server, sign-in name and envelope sender are used, not the mailbox's |
+| `sent_copies_that_failed_are_saved_later_once` | A Sent copy refused by the server waits and is saved later, and one already in Sent (by Message-ID) isn't saved again |
+| `send_later_waits_in_drafts_until_due` | Scheduled drafts wait with their time, aren't sent early or while their account can't sign in, and say why when sending fails |
 | `pop3_tls_download_is_deduplicated_and_local_moves_survive_sync` | TLS POP3, stable UIDL deduplication, cached MIME reads, and preservation of local archive/read changes across sync |
 | `pop3_loopback_uidl_and_dot_unstuffing` | UIDL parsing and POP3 dot unstuffing |
 | `parses_mime_body_and_attachment` | Encoded headers, UTF-8 subject, plain text, attachment filename and decoded size |

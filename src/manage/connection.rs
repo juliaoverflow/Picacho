@@ -38,6 +38,8 @@ pub(super) struct Connection {
     rights: std::collections::HashMap<String, (Option<String>, Instant)>,
     selected: Option<Selected>,
     used: Instant,
+    /// What ENABLE turned on (QRESYNC, UTF8=ACCEPT).
+    pub(super) enabled: crate::sync::transport::Enabled,
 }
 impl Connection {
     pub(super) fn new(session: ImapSession) -> Self {
@@ -49,7 +51,25 @@ impl Connection {
             rights: std::collections::HashMap::new(),
             selected: None,
             used: Instant::now(),
+            enabled: Default::default(),
         }
+    }
+    /// A new session, with QRESYNC and UTF8=ACCEPT turned on where the
+    /// server has them (ENABLE comes before any SELECT).
+    pub(super) fn open(session: ImapSession) -> Result<Self> {
+        let mut c = Self::new(session);
+        let ext = c.extensions()?;
+        c.enabled = crate::sync::transport::enable(&mut c.session, &ext)?;
+        Ok(c)
+    }
+    /// A mailbox name (as the cache keeps it) as this session takes it, quoted.
+    pub(super) fn mailbox(&self, name: &str) -> Result<String> {
+        crate::sync::transport::quote(&self.wire(name))
+    }
+    /// A mailbox name as this session takes it, for the imap crate's own
+    /// commands (which quote it themselves).
+    pub(super) fn wire(&self, name: &str) -> String {
+        crate::sync::transport::wire_name(name, self.enabled.utf8)
     }
     pub(super) fn extensions(&mut self) -> Result<Extensions> {
         if let Some(e) = self.extensions {
@@ -66,6 +86,7 @@ impl Connection {
             self.names = Some(crate::sync::transport::list(
                 &mut self.session,
                 special_use,
+                self.enabled.utf8,
             )?);
         }
         Ok(self.names.as_deref().unwrap_or_default())
@@ -93,7 +114,8 @@ impl Connection {
         let rights = match self.rights.get(mailbox) {
             Some((rights, at)) if at.elapsed() < RIGHTS_FOR => rights.clone(),
             _ => {
-                let rights = crate::sync::transport::my_rights(&mut self.session, mailbox)?;
+                let wire = self.wire(mailbox);
+                let rights = crate::sync::transport::my_rights(&mut self.session, &wire)?;
                 self.rights
                     .insert(mailbox.to_owned(), (rights.clone(), Instant::now()));
                 rights
@@ -148,9 +170,33 @@ impl Connection {
     pub(super) fn select(&mut self, name: &str) -> Result<Selected> {
         let condstore = self.extensions()?.condstore;
         self.selected = None;
-        let selected = crate::sync::transport::select(&mut self.session, name, condstore)?;
+        let selected =
+            crate::sync::transport::select(&mut self.session, name, condstore, self.enabled.utf8)?;
         self.selected = Some(selected.clone());
         Ok(selected)
+    }
+    /// SELECT that resynchronizes (QRESYNC) from a saved state: also says
+    /// which UIDs were removed and which messages' flags changed since.
+    pub(super) fn select_resync(
+        &mut self,
+        name: &str,
+        validity: u32,
+        modseq: u64,
+    ) -> Result<(Selected, Option<crate::sync::transport::Resync>)> {
+        self.selected = None;
+        let (selected, resync) = crate::sync::transport::select_qresync(
+            &mut self.session,
+            name,
+            self.enabled.utf8,
+            validity,
+            modseq,
+        )?;
+        self.selected = Some(selected.clone());
+        Ok((selected, resync))
+    }
+    /// The mailbox selected now, if any.
+    pub(super) fn current(&self) -> Option<&Selected> {
+        self.selected.as_ref()
     }
     /// SELECT unless this mailbox is already selected. UIDVALIDITY cannot
     /// change while a mailbox stays selected.
@@ -206,7 +252,7 @@ impl Backend {
             Some(c) => c,
             None => {
                 let secret = self.credentials(a)?;
-                Connection::new(self.imap_login(a, &secret)?)
+                Connection::open(self.imap_login(a, &secret)?)?
             }
         };
         let result = work(&mut connection);

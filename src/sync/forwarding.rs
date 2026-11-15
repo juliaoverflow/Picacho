@@ -376,16 +376,6 @@ impl Client {
         Ok(())
     }
 
-    /// SimpleLogin: the reverse aliases of an alias's contacts. Mail sent
-    /// to one of these from your mailbox goes out as the alias.
-    pub fn reverse_aliases(&self, alias: &Alias) -> Result<std::collections::HashSet<String>> {
-        Ok(self
-            .contacts(alias)?
-            .into_iter()
-            .map(|r| r.address)
-            .collect())
-    }
-
     /// SimpleLogin: an alias's contacts, each with its reverse alias.
     ///
     /// SimpleLogin lists 20 a page, so hundreds take dozens of requests; a

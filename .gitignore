@@ -3,3 +3,7 @@
 .DS_Store
 *.log
 .env
+__pycache__/
+# Model files: published on Hugging Face (pinaltech/veil-otp), not kept here.
+models/otp/*.bin
+models/otp/*.mlmodel

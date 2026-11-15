@@ -1,5 +1,9 @@
 //! Verified IMAP connections, stable identities, and remote folder resolution.
-use super::{stream::ImapStream, wire::Wire};
+use super::{
+    sasl::{self, Mechanism},
+    stream::ImapStream,
+    wire::Wire,
+};
 use crate::manage::model::*;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -10,7 +14,9 @@ pub(crate) type ImapSession = imap::Session<ImapStream>;
 pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
     let addrs = (host, port)
         .to_socket_addrs()
-        .context("Server hostname could not be resolved")?;
+        .context(super::retry::Unreachable(
+            "Server hostname could not be resolved".into(),
+        ))?;
     let mut last = None;
     let deadline = Instant::now() + Duration::from_secs(12);
     for addr in addrs {
@@ -26,10 +32,11 @@ pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
             Err(e) => last = Some(e),
         }
     }
-    bail!(
+    Err(super::retry::Unreachable(format!(
         "Could not connect to {host}:{port}: {}",
         last.map(|e| e.to_string()).unwrap_or_default()
-    )
+    ))
+    .into())
 }
 pub(crate) fn imap_login(
     a: &Account,
@@ -52,33 +59,57 @@ pub(crate) fn imap_login_interruptible(
         // plaintext upgrade here so bounded I/O also covers STARTTLS sessions.
         starttls(&mut socket)?;
     }
-    let stream = ImapStream::new(
+    let mut stream = ImapStream::new(
         tls.connect(&a.incoming_host, socket)
             .map_err(|e| anyhow::anyhow!("IMAP TLS handshake failed: {e}"))?,
     );
     let compressing = stream.compression_switch();
     let interrupter = stream.interrupter()?;
     let tap = stream.tap();
+    // What the server offers for signing in, asked before the imap crate
+    // takes the stream (it has no CAPABILITY before login). IMAP sends no
+    // second greeting after STARTTLS.
+    let caps = pre_auth_capabilities(&mut stream, !a.incoming_starttls)?;
     let mut client = imap::Client::new(stream);
-    if a.incoming_starttls {
-        client.greeting_read = true; // IMAP sends no second greeting after STARTTLS.
-    } else {
-        client.read_greeting()?;
-    }
-    let session = if a.oauth {
-        client.authenticate(
-            "XOAUTH2",
-            &Xoauth {
-                user: a.email.clone(),
-                token: s.access_token.clone(),
-            },
-        )
-    } else {
-        client.login(a.login(), &s.password)
+    client.greeting_read = true;
+    let offered = auth_mechanisms(&caps);
+    let credentials = |user: &str, secret: &str| sasl::Credentials {
+        user: user.to_owned(),
+        secret: secret.to_owned(),
+        host: a.incoming_host.clone(),
+        port: a.incoming_port,
     };
-    let mut session = session.map_err(|(e, _)| {
-        let rejected = matches!(e, imap::Error::No(_) | imap::Error::Bad(_));
-        let error = anyhow::Error::new(e).context("IMAP authentication failed");
+    let session = if a.oauth {
+        // XOAUTH2 when the server lists neither: Gmail and Outlook take it.
+        let mechanism = Mechanism::choose(&sasl::TOKEN_ORDER, offered.iter().map(String::as_str))
+            .unwrap_or(Mechanism::XOAuth2);
+        authenticate(client, mechanism, credentials(&a.email, &s.access_token))
+    } else if let Some(mechanism) = Mechanism::choose(
+        &[Mechanism::ScramSha256, Mechanism::ScramSha1],
+        offered.iter().map(String::as_str),
+    ) {
+        authenticate(client, mechanism, credentials(a.login(), &s.password))
+    } else if !caps.iter().any(|c| c == "LOGINDISABLED") {
+        client
+            .login(a.login(), &s.password)
+            .map_err(|(e, _)| e.into())
+    } else {
+        match Mechanism::choose(
+            &[Mechanism::Plain, Mechanism::Login, Mechanism::CramMd5],
+            offered.iter().map(String::as_str),
+        ) {
+            Some(mechanism) => authenticate(client, mechanism, credentials(a.login(), &s.password)),
+            None => bail!(
+                "{} offers no sign-in method Picacho supports.",
+                a.incoming_host
+            ),
+        }
+    };
+    let mut session = session.map_err(|e| {
+        let rejected = e
+            .downcast_ref::<imap::Error>()
+            .is_some_and(|e| matches!(e, imap::Error::No(_) | imap::Error::Bad(_)));
+        let error = e.context("IMAP authentication failed");
         if rejected {
             error.context(crate::manage::status::AccessFailure::Authentication)
         } else {
@@ -119,15 +150,113 @@ pub(crate) fn optional(result: imap::error::Result<()>) -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
-struct Xoauth {
-    user: String,
-    token: String,
+/// A SASL exchange as the imap crate drives it: each challenge in, each
+/// answer out. A failed step answers with nothing, which the server refuses;
+/// the step's own error is kept to say why.
+struct Sasl {
+    exchange: std::cell::RefCell<sasl::Exchange>,
+    failed: std::cell::RefCell<Option<anyhow::Error>>,
 }
-impl imap::Authenticator for Xoauth {
-    type Response = String;
-    fn process(&self, _: &[u8]) -> String {
-        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
+impl imap::Authenticator for Sasl {
+    type Response = Vec<u8>;
+    fn process(&self, challenge: &[u8]) -> Vec<u8> {
+        match self.exchange.borrow_mut().step(challenge) {
+            Ok(answer) => answer,
+            Err(e) => {
+                *self.failed.borrow_mut() = Some(e);
+                Vec::new()
+            }
+        }
     }
+}
+/// Signs in with AUTHENTICATE and a SASL mechanism.
+fn authenticate(
+    client: imap::Client<ImapStream>,
+    mechanism: Mechanism,
+    credentials: sasl::Credentials,
+) -> Result<ImapSession> {
+    let auth = Sasl {
+        exchange: std::cell::RefCell::new(sasl::Exchange::new(mechanism, credentials)),
+        failed: std::cell::RefCell::new(None),
+    };
+    let result = client.authenticate(mechanism.name(), &auth);
+    if let Some(e) = auth.failed.borrow_mut().take() {
+        return Err(e.context(crate::manage::status::AccessFailure::Authentication));
+    }
+    let mut session = match result {
+        Ok(session) => session,
+        Err((e, _)) => {
+            let reason = auth.exchange.borrow().refusal().map(str::to_owned);
+            let e = anyhow::Error::new(e);
+            return Err(match reason {
+                Some(reason) => e.context(format!("The server refused the token ({reason})")),
+                None => e,
+            });
+        }
+    };
+    // SCRAM: the server must also have proved it knows the password.
+    if let Err(e) = auth.exchange.borrow_mut().finish(None) {
+        let _ = session.logout();
+        return Err(e.context(crate::manage::status::AccessFailure::Authentication));
+    }
+    Ok(session)
+}
+/// The greeting (unless already read, after STARTTLS) and CAPABILITY,
+/// before signing in, read straight from the stream so nothing is left
+/// buffered for the imap crate. Capabilities in uppercase.
+fn pre_auth_capabilities(stream: &mut ImapStream, greeting: bool) -> Result<Vec<String>> {
+    use std::io::Write;
+    let words = |text: &str| -> Vec<String> {
+        text.split_ascii_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect()
+    };
+    if greeting {
+        let hello = read_line(stream)?;
+        ensure!(
+            hello.starts_with("* OK") && !hello.starts_with("* OKAY"),
+            "IMAP server rejected connection"
+        );
+        // Servers often list their capabilities in the greeting.
+        if let Some((listed, _)) = hello
+            .split_once("[CAPABILITY ")
+            .and_then(|(_, rest)| rest.split_once(']'))
+        {
+            return Ok(words(listed));
+        }
+    }
+    stream.write_all(b"p0 CAPABILITY\r\n")?;
+    stream.flush()?;
+    let mut caps = Vec::new();
+    loop {
+        let reply = read_line(stream)?;
+        if let Some(rest) = reply.strip_prefix("p0 ") {
+            ensure!(rest.starts_with("OK"), "The IMAP server refused CAPABILITY");
+            return Ok(caps);
+        }
+        if let Some(listed) = reply.strip_prefix("* CAPABILITY ") {
+            caps.extend(words(listed));
+        }
+    }
+}
+/// One line from the server, a byte at a time so nothing past it is read.
+fn read_line(stream: &mut impl std::io::Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while !bytes.ends_with(b"\r\n") {
+        ensure!(bytes.len() <= 8192, "The IMAP server's reply is too long");
+        let n = stream.read(&mut byte)?;
+        ensure!(n == 1, "The IMAP server closed the connection");
+        bytes.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).trim_end().to_owned())
+}
+/// The SASL mechanisms in a capability list ("AUTH=PLAIN"…).
+fn auth_mechanisms(caps: &[String]) -> Vec<String> {
+    caps.iter()
+        .filter_map(|c| c.strip_prefix("AUTH="))
+        .map(str::to_owned)
+        .collect()
 }
 pub(crate) fn same_validity(a: &Mail, b: &Mail) -> bool {
     a.id.rsplit(':').nth(1) == b.id.rsplit(':').nth(1)
@@ -145,11 +274,25 @@ pub(crate) struct Name {
     delimiter: Option<String>,
 }
 impl Name {
+    /// Whether the server gave this mailbox `attribute`. Attributes are
+    /// case-insensitive (\\Noselect, \\NoSelect…).
     fn has(&self, attribute: &str) -> bool {
-        self.attributes.iter().any(|a| a.contains(attribute))
+        let attribute = attribute.to_ascii_lowercase();
+        self.attributes
+            .iter()
+            .any(|a| a.to_ascii_lowercase().contains(&attribute))
     }
-    fn delimiter(&self) -> Option<&str> {
+    pub(crate) fn delimiter(&self) -> Option<&str> {
         self.delimiter.as_deref().filter(|d| !d.is_empty())
+    }
+    /// A mailbox as LIST would give it, for tests elsewhere.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, delimiter: &str, attributes: &[&str]) -> Self {
+        Self {
+            name: name.to_owned(),
+            attributes: attributes.iter().map(|a| (*a).to_owned()).collect(),
+            delimiter: Some(delimiter.to_owned()),
+        }
     }
     /// Whether folders can be made inside this one: the server has a
     /// hierarchy and has not marked it \Noinferiors.
@@ -160,7 +303,17 @@ impl Name {
 /// Every mailbox on the server. Servers with SPECIAL-USE (RFC 6154) are
 /// asked to mark the standard ones (\\Sent, \\Trash…), so they are found by
 /// role rather than guessed from their names.
-pub(crate) fn list(session: &mut ImapSession, special_use: bool) -> Result<Vec<Name>> {
+pub(crate) fn list(session: &mut ImapSession, special_use: bool, utf8: bool) -> Result<Vec<Name>> {
+    let names = list_wire(session, special_use)?;
+    Ok(names
+        .into_iter()
+        .map(|n| Name {
+            name: super::imap_ext::cache_name(&n.name, utf8),
+            ..n
+        })
+        .collect())
+}
+fn list_wire(session: &mut ImapSession, special_use: bool) -> Result<Vec<Name>> {
     if !special_use {
         return Ok(session
             .list(None, Some("*"))?
@@ -221,8 +374,11 @@ const STANDARD_NAMES: [&str; 14] = [
 pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
     let mut out: Vec<RemoteFolder> = names
         .iter()
-        .filter(|n| !n.has("NoSelect") && !n.has("Noselect"))
+        // Placeholders in the hierarchy can't be opened: \\Noselect, and
+        // \\NonExistent from servers with LIST-EXTENDED.
+        .filter(|n| !n.has("NoSelect") && !n.has("NonExistent"))
         .filter(|n| !STANDARD_ATTRIBUTES.iter().any(|a| n.has(a)))
+        .filter(|n| !gmail_system(&n.name))
         .filter_map(|n| {
             let delimiter = n.delimiter.as_deref().filter(|d| !d.is_empty());
             let mut parts: Vec<&str> = match delimiter {
@@ -246,6 +402,17 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
         .collect();
     out.sort_by_key(|f| f.name.to_lowercase());
     out
+}
+/// Whether `name` is Gmail's system container ("[Gmail]", or "[Google
+/// Mail]" in some countries) or a mailbox inside it. The container can't be
+/// opened, everything in it is a standard mailbox, and Gmail allows no
+/// labels of one's own there, so none of it is listed as a folder.
+pub(crate) fn gmail_system(name: &str) -> bool {
+    ["[Gmail]", "[Google Mail]"].iter().any(|root| {
+        name.get(..root.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(root))
+            && matches!(name.as_bytes().get(root.len()), None | Some(b'/' | b'.'))
+    })
 }
 /// Whether a server folder may be deleted: one of the account's own
 /// folders (not the inbox, a standard mailbox, or Gmail's system labels)
@@ -521,6 +688,8 @@ pub(crate) fn encode_name(name: &str) -> String {
     out
 }
 pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> Result<String> {
+    // All Mail is every mailbox at once, not a server folder.
+    ensure!(folder != Folder::All, "All Mail is not a folder on the server.");
     if folder == Folder::Inbox {
         return Ok("INBOX".into());
     }
@@ -609,9 +778,11 @@ fn starttls(socket: &mut Wire) -> Result<()> {
 /// Header fields the message list shows. Full headers carry Received, DKIM
 /// and ARC chains that are often several times larger, and are only needed
 /// once a message is opened (its whole source is downloaded then). Reply-To
-/// and Cc are small and let the list be searched by them (`reply-to:`).
+/// and Cc are small and let the list be searched by them (`reply-to:`);
+/// References and In-Reply-To join conversations before bodies download,
+/// and Disposition-Notification-To says the sender asks for a read receipt.
 pub(crate) const LIST_HEADERS: &str =
-    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]";
+    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DISPOSITION-NOTIFICATION-TO)]";
 
 /// Extensions beyond IMAP4rev1 that the app uses where a server has them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -636,6 +807,31 @@ pub(crate) struct Extensions {
     pub(crate) special_use: bool,
     /// RFC 7889: the largest message the server accepts (APPENDLIMIT).
     pub(crate) append_limit: Option<u64>,
+    /// RFC 7162: removed UIDs reported on SELECT (VANISHED), QRESYNC.
+    pub(crate) qresync: bool,
+    /// RFC 4731: compact search results (ESEARCH, `RETURN (ALL)`).
+    pub(crate) esearch: bool,
+    /// RFC 5256: server-side ordering (SORT) and threads (THREAD=REFERENCES).
+    pub(crate) sort: bool,
+    pub(crate) thread: bool,
+    /// RFC 6855: UTF-8 mailbox names and headers (UTF8=ACCEPT).
+    pub(crate) utf8_accept: bool,
+    /// RFC 5161: ENABLE, needed for QRESYNC and UTF8=ACCEPT.
+    pub(crate) enable: bool,
+    /// RFC 5465: changes in every mailbox over one connection (NOTIFY).
+    pub(crate) notify: bool,
+    /// RFC 5464: annotations on mailboxes and the server (METADATA).
+    pub(crate) metadata: bool,
+    /// RFC 8474: permanent message and thread ids (OBJECTID).
+    pub(crate) objectid: bool,
+    /// RFC 8970: a short preview of each message (PREVIEW).
+    pub(crate) preview: bool,
+    /// RFC 8514: when a message was saved in its mailbox (SAVEDATE).
+    pub(crate) savedate: bool,
+    /// RFC 3516: parts decoded by the server (BINARY).
+    pub(crate) binary: bool,
+    /// RFC 7888: literals that need no go-ahead (LITERAL+ or LITERAL-).
+    pub(crate) literal_plus: bool,
 }
 pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
     let caps = session.capabilities()?;
@@ -665,12 +861,25 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         acl: caps.has_str("ACL"),
         special_use: caps.has_str("SPECIAL-USE"),
         append_limit,
+        qresync: caps.has_str("QRESYNC"),
+        esearch: caps.has_str("ESEARCH"),
+        sort: caps.has_str("SORT"),
+        thread: caps.has_str("THREAD=REFERENCES"),
+        utf8_accept: caps.has_str("UTF8=ACCEPT") || caps.has_str("UTF8=ONLY"),
+        enable: caps.has_str("ENABLE"),
+        notify: caps.has_str("NOTIFY"),
+        metadata: caps.has_str("METADATA") || caps.has_str("METADATA-SERVER"),
+        objectid: caps.has_str("OBJECTID"),
+        preview: caps.has_str("PREVIEW"),
+        savedate: caps.has_str("SAVEDATE"),
+        binary: caps.has_str("BINARY"),
+        literal_plus: caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
     })
 }
 
 /// The untagged lines of an extension's reply that start with `name`, as
 /// text after it (NAMESPACE, QUOTA…; see the vendored parser's `resp_other`).
-fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
+pub(crate) fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
     Ok(responses(data)?
         .into_iter()
         .filter_map(|r| match r {
@@ -684,13 +893,13 @@ fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
 }
 /// Words, quoted strings, NIL and parentheses in an extension's reply.
 #[derive(Debug, PartialEq)]
-enum Token {
+pub(crate) enum Token {
     Open,
     Close,
     Nil,
     Text(String),
 }
-fn tokens(line: &str) -> Vec<Token> {
+pub(crate) fn tokens(line: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -902,19 +1111,28 @@ pub(crate) fn quote(name: &str) -> Result<String> {
 
 /// SELECT, asking for change tracking when the server supports it. The imap
 /// crate's own SELECT discards HIGHESTMODSEQ, so this reads the response here.
-pub(crate) fn select(session: &mut ImapSession, name: &str, condstore: bool) -> Result<Selected> {
+pub(crate) fn select(
+    session: &mut ImapSession,
+    name: &str,
+    condstore: bool,
+    utf8: bool,
+) -> Result<Selected> {
     let command = format!(
         "SELECT {}{}",
-        quote(name)?,
+        quote(&super::imap_ext::wire_name(name, utf8))?,
         if condstore { " (CONDSTORE)" } else { "" }
     );
     let data = session.run_command_and_read_response(command)?;
+    selected_from(&data, name, condstore)
+}
+/// What a SELECT's reply says about the mailbox `name`.
+pub(crate) fn selected_from(data: &[u8], name: &str, condstore: bool) -> Result<Selected> {
     let mut selected = Selected {
         name: name.into(),
         ..Default::default()
     };
     let mut validity = None;
-    for response in responses(&data)? {
+    for response in responses(data)? {
         use imap_proto::{MailboxDatum, Response, ResponseCode};
         match response {
             Response::Data {
@@ -950,6 +1168,16 @@ pub(crate) struct Row {
     pub(crate) header: Option<Vec<u8>>,
     pub(crate) gmail_id: Option<u64>,
     pub(crate) gmail_labels: Option<Vec<String>>,
+    /// The server's thread: Gmail's X-GM-THRID or OBJECTID's THREADID.
+    pub(crate) thread: Option<String>,
+    /// OBJECTID's EMAILID: the same message in every mailbox.
+    pub(crate) email_id: Option<String>,
+    /// PREVIEW's text.
+    pub(crate) preview: Option<String>,
+    /// SAVEDATE: when it was put in this mailbox.
+    pub(crate) save_date: Option<i64>,
+    /// MODSEQ, with CONDSTORE.
+    pub(crate) modseq: Option<u64>,
 }
 impl Row {
     fn flag(&self, name: &str) -> bool {
@@ -963,6 +1191,18 @@ impl Row {
     }
     pub(crate) fn flagged(&self) -> bool {
         self.flag("\\Flagged")
+    }
+    /// Replied to (\\Answered).
+    pub(crate) fn answered(&self) -> bool {
+        self.flag("\\Answered")
+    }
+    /// Forwarded ($Forwarded, RFC 5550).
+    pub(crate) fn forwarded(&self) -> bool {
+        self.flag("$Forwarded")
+    }
+    /// A read receipt was sent or declined ($MDNSent, RFC 3503).
+    pub(crate) fn mdn_sent(&self) -> bool {
+        self.flag("$MDNSent")
     }
     /// The labels a person set, when this row says: Gmail's labels (where
     /// asked for, `gmail`), else the keywords among its flags.
@@ -991,7 +1231,7 @@ impl Row {
     }
 }
 /// A quoted string's text as imap-proto leaves it: escapes still in.
-fn unescape(text: &str) -> String {
+pub(crate) fn unescape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
@@ -1016,8 +1256,12 @@ pub(crate) fn uid_fetch_rows(
         "Invalid IMAP FETCH"
     );
     let data = session.run_command_and_read_response(format!("UID FETCH {set} {items}"))?;
+    rows_from(&data)
+}
+/// The FETCH rows in a reply (with a UID; others are skipped).
+pub(crate) fn rows_from(data: &[u8]) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    for response in responses(&data)? {
+    for response in responses(data)? {
         let imap_proto::Response::Fetch(_, attributes) = response else {
             continue;
         };
@@ -1030,6 +1274,14 @@ pub(crate) fn uid_fetch_rows(
                 A::Rfc822Size(size) => row.size = Some(size),
                 A::InternalDate(date) => row.internal_date = internal_date(date),
                 A::GmailMsgId(id) => row.gmail_id = Some(id),
+                A::GmailThrId(id) => row.thread = Some(format!("gm:{id}")),
+                A::ThreadId(Some(id)) => row.thread = Some(format!("oid:{id}")),
+                A::EmailId(id) => row.email_id = Some(id.to_owned()),
+                A::Preview(Some(text)) => {
+                    row.preview = Some(String::from_utf8_lossy(text).trim().to_owned())
+                }
+                A::SaveDate(Some(date)) => row.save_date = internal_date(date),
+                A::ModSeq(m) => row.modseq = Some(m),
                 A::GmailLabels(labels) => {
                     row.gmail_labels = Some(
                         labels
@@ -1057,13 +1309,13 @@ pub(crate) fn uid_fetch_rows(
     }
     Ok(rows)
 }
-fn internal_date(date: &str) -> Option<i64> {
+pub(crate) fn internal_date(date: &str) -> Option<i64> {
     chrono::DateTime::parse_from_str(date.trim(), "%d-%b-%Y %H:%M:%S %z")
         .ok()
         .map(|d| d.timestamp())
 }
 /// Untagged responses that the imap crate has already read and validated.
-fn responses(data: &[u8]) -> Result<Vec<imap_proto::Response<'_>>> {
+pub(crate) fn responses(data: &[u8]) -> Result<Vec<imap_proto::Response<'_>>> {
     let mut rest = data;
     let mut out = Vec::new();
     while !rest.is_empty() {
@@ -1151,6 +1403,20 @@ mod extension_tests {
             name("[Gmail]", &["NoSelect"]),
             name("[Gmail]/Starred", &[]),
         ];
+        // Gmail's container and its mailboxes are never listed as folders,
+        // however the server marks them.
+        let listed: Vec<String> = custom_folders(&[
+            name("[Gmail]", &["\\HasChildren"]),
+            name("[Google Mail]/Important", &[]),
+            name("Placeholder", &["\\NONEXISTENT"]),
+            name("Old", &["\\noselect"]),
+            name("[Gmail] Receipts", &[]),
+            name("Receipts", &[]),
+        ])
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+        assert_eq!(listed, ["[Gmail] Receipts", "Receipts"]);
         assert!(deletable(&names, Provider::Imap, "Receipts").is_ok());
         assert!(deletable(&names, Provider::Imap, "Projects/2024").is_ok());
         let refused = |n: &str, provider| {

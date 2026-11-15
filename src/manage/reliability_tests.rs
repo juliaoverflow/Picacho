@@ -310,6 +310,9 @@ fn pop_server(
             let command = line.trim_end();
             let response = if command.starts_with("USER ") || command.starts_with("PASS ") {
                 "+OK\r\n".to_owned()
+            } else if command == "CAPA" {
+                // An older server without CAPA: USER/PASS it is.
+                "-ERR unknown command\r\n".to_owned()
             } else if command == "UIDL" {
                 format!("+OK\r\n{uidl}.\r\n")
             } else if let Some(number) = command.strip_prefix("RETR ") {
@@ -480,14 +483,23 @@ fn rejected_imap_login_is_actionable_and_failed_reconnect_keeps_local_data() -> 
         };
         let mut r = BufReader::new(stream);
         r.get_mut().write_all(b"* OK fixture\r\n").unwrap();
-        let mut line = String::new();
-        r.read_line(&mut line).unwrap();
-        let tag = line.split_whitespace().next().unwrap();
-        write!(
-            r.get_mut(),
-            "{tag} NO [AUTHENTICATIONFAILED] Invalid app password\r\n"
-        )
-        .unwrap();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let tag = line.split_whitespace().next().unwrap();
+            if line.trim_end().ends_with(" CAPABILITY") {
+                write!(r.get_mut(), "* CAPABILITY IMAP4rev1\r\n{tag} OK\r\n").unwrap();
+                continue;
+            }
+            write!(
+                r.get_mut(),
+                "{tag} NO [AUTHENTICATIONFAILED] Invalid app password\r\n"
+            )
+            .unwrap();
+            return;
+        }
     })?;
     let (b, mut a, path) = backend(&cert)?;
     a.incoming_port = server.port;

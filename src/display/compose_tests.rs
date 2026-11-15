@@ -228,3 +228,154 @@ fn settings_expands_pops_out_and_comes_back(cx: &mut TestAppContext) {
         assert!(this.page == Page::Forwarding);
     });
 }
+
+/// Send Later keeps the message in Drafts with its time, says when it goes,
+/// and sends it once due; one that can't be sent stays, saying why.
+#[gpui::test]
+fn send_later_waits_in_drafts_until_due(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    type_into(&composer, "ana@example.com", "Tomorrow's plans", cx);
+    let at = chrono::Utc::now().timestamp() + 3600;
+    composer.update_in(cx, |c, w, cx| c.request_send_at(Some(at), w, cx));
+    cx.run_until_parked();
+    let (id, account) =
+        composer.read_with(cx, |c, _| (c.draft.id.clone(), c.draft.account.clone()));
+    view.read_with(cx, |this, _| {
+        assert!(this.composers.is_empty(), "the editor closes");
+        assert!(this.outbox.is_empty(), "nothing is sent yet");
+        assert!(
+            this.status.starts_with("Scheduled to send"),
+            "{}",
+            this.status
+        );
+    });
+    let saved = store.draft(&id).unwrap().unwrap();
+    assert_eq!(saved.send_at, Some(at));
+    // Not due: nothing happens.
+    view.update(cx, |this, cx| this.send_due(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| assert!(this.scheduled_sending.is_empty()));
+    assert!(store.draft(&id).unwrap().unwrap().send_error.is_empty());
+    // Opened again, it says when it goes and can be unscheduled.
+    view.update_in(cx, |this, w, cx| this.open_draft(saved.clone(), w, cx));
+    frame(cx);
+    assert!(cx.debug_bounds("compose-unschedule").is_some());
+    let reopened = view.read_with(cx, |this, _| this.composers[0].clone());
+    reopened.update(cx, |_, cx| cx.emit(super::composer::ComposerEvent::Close));
+    cx.run_until_parked();
+    // Due: it is sent. The test account has no credentials, so sending
+    // fails; it stays in Drafts with the reason, or waits to try again.
+    let mut due = store.draft(&id).unwrap().unwrap();
+    due.send_at = Some(chrono::Utc::now().timestamp() - 5);
+    store.save_draft(&due).unwrap();
+    // An account that can't sign in keeps it waiting, unchanged, until it can.
+    let blocked = view.read_with(cx, |this, _| this.account_blocked(&account));
+    if blocked {
+        view.update(cx, |this, cx| this.send_due(cx));
+        cx.run_until_parked();
+        assert_eq!(store.draft(&id).unwrap().unwrap().send_at, due.send_at);
+        assert!(store.draft(&id).unwrap().unwrap().send_error.is_empty());
+        view.update(cx, |this, _| {
+            this.account_issues.clear();
+            this.retrying.clear();
+        });
+    }
+    view.update(cx, |this, cx| this.send_due(cx));
+    cx.run_until_parked();
+    let after = store
+        .draft(&id)
+        .unwrap()
+        .expect("a draft that wasn't sent is kept");
+    let retrying = view.read_with(cx, |this, _| this.scheduled_retry.contains_key(&id));
+    assert!(!after.send_error.is_empty() || retrying, "{after:?}");
+    assert_eq!(after.account, account);
+}
+
+/// A sending address is added in an account's Settings, offered in From,
+/// and answers mail sent to it; requiring encryption in transit is a switch
+/// beside it.
+#[gpui::test]
+fn sending_addresses_are_added_in_settings_and_offered_in_from(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let work = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    act(&view, Action::AccountSettings(work.clone()), cx);
+    frame(cx);
+    let switch: &'static str = Box::leak(format!("require-tls-{work}").into_boxed_str());
+    assert!(cx.debug_bounds(switch).is_some());
+    act(&view, Action::ToggleRequireTls(work.clone()), cx);
+    act(&view, Action::AddIdentity(work.clone()), cx);
+    frame(cx);
+    assert!(cx.debug_bounds("identity-form").is_some());
+    // A wrong address is refused in the form.
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.identity_inputs[0], "not an address", w, cx);
+        this.handle(Action::SaveIdentity, w, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(this.identity_edit.as_ref().unwrap().error.is_some());
+    });
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.identity_inputs[0], "desk@shop.example", w, cx);
+        MailApp::set(&this.identity_inputs[1], "Shop Desk", w, cx);
+        this.handle(Action::SaveIdentity, w, cx);
+    });
+    cx.run_until_parked();
+    let desk = view.read_with(cx, |this, _| {
+        assert!(this.identity_edit.is_none(), "the form closes once saved");
+        let a = this.accounts.iter().find(|a| a.id == work).unwrap();
+        assert!(a.require_tls);
+        assert_eq!(a.identities.len(), 1);
+        assert_eq!(a.identities[0].email, "desk@shop.example");
+        a.identities[0].clone()
+    });
+    let saved = store.accounts().unwrap();
+    assert_eq!(
+        saved.iter().find(|a| a.id == work).unwrap().identities,
+        std::slice::from_ref(&desk)
+    );
+    frame(cx);
+    assert!(cx.debug_bounds("identity-0").is_some());
+    // Mail to the address is answered as it, and it isn't copied in.
+    let id = view.read_with(cx, |this, _| {
+        this.messages
+            .iter()
+            .find(|m| m.account == work)
+            .unwrap()
+            .id
+            .clone()
+    });
+    view.update(cx, |this, _| {
+        let m = this.messages.iter_mut().find(|m| m.id == id).unwrap();
+        m.to = "Shop Desk <desk@shop.example>".into();
+        m.cc = "work@example.com, bo@example.com".into();
+        store.save_messages(std::slice::from_ref(m)).unwrap();
+    });
+    act(&view, Action::Select(id.clone()), cx);
+    act(&view, Action::Reply(true), cx);
+    view.read_with(cx, |this, cx| {
+        let draft = &this.composers.last().unwrap().read(cx).draft;
+        assert_eq!(draft.identity, desk.id);
+        assert!(!draft.to.contains("desk@shop.example") && !draft.cc.contains("desk@shop.example"));
+        assert!(draft.cc.contains("bo@example.com"), "{}", draft.cc);
+    });
+    // Removed, it goes from the account.
+    act(
+        &view,
+        Action::RemoveIdentity(work.clone(), desk.id.clone()),
+        cx,
+    );
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.accounts
+                .iter()
+                .find(|a| a.id == work)
+                .unwrap()
+                .identities
+                .is_empty()
+        );
+    });
+}

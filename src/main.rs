@@ -3,6 +3,11 @@ mod manage;
 mod sync;
 
 fn main() -> anyhow::Result<()> {
+    // Started by a Proton sign-in to show its human verification page.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(sync::proton::VERIFY_FLAG) {
+        display::verify::run(&args.next().unwrap_or_default());
+    }
     let project = directories::ProjectDirs::from("tech", "pinal", "picacho")
         .ok_or_else(|| anyhow::anyhow!("Cannot find the application data directory"))?;
     let path = std::env::var_os("PICACHO_DATA_DIR")

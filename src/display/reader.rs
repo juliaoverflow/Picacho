@@ -352,6 +352,20 @@ impl MailApp {
                 false,
                 cx,
             ))
+            .when(
+                self.account_of(m).is_some_and(|a| a.provider != Provider::Pop3)
+                    && !matches!(m.folder, Folder::Drafts | Folder::Sent),
+                |d| {
+                    d.child(self.button(
+                        "snooze",
+                        "@Snooze until…",
+                        "snooze",
+                        Action::SnoozeMenu(vec![m.id.clone()]),
+                        false,
+                        cx,
+                    ))
+                },
+            )
             .child(self.button(
                 "read",
                 "@Mark read / unread",
@@ -402,7 +416,7 @@ impl MailApp {
                                     .text_size(px(23.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .line_height(relative(1.35))
-                                    .child(m.subject.clone()),
+                                    .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
                             .children(self.label_chips(m, cx)),
                     )
@@ -479,6 +493,8 @@ impl MailApp {
                     ),
             )
             .when(self.details_open, |d| d.child(self.details_panel(m, cx)))
+            .children(self.snooze_banner(m, cx))
+            .children(self.receipt_banner(m, cx))
             .children(self.unsubscribe_banner(m, cx));
         let locked = m.body.is_none() && self.locked.contains(&m.account);
         let options = self.reading_options(m);
@@ -489,7 +505,8 @@ impl MailApp {
             .when(!locked, |d| {
                 d.child(self.rendering_controls(m, options, narrow, cx))
             })
-            .child(div().h(px(1.)).bg(rgb(c.border)).mb_6());
+            .child(div().h(px(1.)).bg(rgb(c.border)).mb_6())
+            .children((!locked).then(|| self.codes_banner(m, cx)).flatten());
         if locked {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
@@ -506,6 +523,8 @@ impl MailApp {
                 };
                 let masked = mask.as_ref().map(|k| k.apply(shown));
                 let shown = masked.as_deref().unwrap_or(shown);
+                let shown = self.hide_codes_html(m, shown);
+                let shown = shown.as_ref();
                 self.html_view.update(cx, |view, cx| {
                     view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
@@ -842,12 +861,20 @@ impl MailApp {
         if let Some(v) = header(details.map(|d| &d.details.reply_to)) {
             panel_rows.push(row("reply-to:", text(masked(&v))).into_any_element());
         }
-        panel_rows.push(row("to:", text(masked(&m.to))).into_any_element());
+        // Recipients a mailbox kept to its aliases wrote to through a
+        // reverse alias show as the contacts themselves.
+        let recipients = |v: &str| match &mask {
+            Some(k) => k.recipients(v),
+            None => v.to_owned(),
+        };
+        panel_rows.push(row("to:", text(recipients(&m.to))).into_any_element());
         if let Some(v) = header(details.map(|d| &d.details.cc)) {
-            panel_rows.push(row("cc:", text(masked(&v))).into_any_element());
+            panel_rows.push(row("cc:", text(recipients(&v))).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
-        panel_rows.push(row("subject:", text(m.subject.clone())).into_any_element());
+        panel_rows.push(
+            row("subject:", text(self.hide_codes(m, &m.subject).into_owned())).into_any_element(),
+        );
         match info.and_then(|i| i.result.as_ref()) {
             None => panel_rows.push(
                 row(
@@ -1458,9 +1485,11 @@ fn switch(on: bool, key: u64, animate: bool, c: Colors) -> AnyElement {
 
 impl MailApp {
     /// The open message's conversation in the loaded list, oldest first,
-    /// including the message itself. Messages join by References, or by
-    /// subject when at least one is a reply (so newsletters that reuse a
-    /// subject stay apart).
+    /// including the message itself. The server's thread ids decide where
+    /// both messages have one (Gmail's X-GM-THRID, OBJECTID's THREADID, or
+    /// IMAP THREAD within a mailbox); otherwise messages join by
+    /// References, or by subject when at least one is a reply (so
+    /// newsletters that reuse a subject stay apart).
     pub(super) fn thread(&self, m: &Mail) -> Rc<Vec<usize>> {
         if let Some((id, revision, rows)) = &*self.thread_cache.borrow()
             && id == &m.id
@@ -1475,6 +1504,21 @@ impl MailApp {
         let linked = |a: &Mail, b: &Mail| {
             !b.message_id.is_empty() && a.references.contains(b.message_id.as_str())
         };
+        // Permanent server thread ids (not IMAP THREAD's, which only
+        // cover one mailbox) settle it either way.
+        let permanent = |x: &Mail| !x.thread_id.is_empty() && !x.thread_id.starts_with("t:");
+        let server = |x: &Mail| -> Option<bool> {
+            if x.thread_id.is_empty() || m.thread_id.is_empty() {
+                return None;
+            }
+            if x.thread_id == m.thread_id {
+                Some(true)
+            } else if permanent(x) && permanent(m) {
+                Some(false)
+            } else {
+                None
+            }
+        };
         let mut seen = HashSet::new();
         let mut rows: Vec<usize> = self
             .messages
@@ -1482,6 +1526,9 @@ impl MailApp {
             .enumerate()
             .filter(|(_, x)| x.account == m.account && !x.pending)
             .filter(|(_, x)| {
+                if let Some(same) = server(x) {
+                    return same || x.id == m.id;
+                }
                 x.id == m.id
                     || linked(x, m)
                     || linked(m, x)
@@ -1541,7 +1588,7 @@ impl MailApp {
             |index: usize| {
                 let x = &self.messages[index];
                 let id = x.id.clone();
-                let to = super::thread::short_names(&x.to, &own);
+                let to = super::thread::short_names(&self.unreversed(x, &x.to), &own);
                 div()
                     .id(SharedString::from(format!("thread-{}", x.id)))
                     .debug_selector(|| "thread-card".into())
@@ -1598,7 +1645,7 @@ impl MailApp {
                                     .truncate()
                                     .text_size(px(12.))
                                     .text_color(rgb(c.muted))
-                                    .child(super::preview(&x.snippet)),
+                                    .child(super::preview(&self.hide_codes(x, &x.snippet))),
                             ),
                     )
                     .child(
@@ -1666,8 +1713,8 @@ impl MailApp {
                 names.join(", ")
             }
         };
-        let to = super::thread::short_names(&m.to, &own);
-        let cc = super::thread::short_names(&m.cc, &own);
+        let to = super::thread::short_names(&self.unreversed(m, &m.to), &own);
+        let cc = super::thread::short_names(&self.unreversed(m, &m.cc), &own);
         let mut line = if to.is_empty() {
             "to undisclosed recipients".to_string()
         } else {
@@ -1698,13 +1745,15 @@ impl MailApp {
     /// unless it is open; and whether there is quoted history.
     pub(super) fn plain_body(&self, m: &Mail) -> (SharedString, bool) {
         let mask = self.mask_for(m);
+        let codes = self.hidden_codes(m);
         let key = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             m.id,
             self.quotes_open,
             self.clean_links,
             mask.as_ref().map_or("", |k| k.alias.as_str()),
-            m.body.as_ref().map_or(0, String::len)
+            m.body.as_ref().map_or(0, String::len),
+            codes.join("\u{1}")
         );
         if let Some((k, text, quoted)) = &*self.plain_cache.borrow()
             && k == &key
@@ -1724,6 +1773,11 @@ impl MailApp {
         let shown = match &mask {
             Some(k) => k.apply(shown),
             None => shown.into(),
+        };
+        let shown: std::borrow::Cow<str> = if codes.is_empty() {
+            shown
+        } else {
+            crate::manage::local_ai::otp::mask(&shown, &codes).into_owned().into()
         };
         let shown = if self.clean_links {
             crate::manage::tracking::clean_text(&shown).into_owned().into()

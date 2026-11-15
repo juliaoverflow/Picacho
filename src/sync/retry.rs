@@ -19,3 +19,20 @@ pub(crate) fn transient(error: &anyhow::Error) -> bool {
         )
     })
 }
+
+/// A server that couldn't be reached at all: its name didn't resolve or no
+/// connection could be made. Nothing was sent; trying later may work.
+#[derive(Debug)]
+pub(crate) struct Unreachable(pub(crate) String);
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Unreachable {}
+
+/// Whether trying again later may work: a lost connection, or a server
+/// that couldn't be reached.
+pub(crate) fn later(error: &anyhow::Error) -> bool {
+    transient(error) || error.chain().any(|cause| cause.is::<Unreachable>())
+}

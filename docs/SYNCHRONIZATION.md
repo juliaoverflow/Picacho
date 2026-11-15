@@ -99,9 +99,12 @@ After signing in, a session sends `ID` where offered and turns on
   keywords (`$Forwarded`, `$MDNSent`, junk markers…) aren't shown. Labels
   travel in the server's form; Gmail's are modified UTF-7 like folder names.
 
+- `THREAD=REFERENCES` gives recent mail conversation ids (`t:` ids, within a mailbox); Gmail's `X-GM-THRID` and OBJECTID's `THREADID` come with headers and are permanent. `PREVIEW` fills snippets before bodies download; `SAVEDATE` is kept. `METADATA` provides the server's `/shared/comment` and `/shared/admin` notes and stores snooze times.
+- `NOTIFY`: the inbox watcher asks for every personal mailbox's changes.
+
 `imap-proto` doesn't model NAMESPACE, QUOTA, MYRIGHTS, ID or ENABLED replies,
 and `imap` 2.4 mistakes any untagged line it can't parse for the server
-leaving; the patched `imap-proto` keeps them as text (`Response::Other`).
+leaving; the patched `imap-proto` keeps them as text (`Response::Other`). The vendored copy in `vendor/imap-proto` adds ESEARCH, SORT, THREAD, VANISHED and the extension FETCH attributes (see its README).
 
 ## Push (IDLE)
 
@@ -211,9 +214,27 @@ connection failure.
 
 TCP attempts have a shared 12-second budget after name resolution, with at most three seconds per address. Verified TLS is mandatory, including STARTTLS; rejection never falls back to plaintext. The socket has a 30-second inactivity timeout. A wire wrapper adds a 90-second response budget and a 32 MiB byte budget between outgoing writes, including TLS framing. This bounds the IMAP library's otherwise unbounded response buffering, even when a peer lies about RFC822.SIZE. TLS handshake writes can also restart this wire budget. The decoded-message limit remains 25 MiB. POP3 status lines and multiline responses have separate length/completeness checks.
 
-System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. QRESYNC, ESEARCH, `UTF8=ACCEPT` (folder names stay in modified UTF-7), resumable partial MIME downloads, and an offline mutation queue remain future work. Removals still cost one full SEARCH, since Gmail offers no QRESYNC.
+System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. With ESEARCH, full searches come back as compact sets; without it, mailboxes over 500,000 messages are searched in UID windows, so no reply outgrows the wire budget. QRESYNC (ENABLEd per connection) reports removals with SELECT's VANISHED (EARLIER); without it (Gmail) removals still cost one full SEARCH. With `UTF8=ACCEPT` names travel in UTF-8 on the wire and are kept in modified UTF-7 in the cache. Large messages download in resumable pieces (`partial-downloads/` in the data directory). Changes that can't reach the server are queued per account (`offline_changes:<account>`) and replayed first by the next sync or change; STOREs are idempotent and a replayed MOVE of vanished UIDs changes nothing.
 
-SMTP delivery reads the server's EHLO itself (lettre keeps only some of it): `SIZE` limits the message, checked before `MAIL FROM` and declared on it; `DSN` lets delivery receipts ask for `NOTIFY=SUCCESS,FAILURE,DELAY` with `RET=HDRS`; `SMTPUTF8` and `8BITMIME` are declared where needed. STARTTLS is required unless the port is 465 (implicit TLS).
+SMTP is Picacho's own client (`sync/smtp.rs`); lettre only builds the MIME message. It runs over the same bounded wire as IMAP and POP3. The client says hello as `[127.0.0.1]`, so the computer's name isn't written into Received headers. STARTTLS is required unless the port is 465 (implicit TLS). Anything the server sends before the TLS handshake is refused. From the EHLO reply:
+
+- `SIZE` limits the message, checked before `MAIL FROM` and declared on it.
+- `DSN` lets delivery receipts ask for `NOTIFY=SUCCESS,FAILURE,DELAY` with `RET=HDRS`.
+- `SMTPUTF8` and `8BITMIME` are declared where needed.
+- `PIPELINING`: `MAIL FROM` and every `RCPT TO` are sent together and their replies read in order. The message waits for those replies, so a refused recipient stops the send before any data goes.
+- `CHUNKING`: the message goes in `BDAT` chunks of 1 MiB, without dot-stuffing (pipelined where allowed); otherwise `DATA`.
+- `REQUIRETLS`: added to `MAIL FROM` when the account requires encryption in transit. Without it, nothing is sent.
+- `AUTH`: the best mechanism Picacho speaks (`sync/sasl.rs`). For passwords: SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, LOGIN, then CRAM-MD5. For tokens: OAUTHBEARER, then XOAUTH2. The first message goes with the command (RFC 4954). SCRAM checks the server's signature, so a server that can't prove it knows the password fails the sign-in.
+
+The reply to the end of the message is waited for up to ten minutes (RFC 5321).
+
+IMAP asks for `CAPABILITY` before signing in, or reads it from the greeting. It does this directly on the stream, since the imap crate can't before login. SCRAM is used where offered, otherwise `LOGIN` unless `LOGINDISABLED` is listed, then `AUTHENTICATE` with PLAIN, LOGIN or CRAM-MD5. POP3 asks `CAPA` (servers without it get `USER`/`PASS`) and uses `AUTH` (RFC 5034) for SCRAM, or for another mechanism where `USER` isn't listed.
+
+OpenSSL 3 reports a connection closed without TLS's goodbye as an error. IMAP and SMTP treat it as the end of the stream, as earlier versions reported it, so a dropped IMAP connection is seen as lost and a read-only sync may retry it.
+
+A sent copy that couldn't be appended is queued as a file under `sent-copies/<account>/` in the data directory. It is filed by the next draft sync, after a `UID SEARCH HEADER Message-ID` in Sent finds no copy already there. Removing the account removes its queue.
+
+MTA-STS checks (`sync/mta_sts.rs`) only run when encryption in transit is required. The `_mta-sts` TXT record goes through the resolver used for sender checks. The policy is fetched from `https://mta-sts.<domain>/.well-known/mta-sts.txt` without redirects (at most 64 KB, `text/plain`) and kept until its max_age or a new record id, for at most a day. A policy in `testing` counts, since REQUIRETLS treats it as enforce. DANE means a TLSA record at `_25._tcp.<mx>` for the most preferred MX; the sending servers check its DNSSEC signatures. These checks only inform: delivery is the outgoing server's.
 
 ## Reference implementation review
 

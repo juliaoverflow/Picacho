@@ -18,9 +18,10 @@ use std::collections::{HashMap, HashSet};
 
 /// Preference holding the service accounts.
 const PREFERENCE: &str = "forwarding";
-/// Preference: list All Mail when there are several accounts ("true"/"false").
+/// Preference: list All Accounts when there are several accounts ("true"/"false").
 pub const ALL_MAIL_PREFERENCE: &str = "all_mail";
-/// The All Mail view's id, used where an account id goes.
+/// The All Accounts view's id, used where an account id goes. (It kept
+/// its old name, "all-mail", so saved places and preferences still work.)
 pub const ALL_MAIL: &str = "all-mail";
 const ALIAS_PREFIX: &str = "alias:";
 
@@ -801,7 +802,14 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
             .collect::<Result<_>>()?,
         ForwardingService::SimpleLogin => {
             let client = account.client()?;
-            let reverse = client.reverse_aliases(alias)?;
+            let contacts = client.contacts(alias)?;
+            let reverse: std::collections::HashSet<String> =
+                contacts.iter().map(|c| c.address.clone()).collect();
+            // A contact's existing reverse alias, by the contact's address.
+            let known: HashMap<String, String> = contacts
+                .iter()
+                .map(|c| (c.contact.trim().to_lowercase(), c.address.clone()))
+                .collect();
             let mut made: HashMap<String, String> = HashMap::new();
             let mut out = Vec::new();
             for list in fields {
@@ -810,6 +818,8 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
                     let key = address.to_lowercase();
                     let routed = if reverse.contains(&key) {
                         address
+                    } else if let Some(r) = known.get(&key) {
+                        r.clone()
                     } else if let Some(r) = made.get(&key) {
                         r.clone()
                     } else {
@@ -821,8 +831,16 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
                 }
                 out.push(field);
             }
-            // Sent copies are addressed to these: note them, so Sent can
-            // say which alias each went out as.
+            // Sent copies are addressed to these: note who each stands
+            // for, so a mailbox kept to its aliases shows the contact.
+            let _ = remember_contacts(
+                store,
+                contacts
+                    .iter()
+                    .map(|c| (c.address.clone(), c.contact.clone()))
+                    .chain(made.iter().map(|(contact, r)| (r.clone(), contact.clone()))),
+            );
+            // And note them, so Sent can say which alias each went out as.
             let _ = remember_routes(
                 store,
                 &alias.email,
@@ -892,6 +910,66 @@ pub fn remember_routes<I: IntoIterator<Item = String>>(
         store.set_preference(ROUTES_PREFERENCE, &serde_json::to_string(&all)?)?;
     }
     Ok(())
+}
+
+/// Where the contacts SimpleLogin's reverse aliases stand for are kept:
+/// a JSON object of reverse alias (lowercase) to the contact's address.
+const CONTACTS_PREFERENCE: &str = "reverse_contacts";
+
+/// The contacts known behind reverse aliases: reverse alias (lowercase)
+/// to the contact's own address.
+pub fn reverse_contacts(store: &Store) -> HashMap<String, String> {
+    store
+        .preference(CONTACTS_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Notes the contacts reverse aliases stand for: (reverse alias, contact).
+pub fn remember_contacts<I: IntoIterator<Item = (String, String)>>(
+    store: &Store,
+    pairs: I,
+) -> Result<()> {
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = reverse_contacts(store);
+    let mut changed = false;
+    for (reverse, contact) in pairs {
+        let (reverse, contact) = (reverse.trim().to_lowercase(), contact.trim().to_owned());
+        if !reverse.is_empty() && !contact.is_empty() && all.get(&reverse) != Some(&contact) {
+            all.insert(reverse, contact);
+            changed = true;
+        }
+    }
+    if changed {
+        store.set_preference(CONTACTS_PREFERENCE, &serde_json::to_string(&all)?)?;
+    }
+    Ok(())
+}
+
+/// Fetches a SimpleLogin alias's contacts and notes who each of its
+/// reverse aliases stands for.
+pub fn learn_contacts(store: &Store, account: &ForwardingAccount, alias: &Alias) -> Result<()> {
+    let contacts = account.client()?.contacts(alias)?;
+    remember_contacts(store, contacts.into_iter().map(|c| (c.address, c.contact)))
+}
+
+/// A recipient list with each known reverse alias in it replaced by the
+/// contact it forwards to.
+pub fn unreverse<'a>(
+    list: &'a str,
+    contacts: &HashMap<String, String>,
+) -> std::borrow::Cow<'a, str> {
+    if contacts.is_empty() {
+        return list.into();
+    }
+    let mut out: std::borrow::Cow<'a, str> = list.into();
+    for (_, email) in crate::sync::smtp::recipients(list).unwrap_or_default() {
+        if let Some(contact) = contacts.get(&email.trim().to_lowercase()) {
+            out = mask_address(&out, &email, contact).into_owned().into();
+        }
+    }
+    out
 }
 
 /// The alias a message you sent went out as, if any: a recipient is a
@@ -971,7 +1049,7 @@ fn addy_route(alias: &str, recipient: &str) -> Result<String> {
 pub fn alias_view(account: &str, alias: &str) -> String {
     format!("{ALIAS_PREFIX}{account}:{alias}")
 }
-/// Whether `id` is All Mail or an alias rather than a real mailbox.
+/// Whether `id` is All Accounts or an alias rather than a real mailbox.
 pub fn is_view(id: &str) -> bool {
     id == ALL_MAIL || id.starts_with(ALIAS_PREFIX)
 }
@@ -1048,7 +1126,7 @@ fn hidden_from(forwarding: &[ForwardingAccount], account: &str) -> HashSet<Strin
         .map(|a| a.email.clone())
         .collect()
 }
-/// What the mailbox `folder` of `view` (an account, All Mail or an alias) lists.
+/// What the mailbox `folder` of `view` (an account, All Accounts or an alias) lists.
 pub fn scope(
     view: &str,
     folder: Folder,
@@ -1088,7 +1166,7 @@ pub fn scope(
 pub type UnreadRow = (String, String, String, String);
 
 /// Sidebar unread counts for every view: mailboxes less the mail of aliases
-/// shown on their own, those aliases, and All Mail.
+/// shown on their own, those aliases, and All Accounts.
 pub fn view_counts(
     raw: HashMap<(String, String), usize>,
     rows: &[UnreadRow],
@@ -1198,6 +1276,31 @@ mod tests {
             mask_address("nothing here", "work@example.com", "a@sl.io"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn reverse_aliases_show_as_their_contacts() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&p)?;
+        remember_contacts(
+            &store,
+            [
+                ("RA+abc@SimpleLogin.co".to_owned(), "ana@example.org".to_owned()),
+                ("ra+def@simplelogin.co".to_owned(), "bo@example.net".to_owned()),
+            ],
+        )?;
+        let contacts = reverse_contacts(&store);
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(
+            unreverse("Ana <RA+abc@simplelogin.co>, ra+def@simplelogin.co, cy@example.com", &contacts),
+            "Ana <ana@example.org>, bo@example.net, cy@example.com"
+        );
+        assert!(matches!(
+            unreverse("cy@example.com", &contacts),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        Ok(())
     }
 
     #[test]

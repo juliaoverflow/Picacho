@@ -6,6 +6,8 @@ pub enum Provider {
     Outlook,
     Imap,
     Pop3,
+    /// Proton's own API, without Proton Mail Bridge (`sync/proton.rs`).
+    Proton,
 }
 impl Provider {
     pub fn label(self) -> &'static str {
@@ -14,7 +16,12 @@ impl Provider {
             Self::Outlook => "Outlook",
             Self::Imap => "IMAP",
             Self::Pop3 => "POP3",
+            Self::Proton => "Proton API",
         }
+    }
+    /// Whether its mail comes over IMAP (anything but POP3 and Proton's API).
+    pub fn imap(self) -> bool {
+        !matches!(self, Self::Pop3 | Self::Proton)
     }
 }
 /// The mail services offered when adding an account. `Provider` is the
@@ -28,7 +35,10 @@ pub enum Service {
     ICloud,
     Fastmail,
     Zoho,
+    /// Proton Mail through Proton Mail Bridge on this computer (IMAP/SMTP).
     ProtonBridge,
+    /// Proton Mail directly through Proton's API, without Bridge.
+    Proton,
     /// Any other server, found by autoconfiguration or entered by hand.
     #[default]
     Other,
@@ -37,10 +47,20 @@ pub enum Service {
 pub enum SignIn {
     /// Pinal Accounts in the browser; the server issues an app password.
     Pinal,
+    /// Proton's own sign-in (SRP), with a two-factor code and mailbox
+    /// password where the account has them.
+    Proton,
     /// The provider's OAuth consent in the browser.
     Browser,
     /// A password made for mail apps, as named by `password_label`.
     Password,
+}
+impl SignIn {
+    /// Whether the sign-in is typed into the form (a password, and for
+    /// Proton maybe a two-factor code), rather than done in the browser.
+    pub fn typed(self) -> bool {
+        matches!(self, Self::Password | Self::Proton)
+    }
 }
 impl Service {
     /// The services offered when adding an account, in order.
@@ -52,7 +72,8 @@ impl Service {
         Self::ICloud,
         Self::Fastmail,
         Self::Zoho,
-        Self::ProtonBridge,
+        // Its Bridge sign-in is a tab of its own.
+        Self::Proton,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -62,7 +83,8 @@ impl Service {
             Self::ICloud => "iCloud Mail",
             Self::Fastmail => "Fastmail",
             Self::Zoho => "Zoho Mail",
-            Self::ProtonBridge => "Proton Mail",
+            Self::ProtonBridge => "Proton Mail Bridge",
+            Self::Proton => "Proton Mail",
             Self::Other => "Other",
         }
     }
@@ -70,12 +92,14 @@ impl Service {
         match self {
             Self::Gmail => Provider::Gmail,
             Self::Outlook => Provider::Outlook,
+            Self::Proton => Provider::Proton,
             _ => Provider::Imap,
         }
     }
     pub fn sign_in(self) -> SignIn {
         match self {
             Self::Pinal => SignIn::Pinal,
+            Self::Proton => SignIn::Proton,
             Self::Gmail | Self::Outlook if crate::sync::oauth::configured(self.provider()) => {
                 SignIn::Browser
             }
@@ -87,6 +111,7 @@ impl Service {
             Self::Gmail | Self::Outlook | Self::Fastmail | Self::Zoho => "App password",
             Self::ICloud => "App-specific password",
             Self::ProtonBridge => "Bridge password",
+            Self::Proton => "Proton password",
             _ => "Password",
         }
     }
@@ -130,6 +155,10 @@ impl Service {
                 "Open Proton Mail Bridge, choose your account and copy its mailbox password. Bridge must be running, with its certificate trusted.",
                 "https://proton.me/support/apple-mail-certificate",
             )),
+            Self::Proton => Some((
+                "Picacho signs in to Proton directly; Proton Mail Bridge isn't needed. Mail is decrypted on this computer with your keys, which never leave it.",
+                "https://account.proton.me/",
+            )),
             Self::Outlook => Some((
                 "Turn on two-step verification in your Microsoft account, then make an app password and paste it here. Work and school accounts can use one only if their admin allows it.",
                 "https://account.live.com/proofs/AppPassword",
@@ -163,6 +192,8 @@ impl Service {
                 a.incoming_starttls = true;
                 ("127.0.0.1", 1143, "127.0.0.1", 1025)
             }
+            // No mail servers: everything goes through Proton's API.
+            Self::Proton => ("mail-api.proton.me", 443, "mail-api.proton.me", 443),
             Self::Other => return None,
         };
         a.incoming_host = host.into();
@@ -251,8 +282,81 @@ pub struct Account {
     /// where the sending server supports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delivery_receipts: bool,
+    /// Only send where every server on the way must use TLS (REQUIRETLS,
+    /// RFC 8689): the outgoing server has to offer it, and mail that can't
+    /// go encrypted the whole way bounces rather than going in the clear.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_tls: bool,
+    /// Other addresses this mailbox sends as, each optionally through its
+    /// own outgoing server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<Identity>,
+}
+/// An address a mailbox sends as besides its own (a sending identity): the
+/// name and address recipients see, where replies go, and the outgoing
+/// server, when it isn't the mailbox's. Its password is in the keychain
+/// under `secret_id`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub id: String,
+    pub email: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply_to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp: Option<OutgoingServer>,
+}
+/// An outgoing (SMTP) server and the name to sign in to it with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingServer {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+}
+impl Identity {
+    /// Where its outgoing server's password is kept in the keychain.
+    pub fn secret_id(&self) -> String {
+        format!("identity:{}", self.id)
+    }
+    /// The name to sign in to its own outgoing server with.
+    pub fn login(&self) -> &str {
+        match &self.smtp {
+            Some(s) if !s.username.trim().is_empty() => s.username.trim(),
+            _ => &self.email,
+        }
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.email.trim().parse::<lettre::Address>().is_ok(),
+            "Enter a valid email address."
+        );
+        anyhow::ensure!(
+            !self.name.contains(['\r', '\n']),
+            "Enter a name without line breaks."
+        );
+        crate::sync::smtp::recipients(&self.reply_to)
+            .map_err(|_| anyhow::anyhow!("Enter a valid Reply-To address."))?;
+        if let Some(s) = &self.smtp {
+            anyhow::ensure!(
+                !s.host.is_empty() && !s.host.contains(['\r', '\n', ' ', '/', ':']),
+                "Enter a valid outgoing server hostname."
+            );
+            anyhow::ensure!(s.port > 0, "Ports must be between 1 and 65535.");
+            anyhow::ensure!(
+                !s.username.contains(['\r', '\n']),
+                "Enter a sign-in name without line breaks."
+            );
+        }
+        Ok(())
+    }
 }
 impl Account {
+    /// One of the addresses it sends as, by id.
+    pub fn identity(&self, id: &str) -> Option<&Identity> {
+        self.identities.iter().find(|i| i.id == id)
+    }
     /// The name to sign in to the mail servers with.
     pub fn login(&self) -> &str {
         if self.username.trim().is_empty() {
@@ -265,6 +369,7 @@ impl Account {
         let (host, smtp) = match provider {
             Provider::Gmail => ("imap.gmail.com", "smtp.gmail.com"),
             Provider::Outlook => ("outlook.office365.com", "smtp.office365.com"),
+            Provider::Proton => ("mail-api.proton.me", "mail-api.proton.me"),
             _ => ("", ""),
         };
         Self {
@@ -274,15 +379,24 @@ impl Account {
             nickname: String::new(),
             provider,
             incoming_host: host.into(),
-            incoming_port: if provider == Provider::Pop3 { 995 } else { 993 },
+            incoming_port: match provider {
+                Provider::Pop3 => 995,
+                Provider::Proton => 443,
+                _ => 993,
+            },
             smtp_host: smtp.into(),
-            smtp_port: 587,
+            smtp_port: if provider == Provider::Proton {
+                443
+            } else {
+                587
+            },
             oauth: provider == Provider::Outlook,
             client_id: String::new(),
             client_secret: String::new(),
             service: match provider {
                 Provider::Gmail => Service::Gmail,
                 Provider::Outlook => Service::Outlook,
+                Provider::Proton => Service::Proton,
                 _ => Service::Other,
             },
             incoming_starttls: false,
@@ -291,6 +405,8 @@ impl Account {
             reply_to: String::new(),
             read_receipts: false,
             delivery_receipts: false,
+            require_tls: false,
+            identities: Vec::new(),
         }
     }
     /// The name shown for the account: its nickname, if it has one.
@@ -364,9 +480,12 @@ pub enum Folder {
     Trash,
     /// A server folder outside the standard set. `Mail::remote_folder` names it.
     Other,
+    /// Every message of the account, whatever folder it is in (drafts
+    /// aside). Like Starred, it is assembled from the other mailboxes.
+    All,
 }
 impl Folder {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Inbox,
         Self::Starred,
         Self::Sent,
@@ -374,7 +493,12 @@ impl Folder {
         Self::Archive,
         Self::Junk,
         Self::Trash,
+        Self::All,
     ];
+    /// Mailboxes assembled from the others rather than kept on a server.
+    pub fn is_virtual(self) -> bool {
+        matches!(self, Self::Starred | Self::All)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Inbox => "Inbox",
@@ -385,6 +509,7 @@ impl Folder {
             Self::Junk => "Spam",
             Self::Trash => "Trash",
             Self::Other => "Folder",
+            Self::All => "All Mail",
         }
     }
     pub fn key(self) -> &'static str {
@@ -397,6 +522,7 @@ impl Folder {
             Self::Junk => "junk",
             Self::Trash => "trash",
             Self::Other => "other",
+            Self::All => "all",
         }
     }
 }
@@ -448,6 +574,13 @@ pub struct Attachment {
     pub size: usize,
     pub mime: String,
     pub part: usize,
+    /// Its IMAP section ("1.2"), for messages too large to download whole,
+    /// whose parts are fetched one at a time; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub section: String,
+    /// Its transfer encoding, with `section`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encoding: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mail {
@@ -497,6 +630,29 @@ pub struct Mail {
     /// as the server names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Replied to (\\Answered), here or in another mail app.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answered: bool,
+    /// Forwarded ($Forwarded).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forwarded: bool,
+    /// The server's conversation id: Gmail's X-GM-THRID ("gm:…"), OBJECTID's
+    /// THREADID ("oid:…") or IMAP THREAD's ("t:…"); empty where unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thread_id: String,
+    /// When it was put in its mailbox (SAVEDATE), where the server says.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub saved: i64,
+    /// Where the sender asked for a read receipt (Disposition-Notification-To).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub receipt_to: String,
+    /// A read receipt was sent or declined ($MDNSent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mdn_sent: bool,
+    /// Too large to download whole: its text was read from its parts, and
+    /// attachments download one at a time (`Attachment::section`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
     /// A row the list knows exists on the server but has not listed yet.
     /// Never stored; the list draws it as a placeholder until it loads.
     #[serde(skip)]
@@ -507,6 +663,9 @@ pub struct Mail {
     pub inline: std::sync::Arc<InlineParts>,
 }
 fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 /// A message's parts that its HTML refers to by Content-ID (`cid:`), such
@@ -643,6 +802,30 @@ pub struct Secret {
     /// always be rebuilt from the password, so the keychain is only a cache.
     #[serde(default)]
     pub mail_key: String,
+    /// Proton (without Bridge): the session's UID. Its tokens are in
+    /// `access_token` and `refresh_token`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proton_uid: String,
+    /// Proton: the salted key passphrase (base64) that unlocks the
+    /// account's keys. The password itself isn't kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proton_key: String,
+}
+impl Secret {
+    pub(crate) fn proton(&self) -> crate::sync::proton::Saved {
+        crate::sync::proton::Saved {
+            uid: self.proton_uid.clone(),
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            key: self.proton_key.clone(),
+        }
+    }
+    pub(crate) fn set_proton(&mut self, saved: &crate::sync::proton::Saved) {
+        self.proton_uid = saved.uid.clone();
+        self.access_token = saved.access_token.clone();
+        self.refresh_token = saved.refresh_token.clone();
+        self.proton_key = saved.key.clone();
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Draft {
@@ -653,6 +836,17 @@ pub struct Draft {
     /// as, through `account`; empty to send as the account itself.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub send_as: String,
+    /// One of the account's other addresses (`Account::identities`) it is
+    /// sent as; empty to send as the account (or `send_as`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
+    /// When to send it (seconds since the epoch), for a message scheduled
+    /// with Send Later; it waits in Drafts until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_at: Option<i64>,
+    /// Why it couldn't be sent when it was scheduled to be, if it couldn't.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub send_error: String,
     pub to: String,
     #[serde(default)]
     pub cc: String,
@@ -679,6 +873,13 @@ pub struct Draft {
     /// uploaded again.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uploaded: String,
+    /// The message this replies to or forwards (its id here), marked
+    /// answered or forwarded once this is sent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub original: String,
+    /// It forwards `original`, rather than replying to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forwarding: bool,
 }
 /// Where a draft is in the server's Drafts folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -716,6 +917,11 @@ impl Draft {
             h.update([0]);
         }
         h.update([u8::from(self.formatted)]);
+        // Added later: drafts without one keep their earlier fingerprints.
+        if !self.identity.is_empty() {
+            h.update(b"identity\0");
+            h.update(self.identity.as_bytes());
+        }
         for path in &self.attachments {
             h.update(path.to_string_lossy().as_bytes());
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -844,6 +1050,13 @@ pub fn demo_mail() -> Vec<Mail> {
             reply_to: String::new(),
             labels: vec![],
             inline: Default::default(),
+            answered: i == 2,
+            forwarded: false,
+            thread_id: String::new(),
+            saved: 0,
+            receipt_to: String::new(),
+            mdn_sent: false,
+            partial: false,
         })
         .collect()
 }

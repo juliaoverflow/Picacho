@@ -1632,6 +1632,11 @@ impl MailApp {
                     &a.email,
                     list.iter().map(|r| r.address.clone()),
                 );
+                // And show as these contacts on mail of a mailbox kept to its aliases.
+                let _ = fwd::remember_contacts(
+                    &b.store,
+                    list.iter().map(|r| (r.address.clone(), r.contact.clone())),
+                );
                 Ok(list)
             },
             move |this, result, cx| {
@@ -1639,6 +1644,8 @@ impl MailApp {
                 match result {
                     Ok(list) => {
                         this.alias_routes = fwd::routes(&this.backend.store);
+                        this.reverse_contacts =
+                            Arc::new(fwd::reverse_contacts(&this.backend.store));
                         let query = if this.fwd_reverse.as_deref() == Some(key.as_str()) {
                             Self::value(&this.fwd_contact_search, cx)
                         } else {
@@ -1823,11 +1830,21 @@ impl MailApp {
         Self::set(&self.fwd_contact_new, "", w, cx);
         self.task(
             cx,
-            move |_| fwd::add_contact(&account, &a, &address).map_err(|e| e.context(address)),
+            move |b| {
+                let contact =
+                    fwd::add_contact(&account, &a, &address).map_err(|e| e.context(address))?;
+                let _ = fwd::remember_contacts(
+                    &b.store,
+                    [(contact.address.clone(), contact.contact.clone())],
+                );
+                Ok(contact)
+            },
             move |this, result, cx| {
                 this.fwd_busy.remove(&busy);
                 match result {
                     Ok(contact) => {
+                        this.reverse_contacts =
+                            Arc::new(fwd::reverse_contacts(&this.backend.store));
                         cx.write_to_clipboard(ClipboardItem::new_string(contact.address.clone()));
                         this.notice(
                             format!("Reverse alias for {} ready · copied", contact.contact),

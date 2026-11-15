@@ -68,6 +68,39 @@ impl Search {
     pub fn matches(&self, m: &Mail) -> bool {
         self.terms.iter().all(|t| t.matches(m) != t.negated)
     }
+    /// The search as IMAP SEARCH criteria, for asking the server to search
+    /// the whole mailbox. `string` makes a search string (quoted, or a
+    /// literal for text the session can't quote). Words search the whole
+    /// message (TEXT), as server-side search does.
+    pub fn imap_criteria(
+        &self,
+        string: &dyn Fn(&str) -> anyhow::Result<String>,
+    ) -> anyhow::Result<String> {
+        let mut parts = Vec::new();
+        for t in &self.terms {
+            let v = || string(&t.value);
+            let part = match t.field {
+                Field::Any => format!("TEXT {}", v()?),
+                Field::From => format!("FROM {}", v()?),
+                Field::ReplyTo => format!("HEADER Reply-To {}", v()?),
+                Field::To => format!("OR TO {} CC {}", v()?, v()?),
+                Field::Cc => format!("CC {}", v()?),
+                Field::Subject => format!("SUBJECT {}", v()?),
+                Field::Label => match crate::sync::transport::keyword(&t.value) {
+                    Ok(keyword) => format!("KEYWORD {keyword}"),
+                    // Not a keyword this server could have.
+                    Err(_) => format!("TEXT {}", v()?),
+                },
+                Field::Unread => "UNSEEN".into(),
+                Field::Read => "SEEN".into(),
+                Field::Starred => "FLAGGED".into(),
+                Field::Unstarred => "UNFLAGGED".into(),
+                Field::Attachment => "HEADER Content-Type \"multipart/mixed\"".into(),
+            };
+            parts.push(if t.negated { format!("NOT ({part})") } else { part });
+        }
+        Ok(if parts.is_empty() { "ALL".into() } else { parts.join(" ") })
+    }
 }
 
 impl Term {
@@ -266,6 +299,20 @@ mod tests {
         assert!(!hit("is:starred"));
         assert!(hit("-is:starred"));
         assert!(!hit("has:attachment"));
+    }
+
+    #[test]
+    fn server_criteria() {
+        let quote = |s: &str| -> anyhow::Result<String> { Ok(format!("\"{s}\"")) };
+        assert_eq!(Search::parse("").imap_criteria(&quote).unwrap(), "ALL");
+        assert_eq!(
+            Search::parse("from:ana -is:read report").imap_criteria(&quote).unwrap(),
+            "FROM \"ana\" NOT (SEEN) TEXT \"report\""
+        );
+        assert_eq!(
+            Search::parse("to:team has:attachment").imap_criteria(&quote).unwrap(),
+            "OR TO \"team\" CC \"team\" HEADER Content-Type \"multipart/mixed\""
+        );
     }
 
     #[test]

@@ -45,6 +45,8 @@ pub fn parse_message(
                 size: part.get_body_raw().map(|b| b.len()).unwrap_or_default(),
                 mime: part.ctype.mimetype.clone(),
                 part: index,
+                section: String::new(),
+                encoding: String::new(),
             });
         } else if part.ctype.mimetype == "text/html" && html.is_none() {
             html = part.get_body().ok();
@@ -104,7 +106,22 @@ pub fn parse_message(
         reply_to: header("Reply-To"),
         labels: vec![],
         inline: std::sync::Arc::new(inline),
+        answered: false,
+        forwarded: false,
+        thread_id: String::new(),
+        saved: 0,
+        receipt_to: receipt_address(&header("Disposition-Notification-To")),
+        mdn_sent: false,
+        partial: false,
     })
+}
+/// The address a read receipt goes to, from Disposition-Notification-To.
+pub(crate) fn receipt_address(value: &str) -> String {
+    mailparse::addrparse(value)
+        .ok()
+        .and_then(|v| v.extract_single_info())
+        .map(|s| s.addr)
+        .unwrap_or_default()
 }
 pub(crate) fn collect_leaves<'a>(
     p: &'a mailparse::ParsedMail<'a>,

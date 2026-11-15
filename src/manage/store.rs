@@ -226,12 +226,13 @@ impl Store {
         } else {
             "data"
         };
-        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred'))) ORDER BY date DESC, id DESC LIMIT ?3"))?;
+        // All Mail is everything but drafts; Starred, the starred mail.
+        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred')) OR (?2='all' AND folder<>'drafts')) ORDER BY date DESC, id DESC LIMIT ?3"))?;
         let rows = q.query_map(
             params![
                 account,
                 mailbox.key(),
-                if folder == Folder::Starred {
+                if folder.is_virtual() {
                     usize::MAX >> 1
                 } else {
                     limit
@@ -244,7 +245,8 @@ impl Store {
         for row in rows {
             let mail: Mail = serde_json::from_str(&row?)?;
             if folder != Folder::Starred || mail.starred {
-                if folder == Folder::Starred
+                // A message in several mailboxes (Gmail's labels) is listed once.
+                if folder.is_virtual()
                     && !seen.insert(if mail.message_id.is_empty() {
                         mail.id.clone()
                     } else {
@@ -795,6 +797,7 @@ impl Store {
     /// Commits one incremental synchronization: new messages, flag changes
     /// for cached ones (by UID, within `prefix`'s generation), and removal of
     /// mail older than the account's sync window (`before`).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_changes(
         &self,
         mailbox: &Mailbox,
@@ -802,6 +805,7 @@ impl Store {
         prefix: &str,
         fresh: &[Mail],
         flags: &[FlagUpdate],
+        removed: &[String],
         before: Option<i64>,
     ) -> Result<()> {
         ensure!(
@@ -818,6 +822,9 @@ impl Store {
             unread,
             starred,
             labels,
+            answered,
+            forwarded,
+            mdn_sent,
         } in flags
         {
             let id = format!("{prefix}{uid}");
@@ -829,9 +836,14 @@ impl Store {
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
                 let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels);
-                if (mail.unread, mail.starred) != (*unread, *starred) || labels_changed {
+                let marks = (*answered, *forwarded, *mdn_sent);
+                if (mail.unread, mail.starred) != (*unread, *starred)
+                    || labels_changed
+                    || (mail.answered, mail.forwarded, mail.mdn_sent) != marks
+                {
                     mail.unread = *unread;
                     mail.starred = *starred;
+                    (mail.answered, mail.forwarded, mail.mdn_sent) = marks;
                     if let Some(labels) = labels {
                         mail.labels = labels.clone();
                     }
@@ -839,10 +851,51 @@ impl Store {
                 }
             }
         }
+        // Removed on the server (QRESYNC's VANISHED), within this generation.
+        for id in removed.iter().filter(|id| id.starts_with(prefix)) {
+            tx.execute(
+                "DELETE FROM messages WHERE id=?1 AND account=?2",
+                params![id, account],
+            )?;
+        }
         if let Some(before) = before {
             tx.execute(
                 "DELETE FROM messages WHERE account=?1 AND folder=?2 AND date < ?3",
                 params![account, mailbox.key(), before],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Sets the server's conversation ids on cached messages (IMAP THREAD).
+    pub fn set_thread_ids(&self, ids: &[(String, String)]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for (id, thread) in ids {
+            let data: Option<String> = {
+                use rusqlite::OptionalExtension;
+                tx.query_row("SELECT data FROM messages WHERE id=?1", [id], |r| r.get(0))
+                    .optional()?
+            };
+            if let Some(data) = data {
+                let mut mail: Mail = serde_json::from_str(&data)?;
+                if &mail.thread_id != thread {
+                    mail.thread_id = thread.clone();
+                    write_messages(&tx, &[mail])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Deletes cached messages by id (removed on the server).
+    pub fn delete_ids(&self, account: &str, ids: &[String]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM messages WHERE id=?1 AND account=?2",
+                params![id, account],
             )?;
         }
         tx.commit()?;
@@ -888,8 +941,12 @@ impl Store {
     }
     pub fn folders(&self, account: &str) -> Vec<RemoteFolder> {
         self.preference(&format!("folders:{account}"))
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str::<Vec<RemoteFolder>>(&s).ok())
             .unwrap_or_default()
+            .into_iter()
+            // Lists saved before Gmail's system container was left out.
+            .filter(|f| !crate::sync::transport::gmail_system(&f.name))
+            .collect()
     }
     /// Forgets a deleted server folder: its cached mail and sync state.
     pub fn forget_mailbox(&self, account: &str, remote: &str) -> Result<()> {
@@ -925,6 +982,16 @@ impl Store {
         q.query_map([account], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
+    }
+    /// Drafts of every account that are scheduled to be sent (Send Later).
+    pub fn scheduled_drafts(&self) -> Result<Vec<Draft>> {
+        let db = self.read();
+        let mut q = db.prepare("SELECT data FROM drafts WHERE data LIKE '%\"send_at\"%'")?;
+        let drafts: Vec<Draft> = q
+            .query_map([], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .collect::<Result<_>>()?;
+        Ok(drafts.into_iter().filter(|d| d.send_at.is_some()).collect())
     }
     pub fn draft(&self, id: &str) -> Result<Option<Draft>> {
         use rusqlite::OptionalExtension;
@@ -1193,6 +1260,42 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn all_mail_lists_every_folder_once_without_drafts() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        let mail = |id: &str, folder: Folder, remote: &str, message_id: &str, date: i64| Mail {
+            id: id.into(),
+            account: "a".into(),
+            folder,
+            remote_folder: remote.into(),
+            message_id: message_id.into(),
+            date,
+            ..Mail::default()
+        };
+        s.save_messages(&[
+            mail("a:INBOX:1:1", Folder::Inbox, "INBOX", "<1@x>", 5),
+            mail("a:Sent:1:1", Folder::Sent, "Sent", "<2@x>", 4),
+            mail("a:Trash:1:1", Folder::Trash, "Trash", "<3@x>", 3),
+            mail("a:Projects:1:1", Folder::Other, "Projects", "<4@x>", 2),
+            // The same message under another label is listed once.
+            mail("a:All:1:1", Folder::Archive, "[Gmail]/All Mail", "<1@x>", 5),
+            mail("a:Drafts:1:1", Folder::Drafts, "Drafts", "<5@x>", 6),
+            Mail {
+                account: "b".into(),
+                ..mail("b:INBOX:1:1", Folder::Inbox, "INBOX", "<6@x>", 7)
+            },
+        ])?;
+        let all = s.summaries("a", Folder::All)?;
+        let ids: Vec<&str> = all.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(ids, ["<1@x>", "<2@x>", "<3@x>", "<4@x>"]);
+        // Each keeps its real place, so its actions apply where it is.
+        assert_eq!(all[2].folder, Folder::Trash);
+        assert_eq!(s.messages("a", Folder::All, 2)?.len(), 2);
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    #[test]
     fn cache_roundtrip_and_account_isolation() -> Result<()> {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
         let s = Store::open(&p)?;
@@ -1266,6 +1369,9 @@ pub struct FlagUpdate {
     pub starred: bool,
     /// Its labels, when the server said (`None` leaves them as they were).
     pub labels: Option<Vec<String>>,
+    pub answered: bool,
+    pub forwarded: bool,
+    pub mdn_sent: bool,
 }
 /// A server mailbox as of its last synchronization: enough to ask only for
 /// what changed since (new UIDs, CONDSTORE flag changes, removals).
