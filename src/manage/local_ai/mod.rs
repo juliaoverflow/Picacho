@@ -25,7 +25,7 @@ pub const OTP_PREFERENCE: &str = "local_ai_otp";
 /// against the size and SHA-256 below, so a changed file is never installed.
 /// `PICACHO_MODELS_URL` points elsewhere (a mirror, or a local server while
 /// developing).
-const MODELS_URL: &str = "https://huggingface.co/pinaltech/picacho-otp/resolve/main";
+const MODELS_URL: &str = "https://huggingface.co/pinaltech/veil-otp/resolve/main";
 
 /// A downloadable model: its file there and here, and what it must be.
 pub struct Model {
@@ -244,22 +244,64 @@ fn size_of(path: &std::path::Path) -> u64 {
     }
 }
 
+/// A published model file for tests: the one `models/otp/train.py` just
+/// wrote, if it is there and is the published one, else the published file,
+/// downloaded once into `target/test-models` and checked like an install.
+/// The model files aren't kept in git; they are published on Hugging Face.
+#[cfg(test)]
+pub(crate) fn test_model(file: &str) -> PathBuf {
+    use std::sync::Mutex;
+    static FETCHING: Mutex<()> = Mutex::new(());
+    let model = [&OTP_NATIVE, &OTP_COREML]
+        .into_iter()
+        .find(|m| m.file == file)
+        .unwrap_or_else(|| panic!("no published model is named {file}"));
+    let published = |path: &std::path::Path| {
+        std::fs::read(path).is_ok_and(|bytes| {
+            bytes.len() as u64 == model.size && hex(&Sha256::digest(&bytes)) == model.sha256
+        })
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let trained = root.join("models/otp").join(file);
+    if published(&trained) {
+        return trained;
+    }
+    let cached = root.join("target/test-models").join(file);
+    let _fetching = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
+    if published(&cached) {
+        return cached;
+    }
+    let url = format!("{MODELS_URL}/{file}");
+    let bytes = crate::sync::models::download(&url, model.size, &AtomicU64::new(0))
+        .unwrap_or_else(|e| panic!("couldn't download {url} for the tests: {e:#}"));
+    assert_eq!(
+        (bytes.len() as u64, hex(&Sha256::digest(&bytes)).as_str()),
+        (model.size, model.sha256),
+        "{url} isn't the model the app expects: update its size and digest"
+    );
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    let partial = cached.with_extension("partial");
+    std::fs::write(&partial, &bytes).unwrap();
+    std::fs::rename(&partial, &cached).unwrap();
+    cached
+}
+
+#[cfg(test)]
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_published_models_are_the_trained_ones() {
-        // The models in the repository are what gets published; their
-        // digests here have to follow them when they are retrained.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp");
+    fn the_published_models_are_the_ones_the_app_expects() {
+        // The files on Hugging Face (or just trained) match the sizes and
+        // digests here; `test_model` checks both, downloading if needed.
         for model in [OTP_NATIVE, OTP_COREML] {
-            let bytes = std::fs::read(dir.join(model.file)).unwrap();
-            let digest: String = Sha256::digest(&bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            assert_eq!(digest, model.sha256, "{}", model.file);
+            let bytes = std::fs::read(test_model(model.file)).unwrap();
+            assert_eq!(hex(&Sha256::digest(&bytes)), model.sha256, "{}", model.file);
             assert_eq!(bytes.len() as u64, model.size, "{}", model.file);
             assert_eq!(model.threshold, OTP.threshold);
         }
@@ -273,7 +315,7 @@ mod tests {
         // As install leaves it, without the download.
         std::fs::create_dir_all(models_dir(&store))?;
         std::fs::copy(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.bin"),
+            test_model("otp-v1.bin"),
             models_dir(&store).join("otp-v1.bin"),
         )?;
         #[cfg(not(target_os = "macos"))]
@@ -293,7 +335,7 @@ mod tests {
         // An older version's file and an unfinished download go; the
         // current model stays.
         std::fs::copy(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.bin"),
+            test_model("otp-v1.bin"),
             models_dir(&store).join(OTP.installed),
         )?;
         std::fs::write(models_dir(&store).join("otp-v0.bin"), b"old")?;

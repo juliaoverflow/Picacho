@@ -1,15 +1,16 @@
-# Sign-in code model
+# Veil OTP: the sign-in code model
 
 The model behind **Settings → Local AI → Hide sign-in codes**. It decides
 whether a number in an email is the message's sign-in, verification or
 one-time code, so Picacho can show it as `••••••` in the subject, the message
 and notifications.
 
-Nothing here ships inside the app. When the feature is turned on, Picacho
-downloads one file from [pinaltech/picacho-otp](https://huggingface.co/pinaltech/picacho-otp)
-on Hugging Face (`MODELS_URL` in `src/manage/local_ai/mod.rs`), checks its
-size and SHA-256,
-and keeps it in the data directory under `models/`. Turning the feature (or
+This directory holds the training code and data; the model files themselves
+are published on Hugging Face as
+[pinaltech/veil-otp](https://huggingface.co/pinaltech/veil-otp) and aren't
+kept in git. Nothing ships inside the app: when the feature is turned on,
+Picacho downloads one file from there (`MODELS_URL` in
+`src/manage/local_ai/mod.rs`), checks its size and SHA-256, and keeps it in the data directory under `models/`. Turning the feature (or
 Local AI) off deletes it, and a model left from an earlier version is deleted
 when the new one is installed.
 
@@ -74,6 +75,10 @@ python3 train.py            # numpy: otp-v1.bin, parity.json
 python3 train.py --coreml   # also otp-v1.mlmodel (pip install coremltools)
 ```
 
+The files it writes here are ignored by git. Tests use them when they are
+the published ones; otherwise they download the published files once into
+`target/test-models` (so the first `cargo test` needs to reach Hugging Face).
+
 The training mail is synthetic (`data.py`): sign-in messages in the languages
 above, mail full of numbers that aren't codes (orders, invoices, tracking and
 booking references, phone numbers, addresses, account endings, coupons,
@@ -96,13 +101,15 @@ it.
 ## Publishing a new version
 
 1. Retrain, then update the sizes and digests `train.py` prints in
-   `src/manage/local_ai/mod.rs` (`cargo test the_published_models_are_the_trained_ones`
-   fails until they match). Bump the version in the file names when the
+   `src/manage/local_ai/mod.rs`. Bump the version in the file names when the
    features or lexicon change.
 2. Upload the new files to the model repository (they are found by name):
-   `hf upload pinaltech/picacho-otp models/otp/otp-v2.bin otp-v2.bin`, and the
+   `hf upload pinaltech/veil-otp models/otp/otp-v2.bin otp-v2.bin`, and the
    same for the `.mlmodel`. Upload before releasing the app that names them;
    a file whose digest doesn't match is never installed.
+3. `cargo test the_published_models_are_the_ones_the_app_expects` checks the
+   uploaded files against those sizes and digests (delete
+   `target/test-models` first so it downloads them again).
 
 `PICACHO_MODELS_URL` makes the app download from somewhere else (an HTTPS
 mirror) while developing.

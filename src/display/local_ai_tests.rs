@@ -50,11 +50,7 @@ fn mailbox() -> (Arc<Store>, String) {
 fn install(store: &Store) {
     let dir = local_ai::models_dir(store);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.bin"),
-        dir.join("otp-v1.bin"),
-    )
-    .unwrap();
+    std::fs::copy(local_ai::test_model("otp-v1.bin"), dir.join("otp-v1.bin")).unwrap();
 }
 
 #[gpui::test]

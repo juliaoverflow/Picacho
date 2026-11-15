@@ -167,11 +167,14 @@ mod tests {
                 .output()?;
             let log = String::from_utf8_lossy(&out.stderr);
             ensure!(out.status.success(), "the measurement failed:\n{log}");
-            ensure!(log.contains("resident memory grew"), "it didn't run:\n{log}");
+            ensure!(
+                log.contains("resident memory grew"),
+                "it didn't run:\n{log}"
+            );
             return Ok(());
         }
         let dir = std::env::temp_dir().join(format!("coreml-{}", uuid::Uuid::new_v4()));
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.mlmodel");
+        let source = super::super::test_model("otp-v1.mlmodel");
         let compiled = dir.join("otp.mlmodelc");
         std::fs::create_dir_all(&dir)?;
         compile(&source, &compiled)?;

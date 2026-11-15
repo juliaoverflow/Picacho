@@ -509,8 +509,7 @@ mod tests {
     use crate::manage::local_ai::runtime::NativeModel;
 
     fn model() -> NativeModel {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.bin");
-        NativeModel::load(&path).expect("the trained model in models/otp")
+        NativeModel::load(&super::super::test_model("otp-v1.bin")).expect("the published model")
     }
 
     /// The candidates, features, vectors and scores the training code
