@@ -156,6 +156,18 @@ fn run(
                 Some("gmail") => Action::ChooseService(Service::Gmail),
                 Some("outlook") => Action::ChooseService(Service::Outlook),
                 Some("allmail") => Action::OpenMailbox(ALL_MAIL.into(), Folder::Inbox.into()),
+                Some("inbox") => match this.accounts.first() {
+                    Some(a) => Action::OpenMailbox(a.id.clone(), Folder::Inbox.into()),
+                    None => return,
+                },
+                Some("subs") => match this.accounts.first() {
+                    Some(a) => Action::OpenSubscriptions(a.id.clone()),
+                    None => return,
+                },
+                Some("unsub") => match this.subs_shown().first().and_then(|&i| this.subs.get(i)) {
+                    Some(sub) => Action::Unsubscribe(sub.clone()),
+                    None => return,
+                },
                 Some("theme") => Action::Theme,
                 Some("details") => Action::ToggleDetails,
                 Some("original") => Action::ShowOriginal,

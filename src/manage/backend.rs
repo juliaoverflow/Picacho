@@ -2498,15 +2498,26 @@ impl Backend {
     ) -> Result<crate::manage::subscriptions::Plan> {
         use crate::manage::subscriptions::Plan;
         let messages = self.store.subscription_messages(&a.id, &sub.address, 5)?;
-        for m in &messages {
-            let Ok(raw) = self.original(a, m) else {
-                continue;
-            };
-            if let Some(plan) = crate::sync::auth::signed_unsubscribe(&raw)
-                .and_then(|signed| Plan::new(Some(&signed), ""))
-            {
-                return Ok(plan);
-            }
+        // Each check waits on the sender's DNS (up to its timeout), so
+        // checking the messages one after another could take over a minute.
+        // Their sources are gathered first, then checked at once; the newest
+        // that verifies is still the one used.
+        let sources: Vec<Option<Vec<u8>>> =
+            messages.iter().map(|m| self.original(a, m).ok()).collect();
+        let checked: Vec<Option<Plan>> = std::thread::scope(|scope| {
+            let checks: Vec<_> = sources
+                .iter()
+                .map(|raw| {
+                    scope.spawn(move || {
+                        crate::sync::auth::signed_unsubscribe(raw.as_deref()?)
+                            .and_then(|signed| Plan::new(Some(&signed), ""))
+                    })
+                })
+                .collect();
+            checks.into_iter().map(|c| c.join().ok().flatten()).collect()
+        });
+        if let Some(plan) = checked.into_iter().flatten().next() {
+            return Ok(plan);
         }
         let latest = messages.first().map_or(sub.unsubscribe.as_str(), |m| m.list_unsubscribe.as_str());
         Plan::new(None, latest).context("This sender offers no way to unsubscribe.")

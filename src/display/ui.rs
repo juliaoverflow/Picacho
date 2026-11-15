@@ -38,6 +38,8 @@ mod local_ai_tests;
 mod message_window;
 #[path = "panes.rs"]
 mod panes;
+#[path = "prompt.rs"]
+mod prompt;
 use panes::{LIST_MIN, Pane, Resize};
 #[path = "reader.rs"]
 mod reader;
@@ -2878,6 +2880,7 @@ impl MailApp {
         .detach();
     }
     fn apply_theme(&self, w: &mut Window, cx: &mut App) {
+        prompt::set_colors(self.colors());
         Theme::change(
             if self.dark {
                 ThemeMode::Dark
@@ -9115,6 +9118,7 @@ pub fn run(store: Arc<Store>) {
     super::desktop::register();
     app.run(move |cx| {
         gpui_component::init(cx);
+        prompt::install(cx);
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
