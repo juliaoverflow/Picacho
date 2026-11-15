@@ -104,7 +104,7 @@ After signing in, a session sends `ID` where offered and turns on
 
 `imap-proto` doesn't model NAMESPACE, QUOTA, MYRIGHTS, ID or ENABLED replies,
 and `imap` 2.4 mistakes any untagged line it can't parse for the server
-leaving; the patched `imap-proto` keeps them as text (`Response::Other`). The vendored copy in `vendor/imap-proto` adds ESEARCH, SORT, THREAD, VANISHED and the extension FETCH attributes (see its README).
+leaving; the patched `imap-proto` keeps them as text (`Response::Other`). Its patch 0004 in [Picacho-Patches](https://github.com/pinaltech/Picacho-Patches/tree/vendor-split-dev/imap-proto) adds ESEARCH, SORT, THREAD, VANISHED and the extension FETCH attributes.
 
 ## Push (IDLE)
 

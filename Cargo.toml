@@ -231,8 +231,8 @@ blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,
-# BINARY, ESEARCH, SORT, THREAD and QRESYNC's VANISHED; see vendor/imap-proto.
-imap-proto = { path = "vendor/imap-proto" }
+# BINARY, ESEARCH, SORT, THREAD and QRESYNC's VANISHED (its patch 0004).
+imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Maximized windows' content is no longer a resize edge.
 gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Copying from a menu (a click) works on Wayland.
