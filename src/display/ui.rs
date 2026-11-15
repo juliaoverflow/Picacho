@@ -183,6 +183,8 @@ struct Colors {
     on_accent: u32,
     soft: u32,
     danger: u32,
+    /// Problems that don't stop the account (yellow).
+    warning: u32,
 }
 impl Colors {
     fn new(dark: bool, accent: Accent) -> Self {
@@ -200,6 +202,7 @@ impl Colors {
                 on_accent,
                 soft,
                 danger: 0xff9aa7,
+                warning: 0xf2c14e,
             }
         } else {
             Self {
@@ -214,6 +217,7 @@ impl Colors {
                 on_accent,
                 soft,
                 danger: 0xa8313e,
+                warning: 0xb7791f,
             }
         }
     }
@@ -569,6 +573,8 @@ enum Action {
     /// Edits an account's nickname: in the sidebar (true) or on its Settings page.
     EditNickname(String, bool),
     RetryAccount(String),
+    /// Hides a warning (not a sign-in problem) of an account's.
+    DismissIssue(String, IssueSource),
     Reconnect(String),
     SubmitReconnect(String),
     SettingsPage(Page),
@@ -858,6 +864,10 @@ pub struct MailApp {
     active: bool,
     last_check: HashMap<String, std::time::Instant>,
     account_issues: HashMap<String, HashMap<IssueSource, AccountIssue>>,
+    /// Warnings dismissed in Settings, by account and source, with what
+    /// they said: the same failure again stays hidden until that check
+    /// succeeds or fails some other way.
+    dismissed_issues: HashMap<String, HashMap<IssueSource, String>>,
     sync_requests: HashSet<(String, String)>,
     downloading: HashSet<String>,
     retrying: HashSet<String>,
@@ -1565,6 +1575,7 @@ impl MailApp {
             active: true,
             last_check: HashMap::new(),
             account_issues: HashMap::new(),
+            dismissed_issues: HashMap::new(),
             sync_requests: HashSet::new(),
             downloading: HashSet::new(),
             retrying: HashSet::new(),
@@ -4896,6 +4907,7 @@ impl MailApp {
                 }
             }
             Action::RetryAccount(id) => self.retry_account(id, cx),
+            Action::DismissIssue(id, source) => self.dismiss_issue(&id, source),
             Action::Reconnect(id) => {
                 if self.retrying.contains(&id) {
                     return;
@@ -5157,6 +5169,7 @@ impl MailApp {
                                 this.forget_mailbox(&id);
                                 this.sync_tree();
                                 this.account_issues.remove(&id);
+                                this.dismissed_issues.remove(&id);
                                 this.folders.remove(&id);
                                 this.known.remove(&id);
                                 this.last_check.remove(&id);

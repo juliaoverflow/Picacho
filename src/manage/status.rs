@@ -119,6 +119,13 @@ impl AccountIssue {
             occurred_at: chrono::Utc::now().timestamp(),
         }
     }
+    /// Whether it needs the person before the account works again: its
+    /// sign-in was refused, or its saved credentials couldn't be read.
+    /// Anything else (a dropped connection, a refused command, a message
+    /// that wouldn't send) is a warning, and can be dismissed.
+    pub fn critical(&self) -> bool {
+        self.access.is_some()
+    }
     pub fn guidance(&self, source: &IssueSource) -> &'static str {
         if *source == IssueSource::Send {
             return "Your draft has been kept. Check your sign-in, recipient, and outgoing server settings before sending again.";

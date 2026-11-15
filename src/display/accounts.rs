@@ -136,6 +136,7 @@ impl MailApp {
     }
     pub(super) fn account_warning(&self, id: &str, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        let critical = self.issues_critical(id);
         let id = id.to_owned();
         let selector = format!("account-warning-{id}");
         div()
@@ -149,8 +150,19 @@ impl MailApp {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .child(icon_el("warning", 16., c.danger))
-            .tooltip(|w, cx| Tooltip::new("Mailbox needs attention · Show details").build(w, cx))
+            .child(icon_el(
+                "warning",
+                16.,
+                if critical { c.danger } else { c.warning },
+            ))
+            .tooltip(move |w, cx| {
+                Tooltip::new(if critical {
+                    "Mailbox needs attention · Show details"
+                } else {
+                    "Something didn't work · Show details"
+                })
+                .build(w, cx)
+            })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, w, cx| {
                 cx.stop_propagation();
@@ -184,6 +196,29 @@ impl MailApp {
             .when_some(a.service.password_help().filter(|_| !browser), |d, (help, _)| d.child(div().text_size(px(12.)).child(help)))
             .into_any_element()
     }
+    /// Whether any of the account's problems is critical (its sign-in or
+    /// saved credentials), drawn red; the rest are yellow warnings.
+    pub(super) fn issues_critical(&self, id: &str) -> bool {
+        self.account_issues
+            .get(id)
+            .is_some_and(|issues| issues.values().any(AccountIssue::critical))
+    }
+    /// Hides a warning until its check succeeds or fails another way.
+    /// Sign-in problems can't be dismissed: the account waits on them.
+    pub(super) fn dismiss_issue(&mut self, id: &str, source: IssueSource) {
+        let Some(issues) = self.account_issues.get_mut(id) else {
+            return;
+        };
+        if issues.get(&source).is_none_or(AccountIssue::critical) {
+            return;
+        }
+        if let Some(issue) = issues.remove(&source) {
+            self.dismissed_issues
+                .entry(id.to_owned())
+                .or_default()
+                .insert(source, issue.details);
+        }
+    }
     pub(super) fn account_blocked(&self, id: &str) -> bool {
         self.retrying.contains(id)
             || self.account_issues.get(id).is_some_and(|issues| {
@@ -202,9 +237,11 @@ impl MailApp {
             return;
         }
         let issues = self.account_issues.entry(id.into()).or_default();
+        let dismissed = self.dismissed_issues.entry(id.into()).or_default();
         match result {
             Ok(_) => {
                 issues.remove(&source);
+                dismissed.remove(&source);
                 // A successful incoming login also resolves earlier access failures
                 // from body downloads/reads. SMTP failures have their own boundary.
                 if matches!(source, IssueSource::Sync(_)) {
@@ -214,7 +251,13 @@ impl MailApp {
                 }
             }
             Err(error) if !error.is::<crate::manage::crypto::Locked>() => {
-                issues.insert(source, AccountIssue::new(error));
+                let issue = AccountIssue::new(error);
+                // The warning dismissed before, again: it stays dismissed.
+                if !issue.critical() && dismissed.get(&source) == Some(&issue.details) {
+                    return;
+                }
+                dismissed.remove(&source);
+                issues.insert(source, issue);
             }
             Err(_) => {}
         }

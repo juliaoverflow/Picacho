@@ -153,3 +153,39 @@ fn polling_is_independent_of_ui_busy_state_and_coalesces_duplicate_requests(
         assert!(this.status.is_empty());
     });
 }
+
+#[gpui::test]
+fn warnings_are_yellow_and_dismissable_until_they_change(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    view.update_in(cx, |this, _, _| {
+        this.account_issues.clear();
+        let dropped: anyhow::Result<()> = Err(anyhow::anyhow!("Connection reset"));
+        this.account_result(&id, IssueSource::Change, &dropped);
+        assert!(
+            !this.issues_critical(&id),
+            "a dropped connection is a warning"
+        );
+        // Dismissed: hidden, and the same failure again stays hidden.
+        this.dismiss_issue(&id, IssueSource::Change);
+        assert!(this.account_issues[&id].is_empty());
+        this.account_result(&id, IssueSource::Change, &dropped);
+        assert!(this.account_issues[&id].is_empty());
+        // Failing another way shows again.
+        let refused: anyhow::Result<()> = Err(anyhow::anyhow!("Server rejected UID MOVE"));
+        this.account_result(&id, IssueSource::Change, &refused);
+        assert!(this.account_issues[&id].contains_key(&IssueSource::Change));
+        // After a success, the first failure isn't dismissed any more.
+        this.dismiss_issue(&id, IssueSource::Change);
+        this.account_result(&id, IssueSource::Change, &Ok(()));
+        this.account_result(&id, IssueSource::Change, &dropped);
+        assert!(this.account_issues[&id].contains_key(&IssueSource::Change));
+        // A sign-in problem is red and can't be dismissed.
+        let revoked: anyhow::Result<()> =
+            Err(anyhow::anyhow!("App password was revoked").context(AccessFailure::Authentication));
+        this.account_result(&id, IssueSource::Sync("inbox".into()), &revoked);
+        assert!(this.issues_critical(&id));
+        this.dismiss_issue(&id, IssueSource::Sync("inbox".into()));
+        assert!(this.account_issues[&id].contains_key(&IssueSource::Sync("inbox".into())));
+    });
+}

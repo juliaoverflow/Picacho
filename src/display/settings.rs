@@ -549,6 +549,9 @@ impl MailApp {
         });
         let busy =
             self.retrying.contains(&a.id) || self.sync_requests.iter().any(|(id, _)| id == &a.id);
+        // Red for a sign-in problem; otherwise yellow warnings.
+        let critical = self.issues_critical(&a.id);
+        let tone = if critical { c.danger } else { c.warning };
         div()
             .id("account-error-details")
             .debug_selector(|| "account-error-details".into())
@@ -557,7 +560,7 @@ impl MailApp {
             .p_3()
             .rounded(px(10.))
             .border_1()
-            .border_color(rgb(c.danger))
+            .border_color(rgb(tone))
             .flex()
             .flex_col()
             .gap_3()
@@ -567,9 +570,13 @@ impl MailApp {
                     .items_center()
                     .gap_2()
                     .text_size(px(13.))
-                    .text_color(rgb(c.danger))
-                    .child(icon_el("warning", 16., c.danger))
-                    .child("Mailbox needs attention"),
+                    .text_color(rgb(tone))
+                    .child(icon_el("warning", 16., tone))
+                    .child(if critical {
+                        "Mailbox needs attention"
+                    } else {
+                        "Something didn't work"
+                    }),
             )
             .children(issues.into_iter().map(|(source, issue)| {
                 let label = match source {
@@ -597,6 +604,21 @@ impl MailApp {
                             .child(issue.details.clone()),
                     )
                     .child(div().text_color(rgb(c.muted)).child(issue.guidance(source)))
+                    .when(!issue.critical(), |d| {
+                        d.child(
+                            div().flex().child(
+                                self.button(
+                                    format!("dismiss-issue-{}", source.label()),
+                                    "Dismiss",
+                                    "",
+                                    Action::DismissIssue(a.id.clone(), source.clone()),
+                                    false,
+                                    cx,
+                                )
+                                .h(px(28.)),
+                            ),
+                        )
+                    })
             }))
             .child(
                 div()
@@ -614,14 +636,17 @@ impl MailApp {
                         )
                         .when(busy, |d| d.opacity(0.6)),
                     )
-                    .child(self.button(
-                        "account-reconnect",
-                        "Sign In Again",
-                        "",
-                        Action::Reconnect(a.id.clone()),
-                        false,
-                        cx,
-                    )),
+                    // Signing in again fixes sign-in problems, not warnings.
+                    .when(critical, |d| {
+                        d.child(self.button(
+                            "account-reconnect",
+                            "Sign In Again",
+                            "",
+                            Action::Reconnect(a.id.clone()),
+                            false,
+                            cx,
+                        ))
+                    }),
             )
             .into_any_element()
     }
