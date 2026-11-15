@@ -288,12 +288,15 @@ impl MailApp {
             cx,
         )
     }
-    /// The fields and choices of the Proton step after the password.
-    pub(super) fn proton_step_view(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    /// The fields and choices of the Proton step after the password. With
+    /// `heading`, its title and explanation too (the setup card shows them
+    /// as its own title instead). Back is the setup's own "Back" link, or
+    /// a button in the sign-in-again dialog's footer.
+    pub(super) fn proton_step_view(&self, heading: bool, cx: &Context<Self>) -> Option<AnyElement> {
         let stage = self.proton_stage?;
         let c = self.colors();
         let mut content = div().w_full().flex().flex_col().gap_4();
-        if let Some((title, about)) = self.proton_heading() {
+        if let Some((title, about)) = self.proton_heading().filter(|_| heading) {
             content = content.child(
                 div()
                     .flex()
@@ -357,12 +360,6 @@ impl MailApp {
                 content = content.child(self.field("Mailbox password", MAILBOX_PASSWORD));
             }
         }
-        content = content.child(
-            div().flex().child(
-                self.link("proton-back", "Back", Action::ProtonBack, cx)
-                    .debug_selector(|| "proton-back".into()),
-            ),
-        );
         Some(content.into_any_element())
     }
     /// What the security key or phone is waiting for.

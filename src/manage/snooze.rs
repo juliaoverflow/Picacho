@@ -1,5 +1,8 @@
 //! Snoozing: a message leaves the inbox for a "Snoozed" folder on the
-//! server until a chosen time, then comes back to the inbox, unread.
+//! server until a chosen time, then comes back to the inbox, unread. The
+//! folder is inside a "Picacho" folder (made if missing, kept if there),
+//! on every provider. (Proton refuses a top-level folder named "Snoozed":
+//! the name is its own snooze's.)
 //!
 //! The times are kept on this computer and, where the server has METADATA
 //! (RFC 5464), also as a private annotation on the inbox, so Picacho on
@@ -8,8 +11,44 @@
 //! by hand is simply forgotten.
 use super::*;
 
-/// The folder snoozed mail waits in.
+/// The folder snoozed mail waits in, inside `PARENT`.
 pub const FOLDER: &str = "Snoozed";
+/// Picacho's own folder, at the top of the account's folders.
+pub const PARENT: &str = "Picacho";
+
+/// Where Bridge keeps Proton's folders ("Folders/"): it makes nothing at
+/// the top level.
+fn bridge_folder(names: &[Name], leaf: &str) -> String {
+    let delimiter = names
+        .iter()
+        .find(|n| n.name.eq_ignore_ascii_case("Folders"))
+        .and_then(|n| n.delimiter())
+        .unwrap_or("/");
+    format!("Folders{delimiter}{leaf}")
+}
+/// The account's top-level folder called `leaf`, if there is one.
+fn top_folder(names: &[Name], a: &Account, leaf: &str) -> Option<String> {
+    if a.service == Service::ProtonBridge {
+        let name = bridge_folder(names, leaf);
+        return names
+            .iter()
+            .find(|n| n.name.eq_ignore_ascii_case(&name))
+            .map(|n| n.name.clone());
+    }
+    custom_folders(names)
+        .into_iter()
+        .find(|f| f.depth == 0 && f.label.eq_ignore_ascii_case(leaf))
+        .map(|f| f.name)
+}
+/// The folder called `leaf` inside `parent`, if there is one.
+fn child_folder(names: &[Name], parent: &str, leaf: &str) -> Option<String> {
+    let delimiter = names.iter().find(|n| n.name == parent)?.delimiter()?;
+    let name = format!("{parent}{delimiter}{leaf}");
+    names
+        .iter()
+        .find(|n| n.name.eq_ignore_ascii_case(&name))
+        .map(|n| n.name.clone())
+}
 /// Where the times are kept on servers with METADATA.
 const ENTRY: &str = "/private/vendor/tech.pinal.picacho/snoozed";
 
@@ -83,23 +122,59 @@ impl Backend {
     /// The account's Snoozed folder, made (and subscribed to) if missing.
     fn snooze_folder(&self, c: &mut Connection, a: &Account) -> Result<String> {
         let names = c.names(true)?.to_vec();
-        if let Some(f) = custom_folders(&names)
-            .into_iter()
-            .find(|f| f.depth == 0 && f.label.eq_ignore_ascii_case(FOLDER))
-        {
-            return Ok(f.name);
-        }
-        let namespace = c.namespace()?;
-        let name = new_folder_name(&names, a.provider, None, FOLDER, namespace.as_deref())?;
-        let wire = c.mailbox(&name)?;
-        allowed(
-            c.session.run_command_and_check_ok(format!("CREATE {wire}")),
-            || format!("create the “{FOLDER}” folder"),
-        )?;
-        subscribe(c, &name)?;
+        // Picacho's folder: the one there, or a new one.
+        let parent = match top_folder(&names, a, PARENT) {
+            Some(found) => found,
+            None => {
+                let name = if a.service == Service::ProtonBridge {
+                    bridge_folder(&names, PARENT)
+                } else {
+                    let namespace = c.namespace()?;
+                    new_folder_name(&names, a.provider, None, PARENT, namespace.as_deref())?
+                };
+                self.create_folder(c, &name, PARENT)?;
+                name
+            }
+        };
+        let names = c.names(true)?.to_vec();
+        let nestable = custom_folders(&names)
+            .iter()
+            .any(|f| f.name == parent && f.nestable);
+        let name = if let Some(found) = child_folder(&names, &parent, FOLDER) {
+            found
+        } else if nestable {
+            let namespace = c.namespace()?;
+            let name = new_folder_name(
+                &names,
+                a.provider,
+                Some(&parent),
+                FOLDER,
+                namespace.as_deref(),
+            )?;
+            self.create_folder(c, &name, FOLDER)?;
+            name
+        } else if let Some(found) = top_folder(&names, a, FOLDER) {
+            // A server without folders inside folders: Snoozed at the top.
+            found
+        } else {
+            let namespace = c.namespace()?;
+            let name = new_folder_name(&names, a.provider, None, FOLDER, namespace.as_deref())?;
+            self.create_folder(c, &name, FOLDER)?;
+            name
+        };
         let folders = custom_folders(c.names(true)?);
         self.store.save_folders(&a.id, &folders)?;
         Ok(name)
+    }
+    /// Makes a folder on the server and subscribes to it, so other mail
+    /// apps show it too.
+    fn create_folder(&self, c: &mut Connection, name: &str, label: &str) -> Result<()> {
+        let wire = c.mailbox(name)?;
+        allowed(
+            c.session.run_command_and_check_ok(format!("CREATE {wire}")),
+            || format!("create the “{label}” folder"),
+        )?;
+        subscribe(c, name)
     }
     /// Snoozes messages until `until`: they move to the Snoozed folder and
     /// come back to the inbox, unread, then. Returns the folder's name.
@@ -218,18 +293,34 @@ impl Backend {
     /// on this computer (Bridge has no METADATA to share them either).
     fn snooze_proton(&self, a: &Account, current: &[Mail], until: i64) -> Result<String> {
         let folder = self.with_proton(a, |s| {
-            if let Some(f) = s
+            let made = |id: &str| -> Result<crate::sync::proton::Folder> {
+                s.reload_folders()?;
+                s.folders()
+                    .into_iter()
+                    .find(|f| f.id == id)
+                    .context("Proton didn't keep the new folder.")
+            };
+            // Picacho's folder: the one there, or a new one.
+            let parent = match s
                 .folders()
                 .into_iter()
-                .find(|f| f.exclusive && f.depth == 0 && f.path.eq_ignore_ascii_case(FOLDER))
+                .find(|f| f.exclusive && f.depth == 0 && f.path.eq_ignore_ascii_case(PARENT))
             {
-                return Ok(f.path);
-            }
-            s.create_label(FOLDER, true, None)?;
-            s.reload_folders()?;
+                Some(f) => f,
+                None => made(&s.create_label(PARENT, true, None)?)?,
+            };
+            let inside = format!("{}/{FOLDER}", parent.path);
+            let path = match s
+                .folders()
+                .into_iter()
+                .find(|f| f.exclusive && f.path.eq_ignore_ascii_case(&inside))
+            {
+                Some(f) => f.path,
+                None => made(&s.create_label(FOLDER, true, Some(&parent.id))?)?.path,
+            };
             self.store
                 .save_folders(&a.id, &super::proton::remote_folders(&s.folders()))?;
-            Ok(FOLDER.to_owned())
+            Ok(path)
         })?;
         let moving: Vec<Mail> = current
             .iter()
@@ -388,5 +479,40 @@ impl Backend {
                 .save_mailbox_state(account, &s.folder, Some(&state))?;
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod folder_name_tests {
+    use super::*;
+
+    #[test]
+    fn snoozed_is_inside_picachos_folder() {
+        let names = vec![
+            Name::for_test("INBOX", "/", &[]),
+            Name::for_test("Picacho", "/", &[]),
+            Name::for_test("Picacho/Snoozed", "/", &[]),
+            Name::for_test("Folders", "/", &["\\Noselect"]),
+            Name::for_test("Folders/Picacho", "/", &[]),
+        ];
+        let mut imap = Account::new(Provider::Imap);
+        imap.service = Service::Fastmail;
+        assert_eq!(
+            top_folder(&names, &imap, PARENT).as_deref(),
+            Some("Picacho")
+        );
+        assert_eq!(
+            child_folder(&names, "Picacho", FOLDER).as_deref(),
+            Some("Picacho/Snoozed")
+        );
+        // Bridge keeps Proton's folders under "Folders/".
+        let mut bridge = Account::new(Provider::Imap);
+        bridge.service = Service::ProtonBridge;
+        assert_eq!(
+            top_folder(&names, &bridge, PARENT).as_deref(),
+            Some("Folders/Picacho")
+        );
+        assert_eq!(bridge_folder(&names, PARENT), "Folders/Picacho");
+        assert_eq!(child_folder(&names, "Folders/Picacho", FOLDER), None);
     }
 }

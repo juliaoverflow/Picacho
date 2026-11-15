@@ -282,8 +282,17 @@ impl Name {
             .iter()
             .any(|a| a.to_ascii_lowercase().contains(&attribute))
     }
-    fn delimiter(&self) -> Option<&str> {
+    pub(crate) fn delimiter(&self) -> Option<&str> {
         self.delimiter.as_deref().filter(|d| !d.is_empty())
+    }
+    /// A mailbox as LIST would give it, for tests elsewhere.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, delimiter: &str, attributes: &[&str]) -> Self {
+        Self {
+            name: name.to_owned(),
+            attributes: attributes.iter().map(|a| (*a).to_owned()).collect(),
+            delimiter: Some(delimiter.to_owned()),
+        }
     }
     /// Whether folders can be made inside this one: the server has a
     /// hierarchy and has not marked it \Noinferiors.

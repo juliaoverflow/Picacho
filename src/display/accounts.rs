@@ -162,7 +162,7 @@ impl MailApp {
             return div().into_any_element();
         };
         if a.service == Service::Proton
-            && let Some(step) = self.proton_step_view(cx)
+            && let Some(step) = self.proton_step_view(true, cx)
         {
             return div()
                 .w_full()

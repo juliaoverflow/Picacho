@@ -4582,12 +4582,9 @@ impl MailApp {
                     self.selection.clear();
                     self.select_mode = false;
                 } else if self.folder != Folder::Drafts {
+                    // Nothing is picked until a message is clicked; the open
+                    // one isn't taken for a pick.
                     self.select_mode = true;
-                    // The open message is the likely first pick.
-                    if let Some(open) = self.selected.clone() {
-                        self.selection.insert(open.clone());
-                        self.select_anchor = Some(open);
-                    }
                 }
             }
             Action::SelectFromSender(id) => {
@@ -7307,7 +7304,7 @@ impl MailApp {
         }
         // Proton's steps after the password replace the form.
         if self.service == Service::Proton
-            && let Some(step) = self.proton_step_view(cx)
+            && let Some(step) = self.proton_step_view(false, cx)
         {
             return step;
         }
@@ -7538,6 +7535,13 @@ impl MailApp {
                     "Sign in with your browser. Picacho never sees your password.".into()
                 },
             ),
+            // Proton's steps after the password name themselves.
+            Step::Credentials
+                if self.service == Service::Proton && self.proton_heading().is_some() =>
+            {
+                let (title, about) = self.proton_heading().unwrap_or_default();
+                (title.into(), about.into())
+            }
             Step::Credentials => (
                 if self.service == Service::Other {
                     "Sign in".into()
@@ -7695,6 +7699,9 @@ impl MailApp {
             Step::Provider if !in_modal => Some("Back"),
             Step::Email | Step::Credentials => Some(if self.connecting {
                 "Cancel"
+            } else if self.proton_stage.is_some() {
+                // Back to the password (SetupBack leaves Proton's step).
+                "Back"
             } else {
                 "Choose another provider"
             }),
@@ -8308,6 +8315,16 @@ impl MailApp {
                     "Retry",
                     "",
                     Action::RetrySignIn,
+                    false,
+                    cx,
+                ));
+            }
+            if self.proton_reconnecting().is_some() && self.proton_stage.is_some() {
+                footer = footer.child(self.button(
+                    "proton-back",
+                    if self.connecting { "Cancel" } else { "Back" },
+                    "",
+                    Action::ProtonBack,
                     false,
                     cx,
                 ));
@@ -9500,7 +9517,14 @@ mod tests {
             })
         });
         frame(cx);
-        assert!(cx.debug_bounds("proton-back").is_some());
+        // The step names itself in the card's title, and the setup's own
+        // link goes back to the password.
+        view.read_with(cx, |this, _| {
+            assert_eq!(
+                this.proton_heading().map(|h| h.0),
+                Some("Two-factor authentication")
+            )
+        });
         let first = KeyMethod::offered()[0];
         assert!(cx.debug_bounds(format!("proton-key-{first:?}").leak()).is_some());
         view.read_with(cx, |this, _| assert_eq!(this.proton_submit_label(), Some("Verify")));
@@ -10452,6 +10476,21 @@ mod tests {
         view.read_with(cx, |this, _| {
             assert!(!this.mailbox_loading());
             assert!(this.unreachable_accounts().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_doesnt_pick_the_open_message(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let open = view.read_with(cx, |this, _| this.messages[0].id.clone());
+        act(&view, Action::Select(open.clone()), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.selected.as_ref(), Some(&open))
+        });
+        act(&view, Action::ToggleSelectMode, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selecting);
+            assert!(this.selection.is_empty(), "nothing is picked until clicked");
         });
     }
 
