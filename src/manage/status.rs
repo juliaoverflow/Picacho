@@ -19,6 +19,9 @@ pub enum SignInStep {
     Finishing,
     /// Signing in to the incoming mail server.
     Mailbox,
+    /// Waiting for the person to pass Proton's human verification (its
+    /// CAPTCHA) in the window it opened.
+    Verifying,
 }
 impl SignInStep {
     pub fn label(self) -> &'static str {
@@ -26,6 +29,7 @@ impl SignInStep {
             Self::Browser => "Waiting for your browser…",
             Self::Finishing => "Signed in. Finishing up…",
             Self::Mailbox => "Connecting to your mailbox…",
+            Self::Verifying => "Finish Proton's check in the window that opened…",
         }
     }
 }

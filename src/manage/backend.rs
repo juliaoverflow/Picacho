@@ -33,6 +33,10 @@ pub use remote_search::ServerResults;
 mod large;
 #[path = "extras.rs"]
 mod extras;
+#[path = "proton.rs"]
+mod proton;
+pub use crate::sync::fido::{Method as KeyMethod, NeedsPin, Prompt as KeyPrompt};
+pub use proton::ProtonNext;
 pub use extras::ServerNotes;
 #[cfg(test)]
 #[path = "dovecot_tests.rs"]
@@ -228,6 +232,14 @@ pub struct Backend {
     /// The mailbox open in the window, watched by account where NOTIFY
     /// doesn't cover it; see `watch_folder`.
     folder_watchers: Mutex<HashMap<String, Watcher>>,
+    /// Signed-in Proton sessions (keys unlocked) by account, in memory
+    /// only; see `proton.rs`.
+    proton: Mutex<HashMap<String, Arc<crate::sync::proton::Session>>>,
+    /// A Proton sign-in between its steps (password, second factor,
+    /// mailbox password); see `proton_begin`.
+    proton_login: Mutex<Option<proton::ProtonLogin>>,
+    /// What a security key or phone is waiting for during a sign-in.
+    proton_prompt: Arc<Mutex<KeyPrompt>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -265,6 +277,9 @@ impl Backend {
             waiting: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             folder_watchers: Mutex::new(HashMap::new()),
+            proton: Mutex::new(HashMap::new()),
+            proton_login: Mutex::new(None),
+            proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -331,6 +346,11 @@ impl Backend {
         self.forget_sign_in();
         self.step(&cancel, SignInStep::Browser);
         let mut account = account.clone();
+        // Proton signs in in steps, which `proton_begin` starts.
+        ensure!(
+            account.provider != Provider::Proton,
+            "Sign in to Proton with its own steps."
+        );
         if account.service == crate::manage::model::Service::Pinal {
             let mailbox = crate::sync::oauth::pinal(cancel.clone(), &|| {
                 self.step(&cancel, SignInStep::Finishing)
@@ -671,6 +691,15 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         self.disconnect(id);
         self.stop_watching(id);
+        if let Some(a) = self
+            .store
+            .accounts()
+            .ok()
+            .and_then(|all| all.into_iter().find(|a| a.id == id))
+            .filter(|a| a.provider == Provider::Proton)
+        {
+            self.forget_proton(&a);
+        }
         self.layouts
             .lock()
             .unwrap()
@@ -851,6 +880,9 @@ impl Backend {
         if a.provider == Provider::Pop3 {
             let secret = self.credentials(a)?;
             return self.sync_pop(a, folder, limit, &secret.password);
+        }
+        if a.provider == Provider::Proton {
+            return self.sync_proton(a, mailbox, limit);
         }
         if folder == Folder::Drafts {
             return Ok(vec![]);
@@ -1119,6 +1151,9 @@ impl Backend {
             let secret = self.credentials(a)?;
             return self.catalog_pop(a, folder, batch, &secret.password);
         }
+        if a.provider == Provider::Proton {
+            return self.catalog_proton(a, mailbox, batch);
+        }
         self.with_imap(a, |c| {
             let remote = remote_name(c.names(false)?, a, mailbox)?;
             let selected = c.selected(&remote)?;
@@ -1166,7 +1201,7 @@ impl Backend {
             .copied()
             .filter(|uid| !cached.contains(&format!("{prefix}{uid}")))
             .collect();
-        if wanted.is_empty() || a.provider == Provider::Pop3 {
+        if wanted.is_empty() || !a.provider.imap() {
             return Ok(Vec::new());
         }
         self.with_imap(a, |c| {
@@ -1688,6 +1723,18 @@ impl Backend {
         let m = &latest;
         let raw = if let Some(raw) = self.store.raw(&m.id)? {
             raw
+        } else if a.provider == Provider::Proton {
+            // Too large to download whole: its text alone, and attachments
+            // when saved.
+            if m.size as usize > large::MAX_DOWNLOAD {
+                if m.partial && m.body.is_some() {
+                    return Ok(m.clone());
+                }
+                let next = self.read_proton_parts(a, m)?;
+                self.store.save_messages(std::slice::from_ref(&next))?;
+                return Ok(next);
+            }
+            self.download_proton(a, m)?
         } else {
             ensure!(
                 a.provider != Provider::Pop3,
@@ -1795,6 +1842,9 @@ impl Backend {
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.create_folder_proton(a, parent, leaf);
+        }
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             let namespace = c.namespace()?;
@@ -1833,6 +1883,9 @@ impl Backend {
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.rename_folder_proton(a, name, leaf);
+        }
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             let namespace = c.namespace()?;
@@ -1888,6 +1941,9 @@ impl Backend {
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.delete_folder_proton(a, name);
+        }
         let folders = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             deletable(&names, a.provider, name)?;
@@ -1936,6 +1992,9 @@ impl Backend {
                 &serde_json::to_string(&erased)?,
             )?;
             return self.store.commit_changes(mails, true);
+        }
+        if a.provider == Provider::Proton {
+            return self.delete_proton(a, mails);
         }
         self.with_imap(a, |c| {
             let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
@@ -1995,6 +2054,9 @@ impl Backend {
         }
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.empty_proton(a, folder);
+        }
         let mailbox = Mailbox::Standard(folder);
         let count = self.with_imap(a, |c| {
             let remote = resolve_in(c.names(false)?, a.provider, folder)?;
@@ -2025,6 +2087,9 @@ impl Backend {
         }
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.quota_proton(a);
+        }
         self.with_imap(a, |c| {
             if !c.extensions()?.quota {
                 return Ok(None);
@@ -2050,6 +2115,21 @@ impl Backend {
             !matches!(change, Change::MoveTo(_)) || Self::can_manage_folders(a),
             "This account's folders aren't kept on the server."
         );
+        if a.provider == Provider::Proton {
+            // Changes made while offline go first, in order.
+            let result = self
+                .replay_offline_proton(a)
+                .and_then(|()| self.change_proton(a, &current, &change));
+            return match result {
+                // Offline: the change shows here now and reaches Proton
+                // with the next connection.
+                Err(e) if crate::sync::retry::later(&e) => self.queue_offline(a, &current, &change),
+                Err(e) => Err(e),
+                // The message keeps its id at Proton wherever it is: its row
+                // changes rather than going.
+                Ok(()) => self.commit_change(&current, change, false),
+            };
+        }
         if a.provider != Provider::Pop3 {
             let result = self.with_imap(a, |c| {
                 // Changes made while offline go first, in order.
@@ -2263,6 +2343,13 @@ impl Backend {
     }
     /// Marks every message in a mailbox read, on the server and in the cache.
     pub fn mark_all_read(&self, a: &Account, mailbox: &Mailbox) -> Result<()> {
+        // Proton: every unread message of the mailbox at Proton, Starred
+        // and All Mail included (they are labels there).
+        if a.provider == Provider::Proton && mailbox.folder() != Folder::Drafts {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            return self.mark_all_read_proton(a, mailbox);
+        }
         if mailbox.folder().is_virtual() {
             let unread: Vec<Mail> = self
                 .store
@@ -2307,6 +2394,9 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.ensure_background(a)?;
+        if a.provider == Provider::Proton {
+            return self.download_batch_proton(a, max, since);
+        }
         // A Gmail message appears once per label; download it only once.
         let shared = if a.provider == Provider::Gmail {
             self.store.share_gmail_raw(&a.id)?
@@ -2480,8 +2570,25 @@ impl Backend {
                 )
             }
         };
-        let tls = self.tls_connector()?;
-        let delivered = crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls)?;
+        let delivered = if a.provider == Provider::Proton && own_server.is_none() {
+            // Through Proton's API: it encrypts for the recipients it can,
+            // signs, and files the message in Sent itself.
+            let message = crate::sync::smtp::build(a, d, false)?;
+            let envelope = message.envelope();
+            let from = envelope
+                .from()
+                .map(|f| f.to_string())
+                .context("The message has no sender.")?;
+            let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
+            self.send_proton(a, &from, &to, &message.formatted())?;
+            crate::sync::smtp::Delivered {
+                message,
+                receipts_unsupported: a.delivery_receipts,
+            }
+        } else {
+            let tls = self.tls_connector()?;
+            crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls)?
+        };
         let message = delivered.message;
         let mut notes = Vec::new();
         if !unprotected.is_empty() {
@@ -2500,9 +2607,20 @@ impl Backend {
         // Gmail and Outlook save what goes through their own servers
         // themselves. Custom IMAP servers do not, nor does anyone save what
         // a sending address sent through another server.
-        if a.provider == Provider::Imap || (a.provider != Provider::Pop3 && own_server.is_some()) {
+        // Proton files what it sends itself; a copy of what went through
+        // another server is added to its Sent, as Bridge does for a mail
+        // app's copy.
+        let proton_copy = a.provider == Provider::Proton && own_server.is_some();
+        if a.provider == Provider::Imap
+            || (a.provider.imap() && own_server.is_some())
+            || proton_copy
+        {
             let raw = message.formatted();
-            let saved = self.with_imap(a, |c| self.file_sent_copy(c, a, &raw));
+            let saved = if proton_copy {
+                self.file_sent_copy_proton(a, &raw)
+            } else {
+                self.with_imap(a, |c| self.file_sent_copy(c, a, &raw))
+            };
             match saved {
                 Ok(()) => {}
                 // It will never fit: nothing to try again.
@@ -2686,6 +2804,9 @@ impl Backend {
         }
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.sync_drafts_proton(a);
+        }
         self.with_imap(a, |c| {
             // Copies for Sent that couldn't be saved when sent go first; a
             // failure leaves them for the next check without holding up drafts.
@@ -2881,6 +3002,9 @@ impl Backend {
             && self.store.raw(&m.id)?.is_none()
         {
             let attachment = attachment.clone();
+            if a.provider == Provider::Proton {
+                return self.proton_attachment(a, m, &attachment.section);
+            }
             return self.with_imap(a, |c| {
                 c.select_for(m)?;
                 self.fetch_attachment(c, m, &attachment)

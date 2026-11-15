@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Picacho: a fast, native email client for macOS, Windows, and Linux"
 license = "MIT"
-# mail-auth 0.14 and later need mail-parser 1.0, which needs Rust 1.98.
-rust-version = "1.98"
+# mail-auth 0.14 and later need mail-parser 1.0, which needs Rust 1.98;
+# protected_email_bridge (Proton Mail without Bridge) needs Rust 1.100.
+rust-version = "1.100"
 
 [dependencies]
 aes-gcm = "0.11"
@@ -60,6 +61,19 @@ native-tls = "0.2"
 notify-rust = "4"
 open = "5"
 pgp = "0.21"
+# Proton Mail without Bridge: Proton's API (SRP sign-in, keys, sync, send),
+# used directly by sync/proton.rs. Its IMAP/SMTP listeners are not started.
+protected_email_bridge = { git = "https://github.com/pinaltech/Protected-Email-Bridge" }
+# Proton's human verification (CAPTCHA) in the system's own webview
+# (WKWebView, WebView2, WebKitGTK), in a window of its own; see display/verify.rs.
+tao = "0.34"
+wry = "0.53"
+# Proton sign-in with a security key or passkey (WebAuthn/FIDO2): USB keys,
+# and a phone's passkey by QR code and Bluetooth (caBLE); Windows Hello below.
+webauthn-authenticator-rs = { version = "0.6.2", features = ["usb", "cable"] }
+webauthn-rs-proto = "=0.6.2"
+# The QR code a phone scans to sign in with its passkey.
+qrcode = { version = "0.14", default-features = false }
 rand = "0.10"
 # Finds candidate sign-in codes for the local model (Local AI).
 regex = "1"
@@ -197,6 +211,10 @@ objc = "0.2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSObject"] }
 objc2-core-ml = { version = "0.3", default-features = false, features = ["std", "MLModel", "MLModel_MLModelCompilation", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLMultiArray", "MLFeatureValue", "MLModelConfiguration"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows Hello: the system's own passkeys and security keys.
+webauthn-authenticator-rs = { version = "0.6.2", features = ["win10"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 # GPUI enables Fontconfig's dlopen API; select the matching API in Blitz's font backend.

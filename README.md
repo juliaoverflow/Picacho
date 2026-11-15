@@ -27,7 +27,7 @@ Picacho is a fast, native email client written in Rust with GPUI. It runs withou
 
 ## Build
 
-Requirements: Rust 1.98 or later. On macOS 12 or later, Xcode with its command-line tools; if GPUI reports a missing Metal compiler, run `xcodebuild -downloadComponent MetalToolchain`. Credentials are kept in the system keychain on each platform: macOS Keychain, Windows Credential Manager, or the Secret Service on Linux.
+Requirements: Rust 1.100 or later. On macOS 12 or later, Xcode with its command-line tools; if GPUI reports a missing Metal compiler, run `xcodebuild -downloadComponent MetalToolchain`. Credentials are kept in the system keychain on each platform: macOS Keychain, Windows Credential Manager, or the Secret Service on Linux.
 
 Create an optimized, locally signed macOS application bundle:
 
@@ -71,6 +71,8 @@ Browser sign-in uses Picacho's own registration with each provider. Set these wh
 
 Without a Google client, Gmail falls back to an app password. Without a Microsoft client, Outlook asks for a password, which most Microsoft accounts no longer accept for IMAP.
 
+Proton Mail without Bridge identifies the app to Proton's API as `<platform>-picacho@<version>` (`x-pm-appversion`). Set `PICACHO_PROTON_APP_TOKEN` when building to use another app token in its place; unlike the variables above, it is only read at build time.
+
 ## Connect email
 
 The setup lists the supported services. Each one signs in the simplest way it allows, and no one is asked for server settings unless they choose another provider and its settings can't be found.
@@ -82,7 +84,8 @@ The setup lists the supported services. Each one signs in the simplest way it al
 | iCloud Mail      | App-specific password                     | `imap.mail.me.com:993`, `smtp.mail.me.com:587`                   |
 | Fastmail         | App password                              | `imap.fastmail.com:993`, `smtp.fastmail.com:465`                 |
 | Zoho Mail        | App password (IMAP turned on in Zoho)     | `imap.zoho.<region>:993`, `smtp.zoho.<region>:465`               |
-| Proton Mail      | Proton Mail Bridge password               | Bridge on this computer, `127.0.0.1:1143` (STARTTLS) and `:1025` |
+| Proton Mail (Direct tab) | Proton password, then a two-factor code, security key or passkey and the mailbox password where the account has them | Proton's API (`mail-api.proton.me`); no Bridge |
+| Proton Mail (Bridge tab) | Proton Mail Bridge password         | Bridge on this computer, `127.0.0.1:1143` (STARTTLS) and `:1025` |
 | Another provider | Password                                  | Found by autoconfiguration, or entered by hand                   |
 
 ## Documentation

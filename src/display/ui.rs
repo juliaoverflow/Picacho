@@ -1,5 +1,9 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[path = "proton_login.rs"]
+mod proton_login;
+use crate::manage::backend::{KeyMethod, KeyPrompt};
+use proton_login::ProtonStage;
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "compose.rs"]
@@ -158,6 +162,12 @@ const SMTP_HOST: usize = 4;
 const SMTP_PORT: usize = 5;
 /// The servers' user name, when it isn't the email address.
 const LOGIN: usize = 6;
+/// Proton: the authenticator app's code, when two-factor is on.
+const TOTP: usize = 7;
+/// Proton: the mailbox password, in two-password mode.
+const MAILBOX_PASSWORD: usize = 8;
+/// Proton: a security key's PIN, once the key asks for it.
+const KEY_PIN: usize = 9;
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -485,6 +495,12 @@ enum MoveTarget {
 }
 #[derive(Clone)]
 enum Action {
+    /// Proton sign-in: a security key or passkey, this way.
+    ProtonKey(KeyMethod),
+    /// Proton sign-in: Direct (its API) or Bridge.
+    ProtonMode(Service),
+    /// Proton sign-in: back to the password.
+    ProtonBack,
     Compose,
     Reply(bool),
     Forward,
@@ -862,6 +878,12 @@ pub struct MailApp {
     sign_in_retry: bool,
     /// How far the running sign-in has come, followed from the backend.
     sign_in_step: SignInStep,
+    /// The Proton sign-in's step after the password, while it has one.
+    proton_stage: Option<ProtonStage>,
+    /// The way a security key or passkey is being used, while it is.
+    key_method: Option<KeyMethod>,
+    /// What that key or phone waits for, followed from the backend.
+    key_prompt: KeyPrompt,
     cancel: Arc<AtomicBool>,
     onboarding: bool,
     step: Step,
@@ -1170,11 +1192,17 @@ impl MailApp {
             "smtp.example.com",
             "587",
             "Same as the email address",
+            "123456",
+            "Mailbox password",
+            "PIN",
         ];
         let form: Vec<_> = placeholders
             .iter()
             .enumerate()
-            .map(|(i, p)| input(p, false, i == PASSWORD, window, cx))
+            .map(|(i, p)| {
+                let masked = matches!(i, PASSWORD | MAILBOX_PASSWORD | KEY_PIN);
+                input(p, false, masked, window, cx)
+            })
             .collect();
         let mut subscriptions = vec![];
         for state in &form {
@@ -1553,6 +1581,9 @@ impl MailApp {
             connecting: false,
             sign_in_retry: false,
             sign_in_step: SignInStep::Browser,
+            proton_stage: None,
+            key_method: None,
+            key_prompt: KeyPrompt::Idle,
             cancel: Arc::new(AtomicBool::new(false)),
             onboarding,
             step: Step::Welcome,
@@ -3777,7 +3808,10 @@ impl MailApp {
         self.modal = None;
         self.status.clear();
         self.error = false;
-        Self::set(&self.form[PASSWORD], "", w, cx);
+        self.drop_proton_login(cx);
+        for i in [PASSWORD, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
+            Self::set(&self.form[i], "", w, cx);
+        }
         self.focus.focus(w);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
@@ -3785,7 +3819,8 @@ impl MailApp {
         cx.notify();
     }
     fn begin_setup(&mut self, step: Step, w: &mut Window, cx: &mut Context<Self>) {
-        for i in [EMAIL, PASSWORD, LOGIN] {
+        self.drop_proton_login(cx);
+        for i in [EMAIL, PASSWORD, LOGIN, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
             Self::set(&self.form[i], "", w, cx);
         }
         self.cancel.store(true, Ordering::Relaxed);
@@ -3811,6 +3846,7 @@ impl MailApp {
         if self.connecting {
             return;
         }
+        self.drop_proton_login(cx);
         self.status.clear();
         self.manual = false;
         self.anim += 1;
@@ -3837,7 +3873,7 @@ impl MailApp {
                 cx,
             );
         }
-        if service.sign_in() == SignIn::Password {
+        if service.sign_in().typed() {
             let field = if Self::value(&self.form[EMAIL], cx).is_empty() {
                 EMAIL
             } else {
@@ -3952,7 +3988,7 @@ impl MailApp {
                 a.email = email.clone();
                 a
             }
-            SignIn::Password => {
+            SignIn::Password | SignIn::Proton => {
                 let mut a = self
                     .service
                     .account(&email)
@@ -3982,6 +4018,9 @@ impl MailApp {
         if self.connecting {
             return;
         }
+        if self.service == Service::Proton {
+            return self.proton_continue(None, cx);
+        }
         let a = self.setup_account(cx);
         let password = Self::value(&self.form[PASSWORD], cx);
         let password = if a.service == Service::Gmail {
@@ -3989,7 +4028,7 @@ impl MailApp {
         } else {
             password
         };
-        if self.service.sign_in() == SignIn::Password {
+        if self.service.sign_in().typed() {
             if let Err(e) = a.validate() {
                 self.notice(e.to_string(), true, cx);
                 return;
@@ -4033,6 +4072,13 @@ impl MailApp {
                         this.sign_in_step = step;
                         cx.notify();
                     }
+                    if this.key_method.is_some() {
+                        let prompt = this.backend.proton_prompt();
+                        if prompt != this.key_prompt {
+                            this.key_prompt = prompt;
+                            cx.notify();
+                        }
+                    }
                     true
                 });
                 if !matches!(running, Ok(true)) {
@@ -4069,32 +4115,7 @@ impl MailApp {
                 }
                 this.connecting = false;
                 match result {
-                    Ok((saved, encrypted)) => {
-                        if encrypted {
-                            this.encrypted.insert(saved.id.clone());
-                        }
-                        this.accounts.push(saved.clone());
-                        this.sync_tree();
-                        this.load_avatar(saved.clone(), cx);
-                        this.account = Some(saved.id.clone());
-                        this.update_scope();
-                        if this.onboarding {
-                            this.step = Step::Done;
-                            this.anim += 1;
-                        } else {
-                            this.notice(format!("Added {}", saved.email), false, cx);
-                        }
-                        this.modal = None;
-                        this.folder = Folder::Inbox;
-                        this.messages.clear();
-                        this.selected = None;
-                        this.load_generation += 1;
-                        this.filter(cx);
-                        if this.onboarding {
-                            this.status.clear();
-                        }
-                        this.refresh(cx);
-                    }
+                    Ok((saved, encrypted)) => this.connected(saved, encrypted, cx),
                     // The whole chain: a bare "Sign-in needs attention" hides
                     // whether the token step or the mail server refused.
                     Err(e) => {
@@ -4104,6 +4125,33 @@ impl MailApp {
                 }
             },
         );
+    }
+    /// Shows a newly added account and starts syncing it.
+    pub(super) fn connected(&mut self, saved: Account, encrypted: bool, cx: &mut Context<Self>) {
+        if encrypted {
+            self.encrypted.insert(saved.id.clone());
+        }
+        self.accounts.push(saved.clone());
+        self.sync_tree();
+        self.load_avatar(saved.clone(), cx);
+        self.account = Some(saved.id.clone());
+        self.update_scope();
+        if self.onboarding {
+            self.step = Step::Done;
+            self.anim += 1;
+        } else {
+            self.notice(format!("Added {}", saved.email), false, cx);
+        }
+        self.modal = None;
+        self.folder = Folder::Inbox;
+        self.messages.clear();
+        self.selected = None;
+        self.load_generation += 1;
+        self.filter(cx);
+        if self.onboarding {
+            self.status.clear();
+        }
+        self.refresh(cx);
     }
     /// Repeats the step after the browser that failed, in the open setup or
     /// sign-in-again form.
@@ -4723,6 +4771,7 @@ impl MailApp {
                 let entries = self.subscription_entries(&sub);
                 self.open_menu(w.mouse_position(), entries, cx);
             }
+            Action::SetupBack if self.proton_stage.is_some() => self.proton_back(w, cx),
             Action::SetupBack => {
                 self.sign_in_retry = false;
                 self.backend.forget_sign_in();
@@ -4859,11 +4908,24 @@ impl MailApp {
                 self.sign_in_retry = false;
                 self.backend.forget_sign_in();
                 self.status.clear();
-                Self::set(&self.form[PASSWORD], "", w, cx);
+                self.drop_proton_login(cx);
+                for i in [PASSWORD, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
+                    Self::set(&self.form[i], "", w, cx);
+                }
                 self.modal = Some(Modal::Reconnect(id));
                 self.anim += 1;
             }
             Action::SubmitReconnect(id) => self.reconnect(id, w, cx),
+            Action::ProtonKey(method) => {
+                let reconnect = self.proton_reconnecting();
+                self.proton_use_key(method, reconnect, cx)
+            }
+            Action::ProtonMode(service) => {
+                if !self.connecting && self.service != service {
+                    self.choose_service(service, w, cx)
+                }
+            }
+            Action::ProtonBack => self.proton_back(w, cx),
             Action::AccountSettings(id) => {
                 self.settings_scroll.set_offset(point(px(0.), px(0.)));
                 self.fwd_reverse = None;
@@ -5070,7 +5132,7 @@ impl MailApp {
                 if self.step == Step::Credentials
                     && (self.onboarding || self.modal == Some(Modal::Connect))
                 {
-                    if self.service.sign_in() == SignIn::Password {
+                    if self.service.sign_in().typed() {
                         self.connect(cx)
                     } else {
                         // Try the browser again after an error or a closed tab.
@@ -7106,7 +7168,7 @@ impl MailApp {
             Service::ICloud => "icloud",
             Service::Fastmail => "fastmail",
             Service::Zoho => "zoho",
-            Service::ProtonBridge => "proton",
+            Service::ProtonBridge | Service::Proton => "proton",
             _ => "other",
         };
         div()
@@ -7243,7 +7305,16 @@ impl MailApp {
                 .child(self.field("Email address", EMAIL))
                 .into_any_element();
         }
+        // Proton's steps after the password replace the form.
+        if self.service == Service::Proton
+            && let Some(step) = self.proton_step_view(cx)
+        {
+            return step;
+        }
         let mut content = div().flex().flex_col().gap_4();
+        if matches!(self.service, Service::Proton | Service::ProtonBridge) {
+            content = content.child(self.proton_tabs(cx));
+        }
         if self.service == Service::Other {
             let email = Self::value(&self.form[EMAIL], cx);
             content = content.child(
@@ -7318,16 +7389,30 @@ impl MailApp {
                     .child(help)
                     .child(
                         div().flex().child(
-                            self.link("password-help", "Make one now", Action::OpenLink(url), cx)
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(icon_el("external-link", 12., c.accent)),
+                            self.link(
+                                "password-help",
+                                if self.service == Service::Proton {
+                                    "Open your Proton account"
+                                } else {
+                                    "Make one now"
+                                },
+                                Action::OpenLink(url),
+                                cx,
+                            )
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(icon_el(
+                                "external-link",
+                                12.,
+                                c.accent,
+                            )),
                         ),
                     ),
             );
         }
-        if !self.manual {
+        // Proton's API has no server settings to change.
+        if !self.manual && self.service != Service::Proton {
             content = content.child(div().flex().justify_end().child(self.link(
                 "setup-manual",
                 "Server settings",
@@ -7428,7 +7513,7 @@ impl MailApp {
     fn setup_view(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let in_modal = self.modal == Some(Modal::Connect);
-        let browser = self.service.sign_in() != SignIn::Password;
+        let browser = !self.service.sign_in().typed();
         let label = self.service.label();
         let (title, subtitle): (String, String) = match self.step {
             Step::Welcome => (
@@ -7585,6 +7670,12 @@ impl MailApp {
             ),
             Step::Provider => None,
             Step::Credentials if browser && self.connecting => None,
+            // A security key alone: its own buttons.
+            Step::Credentials
+                if self.service == Service::Proton && self.proton_submit_label().is_none() =>
+            {
+                None
+            }
             Step::Credentials if self.sign_in_retry => Some(
                 self.button("setup-retry", "Retry", "", Action::RetrySignIn, true, cx)
                     .min_w(px(120.))
@@ -7943,9 +8034,16 @@ impl MailApp {
         let busy = self.discovering || self.connecting;
         let (label, action) = if self.step == Step::Credentials {
             (
-                if self.connecting {
+                if let Some(label) = self
+                    .proton_submit_label()
+                    .filter(|_| self.service == Service::Proton)
+                {
+                    label
+                } else if self.connecting && self.sign_in_step == SignInStep::Verifying {
+                    "Waiting for Proton's check…"
+                } else if self.connecting {
                     "Connecting…"
-                } else if self.service.sign_in() != SignIn::Password {
+                } else if !self.service.sign_in().typed() {
                     "Open Browser Again"
                 } else {
                     "Connect"
@@ -7997,7 +8095,7 @@ impl MailApp {
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
-            Modal::Reconnect(id) => self.reconnect_form(id),
+            Modal::Reconnect(id) => self.reconnect_form(id, cx),
             Modal::Settings => self.settings_modal(window, cx),
             Modal::About => self.about_modal(),
             Modal::Help => self.help_modal(),
@@ -8214,6 +8312,22 @@ impl MailApp {
                     cx,
                 ));
             }
+            let proton = self
+                .proton_reconnecting()
+                .and_then(|_| self.proton_submit_label().map(|l| (l, true)))
+                .or_else(|| self.proton_reconnecting().map(|_| ("", false)));
+            if proton == Some(("", false)) {
+                // A security key alone: its own buttons.
+            } else if let Some((label, _)) = proton {
+                footer = footer.child(self.button(
+                    "reconnect-submit",
+                    label,
+                    "",
+                    Action::SubmitReconnect(id.clone()),
+                    true,
+                    cx,
+                ));
+            } else {
             footer = footer.child(self.button(
                 "reconnect-submit",
                 if !self.connecting {
@@ -8228,6 +8342,7 @@ impl MailApp {
                 true,
                 cx,
             ));
+            }
         } else {
             footer = footer.child(div().flex_1()).child(self.button(
                 "done",
@@ -9329,7 +9444,9 @@ mod tests {
             cfg!(feature = "pinal"),
             "Pinal Mail is offered only with the pinal feature"
         );
-        assert!(cx.debug_bounds("service-ProtonBridge").is_some());
+        // Proton Mail is one item; Bridge is a tab inside it.
+        assert!(cx.debug_bounds("service-Proton").is_some());
+        assert!(cx.debug_bounds("service-ProtonBridge").is_none());
         // Password services use fixed servers and never ask for them.
         act(&view, Action::ChooseService(Service::ICloud), cx);
         view.read_with(cx, |this, cx| {
@@ -9343,13 +9460,63 @@ mod tests {
         // Validation stops before any network connection is attempted.
         act(&view, Action::SubmitAccount, cx);
         view.read_with(cx, |this, _| assert!(!this.connecting && this.error));
+        // Proton Mail: Direct (Proton's API) first, with Bridge a tab away.
         act(&view, Action::SetupBack, cx);
-        act(&view, Action::ChooseService(Service::ProtonBridge), cx);
+        act(&view, Action::ChooseService(Service::Proton), cx);
         type_email(&view, "me@proton.me", cx);
+        frame(cx);
+        assert!(cx.debug_bounds("proton-mode-0").is_some());
+        assert!(cx.debug_bounds("proton-mode-1").is_some());
         view.read_with(cx, |this, cx| {
+            assert!(this.step == Step::Credentials && !this.manual);
+            let a = this.setup_account(cx);
+            assert_eq!(a.provider, Provider::Proton);
+            assert_eq!(a.service, Service::Proton);
+            assert!(!a.incoming_starttls && !a.oauth);
+            assert!(a.validate().is_ok());
+        });
+        // No password: stopped here, before Proton is asked anything.
+        act(&view, Action::SubmitAccount, cx);
+        view.read_with(cx, |this, _| assert!(!this.connecting && this.error));
+        act(&view, Action::ProtonMode(Service::ProtonBridge), cx);
+        view.read_with(cx, |this, cx| {
+            assert_eq!(this.service, Service::ProtonBridge);
+            assert_eq!(MailApp::value(&this.form[EMAIL], cx), "me@proton.me");
             let a = this.setup_account(cx);
             assert!(a.incoming_starttls && a.incoming_port == 1143 && a.smtp_port == 1025);
             assert!(a.validate().is_ok());
+        });
+        act(&view, Action::ProtonMode(Service::Proton), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.service, Service::Proton);
+            assert!(this.step == Step::Credentials);
+        });
+        // The steps after the password replace the form, and Back leaves them.
+        view.update(cx, |this, _| {
+            this.proton_stage = Some(ProtonStage::SecondFactor {
+                code: true,
+                key: true,
+                pin: false,
+            })
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("proton-back").is_some());
+        let first = KeyMethod::offered()[0];
+        assert!(cx.debug_bounds(format!("proton-key-{first:?}").leak()).is_some());
+        view.read_with(cx, |this, _| assert_eq!(this.proton_submit_label(), Some("Verify")));
+        // With a key alone, the key's buttons are the way on.
+        view.update(cx, |this, _| {
+            this.proton_stage = Some(ProtonStage::SecondFactor {
+                code: false,
+                key: true,
+                pin: false,
+            })
+        });
+        view.read_with(cx, |this, _| assert_eq!(this.proton_submit_label(), None));
+        act(&view, Action::SetupBack, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.proton_stage.is_none());
+            assert!(this.step == Step::Credentials, "Back from a step returns to the password");
         });
         // Another provider: look the address up.
         act(&view, Action::SetupBack, cx);

@@ -6,6 +6,8 @@ pub enum Provider {
     Outlook,
     Imap,
     Pop3,
+    /// Proton's own API, without Proton Mail Bridge (`sync/proton.rs`).
+    Proton,
 }
 impl Provider {
     pub fn label(self) -> &'static str {
@@ -14,7 +16,12 @@ impl Provider {
             Self::Outlook => "Outlook",
             Self::Imap => "IMAP",
             Self::Pop3 => "POP3",
+            Self::Proton => "Proton API",
         }
+    }
+    /// Whether its mail comes over IMAP (anything but POP3 and Proton's API).
+    pub fn imap(self) -> bool {
+        !matches!(self, Self::Pop3 | Self::Proton)
     }
 }
 /// The mail services offered when adding an account. `Provider` is the
@@ -28,7 +35,10 @@ pub enum Service {
     ICloud,
     Fastmail,
     Zoho,
+    /// Proton Mail through Proton Mail Bridge on this computer (IMAP/SMTP).
     ProtonBridge,
+    /// Proton Mail directly through Proton's API, without Bridge.
+    Proton,
     /// Any other server, found by autoconfiguration or entered by hand.
     #[default]
     Other,
@@ -37,10 +47,20 @@ pub enum Service {
 pub enum SignIn {
     /// Pinal Accounts in the browser; the server issues an app password.
     Pinal,
+    /// Proton's own sign-in (SRP), with a two-factor code and mailbox
+    /// password where the account has them.
+    Proton,
     /// The provider's OAuth consent in the browser.
     Browser,
     /// A password made for mail apps, as named by `password_label`.
     Password,
+}
+impl SignIn {
+    /// Whether the sign-in is typed into the form (a password, and for
+    /// Proton maybe a two-factor code), rather than done in the browser.
+    pub fn typed(self) -> bool {
+        matches!(self, Self::Password | Self::Proton)
+    }
 }
 impl Service {
     /// The services offered when adding an account, in order.
@@ -52,7 +72,8 @@ impl Service {
         Self::ICloud,
         Self::Fastmail,
         Self::Zoho,
-        Self::ProtonBridge,
+        // Its Bridge sign-in is a tab of its own.
+        Self::Proton,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -62,7 +83,8 @@ impl Service {
             Self::ICloud => "iCloud Mail",
             Self::Fastmail => "Fastmail",
             Self::Zoho => "Zoho Mail",
-            Self::ProtonBridge => "Proton Mail",
+            Self::ProtonBridge => "Proton Mail Bridge",
+            Self::Proton => "Proton Mail",
             Self::Other => "Other",
         }
     }
@@ -70,12 +92,14 @@ impl Service {
         match self {
             Self::Gmail => Provider::Gmail,
             Self::Outlook => Provider::Outlook,
+            Self::Proton => Provider::Proton,
             _ => Provider::Imap,
         }
     }
     pub fn sign_in(self) -> SignIn {
         match self {
             Self::Pinal => SignIn::Pinal,
+            Self::Proton => SignIn::Proton,
             Self::Gmail | Self::Outlook if crate::sync::oauth::configured(self.provider()) => {
                 SignIn::Browser
             }
@@ -87,6 +111,7 @@ impl Service {
             Self::Gmail | Self::Outlook | Self::Fastmail | Self::Zoho => "App password",
             Self::ICloud => "App-specific password",
             Self::ProtonBridge => "Bridge password",
+            Self::Proton => "Proton password",
             _ => "Password",
         }
     }
@@ -130,6 +155,10 @@ impl Service {
                 "Open Proton Mail Bridge, choose your account and copy its mailbox password. Bridge must be running, with its certificate trusted.",
                 "https://proton.me/support/apple-mail-certificate",
             )),
+            Self::Proton => Some((
+                "Picacho signs in to Proton directly; Proton Mail Bridge isn't needed. Mail is decrypted on this computer with your keys, which never leave it.",
+                "https://account.proton.me/",
+            )),
             Self::Outlook => Some((
                 "Turn on two-step verification in your Microsoft account, then make an app password and paste it here. Work and school accounts can use one only if their admin allows it.",
                 "https://account.live.com/proofs/AppPassword",
@@ -163,6 +192,8 @@ impl Service {
                 a.incoming_starttls = true;
                 ("127.0.0.1", 1143, "127.0.0.1", 1025)
             }
+            // No mail servers: everything goes through Proton's API.
+            Self::Proton => ("mail-api.proton.me", 443, "mail-api.proton.me", 443),
             Self::Other => return None,
         };
         a.incoming_host = host.into();
@@ -338,6 +369,7 @@ impl Account {
         let (host, smtp) = match provider {
             Provider::Gmail => ("imap.gmail.com", "smtp.gmail.com"),
             Provider::Outlook => ("outlook.office365.com", "smtp.office365.com"),
+            Provider::Proton => ("mail-api.proton.me", "mail-api.proton.me"),
             _ => ("", ""),
         };
         Self {
@@ -347,15 +379,24 @@ impl Account {
             nickname: String::new(),
             provider,
             incoming_host: host.into(),
-            incoming_port: if provider == Provider::Pop3 { 995 } else { 993 },
+            incoming_port: match provider {
+                Provider::Pop3 => 995,
+                Provider::Proton => 443,
+                _ => 993,
+            },
             smtp_host: smtp.into(),
-            smtp_port: 587,
+            smtp_port: if provider == Provider::Proton {
+                443
+            } else {
+                587
+            },
             oauth: provider == Provider::Outlook,
             client_id: String::new(),
             client_secret: String::new(),
             service: match provider {
                 Provider::Gmail => Service::Gmail,
                 Provider::Outlook => Service::Outlook,
+                Provider::Proton => Service::Proton,
                 _ => Service::Other,
             },
             incoming_starttls: false,
@@ -761,6 +802,30 @@ pub struct Secret {
     /// always be rebuilt from the password, so the keychain is only a cache.
     #[serde(default)]
     pub mail_key: String,
+    /// Proton (without Bridge): the session's UID. Its tokens are in
+    /// `access_token` and `refresh_token`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proton_uid: String,
+    /// Proton: the salted key passphrase (base64) that unlocks the
+    /// account's keys. The password itself isn't kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proton_key: String,
+}
+impl Secret {
+    pub(crate) fn proton(&self) -> crate::sync::proton::Saved {
+        crate::sync::proton::Saved {
+            uid: self.proton_uid.clone(),
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            key: self.proton_key.clone(),
+        }
+    }
+    pub(crate) fn set_proton(&mut self, saved: &crate::sync::proton::Saved) {
+        self.proton_uid = saved.uid.clone();
+        self.access_token = saved.access_token.clone();
+        self.refresh_token = saved.refresh_token.clone();
+        self.proton_key = saved.key.clone();
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Draft {

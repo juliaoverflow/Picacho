@@ -80,7 +80,11 @@ impl Backend {
         ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
         ensure!(m.account == a.id, "Message belongs to another account");
         let raw = crate::sync::smtp::receipt(a, m, &to);
-        {
+        if a.provider == Provider::Proton {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            self.send_proton(a, &a.email, &[to], &raw)?;
+        } else {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
             let s = self.credentials(a)?;
@@ -253,7 +257,7 @@ impl Backend {
     }
     /// The server's notes for its users (METADATA), where it has any.
     pub fn server_notes(&self, a: &Account) -> Result<ServerNotes> {
-        if a.provider == Provider::Pop3 {
+        if !a.provider.imap() {
             return Ok(ServerNotes::default());
         }
         let lock = self.account_lock(&a.id);

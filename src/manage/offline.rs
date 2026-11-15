@@ -82,6 +82,37 @@ impl Backend {
         });
         self.save_queue(&a.id, &queue)
     }
+    /// Sends queued changes to Proton, oldest first, as `replay_offline`
+    /// does for IMAP. Callers hold the lock.
+    pub(super) fn replay_offline_proton(&self, a: &Account) -> Result<()> {
+        let mut queue = self.queued_changes(&a.id);
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        while let Some(next) = queue.first().cloned() {
+            if now - next.at > KEEP_FOR {
+                queue.remove(0);
+                continue;
+            }
+            match self.change_proton(a, &next.mails, &next.change) {
+                Ok(()) => {
+                    queue.remove(0);
+                }
+                Err(e) if crate::sync::retry::later(&e) => {
+                    self.save_queue(&a.id, &queue)?;
+                    return Err(e);
+                }
+                // A message or folder that's gone: the change can't be made
+                // as it was. The next sync shows Proton's state.
+                Err(_) => {
+                    queue.remove(0);
+                }
+            }
+            self.save_queue(&a.id, &queue)?;
+        }
+        Ok(())
+    }
     /// Sends queued changes, oldest first, on a connection that works.
     /// Stops (keeping the rest) if the connection fails again; drops
     /// changes the server can't take any more. Callers hold the lock.

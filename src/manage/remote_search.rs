@@ -42,6 +42,9 @@ impl Backend {
         ensure!(!query.is_empty(), "Type something to search for.");
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.search_proton(a, mailbox, query, limit);
+        }
         self.with_imap(a, |c| {
             let names = c.names(false)?.to_vec();
             let starred = mailbox.folder() == Folder::Starred;

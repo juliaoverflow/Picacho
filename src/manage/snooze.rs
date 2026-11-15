@@ -23,6 +23,10 @@ pub struct Snoozed {
     pub until: i64,
     /// The server folder it waits in.
     pub folder: String,
+    /// Proton (without Bridge): its message ids, which don't change when it
+    /// moves, so it is found again by them rather than its Message-ID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
 }
 
 impl Backend {
@@ -102,7 +106,7 @@ impl Backend {
     pub fn snooze(&self, a: &Account, mails: &[Mail], until: i64) -> Result<String> {
         ensure!(
             a.provider != Provider::Pop3,
-            "Snoozing needs mail kept on the server (IMAP)."
+            "Snoozing needs mail kept on the server."
         );
         ensure!(
             until > chrono::Utc::now().timestamp(),
@@ -122,6 +126,9 @@ impl Backend {
         let mut current = Vec::new();
         for m in mails {
             current.push(self.store.message(&m.id)?.unwrap_or_else(|| m.clone()));
+        }
+        if a.provider == Provider::Proton {
+            return self.snooze_proton(a, &current, until);
         }
         self.with_imap(a, |c| {
             self.replay_offline(c, a)?;
@@ -143,6 +150,7 @@ impl Backend {
                     sender: m.sender.clone(),
                     until,
                     folder: folder.clone(),
+                    ids: Vec::new(),
                 });
             }
             self.save_snoozed(Some(c), &a.id, &list)?;
@@ -170,6 +178,9 @@ impl Backend {
         }
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Proton {
+            return self.wake_due_proton(a);
+        }
         self.with_imap(a, |c| {
             let list = self.merged_snoozed(c, &a.id)?;
             let now = chrono::Utc::now().timestamp();
@@ -200,6 +211,128 @@ impl Backend {
             }
             self.save_snoozed(Some(c), &a.id, &kept)?;
             Ok(woken)
+        })
+    }
+    /// Proton: snoozed mail waits in a "Snoozed" folder at Proton, made if
+    /// missing, as it would through Proton Mail Bridge; the times are kept
+    /// on this computer (Bridge has no METADATA to share them either).
+    fn snooze_proton(&self, a: &Account, current: &[Mail], until: i64) -> Result<String> {
+        let folder = self.with_proton(a, |s| {
+            if let Some(f) = s
+                .folders()
+                .into_iter()
+                .find(|f| f.exclusive && f.depth == 0 && f.path.eq_ignore_ascii_case(FOLDER))
+            {
+                return Ok(f.path);
+            }
+            s.create_label(FOLDER, true, None)?;
+            s.reload_folders()?;
+            self.store
+                .save_folders(&a.id, &super::proton::remote_folders(&s.folders()))?;
+            Ok(FOLDER.to_owned())
+        })?;
+        let moving: Vec<Mail> = current
+            .iter()
+            .filter(|m| !(m.folder == Folder::Other && m.remote_folder == folder))
+            .cloned()
+            .collect();
+        if !moving.is_empty() {
+            let change = Change::MoveTo(folder.clone());
+            self.change_proton(a, &moving, &change)?;
+            self.commit_change(&moving, change, false)?;
+        }
+        let mut list = self.snoozed(&a.id);
+        for m in current {
+            list.retain(|s| s.message_id != m.message_id);
+            list.push(Snoozed {
+                message_id: m.message_id.trim().to_owned(),
+                subject: m.subject.clone(),
+                sender: m.sender.clone(),
+                until,
+                folder: folder.clone(),
+                ids: super::proton::proton_id(a, m)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        self.save_snoozed(None, &a.id, &list)?;
+        Ok(folder)
+    }
+    /// Proton: brings back the messages whose time has come.
+    fn wake_due_proton(&self, a: &Account) -> Result<Vec<Snoozed>> {
+        let now = chrono::Utc::now().timestamp();
+        let (due, waiting): (Vec<Snoozed>, Vec<Snoozed>) = self
+            .snoozed(&a.id)
+            .into_iter()
+            .partition(|s| s.until <= now);
+        if due.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut woken = Vec::new();
+        let mut kept = waiting;
+        for s in due {
+            match self.wake_proton(a, &s) {
+                Ok(true) => woken.push(s),
+                // Moved out of Snoozed by hand, or its folder is gone.
+                Ok(false) => {}
+                Err(e) if crate::sync::retry::later(&e) => {
+                    kept.push(s);
+                    self.save_snoozed(None, &a.id, &kept)?;
+                    return Err(e);
+                }
+                Err(_) => {}
+            }
+        }
+        self.save_snoozed(None, &a.id, &kept)?;
+        Ok(woken)
+    }
+    /// Proton: moves one snoozed message back to the inbox, unread.
+    /// Whether it was still in the Snoozed folder.
+    fn wake_proton(&self, a: &Account, s: &Snoozed) -> Result<bool> {
+        use protected_email_bridge::api::types::label_id;
+        let ids: Vec<String> = if s.ids.is_empty() {
+            // Snoozed before ids were kept: found by Message-ID.
+            self.store
+                .messages(&a.id, Mailbox::Remote(s.folder.clone()), usize::MAX >> 1)?
+                .iter()
+                .filter(|m| m.message_id.trim() == s.message_id)
+                .filter_map(|m| super::proton::proton_id(a, m).map(str::to_owned))
+                .collect()
+        } else {
+            s.ids.clone()
+        };
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        self.with_proton(a, |p| {
+            let Ok(label) =
+                super::proton::label_for(&p.folders(), &Mailbox::Remote(s.folder.clone()))
+            else {
+                return Ok(false);
+            };
+            let still: Vec<String> = p
+                .metadata(&ids)?
+                .into_iter()
+                .filter(|m| m.has_label(&label))
+                .map(|m| m.id)
+                .collect();
+            if still.is_empty() {
+                return Ok(false);
+            }
+            p.label_messages(label_id::INBOX, &still, true)?;
+            p.mark_read(&still, false)?;
+            let mut rows = Vec::new();
+            for id in &still {
+                if let Some(mut m) = self.store.message(&super::proton::row_id(a, id))? {
+                    m.folder = Folder::Inbox;
+                    m.remote_folder = "Inbox".into();
+                    m.unread = true;
+                    rows.push(m);
+                }
+            }
+            self.store.save_messages(&rows)?;
+            Ok(true)
         })
     }
     /// Moves one snoozed message back to the inbox, unread. Whether it was

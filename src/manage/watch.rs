@@ -24,6 +24,8 @@ const RENEW_IDLE: Duration = Duration::from_secs(9 * 60);
 /// Waits after a failure, doubling up to the longest.
 const FIRST_RETRY: Duration = Duration::from_secs(30);
 const LONGEST_RETRY: Duration = Duration::from_secs(15 * 60);
+/// How often Proton's events are asked for, before a random 0–20 s more.
+const PROTON_EVENTS: Duration = Duration::from_secs(20);
 
 pub(super) struct Watcher {
     stop: Arc<AtomicBool>,
@@ -61,7 +63,15 @@ impl Backend {
         a: &Account,
         changed: impl Fn(Mailbox) + Send + Sync + 'static,
     ) {
-        if a.provider == Provider::Pop3 {
+        if a.provider == Provider::Proton {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_proton_watch(a, Arc::new(changed)) {
+                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+            }
+            return;
+        }
+        // POP3 has no IDLE: its mail is checked on a timer.
+        if !a.provider.imap() {
             return;
         }
         self.stop_watching(&a.id);
@@ -83,7 +93,7 @@ impl Backend {
         let wanted = mailbox.filter(|m| {
             !m.folder().is_virtual()
                 && !matches!(m, Mailbox::Standard(Folder::Inbox | Folder::Drafts))
-                && a.provider != Provider::Pop3
+                && a.provider.imap()
         });
         let notifying = self
             .watchers
@@ -107,6 +117,114 @@ impl Backend {
         };
         if let Some(w) = self.spawn_watch(a, mailbox, Arc::new(changed)) {
             self.folder_watchers.lock().unwrap().insert(a.id.clone(), w);
+        }
+    }
+    /// Proton: its event stream stands in for IDLE, as it does inside
+    /// Proton Mail Bridge. One watcher per account hears about every
+    /// mailbox (like NOTIFY), so no folder needs one of its own.
+    fn spawn_proton_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(true)),
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("proton-events-{}", a.id))
+            .spawn(move || {
+                let mut retry = FIRST_RETRY;
+                while !stop.load(Ordering::Acquire) {
+                    let mut watched = false;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend.proton_events(&a, &stop, &*changed, &mut watched)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Proton's events failed")));
+                    let Err(error) = outcome else {
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if watched {
+                        retry = FIRST_RETRY;
+                    }
+                    let wait = if error.downcast_ref::<AccessFailure>().is_some() {
+                        LONGEST_RETRY
+                    } else {
+                        retry
+                    };
+                    retry = (retry * 2).min(LONGEST_RETRY);
+                    let until = std::time::Instant::now() + wait;
+                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    // Mail may have arrived while the watch was down.
+                    if !stop.load(Ordering::Acquire) {
+                        changed(Mailbox::Standard(Folder::Inbox));
+                    }
+                }
+            });
+        spawned.ok().map(|_| watcher)
+    }
+    /// Follows Proton's events until `stop`, saying which mailboxes
+    /// changed. Like IDLE, it only notices: the regular check syncs.
+    fn proton_events(
+        &self,
+        a: &Account,
+        stop: &AtomicBool,
+        changed: &(dyn Fn(Mailbox) + Send + Sync),
+        watched: &mut bool,
+    ) -> Result<()> {
+        let mut since = self.with_proton(a, |s| s.latest_event())?;
+        *watched = true;
+        loop {
+            // Proton's own apps ask about every 20–40 seconds.
+            let wait = PROTON_EVENTS + Duration::from_millis(rand::random::<u64>() % 20_000);
+            let until = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < until {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let (latest, events, refresh, folders) = self.with_proton(a, |s| {
+                let (latest, events, refresh) = s.events_since(&since)?;
+                Ok((latest, events, refresh, s.folders()))
+            })?;
+            since = latest;
+            let mut boxes: Vec<Mailbox> = Vec::new();
+            if refresh {
+                boxes.push(Mailbox::Standard(Folder::Inbox));
+            }
+            for e in events {
+                let mut affected = Vec::new();
+                if let Some(m) = &e.message {
+                    let (folder, remote) = super::proton::location(&m.label_ids, &folders);
+                    affected.push(if folder == Folder::Other {
+                        Mailbox::Remote(remote)
+                    } else {
+                        Mailbox::Standard(folder)
+                    });
+                    if m.is_starred() {
+                        affected.push(Mailbox::Standard(Folder::Starred));
+                    }
+                }
+                // Where it was before: a deleted or moved message.
+                if let Ok(Some(old)) = self.store.message(&super::proton::row_id(a, &e.id)) {
+                    affected.push(old.mailbox());
+                }
+                for b in affected {
+                    if !boxes.contains(&b) {
+                        boxes.push(b);
+                    }
+                }
+            }
+            for b in boxes {
+                changed(b);
+            }
         }
     }
     fn spawn_watch(
