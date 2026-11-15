@@ -235,6 +235,10 @@ pub struct Backend {
     /// Signed-in Proton sessions (keys unlocked) by account, in memory
     /// only; see `proton.rs`.
     proton: Mutex<HashMap<String, Arc<crate::sync::proton::Session>>>,
+    /// Held while an account's Proton session is resumed, so two threads
+    /// never resume it at once: each would refresh the same refresh token,
+    /// and Proton replaces it at the first refresh.
+    proton_opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// A Proton sign-in between its steps (password, second factor,
     /// mailbox password); see `proton_begin`.
     proton_login: Mutex<Option<proton::ProtonLogin>>,
@@ -278,6 +282,7 @@ impl Backend {
             watchers: Mutex::new(HashMap::new()),
             folder_watchers: Mutex::new(HashMap::new()),
             proton: Mutex::new(HashMap::new()),
+            proton_opening: Mutex::new(HashMap::new()),
             proton_login: Mutex::new(None),
             proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
             #[cfg(test)]

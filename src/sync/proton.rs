@@ -172,13 +172,21 @@ impl<T> Explained<T> for std::result::Result<T, ProtonError> {
 /// What a Proton account keeps in the keychain: the session, and the
 /// salted key passphrase that unlocks its keys. The password itself isn't
 /// kept, as with Proton Mail Bridge.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Saved {
     pub uid: String,
     pub access_token: String,
     pub refresh_token: String,
     /// The salted key passphrase, base64.
     pub key: String,
+}
+/// Only the session's id: its tokens and key passphrase stay out of logs.
+impl std::fmt::Debug for Saved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Saved")
+            .field("uid", &self.uid)
+            .finish_non_exhaustive()
+    }
 }
 impl Saved {
     fn tokens(&self) -> SessionTokens {
@@ -257,6 +265,17 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
         .stdout(std::process::Stdio::piped())
         .spawn()
         .context("Couldn't open a window for Proton's check")?;
+    // Read as it is written: a webview that logs to standard output could
+    // otherwise fill the pipe and stall the window until it was cancelled.
+    let reading = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = out.by_ref().take(1024 * 1024).read_to_end(&mut output);
+            // Past the limit, keep draining so the window never blocks.
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
+            output
+        })
+    });
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -268,10 +287,7 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let mut output = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut output)?;
-    }
+    let output = reading.and_then(|r| r.join().ok()).unwrap_or_default();
     match (status.code(), verified(&output)) {
         (Some(0), Some(hv)) => Ok(hv),
         (Some(64 | 70), _) => bail!(
@@ -292,6 +308,9 @@ pub enum Next {
     /// Nothing more: the keys can be unlocked.
     Ready,
 }
+
+/// Why a sign-in step can't be taken: the sign-in was ended.
+const ENDED: &str = "This sign-in has ended. Start again with your password.";
 
 /// A Proton sign-in in progress, one step at a time: the password was
 /// accepted (`begin`), and Proton may still want a second factor and the
@@ -343,16 +362,21 @@ impl Login {
             }
         })
     }
-    fn pending(&self) -> &auth::PendingLogin {
-        self.pending.as_ref().expect("a sign-in in progress")
+    fn pending(&self) -> Result<&auth::PendingLogin> {
+        self.pending.as_ref().context(ENDED)
     }
-    fn pending_mut(&mut self) -> &mut auth::PendingLogin {
-        self.pending.as_mut().expect("a sign-in in progress")
+    fn pending_mut(&mut self) -> Result<&mut auth::PendingLogin> {
+        self.pending.as_mut().context(ENDED)
+    }
+    /// Whether the sign-in can't go on (Proton or the library ended it);
+    /// it has to start again with the password.
+    pub fn ended(&self) -> bool {
+        self.pending.is_none()
     }
     /// What Proton needs next.
-    pub fn next(&self) -> Next {
-        let p = self.pending();
-        if p.needs_second_factor() {
+    pub fn next(&self) -> Result<Next> {
+        let p = self.pending()?;
+        Ok(if p.needs_second_factor() {
             let tf = &p.auth.two_factor;
             Next::SecondFactor {
                 code: tf.totp(),
@@ -363,7 +387,7 @@ impl Login {
             Next::MailboxPassword
         } else {
             Next::Ready
-        }
+        })
     }
     /// The code from an authenticator app.
     pub fn submit_code(&mut self, code: &str) -> Result<()> {
@@ -372,7 +396,7 @@ impl Login {
             !code.is_empty(),
             "Enter the code from your authenticator app."
         );
-        let pending = self.pending_mut();
+        let pending = self.pending_mut()?;
         block_on(pending.submit_totp(&code)).map_err(|e| {
             if e.api().is_some_and(|a| a.status == 422 || a.code == 8002) {
                 anyhow!("Proton didn't accept that code. Enter the current one from your authenticator app.")
@@ -390,7 +414,7 @@ impl Login {
         prompt: Arc<Mutex<crate::sync::fido::Prompt>>,
         cancel: &AtomicBool,
     ) -> Result<()> {
-        let pending = self.pending_mut();
+        let pending = self.pending_mut()?;
         let request = pending.fido2_request().explained()?;
         let options = crate::sync::fido::request_options(&request.options)?;
         block_on(async {
@@ -436,7 +460,7 @@ impl Login {
     /// two-password mode. A wrong mailbox password keeps the sign-in, to try
     /// another; any other failure ends it.
     pub fn finish(&mut self, mailbox_password: Option<&str>) -> Result<SignedIn> {
-        let pending = self.pending();
+        let pending = self.pending()?;
         let mailbox = mailbox_password
             .map(str::as_bytes)
             .filter(|m| !m.is_empty());
@@ -623,6 +647,14 @@ impl Session {
         let mut saved = self.saved.lock().unwrap();
         *saved = saved.with_tokens(&tokens);
         Some(saved.clone())
+    }
+    /// Tokens `renewed` handed out that couldn't be saved: handed out
+    /// again next time, unless newer ones came meanwhile.
+    pub fn unsaved(&self, saved: Saved) {
+        let mut renewed = self.renewed.lock().unwrap();
+        if renewed.is_none() {
+            *renewed = Some(saved.tokens());
+        }
     }
     /// The account's folders and labels (not Proton's own mailboxes).
     pub fn folders(&self) -> Vec<Folder> {
@@ -985,6 +1017,33 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sign-in Proton ended (a failed last step signs it out) says so
+    /// at each later step rather than panicking.
+    #[test]
+    fn an_ended_sign_in_refuses_further_steps() {
+        let mut login = Login { pending: None };
+        assert!(login.ended());
+        assert!(login.next().is_err());
+        assert!(login.submit_code("123456").is_err());
+        let Err(error) = login.finish(Some("mailbox")) else {
+            panic!("an ended sign-in finished");
+        };
+        assert_eq!(error.to_string(), ENDED);
+        login.abort();
+    }
+
+    #[test]
+    fn saved_sessions_keep_their_secrets_out_of_debug() {
+        let saved = Saved {
+            uid: "uid-1".into(),
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            key: "key-secret".into(),
+        };
+        let shown = format!("{saved:?}");
+        assert!(shown.contains("uid-1") && !shown.contains("secret"), "{shown}");
+    }
 
     #[test]
     fn modulus_signing_key_parses() {

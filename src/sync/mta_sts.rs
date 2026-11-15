@@ -99,6 +99,12 @@ static KEPT: Mutex<Option<HashMap<String, Kept>>> = Mutex::new(None);
 /// The domain's policy file, over verified HTTPS without redirects, as RFC
 /// 8461 requires.
 fn fetch(domain: &str) -> Result<Policy> {
+    // A host name only: a domain from an address could otherwise carry a
+    // path, port or another host into the URL.
+    ensure!(
+        is_domain(domain),
+        "{domain:?} isn't a domain name that can publish a policy"
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .https_only(true)
@@ -131,6 +137,22 @@ fn fetch(domain: &str) -> Result<Policy> {
     parse(&text)
 }
 
+/// Whether `domain` is a plain DNS name (letters, digits and hyphens, in
+/// dot-separated labels); internationalized names in their ASCII form.
+fn is_domain(domain: &str) -> bool {
+    domain.len() <= 253
+        && domain.contains('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
 /// The domain's MTA-STS policy, if it publishes one: fetched again when
 /// its record's id changes or it is older than its max_age.
 pub(crate) fn policy(domain: &str) -> Result<Option<Policy>> {
@@ -148,23 +170,31 @@ pub(crate) fn policy(domain: &str) -> Result<Option<Policy>> {
     }
     let policy = fetch(domain)?;
     let age = Duration::from_secs(policy.max_age).min(LONGEST_KEPT);
-    KEPT.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(
-            domain.to_owned(),
-            Kept {
-                id,
-                policy: policy.clone(),
-                until: Instant::now() + age,
-            },
-        );
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let kept = kept.get_or_insert_with(HashMap::new);
+    // Expired policies go, so the cache holds only the domains of recent
+    // mail rather than every domain ever written to.
+    let now = Instant::now();
+    kept.retain(|_, k| k.until > now);
+    kept.insert(
+        domain.to_owned(),
+        Kept {
+            id,
+            policy: policy.clone(),
+            until: Instant::now() + age,
+        },
+    );
     Ok(Some(policy))
 }
 
 /// How mail to `domain` can be kept encrypted all the way.
 pub(crate) fn protection(domain: &str) -> Protection {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    // Internationalized names are looked up in their ASCII (punycode) form.
+    let domain = match url::Host::parse(&domain) {
+        Ok(url::Host::Domain(ascii)) if is_domain(&ascii) => ascii,
+        _ => return Protection::Unknown(format!("{domain:?} isn't a domain name")),
+    };
     let mut doubt = None;
     match policy(&domain) {
         Ok(Some(p)) if p.mode != Mode::None => return Protection::MtaSts,
@@ -217,6 +247,28 @@ pub(crate) fn unprotected(domains: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_domain_names_are_looked_up() {
+        assert!(is_domain("example.com") && is_domain("xn--mnchen-3ya.de"));
+        for bad in [
+            "example.com/x",
+            "a@b.com",
+            "example.com:8443",
+            "[127.0.0.1]",
+            "-a.com",
+            "com",
+            "a..com",
+        ] {
+            assert!(!is_domain(bad), "{bad}");
+            assert!(fetch(bad).is_err(), "{bad}");
+        }
+        assert!(matches!(protection("[127.0.0.1]"), Protection::Unknown(_)));
+        assert!(matches!(
+            protection("example.com#x"),
+            Protection::Unknown(_)
+        ));
+    }
 
     #[test]
     fn policies_are_parsed_as_rfc_8461_writes_them() -> Result<()> {

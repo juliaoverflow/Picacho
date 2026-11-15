@@ -173,7 +173,7 @@ impl Backend {
     pub fn proton_code(&self, code: String, cancel: Arc<AtomicBool>) -> Result<ProtonNext> {
         let mut p = self.proton_waiting()?;
         if let Err(e) = p.login.submit_code(&code) {
-            *self.proton_login.lock().unwrap() = Some(p);
+            self.proton_keep(p);
             return Err(e);
         }
         self.proton_advance(p, &cancel)
@@ -192,7 +192,7 @@ impl Backend {
             .submit_key(method, pin, self.proton_prompt.clone(), &cancel);
         *self.proton_prompt.lock().unwrap() = KeyPrompt::Idle;
         if let Err(e) = result {
-            *self.proton_login.lock().unwrap() = Some(p);
+            self.proton_keep(p);
             return Err(e);
         }
         self.proton_advance(p, &cancel)
@@ -205,9 +205,16 @@ impl Backend {
                 .save_proton(p, signed, &cancel)
                 .map(|a| ProtonNext::Done(Box::new(a))),
             Err(e) => {
-                *self.proton_login.lock().unwrap() = Some(p);
+                self.proton_keep(p);
                 Err(e)
             }
+        }
+    }
+    /// Keeps a sign-in whose step failed, to try that step again, unless
+    /// the failure ended it: then it starts again with the password.
+    fn proton_keep(&self, p: ProtonLogin) {
+        if !p.login.ended() {
+            *self.proton_login.lock().unwrap() = Some(p);
         }
     }
     /// Gives up on the sign-in in progress, signing its session out.
@@ -230,7 +237,7 @@ impl Backend {
     }
     /// Keeps the sign-in for its next step, or finishes it.
     fn proton_advance(&self, mut p: ProtonLogin, cancel: &AtomicBool) -> Result<ProtonNext> {
-        match p.login.next() {
+        match p.login.next()? {
             proton::Next::SecondFactor { code, key } => {
                 *self.proton_login.lock().unwrap() = Some(p);
                 Ok(ProtonNext::SecondFactor { code, key })
@@ -330,6 +337,18 @@ impl Backend {
         if let Some(s) = self.proton.lock().unwrap().get(&a.id) {
             return Ok(s.clone());
         }
+        let opening = self
+            .proton_opening
+            .lock()
+            .unwrap()
+            .entry(a.id.clone())
+            .or_default()
+            .clone();
+        let _opening = opening.lock().unwrap_or_else(|e| e.into_inner());
+        // Another thread may have resumed it while this one waited.
+        if let Some(s) = self.proton.lock().unwrap().get(&a.id) {
+            return Ok(s.clone());
+        }
         let secret = self.credentials(a)?;
         let session = Arc::new(Session::open(&secret.proton())?);
         self.keep_proton_tokens(a, &session);
@@ -365,9 +384,15 @@ impl Backend {
         if self.test_secret.is_some() {
             return;
         }
-        if let Ok(mut secret) = self.saved_credentials(&a.id) {
+        let kept = self.saved_credentials(&a.id).and_then(|mut secret| {
             secret.set_proton(&saved);
-            let _ = self.save_credentials(&a.id, &secret);
+            self.save_credentials(&a.id, &secret)
+        });
+        if kept.is_err() {
+            // Not saved: the keychain still has the replaced refresh token,
+            // which would sign the account out at the next launch. Keep the
+            // new tokens to save again after the next request.
+            session.unsaved(saved);
         }
     }
     /// Ends the account's Proton session (it is being removed).

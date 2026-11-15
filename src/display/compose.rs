@@ -741,6 +741,10 @@ impl MailApp {
                 };
                 let now = chrono::Utc::now().timestamp();
                 let moment = std::time::Instant::now();
+                // Retry times of drafts no longer scheduled (sent, deleted,
+                // unscheduled) aren't kept.
+                this.scheduled_retry
+                    .retain(|id, _| drafts.iter().any(|d| &d.id == id));
                 for d in drafts {
                     let due = d.send_at.is_some_and(|t| t <= now) && d.send_error.is_empty();
                     let waiting = this.scheduled_retry.get(&d.id).is_some_and(|t| *t > moment);

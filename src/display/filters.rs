@@ -419,19 +419,27 @@ impl MailApp {
         };
         let mut page = div().flex().flex_col().gap_4();
         if let Some(other) = &state.other_active {
-            let including = ui.draft.include.is_some();
-            page = page.child(self.switch_setting(
-                &format!("Keep running “{other}”"),
-                if state.has("include") {
-                    "Another app's filters are on. Picacho's filters can run them first, so both apply."
-                } else {
-                    "Another app's filters are on. This server can run only one set, so saving Picacho's turns those off."
-                },
-                format!("filters-include-{id}"),
-                including,
-                act(FilterAction::ToggleInclude(id.clone())),
-                cx,
-            ));
+            if state.has("include") {
+                let including = ui.draft.include.is_some();
+                page = page.child(self.switch_setting(
+                    &format!("Keep running “{other}”"),
+                    "Another app's filters are on. Picacho's filters can run them first, so both apply.",
+                    format!("filters-include-{id}"),
+                    including,
+                    act(FilterAction::ToggleInclude(id.clone())),
+                    cx,
+                ));
+            } else {
+                // Nothing to choose: the server runs one set of filters.
+                page = page.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(format!(
+                            "Another app's filters (“{other}”) are on. This server can run only one set, so saving Picacho's turns those off."
+                        )),
+                );
+            }
         }
         // Rules.
         let mut rules = div().flex().flex_col().gap_1();

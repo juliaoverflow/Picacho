@@ -546,6 +546,15 @@ pub fn load(endpoint: &Endpoint, secret: &str, tls: &native_tls::TlsConnector) -
             state.other_active = Some(name.clone());
         }
     }
+    // Another app's filters are on and Picacho's aren't: by default
+    // Picacho's run them too, so saving doesn't silently turn them off.
+    if !state.active
+        && state.filters.include.is_none()
+        && state.has("include")
+        && let Some(other) = &state.other_active
+    {
+        state.filters.include = Some(other.clone());
+    }
     let _ = session.command("LOGOUT");
     Ok(state)
 }

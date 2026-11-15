@@ -21,12 +21,20 @@ use wry::{NewWindowResponse, WebViewBuilder};
 /// Hands the page's messages to Picacho. Proton's verification page reports
 /// its result with `postMessage` (to its parent when framed, otherwise to
 /// itself) and, in Proton's mobile apps, through a native bridge; every one
-/// of those reaches `window.ipc`, and Rust keeps only the result.
+/// of those reaches `window.ipc`, and Rust keeps only the result. Posted
+/// messages count only from Proton's own pages: the CAPTCHA frames it embeds
+/// (hCaptcha, Google's) can post to it too.
 const BRIDGE: &str = r#"(() => {
   const send = (m) => {
     try { window.ipc.postMessage(typeof m === "string" ? m : JSON.stringify(m)); } catch (_) {}
   };
-  window.addEventListener("message", (e) => send(e.data));
+  const proton = (origin) => {
+    try {
+      const u = new URL(origin);
+      return u.protocol === "https:" && (u.hostname === "proton.me" || u.hostname.endsWith(".proton.me"));
+    } catch (_) { return false; }
+  };
+  window.addEventListener("message", (e) => { if (proton(e.origin)) send(e.data); });
   window.AndroidInterface = { dispatch: send };
   try {
     const handlers = window.webkit && window.webkit.messageHandlers;
@@ -137,8 +145,16 @@ fn show(url: &str) -> anyhow::Result<()> {
         .with_initialization_script(BRIDGE)
         .with_navigation_handler(|url| allowed(&url))
         .with_new_window_req_handler(|url, _| {
-            // Links (Proton's terms, help) open in the browser instead.
-            if url::Url::parse(&url).is_ok_and(|u| u.scheme() == "https") {
+            // Links (Proton's terms, help) open in the browser instead;
+            // only Proton's own, so the page can't open other sites.
+            if url::Url::parse(&url).is_ok_and(|u| {
+                u.scheme() == "https"
+                    && u.host_str().is_some_and(|h| {
+                        ["proton.me", "protonmail.com"]
+                            .iter()
+                            .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+                    })
+            }) {
                 let _ = open::that_detached(&url);
             }
             NewWindowResponse::Deny

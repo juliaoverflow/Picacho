@@ -6,8 +6,9 @@ one-time code, so Picacho can show it as `••••••` in the subject, th
 and notifications.
 
 Nothing here ships inside the app. When the feature is turned on, Picacho
-downloads one file from this directory at a pinned commit of the repository
-(`MODELS_URL` in `src/manage/local_ai/mod.rs`), checks its size and SHA-256,
+downloads one file from [pinaltech/picacho-otp](https://huggingface.co/pinaltech/picacho-otp)
+on Hugging Face (`MODELS_URL` in `src/manage/local_ai/mod.rs`), checks its
+size and SHA-256,
 and keeps it in the data directory under `models/`. Turning the feature (or
 Local AI) off deletes it, and a model left from an earlier version is deleted
 when the new one is installed.
@@ -98,10 +99,10 @@ it.
    `src/manage/local_ai/mod.rs` (`cargo test the_published_models_are_the_trained_ones`
    fails until they match). Bump the version in the file names when the
    features or lexicon change.
-2. Commit and push the model files, then point `MODELS_URL` at that commit:
-   `https://raw.githubusercontent.com/juliaoverflow/Picacho/<commit>/models/otp`.
-   A commit, not a branch, so the file at the address never changes under the
-   pinned digest.
+2. Upload the new files to the model repository (they are found by name):
+   `hf upload pinaltech/picacho-otp models/otp/otp-v2.bin otp-v2.bin`, and the
+   same for the `.mlmodel`. Upload before releasing the app that names them;
+   a file whose digest doesn't match is never installed.
 
 `PICACHO_MODELS_URL` makes the app download from somewhere else (an HTTPS
 mirror) while developing.

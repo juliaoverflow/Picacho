@@ -21,24 +21,43 @@ const MAX_PART: usize = 1024 * 1024 * 1024;
 impl Backend {
     /// Where a download in progress keeps what has arrived.
     fn partial_file(&self, id: &str) -> std::path::PathBuf {
-        let safe: String = id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
+        // Named by a hash of the id: any mapping of ids to file names that
+        // drops characters can give two messages one file, and a download
+        // would then resume from another message's bytes.
+        use sha2::Digest as _;
+        let name: String = sha2::Sha256::digest(id.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
             .collect();
-        self.store.path.join("partial-downloads").join(safe)
+        self.store.path.join("partial-downloads").join(name)
+    }
+    /// Pieces of downloads left this long (the message was deleted, or
+    /// never opened again) are deleted rather than kept forever.
+    fn remove_stale_partials(&self, dir: &std::path::Path) {
+        const STALE: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
     /// Downloads a selected message's source in pieces, resuming from what
     /// an earlier, interrupted download kept. Callers selected its mailbox.
     pub(super) fn download_resumable(&self, c: &mut Connection, m: &Mail) -> Result<Vec<u8>> {
         use std::io::Write;
         let path = self.partial_file(&m.id);
-        std::fs::create_dir_all(path.parent().context("Invalid download folder")?)?;
+        let dir = path.parent().context("Invalid download folder")?;
+        std::fs::create_dir_all(dir)?;
+        self.remove_stale_partials(dir);
         let mut have = std::fs::read(&path).unwrap_or_default();
         // A piece from another generation, or past the message, is no use.
         if have.len() > m.size as usize && m.size > 0 {

@@ -20,11 +20,12 @@ pub const ENABLED_PREFERENCE: &str = "local_ai";
 /// Preference: sign-in codes are found and hidden.
 pub const OTP_PREFERENCE: &str = "local_ai_otp";
 
-/// Where the models are published: `models/otp` at a commit that has the
-/// files named below (a commit, so they never change under their digests).
+/// Where the models are published: Picacho's model repository on Hugging
+/// Face (in the pinaltech "Picacho Models" collection). Each file is checked
+/// against the size and SHA-256 below, so a changed file is never installed.
 /// `PICACHO_MODELS_URL` points elsewhere (a mirror, or a local server while
 /// developing).
-const MODELS_URL: &str = "https://raw.githubusercontent.com/juliaoverflow/Picacho/5f1e573855a21c5d128b8533d1079684b9d59b41/models/otp";
+const MODELS_URL: &str = "https://huggingface.co/pinaltech/picacho-otp/resolve/main";
 
 /// A downloadable model: its file there and here, and what it must be.
 pub struct Model {

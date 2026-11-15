@@ -3,7 +3,7 @@
 //! and run by Core ML, which picks the CPU, GPU or Neural Engine itself.
 use anyhow::{Context, Result, anyhow, ensure};
 use objc2::AnyThread;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_ml::{
     MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel, MLMultiArray,
@@ -25,12 +25,14 @@ fn url(path: &Path) -> Retained<NSURL> {
 pub fn compile(source: &Path, target: &Path) -> Result<()> {
     // The synchronous call is deprecated in favour of a completion handler,
     // but installing already runs off the main thread.
-    #[allow(deprecated)]
-    let compiled = unsafe { MLModel::compileModelAtURL_error(&url(source)) }.map_err(error)?;
-    let path = compiled
-        .path()
-        .map(|p| p.to_string())
-        .context("Core ML gave no compiled model")?;
+    let path = autoreleasepool(|_| {
+        #[allow(deprecated)]
+        let compiled = unsafe { MLModel::compileModelAtURL_error(&url(source)) }.map_err(error)?;
+        compiled
+            .path()
+            .map(|p| p.to_string())
+            .context("Core ML gave no compiled model")
+    })?;
     if target.exists() {
         std::fs::remove_dir_all(target)?;
     }
@@ -65,13 +67,24 @@ pub struct CoreMlModel {
 
 impl CoreMlModel {
     pub fn load(compiled: &Path, dim: usize) -> Result<Self> {
-        let model =
-            unsafe { MLModel::modelWithContentsOfURL_error(&url(compiled)) }.map_err(error)?;
+        let model = autoreleasepool(|_| {
+            unsafe { MLModel::modelWithContentsOfURL_error(&url(compiled)) }.map_err(error)
+        })?;
         Ok(Self { model, dim })
     }
 
     /// The probability for one sparse feature vector of (index, value).
+    ///
+    /// Core ML autoreleases what a prediction makes (its input and output
+    /// arrays among them). Picacho's task threads have no autorelease pool
+    /// that is ever drained, so without one here every score would keep its
+    /// arrays until the thread ended: tens of kilobytes each, for every code
+    /// candidate in every message shown.
     pub fn score(&self, x: &[(usize, f32)]) -> Result<f32> {
+        autoreleasepool(|_| self.score_in_pool(x))
+    }
+
+    fn score_in_pool(&self, x: &[(usize, f32)]) -> Result<f32> {
         unsafe {
             let shape = NSArray::from_retained_slice(&[NSNumber::new_usize(self.dim)]);
             let input = MLMultiArray::initWithShape_dataType_error(
@@ -118,5 +131,67 @@ impl CoreMlModel {
                 .context("Core ML gave no probability")?;
             Ok(probability.objectAtIndexedSubscript(0).floatValue())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resident_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Scoring runs on threads without an autorelease pool of their own
+    /// (Picacho's task threads); what Core ML autoreleases must not pile up.
+    ///
+    /// Memory is measured for the whole process, so the test runs itself
+    /// again alone, in a process of its own, where other tests running at
+    /// the same time can't add to it.
+    #[test]
+    fn scoring_does_not_grow_memory() -> Result<()> {
+        const ALONE: &str = "PICACHO_COREML_MEMORY_TEST";
+        if std::env::var_os(ALONE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "manage::local_ai::coreml::tests::scoring_does_not_grow_memory",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ALONE, "1")
+                .output()?;
+            let log = String::from_utf8_lossy(&out.stderr);
+            ensure!(out.status.success(), "the measurement failed:\n{log}");
+            ensure!(log.contains("resident memory grew"), "it didn't run:\n{log}");
+            return Ok(());
+        }
+        let dir = std::env::temp_dir().join(format!("coreml-{}", uuid::Uuid::new_v4()));
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/otp-v1.mlmodel");
+        let compiled = dir.join("otp.mlmodelc");
+        std::fs::create_dir_all(&dir)?;
+        compile(&source, &compiled)?;
+        let grown = std::thread::spawn(move || -> Result<u64> {
+            let model = CoreMlModel::load(&compiled, super::super::otp::DIM)?;
+            let x = [(1, 1.0), (7, 0.5)];
+            for _ in 0..2_000 {
+                model.score(&x)?;
+            }
+            let before = resident_kb();
+            for _ in 0..20_000 {
+                model.score(&x)?;
+            }
+            Ok(resident_kb().saturating_sub(before))
+        })
+        .join()
+        .unwrap()?;
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("resident memory grew {grown} KB over 20,000 scores");
+        assert!(grown < 20 * 1024, "grew {grown} KB");
+        Ok(())
     }
 }
