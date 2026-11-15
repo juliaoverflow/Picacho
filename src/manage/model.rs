@@ -251,8 +251,81 @@ pub struct Account {
     /// where the sending server supports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delivery_receipts: bool,
+    /// Only send where every server on the way must use TLS (REQUIRETLS,
+    /// RFC 8689): the outgoing server has to offer it, and mail that can't
+    /// go encrypted the whole way bounces rather than going in the clear.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_tls: bool,
+    /// Other addresses this mailbox sends as, each optionally through its
+    /// own outgoing server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<Identity>,
+}
+/// An address a mailbox sends as besides its own (a sending identity): the
+/// name and address recipients see, where replies go, and the outgoing
+/// server, when it isn't the mailbox's. Its password is in the keychain
+/// under `secret_id`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub id: String,
+    pub email: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply_to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp: Option<OutgoingServer>,
+}
+/// An outgoing (SMTP) server and the name to sign in to it with.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingServer {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+}
+impl Identity {
+    /// Where its outgoing server's password is kept in the keychain.
+    pub fn secret_id(&self) -> String {
+        format!("identity:{}", self.id)
+    }
+    /// The name to sign in to its own outgoing server with.
+    pub fn login(&self) -> &str {
+        match &self.smtp {
+            Some(s) if !s.username.trim().is_empty() => s.username.trim(),
+            _ => &self.email,
+        }
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.email.trim().parse::<lettre::Address>().is_ok(),
+            "Enter a valid email address."
+        );
+        anyhow::ensure!(
+            !self.name.contains(['\r', '\n']),
+            "Enter a name without line breaks."
+        );
+        crate::sync::smtp::recipients(&self.reply_to)
+            .map_err(|_| anyhow::anyhow!("Enter a valid Reply-To address."))?;
+        if let Some(s) = &self.smtp {
+            anyhow::ensure!(
+                !s.host.is_empty() && !s.host.contains(['\r', '\n', ' ', '/', ':']),
+                "Enter a valid outgoing server hostname."
+            );
+            anyhow::ensure!(s.port > 0, "Ports must be between 1 and 65535.");
+            anyhow::ensure!(
+                !s.username.contains(['\r', '\n']),
+                "Enter a sign-in name without line breaks."
+            );
+        }
+        Ok(())
+    }
 }
 impl Account {
+    /// One of the addresses it sends as, by id.
+    pub fn identity(&self, id: &str) -> Option<&Identity> {
+        self.identities.iter().find(|i| i.id == id)
+    }
     /// The name to sign in to the mail servers with.
     pub fn login(&self) -> &str {
         if self.username.trim().is_empty() {
@@ -291,6 +364,8 @@ impl Account {
             reply_to: String::new(),
             read_receipts: false,
             delivery_receipts: false,
+            require_tls: false,
+            identities: Vec::new(),
         }
     }
     /// The name shown for the account: its nickname, if it has one.
@@ -663,6 +738,17 @@ pub struct Draft {
     /// as, through `account`; empty to send as the account itself.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub send_as: String,
+    /// One of the account's other addresses (`Account::identities`) it is
+    /// sent as; empty to send as the account (or `send_as`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
+    /// When to send it (seconds since the epoch), for a message scheduled
+    /// with Send Later; it waits in Drafts until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_at: Option<i64>,
+    /// Why it couldn't be sent when it was scheduled to be, if it couldn't.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub send_error: String,
     pub to: String,
     #[serde(default)]
     pub cc: String,
@@ -726,6 +812,11 @@ impl Draft {
             h.update([0]);
         }
         h.update([u8::from(self.formatted)]);
+        // Added later: drafts without one keep their earlier fingerprints.
+        if !self.identity.is_empty() {
+            h.update(b"identity\0");
+            h.update(self.identity.as_bytes());
+        }
         for path in &self.attachments {
             h.update(path.to_string_lossy().as_bytes());
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);

@@ -905,3 +905,431 @@ fn same_named_attachments_get_their_own_files() {
     assert_eq!(distinct_name("notes", &mut used), "notes");
     assert_eq!(distinct_name("notes", &mut used), "notes (2)");
 }
+
+/// What a scripted SMTP server saw: its commands, the message, and how the
+/// sign-in went.
+struct SmtpSeen {
+    commands: Vec<String>,
+    message: Vec<u8>,
+    signed_in: bool,
+}
+
+/// A server offering `ehlo` after STARTTLS. With PIPELINING it answers MAIL
+/// only once it has read `recipients` RCPTs as well, as a client that
+/// pipelines sends them; one that waits for each reply stalls and fails.
+fn scripted_smtp(
+    ehlo: &'static str,
+    recipients: usize,
+    a: impl FnOnce(&mut Account),
+    draft: Draft,
+) -> Result<(Result<Vec<String>>, SmtpSeen)> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let pipelining = ehlo.contains("PIPELINING");
+    let server = std::thread::spawn(move || {
+        let mut seen = SmtpSeen {
+            commands: Vec::new(),
+            message: Vec::new(),
+            signed_in: false,
+        };
+        let Ok((socket, _)) = listener.accept() else {
+            return seen;
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut plain = BufReader::new(socket);
+        plain.get_mut().write_all(b"220 fixture ESMTP\r\n").unwrap();
+        let mut line = String::new();
+        plain.read_line(&mut line).unwrap();
+        plain
+            .get_mut()
+            .write_all(b"250-fixture\r\n250 STARTTLS\r\n")
+            .unwrap();
+        line.clear();
+        plain.read_line(&mut line).unwrap();
+        plain.get_mut().write_all(b"220 go\r\n").unwrap();
+        let mut r = BufReader::new(acceptor.accept(plain.into_inner()).unwrap());
+        let next = |r: &mut BufReader<native_tls::TlsStream<TcpStream>>| -> Option<String> {
+            let mut line = String::new();
+            (r.read_line(&mut line).unwrap_or(0) > 0).then(|| line.trim_end().to_owned())
+        };
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        while let Some(command) = next(&mut r) {
+            seen.commands.push(command.clone());
+            let reply: String = if command.starts_with("EHLO") {
+                ehlo.into()
+            } else if command == "AUTH CRAM-MD5" {
+                let challenge = "<1896.697170952@fixture>";
+                write!(r.get_mut(), "334 {}\r\n", b64.encode(challenge)).unwrap();
+                let answer = b64.decode(next(&mut r).unwrap()).unwrap();
+                let answer = String::from_utf8(answer).unwrap();
+                use hmac::{KeyInit, Mac};
+                let mut mac =
+                    <hmac::Hmac<md5::Md5> as KeyInit>::new_from_slice(b"fixture-password").unwrap();
+                mac.update(challenge.as_bytes());
+                let digest: String = mac
+                    .finalize()
+                    .into_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                seen.signed_in = answer == format!("qa@example.com {digest}");
+                if seen.signed_in {
+                    "235 ok\r\n"
+                } else {
+                    "535 no\r\n"
+                }
+                .into()
+            } else if command == "AUTH LOGIN" {
+                r.get_mut().write_all(b"334 VXNlcm5hbWU6\r\n").unwrap();
+                let user = b64.decode(next(&mut r).unwrap()).unwrap();
+                r.get_mut().write_all(b"334 UGFzc3dvcmQ6\r\n").unwrap();
+                let password = b64.decode(next(&mut r).unwrap()).unwrap();
+                seen.signed_in = user == b"qa@example.com" && password == b"fixture-password";
+                if seen.signed_in {
+                    "235 ok\r\n"
+                } else {
+                    "535 no\r\n"
+                }
+                .into()
+            } else if command.starts_with("AUTH PLAIN") {
+                seen.signed_in = true;
+                "235 ok\r\n".into()
+            } else if command.starts_with("MAIL") {
+                if pipelining {
+                    for _ in 0..recipients {
+                        let rcpt = next(&mut r).unwrap();
+                        assert!(rcpt.starts_with("RCPT"), "{rcpt}");
+                        seen.commands.push(rcpt);
+                    }
+                    "250 ok\r\n".repeat(recipients + 1)
+                } else {
+                    "250 ok\r\n".into()
+                }
+            } else if command.starts_with("RCPT") {
+                "250 ok\r\n".into()
+            } else if let Some(size) = command.strip_prefix("BDAT ") {
+                let n: usize = size.split(' ').next().unwrap().parse().unwrap();
+                let mut chunk = vec![0; n];
+                r.read_exact(&mut chunk).unwrap();
+                seen.message.extend(chunk);
+                "250 chunk ok\r\n".into()
+            } else if command == "DATA" {
+                r.get_mut().write_all(b"354 go\r\n").unwrap();
+                loop {
+                    let mut data = Vec::new();
+                    r.read_until(b'\n', &mut data).unwrap();
+                    if data == b".\r\n" {
+                        break;
+                    }
+                    if data.starts_with(b"..") {
+                        data.remove(0);
+                    }
+                    seen.message.extend(data);
+                }
+                "250 queued\r\n".into()
+            } else if command == "QUIT" {
+                r.get_mut().write_all(b"221 bye\r\n").unwrap();
+                break;
+            } else {
+                "500 what\r\n".into()
+            };
+            r.get_mut().write_all(reply.as_bytes()).unwrap();
+        }
+        seen
+    });
+    let (b, mut account, path) = backend(&cert)?;
+    account.provider = Provider::Pop3;
+    account.smtp_port = port;
+    a(&mut account);
+    let draft = Draft {
+        account: account.id.clone(),
+        ..draft
+    };
+    let result = b.send_noting(&account, &draft);
+    let seen = server.join().unwrap();
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok((result, seen))
+}
+
+/// PIPELINING sends the sender and recipients at once, CHUNKING sends the
+/// message in BDAT chunks without dot-stuffing, REQUIRETLS goes with MAIL
+/// when asked for (and nothing is sent where it isn't offered), and the
+/// best sign-in the server offers is used: CRAM-MD5 when it's all there is,
+/// LOGIN before it.
+#[test]
+fn smtp_pipelining_chunking_requiretls_and_sign_in_methods() -> Result<()> {
+    let draft = Draft {
+        id: "modern".into(),
+        to: "ana@example.com, bo@example.com".into(),
+        subject: "Pipelined".into(),
+        body: ".A line starting with a dot".into(),
+        ..Draft::default()
+    };
+    let (result, seen) = scripted_smtp(
+        "250-fixture\r\n250-PIPELINING\r\n250-CHUNKING\r\n250-REQUIRETLS\r\n250 AUTH CRAM-MD5\r\n",
+        2,
+        |a| a.require_tls = true,
+        draft.clone(),
+    )?;
+    result?;
+    assert!(seen.signed_in, "{:?}", seen.commands);
+    let mail = seen
+        .commands
+        .iter()
+        .find(|c| c.starts_with("MAIL"))
+        .unwrap();
+    assert!(mail.ends_with(" REQUIRETLS"), "{mail}");
+    assert!(
+        seen.commands
+            .iter()
+            .any(|c| c.starts_with("BDAT ") && c.ends_with(" LAST"))
+    );
+    assert!(!seen.commands.iter().any(|c| c == "DATA"));
+    let message = String::from_utf8_lossy(&seen.message);
+    assert!(message.contains("Subject: Pipelined"), "{message}");
+    // BDAT sends the message as it is: the dot isn't doubled.
+    assert!(message.contains("\r\n.A line starting"), "{message}");
+    // Encryption all the way asked for, where the server can't promise it.
+    let (result, seen) = scripted_smtp(
+        "250-fixture\r\n250 AUTH PLAIN\r\n",
+        1,
+        |a| a.require_tls = true,
+        draft.clone(),
+    )?;
+    assert!(format!("{:#}", result.unwrap_err()).contains("REQUIRETLS"));
+    assert!(!seen.commands.iter().any(|c| c.starts_with("MAIL")));
+    // An older server: one command at a time, DATA, and LOGIN over CRAM-MD5.
+    let (result, seen) = scripted_smtp(
+        "250-fixture\r\n250 AUTH CRAM-MD5 LOGIN\r\n",
+        2,
+        |_| {},
+        draft,
+    )?;
+    result?;
+    assert!(seen.signed_in);
+    assert!(
+        seen.commands.contains(&"AUTH LOGIN".to_owned()),
+        "{:?}",
+        seen.commands
+    );
+    assert!(seen.commands.iter().any(|c| c == "DATA"));
+    assert!(String::from_utf8_lossy(&seen.message).contains("\r\n.A line starting"));
+    Ok(())
+}
+
+/// Copies for Sent that couldn't be saved when a message went out wait and
+/// are saved with a later check: one already there (found by Message-ID)
+/// isn't saved twice, and one the server refuses waits for the next try.
+#[test]
+fn sent_copies_that_failed_are_saved_later_once() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let sent: FixtureFolder = Arc::new(Mutex::new(vec![(
+        1,
+        b"Message-ID: <first@example.com>\r\nSubject: Already here\r\n\r\nHi\r\n".to_vec(),
+    )]));
+    let folder = sent.clone();
+    let server = std::thread::spawn(move || {
+        let mut appends = 0;
+        let mut connections = 0;
+        while connections < 2 {
+            let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+                break;
+            };
+            connections += 1;
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                let mut sent = folder.lock().unwrap();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 UIDPLUS\r\n");
+                } else if upper.starts_with("LIST") {
+                    // No Drafts folder: the draft sync stops after the copies.
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Sent) \"/\" Sent\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send(&format!(
+                        "* {} EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n",
+                        sent.len()
+                    ));
+                } else if let Some(id) = upper.strip_prefix("UID SEARCH HEADER MESSAGE-ID ") {
+                    let id = id.trim_matches('"').to_ascii_lowercase();
+                    let uids: String = sent
+                        .iter()
+                        .filter(|(_, raw)| {
+                            String::from_utf8_lossy(raw)
+                                .to_ascii_lowercase()
+                                .contains(&id)
+                        })
+                        .map(|(u, _)| format!(" {u}"))
+                        .collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if upper.starts_with("APPEND") {
+                    appends += 1;
+                    // The first try fails, as a full mailbox or a dropped
+                    // connection would.
+                    if appends == 1 {
+                        p.send(&format!("{tag} NO [OVERQUOTA] try later\r\n"));
+                        continue;
+                    }
+                    assert!(command.contains("\\Seen"), "{command}");
+                    let uid = sent.len() as u32 + 1;
+                    sent.push((uid, literal));
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.queue_sent_copy(
+        &a.id,
+        b"Message-ID: <first@example.com>\r\nSubject: Already here\r\n\r\nHi\r\n",
+    )?;
+    b.queue_sent_copy(
+        &a.id,
+        b"Message-ID: <second@example.com>\r\nSubject: New\r\n\r\nHello\r\n",
+    )?;
+    assert_eq!(b.queued_sent_copies(&a.id), 2);
+    b.sync_drafts(&a)?;
+    // The first was there already; the second was refused and waits.
+    assert_eq!(b.queued_sent_copies(&a.id), 1);
+    assert_eq!(sent.lock().unwrap().len(), 1);
+    b.disconnect(&a.id);
+    b.sync_drafts(&a)?;
+    assert_eq!(b.queued_sent_copies(&a.id), 0);
+    let saved = sent.lock().unwrap();
+    assert_eq!(saved.len(), 2);
+    assert!(String::from_utf8_lossy(&saved[1].1).contains("<second@example.com>"));
+    drop(saved);
+    b.disconnect(&a.id);
+    server.join().unwrap();
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A sending address with its own outgoing server sends through it, signed
+/// in with its own name, as itself; the mailbox's server isn't used.
+#[test]
+fn other_addresses_send_through_their_own_server() -> Result<()> {
+    let draft = Draft {
+        id: "as-desk".into(),
+        to: "ana@example.com".into(),
+        subject: "From the desk".into(),
+        body: "Hello".into(),
+        identity: "desk".into(),
+        ..Draft::default()
+    };
+    let (result, seen) = scripted_smtp(
+        "250-fixture\r\n250 AUTH PLAIN\r\n",
+        1,
+        |a| {
+            a.identities = vec![crate::manage::model::Identity {
+                id: "desk".into(),
+                email: "desk@shop.example".into(),
+                name: "Shop Desk".into(),
+                reply_to: String::new(),
+                smtp: Some(crate::manage::model::OutgoingServer {
+                    host: "localhost".into(),
+                    port: a.smtp_port,
+                    username: "desk-login".into(),
+                }),
+            }];
+            // Nothing listens here: the mailbox's server mustn't be used.
+            a.smtp_port = 1;
+        },
+        draft,
+    )?;
+    result?;
+    use base64::Engine as _;
+    let auth = seen
+        .commands
+        .iter()
+        .find(|c| c.starts_with("AUTH PLAIN "))
+        .unwrap();
+    let credentials = base64::engine::general_purpose::STANDARD
+        .decode(auth.split(' ').nth(2).unwrap())
+        .unwrap();
+    assert_eq!(credentials, b"\0desk-login\0fixture-password");
+    let mail = seen
+        .commands
+        .iter()
+        .find(|c| c.starts_with("MAIL"))
+        .unwrap();
+    assert!(mail.starts_with("MAIL FROM:<desk@shop.example>"), "{mail}");
+    let message = String::from_utf8_lossy(&seen.message);
+    assert!(
+        message.contains("desk@shop.example") && !message.contains("qa@example.com"),
+        "{message}"
+    );
+    Ok(())
+}
+
+/// Sending addresses are kept with their account; the account's own
+/// address, a duplicate or an invalid one isn't taken.
+#[test]
+fn sending_addresses_are_saved_and_removed() -> Result<()> {
+    use crate::manage::model::Identity;
+    let (b, a, path) = backend(&[])?;
+    b.store.save_account(&a)?;
+    let desk = Identity {
+        id: "desk".into(),
+        email: " desk@shop.example ".into(),
+        name: "Shop Desk".into(),
+        ..Identity::default()
+    };
+    let saved = b.save_identity(&a.id, desk.clone(), None)?;
+    assert_eq!(saved.identities.len(), 1);
+    assert_eq!(saved.identities[0].email, "desk@shop.example");
+    let stored = b
+        .store
+        .accounts()?
+        .into_iter()
+        .find(|x| x.id == a.id)
+        .unwrap();
+    assert_eq!(stored.identities, saved.identities);
+    // Changing it keeps one.
+    let renamed = Identity {
+        name: "Front Desk".into(),
+        ..desk.clone()
+    };
+    assert_eq!(
+        b.save_identity(&a.id, renamed, None)?.identities[0].name,
+        "Front Desk"
+    );
+    for wrong in [
+        Identity {
+            id: "x".into(),
+            email: "DESK@shop.example".into(),
+            ..Identity::default()
+        },
+        Identity {
+            id: "y".into(),
+            email: a.email.clone(),
+            ..Identity::default()
+        },
+        Identity {
+            id: "z".into(),
+            email: "not an address".into(),
+            ..Identity::default()
+        },
+    ] {
+        assert!(b.save_identity(&a.id, wrong, None).is_err());
+    }
+    assert!(b.remove_identity(&a.id, "desk")?.identities.is_empty());
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

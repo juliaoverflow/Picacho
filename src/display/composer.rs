@@ -69,6 +69,9 @@ pub(super) enum ComposerEvent {
     /// Open Forwarding settings to make an alias at a service for a
     /// mailbox: (service, mailbox).
     NewAlias(String, String),
+    /// The draft passed its checks and should be sent at this time
+    /// (seconds since the epoch): Send Later.
+    Schedule(i64),
 }
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -135,6 +138,10 @@ pub(super) struct Composer {
     from_closed: Option<std::time::Instant>,
     /// Narrows a long From menu.
     from_filter: Entity<InputState>,
+    /// Send Later's menu is open.
+    later_open: bool,
+    /// A time typed in Send Later's menu.
+    later_input: Entity<InputState>,
     accounts: Vec<Account>,
     /// Aliases at forwarding services that can send.
     aliases: Vec<fwd::SendAlias>,
@@ -181,6 +188,7 @@ impl Composer {
         ];
         let subject = field("Subject", window, cx);
         let from_filter = field("Find an address", window, cx);
+        let later_input = field("2026-11-20 9:00, 14:30, tomorrow 9:00", window, cx);
         let body = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -219,6 +227,14 @@ impl Composer {
                 }
             }));
         }
+        subscriptions.push(
+            cx.subscribe_in(&later_input, window, |this, input, e, w, cx| {
+                if let InputEvent::PressEnter { .. } = e {
+                    let text = input.read(cx).value().to_string();
+                    this.schedule_typed(&text, w, cx);
+                }
+            }),
+        );
         subscriptions.push(cx.subscribe(&from_filter, |_, _, e, cx| {
             if matches!(e, InputEvent::Change) {
                 cx.notify();
@@ -254,6 +270,8 @@ impl Composer {
             from_open: false,
             from_closed: None,
             from_filter,
+            later_open: false,
+            later_input,
             accounts,
             aliases,
             alias_services: vec![],
@@ -594,9 +612,29 @@ impl Composer {
     /// Checks the draft and asks the app to send it. Missing recipients stop
     /// here; a missing subject or attachment asks first.
     pub(super) fn request_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_send_at(None, window, cx)
+    }
+
+    /// Like `request_send`, for sending at `at` (Send Later) when given.
+    pub(super) fn request_send_at(
+        &mut self,
+        at: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.sending {
             return;
         }
+        self.later_open = false;
+        if at.is_some_and(|t| t <= chrono::Utc::now().timestamp() + 30) {
+            self.error = Some("Choose a time in the future.".into());
+            cx.notify();
+            return;
+        }
+        let event = move || match at {
+            Some(t) => ComposerEvent::Schedule(t),
+            None => ComposerEvent::Send,
+        };
         if self.needs_alias() {
             let email = self
                 .accounts
@@ -641,22 +679,200 @@ impl Composer {
             doubts.push("The message mentions an attachment, but nothing is attached.");
         }
         if doubts.is_empty() {
-            cx.emit(ComposerEvent::Send);
+            cx.emit(event());
             return;
         }
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Send anyway?",
+            if at.is_some() {
+                "Schedule anyway?"
+            } else {
+                "Send anyway?"
+            },
             Some(&doubts.join("\n")),
-            &["Send", "Keep Editing"],
+            &[
+                if at.is_some() { "Schedule" } else { "Send" },
+                "Keep Editing",
+            ],
             cx,
         );
         cx.spawn(async move |this, cx| {
             if let Ok(0) = answer.await {
-                let _ = this.update(cx, |_, cx| cx.emit(ComposerEvent::Send));
+                let _ = this.update(cx, |_, cx| cx.emit(event()));
             }
         })
         .detach();
+    }
+
+    /// Schedules the time typed in Send Later's menu.
+    fn schedule_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::manage::composing::parse_later(text, chrono::Local::now()) {
+            Some(at) => self.request_send_at(Some(at), window, cx),
+            None => {
+                self.error =
+                    Some("Enter a time like 14:30, tomorrow 9:00 or 2026-11-20 9:00.".into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Sends the draft when it was going to, no more: it stays a draft.
+    fn unschedule(&mut self, cx: &mut Context<Self>) {
+        self.draft.send_at = None;
+        self.draft.send_error.clear();
+        self.changed(cx);
+    }
+
+    /// When a scheduled draft is to go, and why it didn't if it couldn't.
+    fn schedule_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        let at = self.draft.send_at?;
+        let c = self.colors;
+        let when = crate::manage::composing::describe_later(at, chrono::Local::now());
+        let failed = !self.draft.send_error.is_empty();
+        let text = if failed {
+            format!("Not sent {when}: {}", self.draft.send_error)
+        } else {
+            format!(
+                "Scheduled to send {when}. It waits in Drafts until then while Picacho is open."
+            )
+        };
+        Some(
+            div()
+                .flex_shrink_0()
+                .px_4()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.soft))
+                .text_size(px(12.))
+                .child(icon_el(
+                    if failed { "warning" } else { "clock" },
+                    14.,
+                    if failed { c.danger } else { c.accent },
+                ))
+                .child(div().flex_1().min_w_0().child(text))
+                .child(
+                    div()
+                        .id("compose-unschedule")
+                        .debug_selector(|| "compose-unschedule".into())
+                        .px_2()
+                        .py(px(3.))
+                        .rounded(px(5.))
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(c.accent))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(c.border)))
+                        .child("Don't Send Later")
+                        .on_click(cx.listener(|this, _, _, cx| this.unschedule(cx))),
+                ),
+        )
+    }
+
+    /// Send Later's choices, and a field for a time of one's own.
+    fn later_menu(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        let now = chrono::Local::now();
+        let mut list = div().flex().flex_col();
+        for (i, (label, at)) in crate::manage::composing::later_choices(now)
+            .into_iter()
+            .enumerate()
+        {
+            let when = crate::manage::composing::describe_later(at, now);
+            list = list.child(
+                div()
+                    .id(("later-choice", i))
+                    .debug_selector(move || format!("later-choice-{i}"))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(c.soft)))
+                    .child(div().flex_1().text_size(px(13.)).child(label))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(when),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, w, cx| this.request_send_at(Some(at), w, cx)),
+                    ),
+            );
+        }
+        div()
+            .id("later-menu")
+            .debug_selector(|| "later-menu".into())
+            .absolute()
+            .bottom(px(48.))
+            .left(px(12.))
+            .w(px(300.))
+            .p_1()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.raised))
+            .shadow_lg()
+            .occlude()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.later_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(c.muted))
+                    .child("Send later"),
+            )
+            .child(list)
+            .child(
+                div()
+                    .mt_1()
+                    .pt_1()
+                    .px_1()
+                    .border_t_1()
+                    .border_color(rgb(c.border))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.input(&self.later_input)),
+                    )
+                    .child(
+                        div()
+                            .id("later-schedule")
+                            .debug_selector(|| "later-schedule".into())
+                            .px_2()
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(c.accent))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(c.soft)))
+                            .child("Schedule")
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                let text = this.later_input.read(cx).value().to_string();
+                                this.schedule_typed(&text, w, cx);
+                            })),
+                    ),
+            )
     }
 
     /// Fills the recipient and subject fields, as typing would (tests).
@@ -985,6 +1201,11 @@ impl Composer {
             .flatten()
     }
 
+    /// The accounts, after one changed (its sending addresses).
+    pub(super) fn set_accounts(&mut self, accounts: Vec<Account>) {
+        self.accounts = accounts;
+    }
+
     /// The aliases and alias services, after they change in Settings.
     pub(super) fn set_forwarding(
         &mut self,
@@ -999,12 +1220,26 @@ impl Composer {
 
     /// The draft would go out as an account that sends only as an alias.
     fn needs_alias(&self) -> bool {
-        self.draft.send_as.trim().is_empty() && self.alias_only.contains(&self.draft.account)
+        self.draft.send_as.trim().is_empty()
+            && self.draft.identity.is_empty()
+            && self.alias_only.contains(&self.draft.account)
+    }
+
+    /// The account's other address the draft is sent as, when it is one.
+    fn send_identity(&self) -> Option<&crate::manage::model::Identity> {
+        if self.draft.identity.is_empty() || !self.draft.send_as.trim().is_empty() {
+            return None;
+        }
+        self.accounts
+            .iter()
+            .find(|a| a.id == self.draft.account)?
+            .identity(&self.draft.identity)
     }
 
     /// Sends as the mailbox again, after the alias in From went away.
     pub(super) fn reset_sender(&mut self, cx: &mut Context<Self>) {
         self.draft.send_as.clear();
+        self.draft.identity.clear();
         self.from_open = false;
         self.changed(cx);
     }
@@ -1069,10 +1304,18 @@ impl Composer {
         cx.notify();
     }
 
-    /// Sends as an account (`alias` None) or as an alias through `account`.
-    fn choose_sender(&mut self, account: String, alias: Option<String>, cx: &mut Context<Self>) {
+    /// Sends as an account (`alias` and `identity` None), as an alias
+    /// through `account`, or as one of the account's other addresses.
+    fn choose_sender(
+        &mut self,
+        account: String,
+        alias: Option<String>,
+        identity: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.draft.account = account;
         self.draft.send_as = alias.unwrap_or_default();
+        self.draft.identity = identity.unwrap_or_default();
         self.from_open = false;
         self.changed(cx);
     }
@@ -1085,11 +1328,47 @@ impl Composer {
             .find(|a| a.id == self.draft.account)
             .or(self.accounts.first())?;
         let alias = self.send_alias();
-        // Sending as an alias that is no longer listed; sending says so.
+        let identity = self.send_identity();
+        // Sending as an alias, or another address, that is no longer
+        // listed; sending says so.
         let missing = alias.is_none() && !self.draft.send_as.is_empty();
-        let several = self.accounts.len() + self.aliases.len() > 1 || missing || self.needs_alias();
+        let gone =
+            !self.draft.identity.is_empty() && self.draft.send_as.is_empty() && identity.is_none();
+        let identities: usize = self.accounts.iter().map(|a| a.identities.len()).sum();
+        let several = self.accounts.len() + self.aliases.len() + identities > 1
+            || missing
+            || gone
+            || self.needs_alias();
         let blocked = alias.is_none() && !missing && self.needs_alias();
+        let missing = missing || gone;
         let (label, tip) = match alias {
+            None if gone => (
+                "Removed address".to_owned(),
+                format!(
+                    "This address was removed from {}. Choose another.",
+                    current.email
+                ),
+            ),
+            None if identity.is_some() => {
+                let i = identity.unwrap();
+                let through = match &i.smtp {
+                    Some(s) => format!("Sent through {}.", s.host),
+                    None => format!("Sent through {}'s server.", current.email),
+                };
+                let name = if i.name.is_empty() {
+                    current.name.as_str()
+                } else {
+                    i.name.as_str()
+                };
+                (
+                    if name.is_empty() || name == i.email {
+                        i.email.clone()
+                    } else {
+                        format!("{name} <{}>", i.email)
+                    },
+                    through,
+                )
+            }
             None if blocked => (
                 "Choose an alias".to_owned(),
                 format!(
@@ -1173,12 +1452,14 @@ impl Composer {
             query.is_empty() || text.iter().any(|t| t.to_lowercase().contains(&query))
         };
         let alias = self.send_alias().map(|a| a.email.clone());
+        let identity = self.send_identity().map(|i| i.id.clone());
         let option = |id: (&'static str, usize),
                       title: String,
                       caption: String,
                       on: bool,
                       account: String,
-                      alias: Option<String>| {
+                      alias: Option<String>,
+                      chosen: Option<String>| {
             div()
                 .id(id)
                 .min_h(px(40.))
@@ -1214,7 +1495,7 @@ impl Composer {
                         }),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.choose_sender(account.clone(), alias.clone(), cx)
+                    this.choose_sender(account.clone(), alias.clone(), chosen.clone(), cx)
                 }))
         };
         let heading = |text: String| {
@@ -1239,6 +1520,7 @@ impl Composer {
         if !accounts.is_empty() && !self.aliases.is_empty() {
             list = list.child(heading("Accounts".into()));
         }
+        let mut other = 0;
         for (i, a) in accounts.into_iter().enumerate() {
             let named = !a.name.is_empty() && a.name != a.email;
             list = list.child(
@@ -1246,13 +1528,43 @@ impl Composer {
                     ("from-account", i),
                     a.email.clone(),
                     if named { a.name.clone() } else { String::new() },
-                    alias.is_none() && a.id == current.id,
+                    alias.is_none() && identity.is_none() && a.id == current.id,
                     a.id.clone(),
+                    None,
                     None,
                 )
                 .children(self.new_alias_button(("from-account-new-alias", i), a, cx)),
             );
             shown += 1;
+            // The account's other addresses, under it.
+            for ident in &a.identities {
+                if !matches(&[&ident.email, &ident.name]) {
+                    continue;
+                }
+                let through = match &ident.smtp {
+                    Some(s) => format!("Through {}", s.host),
+                    None => format!("Through {}", a.email),
+                };
+                let caption = if ident.name.is_empty() {
+                    through
+                } else {
+                    format!("{} · {through}", ident.name)
+                };
+                list = list.child(
+                    option(
+                        ("from-identity", other),
+                        ident.email.clone(),
+                        caption,
+                        identity.as_deref() == Some(ident.id.as_str()) && a.id == current.id,
+                        a.id.clone(),
+                        None,
+                        Some(ident.id.clone()),
+                    )
+                    .pl(px(22.)),
+                );
+                other += 1;
+                shown += 1;
+            }
         }
         let mut service = None;
         for (i, a) in self.aliases.iter().enumerate() {
@@ -1281,6 +1593,7 @@ impl Composer {
                 alias.as_deref() == Some(a.email.as_str()),
                 through.id.clone(),
                 Some(a.email.clone()),
+                None,
             ));
             shown += 1;
         }
@@ -1684,12 +1997,33 @@ impl Composer {
             .h(px(52.))
             .flex_shrink_0()
             .px_3()
+            .relative()
             .flex()
             .items_center()
             .gap_1()
             .border_t_1()
             .border_color(rgb(c.border))
             .child(send)
+            .child(self.icon_button(
+                "send-later",
+                "clock",
+                "Send later…",
+                self.later_open,
+                cx,
+                |t, w, cx| {
+                    if t.sending {
+                        return;
+                    }
+                    t.later_open = !t.later_open;
+                    if t.later_open {
+                        t.later_input.update(cx, |s, cx| s.set_value("", w, cx));
+                    }
+                    cx.notify();
+                },
+            ))
+            .when(self.later_open, |d| {
+                d.child(deferred(self.later_menu(cx)).with_priority(2))
+            })
             .child(div().w(px(6.)))
             .child(self.icon_button(
                 "attach",
@@ -1776,6 +2110,7 @@ impl Render for Composer {
         if self.minimized {
             return root;
         }
+        root = root.children(self.schedule_banner(cx));
         root = root.children(self.sender_row(cx));
         root = root.child(self.recipient_row(TO, cx));
         if self.show_cc {

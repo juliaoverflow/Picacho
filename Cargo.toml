@@ -35,6 +35,8 @@ gpui = "=0.2.2"
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
 hkdf = "0.13"
+# SASL sign-in: HMAC for SCRAM and CRAM-MD5, and their hashes.
+hmac = "0.13"
 # Tokio runs mail-auth's DNS lookups (hickory) for checking senders.
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 imap = "2.4"
@@ -44,12 +46,14 @@ imap-proto = "=0.10.2"
 # stores: Keychain, Credential Manager and the Secret Service, which finds
 # items saved by keyring 3 by service and user.
 keyring = "4"
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
+# Builds messages (MIME); Picacho speaks SMTP itself (sync/smtp.rs).
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname"] }
 # Checks DKIM, SPF and DMARC. Pure-Rust crypto, without aws-lc's C build.
 mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory"] }
 # 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
 mailparse = "0.18"
 markdown = "1.0.0"
+md-5 = "0.11"
 # Attachment content types from their file names.
 mime_guess = "2"
 native-tls = "0.2"
@@ -64,6 +68,7 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.11"
 sha2 = "0.11"
 unicode-normalization = "0.1"
 url = "2"

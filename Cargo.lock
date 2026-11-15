@@ -4786,7 +4786,6 @@ version = "0.11.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
 dependencies = [
- "base64 0.23.1",
  "email-encoding",
  "email_address",
  "fastrand 2.5.0",
@@ -4794,13 +4793,8 @@ dependencies = [
  "httpdate",
  "idna",
  "mime",
- "native-tls",
  "nom 8.0.0",
- "percent-encoding",
  "quoted_printable",
- "socket2",
- "tokio",
- "url",
 ]
 
 [[package]]
@@ -5176,6 +5170,16 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -5898,7 +5902,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hkdf 0.12.4",
  "hmac 0.12.1",
- "md-5",
+ "md-5 0.10.6",
  "num",
  "num-bigint-dig",
  "pbkdf2",
@@ -6246,7 +6250,7 @@ dependencies = [
  "idea",
  "k256",
  "log",
- "md-5",
+ "md-5 0.10.6",
  "memchr",
  "nom 8.0.0",
  "num-bigint-dig",
@@ -6402,6 +6406,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "hkdf 0.13.0",
+ "hmac 0.13.0",
  "image",
  "imap",
  "imap-proto",
@@ -6412,6 +6417,7 @@ dependencies = [
  "mail-auth",
  "mailparse",
  "markdown",
+ "md-5 0.11.0",
  "mime_guess",
  "native-tls",
  "notify-rust",
@@ -6429,6 +6435,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "tokio",
  "unicode-normalization",

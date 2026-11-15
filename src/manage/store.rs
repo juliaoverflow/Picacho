@@ -932,6 +932,16 @@ impl Store {
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
     }
+    /// Drafts of every account that are scheduled to be sent (Send Later).
+    pub fn scheduled_drafts(&self) -> Result<Vec<Draft>> {
+        let db = self.read();
+        let mut q = db.prepare("SELECT data FROM drafts WHERE data LIKE '%\"send_at\"%'")?;
+        let drafts: Vec<Draft> = q
+            .query_map([], |r| r.get::<_, String>(0))?
+            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .collect::<Result<_>>()?;
+        Ok(drafts.into_iter().filter(|d| d.send_at.is_some()).collect())
+    }
     pub fn draft(&self, id: &str) -> Result<Option<Draft>> {
         use rusqlite::OptionalExtension;
         let data: Option<String> = self

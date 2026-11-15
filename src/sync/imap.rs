@@ -1,5 +1,9 @@
 //! Verified IMAP connections, stable identities, and remote folder resolution.
-use super::{stream::ImapStream, wire::Wire};
+use super::{
+    sasl::{self, Mechanism},
+    stream::ImapStream,
+    wire::Wire,
+};
 use crate::manage::model::*;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -10,7 +14,9 @@ pub(crate) type ImapSession = imap::Session<ImapStream>;
 pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
     let addrs = (host, port)
         .to_socket_addrs()
-        .context("Server hostname could not be resolved")?;
+        .context(super::retry::Unreachable(
+            "Server hostname could not be resolved".into(),
+        ))?;
     let mut last = None;
     let deadline = Instant::now() + Duration::from_secs(12);
     for addr in addrs {
@@ -26,10 +32,11 @@ pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
             Err(e) => last = Some(e),
         }
     }
-    bail!(
+    Err(super::retry::Unreachable(format!(
         "Could not connect to {host}:{port}: {}",
         last.map(|e| e.to_string()).unwrap_or_default()
-    )
+    ))
+    .into())
 }
 pub(crate) fn imap_login(
     a: &Account,
@@ -52,33 +59,57 @@ pub(crate) fn imap_login_interruptible(
         // plaintext upgrade here so bounded I/O also covers STARTTLS sessions.
         starttls(&mut socket)?;
     }
-    let stream = ImapStream::new(
+    let mut stream = ImapStream::new(
         tls.connect(&a.incoming_host, socket)
             .map_err(|e| anyhow::anyhow!("IMAP TLS handshake failed: {e}"))?,
     );
     let compressing = stream.compression_switch();
     let interrupter = stream.interrupter()?;
     let tap = stream.tap();
+    // What the server offers for signing in, asked before the imap crate
+    // takes the stream (it has no CAPABILITY before login). IMAP sends no
+    // second greeting after STARTTLS.
+    let caps = pre_auth_capabilities(&mut stream, !a.incoming_starttls)?;
     let mut client = imap::Client::new(stream);
-    if a.incoming_starttls {
-        client.greeting_read = true; // IMAP sends no second greeting after STARTTLS.
-    } else {
-        client.read_greeting()?;
-    }
-    let session = if a.oauth {
-        client.authenticate(
-            "XOAUTH2",
-            &Xoauth {
-                user: a.email.clone(),
-                token: s.access_token.clone(),
-            },
-        )
-    } else {
-        client.login(a.login(), &s.password)
+    client.greeting_read = true;
+    let offered = auth_mechanisms(&caps);
+    let credentials = |user: &str, secret: &str| sasl::Credentials {
+        user: user.to_owned(),
+        secret: secret.to_owned(),
+        host: a.incoming_host.clone(),
+        port: a.incoming_port,
     };
-    let mut session = session.map_err(|(e, _)| {
-        let rejected = matches!(e, imap::Error::No(_) | imap::Error::Bad(_));
-        let error = anyhow::Error::new(e).context("IMAP authentication failed");
+    let session = if a.oauth {
+        // XOAUTH2 when the server lists neither: Gmail and Outlook take it.
+        let mechanism = Mechanism::choose(&sasl::TOKEN_ORDER, offered.iter().map(String::as_str))
+            .unwrap_or(Mechanism::XOAuth2);
+        authenticate(client, mechanism, credentials(&a.email, &s.access_token))
+    } else if let Some(mechanism) = Mechanism::choose(
+        &[Mechanism::ScramSha256, Mechanism::ScramSha1],
+        offered.iter().map(String::as_str),
+    ) {
+        authenticate(client, mechanism, credentials(a.login(), &s.password))
+    } else if !caps.iter().any(|c| c == "LOGINDISABLED") {
+        client
+            .login(a.login(), &s.password)
+            .map_err(|(e, _)| e.into())
+    } else {
+        match Mechanism::choose(
+            &[Mechanism::Plain, Mechanism::Login, Mechanism::CramMd5],
+            offered.iter().map(String::as_str),
+        ) {
+            Some(mechanism) => authenticate(client, mechanism, credentials(a.login(), &s.password)),
+            None => bail!(
+                "{} offers no sign-in method Picacho supports.",
+                a.incoming_host
+            ),
+        }
+    };
+    let mut session = session.map_err(|e| {
+        let rejected = e
+            .downcast_ref::<imap::Error>()
+            .is_some_and(|e| matches!(e, imap::Error::No(_) | imap::Error::Bad(_)));
+        let error = e.context("IMAP authentication failed");
         if rejected {
             error.context(crate::manage::status::AccessFailure::Authentication)
         } else {
@@ -119,15 +150,113 @@ pub(crate) fn optional(result: imap::error::Result<()>) -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
-struct Xoauth {
-    user: String,
-    token: String,
+/// A SASL exchange as the imap crate drives it: each challenge in, each
+/// answer out. A failed step answers with nothing, which the server refuses;
+/// the step's own error is kept to say why.
+struct Sasl {
+    exchange: std::cell::RefCell<sasl::Exchange>,
+    failed: std::cell::RefCell<Option<anyhow::Error>>,
 }
-impl imap::Authenticator for Xoauth {
-    type Response = String;
-    fn process(&self, _: &[u8]) -> String {
-        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
+impl imap::Authenticator for Sasl {
+    type Response = Vec<u8>;
+    fn process(&self, challenge: &[u8]) -> Vec<u8> {
+        match self.exchange.borrow_mut().step(challenge) {
+            Ok(answer) => answer,
+            Err(e) => {
+                *self.failed.borrow_mut() = Some(e);
+                Vec::new()
+            }
+        }
     }
+}
+/// Signs in with AUTHENTICATE and a SASL mechanism.
+fn authenticate(
+    client: imap::Client<ImapStream>,
+    mechanism: Mechanism,
+    credentials: sasl::Credentials,
+) -> Result<ImapSession> {
+    let auth = Sasl {
+        exchange: std::cell::RefCell::new(sasl::Exchange::new(mechanism, credentials)),
+        failed: std::cell::RefCell::new(None),
+    };
+    let result = client.authenticate(mechanism.name(), &auth);
+    if let Some(e) = auth.failed.borrow_mut().take() {
+        return Err(e.context(crate::manage::status::AccessFailure::Authentication));
+    }
+    let mut session = match result {
+        Ok(session) => session,
+        Err((e, _)) => {
+            let reason = auth.exchange.borrow().refusal().map(str::to_owned);
+            let e = anyhow::Error::new(e);
+            return Err(match reason {
+                Some(reason) => e.context(format!("The server refused the token ({reason})")),
+                None => e,
+            });
+        }
+    };
+    // SCRAM: the server must also have proved it knows the password.
+    if let Err(e) = auth.exchange.borrow_mut().finish(None) {
+        let _ = session.logout();
+        return Err(e.context(crate::manage::status::AccessFailure::Authentication));
+    }
+    Ok(session)
+}
+/// The greeting (unless already read, after STARTTLS) and CAPABILITY,
+/// before signing in, read straight from the stream so nothing is left
+/// buffered for the imap crate. Capabilities in uppercase.
+fn pre_auth_capabilities(stream: &mut ImapStream, greeting: bool) -> Result<Vec<String>> {
+    use std::io::Write;
+    let words = |text: &str| -> Vec<String> {
+        text.split_ascii_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect()
+    };
+    if greeting {
+        let hello = read_line(stream)?;
+        ensure!(
+            hello.starts_with("* OK") && !hello.starts_with("* OKAY"),
+            "IMAP server rejected connection"
+        );
+        // Servers often list their capabilities in the greeting.
+        if let Some((listed, _)) = hello
+            .split_once("[CAPABILITY ")
+            .and_then(|(_, rest)| rest.split_once(']'))
+        {
+            return Ok(words(listed));
+        }
+    }
+    stream.write_all(b"p0 CAPABILITY\r\n")?;
+    stream.flush()?;
+    let mut caps = Vec::new();
+    loop {
+        let reply = read_line(stream)?;
+        if let Some(rest) = reply.strip_prefix("p0 ") {
+            ensure!(rest.starts_with("OK"), "The IMAP server refused CAPABILITY");
+            return Ok(caps);
+        }
+        if let Some(listed) = reply.strip_prefix("* CAPABILITY ") {
+            caps.extend(words(listed));
+        }
+    }
+}
+/// One line from the server, a byte at a time so nothing past it is read.
+fn read_line(stream: &mut impl std::io::Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while !bytes.ends_with(b"\r\n") {
+        ensure!(bytes.len() <= 8192, "The IMAP server's reply is too long");
+        let n = stream.read(&mut byte)?;
+        ensure!(n == 1, "The IMAP server closed the connection");
+        bytes.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).trim_end().to_owned())
+}
+/// The SASL mechanisms in a capability list ("AUTH=PLAIN"…).
+fn auth_mechanisms(caps: &[String]) -> Vec<String> {
+    caps.iter()
+        .filter_map(|c| c.strip_prefix("AUTH="))
+        .map(str::to_owned)
+        .collect()
 }
 pub(crate) fn same_validity(a: &Mail, b: &Mail) -> bool {
     a.id.rsplit(':').nth(1) == b.id.rsplit(':').nth(1)

@@ -109,6 +109,12 @@ impl MailApp {
                 if let Some(alias) = alias_addressed(m, &aliases) {
                     draft.send_as = alias.email.clone();
                 }
+                // Sent to one of the account's other addresses: answer as it.
+                if draft.send_as.is_empty()
+                    && let Some(i) = account.as_ref().and_then(|a| identity_addressed(m, a))
+                {
+                    draft.identity = i.id.clone();
+                }
                 // A mailbox kept to its aliases answers its own sent mail as
                 // the alias it went out as.
                 let mask = self.mask_for(m);
@@ -131,8 +137,12 @@ impl MailApp {
                     _ => m.sender.clone(),
                 };
                 if !forward {
-                    let (to, cc) =
-                        reply_recipients(m, mode == 2, &[own.as_str(), draft.send_as.as_str()]);
+                    // None of the account's own addresses answer themselves.
+                    let mut mine = vec![own.as_str(), draft.send_as.as_str()];
+                    if let Some(a) = &account {
+                        mine.extend(a.identities.iter().map(|i| i.email.as_str()));
+                    }
+                    let (to, cc) = reply_recipients(m, mode == 2, &mine);
                     // Reverse aliases show as the contacts they stand for;
                     // sending routes them through the alias again.
                     let (to, cc) = match &mask {
@@ -189,6 +199,7 @@ impl MailApp {
         }
         // A mailbox kept to its aliases writes as one of them.
         if draft.send_as.is_empty()
+            && draft.identity.is_empty()
             && let Some(alias) =
                 fwd::default_alias(&self.forwarding, &self.accounts, &draft.account)
         {
@@ -210,6 +221,10 @@ impl MailApp {
 
     /// Opens a saved draft where new messages open.
     pub(super) fn open_draft(&mut self, draft: Draft, w: &mut Window, cx: &mut Context<Self>) {
+        if self.scheduled_sending.contains(&draft.id) {
+            self.notice("This scheduled message is being sent now.", false, cx);
+            return;
+        }
         if let Some(open) = self
             .composers
             .iter()
@@ -391,6 +406,7 @@ impl MailApp {
             ComposerEvent::NewAlias(service, mailbox) => {
                 self.handle(Action::NewAliasFor(service.clone(), mailbox.clone()), w, cx);
             }
+            ComposerEvent::Schedule(at) => self.schedule_send(composer, *at, cx),
         }
         cx.notify();
     }
@@ -522,7 +538,10 @@ impl MailApp {
         let own: HashSet<String> = self
             .accounts
             .iter()
-            .map(|a| a.email.to_lowercase())
+            .flat_map(|a| {
+                std::iter::once(a.email.to_lowercase())
+                    .chain(a.identities.iter().map(|i| i.email.to_lowercase()))
+            })
             .collect();
         let mut seen = HashSet::new();
         let mut out = vec![];
@@ -667,6 +686,120 @@ impl MailApp {
         cx.notify();
     }
 
+    /// Puts a checked draft aside to be sent at `at` (Send Later): it is
+    /// saved with the time and waits in Drafts.
+    fn schedule_send(&mut self, composer: Entity<Composer>, at: i64, cx: &mut Context<Self>) {
+        composer.update(cx, |c, cx| {
+            c.draft.send_at = Some(at);
+            c.draft.send_error.clear();
+            c.save_now(cx);
+        });
+        let account = composer.read(cx).draft.account.clone();
+        self.scheduled_retry.remove(&composer.read(cx).draft.id);
+        self.close_composer(&composer, cx);
+        let when = crate::manage::composing::describe_later(at, chrono::Local::now());
+        self.notice(format!("Scheduled to send {when}."), false, cx);
+        self.refresh_drafts(cx);
+        self.sync_drafts_soon(&account, cx);
+    }
+
+    /// Sends the scheduled drafts whose time has come, except any open in
+    /// a composer (being changed) or already going. Picacho has to be open
+    /// for them to go; ones whose time passed while it was closed go at
+    /// the next check after it opens.
+    pub(super) fn send_due(&mut self, cx: &mut Context<Self>) {
+        let mut open: HashSet<String> = self
+            .composers
+            .iter()
+            .map(|c| c.read(cx).draft.id.clone())
+            .collect();
+        open.extend(
+            self.outbox
+                .iter()
+                .map(|o| o.composer.read(cx).draft.id.clone()),
+        );
+        self.task(
+            cx,
+            |b| b.store.scheduled_drafts(),
+            move |this, result, cx| {
+                let Ok(drafts) = result else {
+                    return;
+                };
+                let now = chrono::Utc::now().timestamp();
+                let moment = std::time::Instant::now();
+                for d in drafts {
+                    let due = d.send_at.is_some_and(|t| t <= now) && d.send_error.is_empty();
+                    let waiting = this.scheduled_retry.get(&d.id).is_some_and(|t| *t > moment);
+                    if due
+                        && !waiting
+                        && !open.contains(&d.id)
+                        && !this.scheduled_sending.contains(&d.id)
+                    {
+                        this.send_scheduled(d, cx);
+                    }
+                }
+            },
+        );
+    }
+
+    fn send_scheduled(&mut self, d: Draft, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == d.account).cloned() else {
+            self.schedule_failed(d.id, "Its account was removed.".into(), cx);
+            return;
+        };
+        if self.account_blocked(&a.id) {
+            return;
+        }
+        let id = d.id.clone();
+        let account_id = a.id.clone();
+        self.scheduled_sending.insert(id.clone());
+        self.task(
+            cx,
+            move |b| b.send_noting(&a, &d),
+            move |this, result, cx| {
+                this.scheduled_sending.remove(&id);
+                match result {
+                    Ok(notes) => {
+                        this.scheduled_retry.remove(&id);
+                        this.notice(
+                            format!("Scheduled message sent. {}", notes.join(" "))
+                                .trim()
+                                .to_owned(),
+                            false,
+                            cx,
+                        );
+                        this.alias_routes = fwd::routes(&this.backend.store);
+                        this.refresh_drafts(cx);
+                        this.sync_drafts_soon(&account_id, cx);
+                    }
+                    // Offline, or the server's away: nothing went; try again
+                    // in a few minutes.
+                    Err(e) if crate::sync::retry::later(&e) => {
+                        this.scheduled_retry
+                            .insert(id, std::time::Instant::now() + Duration::from_secs(5 * 60));
+                    }
+                    Err(e) => this.schedule_failed(id, format!("{e:#}"), cx),
+                }
+            },
+        );
+    }
+
+    /// A scheduled draft couldn't be sent: it stays in Drafts saying why,
+    /// for the person to fix and send.
+    fn schedule_failed(&mut self, id: String, error: String, cx: &mut Context<Self>) {
+        self.scheduled_retry.remove(&id);
+        if let Ok(Some(mut d)) = self.backend.store.draft(&id) {
+            d.send_error = error.clone();
+            let _ = self.backend.store.save_draft(&d);
+        }
+        self.notice(
+            format!("A scheduled message wasn't sent: {error} It's in Drafts."),
+            true,
+            cx,
+        );
+        self.refresh_drafts(cx);
+    }
+
     /// The alias a message was to be sent as no longer exists: it is
     /// forgotten here, From goes back to the mailbox, and a dialog says so.
     fn alias_gone(&mut self, id: u64, gone: fwd::AliasGone, cx: &mut Context<Self>) {
@@ -775,6 +908,7 @@ impl MailApp {
                 ComposerEvent::NewAlias(service, mailbox) => {
                     this.pending_new_alias = Some((service.clone(), mailbox.clone()));
                 }
+                ComposerEvent::Schedule(at) => this.schedule_send(composer, *at, cx),
             }
             cx.notify();
         });
@@ -1052,6 +1186,24 @@ pub(super) fn alias_addressed<'a>(
         .map(|(_, email)| email.to_lowercase())
         .collect();
     aliases.iter().find(|a| addressed.contains(&a.email))
+}
+
+/// The account's other address a message was sent to (To or Cc), if any.
+pub(super) fn identity_addressed<'a>(
+    m: &Mail,
+    a: &'a Account,
+) -> Option<&'a crate::manage::model::Identity> {
+    if a.identities.is_empty() {
+        return None;
+    }
+    let addressed: Vec<String> = [&m.to, &m.cc]
+        .into_iter()
+        .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
+        .map(|(_, email)| email.to_lowercase())
+        .collect();
+    a.identities
+        .iter()
+        .find(|i| addressed.contains(&i.email.to_lowercase()))
 }
 
 #[cfg(test)]

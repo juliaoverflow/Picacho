@@ -600,6 +600,19 @@ enum Action {
     ToggleReadReceipts(String),
     /// Turns asking for delivery receipts on or off for an account.
     ToggleDeliveryReceipts(String),
+    /// Turns requiring encryption all the way (REQUIRETLS) on or off.
+    ToggleRequireTls(String),
+    /// Starts adding a sending address to an account.
+    AddIdentity(String),
+    /// Edits one of an account's sending addresses: (account, identity).
+    EditIdentity(String, String),
+    /// Removes one of an account's sending addresses: (account, identity).
+    RemoveIdentity(String, String),
+    /// Switches the address being edited between the mailbox's outgoing
+    /// server and one of its own.
+    ToggleIdentityServer,
+    SaveIdentity,
+    CancelIdentity,
     /// Asks before deleting messages for good.
     DeleteForever(Vec<String>),
     /// Asks before emptying an account's Trash or Spam.
@@ -854,6 +867,11 @@ pub struct MailApp {
     /// The account page's sign-in name and Reply-To fields.
     login_input: Entity<InputState>,
     reply_to_input: Entity<InputState>,
+    /// The sending address being added or changed in Settings, if any.
+    identity_edit: Option<settings::IdentityEdit>,
+    /// Its fields: address, name, Reply-To, server, port, sign-in name and
+    /// password.
+    identity_inputs: [Entity<InputState>; 7],
     /// A sign-in name being typed and not yet applied: (account, name).
     /// Each change signs the account out, so it applies once typing pauses
     /// or ends, not on every key; see `apply_login`.
@@ -943,6 +961,11 @@ pub struct MailApp {
     deleting_folders: HashSet<(String, String)>,
     /// Accounts whose drafts are being synced with the server now.
     draft_syncs: HashSet<String>,
+    /// Scheduled drafts being sent now (Send Later).
+    scheduled_sending: HashSet<String>,
+    /// Scheduled drafts that couldn't reach their server, and when to try
+    /// them again.
+    scheduled_retry: HashMap<String, std::time::Instant>,
     /// Inbox watchers (IDLE) send their account's id here when the server
     /// reports a change.
     pushed: futures::channel::mpsc::UnboundedSender<String>,
@@ -1389,6 +1412,15 @@ impl MailApp {
                 }
             }
         }));
+        let identity_inputs = [
+            input("name@example.com", false, false, window, cx),
+            input("Your name, as recipients see it", false, false, window, cx),
+            input("Replies come to this address", false, false, window, cx),
+            input("smtp.example.com", false, false, window, cx),
+            input("587", false, false, window, cx),
+            input("Same as the address", false, false, window, cx),
+            input("Password or app password", false, true, window, cx),
+        ];
         let html_view = cx.new(HtmlView::new);
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
@@ -1501,6 +1533,8 @@ impl MailApp {
             nickname_input,
             login_input,
             reply_to_input,
+            identity_edit: None,
+            identity_inputs,
             login_pending: None,
             login_revision: 0,
             quotas: HashMap::new(),
@@ -1550,6 +1584,8 @@ impl MailApp {
             subs_busy: HashSet::new(),
             deleting_folders: HashSet::new(),
             draft_syncs: HashSet::new(),
+            scheduled_sending: HashSet::new(),
+            scheduled_retry: HashMap::new(),
             pushed,
             draft_synced: HashMap::new(),
             label_input,
@@ -1651,6 +1687,7 @@ impl MailApp {
                 let checked = this.update(cx, |this, cx| {
                     this.watch_inboxes();
                     this.check_due(cx);
+                    this.send_due(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
                 });
                 if checked.is_err() {
@@ -2959,8 +2996,26 @@ impl MailApp {
                                 } else {
                                     d.subject.clone()
                                 },
-                                snippet: d.body.clone(),
-                                date: chrono::Utc::now().timestamp(),
+                                // Scheduled ones say when they go, or why
+                                // they didn't.
+                                snippet: match d.send_at {
+                                    Some(at) => {
+                                        let when = crate::manage::composing::describe_later(
+                                            at,
+                                            chrono::Local::now(),
+                                        );
+                                        if d.send_error.is_empty() {
+                                            format!("Scheduled to send {when} · {}", d.body)
+                                        } else {
+                                            format!(
+                                                "Not sent {when}: {} · {}",
+                                                d.send_error, d.body
+                                            )
+                                        }
+                                    }
+                                    None => d.body.clone(),
+                                },
+                                date: d.send_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
                                 unread: false,
                                 starred: false,
                                 size: 0,
@@ -4486,6 +4541,19 @@ impl MailApp {
             Action::ToggleDeliveryReceipts(id) => {
                 self.edit_account(&id, |a| a.delivery_receipts = !a.delivery_receipts, cx)
             }
+            Action::ToggleRequireTls(id) => {
+                self.edit_account(&id, |a| a.require_tls = !a.require_tls, cx)
+            }
+            Action::AddIdentity(account) => self.start_identity(account, None, w, cx),
+            Action::EditIdentity(account, id) => self.start_identity(account, Some(id), w, cx),
+            Action::RemoveIdentity(account, id) => self.remove_identity(account, id, cx),
+            Action::ToggleIdentityServer => {
+                if let Some(edit) = &mut self.identity_edit {
+                    edit.own_server = !edit.own_server;
+                }
+            }
+            Action::SaveIdentity => self.save_identity(cx),
+            Action::CancelIdentity => self.identity_edit = None,
             Action::DeleteForever(ids) => {
                 if !ids.is_empty() {
                     self.modal = Some(Modal::Erase(Erase::Mail(ids)));
@@ -5124,6 +5192,153 @@ impl MailApp {
             self.download_account(account, cx);
         }
         self.refresh_counts(cx);
+    }
+    /// Opens the form for a new sending address of `account`, or for
+    /// changing one (`id`).
+    fn start_identity(
+        &mut self,
+        account: String,
+        id: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = id.as_ref().and_then(|id| {
+            self.accounts
+                .iter()
+                .find(|a| a.id == account)?
+                .identity(id)
+                .cloned()
+        });
+        let i = existing.clone().unwrap_or_default();
+        let server = i.smtp.clone().unwrap_or_default();
+        let values = [
+            i.email.clone(),
+            i.name.clone(),
+            i.reply_to.clone(),
+            server.host.clone(),
+            if server.port == 0 {
+                "587".into()
+            } else {
+                server.port.to_string()
+            },
+            server.username.clone(),
+            String::new(),
+        ];
+        for (input, value) in self.identity_inputs.clone().iter().zip(values) {
+            Self::set(input, value, w, cx);
+        }
+        self.identity_edit = Some(settings::IdentityEdit {
+            account,
+            id: existing.map(|i| i.id),
+            own_server: i.smtp.is_some(),
+            had_password: i.smtp.is_some(),
+            saving: false,
+            error: None,
+        });
+        let first = self.identity_inputs[0].clone();
+        first.update(cx, |s, cx| s.focus(w, cx));
+    }
+    /// Checks and saves the sending address being edited, signing in to
+    /// its own server first if it has one.
+    fn save_identity(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.identity_edit.clone() else {
+            return;
+        };
+        if edit.saving {
+            return;
+        }
+        let value = |i: usize| Self::value(&self.identity_inputs[i], cx).trim().to_owned();
+        let smtp = if edit.own_server {
+            let port = match value(4).parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    self.identity_failed("Enter a port between 1 and 65535.".into(), cx);
+                    return;
+                }
+            };
+            Some(crate::manage::model::OutgoingServer {
+                host: value(3),
+                port,
+                username: value(5),
+            })
+        } else {
+            None
+        };
+        let identity = crate::manage::model::Identity {
+            id: edit
+                .id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            email: value(0),
+            name: value(1),
+            reply_to: value(2),
+            smtp,
+        };
+        if let Err(e) = identity.validate() {
+            self.identity_failed(e.to_string(), cx);
+            return;
+        }
+        let password = Self::value(&self.identity_inputs[6], cx).to_string();
+        if edit.own_server && password.is_empty() && !edit.had_password {
+            self.identity_failed("Enter the password for its outgoing server.".into(), cx);
+            return;
+        }
+        if let Some(e) = &mut self.identity_edit {
+            e.saving = true;
+            e.error = None;
+        }
+        let account = edit.account.clone();
+        let password = (!password.is_empty()).then_some(password);
+        self.task(
+            cx,
+            move |b| b.save_identity(&account, identity, password),
+            move |this, result, cx| match result {
+                Ok(a) => {
+                    this.identity_edit = None;
+                    this.account_saved(a, cx);
+                    this.notice("Address saved.", false, cx);
+                }
+                Err(e) => this.identity_failed(format!("{e:#}"), cx),
+            },
+        );
+    }
+    fn identity_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(e) = &mut self.identity_edit {
+            e.saving = false;
+            e.error = Some(error);
+        }
+        cx.notify();
+    }
+    fn remove_identity(&mut self, account: String, id: String, cx: &mut Context<Self>) {
+        if self
+            .identity_edit
+            .as_ref()
+            .is_some_and(|e| e.id.as_deref() == Some(id.as_str()))
+        {
+            self.identity_edit = None;
+        }
+        self.task(
+            cx,
+            move |b| b.remove_identity(&account, &id),
+            |this, result, cx| match result {
+                Ok(a) => this.account_saved(a, cx),
+                Err(e) => this.notice(format!("{e:#}"), true, cx),
+            },
+        );
+    }
+    /// Takes an account as the backend saved it, here and in open composers.
+    fn account_saved(&mut self, a: Account, cx: &mut Context<Self>) {
+        if let Some(existing) = self.accounts.iter_mut().find(|x| x.id == a.id) {
+            *existing = a;
+        }
+        let accounts = self.accounts.clone();
+        for composer in self.composers.clone() {
+            composer.update(cx, |c, cx| {
+                c.set_accounts(accounts.clone());
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
     /// Saves an account's nickname; an empty one goes back to its name.
     /// Changes an account's settings and saves them.
@@ -8353,6 +8568,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "mail",
         "compose",
         "send",
+        "clock",
         "archive",
         "trash",
         "reply",

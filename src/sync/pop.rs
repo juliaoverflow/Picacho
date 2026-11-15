@@ -1,5 +1,9 @@
 //! Bounded POP3 command and multiline response handling.
-use super::{imap::tcp, wire::Wire};
+use super::{
+    imap::tcp,
+    sasl::{self, Mechanism},
+    wire::Wire,
+};
 use crate::manage::model::*;
 use anyhow::{Context, Result, ensure};
 use std::collections::HashSet;
@@ -45,6 +49,64 @@ impl<T: Read + Write> PopSession<T> {
         write!(self.reader.get_mut(), "{command}\r\n")?;
         self.reader.get_mut().flush()?;
         self.status()
+    }
+    /// What the server says it can do (CAPA, RFC 2449), uppercase; none
+    /// when it doesn't know CAPA.
+    pub(crate) fn capabilities(&mut self) -> Result<Vec<String>> {
+        match self.command("CAPA") {
+            Ok(_) => {}
+            Err(e) if e.is::<Rejected>() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
+        let list = self.multiline(64 * 1024)?;
+        Ok(String::from_utf8_lossy(&list)
+            .lines()
+            .map(|l| l.trim().to_ascii_uppercase())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+    /// Signs in with AUTH and a SASL mechanism (RFC 5034).
+    pub(crate) fn authenticate(&mut self, exchange: &mut sasl::Exchange) -> Result<()> {
+        let command = format!("AUTH {}", exchange.mechanism().name());
+        write!(self.reader.get_mut(), "{command}\r\n")?;
+        self.reader.get_mut().flush()?;
+        loop {
+            let mut line = String::new();
+            self.reader.by_ref().take(8193).read_line(&mut line)?;
+            ensure!(
+                line.ends_with('\n') && line.len() <= 8192,
+                "Incomplete or oversized POP3 status"
+            );
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line == "+OK" || line.starts_with("+OK ") {
+                return exchange.finish(None);
+            }
+            if line.starts_with("-ERR") {
+                let reason = exchange.refusal().map(str::to_owned);
+                let error = anyhow::Error::new(Rejected);
+                return Err(match reason {
+                    Some(reason) => {
+                        error.context(format!("The server refused the token ({reason})"))
+                    }
+                    None => error,
+                });
+            }
+            let challenge = line
+                .strip_prefix('+')
+                .context("Invalid POP3 sign-in reply")?;
+            let answer = match exchange.step(&sasl::decode(challenge)?) {
+                Ok(answer) => answer,
+                Err(e) => {
+                    // "*" cancels the exchange; the server answers -ERR.
+                    self.reader.get_mut().write_all(b"*\r\n")?;
+                    self.reader.get_mut().flush()?;
+                    let _ = self.status();
+                    return Err(e);
+                }
+            };
+            write!(self.reader.get_mut(), "{}\r\n", sasl::encode(&answer))?;
+            self.reader.get_mut().flush()?;
+        }
     }
     pub(crate) fn multiline(&mut self, max: usize) -> Result<Vec<u8>> {
         let mut result = Vec::new();
@@ -112,14 +174,56 @@ pub(crate) fn pop_login(
     let tcp = tcp(&a.incoming_host, a.incoming_port)?;
     let stream = tls.connect(&a.incoming_host, tcp)?;
     let mut s = PopSession::new(stream)?;
-    for command in [format!("USER {}", a.login()), format!("PASS {password}")] {
-        s.command(&command).map_err(|error| {
-            if error.is::<Rejected>() {
-                error.context(crate::manage::status::AccessFailure::Authentication)
-            } else {
-                error
+    let rejected = |error: anyhow::Error| {
+        if error.is::<Rejected>() || error.chain().any(|c| c.is::<Rejected>()) {
+            error.context(crate::manage::status::AccessFailure::Authentication)
+        } else {
+            error
+        }
+    };
+    let caps = s.capabilities()?;
+    let offered: Vec<&str> = caps
+        .iter()
+        .filter_map(|c| c.strip_prefix("SASL "))
+        .flat_map(str::split_ascii_whitespace)
+        .collect();
+    let credentials = sasl::Credentials {
+        user: a.login().to_owned(),
+        secret: password.to_owned(),
+        host: a.incoming_host.clone(),
+        port: a.incoming_port,
+    };
+    // SCRAM where offered; else USER/PASS (unless the server lists
+    // capabilities without USER), else another SASL mechanism.
+    let user_pass = caps.is_empty() || caps.iter().any(|c| c == "USER");
+    let mechanism = Mechanism::choose(
+        &[Mechanism::ScramSha256, Mechanism::ScramSha1],
+        offered.iter().copied(),
+    )
+    .or_else(|| {
+        (!user_pass)
+            .then(|| {
+                Mechanism::choose(
+                    &[Mechanism::Plain, Mechanism::Login, Mechanism::CramMd5],
+                    offered.iter().copied(),
+                )
+            })
+            .flatten()
+    });
+    match mechanism {
+        Some(mechanism) => s
+            .authenticate(&mut sasl::Exchange::new(mechanism, credentials))
+            .map_err(rejected)?,
+        None => {
+            ensure!(
+                user_pass,
+                "{} offers no sign-in method Picacho supports.",
+                a.incoming_host
+            );
+            for command in [format!("USER {}", a.login()), format!("PASS {password}")] {
+                s.command(&command).map_err(rejected)?;
             }
-        })?;
+        }
     }
     Ok(s)
 }

@@ -116,9 +116,19 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
         format!("Compressed IMAP stream: {e}"),
     )
 }
+/// OpenSSL 3 reports a connection closed without TLS's goodbye as an error;
+/// IMAP's replies are self-delimiting, so it is the end of the stream, as
+/// earlier versions reported it (and the imap crate then sees the
+/// connection lost, which a read-only sync may retry).
+pub(crate) fn closed_without_goodbye(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Other && e.to_string().contains("unexpected eof")
+}
 impl Read for ImapStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.read_plain(buf)?;
+        let read = match self.read_plain(buf) {
+            Err(e) if closed_without_goodbye(&e) => 0,
+            other => other?,
+        };
         self.tap.record(&buf[..read]);
         Ok(read)
     }

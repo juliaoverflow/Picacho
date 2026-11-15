@@ -324,6 +324,76 @@ pub fn check(raw: &[u8], details: &mut Details) {
     details.dmarc = v.dmarc;
 }
 
+/// The id of a domain's MTA-STS record (`_mta-sts` TXT, RFC 8461): `None`
+/// when it publishes none, an error when DNS couldn't say.
+pub(crate) fn mta_sts_id(domain: &str) -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
+    use mail_auth::{DnsError, Error};
+    let checker = checker().context("DNS isn't available")?;
+    let name = format!("_mta-sts.{domain}");
+    let answer = checker.runtime.block_on(async {
+        tokio::time::timeout(
+            TIMEOUT,
+            checker
+                .authenticator
+                .txt_lookup::<mail_auth::mta_sts::MtaStsRecord>(
+                    name.as_str(),
+                    Some(&checker.cache.txt),
+                ),
+        )
+        .await
+    });
+    match answer {
+        Err(_) => anyhow::bail!("DNS didn't answer in time"),
+        Ok(Ok(record)) => Ok(Some(record.id.clone())),
+        Ok(Err(Error::Dns(DnsError::RecordNotFound(_) | DnsError::InvalidRecordType))) => Ok(None),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+/// Whether a domain's most preferred mail servers publish DANE records
+/// (TLSA at `_25._tcp.<server>`, RFC 7672), which also let servers insist
+/// on TLS. The records' DNSSEC signatures are the sending servers' to check.
+pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    use mail_auth::hickory_resolver::proto::rr::RecordType;
+    use mail_auth::{DnsError, Error};
+    let checker = checker().context("DNS isn't available")?;
+    checker.runtime.block_on(async {
+        tokio::time::timeout(TIMEOUT, async {
+            let mx = match checker
+                .authenticator
+                .mx_lookup(domain, Some(&checker.cache.mx))
+                .await
+            {
+                Ok(mx) => mx,
+                Err(Error::Dns(DnsError::RecordNotFound(_))) => return Ok(false),
+                Err(e) => anyhow::bail!("{e}"),
+            };
+            let Some(first) = mx.records.first() else {
+                return Ok(false);
+            };
+            for exchange in first.exchanges.iter() {
+                let name = format!("_25._tcp.{}", exchange.trim_end_matches('.'));
+                match checker
+                    .authenticator
+                    .resolver()
+                    .lookup(name.as_str(), RecordType::TLSA)
+                    .await
+                {
+                    Ok(found) if !found.answers().is_empty() => return Ok(true),
+                    Ok(_) => {}
+                    Err(e) if e.is_no_records_found() || e.is_nx_domain() => {}
+                    Err(e) => anyhow::bail!("{e}"),
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+    })
+}
+
 /// How long ago, in seconds, a message says it was written.
 fn age(raw: &[u8]) -> Option<i64> {
     use mailparse::MailHeaderMap;

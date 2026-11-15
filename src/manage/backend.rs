@@ -504,6 +504,103 @@ impl Backend {
             .insert(id.into(), Ok(secret.clone()));
         Ok(())
     }
+    /// The password for a sending address's own outgoing server.
+    pub(super) fn identity_secret(&self, i: &crate::manage::model::Identity) -> Result<Secret> {
+        #[cfg(test)]
+        if let Some(secret) = &self.test_secret {
+            return Ok(secret.clone());
+        }
+        self.saved_credentials(&i.secret_id())
+    }
+    /// Adds or changes one of an account's sending addresses. With its own
+    /// outgoing server, signing in there is checked first (with `password`,
+    /// or the saved one when it is `None`), and the password is kept in the
+    /// keychain. Returns the account as saved.
+    pub fn save_identity(
+        &self,
+        account: &str,
+        identity: crate::manage::model::Identity,
+        password: Option<String>,
+    ) -> Result<Account> {
+        identity.validate()?;
+        let lock = self.account_lock(account);
+        let _operation = lock.lock().unwrap();
+        let mut a = self
+            .store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.id == account)
+            .context("The account was removed.")?;
+        ensure!(
+            !a.email.eq_ignore_ascii_case(identity.email.trim())
+                && !a.identities.iter().any(|i| {
+                    i.id != identity.id && i.email.eq_ignore_ascii_case(identity.email.trim())
+                }),
+            "{} already sends as {}.",
+            a.email,
+            identity.email.trim()
+        );
+        if let Some(endpoint) = crate::sync::smtp::Endpoint::of_identity(&identity) {
+            let secret = match password.filter(|p| !p.is_empty()) {
+                Some(password) => Secret {
+                    password,
+                    ..Default::default()
+                },
+                None => self
+                    .identity_secret(&identity)
+                    .context("Enter the password for its outgoing server.")?,
+            };
+            crate::sync::smtp::check_server(&endpoint, &secret.password, &self.tls_connector()?)
+                .with_context(|| format!("Couldn't sign in to {}", endpoint.host))?;
+            #[cfg(test)]
+            let saved = self.test_secret.is_some();
+            #[cfg(not(test))]
+            let saved = false;
+            if !saved {
+                self.save_credentials(&identity.secret_id(), &secret)?;
+            }
+        } else {
+            self.forget_identity_secret(&identity);
+        }
+        let identity = crate::manage::model::Identity {
+            email: identity.email.trim().to_owned(),
+            name: identity.name.trim().to_owned(),
+            reply_to: identity.reply_to.trim().to_owned(),
+            ..identity
+        };
+        match a.identities.iter_mut().find(|i| i.id == identity.id) {
+            Some(existing) => *existing = identity,
+            None => a.identities.push(identity),
+        }
+        self.store.save_account(&a)?;
+        Ok(a)
+    }
+    /// Removes one of an account's sending addresses, and its password.
+    pub fn remove_identity(&self, account: &str, id: &str) -> Result<Account> {
+        let lock = self.account_lock(account);
+        let _operation = lock.lock().unwrap();
+        let mut a = self
+            .store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.id == account)
+            .context("The account was removed.")?;
+        if let Some(i) = a.identity(id).cloned() {
+            self.forget_identity_secret(&i);
+        }
+        a.identities.retain(|i| i.id != id);
+        self.store.save_account(&a)?;
+        Ok(a)
+    }
+    fn forget_identity_secret(&self, i: &crate::manage::model::Identity) {
+        let id = i.secret_id();
+        self.credentials.lock().unwrap().remove(&id);
+        #[cfg(test)]
+        if self.test_secret.is_some() {
+            return;
+        }
+        let _ = store::secret_entry(&id).and_then(|e| e.delete_credential().map_err(Into::into));
+    }
     /// Only an explicit user retry reopens denied/missing Keychain entries.
     pub fn retry_credentials(&self, id: &str) {
         let lock = self.account_lock(id);
@@ -522,7 +619,18 @@ impl Backend {
             .lock()
             .unwrap()
             .retain(|(account, _), _| account != id);
+        let identities: Vec<crate::manage::model::Identity> = self
+            .store
+            .accounts()
+            .ok()
+            .and_then(|all| all.into_iter().find(|a| a.id == id))
+            .map(|a| a.identities)
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(self.sent_queue(id));
         self.store.remove_account(id)?;
+        for i in &identities {
+            self.forget_identity_secret(i);
+        }
         self.credentials.lock().unwrap().remove(id);
         self.mail_keys.lock().unwrap().remove(id);
         self.readable.lock().unwrap().retain(|_, m| m.account != id);
@@ -2160,7 +2268,9 @@ impl Backend {
         // Sending as an alias asks its service for the routed addresses
         // first, outside the account's lock, once it knows the alias is
         // still there.
-        if d.send_as.trim().is_empty() {
+        // An account kept to its aliases may still send as its own other
+        // addresses: they don't show the mailbox's address either.
+        if d.send_as.trim().is_empty() && d.identity.is_empty() {
             let forwarding = crate::manage::forwarding::load(&self.store);
             let accounts = self.store.accounts()?;
             ensure!(
@@ -2172,48 +2282,73 @@ impl Backend {
         crate::manage::forwarding::verify_alias(&self.store, d)?;
         let routed = crate::manage::forwarding::route(&self.store, d)?;
         let d = &routed;
+        // Requiring encryption all the way: say which recipients' domains
+        // publish nothing (MTA-STS or DANE) a server could insist on it by,
+        // since mail to them will bounce. Looked up before the account is
+        // locked: it can take a few seconds.
+        // (Tests stay off the network.)
+        let unprotected = if a.require_tls && !cfg!(test) {
+            crate::sync::mta_sts::unprotected(&crate::sync::mta_sts::domains(&[
+                &d.to, &d.cc, &d.bcc,
+            ]))
+        } else {
+            Vec::new()
+        };
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
-        use lettre::transport::smtp::client::TlsParameters;
-        let secret = self.credentials(a)?;
-        let tls = TlsParameters::new(a.smtp_host.clone())?;
-        #[cfg(test)]
-        let tls = if let Some(cert) = &self.test_certificate {
-            TlsParameters::builder(a.smtp_host.clone())
-                .add_root_certificate(lettre::transport::smtp::client::Certificate::from_pem(
-                    cert,
-                )?)
-                .build()?
-        } else {
-            tls
+        use crate::sync::smtp::Endpoint;
+        // A sending address with its own outgoing server goes through it,
+        // signed in with its own password; anything else through the
+        // account's server.
+        let identity = (d.send_as.trim().is_empty() && !d.identity.is_empty())
+            .then(|| a.identity(&d.identity))
+            .flatten();
+        let own_server = identity.and_then(|i| Endpoint::of_identity(i).map(|e| (i, e)));
+        let (endpoint, secret) = match &own_server {
+            Some((i, endpoint)) => (endpoint.clone(), self.identity_secret(i)?.password),
+            None => {
+                let s = self.credentials(a)?;
+                (
+                    Endpoint::of(a),
+                    if a.oauth { s.access_token } else { s.password },
+                )
+            }
         };
-        let delivered = crate::sync::smtp::deliver(a, d, &secret, tls)?;
+        let tls = self.tls_connector()?;
+        let delivered = crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls)?;
         let message = delivered.message;
         let mut notes = Vec::new();
+        if !unprotected.is_empty() {
+            notes.push(format!(
+                "It may bounce at {}: encryption all the way was required, and {} no MTA-STS policy or DANE records for servers to insist on it by.",
+                unprotected.join(", "),
+                if unprotected.len() == 1 { "that domain publishes" } else { "those domains publish" }
+            ));
+        }
         if delivered.receipts_unsupported {
             notes.push(format!(
                 "{} can't request delivery receipts, so none were asked for.",
                 a.smtp_host
             ));
         }
-        // Gmail and Outlook save sent messages themselves. Custom IMAP servers do not.
-        if a.provider == Provider::Imap {
+        // Gmail and Outlook save what goes through their own servers
+        // themselves. Custom IMAP servers do not, nor does anyone save what
+        // a sending address sent through another server.
+        if a.provider == Provider::Imap || (a.provider != Provider::Pop3 && own_server.is_some()) {
             let raw = message.formatted();
-            let saved = self.with_imap(a, |c| {
-                if let Some(limit) = c.extensions()?.append_limit {
-                    ensure!(
-                        raw.len() as u64 <= limit,
-                        "it's larger than the server keeps ({} KB)",
-                        limit / 1024
-                    );
+            let saved = self.with_imap(a, |c| self.file_sent_copy(c, a, &raw));
+            match saved {
+                Ok(()) => {}
+                // It will never fit: nothing to try again.
+                Err(e) if e.is::<TooLargeForSent>() => {
+                    notes.push(format!("A copy wasn't saved in Sent: {e:#}"));
                 }
-                let sent = resolve_in(c.names(false)?, a.provider, Folder::Sent)?;
-                c.session
-                    .append_with_flags(sent, &raw, &[imap::types::Flag::Seen])?;
-                Ok(())
-            });
-            if let Err(e) = saved {
-                notes.push(format!("A copy wasn't saved in Sent: {e:#}"));
+                Err(e) => match self.queue_sent_copy(&a.id, &raw) {
+                    Ok(()) => notes.push(format!(
+                        "A copy couldn't be saved in Sent yet ({e:#}); Picacho will try again with the next mail check."
+                    )),
+                    Err(_) => notes.push(format!("A copy wasn't saved in Sent: {e:#}")),
+                },
             }
         }
         // SMTP acceptance is the delivery boundary. Do not report a send failure
@@ -2229,6 +2364,109 @@ impl Backend {
         }
         let _ = self.discard_draft(&d.id);
         Ok(notes)
+    }
+    /// Saves a sent message in the account's Sent folder, unless a copy
+    /// with its Message-ID is already there (an earlier try may have
+    /// succeeded without its reply arriving).
+    fn file_sent_copy(&self, c: &mut Connection, a: &Account, raw: &[u8]) -> Result<()> {
+        if let Some(limit) = c.extensions()?.append_limit
+            && raw.len() as u64 > limit
+        {
+            return Err(TooLargeForSent(limit).into());
+        }
+        let sent = resolve_in(c.names(false)?, a.provider, Folder::Sent)?;
+        let id = message_id_of(raw);
+        if !id.is_empty() {
+            c.select(&sent)?;
+            let found = match c
+                .session
+                .uid_search(format!("HEADER Message-ID {}", quote(&id)?))
+            {
+                Ok(found) => found,
+                // A server that can't search headers: file it anyway.
+                Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => Default::default(),
+                Err(e) => return Err(e.into()),
+            };
+            if !found.is_empty() {
+                return Ok(());
+            }
+        }
+        c.session
+            .append_with_flags(&sent, raw, &[imap::types::Flag::Seen])?;
+        Ok(())
+    }
+    /// Where copies for Sent that couldn't be saved yet wait, per account.
+    fn sent_queue(&self, account: &str) -> std::path::PathBuf {
+        let safe: String = account
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.store.path.join("sent-copies").join(safe)
+    }
+    fn queue_sent_copy(&self, account: &str, raw: &[u8]) -> Result<()> {
+        let dir = self.sent_queue(account);
+        std::fs::create_dir_all(&dir)?;
+        // Named by when, so they are saved in the order they were sent.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!("{nanos:020}-{}.eml", uuid::Uuid::new_v4());
+        // Written whole, then named, so a half-written file is never filed.
+        let partial = dir.join(format!("{name}.partial"));
+        std::fs::write(&partial, raw)?;
+        std::fs::rename(partial, dir.join(name))?;
+        Ok(())
+    }
+    /// How many copies for Sent are waiting to be saved for an account.
+    #[cfg(test)]
+    pub fn queued_sent_copies(&self, account: &str) -> usize {
+        std::fs::read_dir(self.sent_queue(account))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "eml"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+    /// Saves the copies for Sent that are waiting, oldest first, stopping
+    /// at the first that fails. Copies that never fit, or that have waited
+    /// two weeks, are let go. Returns how many were saved.
+    fn file_queued_sent_copies(&self, c: &mut Connection, a: &Account) -> Result<usize> {
+        let Ok(entries) = std::fs::read_dir(self.sent_queue(&a.id)) else {
+            return Ok(0);
+        };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "eml"))
+            .collect();
+        files.sort();
+        let mut filed = 0;
+        for path in files {
+            let stale = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(14 * 86_400));
+            let raw = std::fs::read(&path)?;
+            match self.file_sent_copy(c, a, &raw) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&path);
+                    filed += 1;
+                }
+                Err(e) if e.is::<TooLargeForSent>() || stale => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filed)
     }
     /// Deletes a draft here, and its copy on the server at the next draft
     /// sync (it may have been uploaded since a composer last saved it).
@@ -2278,6 +2516,9 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_imap(a, |c| {
+            // Copies for Sent that couldn't be saved when sent go first; a
+            // failure leaves them for the next check without holding up drafts.
+            let _ = self.file_queued_sent_copies(c, a);
             let Ok(mailbox) = resolve_in(c.names(false)?, a.provider, Folder::Drafts) else {
                 // No Drafts folder on the server: drafts stay here.
                 return Ok(0);
@@ -2499,6 +2740,30 @@ fn distinct_name(name: &str, used: &mut std::collections::HashSet<String>) -> St
 /// `X-Picacho-Draft` header. The server is asked to search for the header;
 /// one that finds nothing (some don't search arbitrary headers) has the
 /// messages above `floor` read instead, keeping those that carry the id.
+/// A sent message larger than the server keeps (APPENDLIMIT).
+#[derive(Debug)]
+struct TooLargeForSent(u64);
+impl std::fmt::Display for TooLargeForSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "it's larger than the server keeps ({} KB)",
+            self.0 / 1024
+        )
+    }
+}
+impl std::error::Error for TooLargeForSent {}
+
+/// A message's Message-ID header, or empty.
+fn message_id_of(raw: &[u8]) -> String {
+    use mailparse::MailHeaderMap;
+    mailparse::parse_headers(raw)
+        .ok()
+        .and_then(|(headers, _)| headers.get_first_value("Message-ID"))
+        .map(|id| id.trim().to_owned())
+        .unwrap_or_default()
+}
+
 fn draft_copies(session: &mut ImapSession, id: &str, floor: u32) -> Result<Vec<u32>> {
     let header = crate::sync::smtp::DRAFT_HEADER;
     let found = match session.uid_search(format!("HEADER {header} {}", quote(id)?)) {

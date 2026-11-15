@@ -422,7 +422,9 @@ fn pop3_tls_download_is_deduplicated_and_local_moves_survive_sync() -> Result<()
             loop {
                 let mut line = String::new();
                 r.read_line(&mut line).unwrap();
-                let response = if line.starts_with("USER ") {
+                let response = if line == "CAPA\r\n" {
+                    b"+OK\r\nUSER\r\nUIDL\r\n.\r\n".to_vec()
+                } else if line.starts_with("USER ") {
                     assert!(line.contains("qa@example.com"));
                     b"+OK user\r\n".to_vec()
                 } else if line.starts_with("PASS ") {
