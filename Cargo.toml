@@ -198,15 +198,18 @@ objc2-core-ml = { version = "0.3", default-features = false, features = ["std", 
 fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
 
 [patch.crates-io]
-# An email's unresolvable image or link address no longer panics; see the patch README.
-blitz-dom = { path = "vendor/blitz-dom" }
-# Inline boxes paint gradient backgrounds (emails' dark styles); see the patch README.
-blitz-paint = { path = "vendor/blitz-paint" }
-# ToCss error inference with GPUI's log/serde feature; see the patch README.
-stylo_derive = { path = "vendor/stylo_derive" }
-# Parses Gmail's X-GM-MSGID; see the patch README.
-imap-proto = { path = "vendor/imap-proto" }
-# Maximized windows' content is no longer a resize edge; see the patch README.
-gpui-component = { path = "vendor/gpui-component" }
-# Copying from a menu (a click) works on Wayland; see vendor/gpui/PATCHES.md.
-gpui = { path = "vendor/gpui" }
+# Patched crates, one folder each with its patches and README:
+# https://github.com/pinaltech/Picacho-Patches
+# After changing that repository, run `cargo update -p gpui` to use it here.
+# An email's unresolvable image or link address no longer panics.
+blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Inline boxes paint gradient backgrounds (emails' dark styles).
+blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# ToCss error inference with GPUI's log/serde feature.
+stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Parses Gmail's X-GM-MSGID.
+imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Maximized windows' content is no longer a resize edge.
+gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Copying from a menu (a click) works on Wayland.
+gpui = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }

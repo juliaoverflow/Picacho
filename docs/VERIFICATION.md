@@ -105,7 +105,8 @@ macOS/Windows builds and OS browser/Keychain integration were not exercised here
 
 The renderer embeds Blitz 0.3.0-beta.4's DOM/HTML/paint crates without its standalone
 shell or unrestricted network client. The scoped Stylo derive patch needed to
-compile alongside GPUI is documented in `vendor/stylo_derive/README.md`; Linux's
+compile alongside GPUI is documented in
+[Picacho-Patches](https://github.com/pinaltech/Picacho-Patches/tree/HEAD/stylo_derive); Linux's
 Fontconfig API features are aligned in Cargo.toml.
 
 ## Incremental sync and Gmail limits (November 5, 2026)
