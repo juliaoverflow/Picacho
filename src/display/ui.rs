@@ -888,6 +888,9 @@ pub struct MailApp {
     sign_in_retry: bool,
     /// How far the running sign-in has come, followed from the backend.
     sign_in_step: SignInStep,
+    /// Whether this build offers Proton without Bridge (Direct): it needs
+    /// Proton's app token or version. Without it, Proton Mail is Bridge.
+    proton_direct: bool,
     /// The Proton sign-in's step after the password, while it has one.
     proton_stage: Option<ProtonStage>,
     /// The way a security key or passkey is being used, while it is.
@@ -1592,6 +1595,7 @@ impl MailApp {
             connecting: false,
             sign_in_retry: false,
             sign_in_step: SignInStep::Browser,
+            proton_direct: crate::sync::proton::available(),
             proton_stage: None,
             key_method: None,
             key_prompt: KeyPrompt::Idle,
@@ -3857,6 +3861,12 @@ impl MailApp {
         if self.connecting {
             return;
         }
+        // Without Direct in this build, Proton Mail is its Bridge sign-in.
+        let service = if service == Service::Proton && !self.proton_direct {
+            Service::ProtonBridge
+        } else {
+            service
+        };
         self.drop_proton_login(cx);
         self.status.clear();
         self.manual = false;
@@ -4930,7 +4940,10 @@ impl MailApp {
                 self.proton_use_key(method, reconnect, cx)
             }
             Action::ProtonMode(service) => {
-                if !self.connecting && self.service != service {
+                if !self.connecting
+                    && self.service != service
+                    && (service != Service::Proton || self.proton_direct)
+                {
                     self.choose_service(service, w, cx)
                 }
             }
@@ -7323,7 +7336,11 @@ impl MailApp {
         }
         let mut content = div().flex().flex_col().gap_4();
         if matches!(self.service, Service::Proton | Service::ProtonBridge) {
-            content = content.child(self.proton_tabs(cx));
+            content = content.child(if self.proton_direct {
+                self.proton_tabs(cx)
+            } else {
+                notice_box(crate::sync::proton::UNAVAILABLE, c)
+            });
         }
         if self.service == Service::Other {
             let email = Self::value(&self.form[EMAIL], cx);
@@ -9456,6 +9473,23 @@ mod tests {
     fn type_email(view: &Entity<MailApp>, email: &str, cx: &mut VisualTestContext) {
         view.update_in(cx, |this, w, cx| {
             MailApp::set(&this.form[EMAIL], email.to_owned(), w, cx)
+        });
+    }
+
+    #[gpui::test]
+    fn proton_is_bridge_alone_without_directs_registration(cx: &mut TestAppContext) {
+        let (view, cx) = open(store(), cx);
+        act(&view, Action::Start, cx);
+        view.update(cx, |this, _| this.proton_direct = false);
+        act(&view, Action::ChooseService(Service::Proton), cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.step == Step::Credentials);
+            assert_eq!(this.service, Service::ProtonBridge);
+        });
+        // The Direct tab can't be chosen either.
+        act(&view, Action::ProtonMode(Service::Proton), cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.service, Service::ProtonBridge)
         });
     }
 

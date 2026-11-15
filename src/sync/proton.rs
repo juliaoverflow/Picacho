@@ -53,13 +53,38 @@ WO4BAMcm1u02t4VKw++ttECPt+HUgPUq5pqQWe5Q2cW4TMsE
 -----END PGP PUBLIC KEY BLOCK-----
 ";
 
-/// The app name Proton sees in `x-pm-appversion`
-/// (`<platform>-<token>@<version>`). Builds can set their own with
-/// `PICACHO_PROTON_APP_TOKEN`, as with the other sign-in registrations.
+/// What builds set for Proton's `x-pm-appversion`
+/// (`<platform>-<token>@<version>`), as with the other sign-in
+/// registrations: `PICACHO_PROTON_APP_TOKEN` and `PICACHO_PROTON_APP_VERSION`.
+const APP_TOKEN: Option<&str> = option_env!("PICACHO_PROTON_APP_TOKEN");
+const APP_VERSION: Option<&str> = option_env!("PICACHO_PROTON_APP_VERSION");
+
+fn set(value: Option<&'static str>) -> Option<&'static str> {
+    value.filter(|v| !v.trim().is_empty())
+}
+/// Whether a build with these values may sign in to Proton directly: it
+/// needs at least one of them. The one left out keeps its default.
+fn registered(token: Option<&str>, version: Option<&str>) -> bool {
+    [token, version]
+        .into_iter()
+        .any(|v| v.is_some_and(|v| !v.trim().is_empty()))
+}
+/// Why Direct isn't offered, when it isn't.
+pub const UNAVAILABLE: &str = "This copy of Picacho was built without Proton's app registration, so Proton Mail Bridge is the only way to connect Proton Mail.";
+
+/// Whether this build offers Proton without Bridge (Direct). Without its
+/// app token and version, only Proton Mail Bridge is offered. Tests always
+/// have it, to exercise Direct; the window's flag can turn it off.
+pub fn available() -> bool {
+    cfg!(test) || registered(APP_TOKEN, APP_VERSION)
+}
+/// The app name Proton sees in `x-pm-appversion`.
 fn app_token() -> &'static str {
-    option_env!("PICACHO_PROTON_APP_TOKEN")
-        .filter(|t| !t.is_empty())
-        .unwrap_or("picacho")
+    set(APP_TOKEN).unwrap_or("picacho")
+}
+/// The app version Proton sees in `x-pm-appversion`.
+fn app_version() -> &'static str {
+    set(APP_VERSION).unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 fn config() -> Arc<DeploymentConfig> {
@@ -72,10 +97,7 @@ fn config() -> Arc<DeploymentConfig> {
                 srp_salt_suffix: SRP_SALT_SUFFIX,
                 refresh_redirect_uri: REFRESH_REDIRECT_URI.into(),
                 app_product_token: app_token().into(),
-                app_version: option_env!("PICACHO_PROTON_APP_VERSION")
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or("0.1.0")
-                    .into(),
+                app_version: app_version().into(),
                 product_name: "Picacho".into(),
                 api_tls_pins: Vec::new(),
             })
@@ -1000,6 +1022,15 @@ mod tests {
         assert_eq!(hv.methods, ["captcha"]);
         assert!(verified(b"").is_none());
         assert!(verified(b"{\"token\":\"has space\"}").is_none());
+    }
+
+    #[test]
+    fn direct_needs_a_token_or_a_version() {
+        assert!(!registered(None, None));
+        assert!(!registered(Some(""), Some("  ")));
+        assert!(registered(Some("token"), None));
+        assert!(registered(None, Some("1.2.3")));
+        assert!(registered(Some("token"), Some("1.2.3")));
     }
 
     #[test]

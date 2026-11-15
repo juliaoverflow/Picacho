@@ -151,6 +151,7 @@ impl Backend {
         cancel: Arc<AtomicBool>,
     ) -> Result<ProtonNext> {
         self.proton_abandon();
+        ensure!(proton::available(), "{}", proton::UNAVAILABLE);
         ensure!(!password.is_empty(), "Enter your Proton password.");
         account.validate()?;
         self.step(&cancel, SignInStep::Mailbox);
