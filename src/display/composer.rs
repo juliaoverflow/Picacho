@@ -140,8 +140,9 @@ pub(super) struct Composer {
     from_filter: Entity<InputState>,
     /// Send Later's menu is open.
     later_open: bool,
-    /// A time typed in Send Later's menu.
-    later_input: Entity<InputState>,
+    /// Send Later's date and time picker, while its menu is open.
+    later_picker: Option<Entity<DateTimePicker>>,
+    later_subscription: Option<Subscription>,
     accounts: Vec<Account>,
     /// Aliases at forwarding services that can send.
     aliases: Vec<fwd::SendAlias>,
@@ -188,7 +189,6 @@ impl Composer {
         ];
         let subject = field("Subject", window, cx);
         let from_filter = field("Find an address", window, cx);
-        let later_input = field("2026-11-20 9:00, 14:30, tomorrow 9:00", window, cx);
         let body = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -227,14 +227,6 @@ impl Composer {
                 }
             }));
         }
-        subscriptions.push(
-            cx.subscribe_in(&later_input, window, |this, input, e, w, cx| {
-                if let InputEvent::PressEnter { .. } = e {
-                    let text = input.read(cx).value().to_string();
-                    this.schedule_typed(&text, w, cx);
-                }
-            }),
-        );
         subscriptions.push(cx.subscribe(&from_filter, |_, _, e, cx| {
             if matches!(e, InputEvent::Change) {
                 cx.notify();
@@ -271,7 +263,8 @@ impl Composer {
             from_closed: None,
             from_filter,
             later_open: false,
-            later_input,
+            later_picker: None,
+            later_subscription: None,
             accounts,
             aliases,
             alias_services: vec![],
@@ -625,7 +618,7 @@ impl Composer {
         if self.sending {
             return;
         }
-        self.later_open = false;
+        self.close_later();
         if at.is_some_and(|t| t <= chrono::Utc::now().timestamp() + 30) {
             self.error = Some("Choose a time in the future.".into());
             cx.notify();
@@ -704,16 +697,34 @@ impl Composer {
         .detach();
     }
 
-    /// Schedules the time typed in Send Later's menu.
-    fn schedule_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match crate::manage::composing::parse_later(text, chrono::Local::now()) {
-            Some(at) => self.request_send_at(Some(at), window, cx),
-            None => {
-                self.error =
-                    Some("Enter a time like 14:30, tomorrow 9:00 or 2026-11-20 9:00.".into());
-                cx.notify();
+    /// Opens Send Later's picker, at the time already chosen if any.
+    fn open_later(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let presets = crate::manage::composing::later_choices(chrono::Local::now());
+        let colors = self.colors;
+        let at = self.draft.send_at;
+        let picker = cx.new(|_| {
+            let picker = DateTimePicker::new("later", "Send", presets, colors);
+            match at {
+                Some(at) => picker.at(at),
+                None => picker,
             }
-        }
+        });
+        self.later_subscription = Some(cx.subscribe_in(&picker, window, |this, _, e, w, cx| {
+            match e {
+                PickerEvent::Picked(at) => this.request_send_at(Some(*at), w, cx),
+                PickerEvent::Cancel => {
+                    this.close_later();
+                    cx.notify();
+                }
+            }
+        }));
+        self.later_picker = Some(picker);
+        self.later_open = true;
+    }
+    fn close_later(&mut self) {
+        self.later_open = false;
+        self.later_picker = None;
+        self.later_subscription = None;
     }
 
     /// Sends the draft when it was going to, no more: it stays a draft.
@@ -772,49 +783,18 @@ impl Composer {
         )
     }
 
-    /// Send Later's choices, and a field for a time of one's own.
+    /// Send Later's menu: quick choices, and a calendar and time of day.
     fn later_menu(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
-        let now = chrono::Local::now();
-        let mut list = div().flex().flex_col();
-        for (i, (label, at)) in crate::manage::composing::later_choices(now)
-            .into_iter()
-            .enumerate()
-        {
-            let when = crate::manage::composing::describe_later(at, now);
-            list = list.child(
-                div()
-                    .id(("later-choice", i))
-                    .debug_selector(move || format!("later-choice-{i}"))
-                    .px_2()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(c.soft)))
-                    .child(div().flex_1().text_size(px(13.)).child(label))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(when),
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, w, cx| this.request_send_at(Some(at), w, cx)),
-                    ),
-            );
-        }
         div()
             .id("later-menu")
             .debug_selector(|| "later-menu".into())
             .absolute()
             .bottom(px(48.))
             .left(px(12.))
-            .w(px(300.))
-            .p_1()
-            .rounded(px(10.))
+            .w(px(520.))
+            .p_3()
+            .rounded(px(12.))
             .border_1()
             .border_color(rgb(c.border))
             .bg(rgb(c.raised))
@@ -822,57 +802,19 @@ impl Composer {
             .occlude()
             .flex()
             .flex_col()
+            .gap_2()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.later_open = false;
+                this.close_later();
                 cx.notify();
             }))
             .child(
                 div()
-                    .px_2()
-                    .pt_1()
-                    .pb_1()
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.muted))
-                    .child("Send later"),
+                    .child("SEND LATER"),
             )
-            .child(list)
-            .child(
-                div()
-                    .mt_1()
-                    .pt_1()
-                    .px_1()
-                    .border_t_1()
-                    .border_color(rgb(c.border))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(self.input(&self.later_input)),
-                    )
-                    .child(
-                        div()
-                            .id("later-schedule")
-                            .debug_selector(|| "later-schedule".into())
-                            .px_2()
-                            .py(px(4.))
-                            .rounded(px(6.))
-                            .flex_shrink_0()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(c.accent))
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgb(c.soft)))
-                            .child("Schedule")
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                let text = this.later_input.read(cx).value().to_string();
-                                this.schedule_typed(&text, w, cx);
-                            })),
-                    ),
-            )
+            .children(self.later_picker.clone())
     }
 
     /// Fills the recipient and subject fields, as typing would (tests).
@@ -898,7 +840,7 @@ impl Composer {
         .detach();
     }
 
-    fn add_files(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+    pub(super) fn add_files(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         for p in paths {
             if p.is_file() && !self.draft.attachments.contains(&p) {
                 self.draft.attachments.push(p);
@@ -2014,9 +1956,10 @@ impl Composer {
                     if t.sending {
                         return;
                     }
-                    t.later_open = !t.later_open;
                     if t.later_open {
-                        t.later_input.update(cx, |s, cx| s.set_value("", w, cx));
+                        t.close_later();
+                    } else {
+                        t.open_later(w, cx);
                     }
                     cx.notify();
                 },

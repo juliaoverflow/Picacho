@@ -21,6 +21,19 @@ use connection::{Connection, Limits};
 #[path = "watch.rs"]
 mod watch;
 use watch::Watcher;
+#[path = "offline.rs"]
+mod offline;
+#[path = "snooze.rs"]
+mod snooze;
+pub use snooze::Snoozed;
+#[path = "remote_search.rs"]
+mod remote_search;
+pub use remote_search::ServerResults;
+#[path = "large.rs"]
+mod large;
+#[path = "extras.rs"]
+mod extras;
+pub use extras::ServerNotes;
 #[cfg(test)]
 #[path = "dovecot_tests.rs"]
 mod dovecot_tests;
@@ -36,7 +49,7 @@ mod extension_tests;
 #[cfg(test)]
 #[path = "reliability_tests.rs"]
 mod reliability_tests;
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     Read(bool),
     Star(bool),
@@ -45,6 +58,29 @@ pub enum Change {
     MoveTo(String),
     /// Adds (true) or removes a label: a Gmail label or an IMAP keyword.
     Label(String, bool),
+    /// Marks what was done with it, for this and other mail apps.
+    Mark(Mark),
+}
+/// What was done with a message, kept as flags on the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Mark {
+    /// Replied to: \\Answered.
+    Answered,
+    /// Forwarded: $Forwarded (RFC 5550).
+    Forwarded,
+    /// A read receipt was sent, or declined: $MDNSent (RFC 3503).
+    ReceiptHandled,
+}
+impl Mark {
+    /// The flag on the server, and whether it is a keyword (which servers
+    /// keep only where PERMANENTFLAGS allows new ones).
+    fn flag(self) -> (&'static str, bool) {
+        match self {
+            Self::Answered => ("\\Answered", false),
+            Self::Forwarded => ("$Forwarded", true),
+            Self::ReceiptHandled => ("$MDNSent", true),
+        }
+    }
 }
 impl Change {
     /// Whether this moves mail to another mailbox.
@@ -76,6 +112,21 @@ impl Change {
                     m.labels.sort();
                 }
             }
+            Self::Mark(Mark::Answered) => m.answered = true,
+            Self::Mark(Mark::Forwarded) => m.forwarded = true,
+            Self::Mark(Mark::ReceiptHandled) => m.mdn_sent = true,
+        }
+    }
+    /// Whether `m` already shows this change (so it needn't be sent again).
+    pub fn shown_by(&self, m: &Mail) -> bool {
+        match self {
+            Self::Read(read) => m.unread != *read,
+            Self::Star(star) => m.starred == *star,
+            Self::Label(label, add) => m.labels.contains(label) == *add,
+            Self::Mark(Mark::Answered) => m.answered,
+            Self::Mark(Mark::Forwarded) => m.forwarded,
+            Self::Mark(Mark::ReceiptHandled) => m.mdn_sent,
+            Self::Move(_) | Self::MoveTo(_) => self.moved_already(m),
         }
     }
 }
@@ -124,8 +175,9 @@ fn allowed(result: imap::error::Result<()>, what: impl FnOnce() -> String) -> Re
 }
 /// Subscribes to a new folder so other mail apps, which often list only
 /// subscribed folders, show it too. A server that refuses is no matter.
-fn subscribe(session: &mut ImapSession, name: &str) -> Result<()> {
-    match session.run_command_and_check_ok(format!("SUBSCRIBE {}", quote(name)?)) {
+fn subscribe(c: &mut Connection, name: &str) -> Result<()> {
+    let wire = c.mailbox(name)?;
+    match c.session.run_command_and_check_ok(format!("SUBSCRIBE {wire}")) {
         Ok(()) | Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -173,6 +225,9 @@ pub struct Backend {
     waiting: Mutex<HashMap<String, usize>>,
     /// Inboxes watched for new mail with IDLE, by account; see `watch.rs`.
     watchers: Mutex<HashMap<String, Watcher>>,
+    /// The mailbox open in the window, watched by account where NOTIFY
+    /// doesn't cover it; see `watch_folder`.
+    folder_watchers: Mutex<HashMap<String, Watcher>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -209,6 +264,7 @@ impl Backend {
             sign_in_step: Mutex::new(SignInStep::Browser),
             waiting: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
+            folder_watchers: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -800,6 +856,9 @@ impl Backend {
             return Ok(vec![]);
         }
         self.with_imap(a, |c| {
+            // Changes made while offline reach the server before anything
+            // is read from it.
+            self.replay_offline(c, a)?;
             // One LIST per sync keeps the folder list current.
             let names = c.names(true)?.to_vec();
             let folders = custom_folders(&names);
@@ -913,8 +972,18 @@ impl Backend {
         remote: &str,
         limit: usize,
     ) -> Result<Vec<Mail>> {
-        let selected = c.select(remote)?;
         let state = self.store.mailbox_state(&a.id, remote)?;
+        // With QRESYNC the SELECT itself says what was removed (VANISHED)
+        // and which flags changed since the saved HIGHESTMODSEQ, so removals
+        // no longer need a full SEARCH to reconcile.
+        let resync_from = state
+            .as_ref()
+            .filter(|s| c.enabled.qresync && s.days == a.sync.days && s.uid_next > 0)
+            .and_then(|s| s.modseq.map(|m| (s.validity, m)));
+        let (selected, resync) = match resync_from {
+            Some((validity, modseq)) => c.select_resync(remote, validity, modseq)?,
+            None => (c.select(remote)?, None),
+        };
         let Some((state, uid_next)) = state.zip(selected.uid_next).filter(|(state, next)| {
             state.validity == selected.validity
                 && state.days == a.sync.days
@@ -941,7 +1010,8 @@ impl Backend {
             Vec::new()
         };
         // Without removals, the count grows by exactly the new messages.
-        if selected.exists != state.exists.saturating_add(fresh.len() as u32) {
+        // QRESYNC lists removals instead, so the count needn't add up.
+        if resync.is_none() && selected.exists != state.exists.saturating_add(fresh.len() as u32) {
             return self.full_sync(c, a, mailbox, remote, &selected, false, limit);
         }
         let prefix = format!("{}:{remote}:{validity}:", a.id);
@@ -949,7 +1019,13 @@ impl Backend {
             condstore, gmail, ..
         } = c.extensions()?;
         let items = flag_items(gmail);
+        let (vanished, resynced) = match resync {
+            Some(r) => (r.vanished, Some(r.changed)),
+            None => (Vec::new(), None),
+        };
         let rows = match (state.modseq, selected.modseq) {
+            // The resynchronizing SELECT already sent the changed flags.
+            _ if resynced.is_some() => resynced.unwrap_or_default(),
             (Some(old), Some(new)) if condstore => {
                 if new == old {
                     Vec::new()
@@ -979,17 +1055,17 @@ impl Backend {
         let flags: Vec<store::FlagUpdate> = rows
             .iter()
             .filter(|r| r.flags.is_some())
-            .map(|r| store::FlagUpdate {
-                uid: r.uid,
-                unread: !r.seen(),
-                starred: r.flagged(),
-                labels: r.labels(gmail),
-            })
+            .map(|r| flag_update(r, gmail))
             .collect();
         let before = (a.sync.days > 0)
             .then(|| chrono::Utc::now().timestamp() - i64::from(a.sync.days) * 86_400);
+        let removed: Vec<String> = vanished.iter().map(|uid| format!("{prefix}{uid}")).collect();
         self.store
-            .apply_changes(mailbox, &a.id, &prefix, &fresh, &flags, before)?;
+            .apply_changes(mailbox, &a.id, &prefix, &fresh, &flags, &removed, before)?;
+        if !removed.is_empty() {
+            let gone: std::collections::HashSet<&String> = removed.iter().collect();
+            self.readable.lock().unwrap().retain(|id, _| !gone.contains(id));
+        }
         self.store.save_mailbox_state(
             &a.id,
             remote,
@@ -1001,7 +1077,11 @@ impl Backend {
                 days: a.sync.days,
             }),
         )?;
-        self.extend_layout(a, mailbox, validity, fresh.iter().map(|m| m.uid), &[]);
+        self.extend_layout(a, mailbox, validity, fresh.iter().map(|m| m.uid), &vanished);
+        if !fresh.is_empty() {
+            // Server threads for the new mail, where the server has them.
+            let _ = self.thread_mailbox(c, a, remote, validity);
+        }
         let mut result = self.store.messages(&a.id, mailbox, limit)?;
         result.retain(|m| m.id.starts_with(&prefix));
         Ok(result)
@@ -1180,7 +1260,7 @@ impl Backend {
         }) {
             return Ok(layout);
         }
-        let uids = search(&mut c.session, a, false)?;
+        let uids = search(c, a, false)?;
         let all_ids: Vec<String> = uids
             .iter()
             .map(|uid| format!("{}:{remote}:{}:{uid}", a.id, selected.validity))
@@ -1314,7 +1394,7 @@ impl Backend {
     ) -> Result<Vec<Mail>> {
         let folder = mailbox.folder();
         let validity = selected.validity;
-        let all = search(&mut c.session, a, starred_only)?;
+        let all = search(c, a, starred_only)?;
         let mut all_ids: Vec<_> = all
             .iter()
             .map(|uid| format!("{}:{remote}:{validity}:{uid}", a.id))
@@ -1351,6 +1431,9 @@ impl Backend {
                 let mut m = old.clone();
                 m.unread = !row.seen();
                 m.starred = row.flagged();
+                m.answered = row.answered();
+                m.forwarded = row.forwarded();
+                m.mdn_sent = row.mdn_sent();
                 if let Some(labels) = row.labels(gmail) {
                     m.labels = labels;
                 }
@@ -1360,7 +1443,7 @@ impl Backend {
         if result.len() != newest.len() {
             // An expunge can race SEARCH/FETCH. Confirm vanished UIDs before
             // removing them; an incomplete successful FETCH is not a snapshot.
-            let current: std::collections::HashSet<u32> = search(&mut c.session, a, starred_only)?
+            let current: std::collections::HashSet<u32> = search(c, a, starred_only)?
                 .into_iter()
                 .collect();
             ensure!(
@@ -1403,6 +1486,7 @@ impl Backend {
                 .filter_map(|id| id.rsplit(':').next()?.parse().ok())
                 .collect();
             self.set_layout(a, mailbox, remote, validity, uids);
+            let _ = self.thread_mailbox(c, a, remote, validity);
         }
         let keep: std::collections::HashSet<_> = all_ids.iter().collect();
         let prefix = format!("{}:{remote}:{validity}:", a.id);
@@ -1455,10 +1539,17 @@ impl Backend {
         if set.is_empty() {
             return Ok(Vec::new());
         }
-        let gmail = c.extensions()?.gmail;
+        let ext = c.extensions()?;
+        let gmail = ext.gmail;
+        // Where the server has them: its thread and message ids (Gmail's,
+        // or OBJECTID's), a preview before the body downloads, and when the
+        // message was put here.
         let items = format!(
-            "(UID FLAGS RFC822.SIZE INTERNALDATE{} {LIST_HEADERS})",
-            if gmail { " X-GM-MSGID X-GM-LABELS" } else { "" }
+            "(UID FLAGS RFC822.SIZE INTERNALDATE{}{}{}{} {LIST_HEADERS})",
+            if gmail { " X-GM-MSGID X-GM-THRID X-GM-LABELS" } else { "" },
+            if ext.objectid && !gmail { " EMAILID THREADID" } else { "" },
+            if ext.preview { " PREVIEW" } else { "" },
+            if ext.savedate { " SAVEDATE" } else { "" },
         );
         let rows = uid_fetch_rows(&mut c.session, set, &items)?;
         let mut result: Vec<Mail> = Vec::new();
@@ -1481,6 +1572,14 @@ impl Backend {
             m.size = row.size.unwrap_or(0);
             m.gmail_id = row.gmail_id.unwrap_or(0);
             m.labels = row.labels(gmail).unwrap_or_default();
+            m.answered = row.answered();
+            m.forwarded = row.forwarded();
+            m.mdn_sent = row.mdn_sent();
+            m.thread_id = row.thread.clone().unwrap_or_default();
+            m.saved = row.save_date.unwrap_or_default();
+            if let Some(preview) = row.preview.as_deref().filter(|p| !p.is_empty()) {
+                m.snippet = preview.to_owned();
+            }
             if m.date == 0 {
                 m.date = row.internal_date.unwrap_or_default();
             }
@@ -1591,18 +1690,29 @@ impl Backend {
             raw
         } else {
             ensure!(
-                m.size as usize <= MAX_MESSAGE,
-                "This message exceeds the 25 MB download limit."
-            );
-            ensure!(
                 a.provider != Provider::Pop3,
                 "Message is not cached. Refresh the mailbox."
             );
+            // Too large to download whole: its text is read from its parts
+            // and attachments download when saved.
+            if m.size as usize > large::MAX_DOWNLOAD {
+                if m.partial && m.body.is_some() {
+                    return Ok(m.clone());
+                }
+                let next = self.with_imap(a, |c| self.read_parts(c, a, m))?;
+                self.store.save_messages(std::slice::from_ref(&next))?;
+                return Ok(next);
+            }
             let raw = match self.store.gmail_raw(&a.id, m.gmail_id)? {
                 // The same Gmail message, already downloaded under another label.
                 Some(raw) => raw,
+                // Large messages download in pieces that resume after an
+                // interruption; others in one request.
                 None => self.with_imap(a, |c| {
                     c.select_for(m)?;
+                    if m.size as usize > large::CHUNK {
+                        return self.download_resumable(c, m);
+                    }
                     let fetched = c
                         .session
                         .uid_fetch(m.uid.to_string(), "(UID BODY.PEEK[])")?;
@@ -1612,7 +1722,10 @@ impl Backend {
                         .find_map(|f| f.body())
                         .context("Message no longer exists on the server")?
                         .to_vec();
-                    ensure!(raw.len() <= MAX_MESSAGE, "Message exceeds the 25 MB limit.");
+                    ensure!(
+                        raw.len() <= large::MAX_DOWNLOAD,
+                        "Message exceeds the download limit."
+                    );
                     Ok(raw)
                 })?,
             };
@@ -1690,12 +1803,12 @@ impl Backend {
                 c.require_rights(parent, "k", "make folders")?;
             }
             let label = decode_name(&name);
+            let wire = c.mailbox(&name)?;
             allowed(
-                c.session
-                    .run_command_and_check_ok(format!("CREATE {}", quote(&name)?)),
+                c.session.run_command_and_check_ok(format!("CREATE {wire}")),
                 || format!("create “{label}”"),
             )?;
-            subscribe(&mut c.session, &name)?;
+            subscribe(c, &name)?;
             Ok(FolderChange {
                 folders: custom_folders(c.names(true)?),
                 moved: vec![],
@@ -1744,16 +1857,14 @@ impl Backend {
                 c.leave(old)?;
             }
             let label = decode_name(name);
+            let (from, to) = (c.mailbox(name)?, c.mailbox(&next)?);
             allowed(
-                c.session.run_command_and_check_ok(format!(
-                    "RENAME {} {}",
-                    quote(name)?,
-                    quote(&next)?
-                )),
+                c.session
+                    .run_command_and_check_ok(format!("RENAME {from} {to}")),
                 || format!("rename “{label}”"),
             )?;
             for (_, new) in &moved {
-                subscribe(&mut c.session, new)?;
+                subscribe(c, new)?;
             }
             Ok(FolderChange {
                 folders: custom_folders(c.names(true)?),
@@ -1783,7 +1894,8 @@ impl Backend {
             c.require_rights(name, "x", "delete the folder")?;
             c.leave(name)?;
             let label = decode_name(name);
-            allowed(c.session.delete(name), || format!("delete “{label}”"))?;
+            let wire = c.wire(name);
+            allowed(c.session.delete(&wire), || format!("delete “{label}”"))?;
             Ok(custom_folders(c.names(true)?))
         })?;
         self.store.save_folders(&a.id, &folders)?;
@@ -1939,16 +2051,31 @@ impl Backend {
             "This account's folders aren't kept on the server."
         );
         if a.provider != Provider::Pop3 {
-            return self.with_imap(a, |c| self.change_remote(c, a, &current, change));
+            let result = self.with_imap(a, |c| {
+                // Changes made while offline go first, in order.
+                self.replay_offline(c, a)?;
+                self.change_remote(c, a, &current, change.clone(), true)
+            });
+            return match result {
+                // Offline (or the connection dropped): the change shows
+                // here now and reaches the server with the next connection.
+                Err(e) if crate::sync::retry::later(&e) => {
+                    self.queue_offline(a, &current, &change)
+                }
+                other => other,
+            };
         }
         self.commit_change(&current, change, false)
     }
+    /// Sends a change to the server, one command per mailbox and chunk;
+    /// with `commit`, each acknowledged chunk is committed to the cache.
     fn change_remote(
         &self,
         c: &mut Connection,
         a: &Account,
         current: &[Mail],
         change: Change,
+        commit: bool,
     ) -> Result<()> {
         let target = match change {
             Change::Move(folder) => Some(resolve_in(c.names(false)?, a.provider, folder)?),
@@ -1998,9 +2125,42 @@ impl Backend {
             if label.is_some() {
                 c.require_rights(&first.remote_folder, "w", "change labels")?;
             }
+            // Moving mail into or out of Spam tells the server's spam
+            // filter which it is ($Junk/$NotJunk, RFC 5788's registry), where
+            // the mailbox keeps keywords. Out of Spam to Trash says nothing.
+            let training = match &change {
+                Change::Move(Folder::Junk) if first.folder != Folder::Junk => {
+                    Some(("$Junk", "$NotJunk"))
+                }
+                Change::Move(to) if first.folder == Folder::Junk && *to != Folder::Trash =>
+                {
+                    Some(("$NotJunk", "$Junk"))
+                }
+                Change::MoveTo(_) if first.folder == Folder::Junk => Some(("$NotJunk", "$Junk")),
+                _ => None,
+            }
+            // Gmail learns from the move into or out of Spam itself.
+            .filter(|_| selected.keywords && !gmail);
             for chunk in uids.chunks(200) {
                 let set = uid_set(chunk);
+                if let Some((add, remove)) = training {
+                    // A server that refuses the keywords still moves the mail.
+                    optional(c.session.uid_store(&set, format!("+FLAGS.SILENT ({add})")).map(|_| ()))?;
+                    optional(c.session.uid_store(&set, format!("-FLAGS.SILENT ({remove})")).map(|_| ()))?;
+                }
                 match change {
+                    Change::Mark(mark) => {
+                        let (flag, keyword) = mark.flag();
+                        // Keywords stick only where the mailbox allows new
+                        // ones; elsewhere the mark stays on this computer.
+                        if !keyword || selected.keywords {
+                            optional(
+                                c.session
+                                    .uid_store(&set, format!("+FLAGS.SILENT ({flag})"))
+                                    .map(|_| ()),
+                            )?;
+                        }
+                    }
                     Change::Read(read) => {
                         c.session.uid_store(
                             &set,
@@ -2034,7 +2194,7 @@ impl Backend {
                         }
                     }
                     Change::Move(_) | Change::MoveTo(_) => {
-                        let target = quote(target.as_deref().unwrap_or_default())?;
+                        let target = c.mailbox(target.as_deref().unwrap_or_default())?;
                         if c.extensions()?.moves {
                             // Atomic, and leaves other deleted messages alone.
                             c.session
@@ -2078,7 +2238,13 @@ impl Backend {
                     })
                     .cloned()
                     .collect();
-                self.commit_change(&confirmed, change.clone(), true)?;
+                if commit {
+                    self.commit_change(&confirmed, change.clone(), true)?;
+                } else if change.moves() {
+                    // Replayed: the cache already shows it moved; the copy
+                    // in its new mailbox arrives with that mailbox's sync.
+                    self.store.commit_changes(&confirmed, true)?;
+                }
             }
         }
         Ok(())
@@ -2363,6 +2529,10 @@ impl Backend {
             }
         }
         let _ = self.discard_draft(&d.id);
+        drop(_operation);
+        // The message it answers or forwards says so, here and in other
+        // mail apps (\\Answered, $Forwarded); offline, that waits.
+        self.mark_original(a, d);
         Ok(notes)
     }
     /// Saves a sent message in the account's Sent folder, unless a copy
@@ -2391,8 +2561,9 @@ impl Backend {
                 return Ok(());
             }
         }
+        let wire = c.wire(&sent);
         c.session
-            .append_with_flags(&sent, raw, &[imap::types::Flag::Seen])?;
+            .append_with_flags(&wire, raw, &[imap::types::Flag::Seen])?;
         Ok(())
     }
     /// Where copies for Sent that couldn't be saved yet wait, per account.
@@ -2614,8 +2785,9 @@ impl Backend {
                     // Too large for the server; it stays here.
                     continue;
                 }
+                let wire = c.wire(&mailbox);
                 c.session.append_with_flags(
-                    &mailbox,
+                    &wire,
                     &raw,
                     &[imap::types::Flag::Seen, imap::types::Flag::Draft],
                 )?;
@@ -2704,6 +2876,16 @@ impl Backend {
     pub fn attachment(&self, a: &Account, m: &Mail, part: usize) -> Result<Vec<u8>> {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        // A message too large to download whole: just this part.
+        if let Some(attachment) = m.attachments.iter().find(|x| x.part == part && !x.section.is_empty())
+            && self.store.raw(&m.id)?.is_none()
+        {
+            let attachment = attachment.clone();
+            return self.with_imap(a, |c| {
+                c.select_for(m)?;
+                self.fetch_attachment(c, m, &attachment)
+            });
+        }
         let raw = self.store.raw(&m.id)?.context("Open this message first")?;
         let (_, raw) = self.plaintext(a, &raw)?;
         let parsed = mailparse::parse_mail(&raw)?;
@@ -2811,22 +2993,33 @@ fn flag_items(gmail: bool) -> &'static str {
         "(UID FLAGS)"
     }
 }
+/// A flag update from a FETCH row, for the cache.
+fn flag_update(r: &crate::sync::transport::Row, gmail: bool) -> store::FlagUpdate {
+    store::FlagUpdate {
+        uid: r.uid,
+        unread: !r.seen(),
+        starred: r.flagged(),
+        labels: r.labels(gmail),
+        answered: r.answered(),
+        forwarded: r.forwarded(),
+        mdn_sent: r.mdn_sent(),
+    }
+}
 /// UIDs of the selected mailbox's messages within the account's sync
 /// window (only flagged ones for Starred), oldest first.
-fn search(session: &mut ImapSession, a: &Account, starred_only: bool) -> Result<Vec<u32>> {
+/// With ESEARCH the reply is compact (`1:90000`); without, a very large
+/// mailbox is searched in windows of UIDs (see `search_uids`), so neither
+/// outgrows the connection's size limit.
+fn search(c: &mut Connection, a: &Account, starred_only: bool) -> Result<Vec<u32>> {
     let mut query = if starred_only { "FLAGGED" } else { "ALL" }.to_owned();
     if a.sync.days > 0 {
         // Older mail stays on the server; reconciling drops it from the cache.
         let since = chrono::Utc::now() - chrono::Duration::days(a.sync.days.into());
         query = format!("{query} SINCE {}", since.format("%-d-%b-%Y"));
     }
-    let mut uids: Vec<_> = session.uid_search(&query)?.into_iter().collect();
-    ensure!(
-        uids.iter().all(|uid| *uid > 0),
-        "Invalid IMAP UID in search response"
-    );
-    uids.sort_unstable();
-    Ok(uids)
+    let ext = c.extensions()?;
+    let selected = c.current().cloned().unwrap_or_default();
+    search_uids(&mut c.session, &ext, &selected, &query)
 }
 
 /// The server mailbox behind a mailbox view.

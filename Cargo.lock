@@ -4381,7 +4381,6 @@ dependencies = [
 [[package]]
 name = "imap-proto"
 version = "0.10.2"
-source = "git+https://github.com/pinaltech/Picacho-Patches?branch=vendor-split-dev#201a585f8df3768397cc9a8090d837bdd7c25561"
 dependencies = [
  "nom 5.1.3",
 ]

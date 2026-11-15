@@ -25,6 +25,11 @@ impl AssetSource for Assets {
             ),
             "mail/send.svg" => Some("<path d='m22 2-7 20-4-9-9-4Z M22 2 11 13'/>"),
             "mail/clock.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>"),
+            "mail/snooze.svg" => Some(
+                "<circle cx='12' cy='13' r='8'/><path d='M12 9v4l2 2M5 3 2 6M19 3l3 3M10 2h4'/>",
+            ),
+            "mail/answered.svg" => Some("<path d='m9 6-6 6 6 6M3 12h11a7 7 0 0 1 7 7'/>"),
+            "mail/forwarded.svg" => Some("<path d='m15 6 6 6-6 6M21 12H10a7 7 0 0 0-7 7'/>"),
             "mail/archive.svg" => Some(
                 "<rect x='3' y='3' width='18' height='4' rx='1'/><path d='M5 7v13h14V7M10 11h4'/>",
             ),

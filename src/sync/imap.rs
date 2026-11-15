@@ -294,7 +294,17 @@ impl Name {
 /// Every mailbox on the server. Servers with SPECIAL-USE (RFC 6154) are
 /// asked to mark the standard ones (\\Sent, \\Trash…), so they are found by
 /// role rather than guessed from their names.
-pub(crate) fn list(session: &mut ImapSession, special_use: bool) -> Result<Vec<Name>> {
+pub(crate) fn list(session: &mut ImapSession, special_use: bool, utf8: bool) -> Result<Vec<Name>> {
+    let names = list_wire(session, special_use)?;
+    Ok(names
+        .into_iter()
+        .map(|n| Name {
+            name: super::imap_ext::cache_name(&n.name, utf8),
+            ..n
+        })
+        .collect())
+}
+fn list_wire(session: &mut ImapSession, special_use: bool) -> Result<Vec<Name>> {
     if !special_use {
         return Ok(session
             .list(None, Some("*"))?
@@ -759,9 +769,11 @@ fn starttls(socket: &mut Wire) -> Result<()> {
 /// Header fields the message list shows. Full headers carry Received, DKIM
 /// and ARC chains that are often several times larger, and are only needed
 /// once a message is opened (its whole source is downloaded then). Reply-To
-/// and Cc are small and let the list be searched by them (`reply-to:`).
+/// and Cc are small and let the list be searched by them (`reply-to:`);
+/// References and In-Reply-To join conversations before bodies download,
+/// and Disposition-Notification-To says the sender asks for a read receipt.
 pub(crate) const LIST_HEADERS: &str =
-    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]";
+    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DISPOSITION-NOTIFICATION-TO)]";
 
 /// Extensions beyond IMAP4rev1 that the app uses where a server has them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -786,6 +798,31 @@ pub(crate) struct Extensions {
     pub(crate) special_use: bool,
     /// RFC 7889: the largest message the server accepts (APPENDLIMIT).
     pub(crate) append_limit: Option<u64>,
+    /// RFC 7162: removed UIDs reported on SELECT (VANISHED), QRESYNC.
+    pub(crate) qresync: bool,
+    /// RFC 4731: compact search results (ESEARCH, `RETURN (ALL)`).
+    pub(crate) esearch: bool,
+    /// RFC 5256: server-side ordering (SORT) and threads (THREAD=REFERENCES).
+    pub(crate) sort: bool,
+    pub(crate) thread: bool,
+    /// RFC 6855: UTF-8 mailbox names and headers (UTF8=ACCEPT).
+    pub(crate) utf8_accept: bool,
+    /// RFC 5161: ENABLE, needed for QRESYNC and UTF8=ACCEPT.
+    pub(crate) enable: bool,
+    /// RFC 5465: changes in every mailbox over one connection (NOTIFY).
+    pub(crate) notify: bool,
+    /// RFC 5464: annotations on mailboxes and the server (METADATA).
+    pub(crate) metadata: bool,
+    /// RFC 8474: permanent message and thread ids (OBJECTID).
+    pub(crate) objectid: bool,
+    /// RFC 8970: a short preview of each message (PREVIEW).
+    pub(crate) preview: bool,
+    /// RFC 8514: when a message was saved in its mailbox (SAVEDATE).
+    pub(crate) savedate: bool,
+    /// RFC 3516: parts decoded by the server (BINARY).
+    pub(crate) binary: bool,
+    /// RFC 7888: literals that need no go-ahead (LITERAL+ or LITERAL-).
+    pub(crate) literal_plus: bool,
 }
 pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
     let caps = session.capabilities()?;
@@ -815,12 +852,25 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         acl: caps.has_str("ACL"),
         special_use: caps.has_str("SPECIAL-USE"),
         append_limit,
+        qresync: caps.has_str("QRESYNC"),
+        esearch: caps.has_str("ESEARCH"),
+        sort: caps.has_str("SORT"),
+        thread: caps.has_str("THREAD=REFERENCES"),
+        utf8_accept: caps.has_str("UTF8=ACCEPT") || caps.has_str("UTF8=ONLY"),
+        enable: caps.has_str("ENABLE"),
+        notify: caps.has_str("NOTIFY"),
+        metadata: caps.has_str("METADATA") || caps.has_str("METADATA-SERVER"),
+        objectid: caps.has_str("OBJECTID"),
+        preview: caps.has_str("PREVIEW"),
+        savedate: caps.has_str("SAVEDATE"),
+        binary: caps.has_str("BINARY"),
+        literal_plus: caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
     })
 }
 
 /// The untagged lines of an extension's reply that start with `name`, as
 /// text after it (NAMESPACE, QUOTA…; see the vendored parser's `resp_other`).
-fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
+pub(crate) fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
     Ok(responses(data)?
         .into_iter()
         .filter_map(|r| match r {
@@ -834,13 +884,13 @@ fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
 }
 /// Words, quoted strings, NIL and parentheses in an extension's reply.
 #[derive(Debug, PartialEq)]
-enum Token {
+pub(crate) enum Token {
     Open,
     Close,
     Nil,
     Text(String),
 }
-fn tokens(line: &str) -> Vec<Token> {
+pub(crate) fn tokens(line: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -1052,19 +1102,28 @@ pub(crate) fn quote(name: &str) -> Result<String> {
 
 /// SELECT, asking for change tracking when the server supports it. The imap
 /// crate's own SELECT discards HIGHESTMODSEQ, so this reads the response here.
-pub(crate) fn select(session: &mut ImapSession, name: &str, condstore: bool) -> Result<Selected> {
+pub(crate) fn select(
+    session: &mut ImapSession,
+    name: &str,
+    condstore: bool,
+    utf8: bool,
+) -> Result<Selected> {
     let command = format!(
         "SELECT {}{}",
-        quote(name)?,
+        quote(&super::imap_ext::wire_name(name, utf8))?,
         if condstore { " (CONDSTORE)" } else { "" }
     );
     let data = session.run_command_and_read_response(command)?;
+    selected_from(&data, name, condstore)
+}
+/// What a SELECT's reply says about the mailbox `name`.
+pub(crate) fn selected_from(data: &[u8], name: &str, condstore: bool) -> Result<Selected> {
     let mut selected = Selected {
         name: name.into(),
         ..Default::default()
     };
     let mut validity = None;
-    for response in responses(&data)? {
+    for response in responses(data)? {
         use imap_proto::{MailboxDatum, Response, ResponseCode};
         match response {
             Response::Data {
@@ -1100,6 +1159,16 @@ pub(crate) struct Row {
     pub(crate) header: Option<Vec<u8>>,
     pub(crate) gmail_id: Option<u64>,
     pub(crate) gmail_labels: Option<Vec<String>>,
+    /// The server's thread: Gmail's X-GM-THRID or OBJECTID's THREADID.
+    pub(crate) thread: Option<String>,
+    /// OBJECTID's EMAILID: the same message in every mailbox.
+    pub(crate) email_id: Option<String>,
+    /// PREVIEW's text.
+    pub(crate) preview: Option<String>,
+    /// SAVEDATE: when it was put in this mailbox.
+    pub(crate) save_date: Option<i64>,
+    /// MODSEQ, with CONDSTORE.
+    pub(crate) modseq: Option<u64>,
 }
 impl Row {
     fn flag(&self, name: &str) -> bool {
@@ -1113,6 +1182,18 @@ impl Row {
     }
     pub(crate) fn flagged(&self) -> bool {
         self.flag("\\Flagged")
+    }
+    /// Replied to (\\Answered).
+    pub(crate) fn answered(&self) -> bool {
+        self.flag("\\Answered")
+    }
+    /// Forwarded ($Forwarded, RFC 5550).
+    pub(crate) fn forwarded(&self) -> bool {
+        self.flag("$Forwarded")
+    }
+    /// A read receipt was sent or declined ($MDNSent, RFC 3503).
+    pub(crate) fn mdn_sent(&self) -> bool {
+        self.flag("$MDNSent")
     }
     /// The labels a person set, when this row says: Gmail's labels (where
     /// asked for, `gmail`), else the keywords among its flags.
@@ -1141,7 +1222,7 @@ impl Row {
     }
 }
 /// A quoted string's text as imap-proto leaves it: escapes still in.
-fn unescape(text: &str) -> String {
+pub(crate) fn unescape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
@@ -1166,8 +1247,12 @@ pub(crate) fn uid_fetch_rows(
         "Invalid IMAP FETCH"
     );
     let data = session.run_command_and_read_response(format!("UID FETCH {set} {items}"))?;
+    rows_from(&data)
+}
+/// The FETCH rows in a reply (with a UID; others are skipped).
+pub(crate) fn rows_from(data: &[u8]) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    for response in responses(&data)? {
+    for response in responses(data)? {
         let imap_proto::Response::Fetch(_, attributes) = response else {
             continue;
         };
@@ -1180,6 +1265,14 @@ pub(crate) fn uid_fetch_rows(
                 A::Rfc822Size(size) => row.size = Some(size),
                 A::InternalDate(date) => row.internal_date = internal_date(date),
                 A::GmailMsgId(id) => row.gmail_id = Some(id),
+                A::GmailThrId(id) => row.thread = Some(format!("gm:{id}")),
+                A::ThreadId(Some(id)) => row.thread = Some(format!("oid:{id}")),
+                A::EmailId(id) => row.email_id = Some(id.to_owned()),
+                A::Preview(Some(text)) => {
+                    row.preview = Some(String::from_utf8_lossy(text).trim().to_owned())
+                }
+                A::SaveDate(Some(date)) => row.save_date = internal_date(date),
+                A::ModSeq(m) => row.modseq = Some(m),
                 A::GmailLabels(labels) => {
                     row.gmail_labels = Some(
                         labels
@@ -1207,13 +1300,13 @@ pub(crate) fn uid_fetch_rows(
     }
     Ok(rows)
 }
-fn internal_date(date: &str) -> Option<i64> {
+pub(crate) fn internal_date(date: &str) -> Option<i64> {
     chrono::DateTime::parse_from_str(date.trim(), "%d-%b-%Y %H:%M:%S %z")
         .ok()
         .map(|d| d.timestamp())
 }
 /// Untagged responses that the imap crate has already read and validated.
-fn responses(data: &[u8]) -> Result<Vec<imap_proto::Response<'_>>> {
+pub(crate) fn responses(data: &[u8]) -> Result<Vec<imap_proto::Response<'_>>> {
     let mut rest = data;
     let mut out = Vec::new();
     while !rest.is_empty() {

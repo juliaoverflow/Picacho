@@ -99,9 +99,12 @@ After signing in, a session sends `ID` where offered and turns on
   keywords (`$Forwarded`, `$MDNSent`, junk markers…) aren't shown. Labels
   travel in the server's form; Gmail's are modified UTF-7 like folder names.
 
+- `THREAD=REFERENCES` gives recent mail conversation ids (`t:` ids, within a mailbox); Gmail's `X-GM-THRID` and OBJECTID's `THREADID` come with headers and are permanent. `PREVIEW` fills snippets before bodies download; `SAVEDATE` is kept. `METADATA` provides the server's `/shared/comment` and `/shared/admin` notes and stores snooze times.
+- `NOTIFY`: the inbox watcher asks for every personal mailbox's changes.
+
 `imap-proto` doesn't model NAMESPACE, QUOTA, MYRIGHTS, ID or ENABLED replies,
 and `imap` 2.4 mistakes any untagged line it can't parse for the server
-leaving; the patched `imap-proto` keeps them as text (`Response::Other`).
+leaving; the patched `imap-proto` keeps them as text (`Response::Other`). The vendored copy in `vendor/imap-proto` adds ESEARCH, SORT, THREAD, VANISHED and the extension FETCH attributes (see its README).
 
 ## Push (IDLE)
 
@@ -211,7 +214,7 @@ connection failure.
 
 TCP attempts have a shared 12-second budget after name resolution, with at most three seconds per address. Verified TLS is mandatory, including STARTTLS; rejection never falls back to plaintext. The socket has a 30-second inactivity timeout. A wire wrapper adds a 90-second response budget and a 32 MiB byte budget between outgoing writes, including TLS framing. This bounds the IMAP library's otherwise unbounded response buffering, even when a peer lies about RFC822.SIZE. TLS handshake writes can also restart this wire budget. The decoded-message limit remains 25 MiB. POP3 status lines and multiline responses have separate length/completeness checks.
 
-System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. QRESYNC, ESEARCH, `UTF8=ACCEPT` (folder names stay in modified UTF-7), resumable partial MIME downloads, and an offline mutation queue remain future work. Removals still cost one full SEARCH, since Gmail offers no QRESYNC.
+System DNS resolution is synchronous and not covered by the TCP budget. Full SEARCH responses and headers are intentionally capped by the wire budget: an unusually large mailbox can report an error while keeping cached mail. With ESEARCH, full searches come back as compact sets; without it, mailboxes over 500,000 messages are searched in UID windows, so no reply outgrows the wire budget. QRESYNC (ENABLEd per connection) reports removals with SELECT's VANISHED (EARLIER); without it (Gmail) removals still cost one full SEARCH. With `UTF8=ACCEPT` names travel in UTF-8 on the wire and are kept in modified UTF-7 in the cache. Large messages download in resumable pieces (`partial-downloads/` in the data directory). Changes that can't reach the server are queued per account (`offline_changes:<account>`) and replayed first by the next sync or change; STOREs are idempotent and a replayed MOVE of vanished UIDs changes nothing.
 
 SMTP is Picacho's own client (`sync/smtp.rs`); lettre only builds the MIME message. It runs over the same bounded wire as IMAP and POP3. The client says hello as `[127.0.0.1]`, so the computer's name isn't written into Received headers. STARTTLS is required unless the port is 465 (implicit TLS). Anything the server sends before the TLS handshake is refused. From the EHLO reply:
 

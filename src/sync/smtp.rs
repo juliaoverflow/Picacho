@@ -135,17 +135,35 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
             "Attachments are too large to send by email. Share them by link instead."
         );
         let bytes = std::fs::read(path)?;
-        multipart = multipart.singlepart(
-            Attachment::new(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-            .body(bytes, content_type(path)),
-        );
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        multipart = multipart.singlepart(attachment_part(name, bytes, content_type(path)));
     }
     Ok(builder.multipart(multipart)?)
+}
+/// One attached file. A forwarded message (message/rfc822) goes as it is
+/// (7bit or 8bit, as RFC 2046 asks of messages), so recipients' apps open it
+/// as a message; when its lines are too long for that, it is encoded like any
+/// other file.
+fn attachment_part(name: String, bytes: Vec<u8>, kind: header::ContentType) -> SinglePart {
+    use lettre::message::{Body, header::ContentTransferEncoding};
+    if kind == header::ContentType::parse("message/rfc822").unwrap() {
+        let encoding = if bytes.is_ascii() {
+            ContentTransferEncoding::SevenBit
+        } else {
+            ContentTransferEncoding::EightBit
+        };
+        if let Ok(body) = Body::new_with_encoding(bytes.clone(), encoding) {
+            return SinglePart::builder()
+                .header(kind)
+                .header(header::ContentDisposition::attachment(&name))
+                .body(body);
+        }
+    }
+    Attachment::new(name).body(bytes, kind)
 }
 /// An attachment's type from its name (image/png, application/pdf…), so
 /// recipients' apps show it; unknown kinds are sent as plain bytes.
@@ -716,6 +734,108 @@ pub(crate) fn deliver(
         message,
         receipts_unsupported: a.delivery_receipts && !limits.dsn,
     })
+}
+/// Sends a message made elsewhere (a read receipt) from `from` to `to`,
+/// as it is. No delivery receipts are asked for.
+pub(crate) fn deliver_raw(
+    a: &Account,
+    from: &str,
+    to: &[String],
+    bytes: &[u8],
+    endpoint: &Endpoint,
+    secret: &str,
+    tls: &native_tls::TlsConnector,
+) -> Result<()> {
+    ensure!(!to.is_empty(), "Add at least one recipient.");
+    for address in std::iter::once(from).chain(to.iter().map(String::as_str)) {
+        ensure!(
+            !address.contains(['<', '>', '\r', '\n', ' ']) && address.contains('@'),
+            "“{address}” isn't a valid address."
+        );
+    }
+    let (mut session, limits) = open(endpoint, secret, tls)?;
+    if a.require_tls {
+        ensure!(
+            limits.require_tls,
+            "{} can't promise this message stays encrypted all the way (no REQUIRETLS), so it wasn't sent.",
+            endpoint.host
+        );
+    }
+    let mut mail = format!("MAIL FROM:<{from}>");
+    if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) {
+        ensure!(limits.utf8, "{} can't send to this address (no SMTPUTF8).", endpoint.host);
+        mail.push_str(" SMTPUTF8");
+    }
+    if a.require_tls {
+        mail.push_str(" REQUIRETLS");
+    }
+    let reply = session.command(&mail)?;
+    ensure!(reply.positive(), "The server refused to send from {from}: {}", reply.text());
+    for address in to {
+        let reply = session.command(&format!("RCPT TO:<{address}>"))?;
+        ensure!(reply.positive(), "The server refused the recipient {address}: {}", reply.text());
+    }
+    session.data(bytes)?;
+    let _ = session.command("QUIT");
+    Ok(())
+}
+/// A read receipt (MDN, RFC 8098) saying `m` was shown to `a`'s owner:
+/// a multipart/report with a human-readable part and the machine-readable
+/// disposition.
+pub(crate) fn receipt(a: &Account, m: &crate::manage::model::Mail, to: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let encoded = |text: &str| {
+        if text.is_ascii() && !text.contains(['\r', '\n']) {
+            text.to_owned()
+        } else {
+            format!(
+                "=?UTF-8?B?{}?=",
+                base64::engine::general_purpose::STANDARD.encode(text.replace(['\r', '\n'], " "))
+            )
+        }
+    };
+    let boundary = format!("mdn-{}", uuid::Uuid::new_v4().simple());
+    let domain = a.email.rsplit('@').next().unwrap_or("localhost");
+    let now = chrono::Local::now();
+    let name = encoded(&a.name);
+    let subject = encoded(&format!("Read: {}", m.subject));
+    let original = m.message_id.trim();
+    let mut out = String::new();
+    out.push_str(&format!("From: {name} <{}>\r\n", a.email));
+    out.push_str(&format!("To: <{to}>\r\n"));
+    out.push_str(&format!("Subject: {subject}\r\n"));
+    out.push_str(&format!("Date: {}\r\n", now.to_rfc2822()));
+    out.push_str(&format!("Message-ID: <{}@{domain}>\r\n", uuid::Uuid::new_v4()));
+    if !original.is_empty() {
+        out.push_str(&format!("In-Reply-To: {original}\r\nReferences: {original}\r\n"));
+    }
+    out.push_str("Auto-Submitted: auto-replied\r\nMIME-Version: 1.0\r\n");
+    out.push_str(&format!(
+        "Content-Type: multipart/report; report-type=disposition-notification; boundary=\"{boundary}\"\r\n\r\n"
+    ));
+    out.push_str(&format!(
+        "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n"
+    ));
+    out.push_str(&format!(
+        "Your message to {} was displayed on {}.\r\nSubject: {}\r\n\r\nThis only says the message was shown; it doesn't guarantee that it was read or understood.\r\n",
+        a.email,
+        now.format("%a, %b %-d %Y at %-H:%M"),
+        m.subject.replace(['\r', '\n'], " ")
+    ));
+    out.push_str(&format!(
+        "--{boundary}\r\nContent-Type: message/disposition-notification\r\n\r\n"
+    ));
+    out.push_str(&format!(
+        "Reporting-UA: Picacho; Picacho {}\r\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    out.push_str(&format!("Final-Recipient: rfc822;{}\r\n", a.email));
+    if !original.is_empty() {
+        out.push_str(&format!("Original-Message-ID: {original}\r\n"));
+    }
+    out.push_str("Disposition: manual-action/MDN-sent-manually; displayed\r\n");
+    out.push_str(&format!("--{boundary}--\r\n"));
+    out.into_bytes()
 }
 /// A value as RFC 3461's xtext: printable ASCII but + and =, else +XX.
 fn xtext(value: &str) -> String {

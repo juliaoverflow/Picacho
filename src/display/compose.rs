@@ -21,8 +21,9 @@ const BAR_H: f32 = 40.;
 const GAP: f32 = 12.;
 
 impl MailApp {
-    /// Starts a new message (mode 0), a reply (1), a reply to all (2) or a
-    /// forward (3) of the open message.
+    /// Starts a new message (mode 0), a reply (1), a reply to all (2), a
+    /// forward (3, with the original's attachments) or a forward as an
+    /// attachment (4) of the open message.
     pub(super) fn new_compose(&mut self, mode: u8, w: &mut Window, cx: &mut Context<Self>) {
         let original = self.selected_mail();
         self.compose_reply(mode, original, None, w, cx);
@@ -50,7 +51,7 @@ impl MailApp {
         // (Reply while forwarding it), open that where new messages open, so
         // it is seen and neither is lost.
         if let Some(m) = &original {
-            if let Some(existing) = self.open_answer(m, mode == 3, cx) {
+            if let Some(existing) = self.open_answer(m, mode >= 3, cx) {
                 let inline = existing.read(cx).placement == Placement::Inline;
                 let window = existing.read(cx).window;
                 existing.update(cx, |c, cx| {
@@ -102,8 +103,11 @@ impl MailApp {
         match &original {
             None => draft.body = sign(false),
             Some(m) => {
-                let forward = mode == 3;
+                let forward = mode >= 3;
                 draft.subject = reply_subject(&m.subject, forward);
+                // Marked answered or forwarded once this is sent.
+                draft.original = m.id.clone();
+                draft.forwarding = forward;
                 // Answer as the alias the message was sent to.
                 let aliases = fwd::sendable(&self.forwarding);
                 if let Some(alias) = alias_addressed(m, &aliases) {
@@ -160,7 +164,10 @@ impl MailApp {
                         .to_string();
                 }
                 let quoted = masked(&m.body.clone().unwrap_or_default());
-                let quote = if forward {
+                let quote = if mode == 4 {
+                    // The message itself goes as an attachment.
+                    String::new()
+                } else if forward {
                     format!(
                         "\n\n---------- Forwarded message ----------\nFrom: {} <{}>\nDate: {}\nSubject: {}\nTo: {}\n{}\n{}",
                         sender,
@@ -214,9 +221,16 @@ impl MailApp {
             },
         });
         let answers = original
+            .as_ref()
             .filter(|_| placement == Placement::Inline)
-            .map(|m| m.id);
-        self.open_composer(draft, placement, answers, w, cx);
+            .map(|m| m.id.clone());
+        let composer = self.open_composer(draft, placement, answers, w, cx);
+        // A forward carries the original's attachments, or the original.
+        if let (Some(composer), Some(m)) = (composer, original)
+            && (mode == 4 || (mode == 3 && m.has_attachments()))
+        {
+            self.attach_forwarded(composer, m, mode == 4, cx);
+        }
     }
 
     /// Opens a saved draft where new messages open.

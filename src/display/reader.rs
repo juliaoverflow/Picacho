@@ -352,6 +352,20 @@ impl MailApp {
                 false,
                 cx,
             ))
+            .when(
+                self.account_of(m).is_some_and(|a| a.provider != Provider::Pop3)
+                    && !matches!(m.folder, Folder::Drafts | Folder::Sent),
+                |d| {
+                    d.child(self.button(
+                        "snooze",
+                        "@Snooze until…",
+                        "snooze",
+                        Action::SnoozeMenu(vec![m.id.clone()]),
+                        false,
+                        cx,
+                    ))
+                },
+            )
             .child(self.button(
                 "read",
                 "@Mark read / unread",
@@ -479,6 +493,8 @@ impl MailApp {
                     ),
             )
             .when(self.details_open, |d| d.child(self.details_panel(m, cx)))
+            .children(self.snooze_banner(m, cx))
+            .children(self.receipt_banner(m, cx))
             .children(self.unsubscribe_banner(m, cx));
         let locked = m.body.is_none() && self.locked.contains(&m.account);
         let options = self.reading_options(m);
@@ -1469,9 +1485,11 @@ fn switch(on: bool, key: u64, animate: bool, c: Colors) -> AnyElement {
 
 impl MailApp {
     /// The open message's conversation in the loaded list, oldest first,
-    /// including the message itself. Messages join by References, or by
-    /// subject when at least one is a reply (so newsletters that reuse a
-    /// subject stay apart).
+    /// including the message itself. The server's thread ids decide where
+    /// both messages have one (Gmail's X-GM-THRID, OBJECTID's THREADID, or
+    /// IMAP THREAD within a mailbox); otherwise messages join by
+    /// References, or by subject when at least one is a reply (so
+    /// newsletters that reuse a subject stay apart).
     pub(super) fn thread(&self, m: &Mail) -> Rc<Vec<usize>> {
         if let Some((id, revision, rows)) = &*self.thread_cache.borrow()
             && id == &m.id
@@ -1486,6 +1504,21 @@ impl MailApp {
         let linked = |a: &Mail, b: &Mail| {
             !b.message_id.is_empty() && a.references.contains(b.message_id.as_str())
         };
+        // Permanent server thread ids (not IMAP THREAD's, which only
+        // cover one mailbox) settle it either way.
+        let permanent = |x: &Mail| !x.thread_id.is_empty() && !x.thread_id.starts_with("t:");
+        let server = |x: &Mail| -> Option<bool> {
+            if x.thread_id.is_empty() || m.thread_id.is_empty() {
+                return None;
+            }
+            if x.thread_id == m.thread_id {
+                Some(true)
+            } else if permanent(x) && permanent(m) {
+                Some(false)
+            } else {
+                None
+            }
+        };
         let mut seen = HashSet::new();
         let mut rows: Vec<usize> = self
             .messages
@@ -1493,6 +1526,9 @@ impl MailApp {
             .enumerate()
             .filter(|(_, x)| x.account == m.account && !x.pending)
             .filter(|(_, x)| {
+                if let Some(same) = server(x) {
+                    return same || x.id == m.id;
+                }
                 x.id == m.id
                     || linked(x, m)
                     || linked(m, x)

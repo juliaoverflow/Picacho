@@ -1006,7 +1006,14 @@ impl MailApp {
             ))
             .child(self.identities_setting(a, cx))
             .when(a.provider != Provider::Pop3, |page| {
-                page.child(self.section("Storage")).child(self.storage(a))
+                page.child(self.section("Storage"))
+                    .child(self.storage(a))
+                    .children(self.server_notes_view(a))
+                    .children(self.offline_note(a))
+            })
+            .when(Backend::may_filter(a), |page| {
+                page.child(self.section("Filters & vacation"))
+                    .child(self.filters_setting(a, cx))
             })
             .child(self.section("Profile picture"))
             .child(self.setting(
@@ -1692,7 +1699,7 @@ impl Render for SettingsWindow {
                 .menu
                 .as_ref()
                 .is_some_and(|m| m.window == Some(id))
-                .then(|| app.popup_menu(cx));
+                .then(|| app.popup_menu(window, cx));
             (
                 app.settings_modal(window, cx),
                 menu,

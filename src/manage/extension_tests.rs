@@ -866,7 +866,7 @@ fn idle_reports_new_mail() -> Result<()> {
     a.incoming_port = port;
     let b = Arc::new(b);
     let (tx, rx) = std::sync::mpsc::channel();
-    b.watch_inbox(&a, move || {
+    b.watch_inbox(&a, move |_| {
         let _ = tx.send(());
     });
     rx.recv_timeout(Duration::from_secs(10))

@@ -533,6 +533,13 @@ pub struct Attachment {
     pub size: usize,
     pub mime: String,
     pub part: usize,
+    /// Its IMAP section ("1.2"), for messages too large to download whole,
+    /// whose parts are fetched one at a time; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub section: String,
+    /// Its transfer encoding, with `section`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encoding: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mail {
@@ -582,6 +589,29 @@ pub struct Mail {
     /// as the server names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Replied to (\\Answered), here or in another mail app.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answered: bool,
+    /// Forwarded ($Forwarded).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forwarded: bool,
+    /// The server's conversation id: Gmail's X-GM-THRID ("gm:…"), OBJECTID's
+    /// THREADID ("oid:…") or IMAP THREAD's ("t:…"); empty where unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thread_id: String,
+    /// When it was put in its mailbox (SAVEDATE), where the server says.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub saved: i64,
+    /// Where the sender asked for a read receipt (Disposition-Notification-To).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub receipt_to: String,
+    /// A read receipt was sent or declined ($MDNSent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mdn_sent: bool,
+    /// Too large to download whole: its text was read from its parts, and
+    /// attachments download one at a time (`Attachment::section`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
     /// A row the list knows exists on the server but has not listed yet.
     /// Never stored; the list draws it as a placeholder until it loads.
     #[serde(skip)]
@@ -592,6 +622,9 @@ pub struct Mail {
     pub inline: std::sync::Arc<InlineParts>,
 }
 fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 /// A message's parts that its HTML refers to by Content-ID (`cid:`), such
@@ -775,6 +808,13 @@ pub struct Draft {
     /// uploaded again.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uploaded: String,
+    /// The message this replies to or forwards (its id here), marked
+    /// answered or forwarded once this is sent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub original: String,
+    /// It forwards `original`, rather than replying to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forwarding: bool,
 }
 /// Where a draft is in the server's Drafts folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -945,6 +985,13 @@ pub fn demo_mail() -> Vec<Mail> {
             reply_to: String::new(),
             labels: vec![],
             inline: Default::default(),
+            answered: i == 2,
+            forwarded: false,
+            thread_id: String::new(),
+            saved: 0,
+            receipt_to: String::new(),
+            mdn_sent: false,
+            partial: false,
         })
         .collect()
 }

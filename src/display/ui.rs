@@ -13,6 +13,13 @@ use composer::{Composer, ComposerDrag, Placement};
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[path = "devdriver.rs"]
 mod devdriver;
+#[path = "datetime.rs"]
+mod datetime;
+#[path = "later.rs"]
+mod later;
+#[path = "filters.rs"]
+mod filters;
+use datetime::{DateTimePicker, PickerEvent};
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod error_tests;
@@ -337,6 +344,8 @@ enum Modal {
     /// A message wasn't sent because the alias in From no longer exists:
     /// (why, the address From was reset to).
     AliasGone(String, String),
+    /// When to bring these messages back.
+    Snooze(Vec<String>),
 }
 /// What is deleted for good, once confirmed.
 #[derive(Clone, Debug, PartialEq)]
@@ -731,6 +740,18 @@ enum Action {
     PlaceSettings(SettingsPlace),
     ClosePresets,
     Dismiss,
+    /// Asks when to bring messages back: these, or the selection (empty).
+    SnoozeMenu(Vec<String>),
+    /// Brings a snoozed message back now: (account, Message-ID).
+    Unsnooze(String, String),
+    /// Searches the open mailbox on the server for what is typed.
+    SearchServer,
+    /// Back to searching the mail on this computer.
+    ClearServerSearch,
+    /// Answers a read receipt request: (message, send it).
+    Receipt(String, bool),
+    /// Server-side filters and vacation replies in an account's Settings.
+    Filters(filters::FilterAction),
 }
 
 /// A conversation's rows for one message at one list revision.
@@ -966,9 +987,23 @@ pub struct MailApp {
     /// Scheduled drafts that couldn't reach their server, and when to try
     /// them again.
     scheduled_retry: HashMap<String, std::time::Instant>,
-    /// Inbox watchers (IDLE) send their account's id here when the server
-    /// reports a change.
-    pushed: futures::channel::mpsc::UnboundedSender<String>,
+    /// The date and time picker of the open dialog (Snooze).
+    picker: Option<Entity<DateTimePicker>>,
+    picker_subscription: Option<Subscription>,
+    /// Each account's snoozed messages.
+    snoozed: HashMap<String, Vec<crate::manage::backend::Snoozed>>,
+    /// Accounts whose snoozed messages are being brought back now.
+    waking: HashSet<String>,
+    /// A search of the whole mailbox on the server.
+    server_search: Option<later::ServerSearch>,
+    /// Server-side filters by account, as loaded in Settings.
+    filters: HashMap<String, filters::FiltersUi>,
+    filter_inputs: filters::FilterInputs,
+    /// What each account's server says about itself (METADATA).
+    server_notes: HashMap<String, crate::manage::backend::ServerNotes>,
+    /// Watchers (IDLE, NOTIFY) send their account's id and the mailbox
+    /// here when the server reports a change.
+    pushed: futures::channel::mpsc::UnboundedSender<(String, Mailbox)>,
     /// When each account's drafts were last synced.
     draft_synced: HashMap<String, std::time::Instant>,
     /// The name in the new label dialog.
@@ -1157,6 +1192,9 @@ impl MailApp {
             }));
         }
         subscriptions.extend([cx.subscribe(&search, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.search_server(cx);
+            }
             if matches!(event, InputEvent::Change) {
                 // A new search lists other mail: start from its top rather
                 // than keeping the place in the old list.
@@ -1165,6 +1203,7 @@ impl MailApp {
                 cx.notify();
             }
         })]);
+        let filter_inputs = filters::FilterInputs::new(window, cx);
         let rename_input = input("Folder name", false, false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
@@ -1427,11 +1466,11 @@ impl MailApp {
                 this.html_menu(menu, cx)
             }),
         );
-        let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<String>();
+        let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<(String, Mailbox)>();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
-            while let Some(id) = pushes.next().await {
-                if this.update(cx, |this, cx| this.on_push(id, cx)).is_err() {
+            while let Some((id, mailbox)) = pushes.next().await {
+                if this.update(cx, |this, cx| this.on_push(id, mailbox, cx)).is_err() {
                     break;
                 }
             }
@@ -1654,8 +1693,17 @@ impl MailApp {
             fwd_contact_page: 0,
             fwd_open: HashSet::new(),
             fwd_adding: false,
+            picker: None,
+            picker_subscription: None,
+            snoozed: HashMap::new(),
+            waking: HashSet::new(),
+            server_search: None,
+            filters: HashMap::new(),
+            filter_inputs,
+            server_notes: HashMap::new(),
         };
         this.update_scope();
+        this.load_snoozed();
         this.load_unsubscribed();
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
@@ -1688,6 +1736,7 @@ impl MailApp {
                     this.watch_inboxes();
                     this.check_due(cx);
                     this.send_due(cx);
+                    this.wake_snoozed(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
                 });
                 if checked.is_err() {
@@ -1772,6 +1821,10 @@ impl MailApp {
     fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
         let search = crate::manage::search::Search::parse(&query);
+        let server = self
+            .current_server_search(Self::value(&self.search, cx).trim())
+            .filter(|s| !s.running && s.error.is_none())
+            .map(|s| s.ids.clone());
         let filter = self.filter_by;
         let open = self.selected.clone();
         self.visible = self
@@ -1788,7 +1841,11 @@ impl MailApp {
                 Filter::Starred => m.starred,
                 Filter::Attachments => m.has_attachments(),
             })
-            .filter(|(_, m)| search.matches(m))
+            .filter(|(_, m)| match &server {
+                // Found by the server's search, in its own syntax.
+                Some(ids) => ids.contains(&m.id),
+                None => search.matches(m),
+            })
             // Views leave out mail of aliases shown on their own, or list
             // only an alias's mail.
             // A subscription's mail is listed whole, as its counts are.
@@ -1917,23 +1974,47 @@ impl MailApp {
                 continue;
             }
             let (pushed, id) = (self.pushed.clone(), a.id.clone());
-            self.backend
-                .watch_inbox(a, move || drop(pushed.unbounded_send(id.clone())));
+            self.backend.watch_inbox(a, move |mailbox| {
+                drop(pushed.unbounded_send((id.clone(), mailbox)))
+            });
+        }
+        self.watch_open_folder();
+    }
+    /// Pushes the mailbox open in the window too (IDLE on a connection of
+    /// its own), unless its account's inbox watcher already hears about
+    /// every mailbox (NOTIFY). Other accounts' folder watches end.
+    fn watch_open_folder(&mut self) {
+        let open = self
+            .account
+            .clone()
+            .filter(|id| !fwd::is_view(id))
+            .filter(|_| !self.folder.is_virtual() && self.folder != Folder::Drafts);
+        for a in self.accounts.iter().filter(|a| !a.incoming_host.is_empty()) {
+            let mailbox = (open.as_ref() == Some(&a.id) && !self.account_blocked(&a.id))
+                .then(|| self.mailbox());
+            let (pushed, id) = (self.pushed.clone(), a.id.clone());
+            self.backend.watch_folder(a, mailbox, move |mailbox| {
+                drop(pushed.unbounded_send((id.clone(), mailbox)))
+            });
         }
     }
-    /// The server reported a change in an account's inbox (IDLE): check it
-    /// now, as the regular check would.
-    fn on_push(&mut self, id: String, cx: &mut Context<Self>) {
+    /// The server reported a change in one of an account's mailboxes (IDLE,
+    /// NOTIFY): check it now, as the regular check would.
+    fn on_push(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
         if self.account_blocked(&id) {
             return;
         }
-        if self.account.as_ref() == Some(&id) && self.folder == Folder::Inbox {
+        let open = self.shows(&id) && self.mailbox() == mailbox;
+        if open && self.account.as_ref() == Some(&id) {
             self.refresh(cx);
-        } else {
+        } else if mailbox == Mailbox::Standard(Folder::Inbox) {
             self.check_inbox(a, cx);
+        } else if mailbox.folder() != Folder::Drafts {
+            // Other mailboxes keep their counts current.
+            self.sync_mailbox(a, mailbox, 100, cx);
         }
     }
     fn check_inbox(&mut self, a: Account, cx: &mut Context<Self>) {
@@ -2528,6 +2609,7 @@ impl MailApp {
                     "trash",
                     Action::ApplySelection(Change::Move(Folder::Trash)),
                 ),
+                entry(format!("Snooze {n}…"), "snooze", Action::SnoozeMenu(vec![])),
             ]
             .into_iter()
             .chain(self.move_folder_entry(format!("Move {n} to Folder…"), MoveTarget::Selection))
@@ -2563,6 +2645,11 @@ impl MailApp {
             entry("Reply", "reply", Action::ReplyTo(m.id.clone(), 1)),
             entry("Reply All", "reply-all", Action::ReplyTo(m.id.clone(), 2)),
             entry("Forward", "forward", Action::ReplyTo(m.id.clone(), 3)),
+            entry(
+                "Forward as Attachment",
+                "paperclip",
+                Action::ReplyTo(m.id.clone(), 4),
+            ),
             Entry::Separator,
             if m.unread {
                 entry(
@@ -2611,6 +2698,19 @@ impl MailApp {
                 "trash",
                 Action::Apply(ids.clone(), Change::Move(Folder::Trash)),
             ));
+        }
+        if self.account_of(m).is_some_and(|a| a.provider != Provider::Pop3) {
+            match self.snoozed_until(m) {
+                Some(_) => entries.push(entry(
+                    "Unsnooze",
+                    "inbox",
+                    Action::Unsnooze(m.account.clone(), m.message_id.clone()),
+                )),
+                None if !matches!(m.folder, Folder::Drafts | Folder::Sent) => {
+                    entries.push(entry("Snooze…", "snooze", Action::SnoozeMenu(ids.clone())))
+                }
+                None => {}
+            }
         }
         entries.extend(self.move_folder_entry("Move to Folder…", MoveTarget::Mail(ids.clone())));
         entries.extend(self.label_entry("Labels…", MoveTarget::Mail(ids.clone())));
@@ -2888,6 +2988,7 @@ impl MailApp {
         self.filter_by = Filter::All;
         Self::set(&self.search, "", w, cx);
         self.search_open = false;
+        self.server_search = None;
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
@@ -2927,6 +3028,7 @@ impl MailApp {
             });
         }
         self.save_place();
+        self.watch_open_folder();
         self.anim += 1;
         cx.notify();
     }
@@ -3033,6 +3135,7 @@ impl MailApp {
                                 reply_to: String::new(),
                                 labels: vec![],
                                 inline: Default::default(),
+                                ..Mail::default()
                             })
                             .collect();
                         this.filter(cx);
@@ -5150,6 +5253,15 @@ impl MailApp {
             Action::PlaceSettings(place) => self.place_settings(place, w, cx),
             Action::ClosePresets => self.presets_for = None,
             Action::Dismiss => self.status.clear(),
+            Action::SnoozeMenu(ids) => self.snooze_menu(ids, w, cx),
+            Action::Unsnooze(account, message_id) => self.unsnooze(account, message_id, cx),
+            Action::SearchServer => self.search_server(cx),
+            Action::ClearServerSearch => {
+                self.server_search = None;
+                self.apply_filter(cx);
+            }
+            Action::Receipt(id, send) => self.answer_receipt(id, send, cx),
+            Action::Filters(action) => self.filter_action(action, w, cx),
         }
         self.sync_selecting();
         cx.notify();
@@ -5427,7 +5539,9 @@ impl MailApp {
         if !same {
             self.nickname_for = Some(id.clone());
             self.load_quota(&id, cx);
+            self.load_account_extras(&id, cx);
         }
+        self.populate_filter_inputs(&id, w, cx);
         let inputs = [
             self.nickname_input.clone(),
             self.login_input.clone(),
@@ -6434,6 +6548,7 @@ impl MailApp {
             if Self::value(&self.search, cx).trim().is_empty() {
                 header = header.child(self.search_hints(cx));
             }
+            header = header.children(self.server_search_bar(cx));
         }
         if self.selecting {
             header = header.child(
@@ -6604,6 +6719,20 @@ impl MailApp {
                     "trash",
                     Change::Move(Folder::Trash),
                 ))
+                .child(
+                    self.button(
+                        "bulk-snooze",
+                        "@Snooze until…",
+                        "snooze",
+                        Action::SnoozeMenu(vec![]),
+                        false,
+                        cx,
+                    )
+                    .h(px(28.))
+                    .w(px(28.))
+                    .rounded(px(7.))
+                    .bg(rgb(c.soft)),
+                )
             })
             .child(
                 self.button(
@@ -6799,6 +6928,13 @@ impl MailApp {
                                     })
                                     .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
+                            // Replied to, forwarded (here or in other apps)
+                            // and snoozed.
+                            .when(m.answered, |d| d.child(icon_el("answered", 13., c.muted)))
+                            .when(m.forwarded, |d| d.child(icon_el("forwarded", 13., c.muted)))
+                            .when(self.snoozed_until(m).is_some(), |d| {
+                                d.child(icon_el("snooze", 13., c.accent))
+                            })
                             .when(m.has_attachments(), |d| {
                                 d.child(icon_el("paperclip", 13., c.muted))
                             })
@@ -7602,17 +7738,23 @@ impl MailApp {
             .child(div().h(px(56.)).flex().items_center().child(dots))
             .into_any_element()
     }
-    fn popup_menu(&self, cx: &Context<Self>) -> AnyElement {
+    fn popup_menu(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let Some(menu) = &self.menu else {
             return div().into_any_element();
         };
+        // The whole menu fits in the window where it can: rows get shorter
+        // when there are many, and only a menu that still doesn't fit (a
+        // long folder list) scrolls.
+        let (height, row) = menu_size(&menu.entries, f32::from(window.viewport_size().height));
         let mut panel = div()
             .id("menu-panel")
             .min_w(px(200.))
-            // A long folder list scrolls rather than run off the window.
-            .max_h(px(520.))
+            .max_h(px(height))
             .overflow_y_scroll()
+            // Scrolling the menu scrolls it, rather than closing it as a
+            // scroll elsewhere does.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             // Long addresses end in an ellipsis rather than widen the menu.
             .max_w(px(380.))
             .p_1()
@@ -7657,7 +7799,7 @@ impl MailApp {
                             .id(("menu-item", i))
                             .debug_selector(|| format!("menu-item-{i}"))
                             .flex_shrink_0()
-                            .h(px(28.))
+                            .h(px(row))
                             .px_2()
                             .flex()
                             .items_center()
@@ -7850,6 +7992,8 @@ impl MailApp {
             },
             Modal::AvatarPresets(_) => "Choose a Picture",
             Modal::AliasGone(..) => "Alias No Longer Exists",
+            Modal::Snooze(ids) if ids.len() > 1 => "Snooze Messages",
+            Modal::Snooze(_) => "Snooze",
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -7864,6 +8008,7 @@ impl MailApp {
             Modal::Original => self.original_modal(cx),
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
+            Modal::Snooze(_) => self.snooze_modal(),
         };
         let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
         let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
@@ -7876,6 +8021,7 @@ impl MailApp {
                 Modal::Connect => 680.,
                 Modal::Help => 460.,
                 Modal::AvatarPresets(_) => 560.,
+                Modal::Snooze(_) => 600.,
                 Modal::RemoveAccount(_)
                 | Modal::DeleteFolder(..)
                 | Modal::Erase(_)
@@ -7997,7 +8143,7 @@ impl MailApp {
             .flex()
             .items_center()
             .gap_2();
-        if matches!(modal, Modal::Connect | Modal::Settings) {
+        if matches!(modal, Modal::Connect | Modal::Settings | Modal::Snooze(_)) {
             // These carry their own buttons.
             return self.modal_frame(panel, window);
         } else if let Modal::RemoveAccount(id) = modal {
@@ -8317,7 +8463,7 @@ impl MailApp {
             .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
             .when(
                 self.menu.as_ref().is_some_and(|m| m.window.is_none()),
-                |d| d.child(self.popup_menu(cx)),
+                |d| d.child(self.popup_menu(window, cx)),
             )
     }
 }
@@ -8621,6 +8767,9 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "ban",
         "subscriptions",
         "tag",
+        "snooze",
+        "answered",
+        "forwarded",
     ]
     .contains(&name)
     {
@@ -8634,6 +8783,24 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .size_full()
             .text_color(rgb(color)),
     )
+}
+/// A popup menu's largest height and its rows' height, for a window
+/// `viewport` tall: the menu fits when it can, with rows from 28 down to 22
+/// points high; beyond that it scrolls.
+fn menu_size(entries: &[Entry], viewport: f32) -> (f32, f32) {
+    // The window margin it keeps (8 each side), and its padding and border.
+    const CHROME: f32 = 16. + 10.;
+    const SEPARATOR: f32 = 9.;
+    let items = entries.iter().filter(|e| matches!(e, Entry::Item { .. })).count() as f32;
+    let separators = entries.len() as f32 - items;
+    let available = (viewport - CHROME).max(120.);
+    let row = if items == 0. {
+        28.
+    } else {
+        ((available - separators * SEPARATOR) / items).clamp(22., 28.)
+    };
+    let needed = items * row + separators * SEPARATOR + 10.;
+    (needed.min(available + 10.), row)
 }
 /// The alias a sent message went out as: its icon and address.
 fn alias_tag(id: &str, alias: String, c: Colors) -> Stateful<Div> {

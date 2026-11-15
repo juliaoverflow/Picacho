@@ -1,0 +1,259 @@
+//! Snoozing: a message leaves the inbox for a "Snoozed" folder on the
+//! server until a chosen time, then comes back to the inbox, unread.
+//!
+//! The times are kept on this computer and, where the server has METADATA
+//! (RFC 5464), also as a private annotation on the inbox, so Picacho on
+//! another computer wakes them too. Messages are found again by their
+//! Message-ID: their UIDs change when they move. One moved out of Snoozed
+//! by hand is simply forgotten.
+use super::*;
+
+/// The folder snoozed mail waits in.
+pub const FOLDER: &str = "Snoozed";
+/// Where the times are kept on servers with METADATA.
+const ENTRY: &str = "/private/vendor/tech.pinal.picacho/snoozed";
+
+/// A snoozed message.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Snoozed {
+    pub message_id: String,
+    pub subject: String,
+    pub sender: String,
+    /// When it comes back, seconds since the epoch.
+    pub until: i64,
+    /// The server folder it waits in.
+    pub folder: String,
+}
+
+impl Backend {
+    fn snooze_key(account: &str) -> String {
+        format!("snoozed:{account}")
+    }
+    /// The account's snoozed messages, soonest first.
+    pub fn snoozed(&self, account: &str) -> Vec<Snoozed> {
+        let mut list: Vec<Snoozed> = self
+            .store
+            .preference(&Self::snooze_key(account))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        list.sort_by_key(|s| s.until);
+        list
+    }
+    fn save_snoozed(
+        &self,
+        c: Option<&mut Connection>,
+        account: &str,
+        list: &[Snoozed],
+    ) -> Result<()> {
+        let json = serde_json::to_string(list)?;
+        self.store
+            .set_preference(&Self::snooze_key(account), &json)?;
+        if let Some(c) = c
+            && c.extensions()?.metadata
+        {
+            // Best effort: the times are kept here either way.
+            let value = (!list.is_empty()).then_some(json.as_str());
+            let _ = set_metadata(&mut c.session, "INBOX", ENTRY, value);
+        }
+        Ok(())
+    }
+    /// This computer's snoozed messages and the server's (from another
+    /// computer), each message once; a time set here wins.
+    fn merged_snoozed(&self, c: &mut Connection, account: &str) -> Result<Vec<Snoozed>> {
+        let mut list = self.snoozed(account);
+        if c.extensions()?.metadata {
+            for (_, value) in get_metadata(&mut c.session, "INBOX", &[ENTRY])? {
+                let theirs: Vec<Snoozed> = value
+                    .and_then(|v| serde_json::from_str(&v).ok())
+                    .unwrap_or_default();
+                for s in theirs {
+                    if !list.iter().any(|x| x.message_id == s.message_id) {
+                        list.push(s);
+                    }
+                }
+            }
+        }
+        list.sort_by_key(|s| s.until);
+        Ok(list)
+    }
+    /// The account's Snoozed folder, made (and subscribed to) if missing.
+    fn snooze_folder(&self, c: &mut Connection, a: &Account) -> Result<String> {
+        let names = c.names(true)?.to_vec();
+        if let Some(f) = custom_folders(&names)
+            .into_iter()
+            .find(|f| f.depth == 0 && f.label.eq_ignore_ascii_case(FOLDER))
+        {
+            return Ok(f.name);
+        }
+        let namespace = c.namespace()?;
+        let name = new_folder_name(&names, a.provider, None, FOLDER, namespace.as_deref())?;
+        let wire = c.mailbox(&name)?;
+        allowed(
+            c.session.run_command_and_check_ok(format!("CREATE {wire}")),
+            || format!("create the “{FOLDER}” folder"),
+        )?;
+        subscribe(c, &name)?;
+        let folders = custom_folders(c.names(true)?);
+        self.store.save_folders(&a.id, &folders)?;
+        Ok(name)
+    }
+    /// Snoozes messages until `until`: they move to the Snoozed folder and
+    /// come back to the inbox, unread, then. Returns the folder's name.
+    pub fn snooze(&self, a: &Account, mails: &[Mail], until: i64) -> Result<String> {
+        ensure!(
+            a.provider != Provider::Pop3,
+            "Snoozing needs mail kept on the server (IMAP)."
+        );
+        ensure!(
+            until > chrono::Utc::now().timestamp(),
+            "Choose a time in the future."
+        );
+        ensure!(!mails.is_empty(), "Choose messages to snooze.");
+        ensure!(
+            mails.iter().all(|m| m.account == a.id),
+            "Message belongs to another account"
+        );
+        ensure!(
+            mails.iter().all(|m| !m.message_id.trim().is_empty()),
+            "This message has no Message-ID, so it couldn't be found again to wake it."
+        );
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let mut current = Vec::new();
+        for m in mails {
+            current.push(self.store.message(&m.id)?.unwrap_or_else(|| m.clone()));
+        }
+        self.with_imap(a, |c| {
+            self.replay_offline(c, a)?;
+            let folder = self.snooze_folder(c, a)?;
+            let moving: Vec<Mail> = current
+                .iter()
+                .filter(|m| !(m.folder == Folder::Other && m.remote_folder == folder))
+                .cloned()
+                .collect();
+            if !moving.is_empty() {
+                self.change_remote(c, a, &moving, Change::MoveTo(folder.clone()), true)?;
+            }
+            let mut list = self.merged_snoozed(c, &a.id)?;
+            for m in &current {
+                list.retain(|s| s.message_id != m.message_id);
+                list.push(Snoozed {
+                    message_id: m.message_id.trim().to_owned(),
+                    subject: m.subject.clone(),
+                    sender: m.sender.clone(),
+                    until,
+                    folder: folder.clone(),
+                });
+            }
+            self.save_snoozed(Some(c), &a.id, &list)?;
+            Ok(folder)
+        })
+    }
+    /// Brings snoozed messages back now.
+    pub fn unsnooze(&self, a: &Account, message_ids: &[String]) -> Result<Vec<Snoozed>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut list = self.snoozed(&a.id);
+        for s in &mut list {
+            if message_ids.contains(&s.message_id) {
+                s.until = now;
+            }
+        }
+        self.store
+            .set_preference(&Self::snooze_key(&a.id), &serde_json::to_string(&list)?)?;
+        self.wake_due(a)
+    }
+    /// Brings back the messages whose time has come: each moves from the
+    /// Snoozed folder to the inbox, marked unread. Returns those woken.
+    pub fn wake_due(&self, a: &Account) -> Result<Vec<Snoozed>> {
+        if a.provider == Provider::Pop3 {
+            return Ok(vec![]);
+        }
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            let list = self.merged_snoozed(c, &a.id)?;
+            let now = chrono::Utc::now().timestamp();
+            let (due, waiting): (Vec<Snoozed>, Vec<Snoozed>) =
+                list.into_iter().partition(|s| s.until <= now);
+            if due.is_empty() {
+                return Ok(vec![]);
+            }
+            let names = c.names(true)?.to_vec();
+            let mut woken = Vec::new();
+            let mut kept = waiting;
+            for s in due {
+                if !names.iter().any(|n| n.name == s.folder) {
+                    // Its folder is gone; so is the snooze.
+                    continue;
+                }
+                match self.wake(c, &a.id, &s) {
+                    Ok(true) => woken.push(s),
+                    // Moved out of Snoozed by hand: nothing to bring back.
+                    Ok(false) => {}
+                    Err(e) if crate::sync::retry::later(&e) => {
+                        kept.push(s);
+                        self.save_snoozed(None, &a.id, &kept)?;
+                        return Err(e);
+                    }
+                    Err(_) => {}
+                }
+            }
+            self.save_snoozed(Some(c), &a.id, &kept)?;
+            Ok(woken)
+        })
+    }
+    /// Moves one snoozed message back to the inbox, unread. Whether it was
+    /// still there.
+    fn wake(&self, c: &mut Connection, account: &str, s: &Snoozed) -> Result<bool> {
+        let selected = c.select(&s.folder)?;
+        let uids: Vec<u32> = c
+            .session
+            .uid_search(format!("HEADER Message-ID {}", quote(&s.message_id)?))?
+            .into_iter()
+            .collect();
+        if uids.is_empty() {
+            return Ok(false);
+        }
+        let set = uid_ranges(&uids);
+        c.session.uid_store(&set, "-FLAGS.SILENT (\\Seen)")?;
+        let inbox = c.mailbox("INBOX")?;
+        if c.extensions()?.moves {
+            c.session
+                .run_command_and_check_ok(format!("UID MOVE {set} {inbox}"))?;
+        } else {
+            c.can_erase(&uids)?;
+            c.session
+                .run_command_and_check_ok(format!("UID COPY {set} {inbox}"))?;
+            c.erase(&uids)?;
+        }
+        // The Snoozed folder's cached copies are gone from it now, and its
+        // saved count is one lower, so its next check stays incremental.
+        let prefix = format!("{account}:{}:{}:", s.folder, selected.validity);
+        let ids: Vec<String> = uids.iter().map(|u| format!("{prefix}{u}")).collect();
+        self.store.delete_ids(account, &ids)?;
+        if let Some(layout) = self
+            .layouts
+            .lock()
+            .unwrap()
+            .get_mut(&(account.to_owned(), Mailbox::Remote(s.folder.clone()).key()))
+            .filter(|l| l.validity == selected.validity)
+        {
+            layout.uids = Arc::new(
+                layout
+                    .uids
+                    .iter()
+                    .copied()
+                    .filter(|u| !uids.contains(u))
+                    .collect(),
+            );
+        }
+        if let Some(mut state) = self.store.mailbox_state(account, &s.folder)?
+            && state.validity == selected.validity
+        {
+            state.exists = state.exists.saturating_sub(uids.len() as u32);
+            self.store
+                .save_mailbox_state(account, &s.folder, Some(&state))?;
+        }
+        Ok(true)
+    }
+}

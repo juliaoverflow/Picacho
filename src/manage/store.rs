@@ -797,6 +797,7 @@ impl Store {
     /// Commits one incremental synchronization: new messages, flag changes
     /// for cached ones (by UID, within `prefix`'s generation), and removal of
     /// mail older than the account's sync window (`before`).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_changes(
         &self,
         mailbox: &Mailbox,
@@ -804,6 +805,7 @@ impl Store {
         prefix: &str,
         fresh: &[Mail],
         flags: &[FlagUpdate],
+        removed: &[String],
         before: Option<i64>,
     ) -> Result<()> {
         ensure!(
@@ -820,6 +822,9 @@ impl Store {
             unread,
             starred,
             labels,
+            answered,
+            forwarded,
+            mdn_sent,
         } in flags
         {
             let id = format!("{prefix}{uid}");
@@ -831,9 +836,14 @@ impl Store {
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
                 let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels);
-                if (mail.unread, mail.starred) != (*unread, *starred) || labels_changed {
+                let marks = (*answered, *forwarded, *mdn_sent);
+                if (mail.unread, mail.starred) != (*unread, *starred)
+                    || labels_changed
+                    || (mail.answered, mail.forwarded, mail.mdn_sent) != marks
+                {
                     mail.unread = *unread;
                     mail.starred = *starred;
+                    (mail.answered, mail.forwarded, mail.mdn_sent) = marks;
                     if let Some(labels) = labels {
                         mail.labels = labels.clone();
                     }
@@ -841,10 +851,51 @@ impl Store {
                 }
             }
         }
+        // Removed on the server (QRESYNC's VANISHED), within this generation.
+        for id in removed.iter().filter(|id| id.starts_with(prefix)) {
+            tx.execute(
+                "DELETE FROM messages WHERE id=?1 AND account=?2",
+                params![id, account],
+            )?;
+        }
         if let Some(before) = before {
             tx.execute(
                 "DELETE FROM messages WHERE account=?1 AND folder=?2 AND date < ?3",
                 params![account, mailbox.key(), before],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Sets the server's conversation ids on cached messages (IMAP THREAD).
+    pub fn set_thread_ids(&self, ids: &[(String, String)]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for (id, thread) in ids {
+            let data: Option<String> = {
+                use rusqlite::OptionalExtension;
+                tx.query_row("SELECT data FROM messages WHERE id=?1", [id], |r| r.get(0))
+                    .optional()?
+            };
+            if let Some(data) = data {
+                let mut mail: Mail = serde_json::from_str(&data)?;
+                if &mail.thread_id != thread {
+                    mail.thread_id = thread.clone();
+                    write_messages(&tx, &[mail])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Deletes cached messages by id (removed on the server).
+    pub fn delete_ids(&self, account: &str, ids: &[String]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM messages WHERE id=?1 AND account=?2",
+                params![id, account],
             )?;
         }
         tx.commit()?;
@@ -1318,6 +1369,9 @@ pub struct FlagUpdate {
     pub starred: bool,
     /// Its labels, when the server said (`None` leaves them as they were).
     pub labels: Option<Vec<String>>,
+    pub answered: bool,
+    pub forwarded: bool,
+    pub mdn_sent: bool,
 }
 /// A server mailbox as of its last synchronization: enough to ask only for
 /// what changed since (new UIDs, CONDSTORE flag changes, removals).

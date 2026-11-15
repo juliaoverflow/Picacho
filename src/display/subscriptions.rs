@@ -268,7 +268,7 @@ impl MailApp {
             move |m: &Mail| match &change {
                 Change::Read(read) => m.unread == *read,
                 Change::Move(_) | Change::MoveTo(_) => !change.moved_already(m),
-                Change::Star(_) | Change::Label(..) => false,
+                Change::Star(_) | Change::Label(..) | Change::Mark(_) => false,
             }
         };
         // The open subscription's list, and its row, change at once.
@@ -357,7 +357,7 @@ impl MailApp {
                                 "Moved {messages} from {who} to {}",
                                 this.destination_label(&account_id, &change).unwrap_or_default()
                             ),
-                            Change::Star(_) | Change::Label(..) => String::new(),
+                            Change::Star(_) | Change::Label(..) | Change::Mark(_) => String::new(),
                         };
                         this.notice(done, false, cx);
                     }

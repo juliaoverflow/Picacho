@@ -1,5 +1,5 @@
 //! Internal protocol facade for the Manage coordinator.
-pub(crate) use super::{imap::*, mime::*, pop::*};
+pub(crate) use super::{imap::*, imap_ext::*, mime::*, pop::*};
 pub const MAX_MESSAGE: usize = 25 * 1024 * 1024;
 #[cfg(test)]
 mod tests {

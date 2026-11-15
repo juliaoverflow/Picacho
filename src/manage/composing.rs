@@ -118,58 +118,34 @@ pub fn later_choices<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> Vec<(St
     out
 }
 
-/// A time typed for Send Later: "2026-11-20 14:30", "2026-11-20" (8:00),
-/// "14:30" or "2:30 pm" (today, or tomorrow once past), or "tomorrow 9:00".
-pub fn parse_later<Tz: chrono::TimeZone>(text: &str, now: chrono::DateTime<Tz>) -> Option<i64> {
-    use chrono::{Days, NaiveDate, NaiveTime};
-    let text = text.trim().to_lowercase();
-    let time = |t: &str| -> Option<NaiveTime> {
-        let t = t.trim().replace('.', ":");
-        ["%H:%M", "%H", "%I:%M %p", "%I:%M%p", "%I %p", "%I%p"]
-            .iter()
-            .find_map(|f| NaiveTime::parse_from_str(&t, f).ok())
-    };
-    let local = |date: NaiveDate, at: NaiveTime| {
+/// Snooze's choices at `now`: (label, when). Later today (in three hours)
+/// and this evening while the day has room, tomorrow morning, this weekend
+/// (Saturday morning, unless it is the weekend already) and next week
+/// (Monday morning).
+pub fn snooze_choices<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> Vec<(String, i64)> {
+    use chrono::{Datelike, Days, Timelike};
+    let at = |days: u64, hour: u32| -> Option<i64> {
+        let date = now.date_naive().checked_add_days(Days::new(days))?;
         now.timezone()
-            .from_local_datetime(&date.and_time(at))
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0)?)
             .earliest()
             .map(|t| t.timestamp())
     };
-    let today = now.date_naive();
-    let eight = NaiveTime::from_hms_opt(8, 0, 0)?;
-    if let Some(rest) = text.strip_prefix("tomorrow") {
-        let at = if rest.trim().is_empty() {
-            eight
-        } else {
-            time(
-                rest.trim_start_matches([' ', ','])
-                    .trim_start_matches("at ")
-                    .trim(),
-            )?
-        };
-        return local(today.checked_add_days(Days::new(1))?, at);
+    let mut out = Vec::new();
+    if now.hour() < 18 {
+        out.extend(at(0, now.hour() + 3).map(|t| ("Later today".to_owned(), t)));
     }
-    // A date, with or without a time.
-    let (date, rest) = match text.split_once([' ', 'T', 't']) {
-        Some((d, r)) => (d, r),
-        None => (text.as_str(), ""),
-    };
-    if let Ok(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") {
-        let at = if rest.trim().is_empty() {
-            eight
-        } else {
-            time(rest)?
-        };
-        return local(date, at);
+    if now.hour() < 17 {
+        out.extend(at(0, 19).map(|t| ("This evening".to_owned(), t)));
     }
-    // A time alone: the next one.
-    let at = time(&text)?;
-    let candidate = local(today, at)?;
-    if candidate > now.timestamp() {
-        Some(candidate)
-    } else {
-        local(today.checked_add_days(Days::new(1))?, at)
+    out.extend(at(1, 8).map(|t| ("Tomorrow".to_owned(), t)));
+    let weekday = now.weekday().num_days_from_monday() as u64;
+    if weekday < 4 {
+        out.extend(at(5 - weekday, 8).map(|t| ("This weekend".to_owned(), t)));
     }
+    out.extend(at(7 - weekday, 8).map(|t| ("Next week".to_owned(), t)));
+    out.dedup_by_key(|(_, t)| *t);
+    out
 }
 
 /// When a scheduled message goes, as a sentence part: "today at 15:00",
@@ -201,7 +177,7 @@ mod tests {
     use chrono::TimeZone as _;
 
     #[test]
-    fn send_later_offers_sensible_times_and_reads_typed_ones() {
+    fn send_later_offers_sensible_times() {
         let tz = chrono::FixedOffset::east_opt(3600).unwrap();
         // Wednesday, November 19 2025, 10:20.
         let now = tz.with_ymd_and_hms(2025, 11, 19, 10, 20, 0).unwrap();
@@ -227,25 +203,6 @@ mod tests {
         // In the evening, later today isn't offered.
         let evening = tz.with_ymd_and_hms(2025, 11, 19, 20, 0, 0).unwrap();
         assert_eq!(super::later_choices(evening)[0].0, "Tomorrow morning");
-        // Typed times.
-        assert_eq!(
-            super::parse_later("2025-11-21 14:30", now),
-            Some(at(21, 14, 30))
-        );
-        assert_eq!(super::parse_later("2025-11-21", now), Some(at(21, 8, 0)));
-        assert_eq!(super::parse_later("15:45", now), Some(at(19, 15, 45)));
-        assert_eq!(
-            super::parse_later("9:00", now),
-            Some(at(20, 9, 0)),
-            "past today: tomorrow"
-        );
-        assert_eq!(super::parse_later("2:30 pm", now), Some(at(19, 14, 30)));
-        assert_eq!(
-            super::parse_later("tomorrow 7:15", now),
-            Some(at(20, 7, 15))
-        );
-        assert_eq!(super::parse_later("Tomorrow", now), Some(at(20, 8, 0)));
-        assert_eq!(super::parse_later("next week", now), None);
         assert_eq!(super::describe_later(at(19, 15, 0), now), "today at 15:00");
         assert_eq!(super::describe_later(at(20, 8, 0), now), "tomorrow at 8:00");
         assert_eq!(
@@ -255,6 +212,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn snooze_offers_sensible_times() {
+        let tz = chrono::FixedOffset::east_opt(0).unwrap();
+        // Wednesday, November 19 2025, 10:20.
+        let now = tz.with_ymd_and_hms(2025, 11, 19, 10, 20, 0).unwrap();
+        let labels: Vec<String> = snooze_choices(now).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, ["Later today", "This evening", "Tomorrow", "This weekend", "Next week"]);
+        // Saturday evening: no weekend, no later today.
+        let saturday = tz.with_ymd_and_hms(2025, 11, 22, 21, 0, 0).unwrap();
+        let labels: Vec<String> = snooze_choices(saturday).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, ["Tomorrow", "Next week"]);
+    }
 
     #[test]
     fn older_or_partial_preferences_take_defaults() {
