@@ -389,6 +389,9 @@ impl MailApp {
         } else {
             sub.name.clone()
         };
+        // Finding a trustworthy way to unsubscribe can take a few seconds
+        // (the sender's signature is checked against its DNS); say so now.
+        self.notice(format!("Checking how to unsubscribe from {who}…"), false, cx);
         let window = w.window_handle();
         let planning = account.clone();
         self.task(
@@ -522,7 +525,7 @@ impl MailApp {
         .text_size(px(12.))
         .border_1()
         .border_color(rgb(c.border))
-        .when(busy, |d| d.opacity(0.6))
+        .when(busy, |d| d.child(spinner(12., c.muted)))
     }
     /// In an email from a subscription: a line offering to unsubscribe.
     pub(super) fn unsubscribe_banner(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
@@ -872,20 +875,6 @@ impl MailApp {
         if all && let Some(a) = self.accounts.iter().find(|a| a.id == sub.account) {
             detail = format!("{detail} · {}", a.label());
         }
-        let badge = |text: String, accent: bool| {
-            div()
-                .flex_shrink_0()
-                .px(px(7.))
-                .h(px(20.))
-                .flex()
-                .items_center()
-                .rounded_full()
-                .bg(rgb(c.soft))
-                .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(if accent { c.accent } else { c.muted }))
-                .child(text)
-        };
         let open = sub.clone();
         let menu = sub.clone();
         let current = self.subs_sender.as_ref().is_some_and(|s| s.key() == sub.key());
@@ -934,36 +923,40 @@ impl MailApp {
                             .truncate()
                             .child(detail),
                     )
-                    // When its latest message came, under its address, as
-                    // the mail list shows times.
-                    .when(sub.latest > 0, |d| {
-                        d.child(
-                            div()
-                                .id(SharedString::from(format!("subscription-{index}-latest")))
-                                .debug_selector(move || format!("subscription-{index}-latest"))
-                                .text_size(px(11.))
-                                .text_color(rgb(if sub.unread > 0 { c.accent } else { c.muted }))
-                                .font_weight(if sub.unread > 0 {
-                                    FontWeight::SEMIBOLD
+                    // When its latest message came and how much there is,
+                    // under its address. Counts used to be badges beside the
+                    // name, which left no room for it in a narrow list.
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("subscription-{index}-latest")))
+                            .debug_selector(move || format!("subscription-{index}-latest"))
+                            .flex()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .text_color(rgb(c.muted))
+                            .when(sub.unread > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(rgb(c.accent))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("{} unread · ", fmt_count(sub.unread))),
+                                )
+                            })
+                            .child(div().min_w_0().truncate().child(format!(
+                                "{} message{}{}",
+                                fmt_count(sub.count),
+                                if sub.count == 1 { "" } else { "s" },
+                                if sub.latest > 0 {
+                                    format!(" · Last email {}", date_short(sub.latest))
                                 } else {
-                                    FontWeight::NORMAL
-                                })
-                                .truncate()
-                                .child(format!("Last email {}", date_short(sub.latest))),
-                        )
-                    }),
+                                    String::new()
+                                }
+                            ))),
+                    ),
             )
-            .when(sub.unread > 0, |d| {
-                d.child(badge(format!("{} unread", fmt_count(sub.unread)), true))
-            })
-            .child(badge(
-                format!(
-                    "{} message{}",
-                    fmt_count(sub.count),
-                    if sub.count == 1 { "" } else { "s" }
-                ),
-                false,
-            ))
             .child(self.subscription_menu_button(format!("subscription-{index}-menu"), sub, cx))
             .child(
                 div()
