@@ -101,7 +101,7 @@ After signing in, a session sends `ID` where offered and turns on
 
 `imap-proto` doesn't model NAMESPACE, QUOTA, MYRIGHTS, ID or ENABLED replies,
 and `imap` 2.4 mistakes any untagged line it can't parse for the server
-leaving; the vendored patch keeps them as text (`Response::Other`).
+leaving; the patched `imap-proto` keeps them as text (`Response::Other`).
 
 ## Push (IDLE)
 
@@ -188,7 +188,8 @@ message whose id is already downloading, copy content already downloaded
 under another label (`Store::share_gmail_raw`), and opening a message uses
 such a copy instead of the network. The id is server-assigned, so unlike
 Message-ID a sender cannot make two different messages share one. Parsing
-it needs the vendored `imap-proto` patch (`vendor/imap-proto/README.md`).
+it needs the patched `imap-proto`
+([Picacho-Patches](https://github.com/pinaltech/Picacho-Patches/tree/HEAD/imap-proto)).
 
 Gmail allows 2,500 MB of IMAP downloads per account per day and then slows
 the account to a crawl. Background traffic (headers and bodies) is counted per
