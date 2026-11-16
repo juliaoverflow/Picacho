@@ -1,7 +1,10 @@
 import AppKit
 
 // Draws the Picacho logo (assets/brand/picacho.svg) on a light app-icon tile.
+// `swift scripts/icon.swift <dir>` writes a macOS iconset; with `ios` after the
+// folder it writes AppIcon.png, a full-bleed 1024-pixel tile iOS rounds itself.
 let output = CommandLine.arguments[1]
+let ios = CommandLine.arguments.dropFirst(2).first == "ios"
 try FileManager.default.createDirectory(atPath: output, withIntermediateDirectories: true)
 
 func color(_ hex: UInt32) -> CGColor {
@@ -38,16 +41,21 @@ let halves = CGMutablePath()
 halves.addPath(polygon([(0, 0), (640, 0), (640, 196), (320, 262), (0, 196)]))
 halves.addPath(polygon([(0, 216), (320, 282), (640, 216), (640, 540), (0, 540)]))
 
-for (name, pixels) in [("icon_16x16",16),("icon_16x16@2x",32),("icon_32x32",32),("icon_32x32@2x",64),("icon_128x128",128),("icon_128x128@2x",256),("icon_256x256",256),("icon_256x256@2x",512),("icon_512x512",512),("icon_512x512@2x",1024)] {
+let sizes = ios ? [("AppIcon", 1024)] : [("icon_16x16",16),("icon_16x16@2x",32),("icon_32x32",32),("icon_32x32@2x",64),("icon_128x128",128),("icon_128x128@2x",256),("icon_256x256",256),("icon_256x256@2x",512),("icon_512x512",512),("icon_512x512@2x",1024)]
+for (name, pixels) in sizes {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
     let context = NSGraphicsContext.current!.cgContext
     context.scaleBy(x: CGFloat(pixels) / 1024, y: CGFloat(pixels) / 1024)
     // Tile, with the inset and corner radius of macOS app icons.
-    let tile = CGPath(roundedRect: CGRect(x: 100, y: 100, width: 824, height: 824), cornerWidth: 185, cornerHeight: 185, transform: nil)
+    let tile = ios
+        ? CGPath(rect: CGRect(x: 0, y: 0, width: 1024, height: 1024), transform: nil)
+        : CGPath(roundedRect: CGRect(x: 100, y: 100, width: 824, height: 824), cornerWidth: 185, cornerHeight: 185, transform: nil)
     context.saveGState()
-    context.setShadow(offset: CGSize(width: 0, height: -10), blur: 24, color: CGColor(gray: 0, alpha: 0.28))
+    if !ios {
+        context.setShadow(offset: CGSize(width: 0, height: -10), blur: 24, color: CGColor(gray: 0, alpha: 0.28))
+    }
     context.addPath(tile)
     context.setFillColor(color(0xffffff))
     context.fillPath()
@@ -55,7 +63,7 @@ for (name, pixels) in [("icon_16x16",16),("icon_16x16@2x",32),("icon_32x32",32),
     context.saveGState()
     context.addPath(tile)
     context.clip()
-    context.drawLinearGradient(gradient([(0, 0xffffff), (1, 0xe6f2ea)]), start: CGPoint(x: 0, y: 924), end: CGPoint(x: 0, y: 100), options: [])
+    context.drawLinearGradient(gradient([(0, 0xffffff), (1, 0xe6f2ea)]), start: CGPoint(x: 0, y: ios ? 1024 : 924), end: CGPoint(x: 0, y: ios ? 0 : 100), options: [])
     context.restoreGState()
     // Logo: flip to SVG coordinates and fit 600 units wide, centered.
     context.translateBy(x: 0, y: 1024)

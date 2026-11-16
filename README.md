@@ -82,6 +82,33 @@ been run on a device. Not yet on Android:
 - Proton: security keys and phone passkeys (sign-in uses the authenticator
   app's code instead), and human verification (CAPTCHA).
 
+### iOS (experimental)
+
+On iOS, the same library (`src/ios.rs`) is linked statically into a small
+host app, `packaging/ios`, whose scene gives gpui-mobile's view controller a
+window and drives its frames. It needs Xcode signed in to an Apple account
+(Settings > Accounts), [XcodeGen](https://github.com/yonaskolb/XcodeGen) and
+the Rust target:
+
+```sh
+rustup target add aarch64-apple-ios
+brew install xcodegen
+sh scripts/bundle-ios.sh
+```
+
+This builds the app, signs it with your first Xcode team and installs and
+opens it on the connected iPhone or iPad (Developer Mode on). `--debug`
+builds faster; `--no-install` only builds. `PICACHO_IOS_TEAM`,
+`PICACHO_IOS_BUNDLE_ID` and `PICACHO_IOS_DEVICE` choose another team,
+bundle identifier or device. On first install, trust the developer in
+Settings > General > VPN & Device Management. With a free Apple account the
+app runs for 7 days before it must be installed again.
+
+Credentials are kept in the app's own Keychain. Not yet on iOS: system
+notifications, Proton's security keys, phone passkeys and human
+verification (as on Android), and app icons other than the 1024-pixel one
+(`swift scripts/icon.swift packaging/ios/Assets.xcassets/AppIcon.appiconset ios`).
+
 ### Built-in sign-in
 
 Browser sign-in uses Picacho's own registration with each provider. Set these when building (the same variables at run time override them, for development):

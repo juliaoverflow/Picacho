@@ -112,6 +112,9 @@ const REPLY_TO: usize = 3;
 pub(super) struct Composer {
     pub(super) draft: Draft,
     pub(super) placement: Placement,
+    /// Shown full screen on a phone or tablet, with touch-sized controls
+    /// (display-mobile).
+    pub(super) mobile: bool,
     pub(super) minimized: bool,
     /// Top-left inside the main window once moved; until then it sits at the
     /// lower right.
@@ -180,8 +183,15 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Software keyboards (phones) take their hints from these: Next
+        // between the address fields, corrections and capitals only where
+        // people write sentences.
         let field = |placeholder: &str, window: &mut Window, cx: &mut Context<Self>| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.to_owned()))
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder.to_owned())
+                    .input_action(TextInputAction::Next)
+            })
         };
         let recipients = [
             field("Recipients", window, cx),
@@ -189,10 +199,19 @@ impl Composer {
             field("Bcc", window, cx),
             field("Where replies go", window, cx),
         ];
-        let subject = field("Subject", window, cx);
+        let subject = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Subject")
+                .input_action(TextInputAction::Next)
+                .autocorrect(true)
+                .autocapitalize(Autocapitalize::Sentences)
+        });
         let from_filter = field("Find an address", window, cx);
         let body = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("Write your message…")
+            TextareaState::new(window, cx)
+                .placeholder("Write your message…")
+                .autocorrect(true)
+                .autocapitalize(Autocapitalize::Sentences)
         });
         let values = [&draft.to, &draft.cc, &draft.bcc, &draft.reply_to];
         for (state, value) in recipients.iter().zip(values) {
@@ -248,6 +267,7 @@ impl Composer {
         Self {
             draft,
             placement,
+            mobile: false,
             minimized: false,
             origin: None,
             grab: Point::default(),
@@ -307,6 +327,35 @@ impl Composer {
                 s.set_cursor_position(gpui_component::input::Position::new(0, 0), window, cx);
             }),
         }
+    }
+
+    /// Shows the formatted message as it will look, or the editor again.
+    pub(super) fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        if self.draft.formatted {
+            self.preview = !self.preview;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn previewing(&self) -> bool {
+        self.preview && self.draft.formatted
+    }
+
+    /// The text fields a phone's keyboard serves, with the keyboard each
+    /// wants: addresses get the email layout.
+    pub(super) fn keyboard_fields(&self, cx: &App) -> Vec<(FocusHandle, super::mobile::Keys)> {
+        let mut out: Vec<_> = self
+            .recipients
+            .iter()
+            .chain([&self.from_filter])
+            .map(|s| (s.read(cx).focus_handle(cx), super::mobile::Keys::Email))
+            .collect();
+        out.push((self.subject.read(cx).focus_handle(cx), super::mobile::Keys::Text));
+        out.push((self.body.read(cx).focus_handle(cx), super::mobile::Keys::Text));
+        if let Some(focus) = self.later_picker.as_ref().and_then(|p| p.read(cx).typed_focus(cx)) {
+            out.push((focus, super::mobile::Keys::Text));
+        }
+        out
     }
 
     /// The draft as currently written.
@@ -708,8 +757,14 @@ impl Composer {
         let colors = self.colors;
         let at = self.draft.send_at;
         let parser = self.when.clone();
+        let mobile = self.mobile;
+        // On a phone the page covers the fields: let go of the one being
+        // typed in, and with it the keyboard.
+        if mobile {
+            self.focus.focus(window, cx);
+        }
         let picker = cx.new(|cx| {
-            let picker = DateTimePicker::new("later", "Send", presets, colors);
+            let picker = DateTimePicker::new("later", "Send", presets, colors).phone(mobile);
             let picker = match at {
                 Some(at) => picker.at(at),
                 None => picker,
@@ -791,6 +846,111 @@ impl Composer {
     }
 
     /// Send Later's menu: quick choices, and a calendar and time of day.
+    /// A phone's formatting switch: says what it is and whether it is on,
+    /// where the desktop has an icon with a tooltip.
+    fn rich_text_toggle(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        let on = self.draft.formatted;
+        div()
+            .id("compose-format")
+            .debug_selector(|| "compose-format".into())
+            .h(px(super::mobile::TOUCH))
+            .pl_3()
+            .pr(px(6.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(if on { c.accent } else { c.border }))
+            .when(on, |d| d.bg(rgb(c.soft)))
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .text_size(px(14.))
+            .text_color(rgb(if on { c.accent } else { c.muted }))
+            .child("Rich text")
+            // A small switch, so on and off read at a glance.
+            .child(
+                div()
+                    .w(px(30.))
+                    .h(px(18.))
+                    .p(px(2.))
+                    .rounded_full()
+                    .bg(rgb(if on { c.accent } else { c.border }))
+                    .flex()
+                    .when(on, |d| d.justify_end())
+                    .child(div().size(px(14.)).rounded_full().bg(rgb(0xffffff))),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|t, _, _, cx| {
+                cx.stop_propagation();
+                let on = !t.draft.formatted;
+                t.set_formatted(on, cx)
+            }))
+    }
+
+    /// Whether Send Later's page is open.
+    pub(super) fn later_open(&self) -> bool {
+        self.later_open
+    }
+
+    /// Send Later on a phone: a page covering the message, with its own bar.
+    fn later_page(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        div()
+            .id("later-menu")
+            .debug_selector(|| "later-menu".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgb(c.surface))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(52.))
+                    .flex_shrink_0()
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .child(
+                        div()
+                            .id("later-back")
+                            .size(px(super::mobile::TOUCH))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|s| s.opacity(0.5))
+                            .child(icon_el("chevron-left", 26., c.accent))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_later();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Send Later"),
+                    ),
+            )
+            // The picker scrolls its middle and keeps its buttons in view.
+            .child(
+                div()
+                    .id("later-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(super::mobile::GUTTER))
+                    .flex()
+                    .flex_col()
+                    .children(self.later_picker.clone()),
+            )
+    }
+
     fn later_menu(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
         div()
@@ -905,7 +1065,8 @@ impl Composer {
         div()
             .id(id)
             .debug_selector(move || format!("compose-{id}"))
-            .size(px(28.))
+            // A fingertip needs a bigger target than a pointer.
+            .size(px(if self.mobile { super::mobile::TOUCH } else { 28. }))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -915,7 +1076,7 @@ impl Composer {
             .when(on, |d| d.bg(rgb(c.soft)))
             .hover(move |s| s.bg(rgb(c.border)))
             .active(|s| s.opacity(0.7))
-            .child(icon_el(icon, 15., if on { c.accent } else { c.muted }))
+            .child(icon_el(icon, if self.mobile { 20. } else { 15. }, if on { c.accent } else { c.muted }))
             .tooltip(move |w, cx| Tooltip::new(keys(tip)).build(w, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, w, cx| {
@@ -1113,7 +1274,7 @@ impl Composer {
     fn row(&self, label: &'static str, field: impl IntoElement) -> Div {
         let c = self.colors;
         div()
-            .h(px(38.))
+            .h(px(if self.mobile { super::mobile::TOUCH + 4. } else { 38. }))
             .flex_shrink_0()
             .px_4()
             .flex()
@@ -1821,7 +1982,8 @@ impl Composer {
                     .appearance(false)
                     .disabled(self.sending)
                     .h_full()
-                    .text_size(px(14.)),
+                    // Phones read body text at their system size (17pt).
+                    .text_size(px(if self.mobile { 17. } else { 14. })),
             )
             .bg(rgb(c.surface))
             .into_any_element()
@@ -1903,7 +2065,7 @@ impl Composer {
         let send = div()
             .id("compose-send")
             .debug_selector(|| "compose-send".into())
-            .h(px(34.))
+            .h(px(if self.mobile { super::mobile::TOUCH } else { 34. }))
             .px_4()
             .flex()
             .items_center()
@@ -1938,7 +2100,7 @@ impl Composer {
                 .when(!self.saved, |d| d.child("Editing…"))
         };
         div()
-            .h(px(52.))
+            .h(px(if self.mobile { 60. } else { 52. }))
             .flex_shrink_0()
             .px_3()
             .relative()
@@ -1966,7 +2128,7 @@ impl Composer {
                     cx.notify();
                 },
             ))
-            .when(self.later_open, |d| {
+            .when(self.later_open && !self.mobile, |d| {
                 d.child(deferred(self.later_menu(cx)).with_priority(2))
             })
             .child(div().w(px(6.)))
@@ -1978,21 +2140,25 @@ impl Composer {
                 cx,
                 |t, _, cx| t.attach(cx),
             ))
-            .child(self.icon_button(
-                "format",
-                "format",
-                if self.draft.formatted {
-                    "Formatting on: sent with bold, lists and links"
-                } else {
-                    "Plain text: turn formatting on"
-                },
-                self.draft.formatted,
-                cx,
-                |t, _, cx| {
-                    let on = !t.draft.formatted;
-                    t.set_formatted(on, cx)
-                },
-            ))
+            .child(if self.mobile {
+                self.rich_text_toggle(cx)
+            } else {
+                self.icon_button(
+                    "format",
+                    "format",
+                    if self.draft.formatted {
+                        "Formatting on: sent with bold, lists and links"
+                    } else {
+                        "Plain text: turn formatting on"
+                    },
+                    self.draft.formatted,
+                    cx,
+                    |t, _, cx| {
+                        let on = !t.draft.formatted;
+                        t.set_formatted(on, cx)
+                    },
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -2021,6 +2187,7 @@ impl Render for Composer {
             .key_context("Composer")
             .track_focus(&self.focus)
             .debug_selector(|| "composer".into())
+            .relative()
             .flex()
             .flex_col()
             .when(!inline, |d| d.size_full())
@@ -2038,16 +2205,13 @@ impl Render for Composer {
             .on_action(cx.listener(|t, _: &Heading, w, cx| t.prefix_lines(Lines::Heading, w, cx)))
             .on_action(cx.listener(|t, _: &SaveDraft, _, cx| t.save(cx)))
             .on_action(cx.listener(|t, _: &SendDraft, w, cx| t.request_send(w, cx)))
-            .on_action(cx.listener(|t, _: &TogglePreview, _, cx| {
-                if t.draft.formatted {
-                    t.preview = !t.preview;
-                    cx.notify();
-                }
-            }))
+            .on_action(cx.listener(|t, _: &TogglePreview, _, cx| t.toggle_preview(cx)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.add_files(paths.paths().to_vec(), cx)
             }))
-            .child(if self.placement == Placement::Window {
+            .child(if self.mobile {
+                self.mobile_header(window, cx)
+            } else if self.placement == Placement::Window {
                 self.window_header(window, cx)
             } else {
                 self.header(cx)
@@ -2076,6 +2240,8 @@ impl Render for Composer {
         root.child(self.body_view(cx))
             .children(self.attachments(cx))
             .child(self.footer(cx))
+            // A phone shows Send Later as a page over the message.
+            .when(self.mobile && self.later_open, |d| d.child(self.later_page(cx)))
     }
 }
 

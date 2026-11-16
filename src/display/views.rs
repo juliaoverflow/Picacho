@@ -412,7 +412,7 @@ impl MailApp {
     }
 
     /// A view's name, what its tooltip says, and its icon.
-    fn view_title(&self, id: &str) -> Option<(String, String, &'static str)> {
+    pub(super) fn view_title(&self, id: &str) -> Option<(String, String, &'static str)> {
         if id == ALL_MAIL {
             return Some((
                 "All Accounts".into(),
@@ -433,14 +433,14 @@ impl MailApp {
             "alias",
         ))
     }
-    fn view_folders(id: &str) -> &'static [Folder] {
+    pub(super) fn view_folders(id: &str) -> &'static [Folder] {
         if id == ALL_MAIL {
             &Folder::ALL
         } else {
             &ALIAS_FOLDERS
         }
     }
-    fn view_entries(&self, id: &str) -> Vec<Entry> {
+    pub(super) fn view_entries(&self, id: &str) -> Vec<Entry> {
         let id = id.to_owned();
         let mut entries = vec![
             entry("Refresh", "refresh", Action::RefreshAccount(id.clone())),
