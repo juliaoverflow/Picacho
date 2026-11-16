@@ -110,11 +110,13 @@ impl Change {
                 m.remote_folder = name.clone();
             }
             Self::Label(label, add) => {
-                m.labels.retain(|l| l != label);
+                let mut labels: Vec<String> =
+                    m.labels().iter().filter(|l| *l != label).cloned().collect();
                 if *add {
-                    m.labels.push(label.clone());
-                    m.labels.sort();
+                    labels.push(label.clone());
+                    labels.sort();
                 }
+                m.set_labels(labels);
             }
             Self::Mark(Mark::Answered) => m.answered = true,
             Self::Mark(Mark::Forwarded) => m.forwarded = true,
@@ -126,7 +128,7 @@ impl Change {
         match self {
             Self::Read(read) => m.unread != *read,
             Self::Star(star) => m.starred == *star,
-            Self::Label(label, add) => m.labels.contains(label) == *add,
+            Self::Label(label, add) => m.labels().contains(label) == *add,
             Self::Mark(Mark::Answered) => m.answered,
             Self::Mark(Mark::Forwarded) => m.forwarded,
             Self::Mark(Mark::ReceiptHandled) => m.mdn_sent,
@@ -819,7 +821,7 @@ impl Backend {
                 m.html = r.html.clone();
                 m.inline = r.inline.clone();
                 m.snippet = r.snippet.clone();
-                m.attachments = r.attachments.clone();
+                m.set_attachments(r.attachments().to_vec());
                 m.has_attachments = r.has_attachments;
             }
         }
@@ -1522,7 +1524,7 @@ impl Backend {
                 m.forwarded = row.forwarded();
                 m.mdn_sent = row.mdn_sent();
                 if let Some(labels) = row.labels(gmail) {
-                    m.labels = labels;
+                    m.set_labels(labels);
                 }
                 result.push(m);
             }
@@ -1658,12 +1660,12 @@ impl Backend {
             m.starred = row.flagged();
             m.size = row.size.unwrap_or(0);
             m.gmail_id = row.gmail_id.unwrap_or(0);
-            m.labels = row.labels(gmail).unwrap_or_default();
+            m.set_labels(row.labels(gmail).unwrap_or_default());
             m.answered = row.answered();
             m.forwarded = row.forwarded();
             m.mdn_sent = row.mdn_sent();
-            m.thread_id = row.thread.clone().unwrap_or_default();
-            m.saved = row.save_date.unwrap_or_default();
+            m.set_thread_id(row.thread.clone().unwrap_or_default());
+            m.set_saved(row.save_date.unwrap_or_default());
             if let Some(preview) = row.preview.as_deref().filter(|p| !p.is_empty()) {
                 m.snippet = preview.to_owned();
             }
@@ -1757,14 +1759,16 @@ impl Backend {
             // those stay. The body comes from `next`: zero-access mail keeps
             // none in the cache.
             return Ok(self.store.refresh_message(&kept)?.map_or(next.clone(), |current| {
-                Mail {
+                let labels = current.labels().to_vec();
+                let mut next = Mail {
                     unread: current.unread,
                     starred: current.starred,
                     folder: current.folder,
                     remote_folder: current.remote_folder,
-                    labels: current.labels,
                     ..next
-                }
+                };
+                next.set_labels(labels);
+                next
             }));
         }
         let waiting = self.wait_for(&a.id);
@@ -1845,7 +1849,7 @@ impl Backend {
         next.starred = m.starred;
         next.size = m.size;
         // What only the server's listing says, not the message's source.
-        next.labels = m.labels.clone();
+        next.set_labels(m.labels().to_vec());
         if next.gmail_id == 0 {
             next.gmail_id = m.gmail_id;
         }
@@ -1854,7 +1858,7 @@ impl Backend {
             kept.body = None;
             kept.html = None;
             kept.snippet.clear();
-            kept.attachments.clear();
+            kept.set_attachments(Vec::new());
             self.readable
                 .lock()
                 .unwrap()
@@ -2515,12 +2519,12 @@ impl Backend {
                             continue;
                         }
                         // Keep summaries small: list views load every row's JSON.
-                        if let Ok(parsed) =
+                        if let Ok(mut parsed) =
                             parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid)
                         {
                             let mut next = (*m).clone();
-                            next.has_attachments = !parsed.attachments.is_empty();
-                            next.attachments = parsed.attachments;
+                            next.has_attachments = !parsed.attachments().is_empty();
+                            next.set_attachments(parsed.take_attachments());
                             if next.snippet.is_empty() {
                                 next.snippet = parsed.snippet;
                             }
@@ -3032,14 +3036,14 @@ impl Backend {
             reply_to: header("Reply-To").trim().to_owned(),
             ..Draft::default()
         };
-        if !m.attachments.is_empty() {
+        if !m.attachments().is_empty() {
             let dir = self.draft_files(id);
             std::fs::create_dir_all(&dir)?;
             let mut leaves = Vec::new();
             collect_leaves(&parsed, &mut leaves);
             // Names already given, lowercase as case-insensitive disks see them.
             let mut used = std::collections::HashSet::new();
-            for (i, attachment) in m.attachments.iter().enumerate() {
+            for (i, attachment) in m.attachments().iter().enumerate() {
                 let Some(leaf) = leaves.get(attachment.part) else {
                     continue;
                 };
@@ -3061,7 +3065,7 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         // A message too large to download whole: just this part.
-        if let Some(attachment) = m.attachments.iter().find(|x| x.part == part && !x.section.is_empty())
+        if let Some(attachment) = m.attachments().iter().find(|x| x.part == part && !x.section.is_empty())
             && self.store.raw(&m.id)?.is_none()
         {
             let attachment = attachment.clone();

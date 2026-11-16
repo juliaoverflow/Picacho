@@ -394,14 +394,15 @@ impl Store {
             return Ok(None);
         };
         let current: Mail = serde_json::from_str(&current)?;
-        let next = Mail {
+        let labels = current.labels().to_vec();
+        let mut next = Mail {
             unread: current.unread,
             starred: current.starred,
             folder: current.folder,
             remote_folder: current.remote_folder,
-            labels: current.labels,
             ..read.clone()
         };
+        next.set_labels(labels);
         write_messages(&tx, std::slice::from_ref(&next))?;
         tx.commit()?;
         Ok(Some(next))
@@ -946,7 +947,7 @@ impl Store {
             };
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
-                let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels);
+                let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels());
                 let marks = (*answered, *forwarded, *mdn_sent);
                 if (mail.unread, mail.starred) != (*unread, *starred)
                     || labels_changed
@@ -956,7 +957,7 @@ impl Store {
                     mail.starred = *starred;
                     (mail.answered, mail.forwarded, mail.mdn_sent) = marks;
                     if let Some(labels) = labels {
-                        mail.labels = labels.clone();
+                        mail.set_labels(labels.clone());
                     }
                     write_messages(&tx, &[mail])?;
                 }
@@ -990,8 +991,8 @@ impl Store {
             };
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
-                if &mail.thread_id != thread {
-                    mail.thread_id = thread.clone();
+                if mail.thread_id() != thread.as_str() {
+                    mail.set_thread_id(thread.clone());
                     write_messages(&tx, &[mail])?;
                 }
             }

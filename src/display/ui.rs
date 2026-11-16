@@ -3294,7 +3294,8 @@ impl MailApp {
                         this.messages = this
                             .drafts
                             .iter()
-                            .map(|d| Mail {
+                            .map(|d| {
+                                let mut m = Mail {
                                 id: d.id.clone(),
                                 account: d.account.clone(),
                                 folder: Folder::Drafts,
@@ -3337,9 +3338,6 @@ impl MailApp {
                                 size: 0,
                                 body: Some(d.body.clone()),
                                 html: None,
-                                attachments: vec![],
-                                cc: d.cc.clone(),
-                                references: String::new(),
                                 message_id: String::new(),
                                 has_attachments: !d.attachments.is_empty(),
                                 gmail_id: 0,
@@ -3347,9 +3345,11 @@ impl MailApp {
                                 one_click: false,
                                 pending: false,
                                 reply_to: String::new(),
-                                labels: vec![],
                                 inline: Default::default(),
                                 ..Mail::default()
+                                };
+                                m.set_cc(d.cc.clone());
+                                m
                             })
                             .collect();
                         this.filter(cx);
@@ -3692,13 +3692,13 @@ impl MailApp {
                     .map(|f| f.name.clone()),
             );
         }
-        known.extend(mails.iter().flat_map(|m| m.labels.iter().cloned()));
+        known.extend(mails.iter().flat_map(|m| m.labels().iter().cloned()));
         known.sort_by_key(|l| l.to_lowercase());
         known.dedup();
         let mut entries: Vec<Entry> = known
             .into_iter()
             .map(|label| {
-                let all = mails.iter().all(|m| m.labels.contains(&label));
+                let all = mails.iter().all(|m| m.labels().contains(&label));
                 let shown = if gmail {
                     crate::sync::transport::decode_name(&label)
                 } else {
@@ -4530,7 +4530,7 @@ impl MailApp {
         let Some(m) = self.selected_mail() else {
             return;
         };
-        let Some(a) = m.attachments.get(index).cloned() else {
+        let Some(a) = m.attachments().get(index).cloned() else {
             return;
         };
         let Some(account) = self.account_of(&m) else {
@@ -10244,12 +10244,15 @@ mod tests {
         let (view, cx, _) = two_accounts(cx);
         let (work, home) =
             view.read_with(cx, |this, _| (this.accounts[0].id.clone(), this.accounts[1].id.clone()));
-        let mail = |id: &str, account: &str, folder: Folder, labels: &[&str]| Mail {
-            id: id.into(),
-            account: account.into(),
-            folder,
-            labels: labels.iter().map(|l| (*l).into()).collect(),
-            ..Mail::default()
+        let mail = |id: &str, account: &str, folder: Folder, labels: &[&str]| {
+            let mut m = Mail {
+                id: id.into(),
+                account: account.into(),
+                folder,
+                ..Mail::default()
+            };
+            m.set_labels(labels.iter().map(|l| (*l).into()).collect());
+            m
         };
         view.update(cx, |this, cx| {
             // Not this view's mail: nothing reloads it from the cache.
@@ -10326,7 +10329,7 @@ mod tests {
             this.handle(Action::SaveLabel, w, cx);
             assert!(this.modal.is_none());
             let m = this.messages.iter().find(|m| m.id == "i1").unwrap();
-            assert!(m.labels.contains(&"Urgent".to_owned()));
+            assert!(m.labels().contains(&"Urgent".to_owned()));
         });
         // The account page has the sign-in name, Reply-To and receipts.
         act(&view, Action::AccountSettings(work.clone()), cx);

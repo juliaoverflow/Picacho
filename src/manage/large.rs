@@ -148,16 +148,16 @@ impl Backend {
         next.body = body.or_else(|| Some(String::new()));
         next.html = html;
         next.has_attachments = !attachments.is_empty();
-        next.attachments = attachments;
+        next.set_attachments(attachments);
         next.partial = true;
         next.unread = m.unread;
         next.starred = m.starred;
         next.size = m.size;
-        next.labels = m.labels.clone();
+        next.set_labels(m.labels().to_vec());
         next.answered = m.answered;
         next.forwarded = m.forwarded;
         next.mdn_sent = m.mdn_sent;
-        next.thread_id = m.thread_id.clone();
+        next.set_thread_id(m.thread_id());
         next.gmail_id = m.gmail_id;
         Ok(next)
     }

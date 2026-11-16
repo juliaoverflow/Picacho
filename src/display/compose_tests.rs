@@ -350,7 +350,7 @@ fn sending_addresses_are_added_in_settings_and_offered_in_from(cx: &mut TestAppC
     view.update(cx, |this, _| {
         let m = this.messages.iter_mut().find(|m| m.id == id).unwrap();
         m.to = "Shop Desk <desk@shop.example>".into();
-        m.cc = "work@example.com, bo@example.com".into();
+        m.set_cc("work@example.com, bo@example.com");
         store.save_messages(std::slice::from_ref(m)).unwrap();
     });
     act(&view, Action::Select(id.clone()), cx);

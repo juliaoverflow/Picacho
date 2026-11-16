@@ -398,15 +398,15 @@ fn labels_come_from_gmail_labels_or_keywords() -> Result<()> {
         let synced = b.sync(&a, Folder::Inbox, 300)?;
         let m = &synced[0];
         if gmail {
-            assert_eq!(m.labels, ["Caf&AOk-", "Receipts", "Tax \"24\""]);
+            assert_eq!(m.labels(), ["Caf&AOk-", "Receipts", "Tax \"24\""]);
         } else {
             // Mail apps' own keywords aren't labels.
-            assert_eq!(m.labels, ["Work"]);
+            assert_eq!(m.labels(), ["Work"]);
         }
         let m = b.change(&a, m, Change::Label("Urgent".into(), true))?;
-        assert!(m.labels.contains(&"Urgent".to_owned()), "{:?}", m.labels);
+        assert!(m.labels().contains(&"Urgent".to_owned()), "{:?}", m.labels());
         let cached = b.store.message(&m.id)?.unwrap();
-        assert!(cached.labels.contains(&"Urgent".to_owned()));
+        assert!(cached.labels().contains(&"Urgent".to_owned()));
         if gmail {
             // Labels travel as Gmail names them (modified UTF-7).
             b.change(&a, &m, Change::Label("Caf&AOk-".into(), false))?;

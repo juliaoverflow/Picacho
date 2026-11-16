@@ -63,7 +63,7 @@ pub fn parse_message(
     let date = mailparse::dateparse(&header("Date")).unwrap_or_default();
     let subject = header("Subject");
     let has_attachments = mixed || !attachments.is_empty();
-    Ok(Mail {
+    let mut mail = Mail {
         id: id.into(),
         account: account.id.clone(),
         folder,
@@ -72,7 +72,6 @@ pub fn parse_message(
         from,
         sender,
         to: header("To"),
-        cc: header("Cc"),
         subject: if subject.is_empty() {
             "(No subject)".into()
         } else {
@@ -85,16 +84,7 @@ pub fn parse_message(
         size: raw.len() as u32,
         body: if body.is_empty() { None } else { Some(body) },
         html,
-        attachments,
         message_id: header("Message-ID"),
-        references: {
-            let refs = header("References");
-            if refs.trim().is_empty() {
-                header("In-Reply-To")
-            } else {
-                refs
-            }
-        },
         has_attachments,
         gmail_id: 0,
         list_unsubscribe: header("List-Unsubscribe").trim().to_owned(),
@@ -104,16 +94,23 @@ pub fn parse_message(
             .contains("list-unsubscribe=one-click"),
         pending: false,
         reply_to: header("Reply-To"),
-        labels: vec![],
         inline: std::sync::Arc::new(inline),
         answered: false,
         forwarded: false,
-        thread_id: String::new(),
-        saved: 0,
-        receipt_to: receipt_address(&header("Disposition-Notification-To")),
         mdn_sent: false,
         partial: false,
-    })
+        ..Mail::default()
+    };
+    mail.set_cc(header("Cc"));
+    mail.set_attachments(attachments);
+    let references = header("References");
+    mail.set_references(if references.trim().is_empty() {
+        header("In-Reply-To")
+    } else {
+        references
+    });
+    mail.set_receipt_to(receipt_address(&header("Disposition-Notification-To")));
+    Ok(mail)
 }
 /// The address a read receipt goes to, from Disposition-Notification-To.
 pub(crate) fn receipt_address(value: &str) -> String {
@@ -508,8 +505,8 @@ mod tests {
         let m = parse_message(raw, &a, "id", Folder::Inbox, "INBOX", 1).unwrap();
         assert_eq!(m.body.as_deref(), Some("Plain alternative"));
         assert_eq!(m.html.as_deref(), Some("<b>Rich alternative</b>"));
-        assert_eq!(m.attachments.len(), 1);
-        assert_eq!(m.attachments[0].part, 2);
+        assert_eq!(m.attachments().len(), 1);
+        assert_eq!(m.attachments()[0].part, 2);
         assert!(!m.snippet.contains("<b>"));
         let html_only = parse_message(
             b"Content-Type: text/html; charset=utf-8\r\n\r\n<h1>HTML only</h1>",

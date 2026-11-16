@@ -258,7 +258,7 @@ impl MailApp {
         }
         let sent = m.folder == Folder::Sent || m.from.eq_ignore_ascii_case(&a.email);
         let alias = sent
-            .then(|| fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes))
+            .then(|| fwd::sent_as(&m.from, &m.to, m.cc(), &self.forwarding, &self.alias_routes))
             .flatten()
             .or_else(|| {
                 super::compose::alias_addressed(m, &fwd::sendable(&self.forwarding))
@@ -287,7 +287,7 @@ impl MailApp {
         if cfg!(test) || self.mask_for(m).is_none() {
             return;
         }
-        let wanted: HashSet<String> = [&m.to, &m.cc]
+        let wanted: HashSet<String> = [m.to.as_str(), m.cc()]
             .into_iter()
             .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
             .map(|(_, email)| email.trim().to_lowercase())
@@ -326,7 +326,7 @@ impl MailApp {
         if m.folder != Folder::Sent && self.folder != Folder::Sent {
             return None;
         }
-        fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes)
+        fwd::sent_as(&m.from, &m.to, m.cc(), &self.forwarding, &self.alias_routes)
     }
     pub(super) fn shows_all_mail(&self) -> bool {
         self.all_mail && self.accounts.len() > 1

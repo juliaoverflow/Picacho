@@ -159,7 +159,7 @@ impl MailApp {
                     draft.to = to;
                     draft.cc = cc;
                     draft.reply_id = m.message_id.clone();
-                    draft.references = format!("{} {}", m.references, m.message_id)
+                    draft.references = format!("{} {}", m.references(), m.message_id)
                         .trim()
                         .to_string();
                 }
@@ -175,10 +175,10 @@ impl MailApp {
                         date_full(m.date),
                         m.subject,
                         recipients(&m.to),
-                        if m.cc.is_empty() {
+                        if m.cc().is_empty() {
                             String::new()
                         } else {
-                            format!("Cc: {}\n", recipients(&m.cc))
+                            format!("Cc: {}\n", recipients(m.cc()))
                         },
                         quoted
                     )
@@ -565,7 +565,7 @@ impl MailApp {
         by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
         for m in by_date {
             let mut people = vec![(m.sender.clone(), m.from.clone())];
-            for list in [&m.to, &m.cc] {
+            for list in [m.to.as_str(), m.cc()] {
                 if let Ok(parsed) = crate::sync::smtp::recipients(list) {
                     people.extend(
                         parsed
@@ -1184,7 +1184,7 @@ pub(super) fn reply_recipients(m: &Mail, all: bool, own: &[&str]) -> (String, St
     }
     let mut cc = vec![];
     if all {
-        for list in [&m.to, &m.cc] {
+        for list in [m.to.as_str(), m.cc()] {
             for (name, email) in crate::sync::smtp::recipients(list).unwrap_or_default() {
                 if seen.insert(email.to_lowercase()) {
                     cc.push(format(name, &email));
@@ -1200,7 +1200,7 @@ pub(super) fn alias_addressed<'a>(
     m: &Mail,
     aliases: &'a [fwd::SendAlias],
 ) -> Option<&'a fwd::SendAlias> {
-    let addressed: Vec<String> = [&m.to, &m.cc]
+    let addressed: Vec<String> = [m.to.as_str(), m.cc()]
         .into_iter()
         .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
         .map(|(_, email)| email.to_lowercase())
@@ -1216,7 +1216,7 @@ pub(super) fn identity_addressed<'a>(
     if a.identities.is_empty() {
         return None;
     }
-    let addressed: Vec<String> = [&m.to, &m.cc]
+    let addressed: Vec<String> = [m.to.as_str(), m.cc()]
         .into_iter()
         .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
         .map(|(_, email)| email.to_lowercase())
@@ -1241,13 +1241,13 @@ mod tests {
 
     #[test]
     fn reply_all_copies_everyone_but_you() {
-        let m = Mail {
+        let mut m = Mail {
             from: "ana@example.com".into(),
             sender: "Ana".into(),
             to: "me@example.com, Bo <bo@example.com>".into(),
-            cc: "cy@example.com, ana@example.com".into(),
             ..Mail::default()
         };
+        m.set_cc("cy@example.com, ana@example.com");
         assert_eq!(
             reply_recipients(&m, false, &["me@example.com"]),
             ("Ana <ana@example.com>".into(), String::new())

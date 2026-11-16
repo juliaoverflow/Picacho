@@ -572,7 +572,7 @@ impl MailApp {
             if has_quotes {
                 content = content.child(div().flex().child(self.quotes_toggle(cx)));
             }
-            for (i, a) in m.attachments.iter().enumerate() {
+            for (i, a) in m.attachments().iter().enumerate() {
                 content = content.child(
                     div()
                         .mt_3()
@@ -1496,19 +1496,19 @@ impl MailApp {
         }
         let key = super::thread::conversation_subject(&m.subject);
         let replyish = |x: &Mail, key: &str| {
-            !x.references.is_empty() || x.subject.trim().to_lowercase() != key
+            !x.references().is_empty() || x.subject.trim().to_lowercase() != key
         };
         let linked = |a: &Mail, b: &Mail| {
-            !b.message_id.is_empty() && a.references.contains(b.message_id.as_str())
+            !b.message_id.is_empty() && a.references().contains(b.message_id.as_str())
         };
         // Permanent server thread ids (not IMAP THREAD's, which only
         // cover one mailbox) settle it either way.
-        let permanent = |x: &Mail| !x.thread_id.is_empty() && !x.thread_id.starts_with("t:");
+        let permanent = |x: &Mail| !x.thread_id().is_empty() && !x.thread_id().starts_with("t:");
         let server = |x: &Mail| -> Option<bool> {
-            if x.thread_id.is_empty() || m.thread_id.is_empty() {
+            if x.thread_id().is_empty() || m.thread_id().is_empty() {
                 return None;
             }
-            if x.thread_id == m.thread_id {
+            if x.thread_id() == m.thread_id() {
                 Some(true)
             } else if permanent(x) && permanent(m) {
                 Some(false)
@@ -1712,7 +1712,7 @@ impl MailApp {
             }
         };
         let to = super::thread::short_names(&self.unreversed(m, &m.to), &own);
-        let cc = super::thread::short_names(&self.unreversed(m, &m.cc), &own);
+        let cc = super::thread::short_names(&self.unreversed(m, m.cc()), &own);
         let mut line = if to.is_empty() {
             "to undisclosed recipients".to_string()
         } else {
@@ -1823,7 +1823,7 @@ impl MailApp {
     /// A message's labels, each removable; choosing one shows the mail
     /// that has it.
     fn label_chips(&self, m: &Mail, cx: &Context<Self>) -> Option<Stateful<Div>> {
-        if m.labels.is_empty() {
+        if m.labels().is_empty() {
             return None;
         }
         let c = self.colors();
@@ -1836,7 +1836,7 @@ impl MailApp {
             .flex()
             .flex_wrap()
             .gap_1();
-        for (i, label) in m.labels.iter().enumerate() {
+        for (i, label) in m.labels().iter().enumerate() {
             let shown = if gmail {
                 crate::sync::transport::decode_name(label)
             } else {

@@ -395,9 +395,9 @@ fn smtp_starttls_auth_delivery_and_attachment() -> Result<()> {
     result?;
     let parsed = parse_message(&raw, &a, "sent", Folder::Sent, "Sent", 1)?;
     assert_eq!(parsed.subject, d.subject);
-    assert!(parsed.body.unwrap().contains("verified STARTTLS"));
-    assert_eq!(parsed.attachments[0].name, "hello.txt");
-    assert_eq!(parsed.attachments[0].size, 21);
+    assert!(parsed.body.as_deref().unwrap().contains("verified STARTTLS"));
+    assert_eq!(parsed.attachments()[0].name, "hello.txt");
+    assert_eq!(parsed.attachments()[0].size, 21);
     assert!(b.store.drafts(&a.id)?.is_empty());
     assert_eq!(b.store.messages(&a.id, Folder::Sent, 300)?.len(), 1);
     drop(b);
@@ -585,13 +585,13 @@ fn encrypted_pinal_mail_is_decrypted_in_memory_only() -> Result<()> {
             .unwrap_or_default()
             .contains("Picacho reads this")
     );
-    assert_eq!(read.attachments.len(), 1);
+    assert_eq!(read.attachments().len(), 1);
     assert_eq!(
-        backend.attachment(&account, &read, read.attachments[0].part)?,
+        backend.attachment(&account, &read, read.attachments()[0].part)?,
         b"%PDF secret"
     );
     let cached = backend.store.message("enc-1")?.unwrap();
-    assert!(cached.body.is_none() && cached.snippet.is_empty() && cached.attachments.is_empty());
+    assert!(cached.body.is_none() && cached.snippet.is_empty() && cached.attachments().is_empty());
     assert_eq!(backend.store.raw("enc-1")?.unwrap(), stored);
     // A reload from the disk cache gets the body back from memory.
     let reloaded = backend.with_readable(vec![cached]);
@@ -1084,19 +1084,17 @@ fn opening_a_message_keeps_its_labels() -> Result<()> {
     let mut a = Account::new(Provider::Gmail);
     a.email = "qa@example.com".into();
     let mut m = parse_message(MESSAGE, &a, "labelled", Folder::Inbox, "INBOX", 1)?;
-    m.labels = vec!["Receipts".into(), "Work".into()];
+    m.set_labels(vec!["Receipts".into(), "Work".into()]);
     m.gmail_id = 42;
     b.store.save_messages(std::slice::from_ref(&m))?;
     b.store.save_raw("labelled", MESSAGE)?;
     // An older copy, as the list may hold one, still opens with the cache's.
-    let stale = Mail {
-        labels: vec![],
-        ..m.clone()
-    };
+    let mut stale = m.clone();
+    stale.set_labels(vec![]);
     let read = b.read(&a, &stale)?;
-    assert_eq!(read.labels, ["Receipts", "Work"]);
+    assert_eq!(read.labels(), ["Receipts", "Work"]);
     let cached = b.store.message("labelled")?.unwrap();
-    assert_eq!(cached.labels, ["Receipts", "Work"]);
+    assert_eq!(cached.labels(), ["Receipts", "Work"]);
     assert_eq!(cached.gmail_id, 42);
     drop(b);
     std::fs::remove_dir_all(path)?;

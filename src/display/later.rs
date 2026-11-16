@@ -449,7 +449,7 @@ impl MailApp {
     /// Above a message whose sender asked for a read receipt: send it, or
     /// don't (either way, no mail app asks again).
     pub(super) fn receipt_banner(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
-        if m.receipt_to.is_empty()
+        if m.receipt_to().is_empty()
             || m.mdn_sent
             || matches!(m.folder, Folder::Sent | Folder::Drafts | Folder::Junk)
         {
