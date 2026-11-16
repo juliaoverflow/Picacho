@@ -444,3 +444,87 @@ fn the_last_open_mailbox_opens_again_after_a_restart(cx: &mut TestAppContext) {
         assert_eq!(this.messages.len(), 10, "its mail is listed");
     });
 }
+
+#[test]
+fn copied_names_and_addresses_read_back_as_written() {
+    for (name, email) in [
+        ("Ana Silva", "ana@example.com"),
+        ("Silva, Ana", "ana@example.com"),
+        ("Ana \"the boss\" S.", "ana@example.com"),
+    ] {
+        let both = name_and_address(Some(name), email);
+        let parsed = crate::sync::smtp::recipients(&both).unwrap();
+        assert_eq!(parsed, vec![(Some(name.to_owned()), email.to_owned())], "{both}");
+    }
+    assert_eq!(name_and_address(None, "ana@example.com"), "ana@example.com");
+    assert_eq!(name_and_address(Some(" "), "ana@example.com"), "ana@example.com");
+}
+
+#[test]
+fn recipients_can_be_copied_but_only_senders_written_to_and_looked_up() {
+    let labels = |entries: Vec<Entry>| -> Vec<String> {
+        entries
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, .. } => Some(label.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let sender = labels(address_entries(Some("Ana"), "ana@example.com", Some("ana@example.com")));
+    assert_eq!(
+        sender,
+        [
+            "Copy Name",
+            "Copy Address",
+            "Copy Name and Address",
+            "Send Email…",
+            "Show Mail From This Address"
+        ]
+    );
+    let recipient = labels(address_entries(Some("Ana"), "ana@example.com", None));
+    assert_eq!(recipient, ["Copy Name", "Copy Address", "Copy Name and Address"]);
+    let bare = labels(address_entries(None, "ana@example.com", None));
+    assert_eq!(bare, ["Copy Address"]);
+}
+
+#[gpui::test]
+fn right_clicking_the_sender_offers_to_write_and_find_their_mail(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    let (id, from) = view.read_with(cx, |this, _| {
+        (this.messages[2].id.clone(), this.messages[2].from.clone())
+    });
+    act(&view, Action::Select(id), cx);
+    frame(cx);
+    let at = cx.debug_bounds("reader-from").expect("the sender is shown").center();
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: at,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    let send = view.read_with(cx, |this, _| {
+        let menu = this.menu.as_ref().expect("right-clicking the sender opens a menu");
+        let find = |name: &str| {
+            menu.entries.iter().find_map(|e| match e {
+                Entry::Item { label, action, .. } if label.as_ref() == name => Some(action.clone()),
+                _ => None,
+            })
+        };
+        assert!(find("Copy Address").is_some());
+        assert!(matches!(
+            find("Show Mail From This Address"),
+            Some(Action::SearchFor(q)) if q == format!("from:{from}")
+        ));
+        find("Send Email…").expect("the menu offers to write to the sender")
+    });
+    act(&view, send, cx);
+    view.read_with(cx, |this, cx| {
+        let composer = this.composers.last().expect("a new message opens");
+        let draft = &composer.read(cx).draft;
+        assert!(draft.to.contains(&from), "{}", draft.to);
+        assert!(draft.subject.is_empty());
+    });
+}

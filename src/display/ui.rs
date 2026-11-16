@@ -328,6 +328,56 @@ fn search_term(field: &str, value: &str) -> String {
         format!("{field}:{value}")
     }
 }
+/// "Name <address>" as a header writes it, the name quoted when it holds
+/// characters that would split it; the bare address when there is no name.
+fn name_and_address(name: Option<&str>, email: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        None => email.to_owned(),
+        Some(name) => {
+            let plain = name
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || " !#$%&'*+-/=?^_`{|}~".contains(ch));
+            if plain {
+                format!("{name} <{email}>")
+            } else {
+                let quoted = name.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{quoted}\" <{email}>")
+            }
+        }
+    }
+}
+/// The menu of an address in the open message's headers: copying it, and,
+/// for a sender (`from`: the address to look its mail up by), writing to it
+/// and finding its mail.
+fn address_entries(name: Option<&str>, email: &str, from: Option<&str>) -> Vec<Entry> {
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    let mut entries = Vec::new();
+    if let Some(name) = name {
+        entries.push(entry("Copy Name", "copy", Action::CopyText(name.to_owned())));
+    }
+    entries.push(entry("Copy Address", "copy", Action::CopyText(email.to_owned())));
+    if name.is_some() {
+        entries.push(entry(
+            "Copy Name and Address",
+            "copy",
+            Action::CopyText(name_and_address(name, email)),
+        ));
+    }
+    if let Some(from) = from {
+        entries.push(Entry::Separator);
+        entries.push(entry(
+            "Send Email…",
+            "compose",
+            Action::ComposeTo(name_and_address(name, email)),
+        ));
+        entries.push(entry(
+            "Show Mail From This Address",
+            "search",
+            Action::SearchFor(search_term("from", from)),
+        ));
+    }
+    entries
+}
 fn keys(text: &str) -> String {
     if cfg!(target_os = "macos") {
         return text.into();
@@ -511,6 +561,8 @@ enum Action {
     /// Proton sign-in: back to the password.
     ProtonBack,
     Compose,
+    /// A new message to these addresses.
+    ComposeTo(String),
     Reply(bool),
     Forward,
     Refresh,
@@ -4599,13 +4651,18 @@ impl MailApp {
         if self.onboarding
             && matches!(
                 action,
-                Action::Compose | Action::Reply(_) | Action::Forward | Action::Settings
+                Action::Compose
+                    | Action::ComposeTo(_)
+                    | Action::Reply(_)
+                    | Action::Forward
+                    | Action::Settings
             )
         {
             return;
         }
         match action {
             Action::Compose => self.new_compose(0, w, cx),
+            Action::ComposeTo(to) => self.compose_to(to, w, cx),
             Action::Reply(all) => {
                 let all = all || self.compose_options.default_reply_all;
                 self.new_compose(if all { 2 } else { 1 }, w, cx)

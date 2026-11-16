@@ -458,10 +458,22 @@ impl MailApp {
                             .gap_1()
                             .child(
                                 div()
+                                    .id("reader-from")
+                                    .debug_selector(|| "reader-from".into())
                                     .flex()
                                     .flex_wrap()
                                     .gap_2()
                                     .items_center()
+                                    .on_mouse_down(MouseButton::Right, {
+                                        let (name, email) = (sender.clone(), from.clone());
+                                        let real = m.from.clone();
+                                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            let entries =
+                                                address_entries(Some(&name), &email, Some(&real));
+                                            this.open_menu(e.position, entries, cx)
+                                        })
+                                    })
                                     .child(
                                         div()
                                             .text_size(px(13.))
@@ -795,6 +807,57 @@ impl MailApp {
             .into_any_element()
     }
 
+    /// A header's addresses, each with its own right-click menu: copying
+    /// it, and for a sender's (`sender`), writing to it and finding its mail.
+    fn address_list(
+        &self,
+        key: &'static str,
+        list: &str,
+        sender: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = self.colors();
+        let parsed = crate::sync::smtp::recipients(list)
+            .ok()
+            .filter(|a| !a.is_empty());
+        let Some(addresses) = parsed else {
+            // Unreadable as addresses: shown as written.
+            return div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_color(rgb(c.text))
+                .child(list.to_owned())
+                .into_any_element();
+        };
+        let last = addresses.len() - 1;
+        div()
+            .debug_selector(move || format!("details-{key}"))
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .gap_x_1()
+            .text_color(rgb(c.text))
+            .children(addresses.into_iter().enumerate().map(|(i, (name, email))| {
+                let shown = super::name_and_address(name.as_deref(), &email);
+                div()
+                    .id(SharedString::from(format!("details-{key}-{i}")))
+                    .debug_selector(move || format!("details-{key}-{i}"))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(if i < last { format!("{shown},") } else { shown })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            let from = sender.then_some(email.as_str());
+                            let entries = address_entries(name.as_deref(), &email, from);
+                            this.open_menu(e.position, entries, cx)
+                        }),
+                    )
+            }))
+            .into_any_element()
+    }
+
     fn details_panel(&self, m: &Mail, cx: &Context<Self>) -> AnyElement {
         use crate::sync::mime::Security;
         let c = self.colors();
@@ -845,18 +908,36 @@ impl MailApp {
             Some(k) if k.sent => k.sender(),
             _ => m.sender.clone(),
         };
+        let from_email = masked(&m.from);
         let from = if sender != m.from && !sender.is_empty() {
             masked(&format!("{} <{}>", sender, m.from))
         } else {
-            masked(&m.from)
+            from_email.clone()
         };
+        let from = div()
+            .id("details-from")
+            .debug_selector(|| "details-from".into())
+            .min_w_0()
+            .overflow_hidden()
+            .text_color(rgb(c.text))
+            .child(from)
+            .on_mouse_down(MouseButton::Right, {
+                let real = m.from.clone();
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let entries = address_entries(Some(&sender), &from_email, Some(&real));
+                    this.open_menu(e.position, entries, cx)
+                })
+            })
+            .into_any_element();
         let details = info
             .and_then(|i| i.result.as_ref())
             .and_then(|r| r.as_ref().ok());
         let header = |value: Option<&String>| value.filter(|v| !v.trim().is_empty()).cloned();
-        let mut panel_rows: Vec<AnyElement> = vec![row("from:", text(from)).into_any_element()];
+        let mut panel_rows: Vec<AnyElement> = vec![row("from:", from).into_any_element()];
         if let Some(v) = header(details.map(|d| &d.details.reply_to)) {
-            panel_rows.push(row("reply-to:", text(masked(&v))).into_any_element());
+            let list = self.address_list("reply-to", &masked(&v), true, cx);
+            panel_rows.push(row("reply-to:", list).into_any_element());
         }
         // Recipients a mailbox kept to its aliases wrote to through a
         // reverse alias show as the contacts themselves.
@@ -864,9 +945,11 @@ impl MailApp {
             Some(k) => k.recipients(v),
             None => v.to_owned(),
         };
-        panel_rows.push(row("to:", text(recipients(&m.to))).into_any_element());
+        let to = self.address_list("to", &recipients(&m.to), false, cx);
+        panel_rows.push(row("to:", to).into_any_element());
         if let Some(v) = header(details.map(|d| &d.details.cc)) {
-            panel_rows.push(row("cc:", text(recipients(&v))).into_any_element());
+            let cc = self.address_list("cc", &recipients(&v), false, cx);
+            panel_rows.push(row("cc:", cc).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
         panel_rows.push(

@@ -39,6 +39,24 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.compose_with(mode, original, placement, None, w, cx);
+    }
+
+    /// A new message to `to` (an address list), sent from the account of
+    /// the open message, as from a reader's address menu.
+    pub(super) fn compose_to(&mut self, to: String, w: &mut Window, cx: &mut Context<Self>) {
+        self.compose_with(0, None, None, Some(to), w, cx);
+    }
+
+    fn compose_with(
+        &mut self,
+        mode: u8,
+        original: Option<Mail>,
+        placement: Option<Placement>,
+        to: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.onboarding {
             return;
         }
@@ -75,9 +93,15 @@ impl MailApp {
                 }));
             }
         }
+        // Writing to someone from an open message: from the account it came to.
         let account = original
             .as_ref()
             .and_then(|m| self.account_of(m))
+            .or_else(|| {
+                to.as_ref()
+                    .and_then(|_| self.selected_mail())
+                    .and_then(|m| self.account_of(&m))
+            })
             .or_else(|| self.current_account());
         let own = account
             .as_ref()
@@ -203,6 +227,9 @@ impl MailApp {
                 };
                 draft.body = format!("{}{quote}", sign(true));
             }
+        }
+        if let Some(to) = to {
+            draft.to = to;
         }
         // A mailbox kept to its aliases writes as one of them.
         if draft.send_as.is_empty()
