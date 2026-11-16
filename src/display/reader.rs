@@ -219,7 +219,7 @@ impl MailApp {
         if self.reader_collapsed || Self::pane_animating(self.reader_since) {
             return;
         }
-        let max = f32::from(self.reader_scroll.max_offset().height);
+        let max = f32::from(self.reader_scroll.max_offset().y);
         let viewport = f32::from(self.reader_scroll.bounds().size.height);
         if max <= 0. || self.html_view.read(cx).is_loading() {
             // Laid out on a later frame.
@@ -557,10 +557,7 @@ impl MailApp {
                                             "body-{}-{}",
                                             m.id, self.quotes_open
                                         )),
-                                        body,
-                                        window,
-                                        cx,
-                                    )
+                                        body)
                                     .selectable(true)
                                     // TextView fills its parent's height by default; in
                                     // the scrolling reader that is the visible area, so
@@ -1409,7 +1406,7 @@ impl MailApp {
                                         })
                                         .collect()
                                 })
-                                .track_scroll(self.original_scroll.clone())
+                                .track_scroll(&self.original_scroll)
                                 .size_full()
                                 .py_3(),
                             ),

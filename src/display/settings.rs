@@ -897,7 +897,7 @@ impl MailApp {
                     .id("signature")
                     .debug_selector(|| "signature".into())
                     .h(px(110.))
-                    .child(field(Input::new(&self.signature_input), c, false).h_full()),
+                    .child(textarea_field(Textarea::new(&self.signature_input), c, false).h_full()),
             )
             .child(row(
                 "Sign replies and forwards",
@@ -1509,7 +1509,7 @@ impl MailApp {
                     window::detached_options("Settings".into(), bounds),
                     move |window, cx| {
                         let view = cx.new(|cx| SettingsWindow::new(app, colors, cx));
-                        view.read(cx).focus.focus(window);
+                        { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
                         cx.new(|cx| Root::new(view, window, cx))
                     },
                 );

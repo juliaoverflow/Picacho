@@ -26,21 +26,21 @@ actions!(
 
 /// Key bindings while a composer has focus. The "Composer" context is
 /// deeper than "Mail", so these win over the main window's shortcuts.
-pub(super) fn bindings() -> Vec<KeyBinding> {
+pub(super) fn bindings(cx: &App) -> Vec<KeyBinding> {
     let ctx = Some("Composer");
     vec![
-        KeyBinding::new("secondary-b", Bold, ctx),
-        KeyBinding::new("secondary-i", Italic, ctx),
-        KeyBinding::new("secondary-shift-x", Strike, ctx),
-        KeyBinding::new("secondary-e", InlineCode, ctx),
-        KeyBinding::new("secondary-k", InsertLink, ctx),
-        KeyBinding::new("secondary-shift-8", Bullets, ctx),
-        KeyBinding::new("secondary-shift-7", Numbers, ctx),
-        KeyBinding::new("secondary-shift-9", QuoteLines, ctx),
-        KeyBinding::new("secondary-alt-1", Heading, ctx),
-        KeyBinding::new("secondary-s", SaveDraft, ctx),
-        KeyBinding::new("secondary-enter", SendDraft, ctx),
-        KeyBinding::new("secondary-shift-p", TogglePreview, ctx),
+        key(cx, "secondary-b", Bold, ctx),
+        key(cx, "secondary-i", Italic, ctx),
+        key(cx, "secondary-shift-x", Strike, ctx),
+        key(cx, "secondary-e", InlineCode, ctx),
+        key(cx, "secondary-k", InsertLink, ctx),
+        key(cx, "secondary-shift-8", Bullets, ctx),
+        key(cx, "secondary-shift-7", Numbers, ctx),
+        key(cx, "secondary-shift-9", QuoteLines, ctx),
+        key(cx, "secondary-alt-1", Heading, ctx),
+        key(cx, "secondary-s", SaveDraft, ctx),
+        key(cx, "secondary-enter", SendDraft, ctx),
+        key(cx, "secondary-shift-p", TogglePreview, ctx),
     ]
 }
 
@@ -127,7 +127,7 @@ pub(super) struct Composer {
     pub(super) error: Option<String>,
     recipients: [Entity<InputState>; 4],
     subject: Entity<InputState>,
-    pub(super) body: Entity<InputState>,
+    pub(super) body: Entity<TextareaState>,
     show_cc: bool,
     show_bcc: bool,
     show_reply_to: bool,
@@ -192,17 +192,15 @@ impl Composer {
         let subject = field("Subject", window, cx);
         let from_filter = field("Find an address", window, cx);
         let body = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("Write your message…")
+            TextareaState::new(window, cx).placeholder("Write your message…")
         });
         let values = [&draft.to, &draft.cc, &draft.bcc, &draft.reply_to];
         for (state, value) in recipients.iter().zip(values) {
             let value = value.clone();
-            state.update(cx, |s, cx| s.set_value(value, window, cx));
+            state.update(cx, |s, cx| s.set_text(value, window, cx));
         }
-        subject.update(cx, |s, cx| s.set_value(draft.subject.clone(), window, cx));
-        body.update(cx, |s, cx| s.set_value(draft.body.clone(), window, cx));
+        subject.update(cx, |s, cx| s.set_text(draft.subject.clone(), window, cx));
+        body.update(cx, |s, cx| s.set_text(draft.body.clone(), window, cx));
         let mut subscriptions = vec![];
         for (i, state) in recipients.iter().enumerate() {
             subscriptions.push(cx.subscribe_in(state, window, move |this, _, e, w, cx| {
@@ -215,7 +213,7 @@ impl Composer {
                     InputEvent::Blur => {
                         // Leave time for a click on a suggestion.
                         cx.spawn(async move |this, cx| {
-                            Timer::after(Duration::from_millis(150)).await;
+                            cx.background_executor().timer(Duration::from_millis(150)).await;
                             let _ = this.update(cx, |this, cx| {
                                 if this.suggest_field == i {
                                     this.suggestions.clear();
@@ -234,13 +232,16 @@ impl Composer {
                 cx.notify();
             }
         }));
-        for state in [&subject, &body] {
-            subscriptions.push(cx.subscribe(state, |this, _, e, cx| {
-                if matches!(e, InputEvent::Change) {
-                    this.changed(cx);
-                }
-            }));
-        }
+        subscriptions.push(cx.subscribe(&subject, |this, _, e, cx| {
+            if matches!(e, InputEvent::Change) {
+                this.changed(cx);
+            }
+        }));
+        subscriptions.push(cx.subscribe(&body, |this, _, e, cx| {
+            if matches!(e, InputEvent::Change) {
+                this.changed(cx);
+            }
+        }));
         let show_cc = !draft.cc.is_empty();
         let show_bcc = !draft.bcc.is_empty();
         let show_reply_to = !draft.reply_to.is_empty();
@@ -290,21 +291,22 @@ impl Composer {
         let target = if self.recipients[TO].read(cx).value().trim().is_empty()
             && self.placement != Placement::Inline
         {
-            &self.recipients[TO]
+            Some(&self.recipients[TO])
         } else if self.subject.read(cx).value().trim().is_empty()
             && self.placement != Placement::Inline
         {
-            &self.subject
+            Some(&self.subject)
         } else {
-            &self.body
+            None
         };
-        target.update(cx, |s, cx| {
-            s.focus(window, cx);
-            // Replies start writing above the quoted message.
-            if std::ptr::eq(target, &self.body) {
+        match target {
+            Some(target) => target.update(cx, |s, cx| s.focus(window, cx)),
+            None => self.body.update(cx, |s, cx| {
+                s.focus(window, cx);
+                // Replies start writing above the quoted message.
                 s.set_cursor_position(gpui_component::input::Position::new(0, 0), window, cx);
-            }
-        });
+            }),
+        }
     }
 
     /// The draft as currently written.
@@ -315,7 +317,7 @@ impl Composer {
         self.draft.bcc = value(&self.recipients[BCC]);
         self.draft.reply_to = value(&self.recipients[REPLY_TO]).trim().to_owned();
         self.draft.subject = value(&self.subject);
-        self.draft.body = value(&self.body);
+        self.draft.body = self.body.read(cx).value().to_string();
         self.draft.clone()
     }
 
@@ -342,7 +344,7 @@ impl Composer {
         self.revision += 1;
         let revision = self.revision;
         cx.spawn(async move |this, cx| {
-            Timer::after(Duration::from_millis(800)).await;
+            cx.background_executor().timer(Duration::from_millis(800)).await;
             let _ = this.update(cx, |this, cx| {
                 if this.revision == revision {
                     this.save(cx);
@@ -438,7 +440,7 @@ impl Composer {
         let next = format!("{}, ", kept.join(", "));
         self.suggestions.clear();
         self.recipients[field].update(cx, |s, cx| {
-            s.set_value(next.clone(), window, cx);
+            s.set_text(next.clone(), window, cx);
             let end = s.text().offset_to_position(next.len());
             s.set_cursor_position(end, window, cx);
         });
@@ -826,8 +828,8 @@ impl Composer {
     #[cfg(test)]
     pub(super) fn fill(&mut self, to: &str, subject: &str, w: &mut Window, cx: &mut Context<Self>) {
         let (to, subject) = (to.to_string(), subject.to_string());
-        self.recipients[TO].update(cx, |s, cx| s.set_value(to, w, cx));
-        self.subject.update(cx, |s, cx| s.set_value(subject, w, cx));
+        self.recipients[TO].update(cx, |s, cx| s.set_text(to, w, cx));
+        self.subject.update(cx, |s, cx| s.set_text(subject, w, cx));
     }
 
     fn attach(&mut self, cx: &mut Context<Self>) {
@@ -1242,7 +1244,7 @@ impl Composer {
         self.from_open = !self.from_open;
         if self.from_open {
             self.from_filter.update(cx, |s, cx| {
-                s.set_value("", w, cx);
+                s.set_text("", w, cx);
                 if self.aliases.len() > FROM_FILTER_AT {
                     s.focus(w, cx);
                 }
@@ -1786,7 +1788,7 @@ impl Composer {
             ))
     }
 
-    fn body_view(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn body_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let c = self.colors;
         let inline = self.placement == Placement::Inline;
         if self.preview && self.draft.formatted {
@@ -1800,12 +1802,7 @@ impl Composer {
                 .px_4()
                 .py_3()
                 .child(
-                    gpui_component::text::TextView::markdown(
-                        "compose-preview-text",
-                        text,
-                        window,
-                        cx,
-                    )
+                    gpui_component::text::TextView::markdown("compose-preview-text", text)
                     .selectable(true)
                     .h_auto()
                     .text_size(px(14.)),
@@ -1820,7 +1817,7 @@ impl Composer {
             .px_2()
             .py_1()
             .child(
-                Input::new(&self.body)
+                Textarea::new(&self.body)
                     .appearance(false)
                     .disabled(self.sending)
                     .h_full()
@@ -2076,7 +2073,7 @@ impl Render for Composer {
         if self.draft.formatted {
             root = root.child(self.toolbar(cx));
         }
-        root.child(self.body_view(window, cx))
+        root.child(self.body_view(cx))
             .children(self.attachments(cx))
             .child(self.footer(cx))
     }

@@ -8,13 +8,21 @@ license = "MIT"
 # protected_email_bridge (Proton Mail without Bridge) needs Rust 1.100.
 rust-version = "1.100"
 
+# Android loads the app as a shared library from its activity (src/android.rs).
+# On other systems the library is empty and the `picacho` binary is the app.
+[lib]
+name = "picacho"
+path = "src/android.rs"
+crate-type = ["cdylib"]
+
 [dependencies]
 aes-gcm = "0.11"
 anyhow = "1"
 argon2 = "0.6"
 base64 = "0.23"
 # Embed Blitz without its standalone window/event loop or unrestricted network client.
-blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff"] }
+# `floats`: gpui-pre turns on taffy's float layout, which stylo_taffy must fill in.
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff", "floats"] }
 blitz-html = { version = "=0.3.0-beta.4", default-features = false }
 blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = "=0.3.0-beta.4"
@@ -32,9 +40,14 @@ futures = "0.3"
 data-url = "0.3"
 keyboard-types = "0.8"
 kurbo = "0.13"
-gpui = "=0.2.2"
-gpui-component = "=0.5.1"
-gpui-component-assets = "=0.5.1"
+# GPUI from the gpui-pre snapshots of Zed; its platforms are separate crates
+# (gpui-platform on desktop, gpui-mobile on Android). gpui-component 0.9.1
+# pins gpui-pre =0.3.12.
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-component = "=0.9.1"
+# Names the input state shared by single- and multi-line fields.
+gpui-base = "=0.9.1"
+gpui-component-assets = { package = "gpui-kit-assets", version = "=0.9.1" }
 hkdf = "0.13"
 # SASL sign-in: HMAC for SCRAM and CRAM-MD5, and their hashes.
 hmac = "0.13"
@@ -64,13 +77,6 @@ pgp = "0.21"
 # Proton Mail without Bridge: Proton's API (SRP sign-in, keys, sync, send),
 # used directly by sync/proton.rs. Its IMAP/SMTP listeners are not started.
 protected_email_bridge = { git = "https://github.com/pinaltech/Protected-Email-Bridge" }
-# Proton's human verification (CAPTCHA) in the system's own webview
-# (WKWebView, WebView2, WebKitGTK), in a window of its own; see display/verify.rs.
-tao = "0.34"
-wry = "0.53"
-# Proton sign-in with a security key or passkey (WebAuthn/FIDO2): USB keys,
-# and a phone's passkey by QR code and Bluetooth (caBLE); Windows Hello below.
-webauthn-authenticator-rs = { version = "0.6.2", features = ["usb", "cable"] }
 webauthn-rs-proto = "=0.6.2"
 # The QR code a phone scans to sign in with its passkey.
 qrcode = { version = "0.14", default-features = false }
@@ -94,7 +100,7 @@ zeroize = "1"
 
 [dev-dependencies]
 rand08 = { package = "rand", version = "0.8" }
-gpui = { version = "=0.2.2", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
 
 [features]
 # Offers a fictional sample inbox from onboarding, for development and screenshots.
@@ -116,7 +122,7 @@ debug = 0
 # development builds so debug runs reflect real reading speed.
 # The UI framework lays out and paints the whole window on each frame;
 # optimize it too, so debug builds show real frame cost.
-[profile.dev.package.gpui]
+[profile.dev.package.gpui-pre]
 opt-level = 2
 [profile.dev.package.gpui-component]
 opt-level = 2
@@ -203,6 +209,28 @@ opt-level = 3
 [profile.dev.package.app_units]
 opt-level = 3
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Unlike gpui 0.2, the platforms leave text and Linux windowing to features:
+# without `font-kit` macOS draws no text, and without `wayland` or `x11`
+# Linux opens no window.
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "wayland", "x11"] }
+# Proton's human verification (CAPTCHA) in the system's own webview
+# (WKWebView, WebView2, WebKitGTK), in a window of its own; see display/verify.rs.
+tao = "0.34"
+wry = "0.53"
+# Proton sign-in with a security key or passkey (WebAuthn/FIDO2): USB keys,
+# and a phone's passkey by QR code and Bluetooth (caBLE); Windows Hello below.
+webauthn-authenticator-rs = { version = "0.6.2", features = ["usb", "cable"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# GPUI's Android platform: the window, input, text and wgpu renderer.
+gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android", default-features = false }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+log = "0.4"
+# Android has no system OpenSSL; build it into the app.
+native-tls = { version = "0.2", features = ["vendored"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Debug builds only: the development driver captures the app's own window.
 core-graphics = "0.24"
@@ -226,16 +254,14 @@ fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
 # https://github.com/pinaltech/Picacho-Patches
 # After changing that repository, run `cargo update -p gpui` to use it here.
 # An email's unresolvable image or link address no longer panics.
-blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
 # Inline boxes paint gradient backgrounds (emails' dark styles).
-blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
 # ToCss error inference with GPUI's log/serde feature.
-stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,
 # BINARY, ESEARCH, SORT, THREAD and QRESYNC's VANISHED (its patch 0004).
-imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
 # Maximized windows' content is no longer a resize edge.
-gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
-# Copying from a menu (a click) works on Wayland. Removed images give their
-# atlas space back.
-gpui = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
+

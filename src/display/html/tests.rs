@@ -88,6 +88,9 @@ fn resource_policy_blocks_every_network_path_and_enabling_it_loads_css_and_image
     let server = std::thread::spawn(move || {
         while !stopped.load(Ordering::Relaxed) {
             if let Ok((mut socket, _)) = listener.accept() {
+                // Accepted sockets can inherit the listener's non-blocking
+                // mode (macOS does), and a read would fail with WouldBlock.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

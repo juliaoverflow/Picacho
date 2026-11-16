@@ -601,7 +601,7 @@ impl MailApp {
             .h(px(28.))
             .max_w(px(260.))
             .min_w_0()
-            .flex_shrink()
+            .flex_shrink_1()
             .pl_3()
             .pr_2()
             .flex()
@@ -676,7 +676,7 @@ impl MailApp {
                     div()
                         .id(SharedString::from(format!("aliases-search-{}", f.id)))
                         .w(px(180.))
-                        .flex_shrink()
+                        .flex_shrink_1()
                         .min_w(px(120.))
                         .child(field(
                             Input::new(&self.fwd_search).prefix(icon_el("search", 13., c.muted)),
@@ -917,7 +917,7 @@ impl MailApp {
             })
             .h(px(32.))
             .w(px(210.))
-            .flex_shrink()
+            .flex_shrink_1()
             .min_w(px(120.))
             .px_2()
             .flex()
@@ -1887,7 +1887,7 @@ impl MailApp {
         self.fwd_editing = Some((id, alias, which));
         self.fwd_description.update(cx, |s, cx| {
             s.set_placeholder(which.placeholder(), w, cx);
-            s.set_value(value, w, cx);
+            s.set_text(value, w, cx);
             s.focus(w, cx);
         });
     }

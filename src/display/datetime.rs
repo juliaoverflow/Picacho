@@ -140,7 +140,7 @@ impl DateTimePicker {
     pub(super) fn type_time(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(typing) = &self.typing {
             let input = typing.input.clone();
-            input.update(cx, |s, cx| s.set_value(text.to_owned(), window, cx));
+            input.update(cx, |s, cx| s.set_text(text.to_owned(), window, cx));
         }
         self.read_typed(text, cx);
     }

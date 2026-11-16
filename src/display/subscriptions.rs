@@ -154,6 +154,7 @@ impl MailApp {
         self.selection.clear();
         self.selecting = false;
         self.messages.clear();
+        self.visible.clear();
         self.filter(cx);
         self.scroll_list_to_top();
         self.load_sender_mail(cx);
@@ -173,6 +174,7 @@ impl MailApp {
         self.selection.clear();
         self.selecting = false;
         self.messages.clear();
+        self.visible.clear();
         self.filter(cx);
         self.load_subscriptions(cx);
         self.save_place();
@@ -280,6 +282,7 @@ impl MailApp {
             }
             if matches!(change, Change::Move(Folder::Junk | Folder::Trash)) {
                 self.messages.clear();
+                self.visible.clear();
                 self.selected = None;
                 self.selection.clear();
             } else if change.moves() {
@@ -832,7 +835,7 @@ impl MailApp {
                     .collect::<Vec<_>>()
             })
         })
-        .track_scroll(self.subs_scroll.clone())
+        .track_scroll(&self.subs_scroll)
         .flex_1()
         .min_h_0()
         .map(|list| panes::scroll_frame(list, &self.subs_scroll))
@@ -1092,7 +1095,7 @@ impl MailApp {
                     .collect::<Vec<_>>()
             })
         })
-        .track_scroll(self.list_scroll.clone())
+        .track_scroll(&self.list_scroll)
         .flex_1()
         .min_h_0()
         .map(|list| panes::scroll_frame(list, &self.list_scroll))

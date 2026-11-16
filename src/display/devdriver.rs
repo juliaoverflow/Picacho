@@ -16,7 +16,7 @@ pub(super) fn start(window: &mut Window, cx: &mut Context<MailApp>) {
     };
     cx.spawn_in(window, async move |this, cx| {
         loop {
-            Timer::after(Duration::from_millis(150)).await;
+            cx.background_executor().timer(Duration::from_millis(150)).await;
             let path = dir.join("cmd");
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -38,9 +38,9 @@ pub(super) fn start(window: &mut Window, cx: &mut Context<MailApp>) {
                 }
                 // A trailing `&` runs the next line right away (mid-animation).
                 if !line.trim_end().ends_with('&') {
-                    Timer::after(Duration::from_millis(400)).await;
+                    cx.background_executor().timer(Duration::from_millis(400)).await;
                 } else {
-                    Timer::after(Duration::from_millis(90)).await;
+                    cx.background_executor().timer(Duration::from_millis(90)).await;
                 }
             }
         }

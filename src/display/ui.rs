@@ -81,8 +81,8 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     Root, Theme, ThemeMode,
-    input::{Input, InputEvent, InputState},
-    scroll::{Scrollbar, ScrollbarShow},
+    input::{Input, InputEvent, InputModeKind, InputState, Textarea, TextareaState},
+    scroll::{Scrollbar, ScrollbarMode},
     tooltip::Tooltip,
 };
 use std::{
@@ -923,7 +923,7 @@ pub struct MailApp {
     inline_replies: HashMap<String, EntityId>,
     composer_subscriptions: HashMap<EntityId, Subscription>,
     /// The signature field in Composing settings.
-    signature_input: Entity<InputState>,
+    signature_input: Entity<TextareaState>,
     signature_revision: u64,
     /// The nickname field on an account's Settings page, and the account it
     /// shows.
@@ -1178,17 +1178,42 @@ pub struct MailApp {
 }
 fn input(
     placeholder: &str,
-    multi: bool,
     masked: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<InputState> {
     cx.new(|cx| {
-        let state = InputState::new(window, cx)
+        InputState::new(window, cx)
             .placeholder(placeholder.to_owned())
-            .multi_line(multi);
-        if multi { state } else { state.masked(masked) }
+            .masked(masked)
     })
+}
+/// Sets a field's text from code and reports it as a change, as a person's
+/// edit would be. gpui-base's `set_value` stays silent; Picacho's handlers
+/// (search filters, account fields) expect to hear about every new value.
+pub(crate) trait SetText: Sized {
+    fn set_text(
+        &mut self,
+        value: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+}
+impl<M: InputModeKind> SetText for gpui_base::input::InputBaseState<M> {
+    fn set_text(
+        &mut self,
+        value: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value: SharedString = value.into();
+        self.set_value(value, window, cx);
+        cx.emit(InputEvent::Change);
+    }
+}
+/// A multi-line text field.
+fn textarea(placeholder: &str, window: &mut Window, cx: &mut App) -> Entity<TextareaState> {
+    cx.new(|cx| TextareaState::new(window, cx).placeholder(placeholder.to_owned()))
 }
 impl MailApp {
     pub fn new(store: Arc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1219,7 +1244,7 @@ impl MailApp {
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let backend = Arc::new(Backend::new(store));
-        let search = input("Search, or from: reply-to: is:unread", false, false, window, cx);
+        let search = input("Search, or from: reply-to: is:unread", false, window, cx);
         let placeholders = [
             "you@example.com",
             "Password",
@@ -1237,7 +1262,7 @@ impl MailApp {
             .enumerate()
             .map(|(i, p)| {
                 let masked = matches!(i, PASSWORD | MAILBOX_PASSWORD | KEY_PIN);
-                input(p, false, masked, window, cx)
+                input(p, masked, window, cx)
             })
             .collect();
         let mut subscriptions = vec![];
@@ -1268,7 +1293,7 @@ impl MailApp {
             }
         })]);
         let filter_inputs = filters::FilterInputs::new(window, cx);
-        let rename_input = input("Folder name", false, false, window, cx);
+        let rename_input = input("Folder name", false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -1276,7 +1301,7 @@ impl MailApp {
                 }
             }),
         );
-        let label_input = input("Label name", false, false, window, cx);
+        let label_input = input("Label name", false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&label_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -1284,7 +1309,7 @@ impl MailApp {
                 }
             }),
         );
-        let unlock_input = input("Pinal password or recovery key", false, true, window, cx);
+        let unlock_input = input("Pinal password or recovery key", true, window, cx);
         subscriptions.push(
             cx.subscribe_in(&unlock_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -1293,16 +1318,13 @@ impl MailApp {
             }),
         );
         let encrypted = HashSet::new();
-        let fwd_key = input("API key", false, true, window, cx);
-        let fwd_server = input(
-            "Server (optional, for self-hosted)",
-            false,
-            false,
+        let fwd_key = input("API key", true, window, cx);
+        let fwd_server = input("Server (optional, for self-hosted)", false,
             window,
             cx,
         );
-        let fwd_note = input("Description (optional)", false, false, window, cx);
-        let fwd_prefix = input("Random prefix", false, false, window, cx);
+        let fwd_note = input("Description (optional)", false, window, cx);
+        let fwd_prefix = input("Random prefix", false, window, cx);
         subscriptions.push(cx.subscribe_in(&fwd_prefix, window, |this, _, event, w, cx| {
             match event {
                 InputEvent::PressEnter { .. } => {
@@ -1314,7 +1336,7 @@ impl MailApp {
                 _ => {}
             }
         }));
-        let fwd_description = input("Description", false, false, window, cx);
+        let fwd_description = input("Description", false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&fwd_description, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -1322,7 +1344,7 @@ impl MailApp {
                 }
             }),
         );
-        let fwd_contact_search = input("Find a contact", false, false, window, cx);
+        let fwd_contact_search = input("Find a contact", false, window, cx);
         subscriptions.push(cx.subscribe(&fwd_contact_search, |this, input, event, cx| {
             if matches!(event, InputEvent::Change) {
                 let query = input.read(cx).value().to_string();
@@ -1331,7 +1353,7 @@ impl MailApp {
                 cx.notify();
             }
         }));
-        let fwd_contact_new = input("Write to a new address", false, false, window, cx);
+        let fwd_contact_new = input("Write to a new address", false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&fwd_contact_new, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. })
@@ -1342,7 +1364,7 @@ impl MailApp {
                 }
             }),
         );
-        let fwd_search = input("Find an alias", false, false, window, cx);
+        let fwd_search = input("Find an alias", false, window, cx);
         subscriptions.push(cx.subscribe(&fwd_search, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 this.fwd_pages.clear();
@@ -1435,8 +1457,7 @@ impl MailApp {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let signature_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .placeholder("Your name, title, phone…")
                 .default_value(compose_options.signature.clone())
         });
@@ -1446,7 +1467,7 @@ impl MailApp {
                 this.signature_revision += 1;
                 let revision = this.signature_revision;
                 cx.spawn(async move |this, cx| {
-                    Timer::after(Duration::from_millis(500)).await;
+                    cx.background_executor().timer(Duration::from_millis(500)).await;
                     let _ = this.update(cx, |this, cx| {
                         if this.signature_revision == revision {
                             let options = ComposeOptions {
@@ -1460,7 +1481,7 @@ impl MailApp {
                 .detach();
             }
         }));
-        let nickname_input = input("Nickname", false, false, window, cx);
+        let nickname_input = input("Nickname", false, window, cx);
         subscriptions.push(cx.subscribe(&nickname_input, |this, input, e, cx| {
             if matches!(e, InputEvent::Change) {
                 if let Some(id) = this.nickname_for.clone() {
@@ -1469,7 +1490,7 @@ impl MailApp {
                 }
             }
         }));
-        let login_input = input("Same as the email address", false, false, window, cx);
+        let login_input = input("Same as the email address", false, window, cx);
         subscriptions.push(cx.subscribe(&login_input, |this, input, e, cx| {
             // Applied once typed (a pause, Enter or leaving the field), not
             // on every key: each change signs the account out, and its
@@ -1504,7 +1525,7 @@ impl MailApp {
                 _ => {}
             }
         }));
-        let reply_to_input = input("Replies come to the sending address", false, false, window, cx);
+        let reply_to_input = input("Replies come to the sending address", false, window, cx);
         subscriptions.push(cx.subscribe(&reply_to_input, |this, input, e, cx| {
             if matches!(e, InputEvent::Change)
                 && let Some(id) = this.nickname_for.clone()
@@ -1516,13 +1537,13 @@ impl MailApp {
             }
         }));
         let identity_inputs = [
-            input("name@example.com", false, false, window, cx),
-            input("Your name, as recipients see it", false, false, window, cx),
-            input("Replies come to this address", false, false, window, cx),
-            input("smtp.example.com", false, false, window, cx),
-            input("587", false, false, window, cx),
-            input("Same as the address", false, false, window, cx),
-            input("Password or app password", false, true, window, cx),
+            input("name@example.com", false, window, cx),
+            input("Your name, as recipients see it", false, window, cx),
+            input("Replies come to this address", false, window, cx),
+            input("smtp.example.com", false, window, cx),
+            input("587", false, window, cx),
+            input("Same as the address", false, window, cx),
+            input("Password or app password", true, window, cx),
         ];
         let html_view = cx.new(HtmlView::new);
         subscriptions.push(
@@ -1808,7 +1829,7 @@ impl MailApp {
         this.start_local_ai(cx);
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_secs(20)).await;
+                cx.background_executor().timer(Duration::from_secs(20)).await;
                 let checked = this.update(cx, |this, cx| {
                     this.watch_inboxes();
                     this.check_due(cx);
@@ -1849,16 +1870,20 @@ impl MailApp {
         let id = self.selected.as_ref()?;
         self.messages.iter().find(|m| &m.id == id)
     }
-    fn value(state: &Entity<InputState>, cx: &App) -> String {
+    fn value<M: InputModeKind>(
+        state: &Entity<gpui_base::input::InputBaseState<M>>,
+        cx: &App,
+    ) -> String {
         state.read(cx).value().to_string()
     }
-    fn set(
-        state: &Entity<InputState>,
+    fn set<M: InputModeKind>(
+        state: &Entity<gpui_base::input::InputBaseState<M>>,
         value: impl Into<SharedString>,
         w: &mut Window,
         cx: &mut App,
     ) {
-        state.update(cx, |s, cx| s.set_value(value, w, cx));
+        let value: SharedString = value.into();
+        state.update(cx, |s, cx| s.set_text(value, w, cx));
     }
     fn mailbox(&self) -> Mailbox {
         if self.folder == Folder::Other {
@@ -1997,7 +2022,7 @@ impl MailApp {
                     }
                 }
             });
-            Timer::after(Duration::from_millis(400)).await;
+            cx.background_executor().timer(Duration::from_millis(400)).await;
             let _ = this.update(cx, |this, cx| {
                 this.counts_running = false;
                 if std::mem::take(&mut this.counts_again) {
@@ -2171,7 +2196,7 @@ impl MailApp {
                     break;
                 }
                 // Yield to interactive operations between batches.
-                Timer::after(Duration::from_millis(25)).await;
+                cx.background_executor().timer(Duration::from_millis(25)).await;
             }
         })
         .detach();
@@ -2473,6 +2498,7 @@ impl MailApp {
         self.update_scope();
         self.selected = None;
         self.messages.clear();
+        self.visible.clear();
         self.layout = None;
         self.filter(cx);
         self.reload_cached(cx);
@@ -2551,7 +2577,7 @@ impl MailApp {
         self.folder_edit = Some((id, edit));
         self.rename_input.update(cx, |s, cx| {
             s.set_placeholder("Folder name", w, cx);
-            s.set_value(value, w, cx);
+            s.set_text(value, w, cx);
             s.focus(w, cx);
         });
         // Select the whole name once the field has focus, so typing replaces it.
@@ -2868,7 +2894,7 @@ impl MailApp {
         if !error {
             let generation = self.notice_generation;
             cx.spawn(async move |this, cx| {
-                Timer::after(Duration::from_secs(4)).await;
+                cx.background_executor().timer(Duration::from_secs(4)).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.notice_generation == generation && !this.connecting {
                         this.status.clear();
@@ -2980,7 +3006,7 @@ impl MailApp {
         // corners. Text fields set their background through `field`.
         theme.colors.window_border = transparent_black();
         // Scrollable areas always show a slim, quiet scrollbar.
-        theme.scrollbar_show = ScrollbarShow::Always;
+        theme.scrollbar_mode = ScrollbarMode::Always;
         theme.colors.scrollbar = transparent_black();
         theme.colors.scrollbar_thumb = rgba((c.muted << 8) | 0x55).into();
         theme.colors.scrollbar_thumb_hover = rgba((c.muted << 8) | 0xa0).into();
@@ -3104,6 +3130,7 @@ impl MailApp {
         self.syncing = false;
         self.cache_loading = false;
         self.messages.clear();
+        self.visible.clear();
         self.layout = None;
         self.wanted_rows.clear();
         self.unfillable.clear();
@@ -3921,7 +3948,7 @@ impl MailApp {
         for i in [PASSWORD, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
             Self::set(&self.form[i], "", w, cx);
         }
-        self.focus.focus(w);
+        self.focus.focus(w, cx);
         if self.folder == Folder::Drafts {
             self.load_drafts(cx);
         }
@@ -4177,7 +4204,7 @@ impl MailApp {
         let cancel = self.cancel.clone();
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(150)).await;
+                cx.background_executor().timer(Duration::from_millis(150)).await;
                 let running = this.update(cx, |this, cx| {
                     if !this.connecting || !Arc::ptr_eq(&this.cancel, &cancel) {
                         return false;
@@ -4260,6 +4287,7 @@ impl MailApp {
         self.modal = None;
         self.folder = Folder::Inbox;
         self.messages.clear();
+        self.visible.clear();
         self.selected = None;
         self.load_generation += 1;
         self.filter(cx);
@@ -4843,7 +4871,7 @@ impl MailApp {
                 self.modal = Some(Modal::NewLabel(target));
                 self.anim += 1;
                 self.label_input.update(cx, |s, cx| {
-                    s.set_value("", w, cx);
+                    s.set_text("", w, cx);
                     s.focus(w, cx);
                 });
             }
@@ -4866,7 +4894,7 @@ impl MailApp {
                         Err(e) => self.notice(e.to_string(), true, cx),
                         Ok(label) => {
                             self.modal = None;
-                            self.focus.focus(w);
+                            self.focus.focus(w, cx);
                             self.apply_target(target, ids, Change::Label(label, true), cx);
                         }
                     }
@@ -4916,7 +4944,7 @@ impl MailApp {
             Action::Finish => {
                 self.onboarding = false;
                 self.step = Step::Welcome;
-                self.focus.focus(w);
+                self.focus.focus(w, cx);
             }
             #[cfg(feature = "sample-data")]
             Action::Sample => {
@@ -4929,7 +4957,7 @@ impl MailApp {
                 self.selected = None;
                 self.read_generation += 1;
                 Self::set(&self.unlock_input, "", w, cx);
-                self.focus.focus(w);
+                self.focus.focus(w, cx);
             }
             Action::UnlockMail => {
                 let Some(m) = self.selected_mail() else {
@@ -5286,6 +5314,7 @@ impl MailApp {
                                     this.account = this.first_account();
                                     this.update_scope();
                                     this.messages.clear();
+                                    this.visible.clear();
                                     this.selected = None;
                                     this.load_generation += 1;
                                     this.filter(cx);
@@ -5741,7 +5770,7 @@ impl MailApp {
             Self::set(&self.search, "", w, cx);
             self.filter(cx);
         }
-        self.focus.focus(w);
+        self.focus.focus(w, cx);
     }
 
     fn button(
@@ -6321,7 +6350,7 @@ impl MailApp {
                             .collect::<Vec<_>>()
                     })
                 })
-                .track_scroll(self.list_scroll.clone())
+                .track_scroll(&self.list_scroll)
                 .flex_1()
                 .min_h_0()
                 .map(|list| panes::scroll_frame(list, &self.list_scroll))
@@ -7977,7 +8006,7 @@ impl MailApp {
             .overflow_y_scroll()
             // Scrolling the menu scrolls it, rather than closing it as a
             // scroll elsewhere does.
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             // Long addresses end in an ellipsis rather than widen the menu.
             .max_w(px(380.))
             .p_1()
@@ -8078,7 +8107,7 @@ impl MailApp {
             .id("menu-backdrop")
             .absolute()
             .inset_0()
-            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
                 let moved = match e.delta {
                     ScrollDelta::Pixels(d) => d.x.abs().max(d.y.abs()) > px(3.),
                     ScrollDelta::Lines(d) => d.x.abs().max(d.y.abs()) > 0.2,
@@ -8542,7 +8571,7 @@ impl Render for MailApp {
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
             self.spin_scheduled = true;
             cx.spawn(async move |this, cx| {
-                Timer::after(SPIN_STEP).await;
+                cx.background_executor().timer(SPIN_STEP).await;
                 let _ = this.update(cx, |this, cx| {
                     this.spin_scheduled = false;
                     cx.notify();
@@ -8956,6 +8985,10 @@ fn folder_icon(f: Folder) -> &'static str {
 fn field(input: Input, c: Colors, disabled: bool) -> Input {
     input.when(!disabled, |i| i.bg(rgb(c.bg)))
 }
+/// A multi-line [`field`].
+fn textarea_field(input: Textarea, c: Colors, disabled: bool) -> Textarea {
+    input.when(!disabled, |i| i.bg(rgb(c.bg)))
+}
 /// A message's preview as the list shows it. Previews are cleaned when
 /// made; any that still carry a character reference or invisible padding
 /// (cached by an older version, say) are cleaned here.
@@ -9206,8 +9239,80 @@ fn date_full(ts: i64) -> String {
         .unwrap_or_default()
 }
 
+/// A key binding whose `secondary-` modifier is Command on macOS and
+/// Control elsewhere, as the running platform reports. (`KeyBinding::new`
+/// no longer resolves `secondary-`, and panics on it.)
+pub(super) fn key<A: gpui::Action>(
+    cx: &App,
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+) -> KeyBinding {
+    let context = context.map(|c| {
+        std::rc::Rc::new(KeyBindingContextPredicate::parse(c).expect("a valid key context"))
+    });
+    KeyBinding::load(keystrokes, Box::new(action), context, false, None, cx)
+        .expect("a valid keystroke")
+}
+
+/// The main and detached windows' key bindings.
+fn app_bindings(cx: &App) -> Vec<KeyBinding> {
+    vec![
+        key(cx, "secondary-q", Quit, Some("Mail")),
+        key(cx, "secondary-w", CloseWindow, Some("Mail")),
+        key(cx, "secondary-,", ShowAccounts, Some("Mail")),
+        key(cx, "secondary-n", Compose, Some("Mail")),
+        key(cx, "secondary-f", Search, Some("Mail")),
+        key(cx, "secondary-r", Refresh, Some("Mail")),
+        key(cx, "escape", Close, Some("Mail")),
+        key(cx, "alt-down", Next, Some("Mail")),
+        key(cx, "alt-up", Previous, Some("Mail")),
+        key(cx, "secondary-shift-a", Archive, Some("Mail")),
+        key(cx, "secondary-backspace", DeleteMail, Some("Mail")),
+        key(cx, "secondary-shift-r", Reply, Some("Mail")),
+        key(cx, "secondary-alt-r", ReplyAll, Some("Mail")),
+        key(cx, "secondary-shift-f", ForwardMail, Some("Mail")),
+        key(cx, "secondary-shift-u", ToggleRead, Some("Mail")),
+        key(cx, "secondary-shift-j", MoveToSpam, Some("Mail")),
+        key(cx, "secondary-shift-s", ToggleStar, Some("Mail")),
+        key(cx, "secondary-shift-l", ToggleTheme, Some("Mail")),
+        key(cx, "secondary-enter", SendMail, Some("Mail")),
+        key(cx, 
+            if cfg!(target_os = "macos") {
+                "ctrl-cmd-s"
+            } else {
+                "ctrl-alt-s"
+            },
+            ToggleSidebar,
+            Some("Mail"),
+        ),
+        key(cx, "secondary-a", SelectAllMail, Some("Mail")),
+        key(cx, "secondary-1", GoInbox, Some("Mail")),
+        key(cx, "secondary-2", GoStarred, Some("Mail")),
+        key(cx, "secondary-3", GoSent, Some("Mail")),
+        key(cx, "secondary-4", GoDrafts, Some("Mail")),
+        key(cx, "secondary-5", GoArchive, Some("Mail")),
+        key(cx, "secondary-6", GoSpam, Some("Mail")),
+        key(cx, "secondary-7", GoTrash, Some("Mail")),
+        key(cx, "secondary-8", GoAllMail, Some("Mail")),
+        key(cx, "secondary-m", Minimize, Some("Mail")),
+        key(cx, "secondary-o", OpenInWindow, Some("Mail")),
+        key(cx, "secondary-w", CloseWindow, Some("Detached")),
+        key(cx, "escape", Close, Some("Detached")),
+        key(cx, "cmd-h", Hide, None),
+        key(cx, "alt-cmd-h", HideOthers, None),
+    ]
+}
+
+/// Runs the app on this system's own GPUI platform.
+#[cfg(not(target_os = "android"))]
 pub fn run(store: Arc<Store>) {
-    let app = Application::new().with_assets(crate::display::assets::Assets);
+    run_on(gpui_platform::application(), store);
+}
+
+/// Runs the app on `app`'s platform (Android's comes from its activity).
+pub fn run_on(app: Application, store: Arc<Store>) {
+    let app = app.with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::sync::oauth::opened);
     super::desktop::register();
     app.run(move |cx| {
@@ -9218,56 +9323,16 @@ pub fn run(store: Arc<Store>) {
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
         cx.set_menus(menus());
         // `secondary` is Command on macOS and Control elsewhere.
-        cx.bind_keys(composer::bindings());
-        cx.bind_keys([
-            KeyBinding::new("secondary-q", Quit, Some("Mail")),
-            KeyBinding::new("secondary-w", CloseWindow, Some("Mail")),
-            KeyBinding::new("secondary-,", ShowAccounts, Some("Mail")),
-            KeyBinding::new("secondary-n", Compose, Some("Mail")),
-            KeyBinding::new("secondary-f", Search, Some("Mail")),
-            KeyBinding::new("secondary-r", Refresh, Some("Mail")),
-            KeyBinding::new("escape", Close, Some("Mail")),
-            KeyBinding::new("alt-down", Next, Some("Mail")),
-            KeyBinding::new("alt-up", Previous, Some("Mail")),
-            KeyBinding::new("secondary-shift-a", Archive, Some("Mail")),
-            KeyBinding::new("secondary-backspace", DeleteMail, Some("Mail")),
-            KeyBinding::new("secondary-shift-r", Reply, Some("Mail")),
-            KeyBinding::new("secondary-alt-r", ReplyAll, Some("Mail")),
-            KeyBinding::new("secondary-shift-f", ForwardMail, Some("Mail")),
-            KeyBinding::new("secondary-shift-u", ToggleRead, Some("Mail")),
-            KeyBinding::new("secondary-shift-j", MoveToSpam, Some("Mail")),
-            KeyBinding::new("secondary-shift-s", ToggleStar, Some("Mail")),
-            KeyBinding::new("secondary-shift-l", ToggleTheme, Some("Mail")),
-            KeyBinding::new("secondary-enter", SendMail, Some("Mail")),
-            KeyBinding::new(
-                if cfg!(target_os = "macos") {
-                    "ctrl-cmd-s"
-                } else {
-                    "ctrl-alt-s"
-                },
-                ToggleSidebar,
-                Some("Mail"),
-            ),
-            KeyBinding::new("secondary-a", SelectAllMail, Some("Mail")),
-            KeyBinding::new("secondary-1", GoInbox, Some("Mail")),
-            KeyBinding::new("secondary-2", GoStarred, Some("Mail")),
-            KeyBinding::new("secondary-3", GoSent, Some("Mail")),
-            KeyBinding::new("secondary-4", GoDrafts, Some("Mail")),
-            KeyBinding::new("secondary-5", GoArchive, Some("Mail")),
-            KeyBinding::new("secondary-6", GoSpam, Some("Mail")),
-            KeyBinding::new("secondary-7", GoTrash, Some("Mail")),
-            KeyBinding::new("secondary-8", GoAllMail, Some("Mail")),
-            KeyBinding::new("secondary-m", Minimize, Some("Mail")),
-            KeyBinding::new("secondary-o", OpenInWindow, Some("Mail")),
-            KeyBinding::new("secondary-w", CloseWindow, Some("Detached")),
-            KeyBinding::new("escape", Close, Some("Detached")),
-            KeyBinding::new("cmd-h", Hide, None),
-            KeyBinding::new("alt-cmd-h", HideOthers, None),
-        ]);
+        let bindings = composer::bindings(cx);
+        cx.bind_keys(bindings);
+        let bindings = app_bindings(cx);
+        cx.bind_keys(bindings);
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // Android's window is the whole screen.
+                window_bounds: (!cfg!(target_os = "android"))
+                    .then_some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(360.), px(320.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Picacho".into()),
@@ -9284,7 +9349,7 @@ pub fn run(store: Arc<Store>) {
             },
             move |window, cx| {
                 let view = cx.new(|cx| MailApp::new(store, window, cx));
-                view.read(cx).focus.focus(window);
+                { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
                 let close_view = view.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
                     close_view
@@ -9307,7 +9372,7 @@ pub fn run(store: Arc<Store>) {
             },
         )
         .expect("Could not open the mail window");
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -9323,6 +9388,7 @@ fn menus() -> Vec<Menu> {
     let menu = |name: &str, items: Vec<MenuItem>| Menu {
         name: name.to_owned().into(),
         items,
+        disabled: false,
     };
     vec![
         menu(
@@ -9545,10 +9611,22 @@ mod tests {
         assert!(plain.view(SourceView::Html).is_none());
     }
 
+    #[gpui::test]
+    fn every_key_binding_parses(cx: &mut TestAppContext) {
+        // Launch binds these; a keystroke gpui can't parse panics there.
+        cx.update(|cx| {
+            assert!(!app_bindings(cx).is_empty());
+            assert!(!composer::bindings(cx).is_empty());
+        });
+    }
+
     pub(super) fn open(
         store: Arc<Store>,
         cx: &mut TestAppContext,
     ) -> (Entity<MailApp>, &mut VisualTestContext) {
+        // Emails lay out on their own threads (html/worker.rs), whose
+        // updates wake the window from outside the test scheduler.
+        cx.executor().allow_parking();
         cx.update(gpui_component::init);
         let mut app = None;
         let window = cx.add_window(|w, cx| {
@@ -9926,7 +10004,8 @@ mod tests {
             );
             assert!(this.tree_ui.renaming.is_none());
         });
-        frame(cx);
+        // Draw without running tasks: the attempt would finish first.
+        cx.update(|w, _| w.refresh());
         assert!(cx.debug_bounds(Box::leak(format!("new-folder-{id}").into_boxed_str())).is_some());
         // This account has no server here: the attempt ends, and says why.
         cx.run_until_parked();
@@ -10221,7 +10300,7 @@ mod tests {
         }
         view.update_in(cx, |this, w, cx| {
             // Typed, so the field has focus.
-            this.login_input.read(cx).focus_handle(cx).focus(w);
+            { let focus = this.login_input.read(cx).focus_handle(cx); focus.focus(w, cx); }
             MailApp::set(&this.login_input, "work-user", w, cx);
         });
         frame(cx);
@@ -10233,7 +10312,12 @@ mod tests {
         // Enter applies it.
         view.update(cx, |this, cx| {
             this.login_input
-                .update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+                .update(cx, |_, cx| {
+                    cx.emit(InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    })
+                });
         });
         view.update_in(cx, |this, w, cx| {
             MailApp::set(&this.reply_to_input, "desk@example.com", w, cx);
@@ -10253,11 +10337,11 @@ mod tests {
         // refreshes fields from the account it shows), and applies once
         // typing has paused.
         view.update_in(cx, |this, w, cx| {
-            this.login_input.read(cx).focus_handle(cx).focus(w);
+            { let focus = this.login_input.read(cx).focus_handle(cx); focus.focus(w, cx); }
             MailApp::set(&this.login_input, "work-user2", w, cx);
         });
         frame(cx);
-        view.update_in(cx, |this, w, _| this.focus.focus(w));
+        view.update_in(cx, |this, w, cx| this.focus.focus(w, cx));
         frame(cx);
         view.read_with(cx, |this, cx| {
             assert_eq!(MailApp::value(&this.login_input, cx), "work-user2");
@@ -10737,11 +10821,12 @@ mod tests {
             );
         });
         // A trackpad's two-finger click sends a tiny scroll with it; the menu stays.
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: at,
             delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: Modifiers::none(),
             touch_phase: TouchPhase::Started,
+            source: Default::default(),
         });
         view.read_with(cx, |this, _| assert!(this.menu.is_some()));
         // Choosing "Select" from the menu starts selection mode.

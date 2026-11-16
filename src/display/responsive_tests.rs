@@ -329,7 +329,7 @@ fn typing_a_search_scrolls_the_list_to_the_top(cx: &mut TestAppContext) {
     let query = template.subject.chars().take(3).collect::<String>();
     view.update_in(cx, |this, w, cx| {
         let search = this.search.clone();
-        search.update(cx, |s, cx| s.set_value(query.clone(), w, cx));
+        search.update(cx, |s, cx| s.set_text(query.clone(), w, cx));
     });
     frame(cx);
     view.read_with(cx, |this, _| {
@@ -346,14 +346,14 @@ fn app_password_sign_in_scrolls_only_when_it_does_not_fit(cx: &mut TestAppContex
         // Everything in view: nothing to scroll into.
         resize(cx, 1280., 1000.);
         frame(cx);
-        let max = view.read_with(cx, |this, _| this.onboarding_scroll.max_offset().height);
+        let max = view.read_with(cx, |this, _| this.onboarding_scroll.max_offset().y);
         assert_eq!(max, px(0.), "{service:?} scrolls in a tall window");
         // A short window scrolls just far enough to show the last control.
         resize(cx, 1280., 480.);
         frame(cx);
         let (max, body) = view.read_with(cx, |this, _| {
             (
-                this.onboarding_scroll.max_offset().height,
+                this.onboarding_scroll.max_offset().y,
                 this.onboarding_scroll.bounds(),
             )
         });

@@ -171,10 +171,7 @@ impl Render for MessageWindow {
                         plain_markdown(&crate::manage::tracking::clean_text(shown))
                     } else {
                         plain_markdown(shown)
-                    },
-                    window,
-                    cx,
-                )
+                    })
                 .selectable(true)
                 .h_auto()
                 .text_size(px(14.))
@@ -427,7 +424,7 @@ impl MailApp {
                     let view = cx.new(|cx| {
                         MessageWindow::new(mail, app, main, colors, options, dark, own, cx)
                     });
-                    view.read(cx).focus.focus(window);
+                    { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
                     *out.borrow_mut() = Some(view.clone());
                     cx.new(|cx| Root::new(view, window, cx))
                 }

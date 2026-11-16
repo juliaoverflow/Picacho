@@ -783,6 +783,7 @@ impl MailApp {
             self.selected = None;
             self.selection.clear();
             self.messages.clear();
+            self.visible.clear();
             self.layout = None;
             self.load_generation += 1;
             self.update_scope();
@@ -1774,7 +1775,7 @@ mod tests {
         });
         frame(cx);
         let target = view.update(cx, |this, _| {
-            let max = this.settings_scroll.max_offset().height;
+            let max = this.settings_scroll.max_offset().y;
             assert!(max > px(100.), "the page scrolls: {max:?}");
             let y = -(max / 2.).round();
             this.settings_scroll.set_offset(point(px(0.), y));

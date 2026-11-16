@@ -216,9 +216,11 @@ pub struct SignedIn {
 
 /// The argument that starts Picacho as Proton's verification window
 /// (`display::verify`) rather than as the app.
+#[cfg(not(target_os = "android"))]
 pub const VERIFY_FLAG: &str = "--proton-verify";
 
 /// Proton's verification page for a sign-in it wants checked.
+#[cfg(not(target_os = "android"))]
 fn verification_url(methods: &[String], token: &str) -> String {
     let methods: Vec<&str> = methods
         .iter()
@@ -239,6 +241,7 @@ fn verification_url(methods: &[String], token: &str) -> String {
 }
 
 /// What the verification window printed: the solved token and its type.
+#[cfg(not(target_os = "android"))]
 fn verified(output: &[u8]) -> Option<HumanVerification> {
     let line = String::from_utf8_lossy(output);
     let value: serde_json::Value = serde_json::from_str(line.lines().last()?.trim()).ok()?;
@@ -255,6 +258,13 @@ fn verified(output: &[u8]) -> Option<HumanVerification> {
 /// text where it offers those) in the system webview, in a window of its
 /// own, and waits until it passes, the window is closed, or the sign-in is
 /// cancelled.
+#[cfg(target_os = "android")]
+fn verify_human(_: &[String], _: &str, _: &AtomicBool) -> Result<HumanVerification> {
+    bail!(
+        "Proton wants to check that it's you, but its check can't be shown on Android yet. Sign in once at account.proton.me and try again."
+    )
+}
+#[cfg(not(target_os = "android"))]
 fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<HumanVerification> {
     use std::io::Read;
     let exe = std::env::current_exe().context("Couldn't find Picacho to show Proton's check")?;

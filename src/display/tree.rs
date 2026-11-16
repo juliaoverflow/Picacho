@@ -491,7 +491,7 @@ impl MailApp {
         self.tree_ui.renaming = Some(id);
         self.rename_input.update(cx, |s, cx| {
             s.set_placeholder(placeholder, w, cx);
-            s.set_value(name, w, cx);
+            s.set_text(name, w, cx);
             s.focus(w, cx);
         });
         // Select the whole name once the field has focus, so typing replaces it.
@@ -506,7 +506,7 @@ impl MailApp {
         };
         // A server folder is named the same way, then made on its server.
         if self.finish_remote_folder(false, cx) {
-            self.focus.focus(w);
+            self.focus.focus(w, cx);
             cx.notify();
             return;
         }
@@ -519,7 +519,7 @@ impl MailApp {
             *name = value;
             self.save_tree();
         }
-        self.focus.focus(w);
+        self.focus.focus(w, cx);
         cx.notify();
     }
     /// Escape leaves the name as it was.
@@ -528,7 +528,7 @@ impl MailApp {
             return false;
         }
         self.finish_remote_folder(true, cx);
-        self.focus.focus(w);
+        self.focus.focus(w, cx);
         cx.notify();
         true
     }
@@ -558,7 +558,7 @@ impl MailApp {
         {
             let (folder, serial) = (folder.clone(), self.tree_ui.serial);
             cx.spawn(async move |this, cx| {
-                Timer::after(SPRING).await;
+                cx.background_executor().timer(SPRING).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.tree_ui.serial == serial && cx.has_active_drag() {
                         this.collapsed.remove(&folder);
@@ -655,7 +655,7 @@ impl MailApp {
         };
         if step != 0. {
             let mut offset = scroll.offset();
-            let max = f32::from(scroll.max_offset().height);
+            let max = f32::from(scroll.max_offset().y);
             offset.y = px((f32::from(offset.y) + step).clamp(-max, 0.));
             scroll.set_offset(offset);
             cx.notify();
