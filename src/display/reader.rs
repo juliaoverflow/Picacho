@@ -1494,51 +1494,7 @@ impl MailApp {
         {
             return rows.clone();
         }
-        let key = super::thread::conversation_subject(&m.subject);
-        let replyish = |x: &Mail, key: &str| {
-            !x.references().is_empty() || x.subject.trim().to_lowercase() != key
-        };
-        let linked = |a: &Mail, b: &Mail| {
-            !b.message_id.is_empty() && a.references().contains(b.message_id.as_str())
-        };
-        // Permanent server thread ids (not IMAP THREAD's, which only
-        // cover one mailbox) settle it either way.
-        let permanent = |x: &Mail| !x.thread_id().is_empty() && !x.thread_id().starts_with("t:");
-        let server = |x: &Mail| -> Option<bool> {
-            if x.thread_id().is_empty() || m.thread_id().is_empty() {
-                return None;
-            }
-            if x.thread_id() == m.thread_id() {
-                Some(true)
-            } else if permanent(x) && permanent(m) {
-                Some(false)
-            } else {
-                None
-            }
-        };
-        let mut seen = HashSet::new();
-        let mut rows: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| x.account == m.account && !x.pending)
-            .filter(|(_, x)| {
-                if let Some(same) = server(x) {
-                    return same || x.id == m.id;
-                }
-                x.id == m.id
-                    || linked(x, m)
-                    || linked(m, x)
-                    || (key.chars().count() > 2
-                        && super::thread::may_be_conversation(&x.subject, &key)
-                        && super::thread::conversation_subject(&x.subject) == key
-                        && (replyish(x, &key) || replyish(m, &key)))
-            })
-            // The same message under several labels or folders shows once.
-            .filter(|(_, x)| x.message_id.is_empty() || seen.insert(x.message_id.clone()))
-            .map(|(i, _)| i)
-            .collect();
-        rows.sort_by_key(|i| self.messages[*i].date);
+        let rows = super::thread::conversation(&self.messages, m);
         let rows = Rc::new(rows);
         *self.thread_cache.borrow_mut() = Some((m.id.clone(), self.list_revision, rows.clone()));
         rows
