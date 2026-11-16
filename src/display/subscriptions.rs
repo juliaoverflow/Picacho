@@ -573,30 +573,18 @@ impl MailApp {
     pub(super) fn unsubscribe_banner(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
         let sub = MailSubscription::of(m)?;
         let c = self.colors();
+        let unsubscribe = self.unsubscribe_button("unsubscribe-mail".into(), &sub, cx);
         Some(
-            div()
-                .id("unsubscribe-banner")
-                .debug_selector(|| "unsubscribe-banner".into())
-                .mb_3()
-                .px_3()
-                .py_2()
-                .rounded(px(9.))
-                .border_1()
-                .border_color(rgb(c.border))
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(px(12.))
-                .text_color(rgb(c.muted))
-                .child(icon_el("subscriptions", 14., c.muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child("This message is from a mailing list or subscription."),
-                )
-                .child(self.unsubscribe_button("unsubscribe-mail".into(), &sub, cx))
-                .into_any_element(),
+            self.banner(
+                "unsubscribe-banner",
+                "subscriptions",
+                BannerStyle::Outlined,
+                "This message is from a mailing list or subscription.",
+                [unsubscribe.into_any_element()],
+            )
+            // A quiet line: it is offered on every such message.
+            .text_color(rgb(c.muted))
+            .into_any_element(),
         )
     }
     /// "Subscriptions" under an account, or "All Subscriptions" under All Accounts.

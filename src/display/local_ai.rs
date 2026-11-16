@@ -72,40 +72,31 @@ impl MailApp {
         }
         let c = self.colors();
         let shown = self.codes_shown.contains(&m.id);
+        let toggle = self.link(
+            "codes-toggle",
+            if shown { "Hide Code" } else { "Show Code" },
+            Action::ShowCodes(m.id.clone(), !shown),
+            cx,
+        );
+        // Copies without showing it.
+        let copy = self.link("codes-copy", "Copy Code", Action::CopyCode(m.id.clone()), cx);
         Some(
-            div()
-                .id("codes-banner")
-                .debug_selector(|| "codes-banner".into())
-                .mb_4()
-                .px_3()
-                .py_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded(px(8.))
-                .bg(rgb(c.soft))
-                .text_size(px(12.))
-                .child(icon_el("lock", 13., c.accent))
-                .child(div().flex_1().min_w_0().child(if shown {
+            self.banner(
+                "codes-banner",
+                "lock",
+                BannerStyle::Filled,
+                if shown {
                     "This message's sign-in code is shown."
                 } else {
                     "This message's sign-in code is hidden."
-                }))
-                .child(self.link(
-                    "codes-toggle",
-                    if shown { "Hide Code" } else { "Show Code" },
-                    Action::ShowCodes(m.id.clone(), !shown),
-                    cx,
-                ))
-                .child(div().text_color(rgb(c.muted)).child("·"))
-                // Copies without showing it.
-                .child(self.link(
-                    "codes-copy",
-                    "Copy Code",
-                    Action::CopyCode(m.id.clone()),
-                    cx,
-                ))
-                .into_any_element(),
+                },
+                [
+                    toggle.into_any_element(),
+                    div().text_color(rgb(c.muted)).child("·").into_any_element(),
+                    copy.into_any_element(),
+                ],
+            )
+            .into_any_element(),
         )
     }
     /// Copies a message's sign-in code, as it is typed into a sign-in form.

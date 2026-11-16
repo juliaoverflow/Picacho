@@ -528,3 +528,75 @@ fn right_clicking_the_sender_offers_to_write_and_find_their_mail(cx: &mut TestAp
         assert!(draft.subject.is_empty());
     });
 }
+
+#[gpui::test]
+fn banner_actions_stay_inside_their_banners_as_the_reader_narrows(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    // One message showing three of the banners: snoozed, asking for a read
+    // receipt, and from a mailing list. (The sign-in code banner, drawn by
+    // the same `banner`, needs the Local AI model.)
+    view.update_in(cx, |this, _, cx| {
+        let m = &mut this.messages[0];
+        m.set_receipt_to("ana@example.com");
+        m.list_unsubscribe = "<https://example.com/unsubscribe>".into();
+        m.one_click = true;
+        let m = m.clone();
+        this.snoozed.insert(
+            m.account.clone(),
+            vec![crate::manage::backend::Snoozed {
+                message_id: m.message_id.clone(),
+                subject: m.subject.clone(),
+                sender: m.sender.clone(),
+                until: chrono::Local::now().timestamp() + 3 * 86_400,
+                folder: "Snoozed".into(),
+                ids: vec![],
+            }],
+        );
+        this.selected = Some(m.id.clone());
+        cx.notify();
+    });
+    let banners: [(&str, &[&str]); 3] = [
+        ("snooze-banner", &["unsnooze", "resnooze"]),
+        ("receipt-banner", &["receipt-decline", "receipt-send"]),
+        ("unsubscribe-banner", &["unsubscribe-mail"]),
+    ];
+    // Three-pane windows with the reader at its narrowest, and narrow
+    // windows' full-width readers.
+    for (width, drag) in [
+        (1440., false),
+        (1180., true),
+        (960., true),
+        (899., false),
+        (480., false),
+        (360., false),
+    ] {
+        cx.simulate_resize(size(px(width), px(700.)));
+        view.update_in(cx, |this, _, cx| {
+            this.reader_width = drag.then_some(super::panes::READER_MIN);
+            cx.notify();
+        });
+        frame(cx);
+        frame(cx);
+        let pane = cx.debug_bounds("reader-pane").unwrap();
+        for (banner, actions) in banners {
+            let selector: &'static str = banner;
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{width}: {banner} is not shown"));
+            assert!(b.right() <= pane.right(), "{width}: {banner} past the reader");
+            for action in actions {
+                let a = cx
+                    .debug_bounds(action)
+                    .unwrap_or_else(|| panic!("{width}: {action} is not shown"));
+                assert!(
+                    a.left() >= b.left() && a.right() <= b.right(),
+                    "{width}: {action} past {banner}: {a:?} in {b:?}"
+                );
+                assert!(
+                    a.top() >= b.top() && a.bottom() <= b.bottom(),
+                    "{width}: {action} outside {banner}: {a:?} in {b:?}"
+                );
+            }
+        }
+    }
+}

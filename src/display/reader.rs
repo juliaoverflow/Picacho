@@ -754,6 +754,66 @@ impl MailApp {
     }
 }
 
+/// How a banner above the open message is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum BannerStyle {
+    /// On a soft fill, with an accent icon: about the message itself
+    /// (snoozed, its sign-in code hidden).
+    Filled,
+    /// Outlined, with a muted icon: something asked of you that can be
+    /// set aside (a read receipt, unsubscribing).
+    Outlined,
+}
+
+impl MailApp {
+    /// A banner above the open message: an icon, a line of text and its
+    /// actions. Every banner wraps the same way: the text wraps, keeping
+    /// room to be read, and past that the actions go below it, together
+    /// and on the right, rather than past the reader's edge.
+    pub(super) fn banner(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        style: BannerStyle,
+        text: impl IntoElement,
+        actions: impl IntoIterator<Item = AnyElement>,
+    ) -> Stateful<Div> {
+        let c = self.colors();
+        let icon_color = match style {
+            BannerStyle::Filled => c.accent,
+            BannerStyle::Outlined => c.muted,
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .mb_4()
+            .px_3()
+            .py_2()
+            .rounded(px(10.))
+            .map(|d| match style {
+                BannerStyle::Filled => d.bg(rgb(c.soft)),
+                BannerStyle::Outlined => d.border_1().border_color(rgb(c.border)),
+            })
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.))
+            .child(icon_el(icon, 15., icon_color))
+            .child(div().flex_1().min_w(px(160.)).child(text))
+            .child(
+                div()
+                    .debug_selector(move || format!("{id}-actions"))
+                    .flex_shrink_0()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(actions),
+            )
+    }
+}
+
 /// A centered spinner where the body will appear.
 fn loading_body(c: Colors) -> AnyElement {
     div()
