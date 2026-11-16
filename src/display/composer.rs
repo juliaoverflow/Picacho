@@ -143,6 +143,8 @@ pub(super) struct Composer {
     /// Send Later's date and time picker, while its menu is open.
     later_picker: Option<Entity<DateTimePicker>>,
     later_subscription: Option<Subscription>,
+    /// Reads a time typed into Send Later (Local AI), when it is on.
+    pub(super) when: Option<Rc<crate::manage::local_ai::when::Parser>>,
     accounts: Vec<Account>,
     /// Aliases at forwarding services that can send.
     aliases: Vec<fwd::SendAlias>,
@@ -265,6 +267,7 @@ impl Composer {
             later_open: false,
             later_picker: None,
             later_subscription: None,
+            when: None,
             accounts,
             aliases,
             alias_services: vec![],
@@ -702,12 +705,14 @@ impl Composer {
         let presets = crate::manage::composing::later_choices(chrono::Local::now());
         let colors = self.colors;
         let at = self.draft.send_at;
-        let picker = cx.new(|_| {
+        let parser = self.when.clone();
+        let picker = cx.new(|cx| {
             let picker = DateTimePicker::new("later", "Send", presets, colors);
-            match at {
+            let picker = match at {
                 Some(at) => picker.at(at),
                 None => picker,
-            }
+            };
+            picker.typed(parser, window, cx)
         });
         self.later_subscription = Some(cx.subscribe_in(&picker, window, |this, _, e, w, cx| {
             match e {

@@ -3,11 +3,14 @@
 //! turned on in Settings → Local AI, and turning it off deletes the model.
 //! Mail never leaves the computer for any of it.
 //!
-//! The first feature hides sign-in and verification codes (see `otp`).
+//! The features: hiding sign-in and verification codes (see `otp`), and
+//! understanding dates and times typed where Picacho asks when ("tmrw at 6",
+//! see `when`).
 #[cfg(target_os = "macos")]
 mod coreml;
 pub mod otp;
 pub mod runtime;
+pub mod when;
 
 use crate::manage::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -19,13 +22,26 @@ use std::sync::atomic::AtomicU64;
 pub const ENABLED_PREFERENCE: &str = "local_ai";
 /// Preference: sign-in codes are found and hidden.
 pub const OTP_PREFERENCE: &str = "local_ai_otp";
+/// Preference: typed dates and times are understood.
+pub const WHEN_PREFERENCE: &str = "local_ai_when";
 
-/// Where the models are published: Picacho's model repository on Hugging
-/// Face (in the pinaltech "Picacho Models" collection). Each file is checked
-/// against the size and SHA-256 below, so a changed file is never installed.
-/// `PICACHO_MODELS_URL` points elsewhere (a mirror, or a local server while
-/// developing).
-const MODELS_URL: &str = "https://huggingface.co/pinaltech/veil-otp/resolve/main";
+/// Where the models are published: Picacho's model repositories on Hugging
+/// Face (in the pinaltech "Picacho Models" collection), one per model. Each
+/// file is checked against the size and SHA-256 below, so a changed file is
+/// never installed. `PICACHO_MODELS_URL` points elsewhere (a mirror holding
+/// every model's files, or a local server while developing).
+const MODELS_URL: &str = "https://huggingface.co/pinaltech";
+
+/// How a model is run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    /// Scores one candidate at a time (Core ML on macOS).
+    Scorer,
+    /// Labels every token of a text, with Picacho's own runtime everywhere:
+    /// it runs for every keystroke, where Core ML's overhead per call would
+    /// cost more than the whole network.
+    Tagger,
+}
 
 /// A downloadable model: its file there and here, and what it must be.
 pub struct Model {
@@ -34,6 +50,9 @@ pub struct Model {
     pub label: &'static str,
     /// The features that need it, as Settings names them.
     pub features: &'static [&'static str],
+    /// Its repository in the collection, and how it runs.
+    repo: &'static str,
+    pub kind: Kind,
     /// The published file.
     file: &'static str,
     /// What is kept in the models directory once installed: the file
@@ -60,6 +79,8 @@ const OTP_COREML: Model = Model {
     id: "otp",
     label: "Sign-in code model",
     features: &["Hide sign-in codes"],
+    repo: "veil-otp",
+    kind: Kind::Scorer,
     file: "otp-v1.mlmodel",
     installed: "otp-v1.mlmodelc",
     sha256: "309484159aa766e287f9a0bffcc0f2d990ba524eaaed374ab63b25b3b0194c8a",
@@ -72,6 +93,8 @@ const OTP_NATIVE: Model = Model {
     id: "otp",
     label: "Sign-in code model",
     features: &["Hide sign-in codes"],
+    repo: "veil-otp",
+    kind: Kind::Scorer,
     file: "otp-v1.bin",
     installed: "otp-v1.bin",
     sha256: "7667b357195ca20d04e3505700ca5db72d335befbafc7e1dbe803eb765347bc6",
@@ -80,8 +103,24 @@ const OTP_NATIVE: Model = Model {
     threshold: 0.3,
 };
 
+/// Epoch TBS, the date and time model (see `models/tbs/train.py`): the
+/// same file on every platform.
+pub const WHEN: Model = Model {
+    id: "tbs",
+    label: "Date and time model",
+    features: &["Understand typed dates"],
+    repo: "epoch-tbs",
+    kind: Kind::Tagger,
+    file: "tbs-v1.bin",
+    installed: "tbs-v1.bin",
+    sha256: "5035ed09e644033d7b53a7ea3dee558ba2099da874b0a5fc68baf2c032de0de5",
+    size: 603_700,
+    dim: when::DIM,
+    threshold: 0.,
+};
+
 /// Every model Local AI can download.
-pub const MODELS: [&Model; 1] = [&OTP];
+pub const MODELS: [&Model; 2] = [&OTP, &WHEN];
 
 /// The model with this id.
 pub fn model(id: &str) -> Option<&'static Model> {
@@ -95,6 +134,10 @@ pub fn enabled(store: &Store) -> bool {
 /// Whether sign-in codes are to be hidden (Local AI on, and the feature on).
 pub fn otp_enabled(store: &Store) -> bool {
     enabled(store) && store.preference(OTP_PREFERENCE).as_deref() == Some("true")
+}
+/// Whether typed dates are understood (Local AI on, and the feature on).
+pub fn when_enabled(store: &Store) -> bool {
+    enabled(store) && store.preference(WHEN_PREFERENCE).as_deref() == Some("true")
 }
 
 /// The directory the models are kept in.
@@ -116,8 +159,10 @@ impl Model {
     /// keeps it (compiled for Core ML on macOS). `received` counts the bytes
     /// downloaded so far. Blocks; run off the main thread.
     pub fn install(&self, store: &Store, received: &AtomicU64) -> Result<()> {
-        let base = std::env::var("PICACHO_MODELS_URL").unwrap_or_else(|_| MODELS_URL.into());
-        let url = format!("{}/{}", base.trim_end_matches('/'), self.file);
+        let url = match std::env::var("PICACHO_MODELS_URL") {
+            Ok(base) => format!("{}/{}", base.trim_end_matches('/'), self.file),
+            Err(_) => self.url(),
+        };
         let bytes = crate::sync::models::download(&url, self.size, received)?;
         let digest: String = Sha256::digest(&bytes)
             .iter()
@@ -135,16 +180,32 @@ impl Model {
         let _ = std::fs::remove_file(&partial);
         result?;
         // What was installed has to load.
-        self.load(store).map(drop)
+        match self.kind {
+            Kind::Scorer => self.load(store).map(drop),
+            Kind::Tagger => self.load_tagger(store).map(drop),
+        }
+    }
+
+    /// Where the model is published.
+    fn url(&self) -> String {
+        format!("{MODELS_URL}/{}/resolve/main/{}", self.repo, self.file)
     }
 
     #[cfg(target_os = "macos")]
     fn place(&self, downloaded: &std::path::Path, target: &std::path::Path) -> Result<()> {
+        if self.kind == Kind::Tagger {
+            runtime::NativeTagger::load(downloaded)?;
+            std::fs::rename(downloaded, target)?;
+            return Ok(());
+        }
         coreml::compile(downloaded, target)
     }
     #[cfg(not(target_os = "macos"))]
     fn place(&self, downloaded: &std::path::Path, target: &std::path::Path) -> Result<()> {
-        runtime::NativeModel::load(downloaded)?;
+        match self.kind {
+            Kind::Scorer => drop(runtime::NativeModel::load(downloaded)?),
+            Kind::Tagger => drop(runtime::NativeTagger::load(downloaded)?),
+        }
         std::fs::rename(downloaded, target)?;
         Ok(())
     }
@@ -165,6 +226,13 @@ impl Model {
             Box::new(model)
         };
         Ok(scorer)
+    }
+
+    /// The installed labeller (a `Kind::Tagger` model).
+    pub fn load_tagger(&self, store: &Store) -> Result<runtime::NativeTagger> {
+        let path = self.path(store);
+        ensure!(path.exists(), "{} isn't installed.", self.label);
+        runtime::NativeTagger::load(&path)
     }
 
     /// The space the installed model takes, in bytes (0 when it isn't).
@@ -189,6 +257,11 @@ impl Model {
 /// The sign-in code detector, with the installed model.
 pub fn otp_detector(store: &Store) -> Result<otp::Detector> {
     Ok(otp::Detector::new(OTP.load(store)?, OTP.threshold))
+}
+
+/// The date and time reader, with the installed model.
+pub fn when_parser(store: &Store) -> Result<when::Parser> {
+    Ok(when::Parser::new(WHEN.load_tagger(store)?))
 }
 
 /// Deletes what isn't a current model: one left from an earlier version
@@ -252,7 +325,7 @@ fn size_of(path: &std::path::Path) -> u64 {
 pub(crate) fn test_model(file: &str) -> PathBuf {
     use std::sync::Mutex;
     static FETCHING: Mutex<()> = Mutex::new(());
-    let model = [&OTP_NATIVE, &OTP_COREML]
+    let model = [&OTP_NATIVE, &OTP_COREML, &WHEN]
         .into_iter()
         .find(|m| m.file == file)
         .unwrap_or_else(|| panic!("no published model is named {file}"));
@@ -262,7 +335,7 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
         })
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let trained = root.join("models/otp").join(file);
+    let trained = root.join("models").join(model.id).join(file);
     if published(&trained) {
         return trained;
     }
@@ -271,7 +344,7 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
     if published(&cached) {
         return cached;
     }
-    let url = format!("{MODELS_URL}/{file}");
+    let url = model.url();
     let bytes = crate::sync::models::download(&url, model.size, &AtomicU64::new(0))
         .unwrap_or_else(|e| panic!("couldn't download {url} for the tests: {e:#}"));
     assert_eq!(
@@ -299,12 +372,39 @@ mod tests {
     fn the_published_models_are_the_ones_the_app_expects() {
         // The files on Hugging Face (or just trained) match the sizes and
         // digests here; `test_model` checks both, downloading if needed.
-        for model in [OTP_NATIVE, OTP_COREML] {
+        for model in [OTP_NATIVE, OTP_COREML, WHEN] {
             let bytes = std::fs::read(test_model(model.file)).unwrap();
             assert_eq!(hex(&Sha256::digest(&bytes)), model.sha256, "{}", model.file);
             assert_eq!(bytes.len() as u64, model.size, "{}", model.file);
-            assert_eq!(model.threshold, OTP.threshold);
         }
+        assert_eq!(OTP_NATIVE.threshold, OTP_COREML.threshold);
+        runtime::NativeTagger::load(&test_model(WHEN.file)).unwrap();
+    }
+
+    /// Installs the date and time model as the app does, from Hugging
+    /// Face, and reads a time with it. Needs the network:
+    /// `cargo test installs_the_date_model -- --ignored`.
+    #[test]
+    #[ignore]
+    fn installs_the_date_model_from_hugging_face() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&p)?;
+        let received = AtomicU64::new(0);
+        WHEN.install(&store, &received)?;
+        assert!(WHEN.is_installed(&store));
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::Relaxed),
+            WHEN.size
+        );
+        let parser = when_parser(&store)?;
+        let now = chrono::Utc::now();
+        assert!(parser.parse("tmrw at 6", &now).is_some());
+        assert!(parser.parse("übermorgen um 18 uhr", &now).is_some());
+        assert!(parser.parse("hello there", &now).is_none());
+        WHEN.remove(&store)?;
+        drop(store);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
     }
 
     #[test]

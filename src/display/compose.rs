@@ -370,7 +370,9 @@ impl MailApp {
         };
         let services = Self::alias_services(&self.forwarding);
         let alias_only = self.alias_only_accounts();
+        let when = self.when.clone();
         composer.update(cx, |c, _| {
+            c.when = when;
             c.set_forwarding(fwd::sendable(&self.forwarding), services, alias_only)
         });
         // The From menu should not offer aliases deleted elsewhere.

@@ -1,6 +1,7 @@
 //! Local AI in the app: the Settings page that turns it and its features on
-//! (downloading their models) and off (deleting them), and hiding the
-//! sign-in codes the model finds wherever mail is shown.
+//! (downloading their models) and off (deleting them), hiding the sign-in
+//! codes the model finds wherever mail is shown, and the date and time model
+//! that reads times typed into Snooze and Send Later.
 use super::*;
 use crate::manage::local_ai::{self, otp};
 use std::borrow::Cow;
@@ -147,9 +148,14 @@ impl MailApp {
         cx.notify();
     }
 
-    /// Loads the installed sign-in code model at launch, or installs it if
-    /// it should be there and isn't (deleted outside Picacho).
+    /// Loads the installed models of the features that are on at launch, or
+    /// installs them if they should be there and aren't (deleted outside
+    /// Picacho).
     pub(super) fn start_local_ai(&mut self, cx: &mut Context<Self>) {
+        self.start_otp(cx);
+        self.start_when(cx);
+    }
+    fn start_otp(&mut self, cx: &mut Context<Self>) {
         if !self.hide_codes {
             return;
         }
@@ -203,14 +209,17 @@ impl MailApp {
                 cx.notify();
             },
         );
-        // The progress ring follows the download.
+        self.follow_download(cx);
+    }
+    /// Redraws while a model downloads, so its progress ring follows it.
+    fn follow_download(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_millis(100)).await;
                 let busy = this
                     .update(cx, |this, cx| {
                         cx.notify();
-                        this.model_busy
+                        this.model_busy || this.when_busy
                     })
                     .unwrap_or(false);
                 if !busy {
@@ -221,9 +230,87 @@ impl MailApp {
         .detach();
     }
 
+    fn start_when(&mut self, cx: &mut Context<Self>) {
+        if !self.understand_dates {
+            return;
+        }
+        let _ = local_ai::remove_stale(&self.backend.store);
+        if local_ai::WHEN.is_installed(&self.backend.store) {
+            self.load_when(cx);
+        } else {
+            self.install_when(cx);
+        }
+    }
+    fn load_when(&mut self, cx: &mut Context<Self>) {
+        match local_ai::when_parser(&self.backend.store) {
+            Ok(parser) => {
+                self.set_parser(Some(Rc::new(parser)), cx);
+                self.when_error = None;
+            }
+            Err(e) => {
+                self.set_parser(None, cx);
+                self.when_error = Some(format!("{e:#}"));
+            }
+        }
+        cx.notify();
+    }
+    /// The date and time reader, here and in open composers (their Send
+    /// Later picks it up the next time it opens).
+    fn set_parser(&mut self, parser: Option<Rc<local_ai::when::Parser>>, cx: &mut Context<Self>) {
+        self.when = parser.clone();
+        for composer in self.composers.clone() {
+            let parser = parser.clone();
+            composer.update(cx, |c, _| c.when = parser);
+        }
+    }
+    fn install_when(&mut self, cx: &mut Context<Self>) {
+        if self.when_busy {
+            return;
+        }
+        self.when_busy = true;
+        self.when_error = None;
+        self.when_progress.store(0, Ordering::Relaxed);
+        let received = self.when_progress.clone();
+        cx.notify();
+        self.task(
+            cx,
+            move |b| local_ai::WHEN.install(&b.store, &received),
+            |this, result, cx| {
+                this.when_busy = false;
+                match result {
+                    // Turned off while downloading: don't keep it.
+                    Ok(()) if !this.understand_dates => {
+                        let _ = local_ai::WHEN.remove(&this.backend.store);
+                    }
+                    Ok(()) => this.load_when(cx),
+                    Err(e) => {
+                        this.when_error = Some(format!("{e:#}"));
+                        this.set_understand_dates(false, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.follow_download(cx);
+    }
+
+    /// Whether a model is downloading.
+    fn model_downloading(&self, model: &local_ai::Model) -> bool {
+        if model.id == local_ai::WHEN.id {
+            self.when_busy
+        } else {
+            self.model_busy
+        }
+    }
+
     /// How far the model download has got, from 0 to 1.
     pub(super) fn model_fraction(&self, model: &local_ai::Model) -> f32 {
-        (self.model_progress.load(Ordering::Relaxed) as f32 / model.size.max(1) as f32).min(1.)
+        let progress = if model.id == local_ai::WHEN.id {
+            &self.when_progress
+        } else {
+            &self.model_progress
+        };
+        (progress.load(Ordering::Relaxed) as f32 / model.size.max(1) as f32).min(1.)
     }
 
     /// Asks before deleting a model, saying which features go with it.
@@ -242,6 +329,9 @@ impl MailApp {
         };
         if model.id == local_ai::OTP.id {
             self.set_hide_codes(false, cx);
+        }
+        if model.id == local_ai::WHEN.id {
+            self.set_understand_dates(false, cx);
         }
         match model.remove(&self.backend.store) {
             Ok(()) => self.notice(
@@ -263,7 +353,9 @@ impl MailApp {
         if !on {
             // Everything it installed goes with it.
             self.set_hide_codes(false, cx);
+            self.set_understand_dates(false, cx);
             self.model_error = None;
+            self.when_error = None;
             if let Err(e) = local_ai::remove_all(&self.backend.store) {
                 self.notice(format!("{e:#}"), true, cx);
             }
@@ -277,7 +369,7 @@ impl MailApp {
             .store
             .set_preference_soon(local_ai::OTP_PREFERENCE, if on { "true" } else { "false" });
         if on {
-            self.start_local_ai(cx);
+            self.start_otp(cx);
         } else {
             self.otp = None;
             self.otp_found.borrow_mut().clear();
@@ -287,6 +379,51 @@ impl MailApp {
             }
         }
         cx.notify();
+    }
+
+    pub(super) fn set_understand_dates(&mut self, on: bool, cx: &mut Context<Self>) {
+        let on = on && self.local_ai;
+        self.understand_dates = on;
+        self.backend
+            .store
+            .set_preference_soon(local_ai::WHEN_PREFERENCE, if on { "true" } else { "false" });
+        if on {
+            self.start_when(cx);
+        } else {
+            self.set_parser(None, cx);
+            if let Err(e) = local_ai::WHEN.remove(&self.backend.store) {
+                self.notice(format!("{e:#}"), true, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Why a feature's model couldn't be installed or loaded, and a way to
+    /// try again.
+    fn feature_error(
+        &self,
+        id: &'static str,
+        error: Option<String>,
+        retry: Action,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let c = self.colors();
+        let error = error?;
+        Some(
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(rgb(c.danger))
+                .child(div().flex_1().min_w_0().child(error))
+                .when(self.local_ai, |d| {
+                    d.child(self.link(&format!("{id}-retry"), "Try Again", retry, cx))
+                })
+                .into_any_element(),
+        )
     }
 
     pub(super) fn local_ai_page(&self, cx: &Context<Self>) -> AnyElement {
@@ -335,27 +472,32 @@ impl MailApp {
                         Action::SetHideCodes(self.local_ai && !self.hide_codes),
                         cx,
                     ))
-                    .when_some(error, |d, error| {
-                        d.child(
-                            div()
-                                .id("local-ai-status")
-                                .debug_selector(|| "local-ai-status".into())
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.danger))
-                                .child(div().flex_1().min_w_0().child(error))
-                                .when(self.local_ai, |d| {
-                                    d.child(self.link(
-                                        "local-ai-retry",
-                                        "Try Again",
-                                        Action::SetHideCodes(true),
-                                        cx,
-                                    ))
-                                }),
-                        )
-                    }),
+                    .children(self.feature_error(
+                        "local-ai-status",
+                        error,
+                        Action::SetHideCodes(true),
+                        cx,
+                    ))
+                    .child(self.switch_setting(
+                        "Understand typed dates",
+                        &format!(
+                            "Type when to snooze a message or send one later in your own words, in 37 \
+                             languages (“tmrw at 6”, “the monday in 3 weeks”, “übermorgen um 18 Uhr”, \
+                             “明天下午6点”), typos and all. Downloads the {} ({}).",
+                            local_ai::WHEN.label.to_lowercase(),
+                            mb(local_ai::WHEN.size),
+                        ),
+                        "local-ai-when".into(),
+                        self.understand_dates,
+                        Action::SetUnderstandDates(self.local_ai && !self.understand_dates),
+                        cx,
+                    ))
+                    .children(self.feature_error(
+                        "local-ai-when-status",
+                        self.when_error.clone(),
+                        Action::SetUnderstandDates(true),
+                        cx,
+                    )),
             )
             .child(self.section("Models"))
             .child(
@@ -400,7 +542,7 @@ impl MailApp {
         let c = self.colors();
         let store = &self.backend.store;
         let installed = model.is_installed(store);
-        let downloading = self.model_busy && model.id == local_ai::OTP.id;
+        let downloading = self.model_downloading(model);
         let status: AnyElement = if downloading {
             let fraction = self.model_fraction(model);
             div()
