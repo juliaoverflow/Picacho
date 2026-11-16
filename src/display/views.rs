@@ -1532,7 +1532,9 @@ mod tests {
             let mut m = this.backend.store.summaries(&work, Folder::Inbox).unwrap()[0].clone();
             m.id = format!("{work}:fresh");
             m.subject = "Just arrived".into();
-            m.date += 1;
+            // After everything listed: each account's sample mail is dated
+            // from its own reading of the clock, which may be a second apart.
+            m.date = this.messages.iter().map(|m| m.date).max().unwrap() + 60;
             m
         });
         view.update(cx, |this, _| this.backend.store.save_messages(&[fresh]).unwrap());
