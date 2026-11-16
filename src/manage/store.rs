@@ -25,9 +25,13 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Store {
     db: Mutex<Connection>,
     /// Set by the writer's triggers when a write changes what message lists
-    /// show; turned into a new `list_revision` once the write is committed.
-    list_dirty: Arc<std::sync::atomic::AtomicBool>,
-    list_revision: std::sync::atomic::AtomicU64,
+    /// show, by account; turned into new `list_revision`s once the write is
+    /// committed.
+    list_dirty: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Each account's list revision: the `list_changes` count at its latest
+    /// list-changing write. Absent for an account not changed since launch.
+    list_revisions: Mutex<HashMap<String, u64>>,
+    list_changes: std::sync::atomic::AtomicU64,
     readers: Vec<Mutex<Connection>>,
     next_reader: std::sync::atomic::AtomicUsize,
     prefs: Arc<PrefQueue>,
@@ -89,8 +93,19 @@ impl Drop for Writer<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         // A rolled-back write counts too: an extra rebuild, never a stale list.
-        if self.store.list_dirty.swap(false, Ordering::AcqRel) {
-            self.store.list_revision.fetch_add(1, Ordering::Release);
+        let dirty = std::mem::take(
+            &mut *self.store.list_dirty.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        if !dirty.is_empty() {
+            let change = self.store.list_changes.fetch_add(1, Ordering::AcqRel) + 1;
+            let mut revisions = self
+                .store
+                .list_revisions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for account in dirty {
+                revisions.insert(account, change);
+            }
         }
     }
 }
@@ -126,21 +141,27 @@ impl Store {
         // cache changed; a write that changes nothing (a sync with no news)
         // leaves the lists as they are, so they need not be built again.
         // Only this connection writes messages; temporary triggers are its own.
-        let list_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Changes are kept by account, so a view of every account rebuilds
+        // only the part of its list whose account changed.
+        let list_dirty: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
         let dirty = list_dirty.clone();
         db.create_scalar_function(
             "picacho_list_changed",
-            0,
+            1,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            move |_| {
-                dirty.store(true, std::sync::atomic::Ordering::Release);
+            move |ctx| {
+                let account = ctx.get::<String>(0)?;
+                let mut dirty = dirty.lock().unwrap_or_else(|e| e.into_inner());
+                if !dirty.contains(&account) {
+                    dirty.insert(account);
+                }
                 Ok(0i64)
             },
         )?;
         db.execute_batch(
-            "CREATE TEMP TRIGGER list_inserted AFTER INSERT ON main.messages BEGIN SELECT picacho_list_changed(); END;
-             CREATE TEMP TRIGGER list_deleted AFTER DELETE ON main.messages BEGIN SELECT picacho_list_changed(); END;
-             CREATE TEMP TRIGGER list_updated AFTER UPDATE OF folder, date, data ON main.messages BEGIN SELECT picacho_list_changed(); END;",
+            "CREATE TEMP TRIGGER list_inserted AFTER INSERT ON main.messages BEGIN SELECT picacho_list_changed(NEW.account); END;
+             CREATE TEMP TRIGGER list_deleted AFTER DELETE ON main.messages BEGIN SELECT picacho_list_changed(OLD.account); END;
+             CREATE TEMP TRIGGER list_updated AFTER UPDATE OF account, folder, date, data ON main.messages BEGIN SELECT picacho_list_changed(NEW.account); SELECT picacho_list_changed(OLD.account); END;",
         )?;
         let readers = (0..READERS)
             .map(|_| {
@@ -159,7 +180,8 @@ impl Store {
         Ok(Self {
             db: Mutex::new(db),
             list_dirty,
-            list_revision: Default::default(),
+            list_revisions: Default::default(),
+            list_changes: Default::default(),
             readers,
             next_reader: Default::default(),
             prefs,
@@ -175,12 +197,18 @@ impl Store {
             store: self,
         }
     }
-    /// Changes whenever a committed write changes what message lists show
-    /// (messages added, removed, or their data, folder or date changed).
-    /// Read it before reading a list: an unchanged revision later means the
-    /// list read is still current. Writes that change nothing keep it.
-    pub fn list_revision(&self) -> u64 {
-        self.list_revision.load(std::sync::atomic::Ordering::Acquire)
+    /// Changes whenever a committed write changes what `account`'s message
+    /// lists show (its messages added, removed, or their data, folder or
+    /// date changed). Read it before reading a list: an unchanged revision
+    /// later means the list read is still current. Writes that change
+    /// nothing, or only other accounts' mail, keep it.
+    pub fn list_revision(&self, account: &str) -> u64 {
+        self.list_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .copied()
+            .unwrap_or(0)
     }
     /// A connection for reading: a free one if any, otherwise the next in turn.
     fn read(&self) -> MutexGuard<'_, Connection> {
@@ -1491,7 +1519,8 @@ mod snapshot_tests {
     /// Lists are rebuilt only when what they show changed: saving mail as
     /// it already is (a check with no news) keeps the revision; new mail,
     /// a changed flag, a removal or a rolled-back write moves it on.
-    /// Writes elsewhere (raw sources, preferences) don't.
+    /// Writes elsewhere (raw sources, preferences, another account's mail)
+    /// don't.
     #[test]
     fn list_revision_follows_changes_to_listed_mail() -> Result<()> {
         let path = std::env::temp_dir().join(format!("picacho-revision-{}", uuid::Uuid::new_v4()));
@@ -1499,27 +1528,34 @@ mod snapshot_tests {
         let a = Account::new(Provider::Imap);
         let id = format!("{}:INBOX:1:7", a.id);
         let mail = parse_message(b"Subject: Hi\r\n\r\nBody", &a, &id, Folder::Inbox, "INBOX", 7)?;
-        let start = store.list_revision();
+        let other = Account::new(Provider::Imap);
+        let other_id = format!("{}:INBOX:1:1", other.id);
+        let other_mail = parse_message(b"Subject: Other\r\n\r\nBody", &other, &other_id, Folder::Inbox, "INBOX", 1)?;
+        store.save_messages(std::slice::from_ref(&other_mail))?;
+        let other_revision = store.list_revision(&other.id);
+        assert!(other_revision > 0);
+        let start = store.list_revision(&a.id);
         store.save_messages(std::slice::from_ref(&mail))?;
-        let saved = store.list_revision();
+        let saved = store.list_revision(&a.id);
         assert!(saved > start, "new mail");
+        assert_eq!(store.list_revision(&other.id), other_revision, "another account's mail");
         store.save_messages(std::slice::from_ref(&mail))?;
-        assert_eq!(store.list_revision(), saved, "the same mail again");
+        assert_eq!(store.list_revision(&a.id), saved, "the same mail again");
         store.save_raw(&id, b"Subject: Hi\r\n\r\nBody")?;
         store.set_preference("x", "y")?;
-        assert_eq!(store.list_revision(), saved, "not what lists show");
+        assert_eq!(store.list_revision(&a.id), saved, "not what lists show");
         let read = Mail { unread: !mail.unread, ..mail.clone() };
         store.save_messages(std::slice::from_ref(&read))?;
-        let flagged = store.list_revision();
+        let flagged = store.list_revision(&a.id);
         assert!(flagged > saved, "a changed flag");
         assert_eq!(store.summaries(&a.id, Folder::Inbox)?[0].unread, read.unread);
         store.delete_ids(&a.id, std::slice::from_ref(&id))?;
-        let deleted = store.list_revision();
+        let deleted = store.list_revision(&a.id);
         assert!(deleted > flagged, "a removal");
         // A failed write may have changed rows before it rolled back.
         store.write().execute_batch("CREATE TRIGGER fail_insert AFTER INSERT ON messages BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;
         assert!(store.save_messages(std::slice::from_ref(&mail)).is_err());
-        assert!(store.list_revision() > deleted, "a rolled-back write");
+        assert!(store.list_revision(&a.id) > deleted, "a rolled-back write");
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

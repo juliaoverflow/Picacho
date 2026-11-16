@@ -967,7 +967,10 @@ pub struct MailApp {
     /// for meanwhile (see `reload_cached`).
     reload_running: bool,
     reload_again: bool,
-    /// What the listed messages were built from; see `list_current`.
+    /// A check of the listed messages (`reload_if_changed`) was asked for
+    /// while a reload ran.
+    recheck_again: bool,
+    /// What the listed messages were built from; see `list_freshness`.
     listed: Option<views::ListKey>,
     /// Unread messages among those loaded, counted when the list changes.
     loaded_unread: usize,
@@ -1680,6 +1683,7 @@ impl MailApp {
             counts_again: false,
             reload_running: false,
             reload_again: false,
+            recheck_again: false,
             listed: None,
             loaded_unread: 0,
             options_cache: Default::default(),
@@ -3083,11 +3087,7 @@ impl MailApp {
                         }
                     }
                     if visible {
-                        // Most checks find nothing new: the list shown is
-                        // then still current, and isn't built again.
-                        if this.subs_open || !this.list_current() {
-                            this.reload_cached(cx);
-                        }
+                        this.reload_if_changed(cx);
                         if !this.subs_open
                             && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
                         {
@@ -3215,10 +3215,57 @@ impl MailApp {
                 this.set_messages(messages, cx);
                 this.listed = Some(key);
             }
-            // Whatever changed meanwhile, in whichever view is open now.
-            if std::mem::take(&mut this.reload_again) {
-                this.reload_cached(cx);
+            this.reload_follow_up(cx);
+        });
+    }
+    /// What was asked for while a reload ran, in whichever view is open now:
+    /// a whole reload, or a check for changes.
+    fn reload_follow_up(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.reload_again) {
+            self.recheck_again = false;
+            self.reload_cached(cx);
+        } else if std::mem::take(&mut self.recheck_again) {
+            self.reload_if_changed(cx);
+        }
+    }
+    /// After a check of a mailbox the list shows: rebuilds what changed.
+    /// Most checks find nothing new, and the list stays as it is. In a view
+    /// of several accounts, only the accounts whose mail changed are listed
+    /// again and put in place of theirs; the others' mail stays.
+    fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.subs_open || self.account.is_none() {
+            self.reload_cached(cx);
+            return;
+        }
+        if self.reload_running {
+            self.recheck_again = true;
+            return;
+        }
+        let changed = match self.list_freshness() {
+            views::Freshness::Current => return,
+            views::Freshness::Stale(changed) if changed.len() < self.scope.accounts.len() => changed,
+            views::Freshness::Stale(_) | views::Freshness::Unknown => {
+                self.reload_cached(cx);
+                return;
             }
+        };
+        let accounts: Vec<String> = changed
+            .into_iter()
+            .map(|i| self.scope.accounts[i].clone())
+            .collect();
+        self.reload_running = true;
+        let generation = self.load_generation;
+        let job = Self::account_lists_job(accounts, self.mailbox());
+        self.list_task(cx, job, move |this, result, cx| {
+            this.reload_running = false;
+            match result {
+                // Another view meanwhile lists itself; these parts are dropped.
+                Ok(parts) => {
+                    this.replace_account_lists(generation, parts, cx);
+                }
+                Err(_) => this.reload_again = true,
+            }
+            this.reload_follow_up(cx);
         });
     }
     fn load_drafts(&mut self, cx: &mut Context<Self>) {

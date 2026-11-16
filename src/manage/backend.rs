@@ -220,8 +220,10 @@ pub struct Backend {
     limits: Mutex<Limits>,
     /// Mailbox layouts by (account, mailbox key), from the latest search.
     layouts: Mutex<HashMap<(String, String), Layout>>,
-    /// Changes whenever a layout does; see `list_revision`.
-    layout_revision: AtomicU64,
+    /// Each account's layout revision, moved on whenever one of its
+    /// layouts changes; see `list_revision`.
+    layout_revisions: Mutex<HashMap<String, u64>>,
+    layout_changes: AtomicU64,
     /// A sign-in that failed after the browser, kept for one retry.
     pending: Mutex<Option<Pending>>,
     /// How far the current sign-in has come; see `sign_in_step`.
@@ -278,7 +280,8 @@ impl Backend {
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
             layouts: Mutex::new(HashMap::new()),
-            layout_revision: AtomicU64::new(0),
+            layout_revisions: Mutex::new(HashMap::new()),
+            layout_changes: AtomicU64::new(0),
             pending: Mutex::new(None),
             sign_in_step: Mutex::new(SignInStep::Browser),
             waiting: Mutex::new(HashMap::new()),
@@ -712,7 +715,7 @@ impl Backend {
             .lock()
             .unwrap()
             .retain(|(account, _), _| account != id);
-        self.layouts_changed();
+        self.layouts_changed(id);
         let identities: Vec<crate::manage::model::Identity> = self
             .store
             .accounts()
@@ -1351,21 +1354,23 @@ impl Backend {
             uids: Arc::new(uids),
         };
         layouts.insert(key, layout.clone());
-        self.layouts_changed();
+        self.layouts_changed(&a.id);
         layout
     }
-    pub(super) fn layouts_changed(&self) {
-        self.layout_revision.fetch_add(1, Ordering::Release);
+    pub(super) fn layouts_changed(&self, account: &str) {
+        let change = self.layout_changes.fetch_add(1, Ordering::AcqRel) + 1;
+        self.layout_revisions
+            .lock()
+            .unwrap()
+            .insert(account.to_owned(), change);
     }
-    /// Changes whenever what message lists show may have: the cache's
-    /// `Store::list_revision`, or a mailbox layout (which places rows for
-    /// mail not listed yet). Read before building a list; the list is
-    /// current for as long as this stays the same.
-    pub fn list_revision(&self) -> (u64, u64) {
-        (
-            self.store.list_revision(),
-            self.layout_revision.load(Ordering::Acquire),
-        )
+    /// Changes whenever what `account`'s message lists show may have: the
+    /// cache's `Store::list_revision`, or one of its mailbox layouts (which
+    /// place rows for mail not listed yet). Read before building a list; the
+    /// list is current for as long as this stays the same.
+    pub fn list_revision(&self, account: &str) -> (u64, u64) {
+        let layout = self.layout_revisions.lock().unwrap().get(account).copied();
+        (self.store.list_revision(account), layout.unwrap_or(0))
     }
     /// Gives a mailbox a layout without a server, for display tests.
     #[cfg(test)]
@@ -1387,7 +1392,7 @@ impl Backend {
             .unwrap()
             .remove(&(a.id.clone(), mailbox.key()));
         if removed.is_some() {
-            self.layouts_changed();
+            self.layouts_changed(&a.id);
         }
     }
     /// Adds new and removes moved messages in a known layout.
@@ -1418,7 +1423,7 @@ impl Backend {
         if uids != *layout.uids {
             layout.uids = Arc::new(uids);
             drop(layouts);
-            self.layouts_changed();
+            self.layouts_changed(&a.id);
         }
     }
     /// POP3 has no headers-only listing, so older messages are downloaded
@@ -3248,17 +3253,17 @@ mod layout_tests {
         let a = Account::new(Provider::Imap);
         let inbox = Mailbox::Standard(Folder::Inbox);
         b.set_test_layout(&a, &inbox, "INBOX", 1, vec![1, 2, 3]);
-        let (first, revision) = (b.layout(&a.id, &inbox).unwrap(), b.list_revision());
+        let (first, revision) = (b.layout(&a.id, &inbox).unwrap(), b.list_revision(&a.id));
         b.set_test_layout(&a, &inbox, "INBOX", 1, vec![1, 2, 3]);
         b.extend_layout(&a, &inbox, 1, std::iter::empty(), &[]);
         b.extend_layout(&a, &inbox, 1, [2].into_iter(), &[9]);
         let same = b.layout(&a.id, &inbox).unwrap();
         assert!(Arc::ptr_eq(&first.uids, &same.uids));
-        assert_eq!(b.list_revision(), revision);
+        assert_eq!(b.list_revision(&a.id), revision);
         b.extend_layout(&a, &inbox, 1, [4].into_iter(), &[1]);
         let next = b.layout(&a.id, &inbox).unwrap();
         assert_eq!(*next.uids, [2, 3, 4]);
-        assert_ne!(b.list_revision(), revision);
+        assert_ne!(b.list_revision(&a.id), revision);
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

@@ -12,6 +12,12 @@ use crate::manage::backend::Catalog;
 /// scrolled into view are not kept waiting behind a batch for long.
 const BATCH: usize = 200;
 
+/// What a new list keeps of the one it replaces; see `list_place`.
+pub(super) struct ListPlace {
+    open: Option<Mail>,
+    anchor: Option<(String, Pixels)>,
+}
+
 /// How much of a mailbox has been listed on this computer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Progress {
@@ -200,27 +206,42 @@ impl MailApp {
     /// Replaces the listed messages, keeping the open message's body and the
     /// list's scroll position on the same message, wherever it moved.
     pub(super) fn set_messages(&mut self, messages: Vec<Mail>, cx: &App) {
+        let kept = self.list_place();
+        self.install_messages(messages, kept, cx);
+    }
+    /// What a new list keeps of the current one: the open message, when its
+    /// body has been read, and where the list is scrolled.
+    pub(super) fn list_place(&self) -> ListPlace {
+        ListPlace {
+            open: self.selected.as_ref().and_then(|id| {
+                self.messages
+                    .iter()
+                    .find(|m| &m.id == id && m.body.is_some())
+                    .cloned()
+            }),
+            anchor: self.scroll_anchor(),
+        }
+    }
+    /// Shows `messages`, keeping what `kept` (taken from the list before)
+    /// holds: see `set_messages`.
+    pub(super) fn install_messages(&mut self, messages: Vec<Mail>, kept: ListPlace, cx: &App) {
         let mut messages = self.backend.with_readable(messages);
-        if let Some(open) = self.selected.as_ref().and_then(|id| {
-            self.messages
-                .iter()
-                .find(|m| &m.id == id && m.body.is_some())
-        }) && let Some(m) = messages
-            .iter_mut()
-            .find(|m| m.id == open.id && m.body.is_none())
+        if let Some(open) = kept.open
+            && let Some(m) = messages
+                .iter_mut()
+                .find(|m| m.id == open.id && m.body.is_none())
         {
             let (unread, starred, folder) = (m.unread, m.starred, m.folder);
             *m = Mail {
                 unread,
                 starred,
                 folder,
-                ..open.clone()
+                ..open
             };
         }
-        let anchor = self.scroll_anchor();
         self.messages = messages;
         self.apply_filter(cx);
-        if let Some(anchor) = anchor {
+        if let Some(anchor) = kept.anchor {
             self.restore_scroll(anchor);
         }
     }
