@@ -1469,6 +1469,12 @@ impl MailApp {
             this.persist_draft(cx);
             // Preferences changed just before quitting are still written.
             this.backend.store.flush();
+            // Gives back, once, the space compressed sources freed in a
+            // database from before that was done as it goes. It holds the
+            // cache while it runs (some seconds), so it waits for quitting,
+            // when nothing is waiting on it. A failure is tried again in a
+            // week; nothing is lost.
+            let _ = this.backend.store.compact_on_quit();
             std::future::ready(())
         }));
         #[cfg(feature = "sample-data")]

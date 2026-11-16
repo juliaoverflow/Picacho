@@ -179,8 +179,14 @@ mod tests {
         open.cancelled.store(true, Ordering::Relaxed);
         open.fetch(0, get("https://example.com/a.png"), Box::new(Ignore));
         assert!(open.fetcher.get().is_none(), "nothing is fetched once cancelled");
+        // A server of the test's own, so nothing leaves the machine.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/a.png", server.local_addr().unwrap());
         let open = make(false);
-        open.fetch(0, get("http://127.0.0.1:9/a.png"), Box::new(Ignore));
+        open.fetch(0, get(&url), Box::new(Ignore));
         assert!(open.fetcher.get().is_some());
+        // The request reached it; then it stops.
+        let _ = server.accept().unwrap();
+        open.cancelled.store(true, Ordering::Relaxed);
     }
 }

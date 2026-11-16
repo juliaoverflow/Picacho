@@ -131,7 +131,7 @@ impl Store {
         let mut db = connect(&file)?;
         // Free pages go back to the system on `incremental_vacuum` (see
         // `pack_saved_sources`). Takes effect for a new database; an older
-        // one is switched by the VACUUM after its sources are packed.
+        // one is switched by the VACUUM of `compact_on_quit`.
         db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -143,12 +143,27 @@ impl Store {
             -- Their conditions must match those queries' WHERE word for word.
             CREATE INDEX IF NOT EXISTS unread ON messages(account, folder) WHERE json_extract(data,'$.unread');
             CREATE INDEX IF NOT EXISTS subscribed ON messages(account) WHERE json_extract(data,'$.list_unsubscribe') IS NOT NULL;
-            -- What background downloads count and pick, without reading rows:
-            -- download progress is counted up to every 400 ms while mail downloads.
-            CREATE INDEX IF NOT EXISTS downloads ON messages(account, date, json_extract(data,'$.size'), raw IS NULL);
             CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, account TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));")?;
+        // Compressed sources get a column of their own (see `pack`), so a
+        // build from before them finds `raw` empty and downloads the
+        // message again, rather than reading compressed bytes as mail.
+        let has_source: i64 = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='source'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_source == 0 {
+            db.execute_batch("ALTER TABLE messages ADD COLUMN source BLOB;")?;
+        }
+        db.execute_batch(&format!(
+            // What background downloads count and pick, without reading
+            // rows: download progress is counted up to every 400 ms while
+            // mail downloads. (`downloads` was an earlier form of it.)
+            "DROP INDEX IF EXISTS downloads;
+             CREATE INDEX IF NOT EXISTS downloaded ON messages(account, date, json_extract(data,'$.size'), {NOT_DOWNLOADED});"
+        ))?;
         // Other connections write too (preferences); taking the write lock
         // when a transaction begins means one that reads first can't find
         // the database changed under it when it comes to write.
@@ -430,8 +445,8 @@ impl Store {
         let tx = db.transaction()?;
         write_messages(&tx, std::slice::from_ref(mail))?;
         tx.execute(
-            "UPDATE messages SET raw=?2 WHERE id=?1",
-            params![mail.id, pack(raw)],
+            "UPDATE messages SET raw=NULL, source=?2 WHERE id=?1",
+            params![mail.id, pack(raw)?],
         )?;
         tx.commit()?;
         Ok(())
@@ -566,9 +581,9 @@ impl Store {
     pub fn refresh_previews(&self) -> Result<usize> {
         let ids: Vec<String> = {
             let db = self.read();
-            let mut q = db.prepare(
-                "SELECT id FROM messages WHERE raw IS NOT NULL OR json_type(data,'$.body')='text' OR json_extract(data,'$.snippet')<>''",
-            )?;
+            let mut q = db.prepare(&format!(
+                "SELECT id FROM messages WHERE {DOWNLOADED} OR json_type(data,'$.body')='text' OR json_extract(data,'$.snippet')<>''"
+            ))?;
             q.query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
@@ -577,15 +592,15 @@ impl Store {
         for chunk in ids.chunks(100) {
             let rows: Vec<(String, String, Option<Vec<u8>>)> = {
                 let db = self.read();
-                let mut q = db.prepare("SELECT data, raw FROM messages WHERE id=?1")?;
+                let mut q = db.prepare(&format!("SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"))?;
                 let mut rows = Vec::new();
                 for id in chunk {
                     if let Some(row) = q
-                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))?
+                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
                         .next()
                     {
-                        let (data, raw) = row?;
-                        rows.push((id.clone(), data, raw.map(unpack).transpose()?));
+                        let (data, (raw, source)) = row?;
+                        rows.push((id.clone(), data, unpack(raw, source)?));
                     }
                 }
                 rows
@@ -667,9 +682,9 @@ impl Store {
     fn backfill_subscriptions_of(&self, account: Option<&str>) -> Result<usize> {
         let ids: Vec<String> = {
             let db = self.read();
-            let mut q = db.prepare(
-                "SELECT id FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL AND (?1 IS NULL OR account=?1)",
-            )?;
+            let mut q = db.prepare(&format!(
+                "SELECT id FROM messages WHERE {DOWNLOADED} AND json_extract(data,'$.list_unsubscribe') IS NULL AND (?1 IS NULL OR account=?1)"
+            ))?;
             q.query_map([account], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
@@ -679,14 +694,17 @@ impl Store {
         for chunk in ids.chunks(100) {
             let rows: Vec<(String, Vec<u8>)> = {
                 let db = self.read();
-                let mut q = db.prepare(
-                    "SELECT raw FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL",
-                )?;
+                let mut q = db.prepare(&format!(
+                    "SELECT {SOURCE_COLUMNS} FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL"
+                ))?;
                 let mut rows = Vec::new();
                 for id in chunk {
-                    if let Some(saved) = q.query_map([id], |r| r.get::<_, Vec<u8>>(0))?.next() {
+                    if let Some(saved) = q.query_map([id], |r| source_columns(r, 0))?.next() {
+                        let (raw, source) = saved?;
                         // Only the headers are needed, which come first.
-                        rows.push((id.clone(), unpack_up_to(saved?, 65536)?));
+                        if let Some(head) = unpack_head(raw, source, 65536)? {
+                            rows.push((id.clone(), head));
+                        }
                     }
                 }
                 rows
@@ -761,77 +779,141 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    /// Compresses message sources saved before they were kept compressed,
-    /// a batch at a time, so other work gets the cache in between; then
-    /// gives the space freed back to the system. Returns how many were.
+    /// Compresses the sources kept as downloaded in `raw` into `source`, a
+    /// batch at a time so other work gets the cache in between; then gives
+    /// the freed pages back to the system, where the database can do that
+    /// a few at a time (see `compact_on_quit` for one that can't yet).
+    /// Returns how many sources were moved.
     pub fn pack_saved_sources(&self) -> Result<usize> {
         let ids: Vec<String> = {
             let db = self.read();
-            let mut q = db.prepare(
-                "SELECT id FROM messages WHERE raw IS NOT NULL AND substr(raw,1,4)<>?1",
-            )?;
-            q.query_map([PACKED], |r| r.get(0))?
+            let mut q = db.prepare("SELECT id FROM messages WHERE raw IS NOT NULL")?;
+            q.query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
         let mut packed = 0;
         for chunk in ids.chunks(50) {
             let rows: Vec<(String, Vec<u8>)> = {
                 let db = self.read();
-                let mut q = db.prepare("SELECT raw FROM messages WHERE id=?1 AND substr(raw,1,4)<>?2")?;
+                let mut q = db.prepare("SELECT raw FROM messages WHERE id=?1 AND raw IS NOT NULL")?;
                 let mut rows = Vec::new();
                 for id in chunk {
-                    if let Some(raw) = q.query_map(params![id, PACKED], |r| r.get::<_, Vec<u8>>(0))?.next() {
-                        rows.push((id.clone(), pack(&raw?)));
+                    if let Some(raw) = q.query_map([id], |r| r.get::<_, Vec<u8>>(0))?.next() {
+                        let raw = raw?;
+                        let source = match raw.strip_prefix(LEGACY_PACKED) {
+                            // Compressed already. A damaged one is left as it
+                            // is (reading it says so), not moved.
+                            Some(packed) if inflate(packed, MAX_SOURCE, true).is_ok() => packed.to_vec(),
+                            Some(_) => continue,
+                            None => pack(&raw)?,
+                        };
+                        rows.push((id.clone(), source));
                     }
                 }
                 rows
             };
             let mut db = self.write();
             let tx = db.transaction()?;
-            for (id, saved) in &rows {
-                // Unless it was saved again meanwhile (packed, then).
+            for (id, source) in &rows {
+                // Unless it was saved again meanwhile (into `source`, then).
                 packed += tx.execute(
-                    "UPDATE messages SET raw=?2 WHERE id=?1 AND substr(raw,1,4)<>?3",
-                    params![id, saved, PACKED],
+                    "UPDATE messages SET source=?2, raw=NULL WHERE id=?1 AND raw IS NOT NULL",
+                    params![id, source],
                 )?;
             }
             tx.commit()?;
         }
-        self.reclaim_space()?;
+        self.free_pages()?;
         Ok(packed)
     }
-    /// Gives free pages back to the system. A database made before the
-    /// cache freed them is rebuilt once (VACUUM) to start doing so.
-    fn reclaim_space(&self) -> Result<()> {
-        let db = self.write();
-        let mode: i64 = db.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
-        if mode == 2 {
+    /// Gives free pages back to the system a batch at a time, releasing the
+    /// cache in between, in a database that can (`auto_vacuum` incremental).
+    fn free_pages(&self) -> Result<()> {
+        let mut left = i64::MAX;
+        loop {
+            let db = self.write();
+            let mode: i64 = db.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+            let free: i64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            // None left, or none freed by the last batch.
+            if mode != 2 || free == 0 || free >= left {
+                break;
+            }
+            left = free;
             // Frees a page per step: run it to the end (execute_batch steps once).
-            let mut q = db.prepare("PRAGMA incremental_vacuum")?;
+            let mut q = db.prepare("PRAGMA incremental_vacuum(2048)")?;
             let mut rows = q.query([])?;
             while rows.next()?.is_some() {}
-        } else {
-            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
         }
-        // VACUUM writes the whole database through the log: cut it back.
-        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.write().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+    /// Rebuilds a database made before free pages were given back, so that
+    /// it gives back the space compressed sources freed, and from then on
+    /// does so as it goes. Only when it would give back enough (a tenth of
+    /// the file, and 16 MB) and nothing else is writing to the cache.
+    ///
+    /// Meant for quitting: the rebuild (VACUUM) holds the cache until it is
+    /// done, some seconds for a large one, and anything wanting to write in
+    /// the meantime would wait. It is all or nothing: stopped part way, the
+    /// database is as it was. One that fails (often for want of disk space:
+    /// it needs about twice the database's size) isn't tried again for a
+    /// week. Returns whether it ran.
+    pub fn compact_on_quit(&self) -> Result<bool> {
+        const RETRY: &str = "compact_after";
+        let not_before = self
+            .preference(RETRY)
+            .and_then(|t| t.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        if now < not_before {
+            return Ok(false);
+        }
+        // A write running (a sync finishing): another time.
+        let Ok(db) = self.db.try_lock() else {
+            return Ok(false);
+        };
+        let pragma = |name: &str| -> Result<i64> {
+            Ok(db.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?)
+        };
+        let (mode, pages, free, size) = (
+            pragma("auto_vacuum")?,
+            pragma("page_count")?,
+            pragma("freelist_count")?,
+            pragma("page_size")?,
+        );
+        if mode == 2 || free * size < 16 * 1024 * 1024 || free * 10 < pages {
+            return Ok(false);
+        }
+        if let Err(e) =
+            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+        {
+            let week = 7 * 24 * 60 * 60;
+            db.execute(PUT_PREFERENCE, params![RETRY, (now + week).to_string()])?;
+            return Err(e).context("Couldn't compact the mail cache");
+        }
+        Ok(true)
     }
     pub fn raw(&self, id: &str) -> Result<Option<Vec<u8>>> {
         use rusqlite::OptionalExtension;
-        Ok(self
+        let saved = self
             .read()
-            .query_row("SELECT raw FROM messages WHERE id=?1", [id], |r| r.get::<_, Option<Vec<u8>>>(0))
-            .optional()?
-            .flatten()
-            .map(unpack)
-            .transpose()?)
+            .query_row(
+                &format!("SELECT {SOURCE_COLUMNS} FROM messages WHERE id=?1"),
+                [id],
+                |r| source_columns(r, 0),
+            )
+            .optional()?;
+        match saved {
+            Some((raw, source)) => unpack(raw, source),
+            None => Ok(None),
+        }
     }
     pub fn save_raw(&self, id: &str, raw: &[u8]) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, pack(raw)])?;
+        let source = pack(raw)?;
+        self.db.lock().unwrap().execute(
+            "UPDATE messages SET raw=NULL, source=?2 WHERE id=?1",
+            params![id, source],
+        )?;
         Ok(())
     }
     /// One accepted remote command is one local transaction. Earlier confirmed
@@ -862,10 +944,10 @@ impl Store {
         since: i64,
     ) -> Result<Vec<Mail>> {
         let db = self.read();
-        let mut q = db.prepare(
-            "SELECT data FROM messages WHERE account=?1 AND raw IS NULL AND date >= ?4
-             AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC, id DESC LIMIT ?3",
-        )?;
+        let mut q = db.prepare(&format!(
+            "SELECT data FROM messages WHERE account=?1 AND {NOT_DOWNLOADED} AND date >= ?4
+             AND json_extract(data,'$.size') <= ?2 ORDER BY date DESC, id DESC LIMIT ?3"
+        ))?;
         q.query_map(params![account, max_size, limit, since], |r| {
             r.get::<_, String>(0)
         })?
@@ -881,10 +963,10 @@ impl Store {
         since: &[(String, i64)],
     ) -> Result<(usize, usize)> {
         let db = self.read();
-        let mut q = db.prepare(
-            "SELECT COUNT(*), COALESCE(SUM(raw IS NULL),0) FROM messages
-             WHERE account=?1 AND date >= ?3 AND json_extract(data,'$.size') <= ?2",
-        )?;
+        let mut q = db.prepare(&format!(
+            "SELECT COUNT(*), COALESCE(SUM({NOT_DOWNLOADED}),0) FROM messages
+             WHERE account=?1 AND date >= ?3 AND json_extract(data,'$.size') <= ?2"
+        ))?;
         let mut totals = (0, 0);
         for (account, since) in since {
             let (total, missing) = q.query_row(params![account, max_size, since], |r| {
@@ -906,10 +988,10 @@ impl Store {
         let mut downloaded: HashMap<i64, String> = HashMap::new();
         let mut missing: Vec<(String, i64)> = Vec::new();
         {
-            let mut q = tx.prepare(
-                "SELECT id, json_extract(data,'$.gmail_id'), raw IS NOT NULL FROM messages
-                 WHERE account=?1 AND json_extract(data,'$.gmail_id') > 0",
-            )?;
+            let mut q = tx.prepare(&format!(
+                "SELECT id, json_extract(data,'$.gmail_id'), {DOWNLOADED} FROM messages
+                 WHERE account=?1 AND json_extract(data,'$.gmail_id') > 0"
+            ))?;
             let rows = q.query_map([account], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -928,10 +1010,10 @@ impl Store {
         }
         let mut filled = 0;
         {
-            let mut copy = tx.prepare(
-                "UPDATE messages SET raw=(SELECT raw FROM messages WHERE id=?2)
-                 WHERE id=?1 AND raw IS NULL",
-            )?;
+            let mut copy = tx.prepare(&format!(
+                "UPDATE messages SET (raw, source)=(SELECT raw, source FROM messages WHERE id=?2)
+                 WHERE id=?1 AND {NOT_DOWNLOADED}"
+            ))?;
             for (id, gmail_id) in &missing {
                 if let Some(source) = downloaded.get(gmail_id) {
                     filled += copy.execute(params![id, source])?;
@@ -947,16 +1029,21 @@ impl Store {
         if gmail_id == 0 {
             return Ok(None);
         }
-        self.read()
+        let saved = self
+            .read()
             .query_row(
-                "SELECT raw FROM messages WHERE account=?1 AND raw IS NOT NULL
-                 AND json_extract(data,'$.gmail_id')=?2 LIMIT 1",
+                &format!(
+                    "SELECT {SOURCE_COLUMNS} FROM messages WHERE account=?1 AND {DOWNLOADED}
+                     AND json_extract(data,'$.gmail_id')=?2 LIMIT 1"
+                ),
                 params![account, gmail_id as i64],
-                |r| r.get::<_, Vec<u8>>(0),
+                |r| source_columns(r, 0),
             )
-            .optional()?
-            .map(unpack)
-            .transpose()
+            .optional()?;
+        match saved {
+            Some((raw, source)) => unpack(raw, source),
+            None => Ok(None),
+        }
     }
     /// What the last synchronization of a server mailbox saw.
     pub fn mailbox_state(&self, account: &str, remote: &str) -> Result<Option<MailboxState>> {
@@ -1320,51 +1407,99 @@ impl Drop for Store {
         }
     }
 }
-/// The preference writer: writes whatever is pending each time it is told
-/// there is something, until the store closes.
-/// Saved message sources are kept compressed (raw deflate) behind this
-/// marker, a quarter of their size on disk. A source without it was saved
-/// before they were, and reads as it is: no message starts with a NUL.
-const PACKED: &[u8] = b"\0PZ1";
-/// No source is larger than a download may be; a damaged one can't
-/// inflate past this.
+// Saved message sources.
+//
+// A source is saved compressed (raw deflate, about a quarter of its size)
+// in the `source` column, leaving `raw` empty. `raw` holds a source as it
+// was downloaded: saved by a build from before sources were compressed,
+// including one run again after this one (it sees no source in `raw`, so
+// downloads the message again). A row may then have both; `raw`, the
+// later, is read. `pack_saved_sources` moves those into `source`.
+//
+// Builds of this change before the column was added kept the compressed
+// source in `raw` behind `LEGACY_PACKED`; those still read, and are moved.
+
+/// Saved sources' columns, in the order `unpack` and `unpack_head` take them.
+const SOURCE_COLUMNS: &str = "raw, source";
+/// The rows whose source has been downloaded.
+const DOWNLOADED: &str = "(raw IS NOT NULL OR source IS NOT NULL)";
+/// The rows whose source hasn't been. Written exactly as the `downloaded`
+/// index has it, so that the download counts are read from the index.
+const NOT_DOWNLOADED: &str = "(raw IS NULL AND source IS NULL)";
+/// What earlier builds of this change put before a compressed source they
+/// kept in `raw`. No downloaded message starts with a NUL.
+const LEGACY_PACKED: &[u8] = b"\0PZ1";
+/// No source is larger than a download may be: one that inflates past
+/// this is damaged.
 const MAX_SOURCE: u64 = 2 * crate::sync::transport::MAX_MESSAGE as u64;
 
-/// A message source as it is saved: compressed, behind `PACKED`.
-fn pack(raw: &[u8]) -> Vec<u8> {
+/// A message source compressed, as it is saved in `source`.
+fn pack(raw: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
     let mut out = flate2::write::DeflateEncoder::new(
-        Vec::with_capacity(PACKED.len() + raw.len() / 3),
+        Vec::with_capacity(raw.len() / 3),
         flate2::Compression::default(),
     );
-    // Writing to memory can't fail.
-    let _ = out.get_mut().write_all(PACKED);
-    let _ = out.write_all(raw);
-    out.finish().unwrap_or_default()
+    out.write_all(raw)?;
+    Ok(out.finish()?)
 }
-/// A saved source as it was downloaded; at most its first `limit` bytes.
-fn unpack_up_to(saved: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
+/// A compressed source inflated: whole (an error past `limit` bytes), or
+/// just its first `limit` bytes.
+fn inflate(packed: &[u8], limit: u64, whole: bool) -> Result<Vec<u8>> {
     use std::io::Read;
-    let Some(packed) = saved.strip_prefix(PACKED) else {
-        let mut saved = saved;
-        saved.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        return Ok(saved);
-    };
-    let mut raw = Vec::with_capacity(packed.len() * 3);
+    let capacity = packed.len().saturating_mul(3).min(usize::try_from(limit).unwrap_or(usize::MAX));
+    let mut raw = Vec::with_capacity(capacity);
     flate2::read::DeflateDecoder::new(packed)
-        .take(limit)
+        .take(limit.saturating_add(u64::from(whole)))
         .read_to_end(&mut raw)
         .context("A saved message source is damaged")?;
+    ensure!(
+        !whole || raw.len() as u64 <= limit,
+        "A saved message source is damaged: it inflates past {limit} bytes"
+    );
     Ok(raw)
 }
-fn unpack(saved: Vec<u8>) -> Result<Vec<u8>> {
-    unpack_up_to(saved, MAX_SOURCE)
+/// A row's saved source as it was downloaded, from its `SOURCE_COLUMNS`;
+/// see `inflate` for `limit` and `whole`.
+fn read_source(
+    raw: Option<Vec<u8>>,
+    source: Option<Vec<u8>>,
+    limit: u64,
+    whole: bool,
+) -> Result<Option<Vec<u8>>> {
+    Ok(match (raw, source) {
+        (Some(raw), _) => Some(match raw.strip_prefix(LEGACY_PACKED) {
+            Some(packed) => inflate(packed, limit, whole)?,
+            None if whole => raw,
+            None => {
+                let mut raw = raw;
+                raw.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                raw
+            }
+        }),
+        (None, Some(source)) => Some(inflate(&source, limit, whole)?),
+        (None, None) => None,
+    })
+}
+/// A row's whole saved source, from its `SOURCE_COLUMNS`.
+fn unpack(raw: Option<Vec<u8>>, source: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    read_source(raw, source, MAX_SOURCE, true)
+}
+/// The first `limit` bytes of a row's saved source (its headers come first).
+fn unpack_head(raw: Option<Vec<u8>>, source: Option<Vec<u8>>, limit: u64) -> Result<Option<Vec<u8>>> {
+    read_source(raw, source, limit, false)
+}
+/// The source columns of a row read with `SOURCE_COLUMNS` from `first` on.
+fn source_columns(r: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    Ok((r.get(first)?, r.get(first + 1)?))
 }
 
 /// Saves a preference, writing nothing when it already has that value
 /// (every check saves its account's folder list, nearly always unchanged).
 const PUT_PREFERENCE: &str = "INSERT INTO preferences VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value";
 
+/// The preference writer: writes whatever is pending each time it is told
+/// there is something, until the store closes.
 fn write_preferences(db: Connection, queue: &PrefQueue, rx: mpsc::Receiver<()>) {
     let write = |batch: &HashMap<String, String>| -> Result<()> {
         let db = db.unchecked_transaction()?;
@@ -1662,58 +1797,159 @@ mod snapshot_tests {
     use super::*;
     use crate::sync::transport::parse_message;
 
-    /// Sources are saved compressed and read back as downloaded; ones saved
-    /// before still read as they are, until the one-time pass compresses
-    /// them and gives the freed space back.
+    /// A message with a large, very compressible source, saved without it.
+    fn big_source(store: &Store, a: &Account, i: usize) -> Result<(String, Vec<u8>)> {
+        let mut raw = format!("Subject: Hi {i}\r\nList-Unsubscribe: <https://x/u>\r\n\r\n").into_bytes();
+        raw.extend(b"The same paragraph, again and again. ".repeat(20_000));
+        let id = format!("{}:{i}", a.id);
+        let mut m = parse_message(&raw, a, &id, Folder::Inbox, "INBOX", i as u32)?;
+        m.gmail_id = 100 + i as u64;
+        m.list_unsubscribe.clear();
+        store.save_messages(std::slice::from_ref(&m))?;
+        Ok((id, raw))
+    }
+    fn columns(store: &Store, id: &str) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        Ok(store.read().query_row("SELECT raw, source FROM messages WHERE id=?1", [id], |r| source_columns(r, 0))?)
+    }
+
+    /// Sources are saved compressed in `source` and read back as
+    /// downloaded. Ones kept in `raw` (by older builds, as downloaded, or
+    /// by earlier builds of this change, compressed) still read, until the
+    /// one-time pass moves them, giving the freed space back.
     #[test]
     fn sources_are_kept_compressed_and_read_back_whole() -> Result<()> {
         let path = std::env::temp_dir().join(format!("picacho-packed-{}", uuid::Uuid::new_v4()));
         let store = Store::open(&path)?;
         let a = Account::new(Provider::Gmail);
-        let raw = |i: usize| {
-            let mut raw = format!("Subject: Hi {i}\r\nList-Unsubscribe: <https://x/u>\r\n\r\n").into_bytes();
-            raw.extend(b"The same paragraph, again and again. ".repeat(20_000));
-            raw
-        };
-        let saved = |id: &str| -> Result<Vec<u8>> {
-            Ok(store.read().query_row("SELECT raw FROM messages WHERE id=?1", [id], |r| r.get(0))?)
-        };
-        let mut ids = Vec::new();
+        let mut saved = Vec::new();
         for i in 0..6 {
-            let id = format!("{}:{i}", a.id);
-            let mut m = parse_message(&raw(i), &a, &id, Folder::Inbox, "INBOX", i as u32)?;
-            m.gmail_id = 100 + i as u64;
-            m.list_unsubscribe.clear();
-            store.save_messages(std::slice::from_ref(&m))?;
-            ids.push(id);
+            saved.push(big_source(&store, &a, i)?);
         }
         // Saved now: compressed, and read back as it was.
-        store.save_raw(&ids[0], &raw(0))?;
-        assert!(saved(&ids[0])?.starts_with(PACKED));
-        assert!(saved(&ids[0])?.len() < raw(0).len() / 10);
-        assert_eq!(store.raw(&ids[0])?, Some(raw(0)));
-        assert_eq!(store.gmail_raw(&a.id, 100)?, Some(raw(0)));
-        // Saved before: as it is, and still read.
-        for (i, id) in ids.iter().enumerate().skip(1) {
-            store.write().execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, raw(i)])?;
+        let (id, raw) = &saved[0];
+        store.save_raw(id, raw)?;
+        let (kept, source) = columns(&store, id)?;
+        assert!(kept.is_none());
+        assert!(source.unwrap().len() < raw.len() / 10);
+        assert_eq!(store.raw(id)?.as_ref(), Some(raw));
+        assert_eq!(store.gmail_raw(&a.id, 100)?.as_ref(), Some(raw));
+        // Kept in `raw` before: as downloaded, or compressed behind the
+        // earlier marker. Both still read.
+        for (i, (id, raw)) in saved.iter().enumerate().skip(1) {
+            let kept = if i % 2 == 0 { [LEGACY_PACKED, &pack(raw)?].concat() } else { raw.clone() };
+            store.write().execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, kept])?;
         }
-        assert_eq!(store.raw(&ids[1])?, Some(raw(1)));
-        // Headers are read from either kind.
+        for (id, raw) in &saved {
+            assert_eq!(store.raw(id)?.as_ref(), Some(raw));
+        }
+        // Headers are read from every kind.
         assert_eq!(store.backfill_subscriptions()?, 6);
         store.write().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         let before = std::fs::metadata(path.join("mail.sqlite3"))?.len();
         assert_eq!(store.pack_saved_sources()?, 5);
-        for (i, id) in ids.iter().enumerate() {
-            assert!(saved(id)?.starts_with(PACKED));
-            assert_eq!(store.raw(id)?, Some(raw(i)));
+        for (id, raw) in &saved {
+            let (kept, source) = columns(&store, id)?;
+            assert!(kept.is_none() && source.is_some(), "moved into `source`");
+            assert_eq!(store.raw(id)?.as_ref(), Some(raw));
         }
         let mode: i64 = store.read().query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
-        assert_eq!(mode, 2, "frees pages from now on");
+        assert_eq!(mode, 2, "a new database frees pages as it goes");
+        // Five sources of some 740 KB each are given back (the text kept
+        // in `data` stays).
         let after = std::fs::metadata(path.join("mail.sqlite3"))?.len();
-        assert!(after < before / 2, "{before} -> {after}");
+        assert!(before - after > 3_000_000, "{before} -> {after}");
         assert_eq!(store.pack_saved_sources()?, 0, "once");
+        assert!(!store.compact_on_quit()?, "nothing to rebuild");
         let _ = std::fs::remove_dir_all(path);
         Ok(())
+    }
+
+    /// A build from before sources were compressed reads only `raw`: it
+    /// finds compressed ones absent, and downloads them again, rather than
+    /// reading compressed bytes as mail. What it saves there is read
+    /// first, and moved into `source` by the next pass.
+    #[test]
+    fn older_builds_see_compressed_sources_as_not_downloaded() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-older-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&path)?;
+        let a = Account::new(Provider::Imap);
+        let (id, raw) = big_source(&store, &a, 1)?;
+        store.save_raw(&id, &raw)?;
+        let older: Option<Vec<u8>> =
+            store.read().query_row("SELECT raw FROM messages WHERE id=?1", [&id], |r| r.get(0))?;
+        assert!(older.is_none(), "an older build sees nothing downloaded");
+        assert_eq!(store.download_counts(1 << 40, &[(a.id.clone(), 0)])?, (1, 0));
+        // Downloaded again by an older build, which knows only `raw`.
+        let again = [raw.as_slice(), b"\r\nAgain"].concat();
+        store.write().execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, again])?;
+        assert_eq!(store.raw(&id)?, Some(again.clone()), "the later copy");
+        assert_eq!(store.pack_saved_sources()?, 1);
+        assert_eq!(columns(&store, &id)?.0, None);
+        assert_eq!(store.raw(&id)?, Some(again));
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A damaged source is an error, not a shorter message; one inflating
+    /// past the largest a download may be is damaged. Reading only the
+    /// headers stops early and is no error.
+    #[test]
+    fn damaged_sources_are_errors_not_short_messages() -> Result<()> {
+        assert!(unpack(None, Some(b"not deflate at all".to_vec())).is_err());
+        let large = pack(&vec![b'a'; 4096])?;
+        assert!(inflate(&large, 4095, true).is_err(), "past the limit");
+        assert_eq!(inflate(&large, 4096, true)?.len(), 4096);
+        assert_eq!(unpack_head(None, Some(large.clone()), 100)?.map(|h| h.len()), Some(100));
+        assert_eq!(unpack_head(Some(vec![b'b'; 300]), None, 100)?.map(|h| h.len()), Some(100));
+        let legacy = [LEGACY_PACKED, &large].concat();
+        assert_eq!(unpack(Some(legacy), None)?.map(|s| s.len()), Some(4096));
+        Ok(())
+    }
+
+    /// A database made before free pages were given back keeps the space
+    /// compressed sources freed, until the rebuild at quitting gives it
+    /// back and switches it to giving pages back as it goes. Not while
+    /// another write holds the cache, and only once.
+    #[test]
+    fn an_older_database_is_compacted_once_at_quitting() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path)?;
+        // Made as earlier builds made it: without incremental vacuum.
+        Connection::open(path.join("mail.sqlite3"))?.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE messages (id TEXT PRIMARY KEY, account TEXT NOT NULL, folder TEXT NOT NULL, date INTEGER NOT NULL, data TEXT NOT NULL, raw BLOB);",
+        )?;
+        let store = Store::open(&path)?;
+        let a = Account::new(Provider::Imap);
+        for i in 0..30 {
+            let (id, raw) = big_source(&store, &a, i)?;
+            store.write().execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, raw])?;
+        }
+        assert_eq!(store.pack_saved_sources()?, 30);
+        // Read where the rebuild ran: a reader connection may still report
+        // the database's mode as it found it.
+        let pragma = |name: &str| -> Result<i64> {
+            Ok(store.db.lock().unwrap().query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?)
+        };
+        assert_eq!(pragma("auto_vacuum")?, 0);
+        let free = pragma("freelist_count")?;
+        assert!(free * pragma("page_size")? > 16 * 1024 * 1024, "{free} pages free");
+        {
+            let _writing = store.write();
+            assert!(!store.compact_on_quit()?, "another write holds the cache");
+        }
+        let before = std::fs::metadata(path.join("mail.sqlite3"))?.len();
+        assert!(store.compact_on_quit()?);
+        assert_eq!(pragma("auto_vacuum")?, 2);
+        assert_eq!(pragma("freelist_count")?, 0);
+        let after = std::fs::metadata(path.join("mail.sqlite3"))?.len();
+        assert!(after < before / 2, "{before} -> {after}");
+        assert!(!store.compact_on_quit()?, "once");
+        assert_eq!(store.raw(&format!("{}:7", a.id))?.map(|s| s.len()), Some(big_source_len(7)));
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+    fn big_source_len(i: usize) -> usize {
+        format!("Subject: Hi {i}\r\nList-Unsubscribe: <https://x/u>\r\n\r\n").len() + 37 * 20_000
     }
 
     /// Saving what is already saved (each check's folder list and mailbox
@@ -1756,8 +1992,8 @@ mod snapshot_tests {
         for (sql, index) in [
             ("SELECT account, folder, COUNT(*) FROM messages WHERE json_extract(data,'$.unread') GROUP BY account, folder", "unread"),
             ("SELECT data FROM messages WHERE account='a' AND json_extract(data,'$.list_unsubscribe') IS NOT NULL", "subscribed"),
-            ("SELECT COUNT(*), COALESCE(SUM(raw IS NULL),0) FROM messages WHERE account='a' AND date >= 0 AND json_extract(data,'$.size') <= 9", "COVERING INDEX downloads"),
-            ("SELECT data FROM messages WHERE account='a' AND raw IS NULL AND date >= 0 AND json_extract(data,'$.size') <= 9 ORDER BY date DESC, id DESC LIMIT 5", "INDEX downloads"),
+            (format!("SELECT COUNT(*), COALESCE(SUM({NOT_DOWNLOADED}),0) FROM messages WHERE account='a' AND date >= 0 AND json_extract(data,'$.size') <= 9").as_str(), "COVERING INDEX downloaded"),
+            (format!("SELECT data FROM messages WHERE account='a' AND {NOT_DOWNLOADED} AND date >= 0 AND json_extract(data,'$.size') <= 9 ORDER BY date DESC, id DESC LIMIT 5").as_str(), "INDEX downloaded"),
         ] {
             let plan = plan(sql)?;
             let index = if index.contains("INDEX") { index.to_owned() } else { format!("INDEX {index}") };

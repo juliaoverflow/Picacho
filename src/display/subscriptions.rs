@@ -75,9 +75,12 @@ impl MailApp {
         );
     }
     /// Compresses message sources saved before they were kept compressed,
-    /// and gives the space back to the system; once.
+    /// and gives the space back to the system where it can at once (see
+    /// `Store::compact_on_quit` for the rest); once.
     pub(super) fn pack_saved_sources(&mut self, cx: &mut Context<Self>) {
-        const DONE: &str = "sources_packed";
+        // Not `sources_packed`: earlier builds of this change set that after
+        // compressing sources in place, which are moved to their own column.
+        const DONE: &str = "sources_moved";
         if self.backend.store.preference(DONE).is_some() {
             return;
         }
