@@ -275,8 +275,9 @@ impl MailApp {
                 .child("No message selected")
                 .into_any_element();
         };
-        let compact = window.viewport_size().width < px(1180.);
-        let single = window.viewport_size().width < px(900.);
+        let width = super::window::content_size(window).width;
+        let compact = width < px(1180.);
+        let single = width < px(900.);
         // A mailbox kept to its aliases shows the alias used in its place.
         let mask = self.mask_for(m);
         let (sender, from) = match &mask {
@@ -512,7 +513,8 @@ impl MailApp {
         let options = self.reading_options(m);
         let dark = self.email_dark(options);
         // A full-width reader in a narrow window shows the controls as icons.
-        let narrow = window.viewport_size().width < px(super::panes::READER_MIN);
+        let narrow =
+            super::window::content_size(window).width < px(super::panes::READER_MIN);
         content = content
             .when(!locked, |d| {
                 d.child(self.rendering_controls(m, options, narrow, cx))

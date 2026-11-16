@@ -4045,7 +4045,7 @@ impl MailApp {
                 self.handle(Action::BackToList, w, cx);
             } else if self.subs_open && self.subs_sender.is_some() {
                 self.close_subscription(w, cx);
-            } else if w.viewport_size().width < px(900.) {
+            } else if window::content_size(w).width < px(900.) {
                 self.selected = None;
                 self.read_generation += 1;
             }
@@ -8400,8 +8400,11 @@ impl MailApp {
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
             Modal::Snooze(_) => self.snooze_modal(),
         };
-        let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
-        let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
+        // Dialogs are laid out inside the window's frame, which is smaller
+        // than the window while Picacho draws its own decorations.
+        let frame = window::content_size(window);
+        let available_height = (frame.height - px(32.)).max(px(0.));
+        let available_width = (frame.width - px(32.)).max(px(0.));
         let mut panel = div()
             .id("modal-panel")
             .debug_selector(|| "modal-panel".into())
@@ -8427,9 +8430,8 @@ impl MailApp {
                     // Like a full-size composer: below the title bar, which
                     // stays visible and usable, with an even margin all round.
                     let edge = px(2. * MAXIMIZED_MARGIN);
-                    let viewport = window.viewport_size();
-                    d.w((viewport.width - edge).max(px(0.)))
-                        .h((viewport.height - px(TITLEBAR_HEIGHT) - edge).max(px(0.)))
+                    d.w((frame.width - edge).max(px(0.)))
+                        .h((frame.height - px(TITLEBAR_HEIGHT) - edge).max(px(0.)))
                 } else {
                     d.h(px(600.).min(available_height))
                 }
@@ -8889,7 +8891,10 @@ impl MailApp {
 impl MailApp {
     fn main(&self, d: Stateful<Div>, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = self.colors();
-        let width = window.viewport_size().width;
+        // The frame's width: in a window drawing its own decorations, the
+        // window's is wider by its shadow band and borders, and panes sized
+        // to it ran past the frame, cutting off the reader's right edge.
+        let width = window::content_size(window).width;
         let single = width < px(900.);
         let compact = width < px(1180.);
         self.compact.set(compact);

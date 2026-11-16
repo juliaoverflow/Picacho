@@ -49,6 +49,48 @@ pub(super) fn frame_insets(w: &Window) -> Edges<Pixels> {
     gpui_component::window_paddings(w)
 }
 
+/// The space inside the window's visible frame, where the app is laid out,
+/// in window coordinates. While Picacho draws its own decorations this is
+/// smaller than the window (`viewport_size`): a shadow band and two borders
+/// surround it. Layout decisions (pane widths, breakpoints, dialog and
+/// composer sizes) use it, so nothing sized to the window runs past the
+/// frame and gets cut off.
+pub(super) fn content_bounds(w: &Window) -> Bounds<Pixels> {
+    let viewport = w.viewport_size();
+    let Decorations::Client { tiling } = w.window_decorations() else {
+        return Bounds::new(Point::default(), viewport);
+    };
+    inner_bounds(viewport, frame_insets(w), tiling, is_client_decorated(w))
+}
+
+/// The size of [`content_bounds`].
+pub(super) fn content_size(w: &Window) -> Size<Pixels> {
+    content_bounds(w).size
+}
+
+/// `content_bounds` for a window `viewport` big with this shadow band and
+/// tiling; `outlined` when Picacho outlines the frame (`window_frame`).
+fn inner_bounds(
+    viewport: Size<Pixels>,
+    shadow: Edges<Pixels>,
+    tiling: Tiling,
+    outlined: bool,
+) -> Bounds<Pixels> {
+    // gpui-component's frame border, and Picacho's outline inside it; both
+    // are left off edges that are tiled.
+    let border = if outlined { px(2.) } else { px(1.) };
+    let side = |inset: Pixels, tiled: bool| inset + if tiled { px(0.) } else { border };
+    let (left, right) = (side(shadow.left, tiling.left), side(shadow.right, tiling.right));
+    let (top, bottom) = (side(shadow.top, tiling.top), side(shadow.bottom, tiling.bottom));
+    Bounds::new(
+        point(left, top),
+        size(
+            (viewport.width - left - right).max(px(0.)),
+            (viewport.height - top - bottom).max(px(0.)),
+        ),
+    )
+}
+
 /// Round and outline the root surface when it is the window frame. GPUI clips
 /// children only to rectangles, so a full-bleed child that paints its own
 /// background into a corner must apply the matching [`window_corners`] radius.
@@ -268,4 +310,50 @@ pub(super) fn detached_titlebar(
             );
     }
     bar
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::prelude::v1::test;
+
+    #[test]
+    fn content_is_laid_out_inside_the_shadow_and_borders() {
+        let viewport = size(px(1200.), px(800.));
+        let floating = Tiling::default();
+        // A floating window: a 20px band and two 1px borders on each side.
+        let band = Edges::all(px(20.));
+        assert_eq!(
+            inner_bounds(viewport, band, floating, true),
+            Bounds::new(point(px(22.), px(22.)), size(px(1156.), px(756.)))
+        );
+        // Without Picacho's outline, only gpui-component's border.
+        assert_eq!(
+            inner_bounds(viewport, band, floating, false),
+            Bounds::new(point(px(21.), px(21.)), size(px(1158.), px(758.)))
+        );
+        // Maximized: no band and no borders.
+        let tiled = Tiling::tiled();
+        let none = Edges::all(px(0.));
+        assert_eq!(
+            inner_bounds(viewport, none, tiled, true),
+            Bounds::new(Point::default(), viewport)
+        );
+        // Tiled to the left half: the left, top and bottom edges are tiled,
+        // so only the right keeps its band and borders.
+        let left = Tiling {
+            left: true,
+            top: true,
+            bottom: true,
+            right: false,
+        };
+        let right_band = Edges {
+            right: px(20.),
+            ..Edges::default()
+        };
+        assert_eq!(
+            inner_bounds(viewport, right_band, left, true),
+            Bounds::new(Point::default(), size(px(1178.), px(800.)))
+        );
+    }
 }

@@ -291,7 +291,7 @@ impl MailApp {
     fn reader_visible(&self, w: &Window) -> bool {
         self.selected.is_some()
             && !self.reader_collapsed
-            && (w.viewport_size().width >= px(900.) || self.selected.is_some())
+            && (super::window::content_size(w).width >= px(900.) || self.selected.is_some())
     }
 
     /// An open composer answering `m`: forwarding it, or replying to it.
@@ -968,8 +968,10 @@ impl MailApp {
     /// Floating, minimized and maximized composers over the main window.
     pub(super) fn composer_layer(&self, window: &Window, cx: &Context<Self>) -> Vec<AnyElement> {
         let c = self.colors();
-        let viewport = window.viewport_size();
-        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        // Composers are placed inside the window's frame, which is smaller
+        // than the window while Picacho draws its own decorations.
+        let frame = super::window::content_size(window);
+        let (vw, vh) = (f32::from(frame.width), f32::from(frame.height));
         let mut right = 16.;
         let mut out = vec![];
         for composer in &self.composers {
@@ -1117,12 +1119,15 @@ impl MailApp {
         let Some(composer) = self.composers.iter().find(|c| c.entity_id() == id).cloned() else {
             return;
         };
-        let viewport = w.viewport_size();
-        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        // The pointer is in window coordinates; composers are placed in the
+        // frame's, which start past the shadow band and borders of a window
+        // drawing its own decorations.
+        let frame = super::window::content_bounds(w);
+        let (vw, vh) = (f32::from(frame.size.width), f32::from(frame.size.height));
         let w_ = FLOAT_W.min(vw - 32.);
         let h_ = FLOAT_H.min(vh - TITLEBAR_HEIGHT - 24.).max(BAR_H);
         composer.update(cx, |c, cx| {
-            let p = e.event.position - c.grab;
+            let p = e.event.position - c.grab - frame.origin;
             let (x, y) = clamp_origin(p, w_, h_, vw, vh);
             c.origin = Some(point(px(x), px(y)));
             cx.notify();
