@@ -1,7 +1,7 @@
 //! GPUI input, clipping and strip caching for an HTML document whose work
 //! happens on its own thread (see `worker.rs`).
 use super::document::{Tone, page_color};
-use super::worker::{self, BAND, Command, Output, Update};
+use super::worker::{self, Command, Output, Update, band_height};
 use crate::manage::model::InlineParts;
 use blitz_traits::events::*;
 use futures::{StreamExt, channel::mpsc::UnboundedSender};
@@ -13,8 +13,11 @@ struct Tile {
     revision: u64,
     width: u32,
     scale: f32,
-    /// Logical (CSS pixel) height of the strip.
-    rows: f32,
+    /// Logical (CSS pixel) top of the strip in the email.
+    top: f32,
+    /// Logical size of the image, padded past the strip with transparency
+    /// (see `worker::TILE`).
+    size: Size<Pixels>,
     image: Arc<RenderImage>,
 }
 
@@ -30,8 +33,10 @@ pub struct HtmlContextMenu {
 struct Thumbnail {
     revision: u64,
     image: Arc<RenderImage>,
-    /// Logical size.
+    /// Logical size of the email in it.
     size: Size<Pixels>,
+    /// Logical size of the image, padded with transparency.
+    padded: Size<Pixels>,
 }
 
 pub struct HtmlView {
@@ -136,7 +141,9 @@ impl HtmlView {
         // Dropping the sender ends the thread and cancels its resources.
         self.worker = None;
         self.generation += 1;
-        self.source.clear();
+        self.source = String::new();
+        // The message's inline images can be large; don't keep them past it.
+        self.inline = Default::default();
         self.failed = false;
         self.retired
             .extend(self.tiles.drain().map(|(_, tile)| tile.image));
@@ -203,6 +210,16 @@ impl HtmlView {
         ));
         cx.notify();
     }
+    /// Takes images no longer shown out of the window's atlas. Strips and
+    /// thumbnails are released as they are painted; a view that is not
+    /// painted any more (the next message is plain text) is released here,
+    /// from its owner's render: during a frame, so the previous frame, which
+    /// may still show them, is never drawn again.
+    pub fn release(&mut self, window: &mut Window) {
+        for image in self.retired.drain(..) {
+            let _ = window.drop_image(image);
+        }
+    }
     fn send(&self, command: Command) {
         if let Some(worker) = &self.worker {
             let _ = worker.send(command);
@@ -243,7 +260,8 @@ impl HtmlView {
                     revision,
                     width,
                     scale,
-                    rows: ph as f32 / scale,
+                    top: band as f32 * band_height(scale),
+                    size: size(px(pw as f32 / scale), px(ph as f32 / scale)),
                     image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
                 };
                 if let Some(old) = self.tiles.insert(band, tile) {
@@ -254,6 +272,7 @@ impl HtmlView {
             Output::Thumbnail {
                 revision,
                 size: (pw, ph),
+                content: (cw, ch),
                 pixels,
             } => {
                 let Some(buffer) = image::RgbaImage::from_raw(pw, ph, pixels) else {
@@ -265,7 +284,8 @@ impl HtmlView {
                 let thumbnail = Thumbnail {
                     revision,
                     image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
-                    size: size(px(pw as f32 / scale), px(ph as f32 / scale)),
+                    size: size(px(cw as f32 / scale), px(ch as f32 / scale)),
+                    padded: size(px(pw as f32 / scale), px(ph as f32 / scale)),
                 };
                 if let Some(old) = self.thumbnail.replace(thumbnail) {
                     self.retired.push(old.image);
@@ -337,9 +357,7 @@ impl HtmlView {
         bounds: Bounds<Pixels>,
         window: &mut Window,
     ) -> Vec<(Bounds<Pixels>, Arc<RenderImage>)> {
-        for image in self.retired.drain(..) {
-            let _ = window.drop_image(image);
-        }
+        self.release(window);
         self.bounds = bounds;
         if self.worker.is_none() {
             return Vec::new();
@@ -359,10 +377,11 @@ impl HtmlView {
         let scale = window.scale_factor();
         let top = f32::from(visible.top() - bounds.top()).max(0.);
         let bottom = top + f32::from(visible.size.height);
-        let first = (top / BAND).floor() as u32;
+        let strip = band_height(scale);
+        let first = (top / strip).floor() as u32;
         // Prefetch one strip below so scrolling down shows finished content.
-        let last = ((bottom / BAND).ceil() as u32)
-            .min((self.height / BAND).ceil() as u32)
+        let last = ((bottom / strip).ceil() as u32)
+            .min((self.height / strip).ceil() as u32)
             .max(first + 1);
         let current = self.laid_width == width;
         let mut drawn = Vec::new();
@@ -377,18 +396,16 @@ impl HtmlView {
                 self.send(Command::Paint { band, width, scale });
             }
             // An older strip stays up until its replacement arrives.
+            // Its transparent padding reaches past the email, showing nothing.
             if let Some(tile) = tile {
                 drawn.push((
-                    Bounds::new(
-                        point(bounds.left(), bounds.top() + px(band as f32 * BAND)),
-                        size(px(tile.width as f32), px(tile.rows)),
-                    ),
+                    Bounds::new(point(bounds.left(), bounds.top() + px(tile.top)), tile.size),
                     tile.image.clone(),
                 ));
             }
         }
         // Keep a few strips around the viewport; drop the rest.
-        let keep = first.saturating_sub(3)..=last + 3;
+        let keep = first.saturating_sub(2)..=last + 2;
         let far: Vec<u32> = self
             .tiles
             .keys()
@@ -416,9 +433,7 @@ impl HtmlView {
         bounds: Bounds<Pixels>,
         window: &mut Window,
     ) -> Option<(Bounds<Pixels>, Arc<RenderImage>)> {
-        for image in self.retired.drain(..) {
-            let _ = window.drop_image(image);
-        }
+        self.release(window);
         self.worker.as_ref()?;
         let scale = window.scale_factor();
         let width = f32::from(bounds.size.width);
@@ -441,14 +456,10 @@ impl HtmlView {
             });
         }
         let thumbnail = self.thumbnail.as_ref()?;
+        // The email fills at most `bounds`' height; the transparent padding
+        // past it shows nothing.
         Some((
-            Bounds::new(
-                bounds.origin,
-                size(
-                    thumbnail.size.width,
-                    thumbnail.size.height.min(bounds.size.height),
-                ),
-            ),
+            Bounds::new(bounds.origin, thumbnail.padded),
             thumbnail.image.clone(),
         ))
     }

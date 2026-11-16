@@ -8445,6 +8445,8 @@ impl Render for MailApp {
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = self.root(window, cx);
+        // The email's images, once the reader no longer paints it.
+        self.html_view.update(cx, |view, _| view.release(window));
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
             self.spin_scheduled = true;
             cx.spawn(async move |this, cx| {

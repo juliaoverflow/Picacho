@@ -235,5 +235,6 @@ stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = 
 imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Maximized windows' content is no longer a resize edge.
 gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
-# Copying from a menu (a click) works on Wayland.
+# Copying from a menu (a click) works on Wayland. Removed images give their
+# atlas space back.
 gpui = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
