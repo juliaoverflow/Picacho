@@ -639,12 +639,22 @@ impl Store {
     /// Reads List-Unsubscribe from the downloaded source of messages cached
     /// before it was kept. Returns how many were found.
     pub fn backfill_subscriptions(&self) -> Result<usize> {
+        self.backfill_subscriptions_of(None)
+    }
+    /// `backfill_subscriptions` for the mail of `accounts` only.
+    pub fn backfill_subscriptions_in(&self, accounts: &[String]) -> Result<usize> {
+        accounts
+            .iter()
+            .map(|id| self.backfill_subscriptions_of(Some(id)))
+            .sum()
+    }
+    fn backfill_subscriptions_of(&self, account: Option<&str>) -> Result<usize> {
         let ids: Vec<String> = {
             let db = self.read();
             let mut q = db.prepare(
-                "SELECT id FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL",
+                "SELECT id FROM messages WHERE raw IS NOT NULL AND json_extract(data,'$.list_unsubscribe') IS NULL AND (?1 IS NULL OR account=?1)",
             )?;
-            q.query_map([], |r| r.get(0))?
+            q.query_map([account], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?
         };
         let mut total = 0;
@@ -1516,6 +1526,33 @@ fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<(
 mod snapshot_tests {
     use super::*;
     use crate::sync::transport::parse_message;
+
+    /// Mail downloaded without its List-Unsubscribe kept (Proton's, before)
+    /// gets it from its saved source, for the accounts asked about only.
+    #[test]
+    fn subscriptions_are_found_in_saved_sources_of_the_accounts_asked() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-backfill-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&path)?;
+        let raw = b"From: News <news@shop.example>\r\nSubject: Sale\r\nList-Unsubscribe: <https://shop.example/u>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\r\nBody";
+        let accounts = [Account::new(Provider::Proton), Account::new(Provider::Proton)];
+        for a in &accounts {
+            let id = format!("{}:1", a.id);
+            let mut m = parse_message(raw, a, &id, Folder::Inbox, "INBOX", 1)?;
+            // As the download used to save it: without the header.
+            m.list_unsubscribe.clear();
+            m.one_click = false;
+            store.save_messages(std::slice::from_ref(&m))?;
+            store.save_raw(&id, raw)?;
+        }
+        assert!(store.subscriptions(&[accounts[0].id.clone()])?.is_empty());
+        assert_eq!(store.backfill_subscriptions_in(&[accounts[0].id.clone()])?, 1);
+        let found = store.subscriptions(&[accounts[0].id.clone()])?;
+        assert_eq!(found.len(), 1);
+        assert!(found[0].one_click);
+        assert!(store.subscriptions(&[accounts[1].id.clone()])?.is_empty(), "not asked about");
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
 
     /// Lists are rebuilt only when what they show changed: saving mail as
     /// it already is (a check with no news) keeps the revision; new mail,

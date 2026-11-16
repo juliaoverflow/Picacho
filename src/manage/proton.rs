@@ -692,10 +692,23 @@ impl Backend {
                 next.has_attachments = !parsed.attachments().is_empty();
                 next.set_attachments(parsed.take_attachments());
                 if next.snippet.is_empty() {
-                    next.snippet = parsed.snippet;
+                    next.snippet = std::mem::take(&mut parsed.snippet);
                 }
                 if !parsed.message_id.is_empty() {
-                    next.message_id = parsed.message_id;
+                    next.message_id = std::mem::take(&mut parsed.message_id);
+                }
+                // What only the source's headers say: Proton's message list
+                // doesn't carry them. Without List-Unsubscribe, a sender's
+                // mail showed under Subscriptions only once each was opened.
+                if next.references().is_empty() {
+                    next.set_references(parsed.references());
+                }
+                if next.receipt_to().is_empty() {
+                    next.set_receipt_to(parsed.receipt_to());
+                }
+                if next.list_unsubscribe.is_empty() {
+                    next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
+                    next.one_click = parsed.one_click;
                 }
                 self.store.save_messages(&[next])?;
             }

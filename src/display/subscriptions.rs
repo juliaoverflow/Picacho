@@ -16,6 +16,9 @@ pub(super) enum SubsTab {
 }
 /// Done once: reads List-Unsubscribe from mail downloaded before it was kept.
 const BACKFILL_PREFERENCE: &str = "subscriptions_backfilled";
+/// Done once: the same for Proton mail downloaded before its background
+/// download kept List-Unsubscribe.
+const PROTON_BACKFILL_PREFERENCE: &str = "subscriptions_backfilled_proton";
 
 impl MailApp {
     pub(super) fn load_unsubscribed(&mut self) {
@@ -33,16 +36,35 @@ impl MailApp {
                 .store.set_preference_soon(subs::UNSUBSCRIBED_PREFERENCE, &json);
         }
     }
-    /// Finds the subscriptions in mail cached before they were detected.
+    /// Finds the subscriptions in mail cached before they were detected:
+    /// all mail once, and Proton's once more, as its background download
+    /// used to keep no List-Unsubscribe (opening each message found it).
     pub(super) fn backfill_subscriptions(&mut self, cx: &mut Context<Self>) {
-        if self.backend.store.preference(BACKFILL_PREFERENCE).is_some() {
+        let all = self.backend.store.preference(BACKFILL_PREFERENCE).is_none();
+        let proton: Vec<String> = if self.backend.store.preference(PROTON_BACKFILL_PREFERENCE).is_none() {
+            self.accounts
+                .iter()
+                .filter(|a| a.provider == Provider::Proton)
+                .map(|a| a.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !all && proton.is_empty() {
             return;
         }
         self.task(
             cx,
-            |b| {
-                let found = b.store.backfill_subscriptions()?;
-                b.store.set_preference(BACKFILL_PREFERENCE, "1")?;
+            move |b| {
+                let mut found = 0;
+                if all {
+                    found += b.store.backfill_subscriptions()?;
+                    b.store.set_preference(BACKFILL_PREFERENCE, "1")?;
+                } else if !proton.is_empty() {
+                    found += b.store.backfill_subscriptions_in(&proton)?;
+                }
+                // Proton mail downloaded from now on keeps it.
+                b.store.set_preference(PROTON_BACKFILL_PREFERENCE, "1")?;
                 Ok(found)
             },
             |this, result, cx| {

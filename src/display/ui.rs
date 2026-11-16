@@ -2191,6 +2191,17 @@ impl MailApp {
                             this.downloading.remove(&a.id);
                             this.download.active = !this.downloading.is_empty();
                         }
+                        // Proton's subscriptions are found as its mail
+                        // downloads (its list doesn't say): show them as
+                        // they are, when its subscriptions are open.
+                        if a.provider == Provider::Proton
+                            && matches!(result, Ok(n) if n > 0)
+                            && this.subs_open
+                            && this.subs_sender.is_none()
+                            && this.account.as_ref().is_some_and(|id| id == &a.id || id == ALL_MAIL)
+                        {
+                            this.load_subscriptions(cx);
+                        }
                         this.refresh_counts(cx);
                         cx.notify();
                         more
