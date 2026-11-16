@@ -475,7 +475,7 @@ pub fn thumbnail(view: Entity<HtmlView>) -> impl IntoElement {
         move |bounds, w, cx| view.update(cx, |this, _| this.prepare_thumbnail(bounds, w)),
         |_, image, w, _| {
             if let Some((bounds, image)) = image {
-                let _ = w.paint_image(bounds, Corners::default(), image, 0, false);
+                let _ = w.paint_image(bounds, bounds, Corners::default(), image, 0, false);
             }
         },
     )
@@ -509,8 +509,8 @@ impl Render for HtmlView {
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, e: &MouseDownEvent, w, _| {
-                    this.focus.focus(w);
+                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                    this.focus.focus(w, cx);
                     this.pointer(e.position, 1, true);
                 }),
             )
@@ -576,7 +576,14 @@ impl Render for HtmlView {
                     move |bounds, w, cx| view.update(cx, |this, _| this.prepare(bounds, w)),
                     |_, tiles, w, _| {
                         for (bounds, image) in tiles {
-                            let _ = w.paint_image(bounds, Corners::default(), image, 0, false);
+                            let _ = w.paint_image(
+                                bounds,
+                                bounds,
+                                Corners::default(),
+                                image,
+                                0,
+                                false,
+                            );
                         }
                     },
                 )

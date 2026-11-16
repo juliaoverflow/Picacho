@@ -16,10 +16,10 @@
 //! scan the QR code), and the window shows it.
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(not(target_os = "android"))]
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+#[cfg(not(target_os = "android"))]
 use webauthn_authenticator_rs::{
     AuthenticatorBackendHashedClientData,
     error::WebauthnCError,
@@ -60,6 +60,7 @@ impl Method {
 }
 
 /// What an authenticator is waiting for, for the window to show.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Prompt {
     #[default]
@@ -96,17 +97,20 @@ pub struct Assertion {
 }
 
 /// The authenticator library's questions, answered from the sign-in.
+#[cfg(not(target_os = "android"))]
 #[derive(Debug)]
 struct Answers {
     pin: Option<String>,
     pin_asked: AtomicBool,
     prompt: Arc<Mutex<Prompt>>,
 }
+#[cfg(not(target_os = "android"))]
 impl Answers {
     fn show(&self, p: Prompt) {
         *self.prompt.lock().unwrap() = p;
     }
 }
+#[cfg(not(target_os = "android"))]
 impl UiCallback for Answers {
     fn request_pin(&self) -> Option<String> {
         self.pin_asked.store(true, Ordering::Relaxed);
@@ -189,6 +193,7 @@ pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOpti
 }
 
 /// The WebAuthn error, said for a person; a PIN problem asks for the PIN.
+#[cfg(not(target_os = "android"))]
 fn explain(e: WebauthnCError, answers: &Answers) -> anyhow::Error {
     use webauthn_authenticator_rs::error::CtapError::*;
     match e {
@@ -229,6 +234,7 @@ fn explain(e: WebauthnCError, answers: &Answers) -> anyhow::Error {
 /// the client data Proton's library made (its SHA-256, `client_data_hash`,
 /// is what keys sign); `prompt` follows what it waits for. Waits up to a
 /// minute for a key or phone, or until `cancel`.
+#[cfg(not(target_os = "android"))]
 pub async fn assert(
     method: Method,
     options: PublicKeyCredentialRequestOptions,
@@ -265,15 +271,18 @@ pub async fn assert(
     })
 }
 
+#[cfg(not(target_os = "android"))]
 enum Failure {
     Webauthn(WebauthnCError),
     Other(anyhow::Error),
 }
+#[cfg(not(target_os = "android"))]
 impl From<WebauthnCError> for Failure {
     fn from(e: WebauthnCError) -> Self {
         Self::Webauthn(e)
     }
 }
+#[cfg(not(target_os = "android"))]
 impl From<anyhow::Error> for Failure {
     fn from(e: anyhow::Error) -> Self {
         Self::Other(e)
@@ -281,18 +290,22 @@ impl From<anyhow::Error> for Failure {
 }
 /// The signed credential, and the client data when the authenticator made
 /// its own (Windows Hello).
+#[cfg(not(target_os = "android"))]
 type Signed =
     std::result::Result<(webauthn_rs_proto::PublicKeyCredential, Option<Vec<u8>>), Failure>;
 
 /// Resolves when the sign-in is cancelled.
+#[cfg(not(target_os = "android"))]
 async fn cancelled(cancel: &AtomicBool) {
     while !cancel.load(Ordering::Relaxed) {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 }
 
+#[cfg(not(target_os = "android"))]
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[cfg(not(target_os = "android"))]
 async fn security_key(
     answers: &Answers,
     options: PublicKeyCredentialRequestOptions,
@@ -333,6 +346,7 @@ async fn security_key(
     Ok((signed, None))
 }
 
+#[cfg(not(target_os = "android"))]
 async fn phone(
     answers: &Answers,
     options: PublicKeyCredentialRequestOptions,
@@ -367,9 +381,23 @@ fn windows(options: PublicKeyCredentialRequestOptions) -> Signed {
     Ok((signed, Some(client_data)))
 }
 
-/// Whether Proton's options name any key at all.
+/// Android has no security key or phone passkey support here yet.
+#[cfg(target_os = "android")]
+pub async fn assert(
+    _method: Method,
+    _options: PublicKeyCredentialRequestOptions,
+    _client_data_json: &[u8],
+    _client_data_hash: &[u8],
+    _pin: Option<String>,
+    _prompt: Arc<Mutex<Prompt>>,
+    _cancel: &AtomicBool,
+) -> Result<Assertion> {
+    Err(anyhow!("Security keys and passkeys aren't available on Android yet."))
+}
+
+/// Whether Proton's options name any key at all, and this system can use one.
 pub fn usable(options: Option<&Value>) -> bool {
-    options.and_then(|o| request_options(o).ok()).is_some()
+    !cfg!(target_os = "android") && options.and_then(|o| request_options(o).ok()).is_some()
 }
 
 #[cfg(test)]

@@ -60,6 +60,28 @@ use a stable signing identity and bundle identifier; the rebuild-specific prompt
 is primarily a development/ad-hoc signing concern. Native Keychain prompt behavior
 still needs verification on macOS when changing signing or distribution.
 
+### Android (experimental)
+
+On Android, Picacho is a shared library (`src/android.rs`) that a
+NativeActivity loads, and GPUI's Android platform comes from
+[gpui-mobile](https://github.com/pinaltech/Picacho-Patches/tree/gpui-pre-android/gpui-mobile).
+It needs the Android NDK, `cargo-ndk` and the Rust target:
+
+```sh
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+ANDROID_NDK_HOME=/path/to/ndk cargo ndk -t arm64-v8a -P 26 build --release --lib
+```
+
+This makes `libpicacho.so`; there is no APK project yet, and the app has not
+been run on a device. Not yet on Android:
+
+- Saving credentials: keyring has no default store on Android, so adding an
+  account fails until its Android Keystore backend is set up.
+- System notifications.
+- Proton: security keys and phone passkeys (sign-in uses the authenticator
+  app's code instead), and human verification (CAPTCHA).
+
 ### Built-in sign-in
 
 Browser sign-in uses Picacho's own registration with each provider. Set these when building (the same variables at run time override them, for development):

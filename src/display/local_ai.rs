@@ -215,7 +215,7 @@ impl MailApp {
     fn follow_download(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(100)).await;
+                cx.background_executor().timer(Duration::from_millis(100)).await;
                 let busy = this
                     .update(cx, |this, cx| {
                         cx.notify();

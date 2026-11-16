@@ -135,11 +135,13 @@ fn long_plain_text_mail_is_laid_out_in_full(cx: &mut TestAppContext) {
     frame(cx);
     frame(cx);
     // The footer follows the whole body, far below the visible area; a body
-    // clipped to the viewport put it within one screen of the header.
+    // clipped to the viewport put it within one screen of the header. (Tests
+    // lay text out with GPUI's fixed test metrics, not the system's fonts.)
     let pane = cx.debug_bounds("reader-pane").unwrap();
     let footer = cx.debug_bounds("reply-bottom").unwrap();
+    let screen = cx.update(|w, _| w.viewport_size().height);
     assert!(
-        footer.top() - pane.top() > px(5000.),
+        footer.top() - pane.top() > screen * 3.,
         "footer at {:?}, pane at {:?}",
         footer.top(),
         pane.top()
@@ -273,7 +275,7 @@ fn reader_buttons_work_after_opening_an_html_email_and_visiting_settings(
     let inside = point(email.center().x, email.top() + px(200.));
     cx.simulate_mouse_move(inside, None, Modifiers::none());
     cx.simulate_click(inside, Modifiers::none());
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
         position: inside,
         delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
         ..Default::default()

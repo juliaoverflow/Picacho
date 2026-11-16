@@ -13,7 +13,7 @@ impl MailApp {
     /// Re-renders once an animation finishes so its outgoing layer is dropped.
     fn after_animation(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            Timer::after(PANE_ANIMATION + Duration::from_millis(16)).await;
+            cx.background_executor().timer(PANE_ANIMATION + Duration::from_millis(16)).await;
             let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();

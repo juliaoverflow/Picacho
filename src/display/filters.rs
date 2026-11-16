@@ -29,7 +29,7 @@ pub(super) struct FiltersUi {
 pub(super) struct FilterInputs {
     pub(super) value: Entity<InputState>,
     pub(super) subject: Entity<InputState>,
-    pub(super) body: Entity<InputState>,
+    pub(super) body: Entity<TextareaState>,
     pub(super) from: Entity<InputState>,
     pub(super) until: Entity<InputState>,
     /// The account whose values they show.
@@ -38,17 +38,15 @@ pub(super) struct FilterInputs {
 impl FilterInputs {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
-            value: input("Text to look for", false, false, window, cx),
-            subject: input("Out of office", false, false, window, cx),
-            body: input(
+            value: input("Text to look for", false, window, cx),
+            subject: input("Out of office", false, window, cx),
+            body: textarea(
                 "I'm away until Monday and will reply when I'm back.",
-                true,
-                false,
                 window,
                 cx,
             ),
-            from: input("2026-12-20 (optional)", false, false, window, cx),
-            until: input("2026-12-31 (optional)", false, false, window, cx),
+            from: input("2026-12-20 (optional)", false, window, cx),
+            until: input("2026-12-31 (optional)", false, window, cx),
             shows: None,
         }
     }
@@ -143,9 +141,9 @@ impl MailApp {
         ui.populate = false;
         let v = ui.draft.vacation.clone();
         self.filter_inputs.shows = Some(id.to_owned());
+        Self::set(&self.filter_inputs.body, &v.body, w, cx);
         let inputs = [
             (self.filter_inputs.subject.clone(), v.subject),
-            (self.filter_inputs.body.clone(), v.body),
             (self.filter_inputs.from.clone(), v.from.unwrap_or_default()),
             (
                 self.filter_inputs.until.clone(),
@@ -652,7 +650,8 @@ impl MailApp {
                             "Message",
                             "",
                             div().h(px(110.)).child(
-                                field(Input::new(&self.filter_inputs.body), c, false).h_full(),
+                                textarea_field(Textarea::new(&self.filter_inputs.body), c, false)
+                                    .h_full(),
                             ),
                         ),
                     )
