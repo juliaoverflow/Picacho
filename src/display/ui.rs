@@ -970,6 +970,9 @@ pub struct MailApp {
     /// A check of the listed messages (`reload_if_changed`) was asked for
     /// while a reload ran.
     recheck_again: bool,
+    /// Composers' address suggestions, with the list revision and your
+    /// addresses they were gathered for; see `contacts`.
+    contacts_cache: std::cell::RefCell<Option<(u64, Vec<String>, Rc<Vec<(String, String)>>)>>,
     /// What the listed messages were built from; see `list_freshness`.
     listed: Option<views::ListKey>,
     /// Unread messages among those loaded, counted when the list changes.
@@ -1687,6 +1690,7 @@ impl MailApp {
             reload_running: false,
             reload_again: false,
             recheck_again: false,
+            contacts_cache: Default::default(),
             listed: None,
             loaded_unread: 0,
             options_cache: Default::default(),

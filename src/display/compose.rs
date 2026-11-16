@@ -550,8 +550,11 @@ impl MailApp {
 
     /// People to suggest as recipients: senders of loaded mail, most recent
     /// first, one entry per address.
+    /// People to suggest in a composer's address fields: everyone in the
+    /// listed mail, newest first, up to 2,000, not counting your own
+    /// addresses. Kept until the list or your addresses change.
     fn contacts(&self) -> Rc<Vec<(String, String)>> {
-        let own: HashSet<String> = self
+        let mut own: Vec<String> = self
             .accounts
             .iter()
             .flat_map(|a| {
@@ -559,32 +562,16 @@ impl MailApp {
                     .chain(a.identities.iter().map(|i| i.email.to_lowercase()))
             })
             .collect();
-        let mut seen = HashSet::new();
-        let mut out = vec![];
-        let mut by_date: Vec<&Mail> = self.messages.iter().filter(|m| !m.pending).collect();
-        by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
-        for m in by_date {
-            let mut people = vec![(m.sender.clone(), m.from.clone())];
-            for list in [m.to.as_str(), m.cc()] {
-                if let Ok(parsed) = crate::sync::smtp::recipients(list) {
-                    people.extend(
-                        parsed
-                            .into_iter()
-                            .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
-                    );
-                }
-            }
-            for (name, email) in people {
-                let key = email.to_lowercase();
-                if email.contains('@') && !own.contains(&key) && seen.insert(key) {
-                    out.push((name, email));
-                }
-            }
-            if out.len() >= 2000 {
-                break;
-            }
+        own.sort();
+        if let Some((revision, addresses, contacts)) = &*self.contacts_cache.borrow()
+            && *revision == self.list_revision
+            && *addresses == own
+        {
+            return contacts.clone();
         }
-        Rc::new(out)
+        let contacts = Rc::new(gather_contacts(&self.messages, &own));
+        *self.contacts_cache.borrow_mut() = Some((self.list_revision, own, contacts.clone()));
+        contacts
     }
 
     /// Brings the end of the reader, where its inline reply is, into view.
@@ -1239,6 +1226,50 @@ mod tests {
         assert_eq!(reply_subject("Re: Plans", true), "Fwd: Re: Plans");
     }
 
+    /// Contacts come out as gathering every message's recipients would:
+    /// newest first, each once with its first name, never your own.
+    #[test]
+    fn contacts_skip_lists_already_read_and_come_out_the_same() {
+        let own = vec!["me@example.com".to_owned()];
+        let mut messages = Vec::new();
+        for i in 0..60 {
+            let mut m = Mail {
+                id: i.to_string(),
+                from: format!("sender{}@x.com", i % 7),
+                sender: format!("Sender {}", i % 7),
+                to: if i % 3 == 0 { "Me <me@example.com>".into() } else { format!("Ana <ana@x.com>, bo{}@x.com", i % 4) },
+                date: i as i64 * if i % 2 == 0 { 1 } else { -1 },
+                ..Mail::default()
+            };
+            if i % 5 == 0 {
+                m.set_cc("Cy <cy@x.com>, ME@example.com, not an address");
+            }
+            messages.push(m);
+        }
+        let old = |messages: &[Mail]| {
+            let mut seen = HashSet::new();
+            let mut out = vec![];
+            let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
+            by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
+            for m in by_date {
+                let mut people = vec![(m.sender.clone(), m.from.clone())];
+                for list in [m.to.as_str(), m.cc()] {
+                    if let Ok(parsed) = crate::sync::smtp::recipients(list) {
+                        people.extend(parsed.into_iter().map(|(n, e)| (n.unwrap_or_else(|| e.clone()), e)));
+                    }
+                }
+                for (name, email) in people {
+                    let key = email.to_lowercase();
+                    if email.contains('@') && key != "me@example.com" && seen.insert(key) {
+                        out.push((name, email));
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(gather_contacts(&messages, &own), old(&messages));
+    }
+
     #[test]
     fn reply_all_copies_everyone_but_you() {
         let mut m = Mail {
@@ -1293,4 +1324,42 @@ mod tests {
         );
         assert!(alias_addressed(&Mail::default(), &aliases).is_none());
     }
+}
+
+/// Everyone in `messages`, newest first, up to 2,000, but those in `own`
+/// (lowercase). Recipient lists already read are skipped: mail from lists
+/// is sent to the same few addresses over and over, and parsing every
+/// list of tens of thousands of messages took most of the time.
+pub(super) fn gather_contacts(messages: &[Mail], own: &[String]) -> Vec<(String, String)> {
+    let own: HashSet<&str> = own.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut lists_read: HashSet<&str> = HashSet::new();
+    let mut out = vec![];
+    let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
+    by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
+    for m in by_date {
+        let mut people = vec![(m.sender.clone(), m.from.clone())];
+        for list in [m.to.as_str(), m.cc()] {
+            if !lists_read.insert(list) {
+                continue;
+            }
+            if let Ok(parsed) = crate::sync::smtp::recipients(list) {
+                people.extend(
+                    parsed
+                        .into_iter()
+                        .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
+                );
+            }
+        }
+        for (name, email) in people {
+            let key = email.to_lowercase();
+            if email.contains('@') && !own.contains(key.as_str()) && seen.insert(key) {
+                out.push((name, email));
+            }
+        }
+        if out.len() >= 2000 {
+            break;
+        }
+    }
+    out
 }
