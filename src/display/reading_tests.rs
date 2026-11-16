@@ -600,3 +600,46 @@ fn banner_actions_stay_inside_their_banners_as_the_reader_narrows(cx: &mut TestA
         }
     }
 }
+
+#[gpui::test]
+fn server_search_line_stays_inside_a_narrow_list(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    // One IMAP account's inbox, searched: the line offers to search the
+    // server too.
+    let account = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    act(&view, Action::OpenMailbox(account, Folder::Inbox.into()), cx);
+    act(&view, Action::SearchFor("plans".into()), cx);
+    // The list at its narrowest beside the reader, and narrow windows'
+    // full-width lists.
+    for (width, drag) in [
+        (1440., false),
+        (1440., true),
+        (1180., true),
+        (960., true),
+        (480., false),
+        (360., false),
+    ] {
+        cx.simulate_resize(size(px(width), px(700.)));
+        view.update_in(cx, |this, _, cx| {
+            // As wide as it goes: the list keeps only its narrowest.
+            this.reader_width = drag.then_some(width);
+            cx.notify();
+        });
+        frame(cx);
+        frame(cx);
+        let list = cx.debug_bounds("message-list").unwrap();
+        let line = cx
+            .debug_bounds("server-search")
+            .unwrap_or_else(|| panic!("{width}: the server search line is not shown"));
+        let link = cx.debug_bounds("server-search-start").unwrap();
+        assert!(line.right() <= list.right(), "{width}: line past the list");
+        assert!(
+            link.left() >= line.left() && link.right() <= line.right(),
+            "{width}: link past the line: {link:?} in {line:?}"
+        );
+        assert!(
+            link.top() >= line.top() && link.bottom() <= line.bottom(),
+            "{width}: link outside the line: {link:?} in {line:?}"
+        );
+    }
+}

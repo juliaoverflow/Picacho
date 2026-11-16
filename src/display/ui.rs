@@ -7403,8 +7403,10 @@ impl MailApp {
     }
     fn link(&self, id: &str, label: &str, action: Action, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        let selector = id.to_owned();
         div()
             .id(SharedString::from(id.to_owned()))
+            .debug_selector(move || selector)
             .text_size(px(12.))
             .text_color(rgb(c.accent))
             .cursor_pointer()

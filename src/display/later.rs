@@ -368,19 +368,25 @@ impl MailApp {
         let a = self.server_searchable()?;
         let c = self.colors();
         let gmail = a.provider == Provider::Gmail;
+        // The list can be narrow: the text wraps, and past that the link
+        // goes below it, on the right, rather than past the list's edge.
         let line = div()
             .id("server-search")
             .debug_selector(|| "server-search".into())
             .pt_2()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap_2()
+            .gap_x_2()
+            .gap_y_1()
             .text_size(px(12.))
             .text_color(rgb(c.muted));
+        let text = |t: String| div().flex_1().min_w(px(120.)).child(t);
+        let action = |link: Stateful<Div>| div().ml_auto().flex_shrink_0().child(link);
         Some(match self.current_server_search(&query) {
             Some(s) if s.running => line
                 .child(spinner(12., c.accent))
-                .child(format!("Searching {} on the server…", self.mailbox_label()))
+                .child(text(format!("Searching {} on the server…", self.mailbox_label())))
                 .into_any_element(),
             Some(s) if s.error.is_some() => line
                 .child(icon_el("warning", 13., c.danger))
@@ -395,7 +401,7 @@ impl MailApp {
                 .into_any_element(),
             Some(s) => line
                 .child(icon_el("cloud", 13., c.accent))
-                .child(div().flex_1().child(if s.total > s.ids.len() {
+                .child(text(if s.total > s.ids.len() {
                     format!(
                         "The newest {} of {} matches on the server",
                         fmt_count(s.ids.len()),
@@ -406,21 +412,17 @@ impl MailApp {
                 } else {
                     format!("{} matches on the server", fmt_count(s.total))
                 }))
-                .child(self.link(
+                .child(action(self.link(
                     "server-search-clear",
                     "Show Local Matches",
                     Action::ClearServerSearch,
                     cx,
-                ))
+                )))
                 .into_any_element(),
             None => line
                 .child(icon_el("cloud", 13., c.muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .child("Only mail on this computer is searched."),
-                )
-                .child(self.link(
+                .child(text("Only mail on this computer is searched.".to_owned()))
+                .child(action(self.link(
                     "server-search-start",
                     if gmail {
                         "Search Gmail · ↩"
@@ -429,7 +431,7 @@ impl MailApp {
                     },
                     Action::SearchServer,
                     cx,
-                ))
+                )))
                 .into_any_element(),
         })
     }
