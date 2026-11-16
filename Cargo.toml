@@ -79,7 +79,7 @@ rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
 # fallible_uint: sizes and counts bind as integers, failing rather than wrapping when too large.
-rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.42", features = ["bundled", "fallible_uint", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"

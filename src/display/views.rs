@@ -18,6 +18,16 @@ pub(super) struct Place {
     #[serde(default)]
     pub sender: Option<MailSubscription>,
 }
+/// What a message list was built from: the view, and the cache's and the
+/// layouts' revisions read before it was (`Backend::list_revision`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ListKey {
+    generation: u64,
+    mailbox: String,
+    accounts: Vec<String>,
+    revision: (u64, u64),
+}
+
 /// The preference holding the last `Place`.
 const PLACE_PREFERENCE: &str = "last_place";
 
@@ -288,21 +298,48 @@ impl MailApp {
     pub(super) fn list_job(
         &self,
         mailbox: Mailbox,
-    ) -> impl FnOnce(Arc<Backend>) -> anyhow::Result<(Vec<Mail>, Option<Layout>)> + Send + 'static
-    {
+    ) -> impl FnOnce(Arc<Backend>) -> anyhow::Result<(Vec<Mail>, Option<Layout>, ListKey)>
+           + Send
+           + 'static {
         let accounts = self.scope.accounts.clone();
+        let generation = self.load_generation;
+        let key = mailbox.key();
         move |b| {
+            // Read first: a change committed while listing makes the key
+            // stale, so the next check builds the list again.
+            let key = ListKey {
+                generation,
+                mailbox: key,
+                accounts: accounts.clone(),
+                revision: b.list_revision(),
+            };
             if let [id] = accounts.as_slice() {
-                return b.listed(id, &mailbox);
+                let (messages, layout) = b.listed(id, &mailbox)?;
+                return Ok((messages, layout, key));
             }
-            let mut all = Vec::new();
-            for id in &accounts {
-                let (messages, _) = b.listed(id, &mailbox)?;
+            let lists = accounts
+                .iter()
+                .map(|id| b.listed(id, &mailbox).map(|(messages, _)| messages))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            // Sized once: grown by doubling, tens of thousands of messages
+            // would leave up to half of it unused, for as long as it's shown.
+            let mut all = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+            for messages in lists {
                 all.extend(messages.into_iter().filter(|m| !m.pending));
             }
             all.sort_by(Mail::newest_first);
-            Ok((all, None))
+            Ok((all, None, key))
         }
+    }
+    /// Whether the listed messages are still what the cache holds for the
+    /// open view: same view, and nothing that lists show changed since.
+    pub(super) fn list_current(&self) -> bool {
+        self.listed.as_ref().is_some_and(|k| {
+            k.generation == self.load_generation
+                && k.mailbox == self.mailbox().key()
+                && k.accounts == self.scope.accounts
+                && k.revision == self.backend.list_revision()
+        })
     }
     /// Checks every mailbox the open view lists.
     pub(super) fn refresh_view(&mut self, cx: &mut Context<Self>) {

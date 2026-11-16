@@ -470,6 +470,7 @@ impl Backend {
                     .filter(|u| !uids.contains(u))
                     .collect(),
             );
+            self.layouts_changed();
         }
         if let Some(mut state) = self.store.mailbox_state(account, &s.folder)?
             && state.validity == selected.validity

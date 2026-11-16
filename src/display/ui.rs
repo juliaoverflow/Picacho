@@ -961,6 +961,8 @@ pub struct MailApp {
     /// for meanwhile (see `reload_cached`).
     reload_running: bool,
     reload_again: bool,
+    /// What the listed messages were built from; see `list_current`.
+    listed: Option<views::ListKey>,
     /// Unread messages among those loaded, counted when the list changes.
     loaded_unread: usize,
     /// Bumped whenever the listed messages change; keys `thread_cache`.
@@ -1642,6 +1644,7 @@ impl MailApp {
             counts_again: false,
             reload_running: false,
             reload_again: false,
+            listed: None,
             loaded_unread: 0,
             options_cache: Default::default(),
             list_revision: 0,
@@ -1909,8 +1912,10 @@ impl MailApp {
         if self.oldest_first {
             self.visible.reverse();
         }
-        let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
-        self.selection.retain(|id| present.contains(id));
+        if !self.selection.is_empty() {
+            let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
+            self.selection.retain(|id| present.contains(id));
+        }
         self.loaded_unread = self
             .messages
             .iter()
@@ -3032,7 +3037,11 @@ impl MailApp {
                         }
                     }
                     if visible {
-                        this.reload_cached(cx);
+                        // Most checks find nothing new: the list shown is
+                        // then still current, and isn't built again.
+                        if this.subs_open || !this.list_current() {
+                            this.reload_cached(cx);
+                        }
                         if !this.subs_open
                             && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
                         {
@@ -3113,9 +3122,10 @@ impl MailApp {
                     return;
                 }
                 this.cache_loading = false;
-                if let Ok((ms, layout)) = result {
+                if let Ok((ms, layout, key)) = result {
                     this.layout = layout;
                     this.set_messages(ms, cx);
+                    this.listed = Some(key);
                 }
                 this.refresh(cx);
             });
@@ -3152,10 +3162,11 @@ impl MailApp {
         self.list_task(cx, self.list_job(mailbox), move |this, result, cx| {
             this.reload_running = false;
             if generation == this.load_generation
-                && let Ok((messages, layout)) = result
+                && let Ok((messages, layout, key)) = result
             {
                 this.layout = layout;
                 this.set_messages(messages, cx);
+                this.listed = Some(key);
             }
             // Whatever changed meanwhile, in whichever view is open now.
             if std::mem::take(&mut this.reload_again) {

@@ -659,7 +659,7 @@ pub struct Mail {
     pub pending: bool,
     /// The parts its HTML shows in place (`cid:` images), found when the
     /// message is read. Never stored: the downloaded source holds them.
-    #[serde(skip)]
+    #[serde(skip, default = "InlineParts::none")]
     pub inline: std::sync::Arc<InlineParts>,
 }
 fn is_zero(v: &u64) -> bool {
@@ -676,6 +676,13 @@ pub struct InlineParts {
     parts: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
 }
 impl InlineParts {
+    /// No parts, shared: every message read from the cache starts with
+    /// these, and a list holds tens of thousands of messages.
+    pub fn none() -> std::sync::Arc<Self> {
+        static NONE: std::sync::LazyLock<std::sync::Arc<InlineParts>> =
+            std::sync::LazyLock::new(Default::default);
+        NONE.clone()
+    }
     /// Whether `html` shows parts of its message (`cid:` images).
     pub fn wanted_by(html: &str) -> bool {
         html.as_bytes()
