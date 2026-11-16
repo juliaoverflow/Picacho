@@ -4237,7 +4237,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/pinaltech/Picacho-Patches?branch=vendor-split-dev#201a585f8df3768397cc9a8090d837bdd7c25561"
+source = "git+https://github.com/pinaltech/Picacho-Patches?branch=vendor-split-dev#b319369c672e197be8fb3fc8cb6de8440f3aa9e1"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",

@@ -26,6 +26,21 @@ pub(super) fn conversation_subject(subject: &str) -> String {
     s.to_lowercase()
 }
 
+/// Whether `subject` can have `key` as its `conversation_subject`, decided
+/// without allocating: that is a suffix of the trimmed subject, which for
+/// ASCII text must end in `key` (in any case). Run over every listed
+/// message when a conversation is gathered, this rules most out at once.
+/// Other text is left to `conversation_subject`, as lowercasing can change
+/// its length.
+pub(super) fn may_be_conversation(subject: &str, key: &str) -> bool {
+    let subject = subject.trim();
+    if !(subject.is_ascii() && key.is_ascii()) {
+        return true;
+    }
+    subject.len() >= key.len()
+        && subject.as_bytes()[subject.len() - key.len()..].eq_ignore_ascii_case(key.as_bytes())
+}
+
 /// Splits a plain-text reply into what was written now and the quoted
 /// history below it, when there is one worth hiding.
 pub(super) fn split_quoted(body: &str) -> (&str, Option<&str>) {
@@ -125,6 +140,26 @@ mod tests {
         assert_eq!(conversation_subject("AW: Plans"), "plans");
         assert_eq!(conversation_subject("Re[2]: Plans"), "plans");
         assert_eq!(conversation_subject("Reading list"), "reading list");
+    }
+
+    /// The quick check never rules out a subject that matches.
+    #[test]
+    fn the_quick_subject_check_keeps_every_match() {
+        let subjects = [
+            "Plans", "Re: Plans", "  RE:  fwd: PLANS  ", "Re[2]: Plans", "Re (3): plans",
+            "AW: Plans", "Réf: Plans", "Re: Café plans", "Re: CAFÉ PLANS", "Plans B",
+            "Other plans", "Re: ", "", "Re: İstanbul", "Re: KK plans",
+        ];
+        for subject in subjects {
+            for other in subjects {
+                let key = conversation_subject(other);
+                if conversation_subject(subject) == key {
+                    assert!(may_be_conversation(subject, &key), "{subject:?} / {key:?}");
+                }
+            }
+        }
+        assert!(!may_be_conversation("Re: Lunch", "plans"));
+        assert!(!may_be_conversation("Plans B", "plans"));
     }
 
     #[test]

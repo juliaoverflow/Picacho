@@ -963,6 +963,12 @@ pub struct MailApp {
     /// A count refresh is running, and another was asked for meanwhile.
     counts_running: bool,
     counts_again: bool,
+    /// A reload of the listed messages is running, and another was asked
+    /// for meanwhile (see `reload_cached`).
+    reload_running: bool,
+    reload_again: bool,
+    /// What the listed messages were built from; see `list_current`.
+    listed: Option<views::ListKey>,
     /// Unread messages among those loaded, counted when the list changes.
     loaded_unread: usize,
     /// Bumped whenever the listed messages change; keys `thread_cache`.
@@ -1651,6 +1657,9 @@ impl MailApp {
             menu_anim: 0,
             counts_running: false,
             counts_again: false,
+            reload_running: false,
+            reload_again: false,
+            listed: None,
             loaded_unread: 0,
             options_cache: Default::default(),
             list_revision: 0,
@@ -1923,8 +1932,10 @@ impl MailApp {
         if self.oldest_first {
             self.visible.reverse();
         }
-        let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
-        self.selection.retain(|id| present.contains(id));
+        if !self.selection.is_empty() {
+            let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
+            self.selection.retain(|id| present.contains(id));
+        }
         self.loaded_unread = self
             .messages
             .iter()
@@ -2899,6 +2910,44 @@ impl MailApp {
         })
         .detach();
     }
+    /// Like `task`, for jobs that build a message list: they run one at a
+    /// time on a thread of their own (see `views::on_list_thread`).
+    fn list_task<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(Arc<Backend>) -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, anyhow::Result<T>, &mut Context<Self>) + 'static,
+    ) {
+        // Tests run jobs on GPUI's executor, which they wait for when parked.
+        #[cfg(test)]
+        return self.task(cx, job, done);
+        #[cfg(not(test))]
+        self.list_task_on_thread(cx, job, done);
+    }
+    #[cfg(not(test))]
+    fn list_task_on_thread<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(Arc<Backend>) -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, anyhow::Result<T>, &mut Context<Self>) + 'static,
+    ) {
+        self.busy += 1;
+        let backend = self.backend.clone();
+        let result = views::on_list_thread(move || job(backend));
+        cx.spawn(async move |this, cx| {
+            let result = result.await.unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "Something went wrong while doing this. Please try again."
+                ))
+            });
+            let _ = this.update(cx, |this, cx| {
+                this.busy = this.busy.saturating_sub(1);
+                done(this, result, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     fn apply_theme(&self, w: &mut Window, cx: &mut App) {
         prompt::set_colors(self.colors());
         Theme::change(
@@ -3008,7 +3057,11 @@ impl MailApp {
                         }
                     }
                     if visible {
-                        this.reload_cached(cx);
+                        // Most checks find nothing new: the list shown is
+                        // then still current, and isn't built again.
+                        if this.subs_open || !this.list_current() {
+                            this.reload_cached(cx);
+                        }
                         if !this.subs_open
                             && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
                         {
@@ -3084,14 +3137,15 @@ impl MailApp {
         } else {
             let gen_ = self.load_generation;
             self.cache_loading = true;
-            self.task(cx, self.list_job(mailbox), move |this, result, cx| {
+            self.list_task(cx, self.list_job(mailbox), move |this, result, cx| {
                 if gen_ != this.load_generation {
                     return;
                 }
                 this.cache_loading = false;
-                if let Ok((ms, layout)) = result {
+                if let Ok((ms, layout, key)) = result {
                     this.layout = layout;
                     this.set_messages(ms, cx);
+                    this.listed = Some(key);
                 }
                 this.refresh(cx);
             });
@@ -3103,6 +3157,12 @@ impl MailApp {
     }
     /// Reload confirmed cache state after a failed or partly applied operation.
     /// A generation check prevents an old request from replacing a newer view.
+    ///
+    /// Requests made while one runs are coalesced into a single follow-up:
+    /// in All Accounts, every account's sync finishing asks for a reload,
+    /// and each one lists every account's mailbox (tens of thousands of
+    /// messages, tens of megabytes). Run side by side, they held several
+    /// such lists at once, and the allocator kept that memory for good.
     fn reload_cached(&mut self, cx: &mut Context<Self>) {
         if self.subs_open {
             // Subscriptions list their own mail, not the mailbox under them.
@@ -3112,14 +3172,25 @@ impl MailApp {
         if self.account.is_none() {
             return;
         }
+        if self.reload_running {
+            self.reload_again = true;
+            return;
+        }
+        self.reload_running = true;
         let mailbox = self.mailbox();
         let generation = self.load_generation;
-        self.task(cx, self.list_job(mailbox), move |this, result, cx| {
+        self.list_task(cx, self.list_job(mailbox), move |this, result, cx| {
+            this.reload_running = false;
             if generation == this.load_generation
-                && let Ok((messages, layout)) = result
+                && let Ok((messages, layout, key)) = result
             {
                 this.layout = layout;
                 this.set_messages(messages, cx);
+                this.listed = Some(key);
+            }
+            // Whatever changed meanwhile, in whichever view is open now.
+            if std::mem::take(&mut this.reload_again) {
+                this.reload_cached(cx);
             }
         });
     }
@@ -8466,6 +8537,8 @@ impl Render for MailApp {
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = self.root(window, cx);
+        // The email's images, once the reader no longer paints it.
+        self.html_view.update(cx, |view, _| view.release(window));
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
             self.spin_scheduled = true;
             cx.spawn(async move |this, cx| {

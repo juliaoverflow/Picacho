@@ -13,8 +13,43 @@ use std::{
     time::Duration,
 };
 
-/// The height of one cached raster strip, in CSS pixels.
-pub const BAND: f32 = 512.;
+/// The side, in device pixels, of the textures GPUI's image atlas makes.
+///
+/// GPUI's atlas never reuses the space of an image dropped from a texture;
+/// it frees a texture only once every image in it is gone. Strips and
+/// thumbnails sharing a texture with images kept for good (avatars, emoji)
+/// would leave it growing by their size with every email opened. So every
+/// image here is at least this big both ways: it gets a texture of its own,
+/// which it fills, and dropping it frees the texture.
+pub const TILE: u32 = 1024;
+
+/// The height of one cached raster strip, in CSS pixels: one texture tall.
+pub fn band_height(scale: f32) -> f32 {
+    TILE as f32 / scale
+}
+
+/// An image side in device pixels as uploaded: at least a texture's side,
+/// and rounded up so that sizes repeat and GPUI's upload buffers are reused
+/// rather than one kept for each new size.
+pub fn padded(side: u32) -> u32 {
+    side.max(TILE).next_multiple_of(256)
+}
+
+/// `pixels` (BGRA, `width` by `height`) at the top left of a transparent
+/// image of the padded size.
+fn pad(width: u32, height: u32, pixels: Vec<u8>) -> ((u32, u32), Vec<u8>) {
+    let size = (padded(width), padded(height));
+    if size == (width, height) {
+        return (size, pixels);
+    }
+    let row = width as usize * 4;
+    let stride = size.0 as usize * 4;
+    let mut out = vec![0; stride * size.1 as usize];
+    for (y, line) in pixels.chunks_exact(row).take(height as usize).enumerate() {
+        out[y * stride..y * stride + row].copy_from_slice(line);
+    }
+    (size, out)
+}
 
 pub enum Command {
     /// Lay the document out for this many CSS pixels of width.
@@ -60,7 +95,7 @@ pub enum Output {
         revision: u64,
         width: u32,
         scale: f32,
-        /// Device pixels.
+        /// Device pixels, padded (see `TILE`).
         size: (u32, u32),
         pixels: Vec<u8>,
     },
@@ -69,8 +104,9 @@ pub enum Output {
     Failed,
     Thumbnail {
         revision: u64,
-        /// Device pixels.
+        /// Device pixels, padded (see `TILE`), and those the email fills.
         size: (u32, u32),
+        content: (u32, u32),
         pixels: Vec<u8>,
     },
 }
@@ -221,9 +257,11 @@ fn run(
                 .ceil()
                 .clamp(1., 8192.) as u32;
             let pixels = doc.pixels_at(pw, ph, factor * scale, left, 0.);
+            let (size, pixels) = pad(pw, ph, pixels);
             if !send(Output::Thumbnail {
                 revision,
-                size: (pw, ph),
+                size,
+                content: (pw, ph),
                 pixels,
             }) {
                 return;
@@ -234,21 +272,21 @@ fn run(
             if w != width || width == 0 {
                 continue;
             }
-            let top = band as f32 * BAND;
+            let top = band as f32 * band_height(scale);
             if top >= height {
                 continue;
             }
-            let rows = (height - top).min(BAND);
+            let rows = (height - top).min(band_height(scale));
             let pw = (width as f32 * scale).ceil().clamp(1., 8192.) as u32;
-            let ph = (rows * scale).ceil().clamp(1., 8192.) as u32;
-            let offset = (top * scale).round() as u32;
-            let pixels = doc.pixels(pw, ph, scale, offset);
+            let ph = ((rows * scale).ceil() as u32).clamp(1, TILE);
+            let pixels = doc.pixels(pw, ph, scale, band * TILE);
+            let (size, pixels) = pad(pw, ph, pixels);
             if !send(Output::Tile {
                 band,
                 revision,
                 width,
                 scale,
-                size: (pw, ph),
+                size,
                 pixels,
             }) {
                 return;

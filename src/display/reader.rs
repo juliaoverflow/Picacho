@@ -1533,6 +1533,7 @@ impl MailApp {
                     || linked(x, m)
                     || linked(m, x)
                     || (key.chars().count() > 2
+                        && super::thread::may_be_conversation(&x.subject, &key)
                         && super::thread::conversation_subject(&x.subject) == key
                         && (replyish(x, &key) || replyish(m, &key)))
             })

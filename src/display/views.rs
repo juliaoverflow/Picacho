@@ -18,8 +18,55 @@ pub(super) struct Place {
     #[serde(default)]
     pub sender: Option<MailSubscription>,
 }
+/// What a message list was built from: the view, and the cache's and the
+/// layouts' revisions read before it was (`Backend::list_revision`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ListKey {
+    generation: u64,
+    mailbox: String,
+    accounts: Vec<String>,
+    revision: (u64, u64),
+}
+
 /// The preference holding the last `Place`.
 const PLACE_PREFERENCE: &str = "last_place";
+
+/// Runs `job` on the one thread that builds message lists, after the
+/// lists asked for before it. The result arrives on the returned channel;
+/// it is cancelled if `job` panics.
+///
+/// A list of All Accounts is tens of megabytes of small allocations. Built
+/// on whichever background thread was free, each list grew that thread's
+/// heap arena to hold it, and glibc kept every arena at its largest: memory
+/// climbed with each reload to many times one list. Built on one thread,
+/// each list reuses the memory of the one before.
+pub(super) fn on_list_thread<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> futures::channel::oneshot::Receiver<T> {
+    type Job = Box<dyn FnOnce() + Send>;
+    static LISTS: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let job: Job = Box::new(move || {
+        let _ = tx.send(job());
+    });
+    let lists = LISTS.get_or_init(|| {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        let _ = std::thread::Builder::new()
+            .name("picacho-lists".into())
+            .spawn(move || {
+                for job in queue {
+                    // A panic drops the job's sender, which reports it; the
+                    // thread carries on with the next list.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            });
+        std::sync::Mutex::new(jobs)
+    });
+    // Should the thread be gone, the job is dropped and reported as failed.
+    let _ = lists.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    rx
+}
 
 /// How mail of a mailbox kept to its aliases is shown: its own address
 /// (and, on mail it sent, its name) in place of which the alias used is.
@@ -251,21 +298,48 @@ impl MailApp {
     pub(super) fn list_job(
         &self,
         mailbox: Mailbox,
-    ) -> impl FnOnce(Arc<Backend>) -> anyhow::Result<(Vec<Mail>, Option<Layout>)> + Send + 'static
-    {
+    ) -> impl FnOnce(Arc<Backend>) -> anyhow::Result<(Vec<Mail>, Option<Layout>, ListKey)>
+           + Send
+           + 'static {
         let accounts = self.scope.accounts.clone();
+        let generation = self.load_generation;
+        let key = mailbox.key();
         move |b| {
+            // Read first: a change committed while listing makes the key
+            // stale, so the next check builds the list again.
+            let key = ListKey {
+                generation,
+                mailbox: key,
+                accounts: accounts.clone(),
+                revision: b.list_revision(),
+            };
             if let [id] = accounts.as_slice() {
-                return b.listed(id, &mailbox);
+                let (messages, layout) = b.listed(id, &mailbox)?;
+                return Ok((messages, layout, key));
             }
-            let mut all = Vec::new();
-            for id in &accounts {
-                let (messages, _) = b.listed(id, &mailbox)?;
+            let lists = accounts
+                .iter()
+                .map(|id| b.listed(id, &mailbox).map(|(messages, _)| messages))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            // Sized once: grown by doubling, tens of thousands of messages
+            // would leave up to half of it unused, for as long as it's shown.
+            let mut all = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+            for messages in lists {
                 all.extend(messages.into_iter().filter(|m| !m.pending));
             }
             all.sort_by(Mail::newest_first);
-            Ok((all, None))
+            Ok((all, None, key))
         }
+    }
+    /// Whether the listed messages are still what the cache holds for the
+    /// open view: same view, and nothing that lists show changed since.
+    pub(super) fn list_current(&self) -> bool {
+        self.listed.as_ref().is_some_and(|k| {
+            k.generation == self.load_generation
+                && k.mailbox == self.mailbox().key()
+                && k.accounts == self.scope.accounts
+                && k.revision == self.backend.list_revision()
+        })
     }
     /// Checks every mailbox the open view lists.
     pub(super) fn refresh_view(&mut self, cx: &mut Context<Self>) {
@@ -1228,6 +1302,31 @@ mod tests {
     use super::*;
     use crate::manage::forwarding::Alias;
     use std::prelude::v1::test;
+
+    /// Lists are built one after another, in order, and one failing does
+    /// not stop the next.
+    #[test]
+    fn list_jobs_run_in_turn_and_survive_a_panic() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs: Vec<_> = (0..5)
+            .map(|i| {
+                let order = order.clone();
+                on_list_thread(move || {
+                    if i == 2 {
+                        panic!("a list failed");
+                    }
+                    order.lock().unwrap().push(i);
+                    i
+                })
+            })
+            .collect();
+        let results: Vec<_> = jobs
+            .into_iter()
+            .map(|rx| futures::executor::block_on(rx).ok())
+            .collect();
+        assert_eq!(results, [Some(0), Some(1), None, Some(3), Some(4)]);
+        assert_eq!(*order.lock().unwrap(), [0, 1, 3, 4]);
+    }
 
     /// Two mailboxes; two of Work's messages were sent to a SimpleLogin alias
     /// shown as an account of its own.

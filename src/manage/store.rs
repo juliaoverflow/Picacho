@@ -24,6 +24,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 /// the cache.
 pub struct Store {
     db: Mutex<Connection>,
+    /// Set by the writer's triggers when a write changes what message lists
+    /// show; turned into a new `list_revision` once the write is committed.
+    list_dirty: Arc<std::sync::atomic::AtomicBool>,
+    list_revision: std::sync::atomic::AtomicU64,
     readers: Vec<Mutex<Connection>>,
     next_reader: std::sync::atomic::AtomicUsize,
     prefs: Arc<PrefQueue>,
@@ -63,6 +67,34 @@ impl PrefState {
     }
 }
 
+/// The held writing connection. Dropped, after whatever it wrote was
+/// committed (or rolled back) and before the connection is free again, it
+/// publishes a list-changing write as a new `Store::list_revision`.
+struct Writer<'a> {
+    db: MutexGuard<'a, Connection>,
+    store: &'a Store,
+}
+impl std::ops::Deref for Writer<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.db
+    }
+}
+impl std::ops::DerefMut for Writer<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.db
+    }
+}
+impl Drop for Writer<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // A rolled-back write counts too: an extra rebuild, never a stale list.
+        if self.store.list_dirty.swap(false, Ordering::AcqRel) {
+            self.store.list_revision.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 fn connect(file: &Path) -> Result<Connection> {
     let db = Connection::open(file)?;
     db.busy_timeout(BUSY_TIMEOUT)?;
@@ -90,6 +122,26 @@ impl Store {
         // when a transaction begins means one that reads first can't find
         // the database changed under it when it comes to write.
         db.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
+        // Every write that changes the rows lists are built from marks the
+        // cache changed; a write that changes nothing (a sync with no news)
+        // leaves the lists as they are, so they need not be built again.
+        // Only this connection writes messages; temporary triggers are its own.
+        let list_dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dirty = list_dirty.clone();
+        db.create_scalar_function(
+            "picacho_list_changed",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                dirty.store(true, std::sync::atomic::Ordering::Release);
+                Ok(0i64)
+            },
+        )?;
+        db.execute_batch(
+            "CREATE TEMP TRIGGER list_inserted AFTER INSERT ON main.messages BEGIN SELECT picacho_list_changed(); END;
+             CREATE TEMP TRIGGER list_deleted AFTER DELETE ON main.messages BEGIN SELECT picacho_list_changed(); END;
+             CREATE TEMP TRIGGER list_updated AFTER UPDATE OF folder, date, data ON main.messages BEGIN SELECT picacho_list_changed(); END;",
+        )?;
         let readers = (0..READERS)
             .map(|_| {
                 let r = connect(&file)?;
@@ -106,6 +158,8 @@ impl Store {
             .spawn(move || write_preferences(writer, &queue, rx))?;
         Ok(Self {
             db: Mutex::new(db),
+            list_dirty,
+            list_revision: Default::default(),
             readers,
             next_reader: Default::default(),
             prefs,
@@ -113,6 +167,20 @@ impl Store {
             pref_thread: Mutex::new(Some(thread)),
             path: path.into(),
         })
+    }
+    /// The writing connection, held until the returned guard is dropped.
+    fn write(&self) -> Writer<'_> {
+        Writer {
+            db: self.db.lock().unwrap(),
+            store: self,
+        }
+    }
+    /// Changes whenever a committed write changes what message lists show
+    /// (messages added, removed, or their data, folder or date changed).
+    /// Read it before reading a list: an unchanged revision later means the
+    /// list read is still current. Writes that change nothing keep it.
+    pub fn list_revision(&self) -> u64 {
+        self.list_revision.load(std::sync::atomic::Ordering::Acquire)
     }
     /// A connection for reading: a free one if any, otherwise the next in turn.
     fn read(&self) -> MutexGuard<'_, Connection> {
@@ -154,7 +222,7 @@ impl Store {
         // OAuth client secrets are credentials, just like refresh tokens.
         let mut safe = a.clone();
         safe.client_secret.clear();
-        self.db.lock().unwrap().execute(
+        self.write().execute(
             "INSERT OR REPLACE INTO accounts VALUES (?1,?2)",
             params![a.id, serde_json::to_string(&safe)?],
         )?;
@@ -162,7 +230,7 @@ impl Store {
     }
     pub fn remove_account(&self, id: &str) -> Result<()> {
         self.flush();
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         tx.execute(
             "DELETE FROM preferences WHERE key=?1",
@@ -226,24 +294,34 @@ impl Store {
         } else {
             "data"
         };
-        // All Mail is everything but drafts; Starred, the starred mail.
-        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND (folder=?2 OR (?2='starred' AND json_extract(data,'$.starred')) OR (?2='all' AND folder<>'drafts')) ORDER BY date DESC, id DESC LIMIT ?3"))?;
-        let rows = q.query_map(
-            params![
-                account,
-                mailbox.key(),
-                if folder.is_virtual() {
-                    usize::MAX >> 1
-                } else {
-                    limit
-                }
-            ],
-            |r| r.get::<_, String>(0),
-        )?;
+        // All Mail is everything but drafts; Starred, the starred mail. An
+        // ordinary mailbox is asked for alone, so that SQLite reads it from
+        // the (account, folder, date) index rather than scanning and
+        // sorting every message of the account.
+        let which = match folder {
+            Folder::Starred => "(folder=?2 OR json_extract(data,'$.starred'))",
+            Folder::All => "(folder=?2 OR folder<>'drafts')",
+            _ => "folder=?2",
+        };
+        let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND {which} ORDER BY date DESC, id DESC LIMIT ?3"))?;
+        let mut rows = q.query(params![
+            account,
+            mailbox.key(),
+            if folder.is_virtual() {
+                usize::MAX >> 1
+            } else {
+                limit
+            }
+        ])?;
         let mut result = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for row in rows {
-            let mail: Mail = serde_json::from_str(&row?)?;
+        while let Some(row) = rows.next()? {
+            // Parsed where SQLite holds the text, without copying it first.
+            let mut mail: Mail = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+            if summaries {
+                mail.body = None;
+                mail.html = None;
+            }
             if folder != Folder::Starred || mail.starred {
                 // A message in several mailboxes (Gmail's labels) is listed once.
                 if folder.is_virtual()
@@ -262,7 +340,7 @@ impl Store {
         Ok(result)
     }
     pub fn save_messages(&self, messages: &[Mail]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         write_messages(&tx, messages)?;
         tx.commit()?;
@@ -274,7 +352,7 @@ impl Store {
     /// deleted meanwhile), in which case nothing is saved.
     pub fn refresh_message(&self, read: &Mail) -> Result<Option<Mail>> {
         use rusqlite::OptionalExtension;
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         let current: Option<String> = tx
             .query_row("SELECT data FROM messages WHERE id=?1", [&read.id], |r| r.get(0))
@@ -298,7 +376,7 @@ impl Store {
     /// Commit a completed download and its stable identity together. A failed
     /// write must never leave POP3 thinking a missing body was downloaded.
     pub fn save_download(&self, mail: &Mail, raw: &[u8]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         write_messages(&tx, std::slice::from_ref(mail))?;
         tx.execute(
@@ -332,7 +410,7 @@ impl Store {
                 && keep.contains(&m.id)),
             "Invalid mailbox snapshot"
         );
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         // Invalidate old generations across standard and custom-folder views,
         // including snapshots obtained through the virtual Starred mailbox.
@@ -505,7 +583,7 @@ impl Store {
             if updates.is_empty() {
                 continue;
             }
-            let mut db = self.db.lock().unwrap();
+            let mut db = self.write();
             let tx = db.transaction()?;
             for (id, body, snippet) in &updates {
                 match body {
@@ -577,7 +655,7 @@ impl Store {
             if found.is_empty() {
                 continue;
             }
-            let mut db = self.db.lock().unwrap();
+            let mut db = self.write();
             let tx = db.transaction()?;
             for (id, header, one_click) in &found {
                 tx.execute(
@@ -607,7 +685,7 @@ impl Store {
         ids: &[String],
     ) -> Result<()> {
         let key = mailbox.into().key();
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         let old: Vec<String> = {
             let mut q = tx.prepare("SELECT id FROM messages WHERE account=?1 AND folder=?2")?;
@@ -641,7 +719,7 @@ impl Store {
     /// One accepted remote command is one local transaction. Earlier confirmed
     /// groups remain committed if a later mailbox rejects a bulk operation.
     pub fn commit_changes(&self, messages: &[Mail], delete: bool) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         if delete {
             for mail in messages {
@@ -705,7 +783,7 @@ impl Store {
         // Two passes over the account rather than a correlated subquery: that
         // re-read every message's JSON once per missing copy, which held the
         // database for seconds on a few thousand messages and stalled the UI.
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         let mut downloaded: HashMap<i64, String> = HashMap::new();
         let mut missing: Vec<(String, i64)> = Vec::new();
@@ -781,7 +859,7 @@ impl Store {
         remote: &str,
         state: Option<&MailboxState>,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.write();
         match state {
             Some(state) => db.execute(
                 "INSERT OR REPLACE INTO mailbox_state VALUES (?1,?2,?3)",
@@ -814,7 +892,7 @@ impl Store {
                 .all(|m| m.account == account && m.id.starts_with(prefix)),
             "Invalid mailbox update"
         );
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         write_messages(&tx, fresh)?;
         for FlagUpdate {
@@ -869,7 +947,7 @@ impl Store {
     }
     /// Sets the server's conversation ids on cached messages (IMAP THREAD).
     pub fn set_thread_ids(&self, ids: &[(String, String)]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         for (id, thread) in ids {
             let data: Option<String> = {
@@ -890,7 +968,7 @@ impl Store {
     }
     /// Deletes cached messages by id (removed on the server).
     pub fn delete_ids(&self, account: &str, ids: &[String]) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         for id in ids {
             tx.execute(
@@ -950,7 +1028,7 @@ impl Store {
     }
     /// Forgets a deleted server folder: its cached mail and sync state.
     pub fn forget_mailbox(&self, account: &str, remote: &str) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.write();
         let tx = db.transaction()?;
         tx.execute(
             "DELETE FROM messages WHERE account=?1 AND json_extract(data,'$.remote_folder')=?2",
@@ -970,7 +1048,7 @@ impl Store {
         )
     }
     pub fn save_draft(&self, d: &Draft) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        self.write().execute(
             "INSERT OR REPLACE INTO drafts VALUES (?1,?2,?3)",
             params![d.id, d.account, serde_json::to_string(d)?],
         )?;
@@ -1030,7 +1108,7 @@ impl Store {
     /// Writes a preference now, after any set to be written soon.
     pub fn set_preference(&self, key: &str, value: &str) -> Result<()> {
         self.flush();
-        self.db.lock().unwrap().execute(
+        self.write().execute(
             "INSERT OR REPLACE INTO preferences VALUES (?1,?2)",
             params![key, value],
         )?;
@@ -1395,7 +1473,7 @@ pub struct MailboxSnapshot<'a> {
 }
 fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<()> {
     for m in messages {
-        tx.execute("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data",params![m.id,m.account,m.mailbox().key(),m.date,serde_json::to_string(m)?])?;
+        tx.execute("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data WHERE folder IS NOT excluded.folder OR date IS NOT excluded.date OR data IS NOT excluded.data",params![m.id,m.account,m.mailbox().key(),m.date,serde_json::to_string(m)?])?;
     }
     Ok(())
 }
@@ -1404,6 +1482,42 @@ fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<(
 mod snapshot_tests {
     use super::*;
     use crate::sync::transport::parse_message;
+
+    /// Lists are rebuilt only when what they show changed: saving mail as
+    /// it already is (a check with no news) keeps the revision; new mail,
+    /// a changed flag, a removal or a rolled-back write moves it on.
+    /// Writes elsewhere (raw sources, preferences) don't.
+    #[test]
+    fn list_revision_follows_changes_to_listed_mail() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-revision-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&path)?;
+        let a = Account::new(Provider::Imap);
+        let id = format!("{}:INBOX:1:7", a.id);
+        let mail = parse_message(b"Subject: Hi\r\n\r\nBody", &a, &id, Folder::Inbox, "INBOX", 7)?;
+        let start = store.list_revision();
+        store.save_messages(std::slice::from_ref(&mail))?;
+        let saved = store.list_revision();
+        assert!(saved > start, "new mail");
+        store.save_messages(std::slice::from_ref(&mail))?;
+        assert_eq!(store.list_revision(), saved, "the same mail again");
+        store.save_raw(&id, b"Subject: Hi\r\n\r\nBody")?;
+        store.set_preference("x", "y")?;
+        assert_eq!(store.list_revision(), saved, "not what lists show");
+        let read = Mail { unread: !mail.unread, ..mail.clone() };
+        store.save_messages(std::slice::from_ref(&read))?;
+        let flagged = store.list_revision();
+        assert!(flagged > saved, "a changed flag");
+        assert_eq!(store.summaries(&a.id, Folder::Inbox)?[0].unread, read.unread);
+        store.delete_ids(&a.id, std::slice::from_ref(&id))?;
+        let deleted = store.list_revision();
+        assert!(deleted > flagged, "a removal");
+        // A failed write may have changed rows before it rolled back.
+        store.write().execute_batch("CREATE TRIGGER fail_insert AFTER INSERT ON messages BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;
+        assert!(store.save_messages(std::slice::from_ref(&mail)).is_err());
+        assert!(store.list_revision() > deleted, "a rolled-back write");
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
 
     #[test]
     fn failed_snapshot_transaction_restores_removed_messages_and_raw_data() -> Result<()> {
