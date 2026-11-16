@@ -21,6 +21,43 @@ pub(super) struct Place {
 /// The preference holding the last `Place`.
 const PLACE_PREFERENCE: &str = "last_place";
 
+/// Runs `job` on the one thread that builds message lists, after the
+/// lists asked for before it. The result arrives on the returned channel;
+/// it is cancelled if `job` panics.
+///
+/// A list of All Accounts is tens of megabytes of small allocations. Built
+/// on whichever background thread was free, each list grew that thread's
+/// heap arena to hold it, and glibc kept every arena at its largest: memory
+/// climbed with each reload to many times one list. Built on one thread,
+/// each list reuses the memory of the one before.
+pub(super) fn on_list_thread<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> futures::channel::oneshot::Receiver<T> {
+    type Job = Box<dyn FnOnce() + Send>;
+    static LISTS: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let job: Job = Box::new(move || {
+        let _ = tx.send(job());
+    });
+    let lists = LISTS.get_or_init(|| {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        let _ = std::thread::Builder::new()
+            .name("picacho-lists".into())
+            .spawn(move || {
+                for job in queue {
+                    // A panic drops the job's sender, which reports it; the
+                    // thread carries on with the next list.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            });
+        std::sync::Mutex::new(jobs)
+    });
+    // Should the thread be gone, the job is dropped and reported as failed.
+    let _ = lists.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    rx
+}
+
 /// How mail of a mailbox kept to its aliases is shown: its own address
 /// (and, on mail it sent, its name) in place of which the alias used is.
 pub(super) struct Mask {
@@ -1228,6 +1265,31 @@ mod tests {
     use super::*;
     use crate::manage::forwarding::Alias;
     use std::prelude::v1::test;
+
+    /// Lists are built one after another, in order, and one failing does
+    /// not stop the next.
+    #[test]
+    fn list_jobs_run_in_turn_and_survive_a_panic() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs: Vec<_> = (0..5)
+            .map(|i| {
+                let order = order.clone();
+                on_list_thread(move || {
+                    if i == 2 {
+                        panic!("a list failed");
+                    }
+                    order.lock().unwrap().push(i);
+                    i
+                })
+            })
+            .collect();
+        let results: Vec<_> = jobs
+            .into_iter()
+            .map(|rx| futures::executor::block_on(rx).ok())
+            .collect();
+        assert_eq!(results, [Some(0), Some(1), None, Some(3), Some(4)]);
+        assert_eq!(*order.lock().unwrap(), [0, 1, 3, 4]);
+    }
 
     /// Two mailboxes; two of Work's messages were sent to a SimpleLogin alias
     /// shown as an account of its own.
