@@ -39,6 +39,9 @@ pub(super) struct DateTimePicker {
     /// Where a time is typed, and what reads it (None while the feature is
     /// off).
     typing: Option<Typing>,
+    /// Laid out for a phone: one column, finger-sized controls, and the
+    /// typed field left unfocused until tapped (it raises the keyboard).
+    phone: bool,
 }
 impl EventEmitter<PickerEvent> for DateTimePicker {}
 
@@ -72,7 +75,19 @@ impl DateTimePicker {
             key,
             error: None,
             typing: None,
+            phone: false,
         }
+    }
+    /// Lays the picker out for a phone. Call before `typed`.
+    pub(super) fn phone(mut self, on: bool) -> Self {
+        self.phone = on;
+        self
+    }
+    /// The typed field's focus, for the phone's keyboard.
+    pub(super) fn typed_focus(&self, cx: &App) -> Option<FocusHandle> {
+        self.typing
+            .as_ref()
+            .map(|t| t.input.read(cx).focus_handle(cx))
     }
     /// Adds the field a time can be typed into, read by `parser`.
     pub(super) fn typed(
@@ -87,18 +102,26 @@ impl DateTimePicker {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Type a time: tmrw at 6, next fri 9am, in 2 hrs…")
+                .input_action(TextInputAction::Done)
         });
-        // Ready to type into as soon as the picker opens.
-        input.update(cx, |s, cx| s.focus(window, cx));
-        let subscription = cx.subscribe_in(&input, window, |this, input, e, _, cx| match e {
+        // Ready to type into as soon as the picker opens; on a phone that
+        // would cover the picker with the keyboard, so it waits for a tap.
+        if !self.phone {
+            input.update(cx, |s, cx| s.focus(window, cx));
+        }
+        let subscription = cx.subscribe_in(&input, window, |this, input, e, w, cx| match e {
             InputEvent::Change => {
                 let text = input.read(cx).value().to_string();
                 this.read_typed(&text, cx);
             }
-            InputEvent::PressEnter { .. }
-                if this.typing.as_ref().is_some_and(|t| t.read.is_some()) =>
-            {
-                this.confirm(cx)
+            InputEvent::PressEnter { .. } => {
+                if this.typing.as_ref().is_some_and(|t| t.read.is_some()) {
+                    this.confirm(cx)
+                }
+                // A phone's Done key lets go of the keyboard, read or not.
+                if this.phone {
+                    w.blur(cx);
+                }
             }
             _ => {}
         });
@@ -253,16 +276,24 @@ impl DateTimePicker {
         div()
             .id(SharedString::from(id))
             .debug_selector(move || selector.clone())
-            .h(px(26.))
-            .min_w(px(26.))
+            .h(px(if self.phone {
+                super::mobile::TOUCH
+            } else {
+                26.
+            }))
+            .min_w(px(if self.phone {
+                super::mobile::TOUCH
+            } else {
+                26.
+            }))
             .px_2()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.))
+            .rounded(px(if self.phone { 10. } else { 6. }))
             .border_1()
             .border_color(rgb(c.border))
-            .text_size(px(12.))
+            .text_size(px(if self.phone { 15. } else { 12. }))
             .cursor_pointer()
             .hover(move |s| s.bg(rgb(c.soft)))
             .child(label.into())
@@ -278,25 +309,25 @@ impl DateTimePicker {
             .checked_sub_days(Days::new(lead))
             .unwrap_or(self.month);
         let can_go_back = self.month > today.with_day(1).unwrap_or(today);
+        let phone = self.phone;
         let mut grid = div().flex().flex_col().gap(px(2.));
-        grid = grid.child(
-            div()
-                .flex()
-                .children(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(|d| {
-                    div()
-                        .w(px(34.))
-                        .h(px(22.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(10.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(c.muted))
-                        .child(d)
-                })),
-        );
+        grid = grid.child(div().flex().when(phone, |d| d.w_full()).children(
+            ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(|d| {
+                div()
+                    .when(!phone, |d| d.w(px(34.)))
+                    .when(phone, |d| d.flex_1())
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(c.muted))
+                    .child(d)
+            }),
+        ));
         for week in 0..6u64 {
-            let mut row = div().flex();
+            let mut row = div().flex().when(phone, |d| d.w_full());
             for weekday in 0..7u64 {
                 let Some(day) = start.checked_add_days(Days::new(week * 7 + weekday)) else {
                     continue;
@@ -310,13 +341,15 @@ impl DateTimePicker {
                     div()
                         .id(SharedString::from(id))
                         .debug_selector(move || selector.clone())
-                        .w(px(34.))
-                        .h(px(30.))
+                        .when(!phone, |d| d.w(px(34.)).h(px(30.)))
+                        // A week spans the phone's width; each day is a
+                        // fingertip tall.
+                        .when(phone, |d| d.flex_1().h(px(40.)))
                         .flex()
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .text_size(px(12.))
+                        .text_size(px(if phone { 16. } else { 12. }))
                         .when(day == today && !selected, |d| {
                             d.border_1().border_color(rgb(c.accent))
                         })
@@ -448,11 +481,14 @@ impl Render for DateTimePicker {
             Some(at) => crate::manage::composing::describe_later(at, now),
             None => "—".into(),
         };
+        let phone = self.phone;
+        // A phone shows the choices as a compact two-column grid, so the
+        // calendar below them is in view without scrolling.
         let mut presets = div()
             .flex()
-            .flex_col()
-            .gap(px(2.))
-            .w(px(190.))
+            .gap(px(if phone { 8. } else { 2. }))
+            .when(!phone, |d| d.flex_col().w(px(190.)))
+            .when(phone, |d| d.w_full().flex_wrap())
             .flex_shrink_0();
         for (i, (label, at)) in self.presets.clone().into_iter().enumerate() {
             let when = crate::manage::composing::describe_later(at, now);
@@ -465,30 +501,42 @@ impl Render for DateTimePicker {
                     .rounded(px(7.))
                     .flex()
                     .flex_col()
+                    // A phone: half the width, a fingertip tall, bordered.
+                    .when(phone, |d| {
+                        d.w(relative(0.5))
+                            .flex_basis(relative(0.47))
+                            .flex_grow(1.)
+                            .min_w_0()
+                            .min_h(px(super::mobile::TOUCH))
+                            .px_3()
+                            .justify_center()
+                            .border_1()
+                            .border_color(rgb(c.border))
+                            .rounded(px(10.))
+                            .active(move |s| s.bg(rgb(c.border)))
+                    })
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(c.soft)))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(if phone { 15. } else { 13. }))
                             .font_weight(FontWeight::MEDIUM)
+                            .when(phone, |d| d.truncate())
                             .child(label),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(if phone { 12. } else { 11. }))
                             .text_color(rgb(c.muted))
+                            .when(phone, |d| d.truncate())
                             .child(when),
                     )
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(PickerEvent::Picked(at)))),
             );
         }
-        div()
-            .id(SharedString::from(format!("{key}-picker")))
-            .debug_selector(move || format!("{key}-picker"))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .when_some(self.typing.as_ref(), |d, typing| {
+        let typed = div().flex_shrink_0().flex().flex_col().gap_3().when_some(
+            self.typing.as_ref(),
+            |d, typing| {
                 d.child(
                     div()
                         .flex()
@@ -501,18 +549,32 @@ impl Render for DateTimePicker {
                                 .child(
                                     Input::new(&typing.input)
                                         .prefix(icon_el("sparkle", 13., c.muted))
-                                        .text_size(px(13.)),
+                                        .when(phone, |i| {
+                                            i.h(px(super::mobile::TOUCH)).text_size(px(16.))
+                                        })
+                                        .when(!phone, |i| i.text_size(px(13.))),
                                 ),
                         )
                         .children(self.typed_hint(typing, cx)),
                 )
-            })
+            },
+        );
+        let middle = div()
+            .flex()
+            .flex_col()
+            .gap_3()
             .child(
                 div()
                     .flex()
                     .gap_4()
+                    // One column on a phone: choices, then calendar and time.
+                    .when(phone, |d| d.flex_col())
                     .child(presets)
-                    .child(div().w(px(1.)).bg(rgb(c.border)))
+                    .child(if phone {
+                        div().h(px(1.)).w_full().bg(rgb(c.border))
+                    } else {
+                        div().w(px(1.)).bg(rgb(c.border))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -528,49 +590,89 @@ impl Render for DateTimePicker {
                 self.error
                     .clone()
                     .map(|e| div().text_size(px(12.)).text_color(rgb(c.danger)).child(e)),
-            )
+            );
+        let footer = div().flex_shrink_0().flex().flex_col().child(
+            div()
+                .pt_3()
+                .border_t_1()
+                .border_color(rgb(c.border))
+                .flex()
+                .items_center()
+                .gap_2()
+                // A phone: what was chosen on its own line, then two
+                // equal buttons below it.
+                .when(phone, |d| d.flex_wrap())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .when(phone, |d| d.w_full().flex_none().text_size(px(15.)))
+                        .when(!phone, |d| d.truncate().text_size(px(13.)))
+                        .child(format!("{} {summary}", self.confirm)),
+                )
+                .child(
+                    self.small_button(format!("{key}-cancel"), "Cancel", cx, |_, cx| {
+                        cx.emit(PickerEvent::Cancel)
+                    })
+                    .when(!phone, |d| d.h(px(30.)))
+                    .when(phone, |d| d.flex_1())
+                    .px_3(),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{key}-confirm")))
+                        .debug_selector(move || format!("{key}-confirm"))
+                        .h(px(if phone { super::mobile::TOUCH } else { 30. }))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .bg(rgb(c.accent))
+                        .text_color(rgb(c.on_accent))
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .when(phone, |d| {
+                            d.flex_1()
+                                .justify_center()
+                                .rounded(px(10.))
+                                .text_size(px(15.))
+                        })
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(c.accent_hover)))
+                        .child(self.confirm.clone())
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
+                ),
+        );
+        let root = div()
+            .id(SharedString::from(format!("{key}-picker")))
+            .debug_selector(move || format!("{key}-picker"))
+            .flex()
+            .flex_col()
+            .gap_3();
+        if !phone {
+            return root
+                .child(typed)
+                .child(middle)
+                .child(footer)
+                .into_any_element();
+        }
+        // A phone: the typed field stays at the top and the buttons at the
+        // bottom; only the choices, calendar and time between them scroll.
+        // Scrolling lets go of the keyboard.
+        root.size_full()
+            .child(typed)
             .child(
                 div()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(rgb(c.border))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.))
-                            .child(format!("{} {summary}", self.confirm)),
-                    )
-                    .child(
-                        self.small_button(format!("{key}-cancel"), "Cancel", cx, |_, cx| {
-                            cx.emit(PickerEvent::Cancel)
-                        })
-                        .h(px(30.))
-                        .px_3(),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("{key}-confirm")))
-                            .debug_selector(move || format!("{key}-confirm"))
-                            .h(px(30.))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.))
-                            .bg(rgb(c.accent))
-                            .text_color(rgb(c.on_accent))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgb(c.accent_hover)))
-                            .child(self.confirm.clone())
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
-                    ),
+                    .id(SharedString::from(format!("{key}-scroll")))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .on_scroll(|_, w, cx| w.blur(cx))
+                    .child(middle),
             )
+            .child(footer)
+            .into_any_element()
     }
 }
 

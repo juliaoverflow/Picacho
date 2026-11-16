@@ -304,6 +304,13 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Composer>> {
+        // A phone has one window: every composer covers it.
+        let placement = if self.mobile.on {
+            Placement::Maximized
+        } else {
+            placement
+        };
+        let answers = answers.filter(|_| placement == Placement::Inline);
         let accounts = self.accounts.clone();
         let aliases = fwd::sendable(&self.forwarding);
         let contacts = self.contacts();
@@ -362,8 +369,10 @@ impl MailApp {
                     draft, placement, accounts, aliases, contacts, options, colors, backend, w, cx,
                 )
             });
+            let mobile = self.mobile.on;
             composer.update(cx, |c, cx| {
                 c.answers = answers.clone();
+                c.mobile = mobile;
                 c.focus_first(w, cx);
             });
             composer
@@ -493,6 +502,10 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) {
         let from = composer.read(cx).placement;
+        // A phone keeps composers full screen.
+        if self.mobile.on && placement != Placement::Maximized {
+            return;
+        }
         let windowed = |p: Placement| p == Placement::Window;
         if !windowed(from) && !windowed(placement) {
             self.inline_replies
@@ -1039,7 +1052,7 @@ impl MailApp {
     }
 
     /// "Sending…" with Undo while a message waits out its delay.
-    fn outbox_toast(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    pub(super) fn outbox_toast(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let c = self.colors();
         let last = self.outbox.last()?;
         let (id, waiting) = (last.id, !last.delivering);

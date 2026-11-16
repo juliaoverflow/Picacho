@@ -1,12 +1,7 @@
 //! Picacho on Android: the activity loads this library and calls
-//! `android_main` on a thread of its own. Other systems run the `picacho`
-//! binary (main.rs), and this library is empty there.
-#![cfg(target_os = "android")]
+//! `android_main` on a thread of its own.
 
-mod display;
-mod manage;
-mod sync;
-
+use crate::{display, manage};
 use gpui_mobile::android::jni;
 
 /// The activity's entry point (android-activity's NativeActivity glue).

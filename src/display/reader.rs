@@ -277,15 +277,6 @@ impl MailApp {
         };
         let compact = window.viewport_size().width < px(1180.);
         let single = window.viewport_size().width < px(900.);
-        // A mailbox kept to its aliases shows the alias used in its place.
-        let mask = self.mask_for(m);
-        let (sender, from) = match &mask {
-            Some(k) => (
-                if k.sent { k.sender() } else { m.sender.clone() },
-                k.apply(&m.from).into_owned(),
-            ),
-            None => (m.sender.clone(), m.from.clone()),
-        };
         let toolbar = div()
             .id("reader-toolbar")
             .debug_selector(|| "reader-toolbar".into())
@@ -382,6 +373,42 @@ impl MailApp {
                 false,
                 cx,
             ));
+        div()
+            .id("reader-pane")
+            .debug_selector(|| "reader-pane".into())
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .bg(rgb(c.surface))
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .flex()
+            .flex_col()
+            .child(toolbar)
+            .child(self.reader_body(m, window, cx))
+            .into_any_element()
+    }
+
+    /// The open message's scrolling body: subject, sender, banners, the
+    /// email itself, attachments and the conversation. The desktop reader
+    /// and the phone's reader screen put their own bars around it.
+    pub(super) fn reader_body(
+        &self,
+        m: &Mail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = self.colors();
+        let compact = self.mobile.on || window.viewport_size().width < px(1180.);
+        // A mailbox kept to its aliases shows the alias used in its place.
+        let mask = self.mask_for(m);
+        let (sender, from) = match &mask {
+            Some(k) => (
+                if k.sent { k.sender() } else { m.sender.clone() },
+                k.apply(&m.from).into_owned(),
+            ),
+            None => (m.sender.clone(), m.from.clone()),
+        };
         let mut content = div()
             .id(SharedString::from(format!("reader-{}", m.id)))
             .track_scroll(&self.reader_scroll)
@@ -391,7 +418,9 @@ impl MailApp {
             .min_w_0()
             .w_full()
             // Narrow readers use narrow margins, wherever the window is.
-            .px(px(if compact || self.reader_shown.get() < 600. {
+            .px(px(if self.mobile.on {
+                super::mobile::GUTTER
+            } else if compact || self.reader_shown.get() < 600. {
                 20.
             } else {
                 32.
@@ -673,39 +702,26 @@ impl MailApp {
             }
             content = content.child(self.source_links(cx));
         }
-        div()
-            .id("reader-pane")
-            .debug_selector(|| "reader-pane".into())
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .bg(rgb(c.surface))
-            .rounded_bl(corners.bottom_left)
-            .rounded_br(corners.bottom_right)
-            .flex()
-            .flex_col()
-            .child(toolbar)
-            .child(
-                super::panes::scroll_frame(
-                    // Only a newly opened message fades in. Rebuilding the
-                    // reader (as when its pane finishes opening) must not
-                    // replay the fade.
-                    if self.open_at.is_some_and(|t| t.elapsed() < OPEN_FADE) {
-                        content
-                            .with_animation(
-                                ("reader-enter", self.open_anim),
-                                Animation::new(OPEN_FADE).with_easing(|t| 1. - (1. - t).powi(3)),
-                                |d, t| d.opacity(t).top(px((1. - t) * 5.)),
-                            )
-                            .into_any_element()
-                    } else {
-                        content.into_any_element()
-                    },
-                    &self.reader_scroll,
-                )
-                .w_full(),
-            )
-            .into_any_element()
+        super::panes::scroll_frame(
+            // Only a newly opened message fades in. Rebuilding the
+            // reader (as when its pane finishes opening) must not
+            // replay the fade.
+            // A phone's message slides in; fading as well dims it mid-slide.
+            if !self.mobile.on && self.open_at.is_some_and(|t| t.elapsed() < OPEN_FADE) {
+                content
+                    .with_animation(
+                        ("reader-enter", self.open_anim),
+                        Animation::new(OPEN_FADE).with_easing(|t| 1. - (1. - t).powi(3)),
+                        |d, t| d.opacity(t).top(px((1. - t) * 5.)),
+                    )
+                    .into_any_element()
+            } else {
+                content.into_any_element()
+            },
+            &self.reader_scroll,
+        )
+        .w_full()
+        .into_any_element()
     }
 }
 
@@ -955,13 +971,18 @@ impl MailApp {
                                             false,
                                             cx,
                                         )
-                                        .h(px(24.))
-                                        .text_size(px(11.5))
+                                        .when(!self.mobile.on, |d| {
+                                            d.h(px(24.)).text_size(px(11.5))
+                                        })
                                         .border_1()
                                         .border_color(rgb(c.border)),
                                     )
                                     .child(
+                                        // Wraps within the panel rather than
+                                        // widening it (a phone's width).
                                         div()
+                                            .w_full()
+                                            .min_w_0()
                                             .text_color(rgb(c.muted))
                                             .child("Looks up SPF, DKIM and DMARC; the sender's DNS can see when."),
                                     )
@@ -1268,7 +1289,7 @@ impl MailApp {
                         .min_w_0()
                         .child(
                             div()
-                                .w(px(110.))
+                                .w(px(if self.mobile.on { 86. } else { 110. }))
                                 .flex_shrink_0()
                                 .text_color(rgb(c.muted))
                                 .child(label),
@@ -1290,14 +1311,21 @@ impl MailApp {
                 let lines = shown.map(|(_, l)| l.clone()).unwrap_or_default();
                 let mono = c;
                 // Switches between the message's headers, HTML and source.
-                let mut tabs = div().flex().gap_1().ml_auto();
+                let mut tabs = div()
+                    .flex()
+                    .gap_1()
+                    .ml_auto()
+                    // A phone gives the tabs a row of their own, split evenly.
+                    .when(self.mobile.on, |d| d.w_full().ml_0());
                 for v in SourceView::ALL {
                     let on = v == view;
                     tabs = tabs.child(
                         div()
                             .id(SharedString::from(format!("source-tab-{}", v.label().to_lowercase())))
+                            .debug_selector(move || format!("source-tab-{}", v.label().to_lowercase()))
                             .px_2()
-                            .h(px(30.))
+                            .h(px(if self.mobile.on { super::mobile::TOUCH } else { 30. }))
+                            .when(self.mobile.on, |d| d.flex_1().justify_center())
                             .flex()
                             .items_center()
                             .rounded(px(7.))
@@ -1314,19 +1342,30 @@ impl MailApp {
                     );
                 }
                 div()
+                    .id("original-body")
+                    .debug_selector(|| "original-body".into())
                     .flex_1()
                     .min_h_0()
+                    // Never wider than the dialog, however long a line is.
+                    .min_w_0()
+                    .w_full()
+                    .max_w_full()
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .child(
                         div()
                             .flex_shrink_0()
-                            .px_5()
+                            .id("original-facts")
+                            .debug_selector(|| "original-facts".into())
+                            .w_full()
+                            .min_w_0()
+                            .px(px(if self.mobile.on { super::mobile::GUTTER } else { 20. }))
                             .py_4()
                             .flex()
                             .flex_col()
                             .gap(px(5.))
-                            .text_size(px(12.))
+                            .text_size(px(if self.mobile.on { 14. } else { 12. }))
                             .border_b_1()
                             .border_color(rgb(c.border))
                             .child(fact("Message ID", d.message_id.clone()))
@@ -1342,6 +1381,7 @@ impl MailApp {
                                 div()
                                     .mt_2()
                                     .flex()
+                                    .flex_wrap()
                                     .gap_2()
                                     .child(
                                         self.button(
@@ -1352,8 +1392,7 @@ impl MailApp {
                                             false,
                                             cx,
                                         )
-                                        .h(px(30.))
-                                        .text_size(px(12.))
+                                        .when(!self.mobile.on, |d| d.h(px(30.)).text_size(px(12.)))
                                         .border_1()
                                         .border_color(rgb(c.border)),
                                     )
@@ -1366,8 +1405,7 @@ impl MailApp {
                                             false,
                                             cx,
                                         )
-                                        .h(px(30.))
-                                        .text_size(px(12.))
+                                        .when(!self.mobile.on, |d| d.h(px(30.)).text_size(px(12.)))
                                         .border_1()
                                         .border_color(rgb(c.border)),
                                     )
@@ -1389,6 +1427,10 @@ impl MailApp {
                             .debug_selector(|| "original-source".into())
                             .flex_1()
                             .min_h_0()
+                            .min_w_0()
+                            // The list measures its lines; laid over this
+                            // area, it can't widen the dialog to fit them.
+                            .relative()
                             .bg(rgb(c.bg))
                             .child(
                                 uniform_list("original-lines", lines.len(), move |range, _, _| {
@@ -1407,7 +1449,15 @@ impl MailApp {
                                         .collect()
                                 })
                                 .track_scroll(&self.original_scroll)
-                                .size_full()
+                                // A phone pans long lines sideways rather
+                                // than cutting them off.
+                                .when(self.mobile.on, |list| {
+                                    list.with_horizontal_sizing_behavior(
+                                        ListHorizontalSizingBehavior::Unconstrained,
+                                    )
+                                })
+                                .absolute()
+                                .inset_0()
                                 .py_3(),
                             ),
                     ))
