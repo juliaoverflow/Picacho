@@ -8,7 +8,7 @@ use blitz_traits::{
 use std::{
     io::Read,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -24,9 +24,14 @@ pub struct Resources {
     /// The message's own parts, for `cid:` addresses. Local, so shown
     /// even while remote content is blocked.
     inline: Arc<InlineParts>,
+    changed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     count: AtomicUsize,
-    tx: mpsc::Sender<Fetch>,
+    /// The fetcher thread, started by the email's first remote request.
+    /// Most emails make none (remote content is blocked by default), and
+    /// starting it costs a thread and an HTTP client (some 6 ms, and a
+    /// runtime thread of the client's own) for every email opened.
+    fetcher: OnceLock<mpsc::Sender<Fetch>>,
 }
 impl Resources {
     pub fn new(
@@ -35,59 +40,68 @@ impl Resources {
         changed: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<Fetch>();
-        let stopped = cancelled.clone();
-        // One worker per visible document: bounded concurrency, no work on the UI thread.
-        std::thread::spawn(move || {
-            let client = reqwest::blocking::Client::builder()
-                .referer(false)
-                .timeout(Duration::from_secs(8))
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    if attempt.previous().len() >= 5 || !remote_url(attempt.url()) {
-                        attempt.stop()
-                    } else {
-                        attempt.follow()
-                    }
-                }))
-                .build();
-            while let Ok((request, handler)) = rx.recv() {
-                if stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                let result = client.as_ref().ok().and_then(|client| {
-                    let mut response = client
-                        .get(request.url.clone())
-                        .send()
-                        .ok()?
-                        .error_for_status()
-                        .ok()?;
-                    if response.content_length().is_some_and(|n| n > MAX_BYTES) {
-                        return None;
-                    }
-                    let resolved = response.url().to_string();
-                    let mut bytes = Vec::new();
-                    response
-                        .by_ref()
-                        .take(MAX_BYTES + 1)
-                        .read_to_end(&mut bytes)
-                        .ok()?;
-                    (bytes.len() as u64 <= MAX_BYTES).then_some((resolved, bytes))
-                });
-                if stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                let (url, bytes) = result.unwrap_or_else(|| (request.url.to_string(), Vec::new()));
-                handler.bytes(url, Bytes::from(bytes));
-                changed.store(true, Ordering::Release);
-            }
-        });
         Self {
             blocked,
             inline,
+            changed,
             cancelled,
             count: AtomicUsize::new(0),
-            tx,
+            fetcher: OnceLock::new(),
         }
+    }
+    /// The fetcher, started now if it isn't yet. One per document: bounded
+    /// concurrency, no work on the UI thread.
+    fn fetcher(&self) -> &mpsc::Sender<Fetch> {
+        self.fetcher.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Fetch>();
+            let (stopped, changed) = (self.cancelled.clone(), self.changed.clone());
+            std::thread::spawn(move || fetch_all(rx, &stopped, &changed));
+            tx
+        })
+    }
+}
+/// Fetches what the document asks for until it is dropped or cancelled.
+fn fetch_all(rx: mpsc::Receiver<Fetch>, stopped: &AtomicBool, changed: &AtomicBool) {
+    let client = reqwest::blocking::Client::builder()
+        .referer(false)
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || !remote_url(attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build();
+    while let Ok((request, handler)) = rx.recv() {
+        if stopped.load(Ordering::Relaxed) {
+            break;
+        }
+        let result = client.as_ref().ok().and_then(|client| {
+            let mut response = client
+                .get(request.url.clone())
+                .send()
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            if response.content_length().is_some_and(|n| n > MAX_BYTES) {
+                return None;
+            }
+            let resolved = response.url().to_string();
+            let mut bytes = Vec::new();
+            response
+                .by_ref()
+                .take(MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() as u64 <= MAX_BYTES).then_some((resolved, bytes))
+        });
+        if stopped.load(Ordering::Relaxed) {
+            break;
+        }
+        let (url, bytes) = result.unwrap_or_else(|| (request.url.to_string(), Vec::new()));
+        handler.bytes(url, Bytes::from(bytes));
+        changed.store(true, Ordering::Release);
     }
 }
 pub fn remote_url(url: &url::Url) -> bool {
@@ -116,7 +130,7 @@ impl NetProvider for Resources {
             && request.method == blitz_traits::net::Method::GET
             && self.count.fetch_add(1, Ordering::Relaxed) < MAX_REQUESTS
         {
-            let _ = self.tx.send((request, handler));
+            let _ = self.fetcher().send((request, handler));
         } else {
             // Complete refused resources, so Blitz never waits forever on a stylesheet.
             handler.bytes(url, Bytes::new());
@@ -133,5 +147,40 @@ impl NavigationProvider for Links {
         {
             let _ = open::that_detached(options.url.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blitz_traits::net::{NetHandler, Request};
+    use std::prelude::v1::test;
+
+    struct Ignore;
+    impl NetHandler for Ignore {
+        fn bytes(self: Box<Self>, _: String, _: Bytes) {}
+    }
+
+    /// An email whose remote content is blocked never starts the fetcher
+    /// (its thread and HTTP client); one that isn't, on its first request.
+    #[test]
+    fn the_fetcher_starts_only_for_remote_content() {
+        let make = |blocked| Resources::new(blocked, Default::default(), Arc::default(), Arc::default());
+        let get = |url: &str| Request::get(url::Url::parse(url).unwrap());
+        let blocked = make(true);
+        for url in ["https://example.com/a.png", "data:image/png;base64,AAAA", "cid:part@x"] {
+            blocked.fetch(0, get(url), Box::new(Ignore));
+        }
+        assert!(blocked.fetcher.get().is_none());
+        let open = make(false);
+        open.fetch(0, get("cid:part@x"), Box::new(Ignore));
+        assert!(open.fetcher.get().is_none(), "local parts need no fetcher");
+        // Cancelled first, so nothing reaches the network.
+        open.cancelled.store(true, Ordering::Relaxed);
+        open.fetch(0, get("https://example.com/a.png"), Box::new(Ignore));
+        assert!(open.fetcher.get().is_none(), "nothing is fetched once cancelled");
+        let open = make(false);
+        open.fetch(0, get("http://127.0.0.1:9/a.png"), Box::new(Ignore));
+        assert!(open.fetcher.get().is_some());
     }
 }

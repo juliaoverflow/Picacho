@@ -1232,6 +1232,9 @@ impl MailApp {
         if clean_links {
             crate::manage::tracking::warm_up();
         }
+        // Fonts for the first email opened, found while the window opens.
+        #[cfg(not(test))]
+        super::html::warm_up();
         let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
         let account = tree::account_order(&tree)
             .into_iter()

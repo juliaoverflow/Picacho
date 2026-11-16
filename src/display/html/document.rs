@@ -7,9 +7,55 @@ use blitz_dom::{DocumentConfig, UserAgentStylesheet};
 use blitz_html::HtmlDocument;
 use blitz_traits::shell::{ColorScheme, Viewport};
 use std::sync::{
-    Arc,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+/// The fonts every email is laid out with, found and loaded once.
+///
+/// Left to itself, Blitz gives each document a font collection of its own:
+/// every opened email scanned the system's fonts and loaded the files it
+/// used again, some 80 ms before its first paint even for a short email.
+/// Each document gets a copy of this one instead: the system's fonts and
+/// the loaded font files are shared, while fonts an email brings itself
+/// (`@font-face`) stay in its own copy, unseen by other emails.
+static FONTS: LazyLock<Mutex<blitz_dom::FontContext>> = LazyLock::new(|| {
+    use fontique::{Blob, Collection, CollectionOptions, SourceCache};
+    let mut fonts = blitz_dom::FontContext {
+        source_cache: SourceCache::new_shared(),
+        collection: Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: true,
+        }),
+    };
+    // As Blitz does for a collection of its own: list markers' font.
+    fonts
+        .collection
+        .register_fonts(Blob::new(Arc::new(blitz_dom::BULLET_FONT) as _), None);
+    Mutex::new(fonts)
+});
+
+fn fonts() -> blitz_dom::FontContext {
+    FONTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Finds and loads the system's common fonts in the background, so that
+/// the first email opened needn't wait for them: Latin text, and an emoji,
+/// as so much mail has (its fallback font took some 70 ms to find).
+#[cfg_attr(test, allow(dead_code))]
+pub fn warm_up() {
+    let _ = std::thread::Builder::new()
+        .name("picacho-fonts".into())
+        .spawn(|| {
+            let mut doc = EmailDocument::with_parts(
+                "<p>Picacho <b>mail</b> <i>reader</i> 0123456789 🎁</p>",
+                Default::default(),
+                true,
+                Tone::Light,
+            );
+            doc.layout(600);
+        });
+}
 
 const READER_CSS: &str = "body { margin: 12px; font: 14px sans-serif; overflow-wrap: anywhere; } img { max-width: 100%; height: auto; } iframe, object, embed, form, input, button, textarea, select { display: none !important; }";
 
@@ -90,6 +136,7 @@ impl EmailDocument {
             DocumentConfig {
                 // Relative resources have no implicit sender-controlled origin.
                 base_url: Some("about:blank".into()),
+                font_ctx: Some(fonts()),
                 net_provider: Some(Arc::new(resources)),
                 navigation_provider: Some(Arc::new(resources::Links)),
                 ua_stylesheets: [
