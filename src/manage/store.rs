@@ -130,6 +130,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, account TEXT NOT NULL, folder TEXT NOT NULL, date INTEGER NOT NULL, data TEXT NOT NULL, raw BLOB);
             CREATE INDEX IF NOT EXISTS mailbox ON messages(account, folder, date DESC);
+            -- Partial indexes for the counts and lists asked for most: unread mail
+            -- (sidebar counts, on every check and download batch) and mail from
+            -- subscriptions. Without them each scanned every message's JSON.
+            -- Their conditions must match those queries' WHERE word for word.
+            CREATE INDEX IF NOT EXISTS unread ON messages(account, folder) WHERE json_extract(data,'$.unread');
+            CREATE INDEX IF NOT EXISTS subscribed ON messages(account) WHERE json_extract(data,'$.list_unsubscribe') IS NOT NULL;
             CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, account TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));")?;
@@ -1526,6 +1532,32 @@ fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<(
 mod snapshot_tests {
     use super::*;
     use crate::sync::transport::parse_message;
+
+    /// The most frequent counts read their partial indexes, rather than
+    /// every message's JSON: their WHERE must match the indexes' exactly.
+    #[test]
+    fn frequent_counts_use_their_indexes() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-plans-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&path)?;
+        let plan = |sql: &str| -> Result<String> {
+            let db = store.read();
+            let mut q = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let rows: Vec<String> = q.query_map([], |r| r.get(3))?.collect::<rusqlite::Result<_>>()?;
+            Ok(rows.join("; "))
+        };
+        for (sql, index) in [
+            ("SELECT account, folder, COUNT(*) FROM messages WHERE json_extract(data,'$.unread') GROUP BY account, folder", "unread"),
+            ("SELECT data FROM messages WHERE account='a' AND json_extract(data,'$.list_unsubscribe') IS NOT NULL", "subscribed"),
+        ] {
+            let plan = plan(sql)?;
+            assert!(plan.contains(&format!("INDEX {index}")), "{sql}: {plan}");
+        }
+        // The queries themselves, as the store runs them, still answer.
+        store.unread_counts()?;
+        store.subscriptions(&["a".into()])?;
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
 
     /// Mail downloaded without its List-Unsubscribe kept (Proton's, before)
     /// gets it from its saved source, for the accounts asked about only.
