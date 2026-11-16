@@ -74,6 +74,23 @@ impl MailApp {
             },
         );
     }
+    /// Compresses message sources saved before they were kept compressed,
+    /// and gives the space back to the system; once.
+    pub(super) fn pack_saved_sources(&mut self, cx: &mut Context<Self>) {
+        const DONE: &str = "sources_packed";
+        if self.backend.store.preference(DONE).is_some() {
+            return;
+        }
+        self.task(
+            cx,
+            |b| {
+                let packed = b.store.pack_saved_sources()?;
+                b.store.set_preference(DONE, "1")?;
+                Ok(packed)
+            },
+            |_, _, _| {},
+        );
+    }
     /// Cleans the previews of mail cached before Office markup, entities
     /// and invisible padding were left out of them; once.
     pub(super) fn refresh_previews(&mut self, cx: &mut Context<Self>) {

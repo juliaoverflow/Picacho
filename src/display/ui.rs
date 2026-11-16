@@ -1816,6 +1816,7 @@ impl MailApp {
         this.load_unsubscribed();
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
+        this.pack_saved_sources(cx);
         this.filter(cx);
         this.apply_theme(window, cx);
         #[cfg(all(debug_assertions, target_os = "macos"))]

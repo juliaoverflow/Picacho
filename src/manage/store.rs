@@ -113,6 +113,9 @@ impl Drop for Writer<'_> {
 fn connect(file: &Path) -> Result<Connection> {
     let db = Connection::open(file)?;
     db.busy_timeout(BUSY_TIMEOUT)?;
+    // The write-ahead log is cut back to this after each checkpoint; left
+    // alone it stayed as large as it had ever grown (24 MB here).
+    db.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
     Ok(db)
 }
 
@@ -126,6 +129,10 @@ impl Store {
         }
         let file = path.join("mail.sqlite3");
         let mut db = connect(&file)?;
+        // Free pages go back to the system on `incremental_vacuum` (see
+        // `pack_saved_sources`). Takes effect for a new database; an older
+        // one is switched by the VACUUM after its sources are packed.
+        db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, account TEXT NOT NULL, folder TEXT NOT NULL, date INTEGER NOT NULL, data TEXT NOT NULL, raw BLOB);
@@ -424,7 +431,7 @@ impl Store {
         write_messages(&tx, std::slice::from_ref(mail))?;
         tx.execute(
             "UPDATE messages SET raw=?2 WHERE id=?1",
-            params![mail.id, raw],
+            params![mail.id, pack(raw)],
         )?;
         tx.commit()?;
         Ok(())
@@ -578,7 +585,7 @@ impl Store {
                         .next()
                     {
                         let (data, raw) = row?;
-                        rows.push((id.clone(), data, raw));
+                        rows.push((id.clone(), data, raw.map(unpack).transpose()?));
                     }
                 }
                 rows
@@ -672,14 +679,14 @@ impl Store {
         for chunk in ids.chunks(100) {
             let rows: Vec<(String, Vec<u8>)> = {
                 let db = self.read();
-                // Only the headers are needed, which come first.
                 let mut q = db.prepare(
-                    "SELECT substr(raw,1,65536) FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL",
+                    "SELECT raw FROM messages WHERE id=?1 AND json_extract(data,'$.list_unsubscribe') IS NULL",
                 )?;
                 let mut rows = Vec::new();
                 for id in chunk {
-                    if let Some(head) = q.query_map([id], |r| r.get::<_, Vec<u8>>(0))?.next() {
-                        rows.push((id.clone(), head?));
+                    if let Some(saved) = q.query_map([id], |r| r.get::<_, Vec<u8>>(0))?.next() {
+                        // Only the headers are needed, which come first.
+                        rows.push((id.clone(), unpack_up_to(saved?, 65536)?));
                     }
                 }
                 rows
@@ -754,19 +761,77 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Compresses message sources saved before they were kept compressed,
+    /// a batch at a time, so other work gets the cache in between; then
+    /// gives the space freed back to the system. Returns how many were.
+    pub fn pack_saved_sources(&self) -> Result<usize> {
+        let ids: Vec<String> = {
+            let db = self.read();
+            let mut q = db.prepare(
+                "SELECT id FROM messages WHERE raw IS NOT NULL AND substr(raw,1,4)<>?1",
+            )?;
+            q.query_map([PACKED], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut packed = 0;
+        for chunk in ids.chunks(50) {
+            let rows: Vec<(String, Vec<u8>)> = {
+                let db = self.read();
+                let mut q = db.prepare("SELECT raw FROM messages WHERE id=?1 AND substr(raw,1,4)<>?2")?;
+                let mut rows = Vec::new();
+                for id in chunk {
+                    if let Some(raw) = q.query_map(params![id, PACKED], |r| r.get::<_, Vec<u8>>(0))?.next() {
+                        rows.push((id.clone(), pack(&raw?)));
+                    }
+                }
+                rows
+            };
+            let mut db = self.write();
+            let tx = db.transaction()?;
+            for (id, saved) in &rows {
+                // Unless it was saved again meanwhile (packed, then).
+                packed += tx.execute(
+                    "UPDATE messages SET raw=?2 WHERE id=?1 AND substr(raw,1,4)<>?3",
+                    params![id, saved, PACKED],
+                )?;
+            }
+            tx.commit()?;
+        }
+        self.reclaim_space()?;
+        Ok(packed)
+    }
+    /// Gives free pages back to the system. A database made before the
+    /// cache freed them is rebuilt once (VACUUM) to start doing so.
+    fn reclaim_space(&self) -> Result<()> {
+        let db = self.write();
+        let mode: i64 = db.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if mode == 2 {
+            // Frees a page per step: run it to the end (execute_batch steps once).
+            let mut q = db.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = q.query([])?;
+            while rows.next()?.is_some() {}
+        } else {
+            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+        }
+        // VACUUM writes the whole database through the log: cut it back.
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
     pub fn raw(&self, id: &str) -> Result<Option<Vec<u8>>> {
         use rusqlite::OptionalExtension;
         Ok(self
             .read()
-            .query_row("SELECT raw FROM messages WHERE id=?1", [id], |r| r.get(0))
+            .query_row("SELECT raw FROM messages WHERE id=?1", [id], |r| r.get::<_, Option<Vec<u8>>>(0))
             .optional()?
-            .flatten())
+            .flatten()
+            .map(unpack)
+            .transpose()?)
     }
     pub fn save_raw(&self, id: &str, raw: &[u8]) -> Result<()> {
         self.db
             .lock()
             .unwrap()
-            .execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, raw])?;
+            .execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, pack(raw)])?;
         Ok(())
     }
     /// One accepted remote command is one local transaction. Earlier confirmed
@@ -882,15 +947,16 @@ impl Store {
         if gmail_id == 0 {
             return Ok(None);
         }
-        Ok(self
-            .read()
+        self.read()
             .query_row(
                 "SELECT raw FROM messages WHERE account=?1 AND raw IS NOT NULL
                  AND json_extract(data,'$.gmail_id')=?2 LIMIT 1",
                 params![account, gmail_id as i64],
-                |r| r.get(0),
+                |r| r.get::<_, Vec<u8>>(0),
             )
-            .optional()?)
+            .optional()?
+            .map(unpack)
+            .transpose()
     }
     /// What the last synchronization of a server mailbox saw.
     pub fn mailbox_state(&self, account: &str, remote: &str) -> Result<Option<MailboxState>> {
@@ -1256,6 +1322,45 @@ impl Drop for Store {
 }
 /// The preference writer: writes whatever is pending each time it is told
 /// there is something, until the store closes.
+/// Saved message sources are kept compressed (raw deflate) behind this
+/// marker, a quarter of their size on disk. A source without it was saved
+/// before they were, and reads as it is: no message starts with a NUL.
+const PACKED: &[u8] = b"\0PZ1";
+/// No source is larger than a download may be; a damaged one can't
+/// inflate past this.
+const MAX_SOURCE: u64 = 2 * crate::sync::transport::MAX_MESSAGE as u64;
+
+/// A message source as it is saved: compressed, behind `PACKED`.
+fn pack(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut out = flate2::write::DeflateEncoder::new(
+        Vec::with_capacity(PACKED.len() + raw.len() / 3),
+        flate2::Compression::default(),
+    );
+    // Writing to memory can't fail.
+    let _ = out.get_mut().write_all(PACKED);
+    let _ = out.write_all(raw);
+    out.finish().unwrap_or_default()
+}
+/// A saved source as it was downloaded; at most its first `limit` bytes.
+fn unpack_up_to(saved: Vec<u8>, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let Some(packed) = saved.strip_prefix(PACKED) else {
+        let mut saved = saved;
+        saved.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        return Ok(saved);
+    };
+    let mut raw = Vec::with_capacity(packed.len() * 3);
+    flate2::read::DeflateDecoder::new(packed)
+        .take(limit)
+        .read_to_end(&mut raw)
+        .context("A saved message source is damaged")?;
+    Ok(raw)
+}
+fn unpack(saved: Vec<u8>) -> Result<Vec<u8>> {
+    unpack_up_to(saved, MAX_SOURCE)
+}
+
 /// Saves a preference, writing nothing when it already has that value
 /// (every check saves its account's folder list, nearly always unchanged).
 const PUT_PREFERENCE: &str = "INSERT INTO preferences VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value";
@@ -1540,6 +1645,60 @@ fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<(
 mod snapshot_tests {
     use super::*;
     use crate::sync::transport::parse_message;
+
+    /// Sources are saved compressed and read back as downloaded; ones saved
+    /// before still read as they are, until the one-time pass compresses
+    /// them and gives the freed space back.
+    #[test]
+    fn sources_are_kept_compressed_and_read_back_whole() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-packed-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&path)?;
+        let a = Account::new(Provider::Gmail);
+        let raw = |i: usize| {
+            let mut raw = format!("Subject: Hi {i}\r\nList-Unsubscribe: <https://x/u>\r\n\r\n").into_bytes();
+            raw.extend(b"The same paragraph, again and again. ".repeat(20_000));
+            raw
+        };
+        let saved = |id: &str| -> Result<Vec<u8>> {
+            Ok(store.read().query_row("SELECT raw FROM messages WHERE id=?1", [id], |r| r.get(0))?)
+        };
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let id = format!("{}:{i}", a.id);
+            let mut m = parse_message(&raw(i), &a, &id, Folder::Inbox, "INBOX", i as u32)?;
+            m.gmail_id = 100 + i as u64;
+            m.list_unsubscribe.clear();
+            store.save_messages(std::slice::from_ref(&m))?;
+            ids.push(id);
+        }
+        // Saved now: compressed, and read back as it was.
+        store.save_raw(&ids[0], &raw(0))?;
+        assert!(saved(&ids[0])?.starts_with(PACKED));
+        assert!(saved(&ids[0])?.len() < raw(0).len() / 10);
+        assert_eq!(store.raw(&ids[0])?, Some(raw(0)));
+        assert_eq!(store.gmail_raw(&a.id, 100)?, Some(raw(0)));
+        // Saved before: as it is, and still read.
+        for (i, id) in ids.iter().enumerate().skip(1) {
+            store.write().execute("UPDATE messages SET raw=?2 WHERE id=?1", params![id, raw(i)])?;
+        }
+        assert_eq!(store.raw(&ids[1])?, Some(raw(1)));
+        // Headers are read from either kind.
+        assert_eq!(store.backfill_subscriptions()?, 6);
+        store.write().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let before = std::fs::metadata(path.join("mail.sqlite3"))?.len();
+        assert_eq!(store.pack_saved_sources()?, 5);
+        for (i, id) in ids.iter().enumerate() {
+            assert!(saved(id)?.starts_with(PACKED));
+            assert_eq!(store.raw(id)?, Some(raw(i)));
+        }
+        let mode: i64 = store.read().query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        assert_eq!(mode, 2, "frees pages from now on");
+        let after = std::fs::metadata(path.join("mail.sqlite3"))?.len();
+        assert!(after < before / 2, "{before} -> {after}");
+        assert_eq!(store.pack_saved_sources()?, 0, "once");
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
 
     /// Saving what is already saved (each check's folder list and mailbox
     /// state) writes nothing to the disk; a change is still saved.
