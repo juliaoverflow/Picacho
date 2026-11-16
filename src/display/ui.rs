@@ -8120,17 +8120,27 @@ impl MailApp {
         // The whole menu fits in the window where it can: rows get shorter
         // when there are many, and only a menu that still doesn't fit (a
         // long folder list) scrolls.
-        let (height, row) = menu_size(&menu.entries, f32::from(window.viewport_size().height));
+        // The menu is placed here rather than by `anchored`'s snapping,
+        // which only moves what crosses the window's edge: on a window with
+        // its own decorations, a menu ending in the transparent shadow band
+        // around the frame stayed put and was cut off by the frame. Its size
+        // is known up front, so it is kept inside the visible frame.
+        let viewport = window.viewport_size();
+        let insets = window::frame_insets(window);
+        let frame = viewport.height - insets.top - insets.bottom;
+        let (height, row) = menu_size(&menu.entries, f32::from(frame));
+        let width = menu_width(&menu.entries, window);
+        let origin = menu_origin(menu.position, size(px(width), px(height)), viewport, insets);
         let mut panel = div()
             .id("menu-panel")
-            .min_w(px(200.))
+            .debug_selector(|| "menu-panel".into())
+            // Long addresses end in an ellipsis rather than widen the menu.
+            .w(px(width))
             .max_h(px(height))
             .overflow_y_scroll()
             // Scrolling the menu scrolls it, rather than closing it as a
             // scroll elsewhere does.
             .on_scroll(|_, _, cx| cx.stop_propagation())
-            // Long addresses end in an ellipsis rather than widen the menu.
-            .max_w(px(380.))
             .p_1()
             .flex()
             .flex_col()
@@ -8245,8 +8255,7 @@ impl MailApp {
             }))
             .child(
                 anchored()
-                    .position(menu.position)
-                    .snap_to_window_with_margin(px(8.))
+                    .position(origin)
                     .child(
                         panel.with_animation(
                             ("popup-menu", menu.key),
@@ -9232,12 +9241,62 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .text_color(rgb(color)),
     )
 }
-/// A popup menu's largest height and its rows' height, for a window
+/// The space a popup menu keeps from the window frame, each side.
+const MENU_MARGIN: f32 = 8.;
+/// A menu's narrowest and widest.
+const MENU_WIDTH: (f32, f32) = (200., 380.);
+/// A menu's width: its longest label's, between `MENU_WIDTH`'s bounds.
+fn menu_width(entries: &[Entry], window: &Window) -> f32 {
+    // Around the label: the border and padding (1 + 4 each side), a row's
+    // padding (8 each side), its icon and gap (16 + 8), and the space after
+    // the label (16); a pixel more so rounding never cuts a label short.
+    const CHROME: f32 = 2. * (1. + 4. + 8.) + 16. + 8. + 16. + 1.;
+    let font = font(".SystemUIFont");
+    let widest = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Item { label, .. } => Some(label),
+            Entry::Separator => None,
+        })
+        .map(|label| {
+            let run = TextRun {
+                len: label.len(),
+                font: font.clone(),
+                color: black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system().shape_line(label.clone(), px(13.), &[run], None).width)
+        })
+        .fold(0., f32::max);
+    (widest + CHROME).clamp(MENU_WIDTH.0, MENU_WIDTH.1)
+}
+/// Where a menu of `size` opened at `at` goes: there, moved only as far as
+/// it takes to keep `MENU_MARGIN` inside the window's visible frame
+/// (`insets` inside the `viewport`). A menu too big for it keeps its top
+/// left corner in view.
+fn menu_origin(
+    at: Point<Pixels>,
+    size: Size<Pixels>,
+    viewport: Size<Pixels>,
+    insets: Edges<Pixels>,
+) -> Point<Pixels> {
+    let margin = px(MENU_MARGIN);
+    let (left, top) = (insets.left + margin, insets.top + margin);
+    let right = viewport.width - insets.right - margin;
+    let bottom = viewport.height - insets.bottom - margin;
+    point(
+        at.x.min(right - size.width).max(left),
+        at.y.min(bottom - size.height).max(top),
+    )
+}
+/// A popup menu's largest height and its rows' height, for a window frame
 /// `viewport` tall: the menu fits when it can, with rows from 28 down to 22
 /// points high; beyond that it scrolls.
 fn menu_size(entries: &[Entry], viewport: f32) -> (f32, f32) {
-    // The window margin it keeps (8 each side), and its padding and border.
-    const CHROME: f32 = 16. + 10.;
+    // The frame margin it keeps (each side), and its padding and border.
+    const CHROME: f32 = 2. * MENU_MARGIN + 10.;
     const SEPARATOR: f32 = 9.;
     let items = entries.iter().filter(|e| matches!(e, Entry::Item { .. })).count() as f32;
     let separators = entries.len() as f32 - items;
@@ -10969,6 +11028,61 @@ mod tests {
         act(&view, Action::SearchFor(String::new()), cx);
         frame(cx);
         assert!(cx.debug_bounds("search-hint-reply-to:").is_some());
+    }
+
+    #[test]
+    fn menus_keep_clear_of_a_client_decorated_windows_shadow() {
+        // A window drawing its own decorations: a 20px transparent shadow
+        // band on every side, as gpui-component draws it.
+        let viewport = size(px(1000.), px(700.));
+        let band = Edges::all(px(20.));
+        let menu = size(px(220.), px(160.));
+        // The Add button sits near the bottom left. Opened 10px above the
+        // frame's bottom, the menu used to run 150px past it.
+        let at = point(px(40.), px(670.));
+        assert_eq!(menu_origin(at, menu, viewport, band), point(px(40.), px(512.)));
+        // Near the right edge, it moves left to clear the band.
+        let at = point(px(900.), px(100.));
+        assert_eq!(menu_origin(at, menu, viewport, band), point(px(752.), px(100.)));
+        // Room where it opens: it stays at the pointer.
+        let at = point(px(300.), px(200.));
+        assert_eq!(menu_origin(at, menu, viewport, band), at);
+        // Maximized or tiled: no band, just the margin.
+        let at = point(px(40.), px(695.));
+        let none = Edges::all(px(0.));
+        assert_eq!(menu_origin(at, menu, viewport, none), point(px(40.), px(532.)));
+        // Too big for the frame: its top left stays in view.
+        let huge = size(px(1200.), px(900.));
+        assert_eq!(menu_origin(at, huge, viewport, band), point(px(28.), px(28.)));
+    }
+
+    #[gpui::test]
+    fn menus_opened_near_an_edge_stay_inside_the_window_frame(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let size = cx.update(|w, _| w.viewport_size());
+        let insets = cx.update(|w, _| window::frame_insets(w));
+        let margins = insets.map(|i| *i + px(MENU_MARGIN));
+        // The Add menu opens at the pointer; the button sits low in the
+        // sidebar, so try every corner of the window.
+        for at in [
+            point(px(4.), size.height - px(4.)),
+            point(size.width - px(4.), size.height - px(4.)),
+            point(size.width - px(4.), px(4.)),
+            point(px(4.), px(4.)),
+        ] {
+            view.update(cx, |this, cx| {
+                let entries = this.create_entries(None);
+                this.open_menu(at, entries, cx)
+            });
+            // Past the opening animation, which nudges the panel.
+            cx.executor().advance_clock(Duration::from_millis(200));
+            frame(cx);
+            let panel = cx.debug_bounds("menu-panel").expect("the menu is shown");
+            assert!(panel.top() >= margins.top, "{at:?}: {panel:?}");
+            assert!(panel.left() >= margins.left, "{at:?}: {panel:?}");
+            assert!(panel.bottom() <= size.height - margins.bottom, "{at:?}: {panel:?}");
+            assert!(panel.right() <= size.width - margins.right, "{at:?}: {panel:?}");
+        }
     }
 
     #[gpui::test]

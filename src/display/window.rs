@@ -41,6 +41,14 @@ pub(super) fn window_corners(w: &Window) -> Corners<Pixels> {
     }
 }
 
+/// How far the visible frame sits inside the window, each side. While
+/// Picacho draws its own decorations, a transparent shadow band surrounds
+/// the frame (none on edges that are tiled or maximized), and anything
+/// drawn there is clipped; with the system's decorations it is zero.
+pub(super) fn frame_insets(w: &Window) -> Edges<Pixels> {
+    gpui_component::window_paddings(w)
+}
+
 /// Round and outline the root surface when it is the window frame. GPUI clips
 /// children only to rectangles, so a full-bleed child that paints its own
 /// background into a corner must apply the matching [`window_corners`] radius.
