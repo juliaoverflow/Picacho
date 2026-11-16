@@ -1,8 +1,12 @@
 //! A date and time picker for choosing when something happens later:
 //! when a snoozed message comes back, or when a scheduled message is sent.
 //! Quick choices on the left; a month calendar, the time of day (steps and
-//! common times) and what was chosen, said in words, on the right.
+//! common times) and what was chosen, said in words, on the right. With
+//! Local AI's "Understand typed dates" on, a field above them takes a time
+//! typed in words ("tmrw at 6", "next fri 9am", "in 2 hrs") and sets the
+//! calendar and clock to it.
 use super::*;
+use crate::manage::local_ai::when;
 use chrono::{Datelike, Days, Local, NaiveDate, NaiveTime, TimeZone, Timelike};
 
 /// What the picker reports.
@@ -32,8 +36,19 @@ pub(super) struct DateTimePicker {
     /// find a picker's parts.
     key: &'static str,
     error: Option<String>,
+    /// Where a time is typed, and what reads it (None while the feature is
+    /// off).
+    typing: Option<Typing>,
 }
 impl EventEmitter<PickerEvent> for DateTimePicker {}
+
+struct Typing {
+    input: Entity<InputState>,
+    parser: Rc<when::Parser>,
+    /// What the typed text was read as, when it names a time.
+    read: Option<when::When>,
+    _subscription: Subscription,
+}
 
 impl DateTimePicker {
     pub(super) fn new(
@@ -56,7 +71,120 @@ impl DateTimePicker {
             confirm: confirm.into(),
             key,
             error: None,
+            typing: None,
         }
+    }
+    /// Adds the field a time can be typed into, read by `parser`.
+    pub(super) fn typed(
+        mut self,
+        parser: Option<Rc<when::Parser>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let Some(parser) = parser else {
+            return self;
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Type a time: tmrw at 6, next fri 9am, in 2 hrs…")
+        });
+        // Ready to type into as soon as the picker opens.
+        input.update(cx, |s, cx| s.focus(window, cx));
+        let subscription = cx.subscribe_in(&input, window, |this, input, e, _, cx| match e {
+            InputEvent::Change => {
+                let text = input.read(cx).value().to_string();
+                this.read_typed(&text, cx);
+            }
+            InputEvent::PressEnter { .. }
+                if this.typing.as_ref().is_some_and(|t| t.read.is_some()) =>
+            {
+                this.confirm(cx)
+            }
+            _ => {}
+        });
+        self.typing = Some(Typing {
+            input,
+            parser,
+            read: None,
+            _subscription: subscription,
+        });
+        self
+    }
+    /// Sets the calendar and clock to the time `text` names, if it names one.
+    fn read_typed(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(typing) = &mut self.typing else {
+            return;
+        };
+        let now = Local::now();
+        typing.read = if text.trim().is_empty() {
+            None
+        } else {
+            typing.parser.parse(text, &now)
+        };
+        if let Some(t) = typing
+            .read
+            .as_ref()
+            .and_then(|w| chrono::DateTime::from_timestamp(w.at, 0))
+        {
+            let t = t.with_timezone(&Local);
+            self.day = t.date_naive();
+            self.month = self.day.with_day(1).unwrap_or(self.day);
+            self.hour = t.hour();
+            self.minute = t.minute();
+        }
+        self.error = None;
+        cx.notify();
+    }
+    /// Types `text` into the field, as someone typing it would.
+    #[cfg(test)]
+    pub(super) fn type_time(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(typing) = &self.typing {
+            let input = typing.input.clone();
+            input.update(cx, |s, cx| s.set_value(text.to_owned(), window, cx));
+        }
+        self.read_typed(text, cx);
+    }
+    /// Whether a time can be typed.
+    #[cfg(test)]
+    pub(super) fn can_type(&self) -> bool {
+        self.typing.is_some()
+    }
+
+    /// Under the typed field: what it was read as.
+    fn typed_hint(&self, typing: &Typing, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        let c = self.colors;
+        let text = typing.input.read(cx).value();
+        if text.trim().is_empty() {
+            return None;
+        }
+        let (line, color) = match &typing.read {
+            Some(w) => {
+                let when = crate::manage::composing::describe_later(w.at, Local::now());
+                let line = match &w.rule {
+                    Some(rule) => format!(
+                        "{when} · the first time of a repeating time ({})",
+                        repeat_words(rule)
+                    ),
+                    None => when,
+                };
+                (line, c.accent)
+            }
+            None => (
+                "Not a time Picacho can read. Try “tomorrow at 6”.".to_owned(),
+                c.muted,
+            ),
+        };
+        Some(
+            div()
+                .id(SharedString::from(format!("{}-typed-hint", self.key)))
+                .debug_selector({
+                    let key = self.key;
+                    move || format!("{key}-typed-hint")
+                })
+                .text_size(px(12.))
+                .text_color(rgb(color))
+                .child(line),
+        )
     }
     /// Starts at an earlier choice (a time already scheduled).
     pub(super) fn at(mut self, when: i64) -> Self {
@@ -360,6 +488,25 @@ impl Render for DateTimePicker {
             .flex()
             .flex_col()
             .gap_3()
+            .when_some(self.typing.as_ref(), |d, typing| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("{key}-typed")))
+                                .debug_selector(move || format!("{key}-typed"))
+                                .child(
+                                    Input::new(&typing.input)
+                                        .prefix(icon_el("sparkle", 13., c.muted))
+                                        .text_size(px(13.)),
+                                ),
+                        )
+                        .children(self.typed_hint(typing, cx)),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -425,4 +572,28 @@ impl Render for DateTimePicker {
                     ),
             )
     }
+}
+
+/// A repeating rule in a few words: "every 2 weeks on MO, WE".
+fn repeat_words(rule: &str) -> String {
+    let field = |name: &str| {
+        rule.split(';')
+            .find_map(|p| p.strip_prefix(name)?.strip_prefix('='))
+    };
+    let unit = match field("FREQ") {
+        Some("MINUTELY") => "minute",
+        Some("HOURLY") => "hour",
+        Some("DAILY") => "day",
+        Some("WEEKLY") => "week",
+        Some("MONTHLY") => "month",
+        _ => "year",
+    };
+    let mut out = match field("INTERVAL").and_then(|n| n.parse::<u32>().ok()) {
+        Some(n) if n > 1 => format!("every {n} {unit}s"),
+        _ => format!("every {unit}"),
+    };
+    if let Some(days) = field("BYDAY") {
+        out.push_str(&format!(" on {}", days.replace(',', ", ")));
+    }
+    out
 }

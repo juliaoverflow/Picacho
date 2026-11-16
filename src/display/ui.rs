@@ -34,6 +34,9 @@ mod ai;
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "local_ai_tests.rs"]
 mod local_ai_tests;
+#[cfg(test)]
+#[path = "when_tests.rs"]
+mod when_tests;
 #[path = "message_window.rs"]
 mod message_window;
 #[path = "panes.rs"]
@@ -590,6 +593,9 @@ enum Action {
     SetLocalAi(bool),
     /// Hides sign-in codes (downloading the model), or stops (deleting it).
     SetHideCodes(bool),
+    /// Reads dates and times typed where Picacho asks when (downloading the
+    /// model), or stops (deleting it).
+    SetUnderstandDates(bool),
     /// Shows a message's hidden sign-in codes, or hides them again.
     ShowCodes(String, bool),
     /// Copies a message's sign-in code without showing it.
@@ -1098,6 +1104,14 @@ pub struct MailApp {
     model_progress: Arc<std::sync::atomic::AtomicU64>,
     /// The model whose deletion is being confirmed over Settings.
     model_confirm: Option<String>,
+    /// Typed dates and times are read (Settings → Local AI), with the date
+    /// and time model once loaded; its download, as the sign-in code
+    /// model's above.
+    understand_dates: bool,
+    when: Option<Rc<crate::manage::local_ai::when::Parser>>,
+    when_busy: bool,
+    when_error: Option<String>,
+    when_progress: Arc<std::sync::atomic::AtomicU64>,
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
@@ -1180,6 +1194,7 @@ impl MailApp {
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
         let local_ai = crate::manage::local_ai::enabled(&store);
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
+        let understand_dates = crate::manage::local_ai::when_enabled(&store);
         if clean_links {
             crate::manage::tracking::warm_up();
         }
@@ -1713,6 +1728,11 @@ impl MailApp {
             model_error: None,
             model_progress: Arc::default(),
             model_confirm: None,
+            understand_dates,
+            when: None,
+            when_busy: false,
+            when_error: None,
+            when_progress: Arc::default(),
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -5001,6 +5021,7 @@ impl MailApp {
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
             Action::SetLocalAi(on) => self.set_local_ai(on, cx),
             Action::SetHideCodes(on) => self.set_hide_codes(on, cx),
+            Action::SetUnderstandDates(on) => self.set_understand_dates(on, cx),
             Action::ShowCodes(id, show) => self.show_codes(id, show, cx),
             Action::CopyCode(id) => self.copy_code(id, cx),
             Action::AskDeleteModel(id) => self.ask_delete_model(id, cx),

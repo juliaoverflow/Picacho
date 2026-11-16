@@ -43,7 +43,10 @@ impl MailApp {
         }
         let presets = crate::manage::composing::snooze_choices(chrono::Local::now());
         let colors = self.colors();
-        let picker = cx.new(|_| DateTimePicker::new("snooze", "Snooze until", presets, colors));
+        let parser = self.when.clone();
+        let picker = cx.new(|cx| {
+            DateTimePicker::new("snooze", "Snooze until", presets, colors).typed(parser, w, cx)
+        });
         let chosen = snoozable.clone();
         self.picker_subscription = Some(cx.subscribe_in(&picker, w, move |this, _, e, w, cx| {
             match e {
