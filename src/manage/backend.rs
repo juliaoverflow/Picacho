@@ -998,7 +998,7 @@ impl Backend {
                 }
             }
         }
-        self.store.messages(&a.id, Folder::All, limit)
+        self.store.newest(&a.id, Folder::All, limit)
     }
     /// Brings one server mailbox's cache up to date. After a first full
     /// synchronization, later ones ask only for what changed: messages past
@@ -1081,7 +1081,7 @@ impl Backend {
             _ => {
                 let newest: Vec<u32> = self
                     .store
-                    .messages(&a.id, mailbox, limit)?
+                    .newest(&a.id, mailbox, limit)?
                     .into_iter()
                     .filter(|m| m.id.starts_with(&prefix))
                     .map(|m| m.uid)
@@ -1123,7 +1123,7 @@ impl Backend {
             // Server threads for the new mail, where the server has them.
             let _ = self.thread_mailbox(c, a, remote, validity);
         }
-        let mut result = self.store.messages(&a.id, mailbox, limit)?;
+        let mut result = self.store.newest(&a.id, mailbox, limit)?;
         result.retain(|m| m.id.starts_with(&prefix));
         Ok(result)
     }
@@ -1678,7 +1678,7 @@ impl Backend {
         password: &str,
     ) -> Result<Vec<Mail>> {
         if !matches!(folder, Folder::Inbox | Folder::Starred | Folder::All) {
-            return self.store.messages(&a.id, folder, limit);
+            return self.store.newest(&a.id, folder, limit);
         }
         let mut pop = self.pop_login(a, password)?;
         let ids = pop.uidl()?;
@@ -1723,7 +1723,7 @@ impl Backend {
         self.store.save_messages(&messages)?;
         // POP3 has no folders. Keep local moves and messages removed from the
         // remote server; UIDL identities prevent duplicate downloads.
-        messages = self.store.messages(&a.id, folder, limit)?;
+        messages = self.store.newest(&a.id, folder, limit)?;
         messages.sort_by(Mail::newest_first);
         if folder == Folder::Starred {
             messages.retain(|m| m.starred);

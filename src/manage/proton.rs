@@ -549,7 +549,7 @@ impl Backend {
                 }
             }
             self.store.save_messages(&rows)?;
-            self.store.messages(&a.id, mailbox.clone(), limit)
+            self.store.newest(&a.id, mailbox.clone(), limit)
         })
     }
 

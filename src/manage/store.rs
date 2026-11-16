@@ -264,6 +264,11 @@ impl Store {
     pub fn summaries(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<Vec<Mail>> {
         self.query_messages(account, mailbox.into(), usize::MAX >> 1, true)
     }
+    /// The newest `limit` cached messages in a mailbox, without bodies: what
+    /// a check reports (new mail to announce, flags), not what is read.
+    pub fn newest(&self, account: &str, mailbox: impl Into<Mailbox>, limit: usize) -> Result<Vec<Mail>> {
+        self.query_messages(account, mailbox.into(), limit, true)
+    }
     /// Cached message identities that start with `prefix`.
     pub fn cached_ids(
         &self,
