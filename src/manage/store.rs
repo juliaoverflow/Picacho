@@ -136,6 +136,9 @@ impl Store {
             -- Their conditions must match those queries' WHERE word for word.
             CREATE INDEX IF NOT EXISTS unread ON messages(account, folder) WHERE json_extract(data,'$.unread');
             CREATE INDEX IF NOT EXISTS subscribed ON messages(account) WHERE json_extract(data,'$.list_unsubscribe') IS NOT NULL;
+            -- What background downloads count and pick, without reading rows:
+            -- download progress is counted up to every 400 ms while mail downloads.
+            CREATE INDEX IF NOT EXISTS downloads ON messages(account, date, json_extract(data,'$.size'), raw IS NULL);
             CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, account TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));")?;
@@ -911,8 +914,9 @@ impl Store {
     ) -> Result<()> {
         let db = self.write();
         match state {
+            // Most checks leave it as it was: then nothing is written.
             Some(state) => db.execute(
-                "INSERT OR REPLACE INTO mailbox_state VALUES (?1,?2,?3)",
+                "INSERT INTO mailbox_state VALUES (?1,?2,?3) ON CONFLICT(account, remote) DO UPDATE SET data=excluded.data WHERE data IS NOT excluded.data",
                 params![account, remote, serde_json::to_string(state)?],
             )?,
             None => db.execute(
@@ -1159,7 +1163,7 @@ impl Store {
     pub fn set_preference(&self, key: &str, value: &str) -> Result<()> {
         self.flush();
         self.write().execute(
-            "INSERT OR REPLACE INTO preferences VALUES (?1,?2)",
+            PUT_PREFERENCE,
             params![key, value],
         )?;
         Ok(())
@@ -1252,12 +1256,16 @@ impl Drop for Store {
 }
 /// The preference writer: writes whatever is pending each time it is told
 /// there is something, until the store closes.
+/// Saves a preference, writing nothing when it already has that value
+/// (every check saves its account's folder list, nearly always unchanged).
+const PUT_PREFERENCE: &str = "INSERT INTO preferences VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value";
+
 fn write_preferences(db: Connection, queue: &PrefQueue, rx: mpsc::Receiver<()>) {
     let write = |batch: &HashMap<String, String>| -> Result<()> {
         let db = db.unchecked_transaction()?;
         for (key, value) in batch {
             db.execute(
-                "INSERT OR REPLACE INTO preferences VALUES (?1,?2)",
+                PUT_PREFERENCE,
                 params![key, value],
             )?;
         }
@@ -1533,6 +1541,31 @@ mod snapshot_tests {
     use super::*;
     use crate::sync::transport::parse_message;
 
+    /// Saving what is already saved (each check's folder list and mailbox
+    /// state) writes nothing to the disk; a change is still saved.
+    #[test]
+    fn unchanged_saves_write_nothing() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-noop-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&path)?;
+        let state = MailboxState { validity: 1, uid_next: 9, exists: 8, modseq: Some(3), days: 0 };
+        store.set_preference("folders:a", "[]")?;
+        store.save_mailbox_state("a", "INBOX", Some(&state))?;
+        let wal = path.join("mail.sqlite3-wal");
+        let before = std::fs::metadata(&wal)?.len();
+        for _ in 0..50 {
+            store.set_preference("folders:a", "[]")?;
+            store.save_mailbox_state("a", "INBOX", Some(&state))?;
+        }
+        assert_eq!(std::fs::metadata(&wal)?.len(), before, "nothing written");
+        store.set_preference("folders:a", "[1]")?;
+        let next = MailboxState { uid_next: 10, ..state };
+        store.save_mailbox_state("a", "INBOX", Some(&next))?;
+        assert_eq!(store.preference("folders:a").as_deref(), Some("[1]"));
+        assert_eq!(store.mailbox_state("a", "INBOX")?.map(|s| s.uid_next), Some(10));
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
     /// The most frequent counts read their partial indexes, rather than
     /// every message's JSON: their WHERE must match the indexes' exactly.
     #[test]
@@ -1548,13 +1581,18 @@ mod snapshot_tests {
         for (sql, index) in [
             ("SELECT account, folder, COUNT(*) FROM messages WHERE json_extract(data,'$.unread') GROUP BY account, folder", "unread"),
             ("SELECT data FROM messages WHERE account='a' AND json_extract(data,'$.list_unsubscribe') IS NOT NULL", "subscribed"),
+            ("SELECT COUNT(*), COALESCE(SUM(raw IS NULL),0) FROM messages WHERE account='a' AND date >= 0 AND json_extract(data,'$.size') <= 9", "COVERING INDEX downloads"),
+            ("SELECT data FROM messages WHERE account='a' AND raw IS NULL AND date >= 0 AND json_extract(data,'$.size') <= 9 ORDER BY date DESC, id DESC LIMIT 5", "INDEX downloads"),
         ] {
             let plan = plan(sql)?;
-            assert!(plan.contains(&format!("INDEX {index}")), "{sql}: {plan}");
+            let index = if index.contains("INDEX") { index.to_owned() } else { format!("INDEX {index}") };
+            assert!(plan.contains(&index), "{sql}: {plan}");
         }
         // The queries themselves, as the store runs them, still answer.
         store.unread_counts()?;
         store.subscriptions(&["a".into()])?;
+        store.download_counts(9, &[("a".into(), 0)])?;
+        store.missing("a", 9, 5, 0)?;
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }
