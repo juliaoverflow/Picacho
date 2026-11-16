@@ -39,6 +39,10 @@ mod local_ai_tests;
 mod when_tests;
 #[path = "message_window.rs"]
 mod message_window;
+/// The phone and tablet presentation of this same app state: touch-first
+/// screens, sheets and bars (src/display-mobile).
+#[path = "../display-mobile/mod.rs"]
+mod mobile;
 #[path = "panes.rs"]
 mod panes;
 #[path = "prompt.rs"]
@@ -1234,6 +1238,8 @@ pub struct MailApp {
     /// Forwarding services whose details are open in the list.
     fwd_open: HashSet<String>,
     fwd_adding: bool,
+    /// The touch presentation's own state; `mobile.on` picks it.
+    mobile: mobile::Mobile,
 }
 fn input(
     placeholder: &str,
@@ -1306,7 +1312,11 @@ impl MailApp {
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let backend = Arc::new(Backend::new(store));
-        let search = input("Search, or from: reply-to: is:unread", false, window, cx);
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search, or from: reply-to: is:unread")
+                .input_action(TextInputAction::Search)
+        });
         let placeholders = [
             "you@example.com",
             "Password",
@@ -1863,6 +1873,7 @@ impl MailApp {
             filters: HashMap::new(),
             filter_inputs,
             server_notes: HashMap::new(),
+            mobile: mobile::Mobile::new(),
         };
         this.update_scope();
         this.load_snoozed();
@@ -4025,6 +4036,10 @@ impl MailApp {
         );
     }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        // A phone goes back one screen at a time (Android's Back, Escape).
+        if self.mobile.on && self.mobile_back(w, cx) {
+            return;
+        }
         if self.menu.take().is_some()
             || self.presets_for.take().is_some()
             || self.model_confirm.take().is_some()
@@ -4046,7 +4061,7 @@ impl MailApp {
                 self.handle(Action::BackToList, w, cx);
             } else if self.subs_open && self.subs_sender.is_some() {
                 self.close_subscription(w, cx);
-            } else if window::content_size(w).width < px(900.) {
+            } else if self.mobile.on || window::content_size(w).width < px(900.) {
                 self.selected = None;
                 self.read_generation += 1;
             }
@@ -5303,9 +5318,13 @@ impl MailApp {
                 self.source_view = view;
                 self.load_details(cx);
                 self.original_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                self.modal = Some(Modal::Original);
                 self.menu = None;
-                self.anim += 1;
+                // Switching between headers, HTML and source keeps the
+                // dialog where it is; only opening it animates.
+                if self.modal != Some(Modal::Original) {
+                    self.modal = Some(Modal::Original);
+                    self.anim += 1;
+                }
             }
             Action::CopyOriginal => {
                 if let Some(raw) = self.original_source() {
@@ -5926,11 +5945,11 @@ impl MailApp {
             .items_center()
             .justify_center()
             .gap_2()
-            .h(px(36.))
+            .h(px(if self.mobile.on { mobile::TOUCH } else { 36. }))
             .px_3()
-            .rounded(px(9.))
+            .rounded(px(if self.mobile.on { 12. } else { 9. }))
             .cursor_pointer()
-            .text_size(px(13.))
+            .text_size(px(if self.mobile.on { 15. } else { 13. }))
             .font_weight(FontWeight::MEDIUM)
             .bg(rgb(if primary { c.accent } else { c.surface }))
             .text_color(rgb(if primary { c.on_accent } else { c.muted }))
@@ -5943,7 +5962,7 @@ impl MailApp {
             el.child(icon_el(icon, 16., icon_color))
         };
         if label.starts_with('@') {
-            el.w(px(34.))
+            el.w(px(if self.mobile.on { mobile::TOUCH } else { 34. }))
                 .px_0()
                 .tooltip(move |w, cx| Tooltip::new(tooltip.clone()).build(w, cx))
         } else {
@@ -8449,6 +8468,8 @@ impl MailApp {
             .bg(rgb(c.surface))
             .shadow_2xl()
             .overflow_hidden()
+            // A phone shows dialogs as sheets from the bottom edge.
+            .when(self.mobile.on, |d| self.mobile_sheet_panel(d, modal, window))
             .child(
                 div()
                     .flex()
@@ -8480,10 +8501,30 @@ impl MailApp {
             .child(match modal {
                 // Settings scrolls its own sections beside a fixed sidebar;
                 // the original source scrolls its own lines.
-                Modal::Settings | Modal::Original => div()
+                // A phone's picker keeps its own buttons in view and
+                // scrolls only what is between them.
+                Modal::Snooze(_) if self.mobile.on => div()
                     .flex_1()
                     .min_h_0()
+                    .w_full()
+                    .px(px(mobile::GUTTER))
+                    .pt_3()
+                    .pb_3()
                     .flex()
+                    .flex_col()
+                    .child(content)
+                    .into_any_element(),
+                Modal::Settings | Modal::Original => div()
+                    .id("modal-body")
+                    .debug_selector(|| "modal-body".into())
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .w_full()
+                    .flex()
+                    // A phone's Original stacks its parts; as a row, the
+                    // source's longest line set the width.
+                    .when(self.mobile.on && *modal == Modal::Original, |d| d.flex_col())
                     .child(content)
                     .into_any_element(),
                 Modal::Connect => panes::scroll_frame(
@@ -8664,6 +8705,9 @@ impl MailApp {
         self.modal_frame(panel, window)
     }
     fn modal_frame(&self, panel: Stateful<Div>, window: &Window) -> AnyElement {
+        if self.mobile.on {
+            return self.mobile_sheet_frame(panel, window);
+        }
         let corners = window::window_corners(window);
         let below_titlebar =
             self.modal == Some(Modal::Settings) && self.settings_place == SettingsPlace::Maximized;
@@ -8701,7 +8745,11 @@ impl Render for MailApp {
         self.apply_pending_new_alias(window, cx);
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
-        let root = self.root(window, cx);
+        let root = if self.mobile.on {
+            self.mobile_root(window, cx)
+        } else {
+            self.root(window, cx)
+        };
         // The email's images, once the reader no longer paints it.
         self.html_view.update(cx, |view, _| view.release(window));
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
@@ -8751,6 +8799,28 @@ impl MailApp {
             .text_color(rgb(c.text))
             .font_family(".SystemUIFont")
             .text_size(px(14.))
+            .map(|d| self.app_actions(d, cx))
+            .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
+            .when(!self.onboarding, |d| self.main(d, window, cx))
+            .map(|d| self.track_resize(d, cx))
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ComposerDrag>, w, cx| {
+                this.drag_composer(e, w, cx)
+            }))
+            .when(!self.onboarding, |d| {
+                d.children(self.composer_layer(window, cx))
+            })
+            .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
+            .when(
+                self.menu.as_ref().is_some_and(|m| m.window.is_none()),
+                |d| d.child(self.popup_menu(window, cx)),
+            )
+    }
+}
+impl MailApp {
+    /// The app's commands (menus and keyboard shortcuts), for the desktop
+    /// window and the phone's alike: a tablet's hardware keyboard uses them.
+    fn app_actions(&self, d: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
+        d
             .on_action(cx.listener(|this, _: &Compose, w, cx| this.new_compose(0, w, cx)))
             .on_action(cx.listener(|this, _: &Quit, _, cx| {
                 if this.sending {
@@ -8875,20 +8945,6 @@ impl MailApp {
             }))
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
-            .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
-            .when(!self.onboarding, |d| self.main(d, window, cx))
-            .map(|d| self.track_resize(d, cx))
-            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ComposerDrag>, w, cx| {
-                this.drag_composer(e, w, cx)
-            }))
-            .when(!self.onboarding, |d| {
-                d.children(self.composer_layer(window, cx))
-            })
-            .when(self.modal.is_some(), |d| d.child(self.modal(window, cx)))
-            .when(
-                self.menu.as_ref().is_some_and(|m| m.window.is_none()),
-                |d| d.child(self.popup_menu(window, cx)),
-            )
     }
 }
 impl MailApp {
@@ -9528,17 +9584,19 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
 }
 
 /// Runs the app on this system's own GPUI platform.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn run(store: Arc<Store>) {
     run_on(gpui_platform::application(), store);
 }
 
-/// Runs the app on `app`'s platform (Android's comes from its activity).
+/// Runs the app on `app`'s platform (a phone's comes from its activity or
+/// app delegate). On iOS this returns once the window is set up to open; the
+/// host app's delegate then opens it (`gpui_ios_did_finish_launching`).
 pub fn run_on(app: Application, store: Arc<Store>) {
     let app = app.with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::sync::oauth::opened);
     super::desktop::register();
-    app.run(move |cx| {
+    let launch = move |cx: &mut gpui::App| {
         gpui_component::init(cx);
         prompt::install(cx);
         cx.on_action(|_: &Hide, cx| cx.hide());
@@ -9550,11 +9608,17 @@ pub fn run_on(app: Application, store: Arc<Store>) {
         cx.bind_keys(bindings);
         let bindings = app_bindings(cx);
         cx.bind_keys(bindings);
-        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+        // A desktop previewing the phone presentation opens phone-sized.
+        let (width, height) = if mobile::desktop_preview() {
+            (390., 844.)
+        } else {
+            (1280., 820.)
+        };
+        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         cx.open_window(
             WindowOptions {
-                // Android's window is the whole screen.
-                window_bounds: (!cfg!(target_os = "android"))
+                // A phone's window is the whole screen.
+                window_bounds: (!cfg!(any(target_os = "android", target_os = "ios")))
                     .then_some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(360.), px(320.))),
                 titlebar: Some(TitlebarOptions {
@@ -9602,7 +9666,13 @@ pub fn run_on(app: Application, store: Arc<Store>) {
         })
         .detach();
         cx.activate(true);
-    });
+    };
+    // UIKit owns iOS's run loop, so `run` returns at once there; keep the
+    // app alive for as long as the process runs.
+    #[cfg(target_os = "ios")]
+    std::mem::forget(app.run_embedded(launch));
+    #[cfg(not(target_os = "ios"))]
+    app.run(launch);
 }
 
 /// The menu bar. On macOS the first menu is the application menu.

@@ -1413,10 +1413,26 @@ fn write_preferences(db: Connection, queue: &PrefQueue, rx: mpsc::Receiver<()>) 
         queue.idle.notify_all();
     }
 }
+// The service name predates the Picacho name; keep it so saved credentials
+// stay readable.
+const SECRET_SERVICE: &str = "com.pinal.native-mail";
+#[cfg(not(target_os = "ios"))]
 pub fn secret_entry(id: &str) -> Result<keyring::Entry> {
-    // The service name predates the Picacho name; keep it so saved
-    // credentials stay readable.
-    keyring::Entry::new("com.pinal.native-mail", id).context("Cannot access the system keychain")
+    keyring::Entry::new(SECRET_SERVICE, id).context("Cannot access the system keychain")
+}
+/// iOS keeps credentials in the app's own Keychain (Protected Data).
+#[cfg(target_os = "ios")]
+pub fn secret_entry(id: &str) -> Result<keyring_core::Entry> {
+    static STORE: std::sync::LazyLock<std::result::Result<(), String>> =
+        std::sync::LazyLock::new(|| {
+            apple_native_keyring_store::protected::Store::new()
+                .map(|store| keyring_core::set_default_store(store))
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = &*STORE {
+        anyhow::bail!("Cannot access the system keychain: {e}");
+    }
+    keyring_core::Entry::new(SECRET_SERVICE, id).context("Cannot access the system keychain")
 }
 pub fn read_secret(id: &str) -> Result<Secret> {
     serde_json::from_str(

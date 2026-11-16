@@ -24,12 +24,17 @@ impl MailApp {
         cx: &Context<Self>,
     ) -> Div {
         let c = self.colors();
-        div()
+        let phone = self.mobile.on;
+        let track = div()
+            .id(SharedString::from(format!("{id}-track")))
             .w_full()
             .min_w_0()
             .p(px(3.))
             .flex()
-            .flex_wrap()
+            // A phone keeps the choices on one line, scrolling sideways
+            // when they don't fit, rather than dropping some to a new line.
+            .when(!phone, |d| d.flex_wrap())
+            .when(phone, |d| d.overflow_x_scroll())
             .gap(px(3.))
             .rounded(px(10.))
             .bg(rgb(c.bg))
@@ -45,14 +50,17 @@ impl MailApp {
                             .id(SharedString::from(selector.clone()))
                             .debug_selector(move || selector)
                             .flex_1()
-                            .min_w(px(76.))
-                            .h(px(28.))
+                            .when(!phone, |d| d.min_w(px(76.)).h(px(28.)).text_size(px(12.)))
+                            // Each choice keeps its whole label; they share
+                            // what room is left.
+                            .when(phone, |d| {
+                                d.flex_shrink_0().h(px(36.)).px_3().text_size(px(14.)).whitespace_nowrap()
+                            })
                             .px_2()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded(px(7.))
-                            .text_size(px(12.))
                             .font_weight(FontWeight::MEDIUM)
                             .cursor_pointer()
                             .when(active, |d| {
@@ -69,7 +77,8 @@ impl MailApp {
                                 }),
                             )
                     }),
-            )
+            );
+        div().w_full().min_w_0().child(track)
     }
     pub(super) fn switch(
         &self,
@@ -1814,7 +1823,7 @@ impl Render for SettingsWindow {
 
 impl MailApp {
     /// The open settings page.
-    fn settings_body(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn settings_body(&self, cx: &Context<Self>) -> AnyElement {
         match &self.page {
             Page::Account(id) => match self.accounts.iter().position(|a| &a.id == id) {
                 Some(i) => self.account_page(i, cx),

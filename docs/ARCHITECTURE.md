@@ -7,6 +7,7 @@ Picacho has three units. `main.rs` only opens the data directory and starts the 
 | **Sync** (`src/sync/`) | Provider APIs, discovery, OAuth, verified TLS, IMAP/POP3/SMTP exchanges, MIME decoding | `imap`, `pop`, `smtp`, `discover`, `oauth` |
 | **Manage** (`src/manage/`) | Account operations, per-account serialization, cache reconciliation, SQLite, local drafts, encryption and readable in-memory messages | `Backend`, `Store`, domain types in `model` |
 | **Display** (`src/display/`) | GPUI events and views, settings, message reader, assets and notifications | `run`, `ui`, `settings`, `reader` |
+| **Display, mobile** (`src/display-mobile/`) | The phone and tablet presentation of the same `MailApp` state: navigation stack, bottom bars, sheets, swipes, safe area and keyboard | `mobile_root`, `Mobile` |
 
 Display invokes Manage on GPUI's background executor. Manage coordinates Sync and persists completed results. Sync's protocol helpers have no database or UI access. Domain types are shared from Manage. OAuth currently saves refreshed credentials through Manage's keychain helper; credentials never enter SQLite. The internal `transport` facade keeps the coordinator's imports small, while protocol implementations remain in separate files.
 
@@ -19,6 +20,7 @@ Display invokes Manage on GPUI's background executor. Manage coordinates Sync an
 - Encryption: change `manage/crypto.rs`; plaintext from encrypted mail must stay in memory.
 - HTML renderer: `display/html/` is a reusable component with no mailbox, database, or MailApp dependencies. `document.rs` owns Blitz layout and vector painting, `view.rs` adapts GPUI input and visible-tile painting, and `resources.rs` is the only resource-loading boundary. The reader supplies HTML and a per-email remote-content policy. Reading defaults live in `manage/reading.rs`; both defaults and overrides use Store preferences. See [Picacho-Patches](https://github.com/pinaltech/Picacho-Patches/tree/HEAD/stylo_derive) for the scoped upstream compatibility patch.
 - Settings or reader layout: use `display/settings.rs` or `display/reader.rs`. Shared view state and event handling live in `display/ui.rs`.
+- Phones and tablets: `src/display-mobile/` is a child module of `display::ui` (declared there with `#[path]`), so it renders the same state and dispatches the same `Action`s, reusing the desktop's message body, Settings pages, setup flow, composer and dialogs inside touch chrome. It is on for iOS and Android builds; on a desktop, `PICACHO_MOBILE=1` previews it in a phone-sized window (`PICACHO_MOBILE_TOP` and `PICACHO_MOBILE_BOTTOM` set the simulated safe area). Controls are at least `mobile::TOUCH` points; give new text fields a keyboard layout in `keyboard_fields`.
 
 ## Verification and commits
 
