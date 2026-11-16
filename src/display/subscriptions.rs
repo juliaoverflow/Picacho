@@ -16,6 +16,9 @@ pub(super) enum SubsTab {
 }
 /// Done once: reads List-Unsubscribe from mail downloaded before it was kept.
 const BACKFILL_PREFERENCE: &str = "subscriptions_backfilled";
+/// Done once: the same for Proton mail downloaded before its background
+/// download kept List-Unsubscribe.
+const PROTON_BACKFILL_PREFERENCE: &str = "subscriptions_backfilled_proton";
 
 impl MailApp {
     pub(super) fn load_unsubscribed(&mut self) {
@@ -33,16 +36,35 @@ impl MailApp {
                 .store.set_preference_soon(subs::UNSUBSCRIBED_PREFERENCE, &json);
         }
     }
-    /// Finds the subscriptions in mail cached before they were detected.
+    /// Finds the subscriptions in mail cached before they were detected:
+    /// all mail once, and Proton's once more, as its background download
+    /// used to keep no List-Unsubscribe (opening each message found it).
     pub(super) fn backfill_subscriptions(&mut self, cx: &mut Context<Self>) {
-        if self.backend.store.preference(BACKFILL_PREFERENCE).is_some() {
+        let all = self.backend.store.preference(BACKFILL_PREFERENCE).is_none();
+        let proton: Vec<String> = if self.backend.store.preference(PROTON_BACKFILL_PREFERENCE).is_none() {
+            self.accounts
+                .iter()
+                .filter(|a| a.provider == Provider::Proton)
+                .map(|a| a.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !all && proton.is_empty() {
             return;
         }
         self.task(
             cx,
-            |b| {
-                let found = b.store.backfill_subscriptions()?;
-                b.store.set_preference(BACKFILL_PREFERENCE, "1")?;
+            move |b| {
+                let mut found = 0;
+                if all {
+                    found += b.store.backfill_subscriptions()?;
+                    b.store.set_preference(BACKFILL_PREFERENCE, "1")?;
+                } else if !proton.is_empty() {
+                    found += b.store.backfill_subscriptions_in(&proton)?;
+                }
+                // Proton mail downloaded from now on keeps it.
+                b.store.set_preference(PROTON_BACKFILL_PREFERENCE, "1")?;
                 Ok(found)
             },
             |this, result, cx| {
@@ -50,6 +72,26 @@ impl MailApp {
                     this.load_subscriptions(cx);
                 }
             },
+        );
+    }
+    /// Compresses message sources saved before they were kept compressed,
+    /// and gives the space back to the system where it can at once (see
+    /// `Store::compact_on_quit` for the rest); once.
+    pub(super) fn pack_saved_sources(&mut self, cx: &mut Context<Self>) {
+        // Not `sources_packed`: earlier builds of this change set that after
+        // compressing sources in place, which are moved to their own column.
+        const DONE: &str = "sources_moved";
+        if self.backend.store.preference(DONE).is_some() {
+            return;
+        }
+        self.task(
+            cx,
+            |b| {
+                let packed = b.store.pack_saved_sources()?;
+                b.store.set_preference(DONE, "1")?;
+                Ok(packed)
+            },
+            |_, _, _| {},
         );
     }
     /// Cleans the previews of mail cached before Office markup, entities
@@ -534,30 +576,18 @@ impl MailApp {
     pub(super) fn unsubscribe_banner(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
         let sub = MailSubscription::of(m)?;
         let c = self.colors();
+        let unsubscribe = self.unsubscribe_button("unsubscribe-mail".into(), &sub, cx);
         Some(
-            div()
-                .id("unsubscribe-banner")
-                .debug_selector(|| "unsubscribe-banner".into())
-                .mb_3()
-                .px_3()
-                .py_2()
-                .rounded(px(9.))
-                .border_1()
-                .border_color(rgb(c.border))
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(px(12.))
-                .text_color(rgb(c.muted))
-                .child(icon_el("subscriptions", 14., c.muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child("This message is from a mailing list or subscription."),
-                )
-                .child(self.unsubscribe_button("unsubscribe-mail".into(), &sub, cx))
-                .into_any_element(),
+            self.banner(
+                "unsubscribe-banner",
+                "subscriptions",
+                BannerStyle::Outlined,
+                "This message is from a mailing list or subscription.",
+                [unsubscribe.into_any_element()],
+            )
+            // A quiet line: it is offered on every such message.
+            .text_color(rgb(c.muted))
+            .into_any_element(),
         )
     }
     /// "Subscriptions" under an account, or "All Subscriptions" under All Accounts.

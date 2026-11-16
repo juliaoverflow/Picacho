@@ -110,11 +110,13 @@ impl Change {
                 m.remote_folder = name.clone();
             }
             Self::Label(label, add) => {
-                m.labels.retain(|l| l != label);
+                let mut labels: Vec<String> =
+                    m.labels().iter().filter(|l| *l != label).cloned().collect();
                 if *add {
-                    m.labels.push(label.clone());
-                    m.labels.sort();
+                    labels.push(label.clone());
+                    labels.sort();
                 }
+                m.set_labels(labels);
             }
             Self::Mark(Mark::Answered) => m.answered = true,
             Self::Mark(Mark::Forwarded) => m.forwarded = true,
@@ -126,7 +128,7 @@ impl Change {
         match self {
             Self::Read(read) => m.unread != *read,
             Self::Star(star) => m.starred == *star,
-            Self::Label(label, add) => m.labels.contains(label) == *add,
+            Self::Label(label, add) => m.labels().contains(label) == *add,
             Self::Mark(Mark::Answered) => m.answered,
             Self::Mark(Mark::Forwarded) => m.forwarded,
             Self::Mark(Mark::ReceiptHandled) => m.mdn_sent,
@@ -220,8 +222,10 @@ pub struct Backend {
     limits: Mutex<Limits>,
     /// Mailbox layouts by (account, mailbox key), from the latest search.
     layouts: Mutex<HashMap<(String, String), Layout>>,
-    /// Changes whenever a layout does; see `list_revision`.
-    layout_revision: AtomicU64,
+    /// Each account's layout revision, moved on whenever one of its
+    /// layouts changes; see `list_revision`.
+    layout_revisions: Mutex<HashMap<String, u64>>,
+    layout_changes: AtomicU64,
     /// A sign-in that failed after the browser, kept for one retry.
     pending: Mutex<Option<Pending>>,
     /// How far the current sign-in has come; see `sign_in_step`.
@@ -278,7 +282,8 @@ impl Backend {
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
             layouts: Mutex::new(HashMap::new()),
-            layout_revision: AtomicU64::new(0),
+            layout_revisions: Mutex::new(HashMap::new()),
+            layout_changes: AtomicU64::new(0),
             pending: Mutex::new(None),
             sign_in_step: Mutex::new(SignInStep::Browser),
             waiting: Mutex::new(HashMap::new()),
@@ -712,7 +717,7 @@ impl Backend {
             .lock()
             .unwrap()
             .retain(|(account, _), _| account != id);
-        self.layouts_changed();
+        self.layouts_changed(id);
         let identities: Vec<crate::manage::model::Identity> = self
             .store
             .accounts()
@@ -816,7 +821,7 @@ impl Backend {
                 m.html = r.html.clone();
                 m.inline = r.inline.clone();
                 m.snippet = r.snippet.clone();
-                m.attachments = r.attachments.clone();
+                m.set_attachments(r.attachments().to_vec());
                 m.has_attachments = r.has_attachments;
             }
         }
@@ -998,7 +1003,7 @@ impl Backend {
                 }
             }
         }
-        self.store.messages(&a.id, Folder::All, limit)
+        self.store.newest(&a.id, Folder::All, limit)
     }
     /// Brings one server mailbox's cache up to date. After a first full
     /// synchronization, later ones ask only for what changed: messages past
@@ -1081,7 +1086,7 @@ impl Backend {
             _ => {
                 let newest: Vec<u32> = self
                     .store
-                    .messages(&a.id, mailbox, limit)?
+                    .newest(&a.id, mailbox, limit)?
                     .into_iter()
                     .filter(|m| m.id.starts_with(&prefix))
                     .map(|m| m.uid)
@@ -1123,7 +1128,7 @@ impl Backend {
             // Server threads for the new mail, where the server has them.
             let _ = self.thread_mailbox(c, a, remote, validity);
         }
-        let mut result = self.store.messages(&a.id, mailbox, limit)?;
+        let mut result = self.store.newest(&a.id, mailbox, limit)?;
         result.retain(|m| m.id.starts_with(&prefix));
         Ok(result)
     }
@@ -1351,21 +1356,23 @@ impl Backend {
             uids: Arc::new(uids),
         };
         layouts.insert(key, layout.clone());
-        self.layouts_changed();
+        self.layouts_changed(&a.id);
         layout
     }
-    pub(super) fn layouts_changed(&self) {
-        self.layout_revision.fetch_add(1, Ordering::Release);
+    pub(super) fn layouts_changed(&self, account: &str) {
+        let change = self.layout_changes.fetch_add(1, Ordering::AcqRel) + 1;
+        self.layout_revisions
+            .lock()
+            .unwrap()
+            .insert(account.to_owned(), change);
     }
-    /// Changes whenever what message lists show may have: the cache's
-    /// `Store::list_revision`, or a mailbox layout (which places rows for
-    /// mail not listed yet). Read before building a list; the list is
-    /// current for as long as this stays the same.
-    pub fn list_revision(&self) -> (u64, u64) {
-        (
-            self.store.list_revision(),
-            self.layout_revision.load(Ordering::Acquire),
-        )
+    /// Changes whenever what `account`'s message lists show may have: the
+    /// cache's `Store::list_revision`, or one of its mailbox layouts (which
+    /// place rows for mail not listed yet). Read before building a list; the
+    /// list is current for as long as this stays the same.
+    pub fn list_revision(&self, account: &str) -> (u64, u64) {
+        let layout = self.layout_revisions.lock().unwrap().get(account).copied();
+        (self.store.list_revision(account), layout.unwrap_or(0))
     }
     /// Gives a mailbox a layout without a server, for display tests.
     #[cfg(test)]
@@ -1387,7 +1394,7 @@ impl Backend {
             .unwrap()
             .remove(&(a.id.clone(), mailbox.key()));
         if removed.is_some() {
-            self.layouts_changed();
+            self.layouts_changed(&a.id);
         }
     }
     /// Adds new and removes moved messages in a known layout.
@@ -1418,7 +1425,7 @@ impl Backend {
         if uids != *layout.uids {
             layout.uids = Arc::new(uids);
             drop(layouts);
-            self.layouts_changed();
+            self.layouts_changed(&a.id);
         }
     }
     /// POP3 has no headers-only listing, so older messages are downloaded
@@ -1517,7 +1524,7 @@ impl Backend {
                 m.forwarded = row.forwarded();
                 m.mdn_sent = row.mdn_sent();
                 if let Some(labels) = row.labels(gmail) {
-                    m.labels = labels;
+                    m.set_labels(labels);
                 }
                 result.push(m);
             }
@@ -1653,12 +1660,12 @@ impl Backend {
             m.starred = row.flagged();
             m.size = row.size.unwrap_or(0);
             m.gmail_id = row.gmail_id.unwrap_or(0);
-            m.labels = row.labels(gmail).unwrap_or_default();
+            m.set_labels(row.labels(gmail).unwrap_or_default());
             m.answered = row.answered();
             m.forwarded = row.forwarded();
             m.mdn_sent = row.mdn_sent();
-            m.thread_id = row.thread.clone().unwrap_or_default();
-            m.saved = row.save_date.unwrap_or_default();
+            m.set_thread_id(row.thread.clone().unwrap_or_default());
+            m.set_saved(row.save_date.unwrap_or_default());
             if let Some(preview) = row.preview.as_deref().filter(|p| !p.is_empty()) {
                 m.snippet = preview.to_owned();
             }
@@ -1678,7 +1685,7 @@ impl Backend {
         password: &str,
     ) -> Result<Vec<Mail>> {
         if !matches!(folder, Folder::Inbox | Folder::Starred | Folder::All) {
-            return self.store.messages(&a.id, folder, limit);
+            return self.store.newest(&a.id, folder, limit);
         }
         let mut pop = self.pop_login(a, password)?;
         let ids = pop.uidl()?;
@@ -1723,7 +1730,7 @@ impl Backend {
         self.store.save_messages(&messages)?;
         // POP3 has no folders. Keep local moves and messages removed from the
         // remote server; UIDL identities prevent duplicate downloads.
-        messages = self.store.messages(&a.id, folder, limit)?;
+        messages = self.store.newest(&a.id, folder, limit)?;
         messages.sort_by(Mail::newest_first);
         if folder == Folder::Starred {
             messages.retain(|m| m.starred);
@@ -1752,14 +1759,16 @@ impl Backend {
             // those stay. The body comes from `next`: zero-access mail keeps
             // none in the cache.
             return Ok(self.store.refresh_message(&kept)?.map_or(next.clone(), |current| {
-                Mail {
+                let labels = current.labels().to_vec();
+                let mut next = Mail {
                     unread: current.unread,
                     starred: current.starred,
                     folder: current.folder,
                     remote_folder: current.remote_folder,
-                    labels: current.labels,
                     ..next
-                }
+                };
+                next.set_labels(labels);
+                next
             }));
         }
         let waiting = self.wait_for(&a.id);
@@ -1840,7 +1849,7 @@ impl Backend {
         next.starred = m.starred;
         next.size = m.size;
         // What only the server's listing says, not the message's source.
-        next.labels = m.labels.clone();
+        next.set_labels(m.labels().to_vec());
         if next.gmail_id == 0 {
             next.gmail_id = m.gmail_id;
         }
@@ -1849,7 +1858,7 @@ impl Backend {
             kept.body = None;
             kept.html = None;
             kept.snippet.clear();
-            kept.attachments.clear();
+            kept.set_attachments(Vec::new());
             self.readable
                 .lock()
                 .unwrap()
@@ -2510,12 +2519,12 @@ impl Backend {
                             continue;
                         }
                         // Keep summaries small: list views load every row's JSON.
-                        if let Ok(parsed) =
+                        if let Ok(mut parsed) =
                             parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid)
                         {
                             let mut next = (*m).clone();
-                            next.has_attachments = !parsed.attachments.is_empty();
-                            next.attachments = parsed.attachments;
+                            next.has_attachments = !parsed.attachments().is_empty();
+                            next.set_attachments(parsed.take_attachments());
                             if next.snippet.is_empty() {
                                 next.snippet = parsed.snippet;
                             }
@@ -3027,14 +3036,14 @@ impl Backend {
             reply_to: header("Reply-To").trim().to_owned(),
             ..Draft::default()
         };
-        if !m.attachments.is_empty() {
+        if !m.attachments().is_empty() {
             let dir = self.draft_files(id);
             std::fs::create_dir_all(&dir)?;
             let mut leaves = Vec::new();
             collect_leaves(&parsed, &mut leaves);
             // Names already given, lowercase as case-insensitive disks see them.
             let mut used = std::collections::HashSet::new();
-            for (i, attachment) in m.attachments.iter().enumerate() {
+            for (i, attachment) in m.attachments().iter().enumerate() {
                 let Some(leaf) = leaves.get(attachment.part) else {
                     continue;
                 };
@@ -3056,7 +3065,7 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         // A message too large to download whole: just this part.
-        if let Some(attachment) = m.attachments.iter().find(|x| x.part == part && !x.section.is_empty())
+        if let Some(attachment) = m.attachments().iter().find(|x| x.part == part && !x.section.is_empty())
             && self.store.raw(&m.id)?.is_none()
         {
             let attachment = attachment.clone();
@@ -3248,17 +3257,17 @@ mod layout_tests {
         let a = Account::new(Provider::Imap);
         let inbox = Mailbox::Standard(Folder::Inbox);
         b.set_test_layout(&a, &inbox, "INBOX", 1, vec![1, 2, 3]);
-        let (first, revision) = (b.layout(&a.id, &inbox).unwrap(), b.list_revision());
+        let (first, revision) = (b.layout(&a.id, &inbox).unwrap(), b.list_revision(&a.id));
         b.set_test_layout(&a, &inbox, "INBOX", 1, vec![1, 2, 3]);
         b.extend_layout(&a, &inbox, 1, std::iter::empty(), &[]);
         b.extend_layout(&a, &inbox, 1, [2].into_iter(), &[9]);
         let same = b.layout(&a.id, &inbox).unwrap();
         assert!(Arc::ptr_eq(&first.uids, &same.uids));
-        assert_eq!(b.list_revision(), revision);
+        assert_eq!(b.list_revision(&a.id), revision);
         b.extend_layout(&a, &inbox, 1, [4].into_iter(), &[1]);
         let next = b.layout(&a.id, &inbox).unwrap();
         assert_eq!(*next.uids, [2, 3, 4]);
-        assert_ne!(b.list_revision(), revision);
+        assert_ne!(b.list_revision(&a.id), revision);
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

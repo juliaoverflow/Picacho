@@ -39,6 +39,24 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.compose_with(mode, original, placement, None, w, cx);
+    }
+
+    /// A new message to `to` (an address list), sent from the account of
+    /// the open message, as from a reader's address menu.
+    pub(super) fn compose_to(&mut self, to: String, w: &mut Window, cx: &mut Context<Self>) {
+        self.compose_with(0, None, None, Some(to), w, cx);
+    }
+
+    fn compose_with(
+        &mut self,
+        mode: u8,
+        original: Option<Mail>,
+        placement: Option<Placement>,
+        to: Option<String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.onboarding {
             return;
         }
@@ -75,9 +93,15 @@ impl MailApp {
                 }));
             }
         }
+        // Writing to someone from an open message: from the account it came to.
         let account = original
             .as_ref()
             .and_then(|m| self.account_of(m))
+            .or_else(|| {
+                to.as_ref()
+                    .and_then(|_| self.selected_mail())
+                    .and_then(|m| self.account_of(&m))
+            })
             .or_else(|| self.current_account());
         let own = account
             .as_ref()
@@ -159,7 +183,7 @@ impl MailApp {
                     draft.to = to;
                     draft.cc = cc;
                     draft.reply_id = m.message_id.clone();
-                    draft.references = format!("{} {}", m.references, m.message_id)
+                    draft.references = format!("{} {}", m.references(), m.message_id)
                         .trim()
                         .to_string();
                 }
@@ -175,10 +199,10 @@ impl MailApp {
                         date_full(m.date),
                         m.subject,
                         recipients(&m.to),
-                        if m.cc.is_empty() {
+                        if m.cc().is_empty() {
                             String::new()
                         } else {
-                            format!("Cc: {}\n", recipients(&m.cc))
+                            format!("Cc: {}\n", recipients(m.cc()))
                         },
                         quoted
                     )
@@ -203,6 +227,9 @@ impl MailApp {
                 };
                 draft.body = format!("{}{quote}", sign(true));
             }
+        }
+        if let Some(to) = to {
+            draft.to = to;
         }
         // A mailbox kept to its aliases writes as one of them.
         if draft.send_as.is_empty()
@@ -264,7 +291,7 @@ impl MailApp {
     fn reader_visible(&self, w: &Window) -> bool {
         self.selected.is_some()
             && !self.reader_collapsed
-            && (w.viewport_size().width >= px(900.) || self.selected.is_some())
+            && (super::window::content_size(w).width >= px(900.) || self.selected.is_some())
     }
 
     /// An open composer answering `m`: forwarding it, or replying to it.
@@ -563,8 +590,11 @@ impl MailApp {
 
     /// People to suggest as recipients: senders of loaded mail, most recent
     /// first, one entry per address.
+    /// People to suggest in a composer's address fields: everyone in the
+    /// listed mail, newest first, up to 2,000, not counting your own
+    /// addresses. Kept until the list or your addresses change.
     fn contacts(&self) -> Rc<Vec<(String, String)>> {
-        let own: HashSet<String> = self
+        let mut own: Vec<String> = self
             .accounts
             .iter()
             .flat_map(|a| {
@@ -572,32 +602,16 @@ impl MailApp {
                     .chain(a.identities.iter().map(|i| i.email.to_lowercase()))
             })
             .collect();
-        let mut seen = HashSet::new();
-        let mut out = vec![];
-        let mut by_date: Vec<&Mail> = self.messages.iter().filter(|m| !m.pending).collect();
-        by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
-        for m in by_date {
-            let mut people = vec![(m.sender.clone(), m.from.clone())];
-            for list in [&m.to, &m.cc] {
-                if let Ok(parsed) = crate::sync::smtp::recipients(list) {
-                    people.extend(
-                        parsed
-                            .into_iter()
-                            .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
-                    );
-                }
-            }
-            for (name, email) in people {
-                let key = email.to_lowercase();
-                if email.contains('@') && !own.contains(&key) && seen.insert(key) {
-                    out.push((name, email));
-                }
-            }
-            if out.len() >= 2000 {
-                break;
-            }
+        own.sort();
+        if let Some((revision, addresses, contacts)) = &*self.contacts_cache.borrow()
+            && *revision == self.list_revision
+            && *addresses == own
+        {
+            return contacts.clone();
         }
-        Rc::new(out)
+        let contacts = Rc::new(gather_contacts(&self.messages, &own));
+        *self.contacts_cache.borrow_mut() = Some((self.list_revision, own, contacts.clone()));
+        contacts
     }
 
     /// Brings the end of the reader, where its inline reply is, into view.
@@ -967,8 +981,10 @@ impl MailApp {
     /// Floating, minimized and maximized composers over the main window.
     pub(super) fn composer_layer(&self, window: &Window, cx: &Context<Self>) -> Vec<AnyElement> {
         let c = self.colors();
-        let viewport = window.viewport_size();
-        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        // Composers are placed inside the window's frame, which is smaller
+        // than the window while Picacho draws its own decorations.
+        let frame = super::window::content_size(window);
+        let (vw, vh) = (f32::from(frame.width), f32::from(frame.height));
         let mut right = 16.;
         let mut out = vec![];
         for composer in &self.composers {
@@ -1116,12 +1132,15 @@ impl MailApp {
         let Some(composer) = self.composers.iter().find(|c| c.entity_id() == id).cloned() else {
             return;
         };
-        let viewport = w.viewport_size();
-        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        // The pointer is in window coordinates; composers are placed in the
+        // frame's, which start past the shadow band and borders of a window
+        // drawing its own decorations.
+        let frame = super::window::content_bounds(w);
+        let (vw, vh) = (f32::from(frame.size.width), f32::from(frame.size.height));
         let w_ = FLOAT_W.min(vw - 32.);
         let h_ = FLOAT_H.min(vh - TITLEBAR_HEIGHT - 24.).max(BAR_H);
         composer.update(cx, |c, cx| {
-            let p = e.event.position - c.grab;
+            let p = e.event.position - c.grab - frame.origin;
             let (x, y) = clamp_origin(p, w_, h_, vw, vh);
             c.origin = Some(point(px(x), px(y)));
             cx.notify();
@@ -1197,7 +1216,7 @@ pub(super) fn reply_recipients(m: &Mail, all: bool, own: &[&str]) -> (String, St
     }
     let mut cc = vec![];
     if all {
-        for list in [&m.to, &m.cc] {
+        for list in [m.to.as_str(), m.cc()] {
             for (name, email) in crate::sync::smtp::recipients(list).unwrap_or_default() {
                 if seen.insert(email.to_lowercase()) {
                     cc.push(format(name, &email));
@@ -1213,7 +1232,7 @@ pub(super) fn alias_addressed<'a>(
     m: &Mail,
     aliases: &'a [fwd::SendAlias],
 ) -> Option<&'a fwd::SendAlias> {
-    let addressed: Vec<String> = [&m.to, &m.cc]
+    let addressed: Vec<String> = [m.to.as_str(), m.cc()]
         .into_iter()
         .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
         .map(|(_, email)| email.to_lowercase())
@@ -1229,7 +1248,7 @@ pub(super) fn identity_addressed<'a>(
     if a.identities.is_empty() {
         return None;
     }
-    let addressed: Vec<String> = [&m.to, &m.cc]
+    let addressed: Vec<String> = [m.to.as_str(), m.cc()]
         .into_iter()
         .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
         .map(|(_, email)| email.to_lowercase())
@@ -1252,15 +1271,59 @@ mod tests {
         assert_eq!(reply_subject("Re: Plans", true), "Fwd: Re: Plans");
     }
 
+    /// Contacts come out as gathering every message's recipients would:
+    /// newest first, each once with its first name, never your own.
+    #[test]
+    fn contacts_skip_lists_already_read_and_come_out_the_same() {
+        let own = vec!["me@example.com".to_owned()];
+        let mut messages = Vec::new();
+        for i in 0..60 {
+            let mut m = Mail {
+                id: i.to_string(),
+                from: format!("sender{}@x.com", i % 7),
+                sender: format!("Sender {}", i % 7),
+                to: if i % 3 == 0 { "Me <me@example.com>".into() } else { format!("Ana <ana@x.com>, bo{}@x.com", i % 4) },
+                date: i as i64 * if i % 2 == 0 { 1 } else { -1 },
+                ..Mail::default()
+            };
+            if i % 5 == 0 {
+                m.set_cc("Cy <cy@x.com>, ME@example.com, not an address");
+            }
+            messages.push(m);
+        }
+        let old = |messages: &[Mail]| {
+            let mut seen = HashSet::new();
+            let mut out = vec![];
+            let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
+            by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
+            for m in by_date {
+                let mut people = vec![(m.sender.clone(), m.from.clone())];
+                for list in [m.to.as_str(), m.cc()] {
+                    if let Ok(parsed) = crate::sync::smtp::recipients(list) {
+                        people.extend(parsed.into_iter().map(|(n, e)| (n.unwrap_or_else(|| e.clone()), e)));
+                    }
+                }
+                for (name, email) in people {
+                    let key = email.to_lowercase();
+                    if email.contains('@') && key != "me@example.com" && seen.insert(key) {
+                        out.push((name, email));
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(gather_contacts(&messages, &own), old(&messages));
+    }
+
     #[test]
     fn reply_all_copies_everyone_but_you() {
-        let m = Mail {
+        let mut m = Mail {
             from: "ana@example.com".into(),
             sender: "Ana".into(),
             to: "me@example.com, Bo <bo@example.com>".into(),
-            cc: "cy@example.com, ana@example.com".into(),
             ..Mail::default()
         };
+        m.set_cc("cy@example.com, ana@example.com");
         assert_eq!(
             reply_recipients(&m, false, &["me@example.com"]),
             ("Ana <ana@example.com>".into(), String::new())
@@ -1306,4 +1369,42 @@ mod tests {
         );
         assert!(alias_addressed(&Mail::default(), &aliases).is_none());
     }
+}
+
+/// Everyone in `messages`, newest first, up to 2,000, but those in `own`
+/// (lowercase). Recipient lists already read are skipped: mail from lists
+/// is sent to the same few addresses over and over, and parsing every
+/// list of tens of thousands of messages took most of the time.
+pub(super) fn gather_contacts(messages: &[Mail], own: &[String]) -> Vec<(String, String)> {
+    let own: HashSet<&str> = own.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut lists_read: HashSet<&str> = HashSet::new();
+    let mut out = vec![];
+    let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
+    by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
+    for m in by_date {
+        let mut people = vec![(m.sender.clone(), m.from.clone())];
+        for list in [m.to.as_str(), m.cc()] {
+            if !lists_read.insert(list) {
+                continue;
+            }
+            if let Ok(parsed) = crate::sync::smtp::recipients(list) {
+                people.extend(
+                    parsed
+                        .into_iter()
+                        .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
+                );
+            }
+        }
+        for (name, email) in people {
+            let key = email.to_lowercase();
+            if email.contains('@') && !own.contains(key.as_str()) && seen.insert(key) {
+                out.push((name, email));
+            }
+        }
+        if out.len() >= 2000 {
+            break;
+        }
+    }
+    out
 }

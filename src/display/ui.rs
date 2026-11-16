@@ -50,6 +50,7 @@ mod prompt;
 use panes::{LIST_MIN, Pane, Resize};
 #[path = "reader.rs"]
 mod reader;
+use reader::BannerStyle;
 #[cfg(test)]
 #[path = "reading_tests.rs"]
 mod reading_tests;
@@ -332,6 +333,56 @@ fn search_term(field: &str, value: &str) -> String {
         format!("{field}:{value}")
     }
 }
+/// "Name <address>" as a header writes it, the name quoted when it holds
+/// characters that would split it; the bare address when there is no name.
+fn name_and_address(name: Option<&str>, email: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        None => email.to_owned(),
+        Some(name) => {
+            let plain = name
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || " !#$%&'*+-/=?^_`{|}~".contains(ch));
+            if plain {
+                format!("{name} <{email}>")
+            } else {
+                let quoted = name.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{quoted}\" <{email}>")
+            }
+        }
+    }
+}
+/// The menu of an address in the open message's headers: copying it, and,
+/// for a sender (`from`: the address to look its mail up by), writing to it
+/// and finding its mail.
+fn address_entries(name: Option<&str>, email: &str, from: Option<&str>) -> Vec<Entry> {
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    let mut entries = Vec::new();
+    if let Some(name) = name {
+        entries.push(entry("Copy Name", "copy", Action::CopyText(name.to_owned())));
+    }
+    entries.push(entry("Copy Address", "copy", Action::CopyText(email.to_owned())));
+    if name.is_some() {
+        entries.push(entry(
+            "Copy Name and Address",
+            "copy",
+            Action::CopyText(name_and_address(name, email)),
+        ));
+    }
+    if let Some(from) = from {
+        entries.push(Entry::Separator);
+        entries.push(entry(
+            "Send Email…",
+            "compose",
+            Action::ComposeTo(name_and_address(name, email)),
+        ));
+        entries.push(entry(
+            "Show Mail From This Address",
+            "search",
+            Action::SearchFor(search_term("from", from)),
+        ));
+    }
+    entries
+}
 fn keys(text: &str) -> String {
     if cfg!(target_os = "macos") {
         return text.into();
@@ -515,6 +566,8 @@ enum Action {
     /// Proton sign-in: back to the password.
     ProtonBack,
     Compose,
+    /// A new message to these addresses.
+    ComposeTo(String),
     Reply(bool),
     Forward,
     Refresh,
@@ -971,7 +1024,13 @@ pub struct MailApp {
     /// for meanwhile (see `reload_cached`).
     reload_running: bool,
     reload_again: bool,
-    /// What the listed messages were built from; see `list_current`.
+    /// A check of the listed messages (`reload_if_changed`) was asked for
+    /// while a reload ran.
+    recheck_again: bool,
+    /// Composers' address suggestions, with the list revision and your
+    /// addresses they were gathered for; see `contacts`.
+    contacts_cache: std::cell::RefCell<Option<(u64, Vec<String>, Rc<Vec<(String, String)>>)>>,
+    /// What the listed messages were built from; see `list_freshness`.
     listed: Option<views::ListKey>,
     /// Unread messages among those loaded, counted when the list changes.
     loaded_unread: usize,
@@ -1235,6 +1294,9 @@ impl MailApp {
         if clean_links {
             crate::manage::tracking::warm_up();
         }
+        // Fonts for the first email opened, found while the window opens.
+        #[cfg(not(test))]
+        super::html::warm_up();
         let tree = Self::load_tree(&store, &Self::tree_ids(&accounts, &forwarding));
         let account = tree::account_order(&tree)
             .into_iter()
@@ -1407,6 +1469,12 @@ impl MailApp {
             this.persist_draft(cx);
             // Preferences changed just before quitting are still written.
             this.backend.store.flush();
+            // Gives back, once, the space compressed sources freed in a
+            // database from before that was done as it goes. It holds the
+            // cache while it runs (some seconds), so it waits for quitting,
+            // when nothing is waiting on it. A failure is tried again in a
+            // week; nothing is lost.
+            let _ = this.backend.store.compact_on_quit();
             std::future::ready(())
         }));
         #[cfg(feature = "sample-data")]
@@ -1690,6 +1758,8 @@ impl MailApp {
             counts_again: false,
             reload_running: false,
             reload_again: false,
+            recheck_again: false,
+            contacts_cache: Default::default(),
             listed: None,
             loaded_unread: 0,
             options_cache: Default::default(),
@@ -1816,6 +1886,7 @@ impl MailApp {
         this.load_unsubscribed();
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
+        this.pack_saved_sources(cx);
         this.filter(cx);
         this.apply_theme(window, cx);
         #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -1940,31 +2011,30 @@ impl MailApp {
             .map(|s| s.ids.clone());
         let filter = self.filter_by;
         let open = self.selected.clone();
-        self.visible = self
-            .messages
-            .iter()
-            .enumerate()
+        let (subs_open, scope) = (self.subs_open, &self.scope);
+        let keep = |m: &Mail| {
             // Placeholders have nothing to match yet; they show only in the
             // whole, unsearched list, where they hold their messages' places.
-            .filter(|(_, m)| !m.pending || (filter == Filter::All && query.is_empty()))
-            .filter(|(_, m)| match filter {
-                Filter::All => true,
-                // Opening a message reads it; it stays listed while it is open.
-                Filter::Unread => m.unread || open.as_ref() == Some(&m.id),
-                Filter::Starred => m.starred,
-                Filter::Attachments => m.has_attachments(),
-            })
-            .filter(|(_, m)| match &server {
-                // Found by the server's search, in its own syntax.
-                Some(ids) => ids.contains(&m.id),
-                None => search.matches(m),
-            })
-            // Views leave out mail of aliases shown on their own, or list
-            // only an alias's mail.
-            // A subscription's mail is listed whole, as its counts are.
-            .filter(|(_, m)| m.pending || self.subs_open || self.scope.admits(m))
-            .map(|(i, _)| i)
-            .collect();
+            (!m.pending || (filter == Filter::All && query.is_empty()))
+                && match filter {
+                    Filter::All => true,
+                    // Opening a message reads it; it stays listed while it is open.
+                    Filter::Unread => m.unread || open.as_ref() == Some(&m.id),
+                    Filter::Starred => m.starred,
+                    Filter::Attachments => m.has_attachments(),
+                }
+                && match &server {
+                    // Found by the server's search, in its own syntax.
+                    Some(ids) => ids.contains(&m.id),
+                    None => search.matches(m),
+                }
+                // Views leave out mail of aliases shown on their own, or list
+                // only an alias's mail.
+                // A subscription's mail is listed whole, as its counts are.
+                && (m.pending || subs_open || scope.admits(m))
+        };
+        // Matching text is what costs: spread it over the cores.
+        self.visible = matching_rows(&self.messages, !query.is_empty(), keep);
         if self.oldest_first {
             self.visible.reverse();
         }
@@ -2197,6 +2267,17 @@ impl MailApp {
                         if !more {
                             this.downloading.remove(&a.id);
                             this.download.active = !this.downloading.is_empty();
+                        }
+                        // Proton's subscriptions are found as its mail
+                        // downloads (its list doesn't say): show them as
+                        // they are, when its subscriptions are open.
+                        if a.provider == Provider::Proton
+                            && matches!(result, Ok(n) if n > 0)
+                            && this.subs_open
+                            && this.subs_sender.is_none()
+                            && this.account.as_ref().is_some_and(|id| id == &a.id || id == ALL_MAIL)
+                        {
+                            this.load_subscriptions(cx);
                         }
                         this.refresh_counts(cx);
                         cx.notify();
@@ -3094,11 +3175,7 @@ impl MailApp {
                         }
                     }
                     if visible {
-                        // Most checks find nothing new: the list shown is
-                        // then still current, and isn't built again.
-                        if this.subs_open || !this.list_current() {
-                            this.reload_cached(cx);
-                        }
+                        this.reload_if_changed(cx);
                         if !this.subs_open
                             && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
                         {
@@ -3226,10 +3303,57 @@ impl MailApp {
                 this.set_messages(messages, cx);
                 this.listed = Some(key);
             }
-            // Whatever changed meanwhile, in whichever view is open now.
-            if std::mem::take(&mut this.reload_again) {
-                this.reload_cached(cx);
+            this.reload_follow_up(cx);
+        });
+    }
+    /// What was asked for while a reload ran, in whichever view is open now:
+    /// a whole reload, or a check for changes.
+    fn reload_follow_up(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.reload_again) {
+            self.recheck_again = false;
+            self.reload_cached(cx);
+        } else if std::mem::take(&mut self.recheck_again) {
+            self.reload_if_changed(cx);
+        }
+    }
+    /// After a check of a mailbox the list shows: rebuilds what changed.
+    /// Most checks find nothing new, and the list stays as it is. In a view
+    /// of several accounts, only the accounts whose mail changed are listed
+    /// again and put in place of theirs; the others' mail stays.
+    fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.subs_open || self.account.is_none() {
+            self.reload_cached(cx);
+            return;
+        }
+        if self.reload_running {
+            self.recheck_again = true;
+            return;
+        }
+        let changed = match self.list_freshness() {
+            views::Freshness::Current => return,
+            views::Freshness::Stale(changed) if changed.len() < self.scope.accounts.len() => changed,
+            views::Freshness::Stale(_) | views::Freshness::Unknown => {
+                self.reload_cached(cx);
+                return;
             }
+        };
+        let accounts: Vec<String> = changed
+            .into_iter()
+            .map(|i| self.scope.accounts[i].clone())
+            .collect();
+        self.reload_running = true;
+        let generation = self.load_generation;
+        let job = Self::account_lists_job(accounts, self.mailbox());
+        self.list_task(cx, job, move |this, result, cx| {
+            this.reload_running = false;
+            match result {
+                // Another view meanwhile lists itself; these parts are dropped.
+                Ok(parts) => {
+                    this.replace_account_lists(generation, parts, cx);
+                }
+                Err(_) => this.reload_again = true,
+            }
+            this.reload_follow_up(cx);
         });
     }
     fn load_drafts(&mut self, cx: &mut Context<Self>) {
@@ -3258,7 +3382,8 @@ impl MailApp {
                         this.messages = this
                             .drafts
                             .iter()
-                            .map(|d| Mail {
+                            .map(|d| {
+                                let mut m = Mail {
                                 id: d.id.clone(),
                                 account: d.account.clone(),
                                 folder: Folder::Drafts,
@@ -3301,9 +3426,6 @@ impl MailApp {
                                 size: 0,
                                 body: Some(d.body.clone()),
                                 html: None,
-                                attachments: vec![],
-                                cc: d.cc.clone(),
-                                references: String::new(),
                                 message_id: String::new(),
                                 has_attachments: !d.attachments.is_empty(),
                                 gmail_id: 0,
@@ -3311,9 +3433,11 @@ impl MailApp {
                                 one_click: false,
                                 pending: false,
                                 reply_to: String::new(),
-                                labels: vec![],
                                 inline: Default::default(),
                                 ..Mail::default()
+                                };
+                                m.set_cc(d.cc.clone());
+                                m
                             })
                             .collect();
                         this.filter(cx);
@@ -3656,13 +3780,13 @@ impl MailApp {
                     .map(|f| f.name.clone()),
             );
         }
-        known.extend(mails.iter().flat_map(|m| m.labels.iter().cloned()));
+        known.extend(mails.iter().flat_map(|m| m.labels().iter().cloned()));
         known.sort_by_key(|l| l.to_lowercase());
         known.dedup();
         let mut entries: Vec<Entry> = known
             .into_iter()
             .map(|label| {
-                let all = mails.iter().all(|m| m.labels.contains(&label));
+                let all = mails.iter().all(|m| m.labels().contains(&label));
                 let shown = if gmail {
                     crate::sync::transport::decode_name(&label)
                 } else {
@@ -3943,7 +4067,7 @@ impl MailApp {
                 self.handle(Action::BackToList, w, cx);
             } else if self.subs_open && self.subs_sender.is_some() {
                 self.close_subscription(w, cx);
-            } else if self.mobile.on || w.viewport_size().width < px(900.) {
+            } else if self.mobile.on || window::content_size(w).width < px(900.) {
                 self.selected = None;
                 self.read_generation += 1;
             }
@@ -4498,7 +4622,7 @@ impl MailApp {
         let Some(m) = self.selected_mail() else {
             return;
         };
-        let Some(a) = m.attachments.get(index).cloned() else {
+        let Some(a) = m.attachments().get(index).cloned() else {
             return;
         };
         let Some(account) = self.account_of(&m) else {
@@ -4549,13 +4673,18 @@ impl MailApp {
         if self.onboarding
             && matches!(
                 action,
-                Action::Compose | Action::Reply(_) | Action::Forward | Action::Settings
+                Action::Compose
+                    | Action::ComposeTo(_)
+                    | Action::Reply(_)
+                    | Action::Forward
+                    | Action::Settings
             )
         {
             return;
         }
         match action {
             Action::Compose => self.new_compose(0, w, cx),
+            Action::ComposeTo(to) => self.compose_to(to, w, cx),
             Action::Reply(all) => {
                 let all = all || self.compose_options.default_reply_all;
                 self.new_compose(if all { 2 } else { 1 }, w, cx)
@@ -7299,8 +7428,10 @@ impl MailApp {
     }
     fn link(&self, id: &str, label: &str, action: Action, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        let selector = id.to_owned();
         div()
             .id(SharedString::from(id.to_owned()))
+            .debug_selector(move || selector)
             .text_size(px(12.))
             .text_color(rgb(c.accent))
             .cursor_pointer()
@@ -8017,17 +8148,27 @@ impl MailApp {
         // The whole menu fits in the window where it can: rows get shorter
         // when there are many, and only a menu that still doesn't fit (a
         // long folder list) scrolls.
-        let (height, row) = menu_size(&menu.entries, f32::from(window.viewport_size().height));
+        // The menu is placed here rather than by `anchored`'s snapping,
+        // which only moves what crosses the window's edge: on a window with
+        // its own decorations, a menu ending in the transparent shadow band
+        // around the frame stayed put and was cut off by the frame. Its size
+        // is known up front, so it is kept inside the visible frame.
+        let viewport = window.viewport_size();
+        let insets = window::frame_insets(window);
+        let frame = viewport.height - insets.top - insets.bottom;
+        let (height, row) = menu_size(&menu.entries, f32::from(frame));
+        let width = menu_width(&menu.entries, window);
+        let origin = menu_origin(menu.position, size(px(width), px(height)), viewport, insets);
         let mut panel = div()
             .id("menu-panel")
-            .min_w(px(200.))
+            .debug_selector(|| "menu-panel".into())
+            // Long addresses end in an ellipsis rather than widen the menu.
+            .w(px(width))
             .max_h(px(height))
             .overflow_y_scroll()
             // Scrolling the menu scrolls it, rather than closing it as a
             // scroll elsewhere does.
             .on_scroll(|_, _, cx| cx.stop_propagation())
-            // Long addresses end in an ellipsis rather than widen the menu.
-            .max_w(px(380.))
             .p_1()
             .flex()
             .flex_col()
@@ -8142,8 +8283,7 @@ impl MailApp {
             }))
             .child(
                 anchored()
-                    .position(menu.position)
-                    .snap_to_window_with_margin(px(8.))
+                    .position(origin)
                     .child(
                         panel.with_animation(
                             ("popup-menu", menu.key),
@@ -8288,8 +8428,11 @@ impl MailApp {
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
             Modal::Snooze(_) => self.snooze_modal(),
         };
-        let available_height = (window.viewport_size().height - px(32.)).max(px(0.));
-        let available_width = (window.viewport_size().width - px(32.)).max(px(0.));
+        // Dialogs are laid out inside the window's frame, which is smaller
+        // than the window while Picacho draws its own decorations.
+        let frame = window::content_size(window);
+        let available_height = (frame.height - px(32.)).max(px(0.));
+        let available_width = (frame.width - px(32.)).max(px(0.));
         let mut panel = div()
             .id("modal-panel")
             .debug_selector(|| "modal-panel".into())
@@ -8315,9 +8458,8 @@ impl MailApp {
                     // Like a full-size composer: below the title bar, which
                     // stays visible and usable, with an even margin all round.
                     let edge = px(2. * MAXIMIZED_MARGIN);
-                    let viewport = window.viewport_size();
-                    d.w((viewport.width - edge).max(px(0.)))
-                        .h((viewport.height - px(TITLEBAR_HEIGHT) - edge).max(px(0.)))
+                    d.w((frame.width - edge).max(px(0.)))
+                        .h((frame.height - px(TITLEBAR_HEIGHT) - edge).max(px(0.)))
                 } else {
                     d.h(px(600.).min(available_height))
                 }
@@ -8814,7 +8956,10 @@ impl MailApp {
 impl MailApp {
     fn main(&self, d: Stateful<Div>, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let c = self.colors();
-        let width = window.viewport_size().width;
+        // The frame's width: in a window drawing its own decorations, the
+        // window's is wider by its shadow band and borders, and panes sized
+        // to it ran past the frame, cutting off the reader's right edge.
+        let width = window::content_size(window).width;
         let single = width < px(900.);
         let compact = width < px(1180.);
         self.compact.set(compact);
@@ -9009,6 +9154,40 @@ thread_local! {
 /// for as long as a sync or download ran.
 const SPIN_STEP: Duration = Duration::from_millis(70);
 const SPIN_STEPS: u128 = 14;
+/// The indexes of `messages` that `keep` keeps, in order. With `parallel`
+/// and many messages, they are checked on several threads at once, each a
+/// part of the list in turn. Searching text in every listed message is
+/// bound by reading their strings from memory (about 10 ms for 68,000 on
+/// one core, on each keystroke); eight cores do it in about 2.
+fn matching_rows(messages: &[Mail], parallel: bool, keep: impl Fn(&Mail) -> bool + Sync) -> Vec<usize> {
+    const PART: usize = 4096;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    if !parallel || threads < 2 || messages.len() < 2 * PART {
+        return (0..messages.len()).filter(|&i| keep(&messages[i])).collect();
+    }
+    let size = messages.len().div_ceil(threads).max(PART);
+    let serial = || (0..messages.len()).filter(|&i| keep(&messages[i])).collect();
+    let keep = &keep;
+    let found: Option<Vec<usize>> = std::thread::scope(|scope| {
+        let parts: Vec<_> = messages
+            .chunks(size)
+            .enumerate()
+            .map(|(n, part)| {
+                scope.spawn(move || {
+                    let start = n * size;
+                    (0..part.len()).filter(|&i| keep(&part[i])).map(|i| start + i).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for part in parts {
+            rows.extend(part.join().ok()?);
+        }
+        Some(rows)
+    });
+    // A part that failed: filter the list here, as without threads.
+    found.unwrap_or_else(serial)
+}
 fn spinner(size: f32, color: u32) -> impl IntoElement {
     SPINNING.with(|s| s.set(true));
     let step = SPIN_EPOCH.with(|e| e.elapsed().as_millis() / SPIN_STEP.as_millis()) % SPIN_STEPS;
@@ -9132,12 +9311,62 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
             .text_color(rgb(color)),
     )
 }
-/// A popup menu's largest height and its rows' height, for a window
+/// The space a popup menu keeps from the window frame, each side.
+const MENU_MARGIN: f32 = 8.;
+/// A menu's narrowest and widest.
+const MENU_WIDTH: (f32, f32) = (200., 380.);
+/// A menu's width: its longest label's, between `MENU_WIDTH`'s bounds.
+fn menu_width(entries: &[Entry], window: &Window) -> f32 {
+    // Around the label: the border and padding (1 + 4 each side), a row's
+    // padding (8 each side), its icon and gap (16 + 8), and the space after
+    // the label (16); a pixel more so rounding never cuts a label short.
+    const CHROME: f32 = 2. * (1. + 4. + 8.) + 16. + 8. + 16. + 1.;
+    let font = font(".SystemUIFont");
+    let widest = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Item { label, .. } => Some(label),
+            Entry::Separator => None,
+        })
+        .map(|label| {
+            let run = TextRun {
+                len: label.len(),
+                font: font.clone(),
+                color: black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system().shape_line(label.clone(), px(13.), &[run], None).width)
+        })
+        .fold(0., f32::max);
+    (widest + CHROME).clamp(MENU_WIDTH.0, MENU_WIDTH.1)
+}
+/// Where a menu of `size` opened at `at` goes: there, moved only as far as
+/// it takes to keep `MENU_MARGIN` inside the window's visible frame
+/// (`insets` inside the `viewport`). A menu too big for it keeps its top
+/// left corner in view.
+fn menu_origin(
+    at: Point<Pixels>,
+    size: Size<Pixels>,
+    viewport: Size<Pixels>,
+    insets: Edges<Pixels>,
+) -> Point<Pixels> {
+    let margin = px(MENU_MARGIN);
+    let (left, top) = (insets.left + margin, insets.top + margin);
+    let right = viewport.width - insets.right - margin;
+    let bottom = viewport.height - insets.bottom - margin;
+    point(
+        at.x.min(right - size.width).max(left),
+        at.y.min(bottom - size.height).max(top),
+    )
+}
+/// A popup menu's largest height and its rows' height, for a window frame
 /// `viewport` tall: the menu fits when it can, with rows from 28 down to 22
 /// points high; beyond that it scrolls.
 fn menu_size(entries: &[Entry], viewport: f32) -> (f32, f32) {
-    // The window margin it keeps (8 each side), and its padding and border.
-    const CHROME: f32 = 16. + 10.;
+    // The frame margin it keeps (each side), and its padding and border.
+    const CHROME: f32 = 2. * MENU_MARGIN + 10.;
     const SEPARATOR: f32 = 9.;
     let items = entries.iter().filter(|e| matches!(e, Entry::Item { .. })).count() as f32;
     let separators = entries.len() as f32 - items;
@@ -9708,6 +9937,20 @@ mod tests {
         cx.run_until_parked();
         (app.unwrap(), cx)
     }
+    /// Filtering on several threads finds exactly what one thread does, in
+    /// the list's order, at sizes around where it starts.
+    #[test]
+    fn threaded_filtering_finds_the_same_rows_in_order() {
+        for n in [0, 10, 8191, 8192, 8193, 30_001] {
+            let messages: Vec<Mail> = (0..n)
+                .map(|i| Mail { id: i.to_string(), subject: format!("s{}", i % 97), unread: i % 3 == 0, ..Mail::default() })
+                .collect();
+            let keep = |m: &Mail| m.unread && m.subject.ends_with('7');
+            let expected: Vec<usize> = (0..n).filter(|&i| keep(&messages[i])).collect();
+            assert_eq!(matching_rows(&messages, true, keep), expected, "{n} messages");
+            assert_eq!(matching_rows(&messages, false, keep), expected, "{n} messages");
+        }
+    }
     pub(super) fn store() -> Arc<Store> {
         let dir = std::env::temp_dir().join(format!("mail-ui-{}", uuid::Uuid::new_v4()));
         Arc::new(Store::open(&dir).unwrap())
@@ -10267,12 +10510,15 @@ mod tests {
         let (view, cx, _) = two_accounts(cx);
         let (work, home) =
             view.read_with(cx, |this, _| (this.accounts[0].id.clone(), this.accounts[1].id.clone()));
-        let mail = |id: &str, account: &str, folder: Folder, labels: &[&str]| Mail {
-            id: id.into(),
-            account: account.into(),
-            folder,
-            labels: labels.iter().map(|l| (*l).into()).collect(),
-            ..Mail::default()
+        let mail = |id: &str, account: &str, folder: Folder, labels: &[&str]| {
+            let mut m = Mail {
+                id: id.into(),
+                account: account.into(),
+                folder,
+                ..Mail::default()
+            };
+            m.set_labels(labels.iter().map(|l| (*l).into()).collect());
+            m
         };
         view.update(cx, |this, cx| {
             // Not this view's mail: nothing reloads it from the cache.
@@ -10349,7 +10595,7 @@ mod tests {
             this.handle(Action::SaveLabel, w, cx);
             assert!(this.modal.is_none());
             let m = this.messages.iter().find(|m| m.id == "i1").unwrap();
-            assert!(m.labels.contains(&"Urgent".to_owned()));
+            assert!(m.labels().contains(&"Urgent".to_owned()));
         });
         // The account page has the sign-in name, Reply-To and receipts.
         act(&view, Action::AccountSettings(work.clone()), cx);
@@ -10866,6 +11112,61 @@ mod tests {
         act(&view, Action::SearchFor(String::new()), cx);
         frame(cx);
         assert!(cx.debug_bounds("search-hint-reply-to:").is_some());
+    }
+
+    #[test]
+    fn menus_keep_clear_of_a_client_decorated_windows_shadow() {
+        // A window drawing its own decorations: a 20px transparent shadow
+        // band on every side, as gpui-component draws it.
+        let viewport = size(px(1000.), px(700.));
+        let band = Edges::all(px(20.));
+        let menu = size(px(220.), px(160.));
+        // The Add button sits near the bottom left. Opened 10px above the
+        // frame's bottom, the menu used to run 150px past it.
+        let at = point(px(40.), px(670.));
+        assert_eq!(menu_origin(at, menu, viewport, band), point(px(40.), px(512.)));
+        // Near the right edge, it moves left to clear the band.
+        let at = point(px(900.), px(100.));
+        assert_eq!(menu_origin(at, menu, viewport, band), point(px(752.), px(100.)));
+        // Room where it opens: it stays at the pointer.
+        let at = point(px(300.), px(200.));
+        assert_eq!(menu_origin(at, menu, viewport, band), at);
+        // Maximized or tiled: no band, just the margin.
+        let at = point(px(40.), px(695.));
+        let none = Edges::all(px(0.));
+        assert_eq!(menu_origin(at, menu, viewport, none), point(px(40.), px(532.)));
+        // Too big for the frame: its top left stays in view.
+        let huge = size(px(1200.), px(900.));
+        assert_eq!(menu_origin(at, huge, viewport, band), point(px(28.), px(28.)));
+    }
+
+    #[gpui::test]
+    fn menus_opened_near_an_edge_stay_inside_the_window_frame(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let size = cx.update(|w, _| w.viewport_size());
+        let insets = cx.update(|w, _| window::frame_insets(w));
+        let margins = insets.map(|i| *i + px(MENU_MARGIN));
+        // The Add menu opens at the pointer; the button sits low in the
+        // sidebar, so try every corner of the window.
+        for at in [
+            point(px(4.), size.height - px(4.)),
+            point(size.width - px(4.), size.height - px(4.)),
+            point(size.width - px(4.), px(4.)),
+            point(px(4.), px(4.)),
+        ] {
+            view.update(cx, |this, cx| {
+                let entries = this.create_entries(None);
+                this.open_menu(at, entries, cx)
+            });
+            // Past the opening animation, which nudges the panel.
+            cx.executor().advance_clock(Duration::from_millis(200));
+            frame(cx);
+            let panel = cx.debug_bounds("menu-panel").expect("the menu is shown");
+            assert!(panel.top() >= margins.top, "{at:?}: {panel:?}");
+            assert!(panel.left() >= margins.left, "{at:?}: {panel:?}");
+            assert!(panel.bottom() <= size.height - margins.bottom, "{at:?}: {panel:?}");
+            assert!(panel.right() <= size.width - margins.right, "{at:?}: {panel:?}");
+        }
     }
 
     #[gpui::test]

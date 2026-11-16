@@ -23,9 +23,9 @@ mod tests {
         )?;
         assert_eq!(m.sender, "Sophie Chen");
         assert_eq!(m.subject, "Hello ✓");
-        assert!(m.body.unwrap().contains("Hi there!"));
-        assert_eq!(m.attachments[0].name, "hello.txt");
-        assert_eq!(m.attachments[0].size, 5);
+        assert!(m.body.as_deref().unwrap().contains("Hi there!"));
+        assert_eq!(m.attachments()[0].name, "hello.txt");
+        assert_eq!(m.attachments()[0].size, 5);
         Ok(())
     }
     #[test]

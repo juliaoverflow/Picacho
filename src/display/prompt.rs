@@ -55,6 +55,10 @@ impl Render for AppPrompt {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = colors();
         let corners = window::window_corners(window);
+        // GPUI lays prompts over the whole window, not inside the app's
+        // frame: they cover the frame, clear of the shadow band a window
+        // drawing its own decorations has around it.
+        let frame = window::content_bounds(window);
         let dismissal = self.dismissal();
         let button = |index: usize, label: SharedString, primary: bool| {
             div()
@@ -102,8 +106,8 @@ impl Render for AppPrompt {
             .flex()
             .flex_col()
             .w(px(400.))
-            .max_w((window.viewport_size().width - px(32.)).max(px(0.)))
-            .max_h((window.viewport_size().height - px(32.)).max(px(0.)))
+            .max_w((frame.size.width - px(32.)).max(px(0.)))
+            .max_h((frame.size.height - px(32.)).max(px(0.)))
             .rounded(px(18.))
             .border_1()
             .border_color(rgb(c.border))
@@ -181,9 +185,10 @@ impl Render for AppPrompt {
             }))
             .occlude()
             .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
+            .left(frame.origin.x)
+            .top(frame.origin.y)
+            .w(frame.size.width)
+            .h(frame.size.height)
             .rounded_tl(corners.top_left)
             .rounded_tr(corners.top_right)
             .rounded_bl(corners.bottom_left)

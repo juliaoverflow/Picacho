@@ -275,8 +275,9 @@ impl MailApp {
                 .child("No message selected")
                 .into_any_element();
         };
-        let compact = window.viewport_size().width < px(1180.);
-        let single = window.viewport_size().width < px(900.);
+        let width = super::window::content_size(window).width;
+        let compact = width < px(1180.);
+        let single = width < px(900.);
         let toolbar = div()
             .id("reader-toolbar")
             .debug_selector(|| "reader-toolbar".into())
@@ -399,7 +400,7 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = self.colors();
-        let compact = self.mobile.on || window.viewport_size().width < px(1180.);
+        let compact = self.mobile.on || super::window::content_size(window).width < px(1180.);
         // A mailbox kept to its aliases shows the alias used in its place.
         let mask = self.mask_for(m);
         let (sender, from) = match &mask {
@@ -487,10 +488,22 @@ impl MailApp {
                             .gap_1()
                             .child(
                                 div()
+                                    .id("reader-from")
+                                    .debug_selector(|| "reader-from".into())
                                     .flex()
                                     .flex_wrap()
                                     .gap_2()
                                     .items_center()
+                                    .on_mouse_down(MouseButton::Right, {
+                                        let (name, email) = (sender.clone(), from.clone());
+                                        let real = m.from.clone();
+                                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            let entries =
+                                                address_entries(Some(&name), &email, Some(&real));
+                                            this.open_menu(e.position, entries, cx)
+                                        })
+                                    })
                                     .child(
                                         div()
                                             .text_size(px(13.))
@@ -529,7 +542,8 @@ impl MailApp {
         let options = self.reading_options(m);
         let dark = self.email_dark(options);
         // A full-width reader in a narrow window shows the controls as icons.
-        let narrow = window.viewport_size().width < px(super::panes::READER_MIN);
+        let narrow =
+            super::window::content_size(window).width < px(super::panes::READER_MIN);
         content = content
             .when(!locked, |d| {
                 d.child(self.rendering_controls(m, options, narrow, cx))
@@ -601,7 +615,7 @@ impl MailApp {
             if has_quotes {
                 content = content.child(div().flex().child(self.quotes_toggle(cx)));
             }
-            for (i, a) in m.attachments.iter().enumerate() {
+            for (i, a) in m.attachments().iter().enumerate() {
                 content = content.child(
                     div()
                         .mt_3()
@@ -756,6 +770,66 @@ impl MailApp {
     }
 }
 
+/// How a banner above the open message is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum BannerStyle {
+    /// On a soft fill, with an accent icon: about the message itself
+    /// (snoozed, its sign-in code hidden).
+    Filled,
+    /// Outlined, with a muted icon: something asked of you that can be
+    /// set aside (a read receipt, unsubscribing).
+    Outlined,
+}
+
+impl MailApp {
+    /// A banner above the open message: an icon, a line of text and its
+    /// actions. Every banner wraps the same way: the text wraps, keeping
+    /// room to be read, and past that the actions go below it, together
+    /// and on the right, rather than past the reader's edge.
+    pub(super) fn banner(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        style: BannerStyle,
+        text: impl IntoElement,
+        actions: impl IntoIterator<Item = AnyElement>,
+    ) -> Stateful<Div> {
+        let c = self.colors();
+        let icon_color = match style {
+            BannerStyle::Filled => c.accent,
+            BannerStyle::Outlined => c.muted,
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .mb_4()
+            .px_3()
+            .py_2()
+            .rounded(px(10.))
+            .map(|d| match style {
+                BannerStyle::Filled => d.bg(rgb(c.soft)),
+                BannerStyle::Outlined => d.border_1().border_color(rgb(c.border)),
+            })
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.))
+            .child(icon_el(icon, 15., icon_color))
+            .child(div().flex_1().min_w(px(160.)).child(text))
+            .child(
+                div()
+                    .debug_selector(move || format!("{id}-actions"))
+                    .flex_shrink_0()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(actions),
+            )
+    }
+}
+
 /// A centered spinner where the body will appear.
 fn loading_body(c: Colors) -> AnyElement {
     div()
@@ -811,6 +885,57 @@ impl MailApp {
             .into_any_element()
     }
 
+    /// A header's addresses, each with its own right-click menu: copying
+    /// it, and for a sender's (`sender`), writing to it and finding its mail.
+    fn address_list(
+        &self,
+        key: &'static str,
+        list: &str,
+        sender: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = self.colors();
+        let parsed = crate::sync::smtp::recipients(list)
+            .ok()
+            .filter(|a| !a.is_empty());
+        let Some(addresses) = parsed else {
+            // Unreadable as addresses: shown as written.
+            return div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_color(rgb(c.text))
+                .child(list.to_owned())
+                .into_any_element();
+        };
+        let last = addresses.len() - 1;
+        div()
+            .debug_selector(move || format!("details-{key}"))
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .gap_x_1()
+            .text_color(rgb(c.text))
+            .children(addresses.into_iter().enumerate().map(|(i, (name, email))| {
+                let shown = super::name_and_address(name.as_deref(), &email);
+                div()
+                    .id(SharedString::from(format!("details-{key}-{i}")))
+                    .debug_selector(move || format!("details-{key}-{i}"))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(if i < last { format!("{shown},") } else { shown })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            let from = sender.then_some(email.as_str());
+                            let entries = address_entries(name.as_deref(), &email, from);
+                            this.open_menu(e.position, entries, cx)
+                        }),
+                    )
+            }))
+            .into_any_element()
+    }
+
     fn details_panel(&self, m: &Mail, cx: &Context<Self>) -> AnyElement {
         use crate::sync::mime::Security;
         let c = self.colors();
@@ -861,18 +986,36 @@ impl MailApp {
             Some(k) if k.sent => k.sender(),
             _ => m.sender.clone(),
         };
+        let from_email = masked(&m.from);
         let from = if sender != m.from && !sender.is_empty() {
             masked(&format!("{} <{}>", sender, m.from))
         } else {
-            masked(&m.from)
+            from_email.clone()
         };
+        let from = div()
+            .id("details-from")
+            .debug_selector(|| "details-from".into())
+            .min_w_0()
+            .overflow_hidden()
+            .text_color(rgb(c.text))
+            .child(from)
+            .on_mouse_down(MouseButton::Right, {
+                let real = m.from.clone();
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let entries = address_entries(Some(&sender), &from_email, Some(&real));
+                    this.open_menu(e.position, entries, cx)
+                })
+            })
+            .into_any_element();
         let details = info
             .and_then(|i| i.result.as_ref())
             .and_then(|r| r.as_ref().ok());
         let header = |value: Option<&String>| value.filter(|v| !v.trim().is_empty()).cloned();
-        let mut panel_rows: Vec<AnyElement> = vec![row("from:", text(from)).into_any_element()];
+        let mut panel_rows: Vec<AnyElement> = vec![row("from:", from).into_any_element()];
         if let Some(v) = header(details.map(|d| &d.details.reply_to)) {
-            panel_rows.push(row("reply-to:", text(masked(&v))).into_any_element());
+            let list = self.address_list("reply-to", &masked(&v), true, cx);
+            panel_rows.push(row("reply-to:", list).into_any_element());
         }
         // Recipients a mailbox kept to its aliases wrote to through a
         // reverse alias show as the contacts themselves.
@@ -880,9 +1023,11 @@ impl MailApp {
             Some(k) => k.recipients(v),
             None => v.to_owned(),
         };
-        panel_rows.push(row("to:", text(recipients(&m.to))).into_any_element());
+        let to = self.address_list("to", &recipients(&m.to), false, cx);
+        panel_rows.push(row("to:", to).into_any_element());
         if let Some(v) = header(details.map(|d| &d.details.cc)) {
-            panel_rows.push(row("cc:", text(recipients(&v))).into_any_element());
+            let cc = self.address_list("cc", &recipients(&v), false, cx);
+            panel_rows.push(row("cc:", cc).into_any_element());
         }
         panel_rows.push(row("date:", text(date_full(m.date))).into_any_element());
         panel_rows.push(
@@ -1544,51 +1689,7 @@ impl MailApp {
         {
             return rows.clone();
         }
-        let key = super::thread::conversation_subject(&m.subject);
-        let replyish = |x: &Mail, key: &str| {
-            !x.references.is_empty() || x.subject.trim().to_lowercase() != key
-        };
-        let linked = |a: &Mail, b: &Mail| {
-            !b.message_id.is_empty() && a.references.contains(b.message_id.as_str())
-        };
-        // Permanent server thread ids (not IMAP THREAD's, which only
-        // cover one mailbox) settle it either way.
-        let permanent = |x: &Mail| !x.thread_id.is_empty() && !x.thread_id.starts_with("t:");
-        let server = |x: &Mail| -> Option<bool> {
-            if x.thread_id.is_empty() || m.thread_id.is_empty() {
-                return None;
-            }
-            if x.thread_id == m.thread_id {
-                Some(true)
-            } else if permanent(x) && permanent(m) {
-                Some(false)
-            } else {
-                None
-            }
-        };
-        let mut seen = HashSet::new();
-        let mut rows: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| x.account == m.account && !x.pending)
-            .filter(|(_, x)| {
-                if let Some(same) = server(x) {
-                    return same || x.id == m.id;
-                }
-                x.id == m.id
-                    || linked(x, m)
-                    || linked(m, x)
-                    || (key.chars().count() > 2
-                        && super::thread::may_be_conversation(&x.subject, &key)
-                        && super::thread::conversation_subject(&x.subject) == key
-                        && (replyish(x, &key) || replyish(m, &key)))
-            })
-            // The same message under several labels or folders shows once.
-            .filter(|(_, x)| x.message_id.is_empty() || seen.insert(x.message_id.clone()))
-            .map(|(i, _)| i)
-            .collect();
-        rows.sort_by_key(|i| self.messages[*i].date);
+        let rows = super::thread::conversation(&self.messages, m);
         let rows = Rc::new(rows);
         *self.thread_cache.borrow_mut() = Some((m.id.clone(), self.list_revision, rows.clone()));
         rows
@@ -1762,7 +1863,7 @@ impl MailApp {
             }
         };
         let to = super::thread::short_names(&self.unreversed(m, &m.to), &own);
-        let cc = super::thread::short_names(&self.unreversed(m, &m.cc), &own);
+        let cc = super::thread::short_names(&self.unreversed(m, m.cc()), &own);
         let mut line = if to.is_empty() {
             "to undisclosed recipients".to_string()
         } else {
@@ -1873,7 +1974,7 @@ impl MailApp {
     /// A message's labels, each removable; choosing one shows the mail
     /// that has it.
     fn label_chips(&self, m: &Mail, cx: &Context<Self>) -> Option<Stateful<Div>> {
-        if m.labels.is_empty() {
+        if m.labels().is_empty() {
             return None;
         }
         let c = self.colors();
@@ -1886,7 +1987,7 @@ impl MailApp {
             .flex()
             .flex_wrap()
             .gap_1();
-        for (i, label) in m.labels.iter().enumerate() {
+        for (i, label) in m.labels().iter().enumerate() {
             let shown = if gmail {
                 crate::sync::transport::decode_name(label)
             } else {

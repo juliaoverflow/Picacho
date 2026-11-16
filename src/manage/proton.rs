@@ -429,7 +429,6 @@ impl Backend {
                     m.sender.name.trim().to_owned()
                 },
                 to: addresses(&m.to_list),
-                cc: addresses(&m.cc_list),
                 reply_to: addresses(&m.reply_tos),
                 subject: m.subject.clone(),
                 date: m.time,
@@ -442,6 +441,7 @@ impl Backend {
                 ..Default::default()
             },
         };
+        mail.set_cc(addresses(&m.cc_list));
         mail.folder = folder;
         mail.remote_folder = remote;
         mail.unread = m.unread;
@@ -449,7 +449,7 @@ impl Backend {
         mail.size = u32::try_from(m.size).unwrap_or(u32::MAX);
         mail.answered = m.is_replied || m.is_replied_all;
         mail.forwarded = m.is_forwarded;
-        mail.labels = m
+        let mut labels: Vec<String> = m
             .label_ids
             .iter()
             .filter(|l| folders.iter().any(|f| !f.exclusive && &f.id == *l))
@@ -458,7 +458,8 @@ impl Backend {
                     .map(|l| if l.path.is_empty() { l.name } else { l.path })
             })
             .collect();
-        mail.labels.sort();
+        labels.sort();
+        mail.set_labels(labels);
         Ok(mail)
     }
 
@@ -549,7 +550,7 @@ impl Backend {
                 }
             }
             self.store.save_messages(&rows)?;
-            self.store.messages(&a.id, mailbox.clone(), limit)
+            self.store.newest(&a.id, mailbox.clone(), limit)
         })
     }
 
@@ -638,25 +639,27 @@ impl Backend {
         let id = proton_id(a, m).context("This message isn't from Proton.")?;
         let (text, attachments) = self.with_proton(a, |s| s.text_only(id))?;
         let mut next = parse_message(&text, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
-        next.attachments = attachments
-            .into_iter()
-            .enumerate()
-            .map(|(i, (id, name, size, mime))| Attachment {
-                name,
-                size,
-                mime,
-                // Past the text's own parts.
-                part: 10_000 + i,
-                section: id,
-                encoding: String::new(),
-            })
-            .collect();
-        next.has_attachments = !next.attachments.is_empty();
+        next.set_attachments(
+            attachments
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, name, size, mime))| Attachment {
+                    name,
+                    size,
+                    mime,
+                    // Past the text's own parts.
+                    part: 10_000 + i,
+                    section: id,
+                    encoding: String::new(),
+                })
+                .collect()
+        );
+        next.has_attachments = !next.attachments().is_empty();
         next.partial = true;
         next.unread = m.unread;
         next.starred = m.starred;
         next.size = m.size;
-        next.labels = m.labels.clone();
+        next.set_labels(m.labels().to_vec());
         Ok(next)
     }
     /// One attachment of a message too large to download whole.
@@ -684,15 +687,28 @@ impl Backend {
                 break;
             }
             let raw = self.download_proton(a, &m)?;
-            if let Ok(parsed) = parse_message(&raw, a, &m.id, m.folder, &m.remote_folder, m.uid) {
+            if let Ok(mut parsed) = parse_message(&raw, a, &m.id, m.folder, &m.remote_folder, m.uid) {
                 let mut next = m.clone();
-                next.has_attachments = !parsed.attachments.is_empty();
-                next.attachments = parsed.attachments;
+                next.has_attachments = !parsed.attachments().is_empty();
+                next.set_attachments(parsed.take_attachments());
                 if next.snippet.is_empty() {
-                    next.snippet = parsed.snippet;
+                    next.snippet = std::mem::take(&mut parsed.snippet);
                 }
                 if !parsed.message_id.is_empty() {
-                    next.message_id = parsed.message_id;
+                    next.message_id = std::mem::take(&mut parsed.message_id);
+                }
+                // What only the source's headers say: Proton's message list
+                // doesn't carry them. Without List-Unsubscribe, a sender's
+                // mail showed under Subscriptions only once each was opened.
+                if next.references().is_empty() {
+                    next.set_references(parsed.references());
+                }
+                if next.receipt_to().is_empty() {
+                    next.set_receipt_to(parsed.receipt_to());
+                }
+                if next.list_unsubscribe.is_empty() {
+                    next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
+                    next.one_click = parsed.one_click;
                 }
                 self.store.save_messages(&[next])?;
             }

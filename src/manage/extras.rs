@@ -76,7 +76,7 @@ impl Backend {
     /// Sends the read receipt `m`'s sender asked for (RFC 8098), then
     /// marks it $MDNSent so no mail app asks again.
     pub fn send_receipt(&self, a: &Account, m: &Mail) -> Result<()> {
-        let to = m.receipt_to.trim().to_owned();
+        let to = m.receipt_to().trim().to_owned();
         ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
         ensure!(m.account == a.id, "Message belongs to another account");
         let raw = crate::sync::smtp::receipt(a, m, &to);
@@ -150,7 +150,7 @@ impl Backend {
         };
         if m.partial || m.size as usize > large::MAX_DOWNLOAD {
             let current = self.read(a, m)?;
-            for (i, attachment) in current.attachments.iter().enumerate() {
+            for (i, attachment) in current.attachments().iter().enumerate() {
                 let bytes = self.attachment(a, &current, attachment.part)?;
                 save(&attachment.name, &bytes, i)?;
             }
@@ -161,7 +161,7 @@ impl Backend {
         let listed = parse_message(&plain, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         let mut leaves = Vec::new();
         collect_leaves(&parsed, &mut leaves);
-        for (i, attachment) in listed.attachments.iter().enumerate() {
+        for (i, attachment) in listed.attachments().iter().enumerate() {
             let Some(leaf) = leaves.get(attachment.part) else {
                 continue;
             };

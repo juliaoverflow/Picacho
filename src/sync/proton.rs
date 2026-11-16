@@ -58,6 +58,10 @@ WO4BAMcm1u02t4VKw++ttECPt+HUgPUq5pqQWe5Q2cW4TMsE
 /// registrations: `PICACHO_PROTON_APP_TOKEN` and `PICACHO_PROTON_APP_VERSION`.
 const APP_TOKEN: Option<&str> = option_env!("PICACHO_PROTON_APP_TOKEN");
 const APP_VERSION: Option<&str> = option_env!("PICACHO_PROTON_APP_VERSION");
+/// The `<platform>` Proton sees in place of the one this build runs on
+/// (`linux`, `macos` or `windows`): `PICACHO_PROTON_APP_PLATFORM_OVERRIDE`.
+/// It doesn't make Direct available by itself.
+const APP_PLATFORM: Option<&str> = option_env!("PICACHO_PROTON_APP_PLATFORM_OVERRIDE");
 
 fn set(value: Option<&'static str>) -> Option<&'static str> {
     value.filter(|v| !v.trim().is_empty())
@@ -98,6 +102,7 @@ fn config() -> Arc<DeploymentConfig> {
                 refresh_redirect_uri: REFRESH_REDIRECT_URI.into(),
                 app_product_token: app_token().into(),
                 app_version: app_version().into(),
+                app_platform: set(APP_PLATFORM).map(|p| p.trim().to_owned()),
                 product_name: "Picacho".into(),
                 api_tls_pins: Vec::new(),
             })
@@ -1073,6 +1078,15 @@ mod tests {
         assert!(
             c.app_version_header()
                 .contains(&format!("-{}@", app_token()))
+        );
+        // The platform named at build time, else the one built for.
+        let platform = set(APP_PLATFORM)
+            .map(str::trim)
+            .unwrap_or(protected_email_bridge::config::platform_token());
+        assert!(
+            c.app_version_header().starts_with(&format!("{platform}-")),
+            "{}",
+            c.app_version_header()
         );
     }
 

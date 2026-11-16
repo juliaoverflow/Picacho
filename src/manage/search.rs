@@ -112,11 +112,11 @@ impl Term {
                 .any(|s| has(s)),
             Field::From => has(&m.from) || has(&m.sender),
             Field::ReplyTo => has(&m.reply_to),
-            Field::To => has(&m.to) || has(&m.cc),
-            Field::Cc => has(&m.cc),
+            Field::To => has(&m.to) || has(m.cc()),
+            Field::Cc => has(m.cc()),
             Field::Subject => has(&m.subject),
             Field::Label => m
-                .labels
+                .labels()
                 .iter()
                 .any(|l| has(l) || has(&crate::sync::transport::decode_name(l))),
             Field::Unread => m.unread,
@@ -238,18 +238,19 @@ mod tests {
     use super::*;
 
     fn mail() -> Mail {
-        Mail {
+        let mut m = Mail {
             id: "1".into(),
             from: "news@shop.example".into(),
             sender: "Shop News".into(),
             reply_to: "Support <help@shop.example>".into(),
             to: "ana@example.com".into(),
-            cc: "team@example.com".into(),
             subject: "Weekly report".into(),
             snippet: "Your order shipped".into(),
             unread: true,
             ..Mail::default()
-        }
+        };
+        m.set_cc("team@example.com");
+        m
     }
 
     fn hit(q: &str) -> bool {

@@ -284,7 +284,7 @@ impl MailApp {
     }
     pub(super) fn settings_modal(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
-        let narrow = window.viewport_size().width < px(700.);
+        let narrow = window::content_size(window).width < px(700.);
         let mut nav = div()
             .id("settings-nav")
             .debug_selector(|| "settings-nav".into())

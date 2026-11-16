@@ -72,7 +72,7 @@ impl Backend {
                 .map(|mut m| {
                     m.body = None;
                     m.html = None;
-                    m.attachments.clear();
+                    m.set_attachments(Vec::new());
                     m.snippet.clear();
                     m
                 })

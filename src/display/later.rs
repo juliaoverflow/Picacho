@@ -245,44 +245,34 @@ impl MailApp {
         let until = self.snoozed_until(m)?;
         let c = self.colors();
         let when = crate::manage::composing::describe_later(until, chrono::Local::now());
+        let unsnooze = self
+            .button(
+                "unsnooze",
+                "Unsnooze",
+                "inbox",
+                Action::Unsnooze(m.account.clone(), m.message_id.clone()),
+                false,
+                cx,
+            )
+            .border_1()
+            .border_color(rgb(c.border));
+        let resnooze = self.button(
+            "resnooze",
+            "@Snooze until another time",
+            "clock",
+            Action::SnoozeMenu(vec![m.id.clone()]),
+            false,
+            cx,
+        );
         Some(
-            div()
-                .id("snooze-banner")
-                .debug_selector(|| "snooze-banner".into())
-                .mb_4()
-                .px_3()
-                .py_2()
-                .rounded(px(10.))
-                .bg(rgb(c.soft))
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(px(12.))
-                .child(icon_el("snooze", 15., c.accent))
-                .child(div().flex_1().child(format!(
-                    "Snoozed until {when}. It comes back to the inbox, unread."
-                )))
-                .child(
-                    self.button(
-                        "unsnooze",
-                        "Unsnooze",
-                        "inbox",
-                        Action::Unsnooze(m.account.clone(), m.message_id.clone()),
-                        false,
-                        cx,
-                    )
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                )
-                .child(self.button(
-                    "resnooze",
-                    "@Snooze until another time",
-                    "clock",
-                    Action::SnoozeMenu(vec![m.id.clone()]),
-                    false,
-                    cx,
-                ))
-                .into_any_element(),
+            self.banner(
+                "snooze-banner",
+                "snooze",
+                BannerStyle::Filled,
+                format!("Snoozed until {when}. It comes back to the inbox, unread."),
+                [unsnooze.into_any_element(), resnooze.into_any_element()],
+            )
+            .into_any_element(),
         )
     }
 
@@ -381,19 +371,25 @@ impl MailApp {
         let a = self.server_searchable()?;
         let c = self.colors();
         let gmail = a.provider == Provider::Gmail;
+        // The list can be narrow: the text wraps, and past that the link
+        // goes below it, on the right, rather than past the list's edge.
         let line = div()
             .id("server-search")
             .debug_selector(|| "server-search".into())
             .pt_2()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap_2()
+            .gap_x_2()
+            .gap_y_1()
             .text_size(px(12.))
             .text_color(rgb(c.muted));
+        let text = |t: String| div().flex_1().min_w(px(120.)).child(t);
+        let action = |link: Stateful<Div>| div().ml_auto().flex_shrink_0().child(link);
         Some(match self.current_server_search(&query) {
             Some(s) if s.running => line
                 .child(spinner(12., c.accent))
-                .child(format!("Searching {} on the server…", self.mailbox_label()))
+                .child(text(format!("Searching {} on the server…", self.mailbox_label())))
                 .into_any_element(),
             Some(s) if s.error.is_some() => line
                 .child(icon_el("warning", 13., c.danger))
@@ -408,7 +404,7 @@ impl MailApp {
                 .into_any_element(),
             Some(s) => line
                 .child(icon_el("cloud", 13., c.accent))
-                .child(div().flex_1().child(if s.total > s.ids.len() {
+                .child(text(if s.total > s.ids.len() {
                     format!(
                         "The newest {} of {} matches on the server",
                         fmt_count(s.ids.len()),
@@ -419,21 +415,17 @@ impl MailApp {
                 } else {
                     format!("{} matches on the server", fmt_count(s.total))
                 }))
-                .child(self.link(
+                .child(action(self.link(
                     "server-search-clear",
                     "Show Local Matches",
                     Action::ClearServerSearch,
                     cx,
-                ))
+                )))
                 .into_any_element(),
             None => line
                 .child(icon_el("cloud", 13., c.muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .child("Only mail on this computer is searched."),
-                )
-                .child(self.link(
+                .child(text("Only mail on this computer is searched.".to_owned()))
+                .child(action(self.link(
                     "server-search-start",
                     if gmail {
                         "Search Gmail · ↩"
@@ -442,7 +434,7 @@ impl MailApp {
                     },
                     Action::SearchServer,
                     cx,
-                ))
+                )))
                 .into_any_element(),
         })
     }
@@ -452,7 +444,7 @@ impl MailApp {
     /// Above a message whose sender asked for a read receipt: send it, or
     /// don't (either way, no mail app asks again).
     pub(super) fn receipt_banner(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
-        if m.receipt_to.is_empty()
+        if m.receipt_to().is_empty()
             || m.mdn_sent
             || matches!(m.folder, Folder::Sent | Folder::Drafts | Folder::Junk)
         {
@@ -464,47 +456,34 @@ impl MailApp {
             return None;
         }
         let c = self.colors();
+        let decline = self
+            .button(
+                "receipt-decline",
+                "Don't Send",
+                "",
+                Action::Receipt(m.id.clone(), false),
+                false,
+                cx,
+            )
+            .border_1()
+            .border_color(rgb(c.border));
+        let send = self.button(
+            "receipt-send",
+            "Send Receipt",
+            "",
+            Action::Receipt(m.id.clone(), true),
+            true,
+            cx,
+        );
         Some(
-            div()
-                .id("receipt-banner")
-                .debug_selector(|| "receipt-banner".into())
-                .mb_4()
-                .px_3()
-                .py_2()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(rgb(c.border))
-                .flex()
-                .items_center()
-                .flex_wrap()
-                .gap_2()
-                .text_size(px(12.))
-                .child(icon_el("mail-open", 15., c.muted))
-                .child(div().flex_1().min_w(px(160.)).child(format!(
-                    "{} asks to be told when you've read this message.",
-                    m.sender
-                )))
-                .child(
-                    self.button(
-                        "receipt-decline",
-                        "Don't Send",
-                        "",
-                        Action::Receipt(m.id.clone(), false),
-                        false,
-                        cx,
-                    )
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                )
-                .child(self.button(
-                    "receipt-send",
-                    "Send Receipt",
-                    "",
-                    Action::Receipt(m.id.clone(), true),
-                    true,
-                    cx,
-                ))
-                .into_any_element(),
+            self.banner(
+                "receipt-banner",
+                "mail-open",
+                BannerStyle::Outlined,
+                format!("{} asks to be told when you've read this message.", m.sender),
+                [decline.into_any_element(), send.into_any_element()],
+            )
+            .into_any_element(),
         )
     }
     pub(super) fn answer_receipt(&mut self, id: String, send: bool, cx: &mut Context<Self>) {

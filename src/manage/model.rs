@@ -582,7 +582,17 @@ pub struct Attachment {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub encoding: String,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// A message: what the cache keeps of it, and what lists and the reader show.
+///
+/// Fields few messages have (copied recipients, a thread's references,
+/// labels, attachments, a server thread id, the save date, a receipt
+/// address) are kept apart in `extra`, absent when all are empty: a list
+/// holds tens of thousands of messages, and inline they made every one
+/// half again as large. Read them through their accessors (`cc()`…) and
+/// change them with the setters (`set_cc`…), which keep `extra` absent
+/// while there is nothing in it. The cache's format is unchanged (see
+/// `MailRecord`).
+#[derive(Clone, Debug, Default)]
 pub struct Mail {
     pub id: String,
     pub account: String,
@@ -592,12 +602,8 @@ pub struct Mail {
     pub from: String,
     pub sender: String,
     pub to: String,
-    /// Copied recipients; empty in cache entries from before it was kept.
-    #[serde(default)]
-    pub cc: String,
     /// Where replies go, when the sender asked for somewhere else (alias
     /// services and mailing lists do). Empty in older cache entries.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reply_to: String,
     pub subject: String,
     pub snippet: String,
@@ -607,60 +613,345 @@ pub struct Mail {
     pub size: u32,
     pub body: Option<String>,
     /// Original decoded HTML; absent in header-only and older cache entries.
-    #[serde(default)]
     pub html: Option<String>,
-    pub attachments: Vec<Attachment>,
     pub message_id: String,
-    /// The thread's earlier message ids (References, or In-Reply-To).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub references: String,
-    #[serde(default)]
     pub has_attachments: bool,
     /// Gmail's permanent id, shared by the copies under each label; 0 elsewhere.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub gmail_id: u64,
     /// The List-Unsubscribe header of mail from a subscription: where to
     /// ask to stop it (mailto: and https: addresses in angle brackets).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub list_unsubscribe: String,
     /// The sender accepts a one-click unsubscribe (RFC 8058).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub one_click: bool,
-    /// Its labels: IMAP keywords set on it, or Gmail's labels (`X-GM-LABELS`),
-    /// as the server names them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub labels: Vec<String>,
     /// Replied to (\\Answered), here or in another mail app.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answered: bool,
     /// Forwarded ($Forwarded).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarded: bool,
-    /// The server's conversation id: Gmail's X-GM-THRID ("gm:…"), OBJECTID's
-    /// THREADID ("oid:…") or IMAP THREAD's ("t:…"); empty where unknown.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub thread_id: String,
-    /// When it was put in its mailbox (SAVEDATE), where the server says.
-    #[serde(default, skip_serializing_if = "is_zero_i64")]
-    pub saved: i64,
-    /// Where the sender asked for a read receipt (Disposition-Notification-To).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub receipt_to: String,
     /// A read receipt was sent or declined ($MDNSent).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mdn_sent: bool,
     /// Too large to download whole: its text was read from its parts, and
     /// attachments download one at a time (`Attachment::section`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
     /// A row the list knows exists on the server but has not listed yet.
     /// Never stored; the list draws it as a placeholder until it loads.
-    #[serde(skip)]
     pub pending: bool,
     /// The parts its HTML shows in place (`cid:` images), found when the
     /// message is read. Never stored: the downloaded source holds them.
-    #[serde(skip, default = "InlineParts::none")]
     pub inline: std::sync::Arc<InlineParts>,
+    /// Visible so that `Mail { .., ..other }` can be written; its fields
+    /// are private, set through `Mail`'s setters.
+    pub extra: Option<Box<MailExtra>>,
+}
+
+/// What few messages have; see `Mail`.
+#[derive(Clone, Debug, Default)]
+pub struct MailExtra {
+    /// Copied recipients; empty in cache entries from before it was kept.
+    cc: String,
+    attachments: Vec<Attachment>,
+    /// The thread's earlier message ids (References, or In-Reply-To).
+    references: String,
+    /// Its labels: IMAP keywords set on it, or Gmail's labels (`X-GM-LABELS`),
+    /// as the server names them.
+    labels: Vec<String>,
+    /// The server's conversation id: Gmail's X-GM-THRID ("gm:…"), OBJECTID's
+    /// THREADID ("oid:…") or IMAP THREAD's ("t:…"); empty where unknown.
+    thread_id: String,
+    /// When it was put in its mailbox (SAVEDATE), where the server says.
+    saved: i64,
+    /// Where the sender asked for a read receipt (Disposition-Notification-To).
+    receipt_to: String,
+}
+impl MailExtra {
+    fn is_empty(&self) -> bool {
+        self.cc.is_empty()
+            && self.attachments.is_empty()
+            && self.references.is_empty()
+            && self.labels.is_empty()
+            && self.thread_id.is_empty()
+            && self.saved == 0
+            && self.receipt_to.is_empty()
+    }
+}
+
+impl Mail {
+    /// Copied recipients.
+    pub fn cc(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.cc)
+    }
+    pub fn attachments(&self) -> &[Attachment] {
+        self.extra.as_ref().map_or(&[], |e| &e.attachments)
+    }
+    /// The thread's earlier message ids (References, or In-Reply-To).
+    pub fn references(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.references)
+    }
+    /// IMAP keywords set on it, or Gmail's labels, as the server names them.
+    pub fn labels(&self) -> &[String] {
+        self.extra.as_ref().map_or(&[], |e| &e.labels)
+    }
+    /// The server's conversation id; empty where unknown.
+    pub fn thread_id(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.thread_id)
+    }
+    /// When it was put in its mailbox (SAVEDATE); 0 where unknown.
+    pub fn saved(&self) -> i64 {
+        self.extra.as_ref().map_or(0, |e| e.saved)
+    }
+    /// Where the sender asked for a read receipt.
+    pub fn receipt_to(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.receipt_to)
+    }
+    pub fn set_cc(&mut self, cc: impl Into<String>) {
+        let cc = cc.into();
+        self.change_extra(cc.is_empty(), |e| e.cc = cc);
+    }
+    pub fn set_attachments(&mut self, attachments: Vec<Attachment>) {
+        self.change_extra(attachments.is_empty(), |e| e.attachments = attachments);
+    }
+    pub fn set_references(&mut self, references: impl Into<String>) {
+        let references = references.into();
+        self.change_extra(references.is_empty(), |e| e.references = references);
+    }
+    pub fn set_labels(&mut self, labels: Vec<String>) {
+        self.change_extra(labels.is_empty(), |e| e.labels = labels);
+    }
+    pub fn set_thread_id(&mut self, thread_id: impl Into<String>) {
+        let thread_id = thread_id.into();
+        self.change_extra(thread_id.is_empty(), |e| e.thread_id = thread_id);
+    }
+    pub fn set_saved(&mut self, saved: i64) {
+        self.change_extra(saved == 0, |e| e.saved = saved);
+    }
+    pub fn set_receipt_to(&mut self, receipt_to: impl Into<String>) {
+        let receipt_to = receipt_to.into();
+        self.change_extra(receipt_to.is_empty(), |e| e.receipt_to = receipt_to);
+    }
+    /// Takes the attachments out, leaving none.
+    pub fn take_attachments(&mut self) -> Vec<Attachment> {
+        let taken = self
+            .extra
+            .as_mut()
+            .map(|e| std::mem::take(&mut e.attachments))
+            .unwrap_or_default();
+        self.compact_extra();
+        taken
+    }
+    /// Applies `change` to the extra fields; an empty value set where there
+    /// are none allocates nothing, and none left frees them.
+    fn change_extra(&mut self, empty: bool, change: impl FnOnce(&mut MailExtra)) {
+        if empty && self.extra.is_none() {
+            return;
+        }
+        change(self.extra.get_or_insert_with(Default::default));
+        self.compact_extra();
+    }
+    fn compact_extra(&mut self) {
+        if self.extra.as_ref().is_some_and(|e| e.is_empty()) {
+            self.extra = None;
+        }
+    }
+}
+
+/// `Mail` as the cache stores it, field for field as it always has been,
+/// so stored messages read back unchanged and unchanged ones save the same.
+/// Read owned (strings are moved into the `Mail`, not copied); written from
+/// borrows (`MailRecordRef`), so saving copies nothing.
+#[derive(Deserialize)]
+struct MailRecord {
+    id: String,
+    account: String,
+    folder: Folder,
+    remote_folder: String,
+    uid: u32,
+    from: String,
+    sender: String,
+    to: String,
+    #[serde(default)]
+    cc: String,
+    #[serde(default)]
+    reply_to: String,
+    subject: String,
+    snippet: String,
+    date: i64,
+    unread: bool,
+    starred: bool,
+    size: u32,
+    body: Option<String>,
+    #[serde(default)]
+    html: Option<String>,
+    attachments: Vec<Attachment>,
+    message_id: String,
+    #[serde(default)]
+    references: String,
+    #[serde(default)]
+    has_attachments: bool,
+    #[serde(default)]
+    gmail_id: u64,
+    #[serde(default)]
+    list_unsubscribe: String,
+    #[serde(default)]
+    one_click: bool,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    answered: bool,
+    #[serde(default)]
+    forwarded: bool,
+    #[serde(default)]
+    thread_id: String,
+    #[serde(default)]
+    saved: i64,
+    #[serde(default)]
+    receipt_to: String,
+    #[serde(default)]
+    mdn_sent: bool,
+    #[serde(default)]
+    partial: bool,
+}
+#[derive(Serialize)]
+struct MailRecordRef<'a> {
+    id: &'a str,
+    account: &'a str,
+    folder: Folder,
+    remote_folder: &'a str,
+    uid: u32,
+    from: &'a str,
+    sender: &'a str,
+    to: &'a str,
+    cc: &'a str,
+    #[serde(skip_serializing_if = "no_text")]
+    reply_to: &'a str,
+    subject: &'a str,
+    snippet: &'a str,
+    date: i64,
+    unread: bool,
+    starred: bool,
+    size: u32,
+    body: Option<&'a str>,
+    html: Option<&'a str>,
+    attachments: &'a [Attachment],
+    message_id: &'a str,
+    #[serde(skip_serializing_if = "no_text")]
+    references: &'a str,
+    has_attachments: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    gmail_id: u64,
+    #[serde(skip_serializing_if = "no_text")]
+    list_unsubscribe: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    one_click: bool,
+    #[serde(skip_serializing_if = "no_items")]
+    labels: &'a [String],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    answered: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    forwarded: bool,
+    #[serde(skip_serializing_if = "no_text")]
+    thread_id: &'a str,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    saved: i64,
+    #[serde(skip_serializing_if = "no_text")]
+    receipt_to: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mdn_sent: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
+}
+fn no_text(s: &&str) -> bool {
+    s.is_empty()
+}
+fn no_items<T>(items: &&[T]) -> bool {
+    items.is_empty()
+}
+impl From<MailRecord> for Mail {
+    fn from(r: MailRecord) -> Self {
+        let extra = MailExtra {
+            cc: r.cc,
+            attachments: r.attachments,
+            references: r.references,
+            labels: r.labels,
+            thread_id: r.thread_id,
+            saved: r.saved,
+            receipt_to: r.receipt_to,
+        };
+        Mail {
+            id: r.id,
+            account: r.account,
+            folder: r.folder,
+            remote_folder: r.remote_folder,
+            uid: r.uid,
+            from: r.from,
+            sender: r.sender,
+            to: r.to,
+            reply_to: r.reply_to,
+            subject: r.subject,
+            snippet: r.snippet,
+            date: r.date,
+            unread: r.unread,
+            starred: r.starred,
+            size: r.size,
+            body: r.body,
+            html: r.html,
+            message_id: r.message_id,
+            has_attachments: r.has_attachments,
+            gmail_id: r.gmail_id,
+            list_unsubscribe: r.list_unsubscribe,
+            one_click: r.one_click,
+            answered: r.answered,
+            forwarded: r.forwarded,
+            mdn_sent: r.mdn_sent,
+            partial: r.partial,
+            pending: false,
+            inline: InlineParts::none(),
+            extra: (!extra.is_empty()).then(|| Box::new(extra)),
+        }
+    }
+}
+impl Serialize for Mail {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        MailRecordRef {
+            id: &self.id,
+            account: &self.account,
+            folder: self.folder,
+            remote_folder: &self.remote_folder,
+            uid: self.uid,
+            from: &self.from,
+            sender: &self.sender,
+            to: &self.to,
+            cc: self.cc(),
+            reply_to: &self.reply_to,
+            subject: &self.subject,
+            snippet: &self.snippet,
+            date: self.date,
+            unread: self.unread,
+            starred: self.starred,
+            size: self.size,
+            body: self.body.as_deref(),
+            html: self.html.as_deref(),
+            attachments: self.attachments(),
+            message_id: &self.message_id,
+            references: self.references(),
+            has_attachments: self.has_attachments,
+            gmail_id: self.gmail_id,
+            list_unsubscribe: &self.list_unsubscribe,
+            one_click: self.one_click,
+            labels: self.labels(),
+            answered: self.answered,
+            forwarded: self.forwarded,
+            thread_id: self.thread_id(),
+            saved: self.saved(),
+            receipt_to: self.receipt_to(),
+            mdn_sent: self.mdn_sent,
+            partial: self.partial,
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Mail {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        MailRecord::deserialize(deserializer).map(Mail::from)
+    }
 }
 fn is_zero(v: &u64) -> bool {
     *v == 0
@@ -780,7 +1071,7 @@ impl Mail {
         }
     }
     pub fn has_attachments(&self) -> bool {
-        self.has_attachments || !self.attachments.is_empty()
+        self.has_attachments || !self.attachments().is_empty()
     }
     pub fn initials(&self) -> String {
         initials(&self.sender)
@@ -1015,7 +1306,8 @@ pub fn demo_mail() -> Vec<Mail> {
     examples
         .iter()
         .enumerate()
-        .map(|(i, (name, from, subject, body, unread))| Mail {
+        .map(|(i, (name, from, subject, body, unread))| {
+            let mut m = Mail {
             id: format!("demo-{i}"),
             account: "demo".into(),
             folder: Folder::Inbox,
@@ -1036,14 +1328,6 @@ pub fn demo_mail() -> Vec<Mail> {
             size: body.len() as u32,
             body: Some((*body).into()),
             html: None,
-            attachments: vec![],
-            // One sample message copies others, to show Cc and Reply All.
-            cc: if i == 2 {
-                "Daniel Kim <daniel@example.com>, Emma Wilson <emma@example.com>".into()
-            } else {
-                String::new()
-            },
-            references: String::new(),
             message_id: format!("<demo-{i}@picacho.example>"),
             has_attachments: i == 2,
             gmail_id: 0,
@@ -1055,15 +1339,18 @@ pub fn demo_mail() -> Vec<Mail> {
             one_click: false,
             pending: false,
             reply_to: String::new(),
-            labels: vec![],
             inline: Default::default(),
             answered: i == 2,
             forwarded: false,
-            thread_id: String::new(),
-            saved: 0,
-            receipt_to: String::new(),
             mdn_sent: false,
             partial: false,
+            extra: None,
+            };
+            // One sample message copies others, to show Cc and Reply All.
+            if i == 2 {
+                m.set_cc("Daniel Kim <daniel@example.com>, Emma Wilson <emma@example.com>");
+            }
+            m
         })
         .collect()
 }
@@ -1071,6 +1358,22 @@ pub fn demo_mail() -> Vec<Mail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message with every field set, as the cache stores it.
+    fn full_mail_json() -> &'static str {
+        r#"{"id":"a:INBOX:1:7","account":"a","folder":"Inbox","remote_folder":"INBOX","uid":7,"from":"ana@example.com","sender":"Ana","to":"bo@example.com","cc":"cy@example.com","reply_to":"list@example.com","subject":"Plans","snippet":"Lunch?","date":1700000000,"unread":true,"starred":true,"size":1234,"body":"Lunch? Bo","html":"<p>Lunch?</p>","attachments":[{"name":"a.pdf","size":10,"mime":"application/pdf","part":2,"section":"2","encoding":"base64"}],"message_id":"<m@x>","references":"<r@x>","has_attachments":true,"gmail_id":42,"list_unsubscribe":"<https://x/u>","one_click":true,"labels":["Work"],"answered":true,"forwarded":true,"thread_id":"gm:9","saved":1700000001,"receipt_to":"ana@example.com","mdn_sent":true,"partial":true}"#
+    }
+    /// Old and new keep the cache's format exactly: a stored message reads
+    /// back and writes out the same, and an empty one stays minimal.
+    #[test]
+    fn mail_keeps_the_cache_format() {
+        let full: Mail = serde_json::from_str(full_mail_json()).unwrap();
+        assert_eq!(serde_json::to_string(&full).unwrap(), full_mail_json());
+        assert_eq!(
+            serde_json::to_string(&Mail::default()).unwrap(),
+            r#"{"id":"","account":"","folder":"Inbox","remote_folder":"","uid":0,"from":"","sender":"","to":"","cc":"","subject":"","snippet":"","date":0,"unread":false,"starred":false,"size":0,"body":null,"html":null,"attachments":[],"message_id":"","has_attachments":false}"#
+        );
+    }
 
     #[test]
     fn inline_parts_match_their_cid_addresses() {

@@ -1100,7 +1100,7 @@ impl Scope {
         !self.only.is_empty() || !self.hide.is_empty()
     }
     pub fn admits(&self, m: &Mail) -> bool {
-        self.admits_recipients(&m.to, &m.cc)
+        self.admits_recipients(&m.to, m.cc())
     }
     fn admits_recipients(&self, to: &str, cc: &str) -> bool {
         if !self.filters() {

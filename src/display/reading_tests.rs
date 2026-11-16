@@ -444,3 +444,202 @@ fn the_last_open_mailbox_opens_again_after_a_restart(cx: &mut TestAppContext) {
         assert_eq!(this.messages.len(), 10, "its mail is listed");
     });
 }
+
+#[test]
+fn copied_names_and_addresses_read_back_as_written() {
+    for (name, email) in [
+        ("Ana Silva", "ana@example.com"),
+        ("Silva, Ana", "ana@example.com"),
+        ("Ana \"the boss\" S.", "ana@example.com"),
+    ] {
+        let both = name_and_address(Some(name), email);
+        let parsed = crate::sync::smtp::recipients(&both).unwrap();
+        assert_eq!(parsed, vec![(Some(name.to_owned()), email.to_owned())], "{both}");
+    }
+    assert_eq!(name_and_address(None, "ana@example.com"), "ana@example.com");
+    assert_eq!(name_and_address(Some(" "), "ana@example.com"), "ana@example.com");
+}
+
+#[test]
+fn recipients_can_be_copied_but_only_senders_written_to_and_looked_up() {
+    let labels = |entries: Vec<Entry>| -> Vec<String> {
+        entries
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, .. } => Some(label.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let sender = labels(address_entries(Some("Ana"), "ana@example.com", Some("ana@example.com")));
+    assert_eq!(
+        sender,
+        [
+            "Copy Name",
+            "Copy Address",
+            "Copy Name and Address",
+            "Send Email…",
+            "Show Mail From This Address"
+        ]
+    );
+    let recipient = labels(address_entries(Some("Ana"), "ana@example.com", None));
+    assert_eq!(recipient, ["Copy Name", "Copy Address", "Copy Name and Address"]);
+    let bare = labels(address_entries(None, "ana@example.com", None));
+    assert_eq!(bare, ["Copy Address"]);
+}
+
+#[gpui::test]
+fn right_clicking_the_sender_offers_to_write_and_find_their_mail(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    let (id, from) = view.read_with(cx, |this, _| {
+        (this.messages[2].id.clone(), this.messages[2].from.clone())
+    });
+    act(&view, Action::Select(id), cx);
+    frame(cx);
+    let at = cx.debug_bounds("reader-from").expect("the sender is shown").center();
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: at,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    let send = view.read_with(cx, |this, _| {
+        let menu = this.menu.as_ref().expect("right-clicking the sender opens a menu");
+        let find = |name: &str| {
+            menu.entries.iter().find_map(|e| match e {
+                Entry::Item { label, action, .. } if label.as_ref() == name => Some(action.clone()),
+                _ => None,
+            })
+        };
+        assert!(find("Copy Address").is_some());
+        assert!(matches!(
+            find("Show Mail From This Address"),
+            Some(Action::SearchFor(q)) if q == format!("from:{from}")
+        ));
+        find("Send Email…").expect("the menu offers to write to the sender")
+    });
+    act(&view, send, cx);
+    view.read_with(cx, |this, cx| {
+        let composer = this.composers.last().expect("a new message opens");
+        let draft = &composer.read(cx).draft;
+        assert!(draft.to.contains(&from), "{}", draft.to);
+        assert!(draft.subject.is_empty());
+    });
+}
+
+#[gpui::test]
+fn banner_actions_stay_inside_their_banners_as_the_reader_narrows(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    // One message showing three of the banners: snoozed, asking for a read
+    // receipt, and from a mailing list. (The sign-in code banner, drawn by
+    // the same `banner`, needs the Local AI model.)
+    view.update_in(cx, |this, _, cx| {
+        let m = &mut this.messages[0];
+        m.set_receipt_to("ana@example.com");
+        m.list_unsubscribe = "<https://example.com/unsubscribe>".into();
+        m.one_click = true;
+        let m = m.clone();
+        this.snoozed.insert(
+            m.account.clone(),
+            vec![crate::manage::backend::Snoozed {
+                message_id: m.message_id.clone(),
+                subject: m.subject.clone(),
+                sender: m.sender.clone(),
+                until: chrono::Local::now().timestamp() + 3 * 86_400,
+                folder: "Snoozed".into(),
+                ids: vec![],
+            }],
+        );
+        this.selected = Some(m.id.clone());
+        cx.notify();
+    });
+    let banners: [(&str, &[&str]); 3] = [
+        ("snooze-banner", &["unsnooze", "resnooze"]),
+        ("receipt-banner", &["receipt-decline", "receipt-send"]),
+        ("unsubscribe-banner", &["unsubscribe-mail"]),
+    ];
+    // Three-pane windows with the reader at its narrowest, and narrow
+    // windows' full-width readers.
+    for (width, drag) in [
+        (1440., false),
+        (1180., true),
+        (960., true),
+        (899., false),
+        (480., false),
+        (360., false),
+    ] {
+        cx.simulate_resize(size(px(width), px(700.)));
+        view.update_in(cx, |this, _, cx| {
+            this.reader_width = drag.then_some(super::panes::READER_MIN);
+            cx.notify();
+        });
+        frame(cx);
+        frame(cx);
+        let pane = cx.debug_bounds("reader-pane").unwrap();
+        for (banner, actions) in banners {
+            let selector: &'static str = banner;
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{width}: {banner} is not shown"));
+            assert!(b.right() <= pane.right(), "{width}: {banner} past the reader");
+            for action in actions {
+                let a = cx
+                    .debug_bounds(action)
+                    .unwrap_or_else(|| panic!("{width}: {action} is not shown"));
+                assert!(
+                    a.left() >= b.left() && a.right() <= b.right(),
+                    "{width}: {action} past {banner}: {a:?} in {b:?}"
+                );
+                assert!(
+                    a.top() >= b.top() && a.bottom() <= b.bottom(),
+                    "{width}: {action} outside {banner}: {a:?} in {b:?}"
+                );
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn server_search_line_stays_inside_a_narrow_list(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    // One IMAP account's inbox, searched: the line offers to search the
+    // server too.
+    let account = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    act(&view, Action::OpenMailbox(account, Folder::Inbox.into()), cx);
+    act(&view, Action::SearchFor("plans".into()), cx);
+    // The list at its narrowest beside the reader, and narrow windows'
+    // full-width lists.
+    for (width, drag) in [
+        (1440., false),
+        (1440., true),
+        (1180., true),
+        (960., true),
+        (480., false),
+        (360., false),
+    ] {
+        cx.simulate_resize(size(px(width), px(700.)));
+        view.update_in(cx, |this, _, cx| {
+            // As wide as it goes: the list keeps only its narrowest.
+            this.reader_width = drag.then_some(width);
+            cx.notify();
+        });
+        frame(cx);
+        frame(cx);
+        let list = cx.debug_bounds("message-list").unwrap();
+        let line = cx
+            .debug_bounds("server-search")
+            .unwrap_or_else(|| panic!("{width}: the server search line is not shown"));
+        let link = cx.debug_bounds("server-search-start").unwrap();
+        assert!(line.right() <= list.right(), "{width}: line past the list");
+        assert!(
+            link.left() >= line.left() && link.right() <= line.right(),
+            "{width}: link past the line: {link:?} in {line:?}"
+        );
+        assert!(
+            link.top() >= line.top() && link.bottom() <= line.bottom(),
+            "{width}: link outside the line: {link:?} in {line:?}"
+        );
+    }
+}

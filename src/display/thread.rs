@@ -27,18 +27,81 @@ pub(super) fn conversation_subject(subject: &str) -> String {
 }
 
 /// Whether `subject` can have `key` as its `conversation_subject`, decided
-/// without allocating: that is a suffix of the trimmed subject, which for
-/// ASCII text must end in `key` (in any case). Run over every listed
+/// without allocating: that is a suffix of the trimmed subject, lowercased,
+/// so the subject must end in `key` (in any case). Run over every listed
 /// message when a conversation is gathered, this rules most out at once.
-/// Other text is left to `conversation_subject`, as lowercasing can change
-/// its length.
 pub(super) fn may_be_conversation(subject: &str, key: &str) -> bool {
     let subject = subject.trim();
-    if !(subject.is_ascii() && key.is_ascii()) {
-        return true;
+    if subject.is_ascii() && key.is_ascii() {
+        return subject.len() >= key.len()
+            && subject.as_bytes()[subject.len() - key.len()..].eq_ignore_ascii_case(key.as_bytes());
     }
-    subject.len() >= key.len()
-        && subject.as_bytes()[subject.len() - key.len()..].eq_ignore_ascii_case(key.as_bytes())
+    // Lowercased a character at a time, from the end. Lowercasing a whole
+    // string turns a final Σ into ς, one character alone into σ: they count
+    // as the same, so that a subject that matches is never ruled out.
+    let fold = |c: char| if c == 'ς' { 'σ' } else { c };
+    let mut tail = subject
+        .chars()
+        .rev()
+        .flat_map(|c| c.to_lowercase().rev())
+        .map(fold);
+    key.chars().rev().map(fold).all(|k| tail.next() == Some(k))
+}
+
+/// `m`'s conversation among `messages`, as indexes, oldest first,
+/// including `m` itself. The server's thread ids decide where both
+/// messages have one (Gmail's X-GM-THRID, OBJECTID's THREADID, or IMAP
+/// THREAD within a mailbox); otherwise messages join by References, or by
+/// subject when at least one is a reply (so newsletters that reuse a
+/// subject stay apart).
+pub(super) fn conversation(messages: &[crate::manage::model::Mail], m: &crate::manage::model::Mail) -> Vec<usize> {
+    use crate::manage::model::Mail;
+    use std::collections::HashSet;
+        let key = conversation_subject(&m.subject);
+        let replyish = |x: &Mail, key: &str| {
+            !x.references().is_empty() || x.subject.trim().to_lowercase() != key
+        };
+        let linked = |a: &Mail, b: &Mail| {
+            !b.message_id.is_empty() && a.references().contains(b.message_id.as_str())
+        };
+        // Permanent server thread ids (not IMAP THREAD's, which only
+        // cover one mailbox) settle it either way.
+        let permanent = |x: &Mail| !x.thread_id().is_empty() && !x.thread_id().starts_with("t:");
+        let server = |x: &Mail| -> Option<bool> {
+            if x.thread_id().is_empty() || m.thread_id().is_empty() {
+                return None;
+            }
+            if x.thread_id() == m.thread_id() {
+                Some(true)
+            } else if permanent(x) && permanent(m) {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let mut seen = HashSet::new();
+        let mut rows: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.account == m.account && !x.pending)
+            .filter(|(_, x)| {
+                if let Some(same) = server(x) {
+                    return same || x.id == m.id;
+                }
+                x.id == m.id
+                    || linked(x, m)
+                    || linked(m, x)
+                    || (key.chars().count() > 2
+                        && may_be_conversation(&x.subject, &key)
+                        && conversation_subject(&x.subject) == key
+                        && (replyish(x, &key) || replyish(m, &key)))
+            })
+            // The same message under several labels or folders shows once.
+            .filter(|(_, x)| x.message_id.is_empty() || seen.insert(x.message_id.clone()))
+            .map(|(i, _)| i)
+            .collect();
+        rows.sort_by_key(|i| messages[*i].date);
+    rows
 }
 
 /// Splits a plain-text reply into what was written now and the quoted
@@ -149,6 +212,8 @@ mod tests {
             "Plans", "Re: Plans", "  RE:  fwd: PLANS  ", "Re[2]: Plans", "Re (3): plans",
             "AW: Plans", "Réf: Plans", "Re: Café plans", "Re: CAFÉ PLANS", "Plans B",
             "Other plans", "Re: ", "", "Re: İstanbul", "Re: KK plans",
+            "Re: ΣΟΦΙΑΣ", "σοφιας", "🎁 Sale!", "Re: 🎁 SALE!",
+            "Fwd: Café", "cafÉ", "Straße", "STRASSE",
         ];
         for subject in subjects {
             for other in subjects {
@@ -160,6 +225,9 @@ mod tests {
         }
         assert!(!may_be_conversation("Re: Lunch", "plans"));
         assert!(!may_be_conversation("Plans B", "plans"));
+        // Text that isn't ASCII is ruled out too, without lowercasing it whole.
+        assert!(!may_be_conversation("🎁 Sale ends", "🎁 sale!"));
+        assert!(may_be_conversation("RE: 🎁 SALE!", "🎁 sale!"));
     }
 
     #[test]

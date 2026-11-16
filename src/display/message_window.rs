@@ -120,7 +120,7 @@ impl Render for MessageWindow {
             None => list.to_owned(),
         };
         let to = super::thread::short_names(&unreversed(&m.to), &self.own);
-        let cc = super::thread::short_names(&unreversed(&m.cc), &self.own);
+        let cc = super::thread::short_names(&unreversed(m.cc()), &self.own);
         let mut body = div().flex().flex_col();
         let mut has_quotes = false;
         if self.loading {
@@ -210,7 +210,7 @@ impl Render for MessageWindow {
                 ),
             );
         }
-        let attachments = m.attachments.iter().map(|a| {
+        let attachments = m.attachments().iter().map(|a| {
             div()
                 .mt_2()
                 .px_3()

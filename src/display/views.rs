@@ -18,14 +18,52 @@ pub(super) struct Place {
     #[serde(default)]
     pub sender: Option<MailSubscription>,
 }
-/// What a message list was built from: the view, and the cache's and the
-/// layouts' revisions read before it was (`Backend::list_revision`).
+/// What a message list was built from: the view, and each of its accounts'
+/// revisions read before it was (`Backend::list_revision`), in the order of
+/// `accounts`.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ListKey {
     generation: u64,
     mailbox: String,
     accounts: Vec<String>,
-    revision: (u64, u64),
+    revisions: Vec<(u64, u64)>,
+}
+
+/// Whether the listed messages are what the cache holds for the open view.
+#[derive(Debug, PartialEq)]
+pub(super) enum Freshness {
+    Current,
+    /// These accounts' mail changed (by index into the view's accounts);
+    /// the rest of the list is still current.
+    Stale(Vec<usize>),
+    /// Another view, or one never listed: the whole list must be built.
+    Unknown,
+}
+
+/// One account's part of a list, rebuilt alone: the account, its revision
+/// read before listing, and its messages, newest first.
+pub(super) type AccountList = (String, (u64, u64), Vec<Mail>);
+
+/// Two lists, each newest first, as one. Messages are moved, not copied.
+fn merge_newest_first(a: Vec<Mail>, b: Vec<Mail>) -> Vec<Mail> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => {
+                if Mail::newest_first(x, y) == std::cmp::Ordering::Greater {
+                    b.next()
+                } else {
+                    a.next()
+                }
+            }
+            (Some(_), None) => a.next(),
+            (None, Some(_)) => b.next(),
+            (None, None) => break,
+        };
+        out.extend(next);
+    }
+    out
 }
 
 /// The preference holding the last `Place`.
@@ -220,7 +258,7 @@ impl MailApp {
         }
         let sent = m.folder == Folder::Sent || m.from.eq_ignore_ascii_case(&a.email);
         let alias = sent
-            .then(|| fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes))
+            .then(|| fwd::sent_as(&m.from, &m.to, m.cc(), &self.forwarding, &self.alias_routes))
             .flatten()
             .or_else(|| {
                 super::compose::alias_addressed(m, &fwd::sendable(&self.forwarding))
@@ -249,7 +287,7 @@ impl MailApp {
         if cfg!(test) || self.mask_for(m).is_none() {
             return;
         }
-        let wanted: HashSet<String> = [&m.to, &m.cc]
+        let wanted: HashSet<String> = [m.to.as_str(), m.cc()]
             .into_iter()
             .flat_map(|list| crate::sync::smtp::recipients(list).unwrap_or_default())
             .map(|(_, email)| email.trim().to_lowercase())
@@ -288,7 +326,7 @@ impl MailApp {
         if m.folder != Folder::Sent && self.folder != Folder::Sent {
             return None;
         }
-        fwd::sent_as(&m.from, &m.to, &m.cc, &self.forwarding, &self.alias_routes)
+        fwd::sent_as(&m.from, &m.to, m.cc(), &self.forwarding, &self.alias_routes)
     }
     pub(super) fn shows_all_mail(&self) -> bool {
         self.all_mail && self.accounts.len() > 1
@@ -311,7 +349,7 @@ impl MailApp {
                 generation,
                 mailbox: key,
                 accounts: accounts.clone(),
-                revision: b.list_revision(),
+                revisions: accounts.iter().map(|id| b.list_revision(id)).collect(),
             };
             if let [id] = accounts.as_slice() {
                 let (messages, layout) = b.listed(id, &mailbox)?;
@@ -332,14 +370,90 @@ impl MailApp {
         }
     }
     /// Whether the listed messages are still what the cache holds for the
-    /// open view: same view, and nothing that lists show changed since.
-    pub(super) fn list_current(&self) -> bool {
-        self.listed.as_ref().is_some_and(|k| {
+    /// open view, and if not, whose mail changed since they were listed.
+    pub(super) fn list_freshness(&self) -> Freshness {
+        let Some(k) = self.listed.as_ref().filter(|k| {
             k.generation == self.load_generation
                 && k.mailbox == self.mailbox().key()
                 && k.accounts == self.scope.accounts
-                && k.revision == self.backend.list_revision()
-        })
+        }) else {
+            return Freshness::Unknown;
+        };
+        let changed: Vec<usize> = k
+            .accounts
+            .iter()
+            .zip(&k.revisions)
+            .enumerate()
+            .filter(|(_, (id, revision))| self.backend.list_revision(id) != **revision)
+            .map(|(i, _)| i)
+            .collect();
+        if changed.is_empty() {
+            Freshness::Current
+        } else {
+            Freshness::Stale(changed)
+        }
+    }
+    /// Lists `accounts`' part of a view of several, each newest first, to
+    /// put in place of what the list holds of their mail.
+    pub(super) fn account_lists_job(
+        accounts: Vec<String>,
+        mailbox: Mailbox,
+    ) -> impl FnOnce(Arc<Backend>) -> anyhow::Result<Vec<AccountList>> + Send + 'static {
+        move |b| {
+            accounts
+                .into_iter()
+                .map(|id| {
+                    let revision = b.list_revision(&id);
+                    let (messages, _) = b.listed(&id, &mailbox)?;
+                    let mut messages: Vec<Mail> =
+                        messages.into_iter().filter(|m| !m.pending).collect();
+                    messages.sort_by(Mail::newest_first);
+                    Ok((id, revision, messages))
+                })
+                .collect()
+        }
+    }
+    /// Puts rebuilt accounts' mail in place of what the list held of theirs,
+    /// keeping everyone else's as it is. False, changing nothing, when the
+    /// list is no longer the one the parts were listed for.
+    pub(super) fn replace_account_lists(
+        &mut self,
+        generation: u64,
+        parts: Vec<AccountList>,
+        cx: &App,
+    ) -> bool {
+        let fits = generation == self.load_generation
+            && self.listed.as_ref().is_some_and(|k| {
+                k.generation == generation
+                    && k.mailbox == self.mailbox().key()
+                    && k.accounts == self.scope.accounts
+                    && parts.iter().all(|(id, ..)| k.accounts.contains(id))
+            });
+        if !fits {
+            return false;
+        }
+        let kept = self.list_place();
+        let changed: HashSet<&str> = parts.iter().map(|(id, ..)| id.as_str()).collect();
+        let others: Vec<Mail> = std::mem::take(&mut self.messages)
+            .into_iter()
+            .filter(|m| !changed.contains(m.account.as_str()))
+            .collect();
+        drop(changed);
+        let mut merged = others;
+        let mut revisions = Vec::new();
+        for (id, revision, messages) in parts {
+            merged = merge_newest_first(merged, messages);
+            revisions.push((id, revision));
+        }
+        if let Some(key) = self.listed.as_mut() {
+            for (id, revision) in revisions {
+                if let Some(i) = key.accounts.iter().position(|a| *a == id) {
+                    key.revisions[i] = revision;
+                }
+            }
+        }
+        self.install_messages(merged, kept, cx);
+        true
     }
     /// Checks every mailbox the open view lists.
     pub(super) fn refresh_view(&mut self, cx: &mut Context<Self>) {
@@ -1382,6 +1496,62 @@ mod tests {
         .unwrap();
         let (view, cx) = open(store, cx);
         (view, cx, work)
+    }
+
+    /// After a check, All Accounts rebuilds only the accounts whose mail
+    /// changed; nothing changed, nothing is rebuilt; and the others' mail
+    /// stays as it is (here, a mark made only in the list, never saved).
+    #[gpui::test]
+    fn all_accounts_rebuilds_only_the_accounts_that_changed(cx: &mut TestAppContext) {
+        let (view, cx, work) = setup(cx);
+        act(&view, Action::OpenMailbox(ALL_MAIL.into(), Folder::Inbox.into()), cx);
+        let (home, total) = view.read_with(cx, |this, _| {
+            assert_eq!(this.list_freshness(), Freshness::Current);
+            let home = this.scope.accounts.iter().find(|a| **a != work).unwrap().clone();
+            (home, this.messages.len())
+        });
+        let mark = |this: &mut MailApp, account: &str| {
+            let m = this.messages.iter_mut().find(|m| m.account == account).unwrap();
+            m.subject = "Marked in the list only".into();
+        };
+        let marked = |this: &MailApp, account: &str| {
+            this.messages
+                .iter()
+                .any(|m| m.account == account && m.subject == "Marked in the list only")
+        };
+        view.update(cx, |this, _| {
+            mark(this, &home);
+            mark(this, &work);
+        });
+        // A check that finds nothing new rebuilds nothing.
+        view.update(cx, |this, cx| this.reload_if_changed(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| assert!(marked(this, &home) && marked(this, &work)));
+        // New mail in Work: only Work's part is listed again.
+        let fresh = view.read_with(cx, |this, _| {
+            let mut m = this.backend.store.summaries(&work, Folder::Inbox).unwrap()[0].clone();
+            m.id = format!("{work}:fresh");
+            m.subject = "Just arrived".into();
+            // After everything listed: each account's sample mail is dated
+            // from its own reading of the clock, which may be a second apart.
+            m.date = this.messages.iter().map(|m| m.date).max().unwrap() + 60;
+            m
+        });
+        view.update(cx, |this, _| this.backend.store.save_messages(&[fresh]).unwrap());
+        view.read_with(cx, |this, _| {
+            let i = this.scope.accounts.iter().position(|a| *a == work).unwrap();
+            assert_eq!(this.list_freshness(), Freshness::Stale(vec![i]));
+        });
+        view.update(cx, |this, cx| this.reload_if_changed(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.list_freshness(), Freshness::Current);
+            assert_eq!(this.messages.len(), total + 1);
+            assert_eq!(this.messages[0].subject, "Just arrived", "newest first");
+            assert!(this.messages.windows(2).all(|w| w[0].date >= w[1].date));
+            assert!(marked(this, &home), "Home's mail wasn't listed again");
+            assert!(!marked(this, &work), "Work's was");
+        });
     }
 
     #[gpui::test]
