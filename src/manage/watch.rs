@@ -24,8 +24,6 @@ const RENEW_IDLE: Duration = Duration::from_secs(9 * 60);
 /// Waits after a failure, doubling up to the longest.
 const FIRST_RETRY: Duration = Duration::from_secs(30);
 const LONGEST_RETRY: Duration = Duration::from_secs(15 * 60);
-/// How often Proton's events are asked for, before a random 0–20 s more.
-const PROTON_EVENTS: Duration = Duration::from_secs(20);
 
 pub(super) struct Watcher {
     stop: Arc<AtomicBool>,
@@ -72,6 +70,11 @@ impl Backend {
     ) {
         if a.provider == Provider::Proton {
             self.stop_watching(&a.id);
+            // Asking Proton for changes is turned off: the regular check
+            // finds new mail.
+            if a.sync.proton_events_seconds == 0 {
+                return;
+            }
             if let Some(w) = self.spawn_proton_watch(a, Arc::new(changed)) {
                 self.watchers.lock().unwrap().insert(a.id.clone(), w);
             }
@@ -190,8 +193,10 @@ impl Backend {
         // Notices already told, should a later event repeat one.
         let mut told = std::collections::HashSet::<String>::new();
         loop {
-            // Proton's own apps ask about every 20–40 seconds.
-            let wait = PROTON_EVENTS + Duration::from_millis(rand::random::<u64>() % 20_000);
+            // As often as the account says, and up to a quarter more, so
+            // the requests don't settle into lockstep with anything else.
+            let every = Duration::from_secs(u64::from(a.sync.proton_events_seconds.max(1)));
+            let wait = every + every.mul_f64(rand::random::<f64>() / 4.0);
             let until = std::time::Instant::now() + wait;
             while std::time::Instant::now() < until {
                 if stop.load(Ordering::Acquire) {

@@ -3278,4 +3278,18 @@ mod layout_tests {
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }
+
+    /// A Proton account set not to ask for changes gets no event watcher;
+    /// the regular check finds its new mail.
+    #[test]
+    fn proton_events_turned_off_start_no_watcher() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-events-{}", uuid::Uuid::new_v4()));
+        let b = Arc::new(Backend::new(Arc::new(Store::open(&path)?)));
+        let mut a = Account::new(Provider::Proton);
+        a.sync.proton_events_seconds = 0;
+        b.watch_inbox(&a, |_| {});
+        assert!(b.watching().is_empty());
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
 }

@@ -216,10 +216,19 @@ pub struct SyncSettings {
     /// Anything else downloads when it is opened.
     #[serde(default = "default_offline_days")]
     pub offline_days: u32,
+    /// Proton Direct: seconds between asking Proton for changes (new mail,
+    /// moves, notices); 0 doesn't ask, leaving new mail to the regular
+    /// check (`refresh_minutes`).
+    #[serde(default = "default_proton_events_seconds")]
+    pub proton_events_seconds: u32,
 }
 /// `SyncSettings::offline_days`: download message contents only when opened.
 pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
 fn default_offline_days() -> u32 {
+    30
+}
+/// About as often as Proton's own apps ask.
+fn default_proton_events_seconds() -> u32 {
     30
 }
 impl SyncSettings {
@@ -239,6 +248,7 @@ impl Default for SyncSettings {
             refresh_minutes: 5,
             notify: true,
             offline_days: default_offline_days(),
+            proton_events_seconds: default_proton_events_seconds(),
         }
     }
 }
@@ -1373,6 +1383,17 @@ mod tests {
             serde_json::to_string(&Mail::default()).unwrap(),
             r#"{"id":"","account":"","folder":"Inbox","remote_folder":"","uid":0,"from":"","sender":"","to":"","cc":"","subject":"","snippet":"","date":0,"unread":false,"starred":false,"size":0,"body":null,"html":null,"attachments":[],"message_id":"","has_attachments":false}"#
         );
+    }
+
+    /// Accounts saved before Proton's event pace was a setting keep the
+    /// pace they had: about every 30 seconds.
+    #[test]
+    fn sync_settings_saved_before_the_proton_pace_ask_every_30_seconds() {
+        let old: SyncSettings =
+            serde_json::from_str(r#"{"days":0,"refresh_minutes":5,"notify":true,"offline_days":30}"#)
+                .unwrap();
+        assert_eq!(old.proton_events_seconds, 30);
+        assert_eq!(old, SyncSettings::default());
     }
 
     #[test]
