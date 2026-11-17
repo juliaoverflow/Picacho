@@ -104,6 +104,9 @@ impl AssetSource for Assets {
             "mail/link.svg" => Some(
                 "<path d='M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1'/>",
             ),
+            "mail/keyboard.svg" => Some(
+                "<rect x='2' y='5' width='20' height='14' rx='2'/><path d='M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M10 13h4M7 16h10'/>",
+            ),
             "mail/heading.svg" => Some("<path d='M6 4v16M18 4v16M6 12h12'/>"),
             "mail/save.svg" => Some(
                 "<path d='M5 3h11l3 3v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z'/><path d='M7 3v5h8V3M7 21v-7h10v7'/>",
