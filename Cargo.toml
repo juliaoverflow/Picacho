@@ -236,6 +236,11 @@ android_logger = "0.15"
 log = "0.4"
 # Android has no system OpenSSL; build it into the app.
 native-tls = { version = "0.2", features = ["vendored"] }
+# keyring's own Entry has no Android store; credentials go to the app's
+# SharedPreferences, encrypted with an Android Keystore key, through
+# keyring-core directly (manage/store.rs).
+keyring-core = "1"
+android-native-keyring-store = "1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 # GPUI's iOS platform: the UIKit window, touch and keyboard input, Core Text

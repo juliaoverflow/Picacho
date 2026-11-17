@@ -1,0 +1,22 @@
+# fdroidserver configuration for Picacho's own F-Droid repository,
+# https://android.repo.pinal.tech/repo (published by scripts/release/publish-fdroid.sh).
+# The keystore and its password come from CI secrets.
+repo_url: https://android.repo.pinal.tech/repo
+repo_name: Picacho
+repo_description: >-
+  Picacho's own repository: release and beta builds of Picacho, the fast,
+  native email client, signed by Pinal Tech.
+repo_icon: icon.png
+archive_older: 3
+archive_url: https://android.repo.pinal.tech/archive
+archive_name: Picacho (archive)
+archive_description: Older Picacho builds.
+archive_icon: icon.png
+
+repo_keyalias: picacho-repo
+keystore: fdroid-repo.jks
+keystorepass:
+  env: FDROID_KEYSTORE_PASSWORD
+keypass:
+  env: FDROID_KEYSTORE_PASSWORD
+keydname: CN=Picacho F-Droid Repository, O=Pinal Tech

@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+# Built by cargo-ndk (scripts/build-android.sh).
+app/src/main/jniLibs/
+*.jks
+*.keystore

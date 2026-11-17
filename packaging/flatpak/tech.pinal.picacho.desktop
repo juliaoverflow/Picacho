@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Picacho
+GenericName=Email Client
+Comment=Fast, native email for every inbox you have
+Exec=picacho
+Icon=tech.pinal.picacho
+StartupWMClass=tech.pinal.picacho
+Terminal=false
+Categories=Network;Email;
+Keywords=mail;email;inbox;imap;

@@ -1,0 +1,11 @@
+# CurrentVersionCode (the newest release; higher codes are betas) is added by
+# scripts/release/fdroid-metadata.py when publishing.
+AuthorName: Pinal Tech
+Categories:
+  - Email
+License: MIT
+WebSite: https://pinal.tech/apps/picacho
+SourceCode: https://github.com/pinaltech/Picacho
+IssueTracker: https://github.com/pinaltech/Picacho/issues
+Changelog: https://github.com/pinaltech/Picacho/blob/main/CHANGELOG.md
+AutoName: Picacho

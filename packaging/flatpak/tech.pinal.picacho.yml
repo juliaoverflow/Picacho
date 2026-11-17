@@ -1,0 +1,63 @@
+# Picacho's Flatpak, published to Picacho's own repository at
+# https://linux.repo.pinal.tech (see .github/workflows/release.yml).
+#
+# Local build (from the repository root):
+#   flatpak-builder --user --install --force-clean build-dir packaging/flatpak/tech.pinal.picacho.yml
+id: tech.pinal.picacho
+# GNOME's runtime (built on the Freedesktop one) for WebKitGTK 4.1, which
+# shows Proton's human verification (wry, display/verify.rs).
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+# libclang, for bindgen (fido-hid-rs, the USB security keys).
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.llvm23
+command: picacho
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  # GPU rendering, and USB security keys for passkey sign-in (all includes dri).
+  - --device=all
+  # Credentials live in the Secret Service (GNOME Keyring, KWallet).
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.Notifications
+modules:
+  - name: picacho
+    buildsystem: simple
+    build-options:
+      # Picacho needs Rust 1.100 or later, newer than the SDK's Rust extension,
+      # so the build installs that toolchain with rustup and lets cargo fetch
+      # the locked crates. Only for this repository; Flathub builds offline.
+      build-args:
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/picacho/.cargo
+        RUSTUP_HOME: /run/build/picacho/.rustup
+        LIBCLANG_PATH: /usr/lib/sdk/llvm23/lib
+        # bindgen asks clang for its built-in headers (stddef.h).
+        CLANG_PATH: /usr/lib/sdk/llvm23/bin/clang
+      # The release profile already leaves symbols out; no .Debug extension.
+      no-debuginfo: true
+      append-path: /usr/lib/sdk/llvm23/bin
+    build-commands:
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.100.0 --no-modify-path
+      - $CARGO_HOME/bin/cargo build --release --locked
+      - install -Dm755 target/release/picacho /app/bin/picacho
+      - install -Dm644 packaging/linux/tech.pinal.picacho.svg /app/share/icons/hicolor/scalable/apps/tech.pinal.picacho.svg
+      - install -Dm644 packaging/flatpak/tech.pinal.picacho.desktop /app/share/applications/tech.pinal.picacho.desktop
+      - python3 scripts/release/changelog.py metainfo packaging/flatpak/tech.pinal.picacho.metainfo.xml /app/share/metainfo/tech.pinal.picacho.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - dist
+          - android
+          - build-dir
+          - .flatpak-builder
+          - build-repo
+          - build
+          - out
+          - fdroid
