@@ -1,12 +1,15 @@
+# The check for dev and every pull request. Only beta and stable deploy
+# (release.yml).
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
   pull_request:
 
 jobs:
-  build:
+  test:
+    name: Test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

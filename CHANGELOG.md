@@ -2,11 +2,12 @@
 
 All notable changes to Picacho are recorded here. Each release's section is
 its release notes: on GitHub, in the F-Droid repository and in the Flatpak's
-metainfo. Versions follow [Semantic Versioning](https://semver.org); a
-pre-release such as `0.2.0-beta.1` ships on the beta channels.
+metainfo. Versions follow [Semantic Versioning](https://semver.org). The
+rolling beta has no version or section of its own.
 
-Add changes under **Unreleased**; when tagging `vX.Y.Z`, rename it to
-`## [X.Y.Z] - YYYY-MM-DD` and set the same version in `Cargo.toml`.
+Add changes under **Unreleased**; in the pull request that releases `X.Y.Z`
+into the stable branch, rename it to `## [X.Y.Z] - YYYY-MM-DD` and set the
+same version in `Cargo.toml`.
 
 ## [Unreleased]
 
