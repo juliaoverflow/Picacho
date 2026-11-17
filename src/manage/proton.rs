@@ -593,6 +593,10 @@ impl Backend {
             // passed over, a few at a time, until new ones turn up.
             let mut ended = false;
             for _ in 0..8 {
+                // A sync or an opened message is waiting: let it go first.
+                if !added.is_empty() && self.someone_waiting(&a.id) {
+                    break;
+                }
                 let listed = s.list(&label, page, PAGE)?;
                 let last = listed.len() < PAGE;
                 for m in &listed {

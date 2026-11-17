@@ -936,6 +936,10 @@ pub struct MailApp {
     /// succeeds or fails some other way.
     dismissed_issues: HashMap<String, HashMap<IssueSource, String>>,
     sync_requests: HashSet<(String, String)>,
+    /// Syncs asked for while the same one ran, by (account, mailbox key),
+    /// with the largest limit asked: they run again once it ends, since it
+    /// may have listed the mailbox before the change.
+    sync_again: HashMap<(String, String), usize>,
     downloading: HashSet<String>,
     retrying: HashSet<String>,
     /// Unread inbox messages already seen per account, to spot new mail.
@@ -1704,6 +1708,7 @@ impl MailApp {
             account_issues: HashMap::new(),
             dismissed_issues: HashMap::new(),
             sync_requests: HashSet::new(),
+            sync_again: HashMap::new(),
             downloading: HashSet::new(),
             retrying: HashSet::new(),
             known: HashMap::new(),
@@ -3130,6 +3135,8 @@ impl MailApp {
         let id = a.id.clone();
         let key = mailbox.key();
         if !self.sync_requests.insert((id.clone(), key.clone())) {
+            let again = self.sync_again.entry((id, key)).or_default();
+            *again = (*again).max(limit);
             return;
         }
         let inbox = mailbox == Mailbox::Standard(Folder::Inbox);
@@ -3142,6 +3149,7 @@ impl MailApp {
             self.syncing = true;
         }
         let catalog = mailbox.clone();
+        let again_mailbox = mailbox.clone();
         self.task(
             cx,
             move |b| {
@@ -3151,6 +3159,7 @@ impl MailApp {
             },
             move |this, result, cx| {
                 this.sync_requests.remove(&(id.clone(), key.clone()));
+                let again = this.sync_again.remove(&(id.clone(), key.clone()));
                 this.account_result(&id, IssueSource::Sync(key.clone()), &result);
                 let visible = this.shows(&id) && this.mailbox().key() == key;
                 if visible {
@@ -3187,6 +3196,12 @@ impl MailApp {
                     if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
                         this.download_account(a, cx);
                     }
+                }
+                if let Some(limit) = again
+                    && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
+                    && !this.account_blocked(&id)
+                {
+                    this.sync_mailbox(a, again_mailbox, limit, cx);
                 }
                 this.refresh_counts(cx);
             },
