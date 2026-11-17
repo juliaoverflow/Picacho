@@ -11,7 +11,16 @@ pub fn new_mail(account: &str, latest: (&str, &str), count: usize) {
             format!("{} — {}", latest.0, latest.1),
         )
     };
-    let account = account.to_owned();
+    show(title, account.to_owned(), body);
+}
+
+/// Shows a notice from the mail provider itself (the messages Proton
+/// sends its apps' users), titled as the provider sent it.
+pub fn account_notice(account: &str, title: &str, body: &str) {
+    show(title.to_owned(), account.to_owned(), body.to_owned());
+}
+
+fn show(title: String, account: String, body: String) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         {

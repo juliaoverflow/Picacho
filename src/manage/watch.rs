@@ -52,8 +52,15 @@ enum Ended {
 }
 /// The callback watchers call with the mailbox that changed.
 type Changed = Arc<dyn Fn(Mailbox) + Send + Sync>;
+/// Hears a Proton account notice: the account, its title and its body.
+pub type ProtonNotice = Arc<dyn Fn(&Account, &str, &str) + Send + Sync>;
 
 impl Backend {
+    /// Who hears the notices Proton's event stream carries (its
+    /// `Notifications`): messages Proton shows its apps' users.
+    pub fn on_proton_notice(&self, hear: impl Fn(&Account, &str, &str) + Send + Sync + 'static) {
+        *self.proton_notice.lock().unwrap() = Some(Arc::new(hear));
+    }
     /// Watches the account's inbox for new mail with IDLE (and, with
     /// NOTIFY, every other mailbox), calling `changed` with the mailbox
     /// whenever the server reports a change, until `stop_watching`. A
@@ -180,6 +187,8 @@ impl Backend {
     ) -> Result<()> {
         let mut since = self.with_proton(a, |s| s.latest_event())?;
         *watched = true;
+        // Notices already told, should a later event repeat one.
+        let mut told = std::collections::HashSet::<String>::new();
         loop {
             // Proton's own apps ask about every 20–40 seconds.
             let wait = PROTON_EVENTS + Duration::from_millis(rand::random::<u64>() % 20_000);
@@ -190,11 +199,39 @@ impl Backend {
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let (latest, events, refresh, folders) = self.with_proton(a, |s| {
-                let (latest, events, refresh) = s.events_since(&since)?;
-                Ok((latest, events, refresh, s.folders()))
-            })?;
+            let (news, folders) =
+                self.with_proton(a, |s| Ok((s.events_since(&since)?, s.folders())))?;
+            let crate::sync::proton::Events {
+                latest,
+                messages: events,
+                refresh,
+                notices,
+            } = news;
             since = latest;
+            let hear = self.proton_notice.lock().unwrap().clone();
+            for n in notices {
+                let key = if n.id.is_empty() {
+                    format!("{}\n{}\n{}", n.time, n.payload.title, n.payload.body)
+                } else {
+                    n.id.clone()
+                };
+                if !told.insert(key) {
+                    continue;
+                }
+                if let Some(hear) = &hear {
+                    let title = if n.payload.title.is_empty() {
+                        "Proton"
+                    } else {
+                        &n.payload.title
+                    };
+                    let body = [n.payload.subtitle.as_str(), n.payload.body.as_str()]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    hear(a, title, &body);
+                }
+            }
             let mut boxes: Vec<Mailbox> = Vec::new();
             if refresh {
                 boxes.push(Mailbox::Standard(Folder::Inbox));

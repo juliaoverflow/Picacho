@@ -16,7 +16,7 @@ use protected_email_bridge::{
     api::{
         ApiClient, HumanVerification, SessionTokens,
         mail::MessageFilter,
-        types::{Label, MessageEvent, MessageMetadata, label_type},
+        types::{Label, MessageEvent, MessageMetadata, Notification, label_type},
     },
     auth,
     config::{DeploymentConfig, GatewaySettings, LocalArtifacts},
@@ -541,6 +541,18 @@ impl Drop for Login {
     }
 }
 
+/// What Proton's event stream said since an earlier event.
+pub struct Events {
+    /// The newest event id, to ask from next time.
+    pub latest: String,
+    /// Message changes.
+    pub messages: Vec<MessageEvent>,
+    /// Proton says to refresh everything.
+    pub refresh: bool,
+    /// Account notices Proton shows its users (`Notifications`).
+    pub notices: Vec<Notification>,
+}
+
 /// Ends a saved session at Proton (removing the account here).
 pub fn sign_out(saved: &Saved) {
     block_on(async {
@@ -872,9 +884,8 @@ impl Session {
     pub fn latest_event(&self) -> Result<String> {
         block_on(self.ctx.client.get_latest_event_id()).explained()
     }
-    /// What changed since event `since`: the newest event id, the message
-    /// changes, and whether Proton says to refresh everything.
-    pub fn events_since(&self, since: &str) -> Result<(String, Vec<MessageEvent>, bool)> {
+    /// What changed since event `since`; see `Events`.
+    pub fn events_since(&self, since: &str) -> Result<Events> {
         let events = block_on(self.ctx.client.get_events_chained(since)).explained()?;
         let latest = events
             .last()
@@ -884,8 +895,18 @@ impl Session {
         if events.iter().any(|e| !e.labels.is_empty()) {
             let _ = self.reload_folders();
         }
-        let messages = events.into_iter().flat_map(|e| e.messages).collect();
-        Ok((latest, messages, refresh))
+        let mut messages = Vec::new();
+        let mut notices = Vec::new();
+        for e in events {
+            messages.extend(e.messages);
+            notices.extend(e.notifications);
+        }
+        Ok(Events {
+            latest,
+            messages,
+            refresh,
+            notices,
+        })
     }
     /// Every message of a mailbox, newest first, up to `most`.
     pub fn list_all(&self, label_id: &str, most: usize) -> Result<Vec<MessageMetadata>> {

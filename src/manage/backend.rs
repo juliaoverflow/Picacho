@@ -20,7 +20,7 @@ mod connection;
 use connection::{Connection, Limits};
 #[path = "watch.rs"]
 mod watch;
-use watch::Watcher;
+use watch::{ProtonNotice, Watcher};
 #[path = "offline.rs"]
 mod offline;
 #[path = "snooze.rs"]
@@ -250,6 +250,8 @@ pub struct Backend {
     proton_login: Mutex<Option<proton::ProtonLogin>>,
     /// What a security key or phone is waiting for during a sign-in.
     proton_prompt: Arc<Mutex<KeyPrompt>>,
+    /// Called with Proton's account notices; see `on_proton_notice`.
+    proton_notice: Mutex<Option<ProtonNotice>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -293,6 +295,7 @@ impl Backend {
             proton_opening: Mutex::new(HashMap::new()),
             proton_login: Mutex::new(None),
             proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
+            proton_notice: Mutex::new(None),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]

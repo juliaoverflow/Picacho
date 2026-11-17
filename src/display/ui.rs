@@ -1316,6 +1316,11 @@ impl MailApp {
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let backend = Arc::new(Backend::new(store));
+        backend.on_proton_notice(|a, title, body| {
+            if a.sync.notify {
+                crate::display::notify::account_notice(&a.email, title, body);
+            }
+        });
         let search = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Search, or from: reply-to: is:unread")
