@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>tech.pinal.picacho</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Picacho</name>
+  <summary>Fast, native email for every inbox you have.</summary>
+  <description>
+    <p>Picacho is a fast, native email client written in Rust with GPUI. It runs without Electron or a webview, and it works with the mail you already have. Gray surfaces, a three-pane layout, rounded controls, and light and dark palettes with a choice of theme colors keep the focus on your mail.</p>
+  </description>
+  <developer id="tech.pinal">
+    <name>Pinal Tech</name>
+  </developer>
+  <launchable type="desktop-id">tech.pinal.picacho.desktop</launchable>
+  <url type="homepage">https://pinal.tech/apps/picacho</url>
+  <url type="bugtracker">https://github.com/pinaltech/Picacho/issues</url>
+  <url type="vcs-browser">https://github.com/pinaltech/Picacho</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The inbox in the light palette</caption>
+      <image>https://linux.repo.pinal.tech/screenshots/inbox-light.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The inbox in the dark palette</caption>
+      <image>https://linux.repo.pinal.tech/screenshots/inbox-dark.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Writing a message</caption>
+      <image>https://linux.repo.pinal.tech/screenshots/compose.png</image>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary" scheme_preference="light">#E6F2EA</color>
+    <color type="primary" scheme_preference="dark">#005353</color>
+  </branding>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-info">mild</content_attribute>
+  </content_rating>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+  </categories>
+  <keywords>
+    <keyword>mail</keyword>
+    <keyword>email</keyword>
+    <keyword>inbox</keyword>
+    <keyword>imap</keyword>
+  </keywords>
+  <!-- Filled from CHANGELOG.md at build time (scripts/release/changelog.py). -->
+  <releases/>
+</component>

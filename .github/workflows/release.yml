@@ -1,0 +1,264 @@
+# Builds a release for Android (APKs) and Linux (Flatpak) from a version tag,
+# publishes them to Picacho's own repositories on Cloudflare R2, and creates
+# the GitHub release with CHANGELOG.md's notes.
+#
+#   vX.Y.Z           a release: F-Droid repo (suggested), Flatpak branch "stable"
+#   vX.Y.Z-beta.N    a pre-release: F-Droid repo (unstable), Flatpak branch "beta"
+#
+# The tag must match Cargo.toml's version and have a dated CHANGELOG.md section.
+# Pull requests that touch the packaging build both formats without publishing.
+# Repositories: https://android.repo.pinal.tech/repo, https://linux.repo.pinal.tech/repo/
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v0.1.0"
+        required: true
+  pull_request:
+    paths:
+      - android/**
+      - packaging/**
+      - fdroid/**
+      - scripts/build-android.sh
+      - scripts/release/**
+      - .github/workflows/release.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  # The publish jobs rewrite the repositories' indexes: one release at a time.
+  group: release
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.100.0"
+  TAG: ${{ inputs.tag || (github.event_name == 'pull_request' && github.sha) || github.ref_name }}
+  PUBLISH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      branch: ${{ steps.version.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - id: version
+        run: |
+          crate=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$PUBLISH" = true ]; then
+            version="${TAG#v}"
+            if [ "$version" != "$crate" ]; then
+              echo "::error::Tag $TAG does not match Cargo.toml's version $crate"
+              exit 1
+            fi
+            python3 scripts/release/changelog.py check "$version"
+          else
+            version="$crate"
+          fi
+          case "$version" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT"; echo "branch=beta" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT"; echo "branch=stable" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+      - name: Build APKs
+        env:
+          PICACHO_KEYSTORE_BASE64: ${{ secrets.PICACHO_KEYSTORE_BASE64 }}
+          PICACHO_KEYSTORE_PASSWORD: ${{ secrets.PICACHO_KEYSTORE_PASSWORD }}
+          PICACHO_KEY_PASSWORD: ${{ secrets.PICACHO_KEYSTORE_PASSWORD }}
+          PICACHO_KEY_ALIAS: picacho
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          # Pull requests build with the debug key; releases need the release key.
+          if [ -n "$PICACHO_KEYSTORE_BASE64" ]; then
+            export PICACHO_KEYSTORE="$RUNNER_TEMP/picacho-release.jks"
+            printf '%s' "$PICACHO_KEYSTORE_BASE64" | base64 -d > "$PICACHO_KEYSTORE"
+          elif [ "$PUBLISH" = true ]; then
+            echo "::error::The PICACHO_KEYSTORE_BASE64 secret is not set"
+            exit 1
+          fi
+          sh scripts/build-android.sh
+          rm -f "$RUNNER_TEMP/picacho-release.jks"
+          mkdir -p out
+          version=${{ needs.prepare.outputs.version }}
+          for abi in arm64-v8a x86_64; do
+            cp "android/app/build/outputs/apk/release/app-$abi-release.apk" "out/picacho-$version-$abi.apk"
+          done
+          # Fails the release if an APK is signed with anything but the release key.
+          apksigner=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)/apksigner
+          for apk in out/*.apk; do
+            "$apksigner" verify --print-certs "$apk" > signer.txt
+            if [ "$PUBLISH" = true ]; then grep -q "CN=Picacho, O=Pinal Tech" signer.txt; fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*.apk
+          if-no-files-found: error
+
+  flatpak:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/cache@v4
+        with:
+          path: .flatpak-builder
+          key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('packaging/flatpak/tech.pinal.picacho.yml') }}
+          restore-keys: flatpak-builder-${{ matrix.arch }}-
+      - name: Build
+        run: |
+          branch=${{ needs.prepare.outputs.branch }}
+          version=${{ needs.prepare.outputs.version }}
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --user --install-deps-from=flathub --disable-rofiles-fuse --force-clean \
+            --arch=${{ matrix.arch }} --default-branch="$branch" --repo=build-repo \
+            build-dir packaging/flatpak/tech.pinal.picacho.yml
+          mkdir -p out
+          flatpak build-bundle --arch=${{ matrix.arch }} \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            build-repo "out/picacho-$version-${{ matrix.arch }}.flatpak" tech.pinal.picacho "$branch"
+          tar -cf "out/build-repo-${{ matrix.arch }}.tar" build-repo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  publish-android:
+    needs: [prepare, android]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: out
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q rclone librsvg2-bin
+          pip install --quiet fdroidserver==2.4.5
+      - name: Publish to android.repo.pinal.tech
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          FDROID_KEYSTORE_BASE64: ${{ secrets.FDROID_KEYSTORE_BASE64 }}
+          FDROID_KEYSTORE_PASSWORD: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+        run: sh scripts/release/publish-fdroid.sh ${{ needs.prepare.outputs.version }} out/*.apk
+
+  publish-linux:
+    needs: [prepare, flatpak]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flatpak-*
+          path: out
+          merge-multiple: true
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q rclone flatpak ostree
+      - name: Publish to linux.repo.pinal.tech
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: 0996483F6998AB8722D3866FF094B0B445C2E4CD
+        run: |
+          repos=""
+          for arch in x86_64 aarch64; do
+            mkdir -p "build/$arch"
+            tar -xf "out/build-repo-$arch.tar" -C "build/$arch"
+            repos="$repos build/$arch/build-repo"
+          done
+          sh scripts/release/publish-flatpak.sh $repos
+
+  github-release:
+    needs: [prepare, android, flatpak, publish-android, publish-linux]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${{ needs.prepare.outputs.version }}
+          python3 scripts/release/changelog.py notes "$version" > notes.md
+          cat >> notes.md <<'EOF'
+
+          ### Install
+
+          **Android:** add `https://android.repo.pinal.tech/repo?fingerprint=a029e7fcd4c66d85aa0baea0f87db04c854c559f056a8b2032b4b26d186ee9d5` in F-Droid, Droid-ify or Neo Store, or install an APK below (`arm64-v8a` for most phones).
+
+          **Linux:** `flatpak install --from https://linux.repo.pinal.tech/tech.pinal.picacho.stable.flatpakref` (beta: `tech.pinal.picacho.beta.flatpakref`), or install a `.flatpak` bundle below.
+          EOF
+          flags=""
+          if [ "${{ needs.prepare.outputs.prerelease }}" = true ]; then flags="--prerelease"; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/*.apk out/*.flatpak --clobber
+            gh release edit "$TAG" --notes-file notes.md $flags
+          else
+            gh release create "$TAG" out/*.apk out/*.flatpak --title "Picacho $version" --notes-file notes.md --verify-tag $flags
+          fi

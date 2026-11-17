@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Picacho</title>
+  <!-- The app icon (assets/brand/icon.png, drawn by scripts/icon.swift):
+       assets/brand/picacho.svg on a light rounded tile. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E6F2EA"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+    <linearGradient id="peak-gradient" x1="40" y1="60" x2="600" y2="400" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#35CD58"/>
+      <stop offset="0.55" stop-color="#18B965"/>
+      <stop offset="1" stop-color="#008D77"/>
+    </linearGradient>
+    <linearGradient id="base-gradient" x1="40" y1="0" x2="600" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#003D40"/>
+      <stop offset="1" stop-color="#005353"/>
+    </linearGradient>
+    <clipPath id="peak-shape">
+      <path d="M 40 396 L 40 352 L 222 201 Q 228 196 235 200 L 258 214 L 318 88 Q 330 64 344 86 L 600 352 L 600 396 Q 600 403 592 397 C 550 362 493 339 432 327 Q 320 306 208 327 C 147 339 90 362 48 397 Q 40 403 40 396 Z"/>
+    </clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)" filter="url(#shadow)"/>
+  <g transform="translate(192 220)">
+    <g clip-path="url(#peak-shape)" fill="url(#peak-gradient)">
+      <path d="M 0 0 L 640 0 L 640 196 L 320 262 L 0 196 Z"/>
+      <path d="M 0 216 L 320 282 L 640 216 L 640 540 L 0 540 Z"/>
+    </g>
+    <path d="M 40 500 A 280 142 0 0 1 600 500 Z" fill="url(#base-gradient)"/>
+  </g>
+</svg>
