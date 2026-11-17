@@ -878,8 +878,12 @@ impl Backend {
         limit: usize,
     ) -> Result<Vec<Mail>> {
         let mailbox = mailbox.into();
+        // Background downloads and listing give way to a sync between
+        // messages, so new mail isn't stuck behind a whole batch.
+        let waiting = self.wait_for(&a.id);
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        drop(waiting);
         match self.sync_once(a, &mailbox, limit) {
             Err(error) if crate::sync::retry::transient(&error) => {
                 // Only downloads/snapshots are replayed, never MOVE or SMTP.
