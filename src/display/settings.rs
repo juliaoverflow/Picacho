@@ -1193,7 +1193,32 @@ impl MailApp {
                         .collect(),
                     cx,
                 ),
-            ))
+            ));
+        if a.provider == Provider::Proton {
+            page = page.child(self.setting(
+                "Check Proton for changes",
+                if sync.proton_events_seconds == 0 {
+                    "New mail, moves and notices from Proton appear at the next check for new mail."
+                } else {
+                    "How often Picacho asks Proton about new mail, moves and notices. Less often uses less data and battery."
+                },
+                self.segmented(
+                    &format!("proton-events-{}", a.id),
+                    [(15, "15 sec"), (30, "30 sec"), (60, "1 min"), (300, "5 min"), (900, "15 min"), (0, "Off")]
+                        .into_iter()
+                        .map(|(seconds, label)| {
+                            (
+                                label.to_owned(),
+                                set(SyncSettings { proton_events_seconds: seconds, ..sync }),
+                                sync.proton_events_seconds == seconds,
+                            )
+                        })
+                        .collect(),
+                    cx,
+                ),
+            ));
+        }
+        page = page
             .child(
                 div()
                     .flex()

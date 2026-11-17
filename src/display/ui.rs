@@ -5665,6 +5665,8 @@ impl MailApp {
             return;
         };
         let window = a.sync.days != sync.days;
+        let events = (a.sync.proton_events_seconds != sync.proton_events_seconds)
+            .then(|| a.id.clone());
         a.sync = sync;
         if let Err(e) = self.backend.store.save_account(a) {
             self.notice(e.to_string(), true, cx);
@@ -5679,6 +5681,11 @@ impl MailApp {
         // A wider offline range starts downloading now; any change recounts.
         if offline != OFFLINE_WHEN_OPENED {
             self.download_account(account, cx);
+        }
+        // Proton's event watcher restarts at the new pace (or stops).
+        if let Some(id) = events {
+            self.backend.stop_watching(&id);
+            self.watch_inboxes();
         }
         self.refresh_counts(cx);
     }
@@ -10166,6 +10173,7 @@ mod tests {
             refresh_minutes: 15,
             notify: false,
             offline_days: 365,
+            proton_events_seconds: 60,
         };
         act(&view, Action::SetSync(first.clone(), sync), cx);
         let saved = store.accounts().unwrap();
