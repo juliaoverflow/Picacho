@@ -9062,7 +9062,7 @@ dependencies = [
 [[package]]
 name = "protected_email_bridge"
 version = "0.1.0"
-source = "git+https://github.com/pinaltech/Protected-Email-Bridge#cb4a2e38515d0a6d157794cfb4a9338bf8c8c0fe"
+source = "git+https://github.com/pinaltech/Protected-Email-Bridge#be96c47efd4c6d913aad3d88a7f9ef9b2ef02e3d"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.23.1",
