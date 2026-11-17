@@ -3,7 +3,8 @@
 #
 #   push to beta     the rolling beta: "Beta Build", no version number. The
 #                    Android app tech.pinal.picacho.beta (beside the release),
-#                    Flatpak branch "beta", and the GitHub pre-release "beta",
+#                    Flatpak branch "beta", and the GitHub pre-release
+#                    "beta-build" (a tag apart from the branch's name),
 #                    replaced on every push.
 #   push to stable   a release of Cargo.toml's version X.Y.Z: the Android app
 #                    tech.pinal.picacho, Flatpak branch "stable", and the
@@ -97,7 +98,7 @@ jobs:
                 echo "publish=true"
                 echo "version=${{ github.run_number }}"
                 echo "label=beta"
-                echo "tag=beta"
+                echo "tag=beta-build"
                 echo "branch=beta"
               } >> "$GITHUB_OUTPUT"
               ;;
@@ -310,8 +311,11 @@ jobs:
               echo "The rolling beta of Picacho, built from \`${SHA}\` on the beta branch. It has no version number and installs beside the release as Picacho Beta."
               echo "$install"
             } > notes.md
-            gh release delete beta --yes --cleanup-tag 2>/dev/null || true
-            gh release create beta out/*.apk out/*.flatpak --target "$SHA" \
+            # (The first betas used the tag "beta", which the branch shares.)
+            for old in "$TAG" beta; do
+              gh release delete "$old" --yes --cleanup-tag 2>/dev/null || true
+            done
+            gh release create "$TAG" out/*.apk out/*.flatpak --target "$SHA" \
               --title "Picacho Beta Build" --notes-file notes.md --prerelease --latest=false
           else
             version=${{ needs.prepare.outputs.version }}

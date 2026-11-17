@@ -180,7 +180,7 @@ Work happens on three branches:
 - **dev**: where changes land. Pushes and pull requests run the tests only.
 - **beta**: the rolling beta. Every push builds and publishes "Picacho Beta"
   for Android (`tech.pinal.picacho.beta`, installed beside the release), the
-  Flatpak `beta` branch, and the GitHub pre-release `beta`, replacing the last
+  Flatpak `beta` branch, and the GitHub pre-release `beta-build`, replacing the last
   one. Beta builds have no version number; they call themselves "Beta Build".
 - **stable**: releases. It takes changes only through pull requests, which
   can merge once the tests pass and the version is new. Merging publishes

@@ -26,6 +26,10 @@ rclone copy r2:$bucket/repo "$repo"
 if [ ! -f "$repo/config" ]; then
     ostree init --mode=archive-z2 --repo="$repo"
 fi
+# R2 keeps no empty directories, so the downloaded repository lacks the ones
+# OSTree expects (refs/remotes and the like) until something is in them.
+mkdir -p "$repo/objects" "$repo/refs/heads" "$repo/refs/mirrors" "$repo/refs/remotes" \
+    "$repo/state" "$repo/tmp" "$repo/extensions"
 
 for build in "$@"; do
     # Sign each new commit in its build repository, then bring it over.
