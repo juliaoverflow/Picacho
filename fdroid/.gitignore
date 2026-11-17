@@ -1,0 +1,9 @@
+# Generated when publishing (scripts/release/publish-fdroid.sh).
+repo/
+archive/
+tmp/
+fdroid-repo.jks
+icon.png
+metadata/tech.pinal.picacho/en-US/changelogs/
+metadata/tech.pinal.picacho/en-US/tenInchScreenshots/
+metadata/tech.pinal.picacho/en-US/icon.png

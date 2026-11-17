@@ -23,6 +23,28 @@
 
 <sub>Screenshots use Picacho's built-in sample inbox.</sub>
 
+## Install
+
+**Android:** add Picacho's repository to [F-Droid](https://f-droid.org),
+Droid-ify or Neo Store, then install Picacho from it:
+
+```
+https://android.repo.pinal.tech/repo?fingerprint=a029e7fcd4c66d85aa0baea0f87db04c854c559f056a8b2032b4b26d186ee9d5
+```
+
+Betas reach you when the client allows unstable updates. Each
+[GitHub release](https://github.com/pinaltech/Picacho/releases) also has the
+APKs (`arm64-v8a` for most phones, `x86_64` for emulators and Chromebooks).
+
+**Linux:** Picacho's Flatpak repository has x86_64 and aarch64 builds:
+
+```sh
+flatpak install --from https://linux.repo.pinal.tech/tech.pinal.picacho.stable.flatpakref
+```
+
+For betas, use `tech.pinal.picacho.beta.flatpakref`. To add the repository
+alone: `flatpak remote-add picacho https://linux.repo.pinal.tech/picacho.flatpakrepo`.
+
 Picacho is a fast, native email client written in Rust with GPUI. It runs without Electron or a webview, and it works with the mail you already have. Gray surfaces, a three-pane layout, rounded controls, and light and dark palettes with a choice of theme colors keep the focus on your mail.
 
 ## Build
@@ -65,20 +87,26 @@ still needs verification on macOS when changing signing or distribution.
 On Android, Picacho is a shared library (`src/android.rs`) that a
 NativeActivity loads, and GPUI's Android platform comes from
 [gpui-mobile](https://github.com/pinaltech/Picacho-Patches/tree/gpui-pre-android/gpui-mobile).
-It needs the Android NDK, `cargo-ndk` and the Rust target:
+The Gradle project in `android/` packages it as an APK per ABI. It needs
+the Android SDK (`ANDROID_HOME`) and NDK (`ANDROID_NDK_HOME`), JDK 17 or
+later, `cargo-ndk` and the Rust targets:
 
 ```sh
-rustup target add aarch64-linux-android
+rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk
-ANDROID_NDK_HOME=/path/to/ndk cargo ndk -t arm64-v8a -P 26 build --release --lib
+sh scripts/build-android.sh
 ```
 
-This makes `libpicacho.so`; there is no APK project yet, and the app has not
-been run on a device. Not yet on Android:
+The APKs land in `android/app/build/outputs/apk/release`, signed with the
+debug key unless `PICACHO_KEYSTORE` and its passwords are set (see the
+script). `PICACHO_ABIS=arm64-v8a` builds one ABI. Credentials are kept in
+the app's SharedPreferences, encrypted with an Android Keystore key. The
+launcher icon's layers are `android/icon/*.svg`
+(`sh scripts/android-icons.sh` renders them). Not yet on Android:
 
-- Saving credentials: keyring has no default store on Android, so adding an
-  account fails until its Android Keystore backend is set up.
 - System notifications.
+- Attachments from the file picker (gpui-mobile's Java helper classes are
+  not in the APK).
 - Proton: security keys and phone passkeys (sign-in uses the authenticator
   app's code instead), and human verification (CAPTCHA).
 
@@ -143,3 +171,21 @@ The setup lists the supported services. Each one signs in the simplest way it al
 - [Architecture](docs/ARCHITECTURE.md): module boundaries and extension points
 - [Synchronization](docs/SYNCHRONIZATION.md) and [display](docs/DISPLAY.md): behavior contracts and checks
 - [Verification](docs/VERIFICATION.md): checks that have been run
+
+## Releasing
+
+Releases for Android and Linux are built and published by
+`.github/workflows/release.yml` when a `v*` tag is pushed:
+
+1. Set the version in `Cargo.toml` and move CHANGELOG.md's **Unreleased**
+   notes under `## [X.Y.Z] - YYYY-MM-DD`.
+2. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+A tag like `v0.2.0-beta.1` is a pre-release: it goes to the Flatpak `beta`
+branch and is an unstable update in the F-Droid repository. The workflow
+publishes to Cloudflare R2 (buckets `android-repository` and `linux-repository`,
+served at android.repo.pinal.tech and linux.repo.pinal.tech) and needs these
+repository secrets: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`, `PICACHO_KEYSTORE_BASE64`,
+`PICACHO_KEYSTORE_PASSWORD`, `FDROID_KEYSTORE_BASE64`,
+`FDROID_KEYSTORE_PASSWORD` and `FLATPAK_GPG_PRIVATE_KEY`.

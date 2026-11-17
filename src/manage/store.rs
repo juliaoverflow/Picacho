@@ -1551,16 +1551,23 @@ fn write_preferences(db: Connection, queue: &PrefQueue, rx: mpsc::Receiver<()>) 
 // The service name predates the Picacho name; keep it so saved credentials
 // stay readable.
 const SECRET_SERVICE: &str = "com.pinal.native-mail";
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn secret_entry(id: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(SECRET_SERVICE, id).context("Cannot access the system keychain")
 }
-/// iOS keeps credentials in the app's own Keychain (Protected Data).
-#[cfg(target_os = "ios")]
+/// iOS keeps credentials in the app's own Keychain (Protected Data); Android
+/// keeps them in the app's SharedPreferences, encrypted with a key held by the
+/// Android Keystore. keyring's own Entry has a default store on neither.
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn secret_entry(id: &str) -> Result<keyring_core::Entry> {
     static STORE: std::sync::LazyLock<std::result::Result<(), String>> =
         std::sync::LazyLock::new(|| {
-            apple_native_keyring_store::protected::Store::new()
+            #[cfg(target_os = "ios")]
+            let store = apple_native_keyring_store::protected::Store::new();
+            // Needs ndk-context, which android-activity sets up before android_main.
+            #[cfg(target_os = "android")]
+            let store = android_native_keyring_store::Store::new();
+            store
                 .map(|store| keyring_core::set_default_store(store))
                 .map_err(|e| e.to_string())
         });
