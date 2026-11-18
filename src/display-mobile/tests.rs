@@ -833,6 +833,21 @@ fn the_snooze_buttons_stay_in_view(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn all_accounts_lists_every_accounts_subscriptions(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    assert!(view.read_with(cx, |this, _| this.shows_all_mail()));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    let row = bounds(cx, "mobile-subscriptions-all-mail");
+    cx.simulate_click(row.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::Subscriptions);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.account.as_deref(), Some(ALL_MAIL));
+    });
+}
+
+#[gpui::test]
 fn accounts_sort_by_dragging_their_handles(cx: &mut TestAppContext) {
     let (view, cx) = phone(PHONE, cx);
     view.update_in(cx, |this, w, cx| this.close(w, cx));

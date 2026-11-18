@@ -175,6 +175,24 @@ impl MailApp {
         .into_any_element()
     }
 
+    /// The row opening an account's subscriptions, or every account's.
+    fn mobile_subscriptions_cell(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        // Only beside an open list (a wide screen) is the open one marked.
+        let active = self.mobile.split && self.subs_open && self.account.as_deref() == Some(id);
+        self.cell(
+            format!("mobile-subscriptions-{id}"),
+            icon_el("subscriptions", 22., c.accent).into_any_element(),
+            "Subscriptions",
+            None,
+            true,
+            active,
+            super::chrome::push(Action::OpenSubscriptions(id.to_owned())),
+            cx,
+        )
+        .into_any_element()
+    }
+
     /// An account: its picture and name, then its folders.
     fn mobile_account_section(&self, a: &Account, index: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -209,19 +227,7 @@ impl MailApp {
             }
         }
         if a.provider != Provider::Pop3 {
-            rows.push(
-                self.cell(
-                    format!("mobile-subscriptions-{id}"),
-                    icon_el("subscriptions", 22., c.accent).into_any_element(),
-                    "Subscriptions",
-                    None,
-                    true,
-                    false,
-                    super::chrome::push(Action::OpenSubscriptions(id.clone())),
-                    cx,
-                )
-                .into_any_element(),
-            );
+            rows.push(self.mobile_subscriptions_cell(&id, cx));
         }
         let menu_id = id.clone();
         let header = div()
@@ -296,7 +302,7 @@ impl MailApp {
         let Some((title, subtitle, icon)) = self.view_title(id) else {
             return div().into_any_element();
         };
-        let rows = Self::view_folders(id)
+        let mut rows: Vec<AnyElement> = Self::view_folders(id)
             .iter()
             .map(|&folder| {
                 self.mobile_folder_cell(
@@ -309,6 +315,11 @@ impl MailApp {
                 )
             })
             .collect();
+        // Every account's subscriptions, as the sidebar lists under All
+        // Accounts (aliases' views have none of their own).
+        if id == ALL_MAIL {
+            rows.push(self.mobile_subscriptions_cell(id, cx));
+        }
         let menu_id = id.to_owned();
         div()
             .flex()
