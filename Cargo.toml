@@ -72,6 +72,8 @@ mail-auth = { version = "0.15", default-features = false, features = ["rust-cryp
 # 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
 mailparse = "0.18"
 markdown = "1.0.0"
+# Pasting with formatting: copied HTML becomes the composer's Markdown.
+htmd = "0.5"
 md-5 = "0.11"
 # Attachment content types from their file names.
 mime_guess = "2"
@@ -226,6 +228,9 @@ wry = "0.53"
 # Proton sign-in with a security key or passkey (WebAuthn/FIDO2): USB keys,
 # and a phone's passkey by QR code and Bluetooth (caBLE); Windows Hello below.
 webauthn-authenticator-rs = { version = "0.6.2", features = ["usb", "cable"] }
+# The clipboard's HTML, for pasting with formatting: GPUI reads only its text.
+# Wayland's data-control protocol where the compositor has it, else X11.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # GPUI's Android platform: the window, input, text and wgpu renderer.
@@ -252,6 +257,9 @@ log = "0.4"
 # Keychain (Protected Data) through keyring-core directly (manage/store.rs).
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["protected"] }
+# UIPasteboard's HTML and RTF, for pasting with formatting (display/paste_ios.rs);
+# the version gpui-mobile uses.
+objc2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Debug builds only: the development driver captures the app's own window.

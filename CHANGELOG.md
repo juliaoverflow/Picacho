@@ -11,6 +11,13 @@ same version in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Pasting copied rich text into a message pastes it as plain text, with a
+  “Paste with formatting” button to keep its bold, links and lists instead.
+  Turn on Settings → Composing → Paste with formatting to make that the
+  default, with “Paste without formatting” offered instead.
+
 ### Fixed
 
 - Selecting text in an email starts and ends under the pointer. In columns

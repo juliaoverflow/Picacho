@@ -45,6 +45,8 @@ mod message_window;
 mod mobile;
 #[path = "panes.rs"]
 mod panes;
+#[path = "paste.rs"]
+mod paste;
 #[path = "prompt.rs"]
 mod prompt;
 use panes::{LIST_MIN, Pane, Resize};

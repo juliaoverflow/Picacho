@@ -880,6 +880,13 @@ impl MailApp {
                     o.quote_original = !o.quote_original
                 }),
             ))
+            .child(row(
+                "Paste with formatting",
+                "Text copied with bold, links or lists keeps them. After pasting you can switch to the other.",
+                toggle("paste-formatted", o.paste_formatted, &|o| {
+                    o.paste_formatted = !o.paste_formatted
+                }),
+            ))
             .child(self.section("Sending"))
             .child(self.setting(
                 "Undo send",
