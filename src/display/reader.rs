@@ -175,7 +175,7 @@ impl MailApp {
                             cx,
                         )
                         .text_size(px(12.))
-                        .h(px(30.)),
+                        .h(self.tap(30., 36.)),
                     ),
             )
     }
@@ -1139,7 +1139,7 @@ impl MailApp {
                                             cx,
                                         )
                                         .when(!self.mobile.on, |d| {
-                                            d.h(px(24.)).text_size(px(11.5))
+                                            d.h(self.tap(24., 36.)).text_size(px(11.5))
                                         })
                                         .border_1()
                                         .border_color(rgb(c.border)),
@@ -1204,7 +1204,7 @@ impl MailApp {
                             false,
                             cx,
                         )
-                        .h(px(30.))
+                        .h(self.tap(30., 36.))
                         .text_size(px(12.))
                         .border_1()
                         .border_color(rgb(c.border)),
@@ -1252,9 +1252,9 @@ impl MailApp {
             div()
                 .id(id)
                 .debug_selector(move || id.into())
-                .h(px(26.))
+                .h(self.tap(26., 36.))
                 .when(label.is_empty() || narrow, |d| {
-                    d.w(px(30.)).justify_center()
+                    d.w(self.tap(30., 40.)).justify_center()
                 })
                 .when(!label.is_empty() && !narrow, |d| d.px(px(10.)))
                 .flex_shrink_0()
@@ -1285,7 +1285,7 @@ impl MailApp {
             div()
                 .id(id)
                 .debug_selector(move || id.into())
-                .h(px(32.))
+                .h(self.tap(32., 42.))
                 .px(px(2.))
                 .flex()
                 .flex_shrink_0()
@@ -1349,7 +1349,7 @@ impl MailApp {
                 div()
                     .id("toggle-email-remote")
                     .debug_selector(|| "toggle-email-remote".into())
-                    .h(px(32.))
+                    .h(self.tap(32., 42.))
                     .flex_shrink_0()
                     .pl(px(10.))
                     .pr(px(6.))
@@ -1560,7 +1560,9 @@ impl MailApp {
                                             false,
                                             cx,
                                         )
-                                        .when(!self.mobile.on, |d| d.h(px(30.)).text_size(px(12.)))
+                                        .when(!self.mobile.on, |d| {
+                                            d.h(self.tap(30., 36.)).text_size(px(12.))
+                                        })
                                         .border_1()
                                         .border_color(rgb(c.border)),
                                     )
@@ -1573,7 +1575,9 @@ impl MailApp {
                                             false,
                                             cx,
                                         )
-                                        .when(!self.mobile.on, |d| d.h(px(30.)).text_size(px(12.)))
+                                        .when(!self.mobile.on, |d| {
+                                            d.h(self.tap(30., 36.)).text_size(px(12.))
+                                        })
                                         .border_1()
                                         .border_color(rgb(c.border)),
                                     )
@@ -1843,7 +1847,7 @@ impl MailApp {
                     .id("thread-more")
                     .debug_selector(|| "thread-more".into())
                     .mb_2()
-                    .h(px(30.))
+                    .h(self.tap(30., 40.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1972,7 +1976,7 @@ impl MailApp {
             .id("toggle-quotes")
             .debug_selector(|| "toggle-quotes".into())
             .mt_3()
-            .h(px(24.))
+            .h(self.tap(24., 32.))
             .px_2()
             .flex()
             .items_center()
@@ -2029,7 +2033,7 @@ impl MailApp {
                     .gap_1()
                     .pl_2()
                     .pr_1()
-                    .h(px(22.))
+                    .h(self.tap(22., 30.))
                     .rounded_full()
                     .bg(rgb(c.soft))
                     .text_size(px(11.))
@@ -2042,7 +2046,7 @@ impl MailApp {
                     .child(
                         div()
                             .id(("reader-label-remove", i))
-                            .size(px(16.))
+                            .size(self.tap(16., 24.))
                             .flex()
                             .items_center()
                             .justify_center()

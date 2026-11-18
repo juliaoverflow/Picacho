@@ -140,6 +140,23 @@ fn insert(nodes: &mut Vec<Node>, at: &DropAt, node: Node) -> Result<(), Node> {
         }
     }
 }
+/// The entries just before and after `key` in its list, and the folder
+/// holding it (at the top level, none).
+fn neighbours(nodes: &[Node], key: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(p) = path(nodes, key) else {
+        return (None, None, None);
+    };
+    let (last, parent) = p.split_last().expect("paths are never empty");
+    let mut list = nodes;
+    let mut folder = None;
+    for &i in parent {
+        folder = Some(list[i].key().to_owned());
+        list = list[i].children();
+    }
+    let before = last.checked_sub(1).map(|i| list[i].key().to_owned());
+    let after = list.get(last + 1).map(|n| n.key().to_owned());
+    (before, after, folder)
+}
 /// Moves `key` to `at`. A folder cannot go inside itself.
 pub(super) fn move_node(nodes: &mut Vec<Node>, key: &str, at: &DropAt) -> bool {
     match find(nodes, key) {
@@ -373,6 +390,36 @@ impl MailApp {
     }
 
     /// Adding: an account, a folder or a separator, inside `parent` or at the end.
+    /// A sidebar entry's menu, with ways to move it on a touch device, where
+    /// it can't be dragged: up, down and out of the folder holding it.
+    pub(super) fn with_arranging(&self, key: &str, mut entries: Vec<Entry>) -> Vec<Entry> {
+        if !self.mobile.touch {
+            return entries;
+        }
+        let (before, after, folder) = neighbours(&self.tree, key);
+        let arrange = |label, icon, at| entry(label, icon, Action::Arrange(key.to_owned(), at));
+        let moves: Vec<Entry> = [
+            before.map(|k| arrange("Move Up", "arrow-up", DropAt::Before(k))),
+            after.map(|k| arrange("Move Down", "arrow-down", DropAt::After(k))),
+            folder.map(|k| arrange("Move Out of Folder", "folder-output", DropAt::After(k))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !moves.is_empty() && !entries.is_empty() {
+            entries.push(Entry::Separator);
+        }
+        entries.extend(moves);
+        entries
+    }
+    /// Moves a sidebar entry from its menu (see `with_arranging`).
+    pub(super) fn arrange(&mut self, key: String, at: DropAt, cx: &mut Context<Self>) {
+        if move_node(&mut self.tree, &key, &at) {
+            self.save_tree();
+            self.mark_landed(key);
+            cx.notify();
+        }
+    }
     pub(super) fn create_entries(&self, parent: Option<String>) -> Vec<Entry> {
         vec![
             entry("Add Account…", "user", Action::Connect),
@@ -965,7 +1012,7 @@ impl MailApp {
         let i = self.accounts.iter().position(|a| a.id == id)?;
         let a = &self.accounts[i];
         let open = self.open(id);
-        let entries = self.account_entries(id, true);
+        let entries = self.with_arranging(id, self.account_entries(id, true));
         let renaming = self.tree_ui.renaming.as_deref() == Some(id);
         let inbox_unread = self.unread_for(id, &Folder::Inbox.into());
         let current = self.account.as_deref() == Some(id);
@@ -976,7 +1023,7 @@ impl MailApp {
                 move || format!("account-{id}")
             })
             .relative()
-            .h(px(34.))
+            .h(self.tap(34., 44.))
             .px_2()
             .rounded(px(8.))
             .flex()
@@ -989,7 +1036,7 @@ impl MailApp {
                     div()
                         .absolute()
                         .left(px(-6.))
-                        .top(px(9.))
+                        .top((self.tap(34., 44.) - px(16.)) / 2.)
                         .w(px(3.))
                         .h(px(16.))
                         .rounded_full()
@@ -1158,7 +1205,7 @@ impl MailApp {
         } else {
             self.folder_unread(children)
         };
-        let entries = self.folder_entries(id);
+        let entries = self.with_arranging(id, self.folder_entries(id));
         let label = if renaming {
             self.rename_field()
         } else {
@@ -1178,7 +1225,7 @@ impl MailApp {
                 let id = id.to_owned();
                 move || format!("folder-{id}")
             })
-            .h(px(32.))
+            .h(self.tap(32., 40.))
             .px_2()
             .rounded(px(8.))
             .flex()
@@ -1306,7 +1353,7 @@ impl MailApp {
     }
     fn separator_block(&self, id: &str, depth: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
-        let entries = self.separator_entries(id);
+        let entries = self.with_arranging(id, self.separator_entries(id));
         let group = SharedString::from(format!("separator-{id}"));
         let row = div()
             .id(group.clone())
@@ -1401,7 +1448,7 @@ impl MailApp {
                     let a = &self.accounts[i];
                     let current = self.account.as_ref() == Some(id);
                     let open = self.open(id);
-                    let entries = self.account_entries(id, false);
+                    let entries = self.with_arranging(id, self.account_entries(id, false));
                     let unread = self.unread_for(id, &Folder::Inbox.into());
                     let button = self
                         .rail_button(
@@ -1536,7 +1583,7 @@ impl MailApp {
                     } else {
                         self.folder_unread(children)
                     };
-                    let entries = self.folder_entries(id);
+                    let entries = self.with_arranging(id, self.folder_entries(id));
                     let button = self
                         .rail_button(
                             format!("rail-folder-{id}"),
@@ -1605,7 +1652,7 @@ impl MailApp {
                     out.push(block.into_any_element());
                 }
                 Node::Separator { id } => {
-                    let entries = self.separator_entries(id);
+                    let entries = self.with_arranging(id, self.separator_entries(id));
                     let line = div()
                         .id(SharedString::from(format!("rail-separator-{id}")))
                         .h(px(10.))
@@ -1681,7 +1728,7 @@ impl MailApp {
             div()
                 .id(SharedString::from(selector.clone()))
                 .debug_selector(|| selector)
-                .h(px(30.))
+                .h(self.tap(30., 40.))
                 .pl(px(30. + indent))
                 .pr_2()
                 .rounded(px(7.))

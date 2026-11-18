@@ -466,6 +466,7 @@ impl MailApp {
             }
             ComposerEvent::Schedule(at) => self.schedule_send(composer, *at, cx),
             ComposerEvent::Notice(text) => self.notice(text.clone(), false, cx),
+            ComposerEvent::TouchMove(at) => self.move_composer(composer.entity_id(), *at, w, cx),
         }
         cx.notify();
     }
@@ -969,6 +970,10 @@ impl MailApp {
                 }
                 ComposerEvent::Schedule(at) => this.schedule_send(composer, *at, cx),
                 ComposerEvent::Notice(text) => this.notice(text.clone(), false, cx),
+                // Moving needs the window; the next render applies it.
+                ComposerEvent::TouchMove(at) => {
+                    this.pending_move = Some((composer.entity_id(), *at));
+                }
             }
             cx.notify();
         });
@@ -981,6 +986,9 @@ impl MailApp {
     /// Applies a placement change asked for by a composer that was restored
     /// after Undo (its subscription has no window to reopen it with).
     pub(super) fn apply_pending_place(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((id, at)) = self.pending_move.take() {
+            self.move_composer(id, at, w, cx);
+        }
         let Some((id, placement)) = self.pending_place.take() else {
             return;
         };
@@ -1116,7 +1124,7 @@ impl MailApp {
                             .id("undo-send")
                             .debug_selector(|| "undo-send".into())
                             .px_3()
-                            .h(px(30.))
+                            .h(self.tap(30., 40.))
                             .flex()
                             .items_center()
                             .rounded(px(7.))
@@ -1142,6 +1150,18 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) {
         let id = e.drag(cx).0;
+        self.move_composer(id, e.event.position, w, cx);
+    }
+
+    /// Moves a floating composer after the pointer (or finger) that holds
+    /// its header, now at `position` in window coordinates.
+    pub(super) fn move_composer(
+        &mut self,
+        id: EntityId,
+        position: Point<Pixels>,
+        w: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(composer) = self.composers.iter().find(|c| c.entity_id() == id).cloned() else {
             return;
         };
@@ -1153,7 +1173,7 @@ impl MailApp {
         let w_ = FLOAT_W.min(vw - 32.);
         let h_ = FLOAT_H.min(vh - TITLEBAR_HEIGHT - 24.).max(BAR_H);
         composer.update(cx, |c, cx| {
-            let p = e.event.position - c.grab - frame.origin;
+            let p = position - c.grab - frame.origin;
             let (x, y) = clamp_origin(p, w_, h_, vw, vh);
             c.origin = Some(point(px(x), px(y)));
             cx.notify();

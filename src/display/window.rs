@@ -48,6 +48,22 @@ thread_local! {
     static SAFE_AREA: std::cell::Cell<Edges<Pixels>> = std::cell::Cell::new(Edges::default());
 }
 
+thread_local! {
+    /// The window is on a touch device (see `Mobile::touch`), for drawing
+    /// that has no `MailApp` to ask. Set as each frame is drawn.
+    static TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets whether the window is on a touch device (see `TOUCH`).
+pub(super) fn set_touch(on: bool) {
+    TOUCH.with(|t| t.set(on));
+}
+
+/// Whether the window is on a touch device (see `TOUCH`).
+pub(super) fn touch() -> bool {
+    TOUCH.with(|t| t.get())
+}
+
 /// Sets the safe area the desktop window keeps out of (see `SAFE_AREA`).
 pub(super) fn set_safe_area(edges: Edges<Pixels>) {
     SAFE_AREA.with(|s| s.set(edges));

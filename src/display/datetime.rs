@@ -42,6 +42,9 @@ pub(super) struct DateTimePicker {
     /// Laid out for a phone: one column, finger-sized controls, and the
     /// typed field left unfocused until tapped (it raises the keyboard).
     phone: bool,
+    /// On a touch device in the desktop layout: laid out as on a desktop,
+    /// with fingertip-sized controls.
+    touch: bool,
 }
 impl EventEmitter<PickerEvent> for DateTimePicker {}
 
@@ -76,7 +79,17 @@ impl DateTimePicker {
             error: None,
             typing: None,
             phone: false,
+            touch: false,
         }
+    }
+    /// Sizes the desktop layout's controls for a fingertip.
+    pub(super) fn touch(mut self, on: bool) -> Self {
+        self.touch = on;
+        self
+    }
+    /// A desktop control's size: `desktop`, or `touch` for a fingertip.
+    fn tap(&self, desktop: f32, touch: f32) -> f32 {
+        if self.touch { touch } else { desktop }
     }
     /// Lays the picker out for a phone. Call before `typed`.
     pub(super) fn phone(mut self, on: bool) -> Self {
@@ -279,12 +292,12 @@ impl DateTimePicker {
             .h(px(if self.phone {
                 super::mobile::TOUCH
             } else {
-                26.
+                self.tap(26., 36.)
             }))
             .min_w(px(if self.phone {
                 super::mobile::TOUCH
             } else {
-                26.
+                self.tap(26., 36.)
             }))
             .px_2()
             .flex()
@@ -310,11 +323,12 @@ impl DateTimePicker {
             .unwrap_or(self.month);
         let can_go_back = self.month > today.with_day(1).unwrap_or(today);
         let phone = self.phone;
+        let (cell_w, cell_h) = (self.tap(34., 44.), self.tap(30., 40.));
         let mut grid = div().flex().flex_col().gap(px(2.));
         grid = grid.child(div().flex().when(phone, |d| d.w_full()).children(
             ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(|d| {
                 div()
-                    .when(!phone, |d| d.w(px(34.)))
+                    .when(!phone, |d| d.w(px(cell_w)))
                     .when(phone, |d| d.flex_1())
                     .h(px(22.))
                     .flex()
@@ -341,7 +355,7 @@ impl DateTimePicker {
                     div()
                         .id(SharedString::from(id))
                         .debug_selector(move || selector.clone())
-                        .when(!phone, |d| d.w(px(34.)).h(px(30.)))
+                        .when(!phone, |d| d.w(px(cell_w)).h(px(cell_h)))
                         // A week spans the phone's width; each day is a
                         // fingertip tall.
                         .when(phone, |d| d.flex_1().h(px(40.)))
@@ -498,6 +512,7 @@ impl Render for DateTimePicker {
                     .debug_selector(move || format!("{key}-preset-{i}"))
                     .px_2()
                     .py(px(6.))
+                    .when(self.touch && !phone, |d| d.min_h(px(44.)).justify_center())
                     .rounded(px(7.))
                     .flex()
                     .flex_col()
@@ -614,7 +629,7 @@ impl Render for DateTimePicker {
                     self.small_button(format!("{key}-cancel"), "Cancel", cx, |_, cx| {
                         cx.emit(PickerEvent::Cancel)
                     })
-                    .when(!phone, |d| d.h(px(30.)))
+                    .when(!phone, |d| d.h(px(self.tap(30., 40.))))
                     .when(phone, |d| d.flex_1())
                     .px_3(),
                 )
@@ -622,7 +637,11 @@ impl Render for DateTimePicker {
                     div()
                         .id(SharedString::from(format!("{key}-confirm")))
                         .debug_selector(move || format!("{key}-confirm"))
-                        .h(px(if phone { super::mobile::TOUCH } else { 30. }))
+                        .h(px(if phone {
+                            super::mobile::TOUCH
+                        } else {
+                            self.tap(30., 40.)
+                        }))
                         .px_3()
                         .flex()
                         .items_center()

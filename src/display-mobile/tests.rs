@@ -1441,3 +1441,131 @@ fn the_desktop_windows_bars_fit_on_tablets(cx: &mut TestAppContext) {
         act(&view, Action::Close, cx);
     }
 }
+
+/// The desktop window on a 13" tablet in landscape, with the whole
+/// sidebar: two accounts' demo mail.
+fn desktop_tablet(cx: &mut TestAppContext) -> (Entity<MailApp>, &mut VisualTestContext) {
+    let (view, cx) = phone((1366., 1024.), cx);
+    view.update(cx, |this, _| {
+        this.mobile.touch = true;
+        this.mobile.fake_insets = Some(TABLET_INSETS);
+    });
+    act(&view, Action::SetDesktopLayout(true), cx);
+    settle(cx);
+    (view, cx)
+}
+
+/// `name` is at least `least` points tall.
+fn tall(cx: &mut VisualTestContext, name: &'static str, least: f32) {
+    let b = bounds(cx, name);
+    assert!(
+        b.size.height >= px(least - 0.5),
+        "{name} is {:?} tall, less than {least} for a fingertip",
+        b.size.height
+    );
+}
+
+#[gpui::test]
+fn the_desktop_windows_controls_take_a_fingertip(cx: &mut TestAppContext) {
+    let (view, cx) = desktop_tablet(cx);
+    let (first, second) = view.read_with(cx, |this, _| {
+        (this.accounts[0].id.clone(), this.accounts[1].id.clone())
+    });
+    // The sidebar's rows.
+    let account: &'static str = Box::leak(format!("account-{first}").into_boxed_str());
+    tall(cx, account, 44.);
+    let inbox: &'static str = Box::leak(format!("nav-{first}-inbox").into_boxed_str());
+    if shown(cx, inbox) {
+        tall(cx, inbox, 40.);
+    }
+    // Menus: taller rows, and labels in larger text that still fit.
+    act(&view, Action::FilterMenu, cx);
+    tall(cx, "menu-item-0", 40.);
+    view.update(cx, |this, cx| {
+        this.menu = None;
+        cx.notify();
+    });
+    // Settings: its pages' rows and switches.
+    act(&view, Action::Settings, cx);
+    tall(cx, "settings-general", 40.);
+    tall(cx, "desktop-layout", 28.);
+    act(&view, Action::Close, cx);
+    // Snooze: the calendar's days and the picker's buttons.
+    let id = first_message(&view, cx);
+    act(&view, Action::SnoozeMenu(vec![id]), cx);
+    tall(cx, "snooze-confirm", 40.);
+    tall(cx, "snooze-cancel", 40.);
+    let tomorrow = chrono::Local::now().date_naive() + chrono::Days::new(1);
+    let day: &'static str =
+        Box::leak(format!("snooze-day-{}", tomorrow.format("%Y-%m-%d")).into_boxed_str());
+    tall(cx, day, 40.);
+    let panel = bounds(cx, "modal-panel");
+    for name in ["snooze-confirm", "snooze-cancel", day] {
+        let b = bounds(cx, name);
+        assert!(
+            b.left() >= panel.left() && b.right() <= panel.right(),
+            "{name} runs out of the dialog: {b:?} in {panel:?}"
+        );
+    }
+    act(&view, Action::Close, cx);
+    // The sidebar can't be dragged: its menus move entries instead.
+    let order = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, _| super::super::tree::account_order(&this.tree))
+    };
+    assert_eq!(order(cx), [first.clone(), second.clone()]);
+    let labels = view.read_with(cx, |this, _| {
+        this.with_arranging(&first, vec![])
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, .. } => Some(label.to_string()),
+                Entry::Separator => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(labels, ["Move Down"]);
+    act(
+        &view,
+        Action::Arrange(
+            first.clone(),
+            super::super::tree::DropAt::After(second.clone()),
+        ),
+        cx,
+    );
+    assert_eq!(order(cx), [second.clone(), first.clone()]);
+    // A floating composer moves with a finger on its title.
+    act(&view, Action::Compose, cx);
+    let composer = view.read_with(cx, |this, _| this.composers.last().cloned().unwrap());
+    composer.update(cx, |c, cx| {
+        c.placement = Placement::Floating;
+        cx.notify();
+    });
+    settle(cx);
+    let header = bounds(cx, "compose-header");
+    let grab = point(header.left() + px(40.), header.center().y);
+    for (phase, at) in [
+        (TouchPhase::Started, grab),
+        (TouchPhase::Moved, grab - point(px(120.), px(200.))),
+        (TouchPhase::Ended, grab - point(px(120.), px(200.))),
+    ] {
+        cx.simulate_event(TouchDragEvent {
+            phase,
+            start_position: grab,
+            position: at,
+        });
+    }
+    // Within the panel's border, as a pointer's drag places it.
+    let moved = bounds(cx, "compose-header").origin;
+    let expected = header.origin - point(px(120.), px(200.));
+    assert!(
+        (moved.x - expected.x).abs() <= px(1.) && (moved.y - expected.y).abs() <= px(1.),
+        "the composer is at {moved:?}, not {expected:?}"
+    );
+    // The title's buttons still take taps, not a move.
+    let close = bounds(cx, "compose-close");
+    cx.simulate_event(TouchDragEvent {
+        phase: TouchPhase::Started,
+        start_position: close.center(),
+        position: close.center(),
+    });
+    assert!(!composer.read_with(cx, |c, _| c.touch_moving));
+}

@@ -50,7 +50,11 @@ impl MailApp {
                             .id(SharedString::from(selector.clone()))
                             .debug_selector(move || selector)
                             .flex_1()
-                            .when(!phone, |d| d.min_w(px(76.)).h(px(28.)).text_size(px(12.)))
+                            .when(!phone, |d| {
+                                d.min_w(px(76.))
+                                    .h(self.tap(28., 36.))
+                                    .text_size(px(if self.mobile.touch { 13. } else { 12. }))
+                            })
                             // Each choice keeps its whole label; they share
                             // what room is left.
                             .when(phone, |d| {
@@ -88,10 +92,12 @@ impl MailApp {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let c = self.colors();
+        // Bigger for a fingertip (on a touch device).
+        let knob = if self.mobile.touch { 22. } else { 16. };
         div()
             .id(SharedString::from(id))
-            .w(px(38.))
-            .h(px(22.))
+            .w(px(knob + 22.))
+            .h(px(knob + 6.))
             .flex_shrink_0()
             .rounded_full()
             .p(px(3.))
@@ -101,7 +107,7 @@ impl MailApp {
             .cursor_pointer()
             .child(
                 div()
-                    .size(px(16.))
+                    .size(px(knob))
                     .rounded_full()
                     .bg(rgb(0xffffff))
                     .shadow_sm(),
@@ -262,7 +268,7 @@ impl MailApp {
             .id(SharedString::from(id))
             .debug_selector(move || selector)
             .max_w(px(180.))
-            .h(px(32.))
+            .h(self.tap(32., 40.))
             .flex_shrink_0()
             .px_2()
             .flex()
@@ -373,7 +379,7 @@ impl MailApp {
             div()
                 .id("settings-add-account")
                 .flex_shrink_0()
-                .h(px(32.))
+                .h(self.tap(32., 40.))
                 .px_2()
                 .flex()
                 .items_center()
@@ -639,7 +645,7 @@ impl MailApp {
                                     false,
                                     cx,
                                 )
-                                .h(px(28.)),
+                                .h(self.tap(28., 36.)),
                             ),
                         )
                     })
@@ -1464,7 +1470,7 @@ impl MailApp {
                             false,
                             cx,
                         )
-                        .h(px(30.)),
+                        .h(self.tap(30., 36.)),
                     )
                     .child(
                         self.button(
@@ -1475,7 +1481,7 @@ impl MailApp {
                             false,
                             cx,
                         )
-                        .h(px(30.)),
+                        .h(self.tap(30., 36.)),
                     ),
             );
         }

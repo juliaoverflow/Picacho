@@ -93,7 +93,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Root, Theme, ThemeMode,
+    Root, Sizable as _, Theme, ThemeMode,
     input::{Input, InputEvent, InputModeKind, InputState, Textarea, TextareaState},
     scroll::{Scrollbar, ScrollbarMode},
     tooltip::Tooltip,
@@ -766,6 +766,8 @@ enum Action {
     /// A touch device shows the desktop window (true) or the phone
     /// presentation.
     SetDesktopLayout(bool),
+    /// Move a sidebar entry from its menu, where it can't be dragged.
+    Arrange(String, tree::DropAt),
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -1056,6 +1058,8 @@ pub struct MailApp {
     main_window: Option<AnyWindowHandle>,
     /// A move asked for by a composer whose subscription had no window.
     pending_place: Option<(EntityId, Placement)>,
+    /// Where a finger moved such a composer to (see `move_composer`).
+    pending_move: Option<(EntityId, Point<Pixels>)>,
     /// Any message is being delivered now; quitting waits for it.
     sending: bool,
     /// A spinner tick is pending (see `spinner`).
@@ -1915,6 +1919,7 @@ impl MailApp {
             settings_window: None,
             main_window: Some(window.window_handle()),
             pending_place: None,
+            pending_move: None,
             sending: false,
             spin_scheduled: false,
             menu_anim: 0,
@@ -5792,6 +5797,7 @@ impl MailApp {
             Action::SetLinkWarnings(on) => self.set_link_warnings(on, cx),
             Action::UntrustSite(site) => self.untrust_site(&site, cx),
             Action::SetDesktopLayout(on) => self.set_desktop_layout(on, w, cx),
+            Action::Arrange(key, at) => self.arrange(key, at, cx),
             Action::OpenUrl(url) => {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
@@ -6593,7 +6599,7 @@ impl MailApp {
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(|| selector)
-            .h(px(30.))
+            .h(self.tap(30., 40.))
             .pl(px(if self.sidebar_collapsed { 10. } else { 30. } + indent))
             .pr_2()
             .rounded(px(7.))
@@ -6672,7 +6678,7 @@ impl MailApp {
             div()
                 .id("sidebar-add-account")
                 .mt_2()
-                .h(px(30.))
+                .h(self.tap(30., 40.))
                 .px_2()
                 .rounded(px(7.))
                 .flex()
@@ -7183,7 +7189,7 @@ impl MailApp {
             .when(failed, |d| {
                 d.child(
                     self.button("empty-list-retry", "Refresh", "refresh", Action::Refresh, false, cx)
-                        .h(px(30.))
+                        .h(self.tap(30., 36.))
                         .mt_1(),
                 )
             })
@@ -7260,7 +7266,7 @@ impl MailApp {
                                 .id("filter-chip")
                                 .ml_1()
                                 .px_2()
-                                .h(px(20.))
+                                .h(self.tap(20., 30.))
                                 .flex()
                                 .items_center()
                                 .gap_1()
@@ -7360,7 +7366,7 @@ impl MailApp {
                                 .suffix(
                                     div()
                                         .id("search-close")
-                                        .size(px(20.))
+                                        .size(self.tap(20., 32.))
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -7375,7 +7381,7 @@ impl MailApp {
                                             this.handle(Action::CloseSearch, w, cx)
                                         })),
                                 )
-                                .h(px(32.))
+                                .h(self.tap(32., 40.))
                                 .text_size(px(13.))
                                 .bg(rgb(c.bg)),
                         ),
@@ -7425,7 +7431,7 @@ impl MailApp {
                     .id(SharedString::from(format!("search-hint-{op}")))
                     .debug_selector(move || format!("search-hint-{op}"))
                     .px_2()
-                    .h(px(22.))
+                    .h(self.tap(22., 32.))
                     .flex()
                     .items_center()
                     .rounded_full()
@@ -7462,8 +7468,8 @@ impl MailApp {
                 false,
                 cx,
             )
-            .h(px(28.))
-            .w(px(28.))
+            .h(self.tap(28., 36.))
+            .w(self.tap(28., 36.))
             .rounded(px(7.))
             .bg(rgb(c.soft))
         };
@@ -7571,8 +7577,8 @@ impl MailApp {
                         false,
                         cx,
                     )
-                    .h(px(28.))
-                    .w(px(28.))
+                    .h(self.tap(28., 36.))
+                    .w(self.tap(28., 36.))
                     .rounded(px(7.))
                     .bg(rgb(c.soft)),
                 )
@@ -7586,8 +7592,8 @@ impl MailApp {
                     false,
                     cx,
                 )
-                .h(px(28.))
-                .w(px(28.))
+                .h(self.tap(28., 36.))
+                .w(self.tap(28., 36.))
                 .rounded(px(7.))
                 .bg(rgb(c.soft)),
             )
@@ -8136,7 +8142,7 @@ impl MailApp {
                                 false,
                                 cx,
                             )
-                            .h(px(30.))
+                            .h(self.tap(30., 36.))
                             .flex_1()
                             .border_1()
                             .border_color(rgb(if p == self.provider {
@@ -8727,8 +8733,9 @@ impl MailApp {
         let viewport = window.viewport_size();
         let insets = window::frame_insets(window);
         let frame = viewport.height - insets.top - insets.bottom;
-        let (height, row) = menu_size(&menu.entries, f32::from(frame));
-        let width = menu_width(&menu.entries, window);
+        let touch = self.mobile.touch;
+        let (height, row) = menu_size(&menu.entries, f32::from(frame), touch);
+        let width = menu_width(&menu.entries, if touch { 15. } else { 13. }, window);
         let origin = menu_origin(menu.position, size(px(width), px(height)), viewport, insets);
         let mut panel = div()
             .id("menu-panel")
@@ -8748,7 +8755,7 @@ impl MailApp {
             .border_color(rgb(c.border))
             .bg(rgb(c.raised))
             .shadow_lg()
-            .text_size(px(13.))
+            .text_size(px(if touch { 15. } else { 13. }))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
@@ -9323,6 +9330,7 @@ impl Render for MailApp {
         self.apply_pending_listed(cx);
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
+        window::set_touch(self.mobile.touch);
         let root = if self.mobile.touch && !self.mobile.on {
             self.touch_desktop_root(window, cx)
         } else {
@@ -9803,7 +9811,10 @@ fn folder_icon(f: Folder) -> &'static str {
 /// corners under the rounded window frame. Disabled fields keep the theme's
 /// muted fill.
 fn field(input: Input, c: Colors, disabled: bool) -> Input {
-    input.when(!disabled, |i| i.bg(rgb(c.bg)))
+    input
+        .when(!disabled, |i| i.bg(rgb(c.bg)))
+        // Taller for a fingertip (on a touch device).
+        .when(window::touch(), |i| i.large())
 }
 /// A multi-line [`field`].
 fn textarea_field(input: Textarea, c: Colors, disabled: bool) -> Textarea {
@@ -9903,7 +9914,7 @@ const MENU_MARGIN: f32 = 8.;
 /// A menu's narrowest and widest.
 const MENU_WIDTH: (f32, f32) = (200., 380.);
 /// A menu's width: its longest label's, between `MENU_WIDTH`'s bounds.
-fn menu_width(entries: &[Entry], window: &Window) -> f32 {
+fn menu_width(entries: &[Entry], text: f32, window: &Window) -> f32 {
     // Around the label: the border and padding (1 + 4 each side), a row's
     // padding (8 each side), its icon and gap (16 + 8), and the space after
     // the label (16); a pixel more so rounding never cuts a label short.
@@ -9924,7 +9935,7 @@ fn menu_width(entries: &[Entry], window: &Window) -> f32 {
                 underline: None,
                 strikethrough: None,
             };
-            f32::from(window.text_system().shape_line(label.clone(), px(13.), &[run], None).width)
+            f32::from(window.text_system().shape_line(label.clone(), px(text), &[run], None).width)
         })
         .fold(0., f32::max);
     (widest + CHROME).clamp(MENU_WIDTH.0, MENU_WIDTH.1)
@@ -9951,17 +9962,19 @@ fn menu_origin(
 /// A popup menu's largest height and its rows' height, for a window frame
 /// `viewport` tall: the menu fits when it can, with rows from 28 down to 22
 /// points high; beyond that it scrolls.
-fn menu_size(entries: &[Entry], viewport: f32) -> (f32, f32) {
+fn menu_size(entries: &[Entry], viewport: f32, touch: bool) -> (f32, f32) {
     // The frame margin it keeps (each side), and its padding and border.
     const CHROME: f32 = 2. * MENU_MARGIN + 10.;
     const SEPARATOR: f32 = 9.;
+    // A fingertip needs taller rows (on a touch device).
+    let (least, most) = if touch { (40., 44.) } else { (22., 28.) };
     let items = entries.iter().filter(|e| matches!(e, Entry::Item { .. })).count() as f32;
     let separators = entries.len() as f32 - items;
     let available = (viewport - CHROME).max(120.);
     let row = if items == 0. {
-        28.
+        most
     } else {
-        ((available - separators * SEPARATOR) / items).clamp(22., 28.)
+        ((available - separators * SEPARATOR) / items).clamp(least, most)
     };
     let needed = items * row + separators * SEPARATOR + 10.;
     (needed.min(available + 10.), row)

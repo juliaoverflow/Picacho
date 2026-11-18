@@ -75,6 +75,9 @@ pub(super) enum ComposerEvent {
     /// Show this briefly in the main window: an icon-only button's name,
     /// long-pressed on a touch device.
     Notice(String),
+    /// A finger moving a floating composer by its title is here (in window
+    /// coordinates), on a touch device: follow it, as a pointer's drag.
+    TouchMove(Point<Pixels>),
 }
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -140,6 +143,8 @@ pub(super) struct Composer {
     pub(super) origin: Option<Point<Pixels>>,
     /// Where the pointer held the header when a move began.
     pub(super) grab: Point<Pixels>,
+    /// A finger is moving it by its title (see `touch_mover`).
+    pub(super) touch_moving: bool,
     /// The message an inline reply answers.
     pub(super) answers: Option<String>,
     /// The separate window showing it, for `Placement::Window`.
@@ -298,6 +303,7 @@ impl Composer {
             minimized: false,
             origin: None,
             grab: Point::default(),
+            touch_moving: false,
             answers: None,
             window: None,
             sending: false,
@@ -912,7 +918,9 @@ impl Composer {
             self.focus.focus(window, cx);
         }
         let picker = cx.new(|cx| {
-            let picker = DateTimePicker::new("later", "Send", presets, colors).phone(mobile);
+            let picker = DateTimePicker::new("later", "Send", presets, colors)
+                .phone(mobile)
+                .touch(self.single_window);
             let picker = match at {
                 Some(at) => picker.at(at),
                 None => picker,
@@ -1240,6 +1248,49 @@ impl Composer {
             }))
     }
 
+    /// Over a floating composer's title on a touch device: a finger on the
+    /// header, short of its buttons, moves the panel (the header's place in
+    /// the window is `header`).
+    fn touch_mover(
+        &self,
+        header: Rc<Cell<Bounds<Pixels>>>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let me = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                window.on_mouse_event(move |e: &TouchDragEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = me.update(cx, |c, cx| match e.phase {
+                        TouchPhase::Started
+                            if header.get().contains(&e.start_position)
+                                && e.start_position.x < bounds.right()
+                                && !window.default_prevented() =>
+                        {
+                            // Claimed: the touch moves the panel rather than
+                            // tapping or scrolling.
+                            window.prevent_default();
+                            c.grab = e.start_position - header.get().origin;
+                            c.touch_moving = true;
+                        }
+                        TouchPhase::Moved if c.touch_moving => {
+                            cx.emit(ComposerEvent::TouchMove(e.position))
+                        }
+                        TouchPhase::Ended | TouchPhase::Cancelled if c.touch_moving => {
+                            c.touch_moving = false;
+                        }
+                        _ => {}
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
     /// An icon-only button's name, shown in the main window on a long press
     /// (which arrives as a right click) in the desktop layout on a touch
     /// device, where there is no pointer to hover for its tooltip.
@@ -1304,6 +1355,13 @@ impl Composer {
     fn header(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
         let floating = matches!(self.placement, Placement::Floating | Placement::Maximized);
+        // A finger can't drag the header as a pointer does: its title is a
+        // handle that moves the panel instead (on a touch device).
+        let touch_move = self.placement == Placement::Floating
+            && !self.minimized
+            && self.single_window
+            && !self.mobile;
+        let header_bounds: Rc<Cell<Bounds<Pixels>>> = Rc::default();
         let mut header = div()
             .id("compose-header")
             .debug_selector(|| "compose-header".into())
@@ -1324,8 +1382,20 @@ impl Composer {
                     .truncate()
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.title(cx)),
+                    .child(self.title(cx))
+                    .when(touch_move, |d| {
+                        d.relative()
+                            .child(self.touch_mover(header_bounds.clone(), cx))
+                    }),
             );
+        if touch_move {
+            let bounds = header_bounds.clone();
+            header = header.relative().child(
+                canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {})
+                    .absolute()
+                    .inset_0(),
+            );
+        }
         if self.placement == Placement::Floating && !self.minimized {
             // Drag the header to move the panel around the window.
             let me = cx.weak_entity();
@@ -1451,7 +1521,13 @@ impl Composer {
     fn row(&self, label: &'static str, field: impl IntoElement) -> Div {
         let c = self.colors;
         div()
-            .h(px(if self.mobile { super::mobile::TOUCH + 4. } else { 38. }))
+            .h(px(if self.mobile {
+                super::mobile::TOUCH + 4.
+            } else if self.single_window {
+                44.
+            } else {
+                38.
+            }))
             .flex_shrink_0()
             .px_4()
             .flex()
@@ -1998,6 +2074,8 @@ impl Composer {
                 list = list.child(
                     div()
                         .id(("suggestion", i))
+                        // Taller for a fingertip (on a touch device).
+                        .when(self.single_window, |d| d.min_h(px(40.)))
                         .px_2()
                         .py_1()
                         .flex()
@@ -2040,7 +2118,7 @@ impl Composer {
         div()
             .id("compose-toolbar")
             .debug_selector(|| "compose-toolbar".into())
-            .h(px(36.))
+            .h(px(if self.single_window && !self.mobile { 44. } else { 36. }))
             .flex_shrink_0()
             .px_3()
             .flex()
@@ -2195,7 +2273,7 @@ impl Composer {
                 div()
                     .id(("attachment", i))
                     .debug_selector(move || format!("compose-attachment-{i}"))
-                    .h(px(30.))
+                    .h(px(if self.single_window { 36. } else { 30. }))
                     .max_w(px(260.))
                     .pl_2()
                     .pr_1()
@@ -2252,7 +2330,11 @@ impl Composer {
         let send = div()
             .id("compose-send")
             .debug_selector(|| "compose-send".into())
-            .h(px(if self.mobile { super::mobile::TOUCH } else { 34. }))
+            .h(px(if self.mobile || self.single_window {
+                super::mobile::TOUCH
+            } else {
+                34.
+            }))
             .px_4()
             .flex()
             .items_center()

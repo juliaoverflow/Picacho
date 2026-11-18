@@ -702,7 +702,7 @@ impl MailApp {
                     true,
                     cx,
                 )
-                .h(px(28.))
+                .h(self.tap(28., 36.))
             });
         // Keeping the mailboxes to their aliases: they don't write as
         // themselves, and show the alias used where their address was.
@@ -1089,7 +1089,7 @@ impl MailApp {
                             true,
                             cx,
                         )
-                        .h(px(30.))
+                        .h(self.tap(30., 36.))
                         .flex_shrink_0()
                         .when(busy, |d| d.opacity(0.6)),
                     ),
@@ -1245,7 +1245,7 @@ impl MailApp {
                                 true,
                                 cx,
                             )
-                            .h(px(28.)),
+                            .h(self.tap(28., 36.)),
                         ),
                 )
             })

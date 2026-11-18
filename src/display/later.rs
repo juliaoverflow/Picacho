@@ -45,9 +45,11 @@ impl MailApp {
         let colors = self.colors();
         let parser = self.when.clone();
         let mobile = self.mobile.on;
+        let touch = self.mobile.touch;
         let picker = cx.new(|cx| {
             DateTimePicker::new("snooze", "Snooze until", presets, colors)
                 .phone(mobile)
+                .touch(touch)
                 .typed(parser, w, cx)
         });
         let chosen = snoozable.clone();

@@ -625,7 +625,7 @@ impl MailApp {
         let c = self.colors();
         let (name, tip, icon) = self.view_title(id)?;
         let open = self.open(id);
-        let entries = self.view_entries(id);
+        let entries = self.with_arranging(id, self.view_entries(id));
         let inbox_unread = self.unread_for(id, &Folder::Inbox.into());
         let current = self.account.as_deref() == Some(id);
         let header = div()
@@ -635,7 +635,7 @@ impl MailApp {
                 move || format!("account-{id}")
             })
             .relative()
-            .h(px(34.))
+            .h(self.tap(34., 44.))
             .px_2()
             .rounded(px(8.))
             .flex()
@@ -647,7 +647,7 @@ impl MailApp {
                     div()
                         .absolute()
                         .left(px(-6.))
-                        .top(px(9.))
+                        .top((self.tap(34., 44.) - px(16.)) / 2.)
                         .w(px(3.))
                         .h(px(16.))
                         .rounded_full()
@@ -754,7 +754,7 @@ impl MailApp {
         let (name, _, icon) = self.view_title(id)?;
         let current = self.account.as_deref() == Some(id);
         let open = self.open(id);
-        let entries = self.view_entries(id);
+        let entries = self.with_arranging(id, self.view_entries(id));
         let unread = self.unread_for(id, &Folder::Inbox.into());
         let button = self
             .rail_button(

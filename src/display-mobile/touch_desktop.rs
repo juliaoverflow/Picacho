@@ -49,6 +49,16 @@ impl MailApp {
             .children(self.link_sheet(insets, window, cx))
     }
 
+    /// A control's height (or side): `desktop` under a pointer, and at
+    /// least `touch` on a touch device, for a fingertip.
+    pub(in crate::display::ui) fn tap(&self, desktop: f32, touch: f32) -> Pixels {
+        px(if self.mobile.touch {
+            desktop.max(touch)
+        } else {
+            desktop
+        })
+    }
+
     /// The side of the desktop's small square buttons (the top bar's, the
     /// list's): bigger for a fingertip, as far as their bars allow.
     pub(in crate::display::ui) fn small_control(&self) -> f32 {

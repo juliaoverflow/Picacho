@@ -565,7 +565,7 @@ impl MailApp {
             false,
             cx,
         )
-        .h(px(28.))
+        .h(self.tap(28., 36.))
         .flex_shrink_0()
         .text_size(px(12.))
         .border_1()
@@ -884,8 +884,8 @@ impl MailApp {
             .when(busy, |d| d.child(spinner(13., c.muted)))
             .child(
                 self.button(id, "@More actions", "ellipsis", Action::SubscriptionMenu(sub.clone()), false, cx)
-                    .h(px(28.))
-                    .w(px(28.)),
+                    .h(self.tap(28., 36.))
+                    .w(self.tap(28., 36.)),
             )
             // The row under it opens the subscription; this must not.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1064,7 +1064,7 @@ impl MailApp {
                                 false,
                                 cx,
                             )
-                            .h(px(30.)),
+                            .h(self.tap(30., 36.)),
                         )
                     })
                     .child(
@@ -1157,7 +1157,7 @@ impl MailApp {
                     false,
                     cx,
                 )
-                .h(px(30.)),
+                .h(self.tap(30., 36.)),
             )
             .child(
                 div()

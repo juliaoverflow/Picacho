@@ -603,7 +603,7 @@ impl MailApp {
                                 false,
                                 cx,
                             )
-                            .h(px(26.))
+                            .h(self.tap(26., 36.))
                             .border_1()
                             .border_color(rgb(if on { c.accent } else { c.border }))
                             .when(on, |d| d.bg(rgb(c.soft)))
