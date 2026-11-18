@@ -643,3 +643,63 @@ fn emails_declaring_xhtml_are_parsed_as_html() {
         assert!(email.layout(400) >= 40., "{start}");
     }
 }
+
+/// Drags from `from` to `to` (document coordinates) and returns the selection.
+fn drag_select(email: &mut EmailDocument, from: (f32, f32), to: (f32, f32)) -> Option<String> {
+    email
+        .doc
+        .handle_ui_event(UiEvent::PointerDown(mouse(from.0, from.1, true)));
+    email
+        .doc
+        .handle_ui_event(UiEvent::PointerMove(mouse(to.0, to.1, true)));
+    email
+        .doc
+        .handle_ui_event(UiEvent::PointerUp(mouse(to.0, to.1, false)));
+    email.doc.get_selected_text()
+}
+
+#[test]
+fn selection_follows_the_pointer_in_inline_blocks_and_centered_cells() {
+    // Responsive emails put their columns in inline blocks inside padded
+    // cells. Their text was hit-tested a cell's padding to the right of
+    // where it was painted, so selections began and ended past the pointer.
+    let mut email = EmailDocument::new(
+        "<body style='margin:0'><div style='padding:0 60px; text-align:center'>\
+         <div id='t' style='display:inline-block; width:300px; text-align:left; font: 16px monospace'>\
+         abcdefghijklmnopqrstuvwxyz</div></div></body>",
+        true,
+    );
+    email.layout(700);
+    let (x, y, _, h) = element_box(&email, "t");
+    assert!((x - 200.).abs() < 1., "the column is centered: {x}");
+    let hit = email.doc.hit(x + 2., y + h / 2.).unwrap();
+    assert!(hit.is_text, "the column's first letter is under the pointer");
+    let picked = drag_select(&mut email, (x + 1., y + h / 2.), (x + 70., y + h / 2.)).unwrap();
+    assert!(picked.starts_with("abc"), "{picked:?}");
+    assert!((6..=9).contains(&picked.len()), "{picked:?}");
+
+    // Text in a vertically centered cell: the second line is picked where
+    // it is painted, not a line away.
+    let mut email = EmailDocument::new(
+        "<body style='margin:0'><table cellspacing='0' cellpadding='0'><tr>\
+         <td id='c' height='300' valign='middle' style='width:120px; font: 16px/20px monospace'>\
+         first line second line third line</td></tr></table></body>",
+        true,
+    );
+    email.layout(400);
+    let (x, y, _, h) = element_box(&email, "c");
+    // Three or four lines of 20px, centered in the cell.
+    let node = email
+        .doc
+        .get_node(email.doc.get_element_by_id("c").unwrap())
+        .unwrap();
+    let text_top = node
+        .element_data()
+        .and_then(|e| e.inline_layout_data.as_ref())
+        .map(|l| l.block_offset)
+        .unwrap();
+    assert!(text_top > 50., "the text is centered: {text_top} of {h}");
+    let line = y + text_top + 30.;
+    let picked = drag_select(&mut email, (x + 1., line), (x + 60., line)).unwrap();
+    assert!(picked.starts_with("second") || picked.starts_with("line"), "{picked:?}");
+}

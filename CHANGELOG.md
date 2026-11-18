@@ -11,6 +11,12 @@ same version in `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Selecting text in an email starts and ends under the pointer. In columns
+  and centered layouts it ran well to the right of it, and in vertically
+  centered cells a line away; links there are clicked where they are shown.
+
 ## [0.1.0] - 2026-11-16
 
 ### Added
