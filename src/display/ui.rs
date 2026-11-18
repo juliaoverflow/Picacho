@@ -5270,7 +5270,7 @@ impl MailApp {
             }
             Action::Start => self.begin_setup(Step::Provider, w, cx),
             Action::ChooseService(service) => self.choose_service(service, w, cx),
-            Action::OpenLink(url) => cx.open_url(url),
+            Action::OpenLink(url) => self.open_external(url, cx),
             Action::Discover => {
                 if self.step == Step::Email
                     && (self.onboarding || self.modal == Some(Modal::Connect))
@@ -5688,7 +5688,7 @@ impl MailApp {
                     url
                 };
                 match super::html::openable_url(&url) {
-                    Some(url) => cx.open_url(url.as_str()),
+                    Some(url) => self.open_external(url.as_str(), cx),
                     None => self.notice("Picacho only opens web and email links.", true, cx),
                 }
             }

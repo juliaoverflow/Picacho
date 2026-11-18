@@ -522,7 +522,7 @@ impl MailApp {
                                 this.notice(format!("Unsubscribed from {who}"), false, cx)
                             }
                             Outcome::Open(url) => {
-                                cx.open_url(&url);
+                                this.open_external(&url, cx);
                                 this.notice(
                                     format!("Finish unsubscribing from {who} on the page that opened"),
                                     false,

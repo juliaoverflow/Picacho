@@ -1468,6 +1468,7 @@ impl MailApp {
                 let shown = original.view(view);
                 let lines = shown.map(|(_, l)| l.clone()).unwrap_or_default();
                 let mono = c;
+                let phone = self.mobile.on;
                 // Switches between the message's headers, HTML and source.
                 let mut tabs = div()
                     .flex()
@@ -1599,7 +1600,10 @@ impl MailApp {
                                                 .px_5()
                                                 .whitespace_nowrap()
                                                 .overflow_hidden()
-                                                .font_family("Menlo")
+                                                // Phones resolve no monospace
+                                                // family; GPUI panics on a
+                                                // font it can't find.
+                                                .when(!phone, |d| d.font_family("Menlo"))
                                                 .text_size(px(11.5))
                                                 .text_color(rgb(mono.text))
                                                 .child(lines[i].clone())
