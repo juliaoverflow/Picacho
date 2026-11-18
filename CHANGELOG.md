@@ -13,6 +13,8 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Phones and tablets: Edit on the Mailboxes screen sorts accounts by dragging
+  their handles, in the same order as the desktop's sidebar.
 - Pasting copied rich text into a message pastes it as plain text, with a
   “Paste with formatting” button to keep its bold, links and lists instead.
   Turn on Settings → Composing → Paste with formatting to make that the

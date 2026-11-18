@@ -831,3 +831,52 @@ fn the_snooze_buttons_stay_in_view(cx: &mut TestAppContext) {
         assert!(b.top() < panel.bottom(), "{b:?}");
     }
 }
+
+#[gpui::test]
+fn accounts_sort_by_dragging_their_handles(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    let before = view.read_with(cx, |this, _| this.mobile_sortable());
+    assert_eq!(before.len(), 2);
+    // Edit shows a row with a handle per account.
+    let edit = bounds(cx, "mobile-reorder");
+    cx.simulate_click(edit.center(), Modifiers::none());
+    let handle: &'static str =
+        Box::leak(format!("mobile-reorder-handle-{}", before[0]).into_boxed_str());
+    touchable(cx, handle);
+    // Its icon is one Picacho draws (the component library's set lacks it).
+    assert!(matches!(
+        gpui::AssetSource::load(&crate::display::assets::Assets, "mail/grip.svg"),
+        Ok(Some(_))
+    ));
+    let at = bounds(cx, handle).center();
+    let pan = |dy: f32, phase: TouchPhase, cx: &mut VisualTestContext| {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+    };
+    // Less than halfway past the next row: still in its place.
+    pan(5., TouchPhase::Started, cx);
+    pan(15., TouchPhase::Moved, cx);
+    assert_eq!(view.read_with(cx, |this, _| this.mobile_sortable()), before);
+    // Past halfway: the two swap, and the list didn't scroll.
+    pan(20., TouchPhase::Moved, cx);
+    pan(0., TouchPhase::Ended, cx);
+    let after = view.read_with(cx, |this, _| this.mobile_sortable());
+    assert_eq!(after, vec![before[1].clone(), before[0].clone()]);
+    view.read_with(cx, |this, _| {
+        assert!(this.mobile.reorder_drag.is_none());
+        assert_eq!(this.mobile.mailboxes_scroll.offset().y, px(0.));
+    });
+    // Done goes back to the mailboxes, in the new order.
+    let done = bounds(cx, "mobile-reorder");
+    cx.simulate_click(done.center(), Modifiers::none());
+    assert!(!view.read_with(cx, |this, _| this.mobile.reordering));
+    let first: &'static str = Box::leak(format!("mobile-account-{}", after[0]).into_boxed_str());
+    let second: &'static str = Box::leak(format!("mobile-account-{}", after[1]).into_boxed_str());
+    assert!(bounds(cx, first).top() < bounds(cx, second).top());
+}

@@ -30,6 +30,7 @@ mod list;
 mod mailboxes;
 mod platform;
 mod reader;
+mod reorder;
 mod settings;
 mod sheets;
 #[cfg(test)]
@@ -91,6 +92,11 @@ pub(super) struct Mobile {
     pub(super) swipe_ended: Option<std::time::Instant>,
     /// How far a pull-to-refresh has been dragged down at the list's top.
     pub(super) pull: f32,
+    /// The mailboxes screen is sorting accounts: each is a row with a handle.
+    pub(super) reordering: bool,
+    /// The account being dragged by its handle, and how far its row has
+    /// been dragged from its place.
+    pub(super) reorder_drag: Option<(String, f32)>,
     /// Where the person is: the screen, dialog, composer and setup step.
     /// When it changes, a field left focused behind lets go of the keyboard.
     pub(super) place: Option<Place>,
@@ -135,6 +141,8 @@ impl Mobile {
             swipe_ended: None,
             pan: None,
             pull: 0.,
+            reordering: false,
+            reorder_drag: None,
             keyboard_for: None,
             place: None,
             chrome_dark: None,
@@ -699,6 +707,9 @@ impl MailApp {
 
     /// Slides the next screen in from the trailing edge.
     pub(super) fn mobile_pushed(&mut self, cx: &mut Context<Self>) {
+        // Sorting accounts ends with the mailboxes screen.
+        self.mobile.reordering = false;
+        self.mobile.reorder_drag = None;
         self.mobile.push_anim += 1;
         self.mobile.slide = Slide::Push;
         self.mobile.slide_at = Some(std::time::Instant::now());

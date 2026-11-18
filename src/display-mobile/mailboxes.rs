@@ -25,6 +25,52 @@ impl MailApp {
             .pb_6()
             .flex()
             .flex_col();
+        if self.mobile.reordering {
+            body = body.child(self.mobile_reorder_list(cx));
+        } else {
+            body = self.mobile_mailbox_sections(body, cx);
+        }
+        let settings = self.bar_icon(
+            "mobile-settings",
+            "settings",
+            "Settings",
+            Rc::new(
+                |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
+                    this.mobile_open_settings(w, cx)
+                },
+            ),
+            cx,
+        );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.bg))
+            .child(self.nav_bar(
+                "mobile-mailboxes-bar",
+                insets,
+                None,
+                "Mailboxes",
+                None,
+                self.mobile_reorder_button(cx).into_iter().collect(),
+            ))
+            .child(super::super::panes::scroll_frame(
+                body,
+                &self.mobile.mailboxes_scroll,
+            ))
+            .child(self.tool_row(
+                "mobile-mailboxes-toolbar",
+                insets,
+                vec![settings],
+                Some(self.mobile_status_line()),
+                vec![self.compose_button(cx)],
+            ))
+            .into_any_element()
+    }
+
+    /// Every account (and view) with its folders, then Add Account.
+    fn mobile_mailbox_sections(&self, mut body: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors();
         if self.shows_all_mail() {
             body = body.child(self.mobile_view_section(ALL_MAIL, cx));
         }
@@ -67,42 +113,7 @@ impl MailApp {
                     )
                     .into_any_element(),
                 ])));
-        let settings = self.bar_icon(
-            "mobile-settings",
-            "settings",
-            "Settings",
-            Rc::new(
-                |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
-                    this.mobile_open_settings(w, cx)
-                },
-            ),
-            cx,
-        );
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(c.bg))
-            .child(self.nav_bar(
-                "mobile-mailboxes-bar",
-                insets,
-                None,
-                "Mailboxes",
-                None,
-                vec![],
-            ))
-            .child(super::super::panes::scroll_frame(
-                body,
-                &self.mobile.mailboxes_scroll,
-            ))
-            .child(self.tool_row(
-                "mobile-mailboxes-toolbar",
-                insets,
-                vec![settings],
-                Some(self.mobile_status_line()),
-                vec![self.compose_button(cx)],
-            ))
-            .into_any_element()
+        body
     }
 
     /// Opens Settings at its list of pages.

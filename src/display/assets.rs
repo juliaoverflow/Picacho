@@ -153,6 +153,10 @@ impl AssetSource for Assets {
             "mail/subscriptions.svg" => Some(
                 "<path d='M4 4h12v15a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2Z'/><path d='M16 8h4v11a2 2 0 0 1-4 0M8 8h4M8 12h4M8 16h3'/>",
             ),
+            // Sorting handles (the phone's account list): two columns of dots.
+            "mail/grip.svg" => Some(
+                "<g fill='currentColor' stroke='none'><circle cx='9' cy='6' r='1.6'/><circle cx='15' cy='6' r='1.6'/><circle cx='9' cy='12' r='1.6'/><circle cx='15' cy='12' r='1.6'/><circle cx='9' cy='18' r='1.6'/><circle cx='15' cy='18' r='1.6'/></g>",
+            ),
             "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
             "mail/tag.svg" => Some(
                 "<path d='M12.6 2.6A2 2 0 0 0 11.2 2H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.7 8.7a2.4 2.4 0 0 0 3.4 0l6.6-6.6a2.4 2.4 0 0 0 0-3.4Z'/><circle cx='7.5' cy='7.5' r='.5'/>",

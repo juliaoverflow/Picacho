@@ -9388,6 +9388,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "answered",
         "forwarded",
         "keyboard",
+        "grip",
     ]
     .contains(&name)
     {
