@@ -38,6 +38,12 @@ Passwords sign in with the strongest method the server offers. IMAP, POP3 and SM
 - **Check for new mail**: every 1, 5, 15, 30, or 60 minutes, or manually.
 - **Notifications**: a system notification for new inbox mail while Picacho is in the background.
 
+General's **Background** section:
+
+- **Keep running in the background** (on by default): closing Picacho's last window leaves it running, without the window, checking every mailbox's inbox on its schedule (and with IDLE or Proton's events) and notifying of new mail. Scheduled mail (Send Later) is sent when due, and snoozed mail comes back to the inbox, each with a notification; a scheduled message that can't be sent stays in Drafts saying why, as with the window open. A tray icon shows meanwhile (in KDE's or the AppIndicator extension's tray on Linux, the notification area on Windows, the menu bar on macOS); its menu opens Picacho again or quits it, as **Quit Picacho** (⌘Q, Ctrl+Q) does from the window. Launching Picacho again, or clicking its Dock icon, opens the window. Turned off, closing the last window quits.
+- **Show tray icon while open**: shows the tray icon while a window is open too.
+- On Android, **Check for mail in the background** (on by default) keeps checking after Picacho is closed (swiped away from Recents) and after the phone restarts, with an ongoing notification whose **Stop** ends it until Picacho is opened again.
+
 A red warning beside a mailbox (also in the collapsed sidebar) means it needs
 attention. Click it, or open that mailbox's settings, for the operation, time,
 underlying cause, and recovery actions. Background failures keep cached mail

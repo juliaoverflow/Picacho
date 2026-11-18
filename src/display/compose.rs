@@ -262,7 +262,10 @@ impl MailApp {
 
     /// Opens a saved draft where new messages open.
     pub(super) fn open_draft(&mut self, draft: Draft, w: &mut Window, cx: &mut Context<Self>) {
-        if self.scheduled_sending.contains(&draft.id) {
+        // Here, or by the background monitor as the window opened.
+        if self.scheduled_sending.contains(&draft.id)
+            || self.backend.sending_scheduled(&draft.id)
+        {
             self.notice("This scheduled message is being sent now.", false, cx);
             return;
         }
@@ -747,9 +750,10 @@ impl MailApp {
     }
 
     /// Sends the scheduled drafts whose time has come, except any open in
-    /// a composer (being changed) or already going. Picacho has to be open
-    /// for them to go; ones whose time passed while it was closed go at
-    /// the next check after it opens.
+    /// a composer (being changed) or already going. With no window open the
+    /// background monitor sends them (`manage::background`); ones whose time
+    /// passed while Picacho wasn't running go at the next check after it
+    /// starts.
     pub(super) fn send_due(&mut self, cx: &mut Context<Self>) {
         let mut open: HashSet<String> = self
             .composers
@@ -802,11 +806,14 @@ impl MailApp {
         self.scheduled_sending.insert(id.clone());
         self.task(
             cx,
-            move |b| b.send_noting(&a, &d),
+            move |b| b.send_scheduled(&a, &d.id),
             move |this, result, cx| {
                 this.scheduled_sending.remove(&id);
                 match result {
-                    Ok(notes) => {
+                    // Sent already, or being sent, by the background
+                    // monitor; or no longer due.
+                    Ok(None) => this.refresh_drafts(cx),
+                    Ok(Some((_, notes))) => {
                         this.scheduled_retry.remove(&id);
                         this.notice(
                             format!("Scheduled message sent. {}", notes.join(" "))
@@ -835,10 +842,7 @@ impl MailApp {
     /// for the person to fix and send.
     fn schedule_failed(&mut self, id: String, error: String, cx: &mut Context<Self>) {
         self.scheduled_retry.remove(&id);
-        if let Ok(Some(mut d)) = self.backend.store.draft(&id) {
-            d.send_error = error.clone();
-            let _ = self.backend.store.save_draft(&d);
-        }
+        self.backend.schedule_failed(&id, &error);
         self.notice(
             format!("A scheduled message wasn't sent: {error} It's in Drafts."),
             true,

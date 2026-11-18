@@ -1100,3 +1100,159 @@ fn opening_a_message_keeps_its_labels() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A one-connection SMTP server over STARTTLS that delivers one message,
+/// pausing `pause` before accepting it. Returns the message once the client
+/// quits, or `None` if it never connected.
+fn slow_smtp(
+    acceptor: native_tls::TlsAcceptor,
+    pause: Duration,
+) -> Result<(u16, std::thread::JoinHandle<Option<Vec<u8>>>)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().ok()?;
+        socket.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        let mut plain = BufReader::new(socket);
+        plain.get_mut().write_all(b"220 localhost ESMTP fixture\r\n").ok()?;
+        let mut line = String::new();
+        plain.read_line(&mut line).ok()?;
+        plain.get_mut().write_all(b"250-localhost\r\n250 STARTTLS\r\n").ok()?;
+        line.clear();
+        plain.read_line(&mut line).ok()?;
+        plain.get_mut().write_all(b"220 Begin TLS\r\n").ok()?;
+        let mut r = BufReader::new(acceptor.accept(plain.into_inner()).ok()?);
+        let mut delivered = Vec::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).ok()? == 0 {
+                break;
+            }
+            let response = if line.starts_with("EHLO") {
+                "250-localhost\r\n250 AUTH PLAIN LOGIN\r\n"
+            } else if line.starts_with("AUTH") {
+                "235 Authenticated\r\n"
+            } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                "250 OK\r\n"
+            } else if line == "DATA\r\n" {
+                r.get_mut().write_all(b"354 Send message\r\n").ok()?;
+                loop {
+                    let mut data = Vec::new();
+                    r.read_until(b'\n', &mut data).ok()?;
+                    if data == b".\r\n" {
+                        break;
+                    }
+                    delivered.extend(data);
+                }
+                std::thread::sleep(pause);
+                "250 Message queued\r\n"
+            } else if line == "QUIT\r\n" {
+                let _ = r.get_mut().write_all(b"221 Bye\r\n");
+                break;
+            } else {
+                "250 OK\r\n"
+            };
+            r.get_mut().write_all(response.as_bytes()).ok()?;
+        }
+        Some(delivered)
+    });
+    Ok((port, server))
+}
+
+/// With no window open, the background monitor sends a scheduled message
+/// once due, removes it from Drafts and says so; the window, opening while
+/// it is being sent, finds it taken and doesn't send it again.
+#[test]
+fn the_background_monitor_sends_scheduled_mail_once() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let (port, server) = slow_smtp(acceptor, Duration::from_millis(800))?;
+    let (b, mut a, path) = backend(&cert)?;
+    // POP3: no inbox watch, and no server Drafts to sync afterwards.
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.sync.refresh_minutes = 0;
+    b.store.save_account(&a)?;
+    let d = Draft {
+        id: "scheduled-test".into(),
+        account: a.id.clone(),
+        to: "Recipient <recipient@example.com>".into(),
+        subject: "Sent while Picacho was closed".into(),
+        body: "Scheduled for earlier.".into(),
+        send_at: Some(chrono::Utc::now().timestamp() - 5),
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let b = Arc::new(b);
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let tx = Mutex::new(tx);
+    let monitor = crate::manage::background::Monitor::start(
+        b.clone(),
+        Box::new(move |a| {
+            let _ = tx.lock().unwrap().send(format!("{a:?}"));
+        }),
+    )?;
+    // While the monitor sends it, the window can't send it too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !b.sending_scheduled(&d.id) {
+        assert!(std::time::Instant::now() < deadline, "the monitor didn't send it");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(b.send_scheduled(&a, &d.id)?.is_none());
+    let said = rx.recv_timeout(Duration::from_secs(10))?;
+    assert!(said.starts_with("ScheduledSent"), "{said}");
+    assert!(said.contains("Sent while Picacho was closed"), "{said}");
+    let delivered = server.join().unwrap().expect("delivered");
+    assert!(String::from_utf8_lossy(&delivered).contains("Sent while Picacho was closed"));
+    assert!(b.store.draft(&d.id)?.is_none(), "sent mail leaves Drafts");
+    // Sent and gone, it isn't sent again by anyone.
+    assert!(b.send_scheduled(&a, &d.id)?.is_none());
+    drop(monitor);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&b) > 1 {
+        assert!(std::time::Instant::now() < deadline, "the monitor kept running");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A due snooze whose server can't be reached isn't tried again at every
+/// tick, and nothing is announced; POP3 accounts have no snoozes to wake.
+#[test]
+fn the_background_monitor_waits_before_waking_snoozes_again() -> Result<()> {
+    let (cert, _) = tls_fixture()?;
+    // A port nothing listens on.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let mut pop = Account::new(Provider::Pop3);
+    pop.email = "pop@example.com".into();
+    b.store.save_account(&pop)?;
+    let due = |folder: &str| Snoozed {
+        message_id: "<snoozed@example.com>".into(),
+        subject: "Look at this later".into(),
+        sender: "Sophie".into(),
+        until: chrono::Utc::now().timestamp() - 5,
+        folder: folder.into(),
+        ids: vec![],
+    };
+    for id in [&a.id, &pop.id] {
+        b.store.set_preference(
+            &format!("snoozed:{id}"),
+            &serde_json::to_string(&[due("Snoozed")])?,
+        )?;
+    }
+    let b = Arc::new(b);
+    let (waiting, refused, said) =
+        crate::manage::background::wake_once(b.clone(), &[a.clone(), pop.clone()]);
+    assert_eq!(waiting, [a.id.clone()]);
+    assert!(refused.is_empty());
+    assert!(said.is_empty(), "{said:?}");
+    // Still snoozed, for the next try.
+    assert_eq!(b.snoozed(&a.id).len(), 1);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

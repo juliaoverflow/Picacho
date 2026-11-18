@@ -275,9 +275,19 @@ objc2-core-ml = { version = "0.3", default-features = false, features = ["std", 
 # Windows Hello: the system's own passkeys and security keys.
 webauthn-authenticator-rs = { version = "0.6.2", features = ["win10"] }
 
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+# The tray (menu bar) icon while Picacho runs in the background (display/tray.rs).
+tray-icon = { version = "0.26", default-features = false }
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 # GPUI enables Fontconfig's dlopen API; select the matching API in Blitz's font backend.
 fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
+# The tray icon while Picacho runs in the background (display/tray.rs):
+# a StatusNotifierItem over D-Bus, without GTK.
+ksni = { version = "0.3", features = ["blocking"] }
+# glibc's allocator settings and malloc_trim, to keep the background's
+# memory small (manage/memory.rs).
+libc = "0.2"
 
 [patch.crates-io]
 # Patched crates, one folder each with its patches and README:

@@ -6,7 +6,7 @@ use crate::manage::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -252,6 +252,9 @@ pub struct Backend {
     proton_prompt: Arc<Mutex<KeyPrompt>>,
     /// Called with Proton's account notices; see `on_proton_notice`.
     proton_notice: Mutex<Option<ProtonNotice>>,
+    /// Scheduled drafts being sent now, by id, by the window or the
+    /// background monitor; see `send_scheduled`.
+    scheduled_sending: Mutex<HashSet<String>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -296,6 +299,7 @@ impl Backend {
             proton_login: Mutex::new(None),
             proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
             proton_notice: Mutex::new(None),
+            scheduled_sending: Mutex::new(HashSet::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -2588,6 +2592,53 @@ impl Backend {
         plan: &crate::manage::subscriptions::Plan,
     ) -> Result<crate::manage::subscriptions::Outcome> {
         crate::manage::subscriptions::unsubscribe(plan, &a.id, |d| self.send(a, d))
+    }
+    /// Sends the scheduled draft `id` if it is due. The window and the
+    /// background monitor (one taking over from the other) may both find it
+    /// due: whichever comes second while the first is sending, or after it
+    /// sent (and so discarded) the draft, gets `Ok(None)` and sends nothing.
+    /// It is read again here, so a time changed meanwhile counts.
+    pub fn send_scheduled(
+        &self,
+        a: &Account,
+        id: &str,
+    ) -> Result<Option<(Draft, Vec<String>)>> {
+        if !self.scheduled_sending.lock().unwrap().insert(id.to_owned()) {
+            return Ok(None);
+        }
+        struct Claim<'a>(&'a Mutex<HashSet<String>>, &'a str);
+        impl Drop for Claim<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(self.1);
+            }
+        }
+        let _claim = Claim(&self.scheduled_sending, id);
+        let now = chrono::Utc::now().timestamp();
+        let Some(d) = self.store.draft(id)? else {
+            return Ok(None);
+        };
+        if !d.send_at.is_some_and(|t| t <= now) || !d.send_error.is_empty() {
+            return Ok(None);
+        }
+        let notes = self.send_noting(a, &d)?;
+        Ok(Some((d, notes)))
+    }
+    /// Whether the scheduled draft `id` is being sent now (see `send_scheduled`).
+    pub fn sending_scheduled(&self, id: &str) -> bool {
+        self.scheduled_sending.lock().unwrap().contains(id)
+    }
+    /// Whether any scheduled draft is being sent now: a background process
+    /// handing over to the window waits for it, so it isn't sent twice.
+    pub fn sending_any_scheduled(&self) -> bool {
+        !self.scheduled_sending.lock().unwrap().is_empty()
+    }
+    /// A scheduled draft that can't be sent stays in Drafts, saying why,
+    /// for the person to fix and send.
+    pub fn schedule_failed(&self, id: &str, error: &str) {
+        if let Ok(Some(mut d)) = self.store.draft(id) {
+            d.send_error = error.to_owned();
+            let _ = self.store.save_draft(&d);
+        }
     }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
         self.send_noting(a, d).map(|_| ())

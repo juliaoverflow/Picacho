@@ -19,6 +19,15 @@ same version in `Cargo.toml`.
   “Paste with formatting” button to keep its bold, links and lists instead.
   Turn on Settings → Composing → Paste with formatting to make that the
   default, with “Paste without formatting” offered instead.
+- Picacho keeps running in the background when its window closes, checking
+  for new mail and notifying you of it, with a tray icon to open it again or
+  quit. Turn it off, or show the tray icon while the window is open too, in
+  Settings → General. Launching Picacho again opens the running one. In the
+  background Picacho is a small process of its own, using a fraction of the
+  window's memory.
+- Scheduled mail (Send Later) is sent, and snoozed mail comes back to the
+  inbox, while Picacho runs in the background (desktop and Android), each
+  with a notification.
 
 ### Fixed
 

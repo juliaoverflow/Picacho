@@ -504,6 +504,7 @@ impl MailApp {
                 self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
                     .debug_selector(|| "all-mail".into()),
             ))
+            .map(|d| self.background_settings(d, cx))
             // A phone lists About in Settings' own list instead.
             .when(!self.mobile.on, |d| d.child(self.section("Picacho")).child(
                 div()
@@ -1521,6 +1522,47 @@ impl MailApp {
         .into_any_element()
     }
 
+    /// Running in the background once Picacho's windows close, and its tray
+    /// icon (desktop); its mail service (Android). iOS has neither.
+    fn background_settings(&self, page: Div, cx: &Context<Self>) -> Div {
+        let background = self
+            .switch(
+                "background".into(),
+                self.background,
+                Action::SetBackground(!self.background),
+                cx,
+            )
+            .debug_selector(|| "background".into());
+        if cfg!(target_os = "ios") {
+            return page;
+        }
+        if cfg!(target_os = "android") {
+            return page.child(self.section("Background")).child(self.toggle_row(
+                "Check for mail in the background",
+                "After Picacho is closed, keep checking for new mail and notify you of it, send scheduled mail, and bring back snoozed mail. Android shows an ongoing notification while Picacho does.",
+                background,
+            ));
+        }
+        let tray = self
+            .switch(
+                "tray-icon".into(),
+                self.tray_icon,
+                Action::SetTrayIcon(!self.tray_icon),
+                cx,
+            )
+            .debug_selector(|| "tray-icon".into());
+        page.child(self.section("Background"))
+            .child(self.toggle_row(
+                "Keep running in the background",
+                "When you close Picacho's window, keep checking for new mail and notify you of it, send scheduled mail, and bring back snoozed mail. Open Picacho again or quit it from its icon in the tray.",
+                background,
+            ))
+            .child(self.toggle_row(
+                "Show tray icon while open",
+                "Also show Picacho's tray icon while its window is open. It always shows while Picacho runs in the background.",
+                tray,
+            ))
+    }
     /// Moves Settings between a dialog, the full main window and a window
     /// of its own, keeping the page and everything on it.
     pub(super) fn place_settings(

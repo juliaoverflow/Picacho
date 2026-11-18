@@ -71,6 +71,10 @@ mod tree;
 mod views;
 #[path = "window.rs"]
 mod window;
+/// The desktop app's life beyond its windows: background and tray.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[path = "shell.rs"]
+mod shell;
 use super::html::{HtmlContextMenu, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
@@ -650,6 +654,10 @@ enum Action {
     SetReadingDefaults(ReadingOptions),
     /// Removes tracking from links in mail, or stops.
     SetCleanLinks(bool),
+    /// Keep running in the background once the windows close.
+    SetBackground(bool),
+    /// Show the tray icon while a window is open too.
+    SetTrayIcon(bool),
     /// Turns Local AI on, or off (deleting its models).
     SetLocalAi(bool),
     /// Hides sign-in codes (downloading the model), or stops (deleting it).
@@ -1164,6 +1172,14 @@ pub struct MailApp {
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
+    /// Picacho keeps checking mail once its windows close (Settings →
+    /// General; on Android, its mail service), and shows its tray icon while
+    /// a window is open too.
+    background: bool,
+    tray_icon: bool,
+    /// Its window closed and the background monitor checks mail now (see
+    /// `retire`).
+    retired: bool,
     /// Local AI and its sign-in code hiding (Settings → Local AI).
     local_ai: bool,
     hide_codes: bool,
@@ -1289,7 +1305,15 @@ fn textarea(placeholder: &str, window: &mut Window, cx: &mut App) -> Entity<Text
     cx.new(|cx| TextareaState::new(window, cx).placeholder(placeholder.to_owned()))
 }
 impl MailApp {
+    /// A mail view with a backend of its own (tests).
+    #[cfg(test)]
     pub fn new(store: Arc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_backend(new_backend(store), window, cx)
+    }
+    /// The mail view on an existing backend: the app's, which outlives each
+    /// window on a desktop running in the background (see `shell`).
+    pub fn with_backend(backend: Arc<Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let store = backend.store.clone();
         let accounts = store.accounts().unwrap_or_default();
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
@@ -1319,12 +1343,9 @@ impl MailApp {
             a => a == Appearance::Dark,
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
-        let backend = Arc::new(Backend::new(store));
-        backend.on_proton_notice(|a, title, body| {
-            if a.sync.notify {
-                crate::display::notify::account_notice(&a.email, title, body);
-            }
-        });
+        let background = crate::manage::background::enabled(&store);
+        let tray_icon = crate::manage::background::tray_while_open(&store);
+        drop(store);
         let search = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Search, or from: reply-to: is:unread")
@@ -1843,6 +1864,9 @@ impl MailApp {
             reverse_contacts,
             contacts_fetched: HashSet::new(),
             clean_links,
+            background,
+            tray_icon,
+            retired: false,
             local_ai,
             hide_codes,
             otp: None,
@@ -1927,13 +1951,17 @@ impl MailApp {
             loop {
                 cx.background_executor().timer(Duration::from_secs(20)).await;
                 let checked = this.update(cx, |this, cx| {
+                    if this.retired {
+                        return false;
+                    }
                     this.watch_inboxes();
                     this.check_due(cx);
                     this.send_due(cx);
                     this.wake_snoozed(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
+                    true
                 });
-                if checked.is_err() {
+                if !checked.unwrap_or(false) {
                     break;
                 }
             }
@@ -1943,6 +1971,44 @@ impl MailApp {
     }
     fn colors(&self) -> Colors {
         Colors::new(self.dark, self.accent)
+    }
+    /// Stops checking mail: the window is gone and the background monitor
+    /// checks instead. The view is normally dropped with its window; should
+    /// anything keep it, it must not check (and announce) alongside the
+    /// monitor.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn retire(&mut self) {
+        self.retired = true;
+    }
+    /// Quits Picacho (not just the window), unless a message is being sent.
+    fn quit_app(&mut self, cx: &mut Context<Self>) {
+        if self.sending {
+            self.notice("Wait for the current message to finish sending.", true, cx);
+        } else {
+            self.persist_draft(cx);
+            cx.quit();
+        }
+    }
+    fn set_background(&mut self, on: bool, cx: &mut Context<Self>) {
+        use crate::manage::background::PREFERENCE;
+        self.background = on;
+        // Read back at once (the shell reads it when the last window closes).
+        self.backend
+            .store
+            .set_preference_soon(PREFERENCE, if on { "true" } else { "false" });
+        #[cfg(target_os = "android")]
+        crate::android::set_background(on);
+        cx.notify();
+    }
+    fn set_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
+        use crate::manage::background::TRAY_PREFERENCE;
+        self.tray_icon = on;
+        self.backend
+            .store
+            .set_preference_soon(TRAY_PREFERENCE, if on { "true" } else { "false" });
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        cx.defer(shell::update_tray);
+        cx.notify();
     }
     fn account_of(&self, m: &Mail) -> Option<Account> {
         self.accounts.iter().find(|a| a.id == m.account).cloned()
@@ -2157,6 +2223,9 @@ impl MailApp {
     /// at once rather than at the next check; ends watches of accounts that
     /// are gone or can't sign in. Polling carries on regardless.
     fn watch_inboxes(&mut self) {
+        if self.retired {
+            return;
+        }
         let watching = self.backend.watching();
         for id in &watching {
             let keep = self.accounts.iter().any(|a| &a.id == id) && !self.account_blocked(id);
@@ -2183,6 +2252,9 @@ impl MailApp {
     /// its own), unless its account's inbox watcher already hears about
     /// every mailbox (NOTIFY). Other accounts' folder watches end.
     fn watch_open_folder(&mut self) {
+        if self.retired {
+            return;
+        }
         let open = self
             .account
             .clone()
@@ -2200,6 +2272,9 @@ impl MailApp {
     /// The server reported a change in one of an account's mailboxes (IDLE,
     /// NOTIFY): check it now, as the regular check would.
     fn on_push(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
+        if self.retired {
+            return;
+        }
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
@@ -2235,7 +2310,7 @@ impl MailApp {
         let present: HashSet<&String> = messages.iter().map(|m| &m.id).collect();
         known.retain(|m| present.contains(m));
         known.extend(messages.iter().filter(|m| m.unread).map(|m| m.id.clone()));
-        if first || fresh.is_empty() || !a.sync.notify || self.active {
+        if first || fresh.is_empty() || !a.sync.notify || self.active || self.retired {
             return;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
@@ -5296,6 +5371,8 @@ impl MailApp {
             Action::CloseModelSheet => {
                 self.model_confirm = None;
             }
+            Action::SetBackground(on) => self.set_background(on, cx),
+            Action::SetTrayIcon(on) => self.set_tray_icon(on, cx),
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
                 if on {
@@ -8918,14 +8995,7 @@ impl MailApp {
     fn app_actions(&self, d: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
         d
             .on_action(cx.listener(|this, _: &Compose, w, cx| this.new_compose(0, w, cx)))
-            .on_action(cx.listener(|this, _: &Quit, _, cx| {
-                if this.sending {
-                    this.notice("Wait for the current message to finish sending.", true, cx);
-                } else {
-                    this.persist_draft(cx);
-                    cx.quit();
-                }
-            }))
+            .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit_app(cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, w, cx| {
                 if this.modal.is_some() {
                     this.close(w, cx);
@@ -9681,16 +9751,49 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
     ]
 }
 
-/// Runs the app on this system's own GPUI platform.
+/// The app's backend for `store`, announcing the provider's own notices
+/// (Proton's) as the window and the background monitor run it.
+pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
+    let backend = Arc::new(Backend::new(store));
+    backend.on_proton_notice(|a, title, body| {
+        if a.sync.notify {
+            crate::display::notify::account_notice(&a.email, title, body);
+        }
+    });
+    backend
+}
+
+/// Runs the app on this system's own GPUI platform. `instance` answers
+/// later launches of Picacho (see `instance`).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn run(store: Arc<Store>) {
-    run_on(gpui_platform::application(), store);
+pub fn run(store: Arc<Store>, instance: Option<super::instance::Listener>) {
+    // Closing the last window may leave Picacho running in the background;
+    // the shell decides, and quits when it doesn't.
+    let app = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
+    app.on_reopen(shell::open);
+    start(app, move |cx| shell::launch(store, instance, cx));
 }
 
 /// Runs the app on `app`'s platform (a phone's comes from its activity or
-/// app delegate). On iOS this returns once the window is set up to open; the
-/// host app's delegate then opens it (`gpui_ios_did_finish_launching`).
-pub fn run_on(app: Application, store: Arc<Store>) {
+/// app delegate) with `backend`. On iOS this returns once the window is set
+/// up to open; the host app's delegate then opens it
+/// (`gpui_ios_did_finish_launching`).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn run_on(app: Application, backend: Arc<Backend>) {
+    start(app, move |cx| {
+        open_main_window(backend, cx).expect("Could not open the mail window");
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
+}
+
+/// Sets up the app, then runs `open` to open its window.
+fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
     let app = app.with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::sync::oauth::opened);
     super::desktop::register();
@@ -9706,64 +9809,7 @@ pub fn run_on(app: Application, store: Arc<Store>) {
         cx.bind_keys(bindings);
         let bindings = app_bindings(cx);
         cx.bind_keys(bindings);
-        // A desktop previewing the phone presentation opens phone-sized.
-        let (width, height) = if mobile::desktop_preview() {
-            (390., 844.)
-        } else {
-            (1280., 820.)
-        };
-        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        cx.open_window(
-            WindowOptions {
-                // A phone's window is the whole screen.
-                window_bounds: (!cfg!(any(target_os = "android", target_os = "ios")))
-                    .then_some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(360.), px(320.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Picacho".into()),
-                    // macOS draws the window buttons over the app's own bar.
-                    appears_transparent: cfg!(target_os = "macos"),
-                    traffic_light_position: Some(point(px(13.), px(12.))),
-                }),
-                // Draw the title bar ourselves on Linux so the topbar is the
-                // window's title bar (GNOME never offers server decorations).
-                window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
-                    .then_some(WindowDecorations::Client),
-                app_id: Some(super::desktop::APP_ID.into()),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view = cx.new(|cx| MailApp::new(store, window, cx));
-                { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
-                let close_view = view.downgrade();
-                window.on_window_should_close(cx, move |_, cx| {
-                    close_view
-                        .update(cx, |this, cx| {
-                            if this.sending {
-                                this.notice(
-                                    "Wait for the current message to finish sending.",
-                                    true,
-                                    cx,
-                                );
-                                false
-                            } else {
-                                this.persist_draft(cx);
-                                true
-                            }
-                        })
-                        .unwrap_or(true)
-                });
-                cx.new(|cx| Root::new(view, window, cx))
-            },
-        )
-        .expect("Could not open the mail window");
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        cx.activate(true);
+        open(cx);
     };
     // UIKit owns iOS's run loop, so `run` returns at once there; keep the
     // app alive for as long as the process runs.
@@ -9786,6 +9832,71 @@ pub(crate) fn version_label() -> String {
 pub(crate) const REPO_URL: &str = "https://github.com/pinaltech/Picacho";
 /// Picacho's website.
 pub(crate) const WEBSITE_URL: &str = "https://pinal.tech/apps/picacho";
+
+/// Opens the main window with a new mail view on `backend`.
+fn open_main_window(
+    backend: Arc<Backend>,
+    cx: &mut App,
+) -> anyhow::Result<(AnyWindowHandle, WeakEntity<MailApp>)> {
+    // A desktop previewing the phone presentation opens phone-sized.
+    let (width, height) = if mobile::desktop_preview() {
+        (390., 844.)
+    } else {
+        (1280., 820.)
+    };
+    let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+    let created: Rc<std::cell::RefCell<Option<WeakEntity<MailApp>>>> = Rc::default();
+    let view_slot = created.clone();
+    let window = cx.open_window(
+        WindowOptions {
+            // A phone's window is the whole screen.
+            window_bounds: (!cfg!(any(target_os = "android", target_os = "ios")))
+                .then_some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(360.), px(320.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Picacho".into()),
+                // macOS draws the window buttons over the app's own bar.
+                appears_transparent: cfg!(target_os = "macos"),
+                traffic_light_position: Some(point(px(13.), px(12.))),
+            }),
+            // Draw the title bar ourselves on Linux so the topbar is the
+            // window's title bar (GNOME never offers server decorations).
+            window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
+                .then_some(WindowDecorations::Client),
+            app_id: Some(super::desktop::APP_ID.into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            let view = cx.new(|cx| MailApp::with_backend(backend, window, cx));
+            *view_slot.borrow_mut() = Some(view.downgrade());
+            { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
+            let close_view = view.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| {
+                        if this.sending {
+                            this.notice(
+                                "Wait for the current message to finish sending.",
+                                true,
+                                cx,
+                            );
+                            false
+                        } else {
+                            this.persist_draft(cx);
+                            true
+                        }
+                    })
+                    .unwrap_or(true)
+            });
+            cx.new(|cx| Root::new(view, window, cx))
+        },
+    )?;
+    let view = created
+        .borrow_mut()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("the mail window opened without its view"))?;
+    Ok((window.into(), view))
+}
 
 /// The menu bar. On macOS the first menu is the application menu.
 fn menus() -> Vec<Menu> {
@@ -11019,6 +11130,30 @@ mod tests {
                 .top()
         };
         assert!(top(cx, &second) < top(cx, &first));
+    }
+
+    #[gpui::test]
+    fn background_settings_are_saved_and_shown_in_general(cx: &mut TestAppContext) {
+        use crate::manage::background;
+        let (view, cx, store) = two_accounts(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.background, "runs in the background by default");
+            assert!(!this.tray_icon, "no tray icon while open by default");
+        });
+        assert!(background::enabled(&store) && !background::tray_while_open(&store));
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::General), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("background").is_some());
+        assert!(cx.debug_bounds("tray-icon").is_some());
+        act(&view, Action::SetBackground(false), cx);
+        act(&view, Action::SetTrayIcon(true), cx);
+        view.read_with(cx, |this, _| assert!(!this.background && this.tray_icon));
+        store.flush();
+        // Saved: the shell reads them when the window closes, and the next
+        // window starts from them.
+        assert!(!background::enabled(&store) && background::tray_while_open(&store));
     }
 
     #[gpui::test]

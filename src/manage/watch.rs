@@ -356,6 +356,29 @@ impl Backend {
             w.stop();
         }
     }
+    /// Ends every account's watches. Whoever watches next (the window or
+    /// the background monitor, see `background.rs`) starts its own, with its
+    /// own callback: a watch outliving its owner would keep its connection
+    /// and thread, and report to nobody.
+    pub fn stop_all_watching(&self) {
+        let inboxes: Vec<Watcher> = self
+            .watchers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, w)| w)
+            .collect();
+        let folders: Vec<Watcher> = self
+            .folder_watchers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, w)| w)
+            .collect();
+        for w in inboxes.iter().chain(&folders) {
+            w.stop();
+        }
+    }
     /// Signs out of the account's connections (pooled and watching), so the
     /// next ones use changed sign-in settings.
     pub fn reconnect_later(&self, id: &str) {
