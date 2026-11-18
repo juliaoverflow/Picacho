@@ -546,6 +546,8 @@ enum Page {
     Forwarding,
     LocalAi,
     Account(String),
+    /// About Picacho: a page of Settings on a phone, a dialog elsewhere.
+    About,
 }
 /// What a folder picker moves into the chosen folder.
 #[derive(Clone, Debug, PartialEq)]
@@ -6037,10 +6039,10 @@ impl MailApp {
                 cx,
             )))
             .child(small(self.button(
-                "help",
-                "@Keyboard shortcuts",
+                "about",
+                "@About Picacho",
                 "info",
-                Action::Help,
+                Action::About,
                 false,
                 cx,
             )))
@@ -7750,37 +7752,96 @@ impl MailApp {
         }
         content.into_any_element()
     }
-    /// A row of mutually exclusive choices.
-    fn about_modal(&self) -> AnyElement {
+    /// Picacho's mark, name and tagline, as About shows them.
+    pub(crate) fn about_heading(&self) -> Div {
         let c = self.colors();
         div()
             .flex()
             .flex_col()
             .items_center()
-            .gap_2()
-            .py_4()
-            .child(img("brand/picacho.svg").w(px(128.)).h(px(108.)))
+            .child(img("brand/picacho.svg").w(px(112.)).h(px(94.)))
             .child(
                 div()
-                    .mt_3()
-                    .text_size(px(22.))
+                    .mt_4()
+                    .text_size(px(24.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Picacho"),
             )
             .child(
                 div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-            )
-            .child(
-                div()
-                    .mt_2()
+                    .mt_1()
                     .text_size(px(13.))
                     .text_color(rgb(c.muted))
                     .text_center()
-                    .child("Fast, native email for every inbox you have. Made by Pinal."),
+                    .child("Fast, native email for every inbox you have."),
             )
+    }
+    /// The copyright, licence and version line at the foot of About.
+    pub(crate) fn about_footer(&self) -> Div {
+        let c = self.colors();
+        div()
+            .text_size(px(11.))
+            .text_color(rgb(c.muted))
+            .text_center()
+            .child(format!("© Pinal Technologies 2026 · MIT Licensed · {}", version_label()))
+    }
+    /// A hyperlink with an icon, opening `url` in the browser.
+    fn about_link(&self, id: &str, label: &str, icon: &str, url: &'static str, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors();
+        let selector = id.to_owned();
+        div()
+            .id(SharedString::from(id.to_owned()))
+            .debug_selector(move || selector)
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_size(px(13.))
+            .text_color(rgb(c.accent))
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.75))
+            .child(icon_el(icon, 14., c.accent))
+            .child(label.to_owned())
+            .child(icon_el("external-link", 11., c.accent))
+            .on_click(cx.listener(move |this, _, w, cx| this.handle(Action::OpenLink(url), w, cx)))
+    }
+    fn about_modal(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt_2()
+            .child(self.about_heading())
+            .child(
+                div()
+                    .mt_6()
+                    .w_full()
+                    .child(
+                        self.button(
+                            "about-shortcuts",
+                            "Keyboard Shortcuts",
+                            "keyboard",
+                            Action::Help,
+                            false,
+                            cx,
+                        )
+                        .w_full()
+                        .border_1()
+                        .border_color(rgb(c.border)),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_5()
+                    .child(self.about_link("about-source", "Source Code", "github", REPO_URL, cx))
+                    .child(self.about_link("about-website", "Website", "globe", WEBSITE_URL, cx)),
+            )
+            .child(div().mt_5().mb_4().w_full().h(px(1.)).bg(rgb(c.border)))
+            .child(self.about_footer())
             .into_any_element()
     }
     fn help_modal(&self) -> AnyElement {
@@ -8444,7 +8505,7 @@ impl MailApp {
             Modal::Connect => self.setup_view(cx),
             Modal::Reconnect(id) => self.reconnect_form(id, cx),
             Modal::Settings => self.settings_modal(window, cx),
-            Modal::About => self.about_modal(),
+            Modal::About => self.about_modal(cx),
             Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
             Modal::DeleteFolder(id, name) => self.delete_folder_modal(id, name),
@@ -9324,6 +9385,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "snooze",
         "answered",
         "forwarded",
+        "keyboard",
     ]
     .contains(&name)
     {
@@ -9707,6 +9769,20 @@ pub fn run_on(app: Application, store: Arc<Store>) {
     #[cfg(not(target_os = "ios"))]
     app.run(launch);
 }
+
+/// The version About shows: "Beta Build" for the rolling beta (built with
+/// `PICACHO_CHANNEL=beta`), otherwise "Version X.Y.Z".
+pub(crate) fn version_label() -> String {
+    match option_env!("PICACHO_CHANNEL") {
+        Some("beta") => "Beta Build".into(),
+        _ => format!("Version {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// Picacho's open source repository.
+pub(crate) const REPO_URL: &str = "https://github.com/pinaltech/Picacho";
+/// Picacho's website.
+pub(crate) const WEBSITE_URL: &str = "https://pinal.tech/apps/picacho";
 
 /// The menu bar. On macOS the first menu is the application menu.
 fn menus() -> Vec<Menu> {

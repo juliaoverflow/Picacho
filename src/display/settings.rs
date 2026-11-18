@@ -504,8 +504,8 @@ impl MailApp {
                 self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
                     .debug_selector(|| "all-mail".into()),
             ))
-            .child(self.section("Picacho"))
-            .child(
+            // A phone lists About in Settings' own list instead.
+            .when(!self.mobile.on, |d| d.child(self.section("Picacho")).child(
                 div()
                     .flex()
                     .flex_wrap()
@@ -527,7 +527,7 @@ impl MailApp {
                             .border_1()
                             .border_color(rgb(c.border)),
                     ),
-            )
+            ))
             .into_any_element()
     }
     /// Whether the open settings page lists an account's mail errors: only
@@ -1859,6 +1859,8 @@ impl MailApp {
             Page::Composing => self.composing_page(cx),
             Page::Forwarding => self.forwarding_page(cx),
             Page::LocalAi => self.local_ai_page(cx),
+            Page::About if self.mobile.on => self.mobile_about_page(cx),
+            Page::About => self.general_page(cx),
         }
     }
 }

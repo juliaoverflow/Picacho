@@ -1,0 +1,31 @@
+# A pull request into stable can merge only with a version of its own: a plain
+# X.Y.Z in Cargo.toml that no tag vX.Y.Z already names, with a dated
+# CHANGELOG.md section. Merging releases it and tags it vX.Y.Z (release.yml).
+# The stable branch's ruleset requires this check.
+name: Stable PR
+
+on:
+  pull_request:
+    branches: [stable]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Stable version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the version is new
+        run: |
+          crate=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          case "$crate" in
+            *-*) echo "::error::A stable release needs a plain X.Y.Z version, not $crate"; exit 1 ;;
+          esac
+          if git ls-remote --exit-code --tags origin "refs/tags/v$crate" >/dev/null; then
+            echo "::error::v$crate is already released; set a new version in Cargo.toml and CHANGELOG.md"
+            exit 1
+          fi
+          python3 scripts/release/changelog.py check "$crate"
+          echo "This merge releases and tags v$crate."

@@ -32,7 +32,8 @@ Droid-ify or Neo Store, then install Picacho from it:
 https://android.repo.pinal.tech/repo?fingerprint=a029e7fcd4c66d85aa0baea0f87db04c854c559f056a8b2032b4b26d186ee9d5
 ```
 
-Betas reach you when the client allows unstable updates. Each
+For the rolling beta, install Picacho Beta from the same repository; it sits
+beside the release. Each
 [GitHub release](https://github.com/pinaltech/Picacho/releases) also has the
 APKs (`arm64-v8a` for most phones, `x86_64` for emulators and Chromebooks).
 
@@ -174,15 +175,25 @@ The setup lists the supported services. Each one signs in the simplest way it al
 
 ## Releasing
 
-Releases for Android and Linux are built and published by
-`.github/workflows/release.yml` when a `v*` tag is pushed:
+Work happens on three branches:
 
-1. Set the version in `Cargo.toml` and move CHANGELOG.md's **Unreleased**
+- **dev**: where changes land. Pushes and pull requests run the tests only.
+- **beta**: the rolling beta. Every push builds and publishes "Picacho Beta"
+  for Android (`tech.pinal.picacho.beta`, installed beside the release), the
+  Flatpak `beta` branch, and the GitHub pre-release `beta-build`, replacing the last
+  one. Beta builds have no version number; they call themselves "Beta Build".
+- **stable**: releases. It takes changes only through pull requests, which
+  can merge once the tests pass and the version is new. Merging publishes
+  Cargo.toml's version and tags it `vX.Y.Z`.
+
+To release, on a branch for the pull request into stable:
+
+1. Set a new version in `Cargo.toml` and move CHANGELOG.md's **Unreleased**
    notes under `## [X.Y.Z] - YYYY-MM-DD`.
-2. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+2. Open the pull request into `stable`. Its "Stable version" check fails
+   while `vX.Y.Z` already exists.
 
-A tag like `v0.2.0-beta.1` is a pre-release: it goes to the Flatpak `beta`
-branch and is an unstable update in the F-Droid repository. The workflow
+`.github/workflows/release.yml` builds and publishes both channels. It
 publishes to Cloudflare R2 (buckets `android-repository` and `linux-repository`,
 served at android.repo.pinal.tech and linux.repo.pinal.tech) and needs these
 repository secrets: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,

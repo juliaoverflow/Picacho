@@ -1,0 +1,3 @@
+This is the rolling beta of Picacho, built from every change to its beta branch. It installs beside the release and may be less stable.
+
+Picacho is a fast, native email client written in Rust with GPUI. It runs without Electron or a webview, and it works with the mail you already have. Gray surfaces, a three-pane layout, rounded controls, and light and dark palettes with a choice of theme colors keep the focus on your mail.

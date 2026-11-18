@@ -23,6 +23,16 @@ val baseVersionCode: Int = run {
     val preSlot = if (pre.isEmpty()) 99 else pre.toInt().coerceIn(1, 98)
     ((major.toInt() * 100 + minor.toInt()) * 100 + patch.toInt()) * 100 + preSlot
 }
+// The rolling beta (PICACHO_CHANNEL=beta) is its own app, "Picacho Beta",
+// installed beside the release. It has no version number: its versionName is
+// "Beta Build" and its versionCode the CI run number (PICACHO_BUILD_NUMBER),
+// which only grows.
+val beta: Boolean = System.getenv("PICACHO_CHANNEL") == "beta"
+val versionBase: Int = if (beta) {
+    System.getenv("PICACHO_BUILD_NUMBER")?.toIntOrNull() ?: error("A beta build needs PICACHO_BUILD_NUMBER")
+} else {
+    baseVersionCode
+}
 val abiDigits = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86" to 3, "x86_64" to 4)
 val abis = (findProperty("picacho.abis") as String? ?: "arm64-v8a,x86_64").split(",")
 
@@ -31,11 +41,12 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "tech.pinal.picacho"
+        applicationId = if (beta) "tech.pinal.picacho.beta" else "tech.pinal.picacho"
         minSdk = 26
         targetSdk = 36
-        versionName = cargoVersion
-        versionCode = baseVersionCode * 10
+        versionName = if (beta) "Beta Build" else cargoVersion
+        versionCode = versionBase * 10
+        manifestPlaceholders["appLabel"] = if (beta) "Picacho Beta" else "Picacho"
     }
 
     // Release signing comes from the environment (CI secrets); without it
@@ -86,7 +97,7 @@ androidComponents {
         variant.outputs.forEach { output ->
             val abi = output.filters.find { it.filterType == FilterConfiguration.FilterType.ABI }?.identifier
             val digit = abiDigits[abi] ?: 0
-            output.versionCode.set(baseVersionCode * 10 + digit)
+            output.versionCode.set(versionBase * 10 + digit)
         }
     }
 }

@@ -65,6 +65,7 @@ impl MailApp {
             Page::Composing => "Composing".into(),
             Page::Forwarding => "Forwarding".into(),
             Page::LocalAi => "Local AI".into(),
+            Page::About => "About Picacho".into(),
             Page::Account(id) => self
                 .accounts
                 .iter()
@@ -163,30 +164,7 @@ impl MailApp {
             .child(self.group_label("Mailboxes"))
             .child(self.group(mailboxes))
             .child(div().h_6())
-            .child(self.group(vec![
-                self.cell(
-                    "mobile-settings-about",
-                    icon_el("info", 22., c.accent).into_any_element(),
-                    "About Picacho",
-                    None,
-                    false,
-                    false,
-                    act(Action::About),
-                    cx,
-                )
-                .into_any_element(),
-                self.cell(
-                    "mobile-settings-help",
-                    icon_el("book-open", 22., c.accent).into_any_element(),
-                    "Keyboard Shortcuts",
-                    None,
-                    false,
-                    false,
-                    act(Action::Help),
-                    cx,
-                )
-                .into_any_element(),
-            ]));
+            .child(self.group(vec![row("mobile-settings-about", "info", Page::About)]));
         div()
             .size_full()
             .flex()
@@ -403,4 +381,49 @@ impl MailApp {
 /// Forwarding's reverse aliases subpage is open.
 fn sub_open(this: &MailApp) -> bool {
     matches!(this.page, Page::Forwarding)
+}
+
+impl MailApp {
+    /// About Picacho, full screen within Settings: its mark, links to the
+    /// source and website, and the licence. No keyboard shortcuts on a phone.
+    pub(crate) fn mobile_about_page(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let link = |id: &'static str, icon: &'static str, label: &'static str, url: &'static str| {
+            self.cell(
+                id,
+                icon_el(icon, 22., c.accent).into_any_element(),
+                label,
+                None,
+                false,
+                false,
+                act(Action::OpenLink(url)),
+                cx,
+            )
+            .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt_6()
+            .child(self.about_heading())
+            .child(
+                div().mt_8().w_full().child(self.group(vec![
+                    link(
+                        "mobile-about-source",
+                        "github",
+                        "Source Code",
+                        super::super::REPO_URL,
+                    ),
+                    link(
+                        "mobile-about-website",
+                        "globe",
+                        "Website",
+                        super::super::WEBSITE_URL,
+                    ),
+                ])),
+            )
+            .child(div().mt_6().px_4().child(self.about_footer()))
+            .into_any_element()
+    }
 }
