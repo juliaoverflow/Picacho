@@ -3,10 +3,10 @@
 //! hovering links or scrolling never stalls the window.
 use super::document::{ContextTarget, EmailDocument, Tone};
 use crate::manage::model::InlineParts;
-use std::sync::Arc;
 use blitz_dom::Document;
 use blitz_traits::events::{BlitzKeyEvent, UiEvent};
 use futures::channel::mpsc::UnboundedSender;
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     sync::{atomic::Ordering, mpsc},
@@ -111,6 +111,10 @@ pub enum Output {
         pixels: Vec<u8>,
     },
     Context(ContextTarget),
+    /// The pointer is over this link now (or over none).
+    Hover(Option<String>),
+    /// A link was clicked: this address, for the view's owner to open.
+    Open(String),
     /// The renderer failed on this email; nothing more will come.
     Failed,
     Thumbnail {
@@ -173,6 +177,7 @@ fn run(
     let mut revision = 0u64;
     let mut selection = None;
     let mut word = None;
+    let mut hovered: Option<String> = None;
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(40)) {
             Ok(command) => Some(command),
@@ -187,6 +192,9 @@ fn run(
         let mut paints = BTreeMap::new();
         let mut contexts = Vec::new();
         let mut thumbnail = None;
+        let mut pointed = false;
+        // The pointer left the email: over no link, whatever blitz keeps.
+        let mut left = false;
         for command in commands {
             match command {
                 Command::Layout(w) => {
@@ -194,6 +202,8 @@ fn run(
                     width = w;
                 }
                 Command::Pointer(event) => {
+                    pointed = true;
+                    left = matches!(event, UiEvent::PointerLeave(_));
                     let interactive = !matches!(event, UiEvent::PointerMove(_))
                         || matches!(&event, UiEvent::PointerMove(e) if e.buttons != blitz_traits::events::MouseEventButtons::None);
                     let hover = doc.doc.get_hover_node_id();
@@ -263,6 +273,20 @@ fn run(
                 cursor: doc.cursor(),
                 selection: selection.clone(),
             }) {
+                return;
+            }
+        }
+        if pointed {
+            let now = if left { None } else { doc.hovered_link() };
+            if now != hovered {
+                hovered = now.clone();
+                if !send(Output::Hover(now)) {
+                    return;
+                }
+            }
+        }
+        for url in doc.take_clicked() {
+            if !send(Output::Open(url)) {
                 return;
             }
         }

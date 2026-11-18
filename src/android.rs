@@ -224,6 +224,21 @@ pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str) 
     });
 }
 
+/// Opens a web or email link in the app that handles it (`Browser.open`):
+/// GPUI's own `open_url` does nothing on Android. False when nothing could.
+pub fn open_url(url: &str) -> bool {
+    call_java("Browser.open", |env, java| {
+        let url = env.new_string(url)?;
+        env.call_static_method(
+            &java.browser,
+            jni_str!("open"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Z"),
+            &[JValue::Object(java.context.as_obj()), JValue::Object(&url)],
+        )?
+        .z()
+    }) == Some(true)
+}
+
 /// The text last copied between Android's clipboard and GPUI's (which, on
 /// Android, is only the app's own). Only a change on one side is copied to the
 /// other, so neither overwrites newer text with what the other had before.
@@ -526,6 +541,8 @@ struct Java {
     keys: Global<JClass<'static>>,
     /// Passkeys, through Android's Credential Manager.
     passkeys: Global<JClass<'static>>,
+    /// Opens links in the browser (or mail app).
+    browser: Global<JClass<'static>>,
     /// The app's package name (`tech.pinal.picacho`, or the beta's).
     package: String,
 }
@@ -615,6 +632,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
         let verify = env.find_class(jni_str!("tech/pinal/picacho/VerifyActivity"))?;
         let keys = env.find_class(jni_str!("tech/pinal/picacho/SecurityKeys"))?;
         let passkeys = env.find_class(jni_str!("tech/pinal/picacho/Passkeys"))?;
+        let browser = env.find_class(jni_str!("tech/pinal/picacho/Browser"))?;
         let package = env
             .call_method(
                 &context,
@@ -635,6 +653,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
             verify: env.new_global_ref(&verify)?,
             keys: env.new_global_ref(&keys)?,
             passkeys: env.new_global_ref(&passkeys)?,
+            browser: env.new_global_ref(&browser)?,
             package,
         };
         let _ = JAVA.set(java);

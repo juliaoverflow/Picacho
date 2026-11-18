@@ -13,6 +13,12 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Phones and tablets: tapping a link in an email first shows where it goes,
+  warns of known tricks (look-alike letters, bare IP addresses, unencrypted
+  pages), and offers Go Back, Open Anyway or Always Trust the site. Turn it
+  off, or remove trusted sites, in Settings → Reading.
+- Desktop: hovering a link in an email shows its address at the bottom left
+  of the mail view.
 - Phones and tablets: Edit on the Mailboxes screen sorts accounts by dragging
   their handles, in the same order as the desktop's sidebar.
 - Pasting copied rich text into a message pastes it as plain text, with a

@@ -17,6 +17,9 @@ pub(super) struct MessageWindow {
     quotes_open: bool,
     scroll: ScrollHandle,
     focus: FocusHandle,
+    /// The link under the pointer, shown at the bottom left.
+    hovered: Option<String>,
+    _links: Subscription,
 }
 
 impl MessageWindow {
@@ -32,11 +35,29 @@ impl MessageWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let loading = mail.body.is_none() && mail.html.is_none();
+        let html = cx.new(HtmlView::new);
+        // A desktop window: links open at once, as the reader's do there.
+        let links = cx.subscribe(&html, |this, _, link: &HtmlLink, cx| match link {
+            HtmlLink::Hovered(url) => {
+                this.hovered = url.clone();
+                cx.notify();
+            }
+            HtmlLink::Opened(url) => {
+                let url = if this.clean_links(cx) {
+                    crate::manage::tracking::clean_url(url).unwrap_or_else(|| url.clone())
+                } else {
+                    url.clone()
+                };
+                if let Some(url) = crate::display::html::openable_url(&url) {
+                    cx.open_url(url.as_str());
+                }
+            }
+        });
         Self {
             mail,
             app,
             main,
-            html: cx.new(HtmlView::new),
+            html,
             colors,
             options,
             app_dark,
@@ -45,6 +66,8 @@ impl MessageWindow {
             quotes_open: false,
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
+            hovered: None,
+            _links: links,
         }
     }
 
@@ -355,6 +378,11 @@ impl Render for MessageWindow {
                     .child(body)
                     .children(attachments),
                 &self.scroll,
+            )
+            .children(
+                self.hovered
+                    .as_deref()
+                    .map(|url| super::links::link_status_pill(url, c)),
             ))
     }
 }

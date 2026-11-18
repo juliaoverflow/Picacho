@@ -450,6 +450,7 @@ impl MailApp {
             .when(self.menu.is_some(), |d| {
                 d.child(self.action_sheet(insets, window, cx))
             })
+            .children(self.link_sheet(insets, window, cx))
             .children(self.mobile_toast(insets, screen, cx))
     }
 
@@ -476,6 +477,11 @@ impl MailApp {
             if shown {
                 return true;
             }
+        }
+        // The warning before a link: Back is Go Back.
+        if self.links.confirm.take().is_some() {
+            cx.notify();
+            return true;
         }
         // An open full-screen composer closes, keeping its draft.
         if let Some(composer) = self.mobile_composer(cx) {
@@ -558,6 +564,7 @@ impl MailApp {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(super) fn mobile_has_back(&self, w: &Window, cx: &App) -> bool {
         self.keyboard_shown(w)
+            || self.links.confirm.is_some()
             || self.mobile_composer(cx).is_some()
             || self.menu.is_some()
             || self.presets_for.is_some()
@@ -640,6 +647,7 @@ impl MailApp {
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
             && self.mobile.back_release.is_none()
+            && self.links.confirm.is_none()
             && !self.selecting
             && !self.search_open
     }

@@ -602,6 +602,17 @@ impl MailApp {
                                         )),
                                         body)
                                     .selectable(true)
+                                    // Its links open as the email's own do
+                                    // (warned of on a phone).
+                                    .on_link_click({
+                                        let app = cx.weak_entity();
+                                        move |url, _, _, cx| {
+                                            let url = url.to_string();
+                                            let _ = app.update(cx, |this, cx| {
+                                                this.open_email_link(url, cx)
+                                            });
+                                        }
+                                    })
                                     // TextView fills its parent's height by default; in
                                     // the scrolling reader that is the visible area, so
                                     // long mail was cut off.
@@ -735,6 +746,8 @@ impl MailApp {
             &self.reader_scroll,
         )
         .w_full()
+        // The hovered link's address, over the bottom left (desktop).
+        .children(self.link_status())
         .into_any_element()
     }
 }

@@ -728,7 +728,60 @@ impl MailApp {
             .child(self.setting(
                 "Remove tracking from links", "Take campaign and click identifiers (such as utm_source and fbclid) out of links, and open the real address behind known redirects (Google, Outlook Safe Links, Facebook). Applies to every email.", clean,
             ))
+            // Phones warn before opening a link; desktops show its address
+            // on hover instead.
+            .when(self.mobile.on, |d| d.child(self.link_warning_settings(cx)))
             .into_any_element()
+    }
+    /// Warn before opening links, and the sites trusted not to (phones).
+    fn link_warning_settings(&self, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let warn = self
+            .switch(
+                "link-warnings".into(),
+                self.links.warn,
+                Action::SetLinkWarnings(!self.links.warn),
+                cx,
+            )
+            .debug_selector(|| "link-warnings".into());
+        let trusted = &self.links.trusted;
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(self.setting(
+                "Warn before opening links",
+                "Show where a link in an email goes, and ask before opening it. Links are how fake sign-in pages steal passwords.",
+                warn,
+            ))
+            .when(self.links.warn, |d| {
+                d.child(self.setting(
+                    "Trusted sites",
+                    if trusted.is_empty() {
+                        "Links to sites you trust open without asking. Trust a site from the warning."
+                    } else {
+                        "Links to these sites, and the sites under them, open without asking."
+                    },
+                    div().flex().flex_col().gap_2().children(trusted.iter().enumerate().map(
+                        |(i, site)| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(icon_el("shield", 16., c.muted))
+                                .child(div().flex_1().min_w_0().truncate().child(site.clone()))
+                                .child(self.button(
+                                    format!("untrust-site-{i}"),
+                                    "Remove",
+                                    "",
+                                    Action::UntrustSite(site.clone()),
+                                    false,
+                                    cx,
+                                ))
+                        },
+                    )),
+                ))
+            })
     }
     pub(super) fn composing_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();

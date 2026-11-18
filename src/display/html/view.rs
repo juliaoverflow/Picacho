@@ -29,6 +29,14 @@ pub struct HtmlContextMenu {
     pub selection: Option<String>,
 }
 
+/// A link in the email: hovered (or no longer, `None`), or clicked. The
+/// view opens nothing itself; its owner does, or asks first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HtmlLink {
+    Hovered(Option<String>),
+    Opened(String),
+}
+
 /// The whole email, scaled down, for the collapsed reader.
 struct Thumbnail {
     revision: u64,
@@ -75,8 +83,11 @@ pub struct HtmlView {
     context_at: Option<gpui::Point<Pixels>>,
     /// Where the current long press began, in document coordinates.
     pressed_at: Option<(f32, f32)>,
+    /// The link under the pointer.
+    hovered: Option<String>,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
+impl EventEmitter<HtmlLink> for HtmlView {}
 
 impl HtmlView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -128,6 +139,14 @@ impl HtmlView {
             retired: Vec::new(),
             context_at: None,
             pressed_at: None,
+            hovered: None,
+        }
+    }
+    /// Says the pointer is over `link` now, if that changed.
+    fn hover(&mut self, link: Option<String>, cx: &mut Context<Self>) {
+        if self.hovered != link {
+            self.hovered = link.clone();
+            cx.emit(HtmlLink::Hovered(link));
         }
     }
     #[cfg(test)]
@@ -159,6 +178,7 @@ impl HtmlView {
         self.laid_out = false;
         self.selection = None;
         self.cursor = CursorStyle::Arrow;
+        self.hover(None, cx);
         if had_document {
             cx.notify();
         }
@@ -295,6 +315,8 @@ impl HtmlView {
                 }
                 cx.notify();
             }
+            Output::Hover(link) => self.hover(link, cx),
+            Output::Open(url) => cx.emit(HtmlLink::Opened(url)),
             Output::Failed => {
                 self.failed = true;
                 self.laid_out = true;
@@ -584,9 +606,10 @@ impl Render for HtmlView {
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
                 this.pointer(e.position, 0, e.pressed_button == Some(MouseButton::Left))
             }))
-            .on_hover(cx.listener(|this, hovered, w, _| {
+            .on_hover(cx.listener(|this, hovered, w, cx| {
                 if !hovered {
                     this.pointer(w.mouse_position(), 3, false);
+                    this.hover(None, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {

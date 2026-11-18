@@ -175,6 +175,223 @@ impl MailApp {
             .into_any_element()
     }
 
+    /// The warning before a link from an email opens (see `links`): where
+    /// it goes, in large letters, what about it is a known trick, and Go
+    /// Back as the easy choice. Opening it, trusting its site, or copying
+    /// it are there too.
+    pub(super) fn link_sheet(
+        &self,
+        insets: Insets,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        use super::super::links::{LinkChoice, link_dangers};
+        let confirm = self.links.confirm.as_ref()?;
+        let c = self.colors();
+        let wide = Self::mobile_split(window);
+        let height = f32::from(window.viewport_size().height);
+        let parsed = url::Url::parse(&confirm.url).ok();
+        let dangers = parsed.as_ref().map(link_dangers).unwrap_or_default();
+        let choose = |choice: LinkChoice| {
+            cx.listener(move |this, _: &ClickEvent, w, cx| {
+                this.handle(Action::LinkChoice(choice), w, cx)
+            })
+        };
+        let row_button = |id: &'static str, label: String, color: u32, bold: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex_shrink_0()
+                .min_h(px(TOUCH + 4.))
+                .px_4()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(14.))
+                .cursor_pointer()
+                .text_size(px(17.))
+                .text_color(rgb(color))
+                .when(bold, |d| d.font_weight(FontWeight::SEMIBOLD))
+                .active(move |s| s.opacity(0.7))
+                .child(div().truncate().child(label))
+        };
+        // The site, with the part that names it (its last two labels)
+        // stressed: what comes before is anyone's to choose.
+        let (lead, named) = match confirm.site.rmatch_indices('.').nth(1) {
+            Some((i, _)) => confirm.site.split_at(i + 1),
+            None => ("", confirm.site.as_str()),
+        };
+        let site = div()
+            .flex()
+            .flex_wrap()
+            .justify_center()
+            .text_size(px(22.))
+            .line_height(relative(1.25))
+            .child(div().text_color(rgb(c.muted)).child(lead.to_owned()))
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(c.text))
+                    .child(named.to_owned()),
+            );
+        let destination = div()
+            .id("link-sheet-destination")
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .p_4()
+            .rounded(px(14.))
+            .border_2()
+            .border_color(rgb(c.danger))
+            .bg(rgb(c.bg))
+            .child(site)
+            .child(
+                div()
+                    .w_full()
+                    .max_h(px(66.))
+                    .overflow_hidden()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .text_center()
+                    // The system font: phones resolve no monospace family
+                    // by name, and GPUI panics on a font it can't find.
+                    .child(confirm.url.clone()),
+            );
+        let card = div()
+            .id("link-sheet")
+            .debug_selector(|| "link-sheet".into())
+            .w_full()
+            .max_h(px((height - insets.top - insets.below()) * 0.85))
+            .overflow_y_scroll()
+            .restrict_scroll_to_axis()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_4()
+            .px_5()
+            .pt_6()
+            .pb_4()
+            .rounded(px(18.))
+            .bg(rgb(c.raised))
+            .border_t_4()
+            .border_color(rgb(c.danger))
+            .child(
+                div()
+                    .size(px(64.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba((c.danger << 8) | 0x26))
+                    .child(icon_el("warning", 34., c.danger)),
+            )
+            .child(
+                div()
+                    .text_size(px(22.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(c.danger))
+                    .text_center()
+                    .child("Be careful with this link"),
+            )
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .text_color(rgb(c.text))
+                    .text_center()
+                    .line_height(relative(1.4))
+                    .child(
+                        "Links in email are the most common way to steal passwords and money. \
+                         This one takes you to:",
+                    ),
+            )
+            .child(destination)
+            .when(!dangers.is_empty(), |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(dangers.into_iter().map(|danger| {
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(c.danger))
+                                .child(div().pt(px(2.)).child(icon_el("warning", 15., c.danger)))
+                                .child(div().flex_1().min_w_0().child(danger))
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .w_full()
+                    .text_size(px(13.))
+                    .text_color(rgb(c.muted))
+                    .line_height(relative(1.4))
+                    .text_center()
+                    .child(
+                        "Open it only if you expected this email and know the site. \
+                         Never sign in or pay on a page a link took you to: go to the site yourself.",
+                    ),
+            )
+            .child(
+                row_button("link-sheet-back", "Go Back".into(), c.on_accent, true)
+                    .w_full()
+                    .bg(rgb(c.accent))
+                    .on_click(choose(LinkChoice::Cancel)),
+            )
+            .child(
+                row_button("link-sheet-open", "Open Anyway".into(), c.danger, true)
+                    .w_full()
+                    .border_1()
+                    .border_color(rgb(c.danger))
+                    .on_click(choose(LinkChoice::Open)),
+            )
+            .child(
+                row_button(
+                    "link-sheet-trust",
+                    format!("Always Trust {}", confirm.site),
+                    c.text,
+                    false,
+                )
+                .w_full()
+                .on_click(choose(LinkChoice::TrustAndOpen)),
+            )
+            .child(
+                row_button("link-sheet-copy", "Copy Link".into(), c.muted, false)
+                    .w_full()
+                    .on_click(choose(LinkChoice::Copy)),
+            );
+        let sheet = div()
+            .w_full()
+            .when(wide, |d| d.max_w(px(SHEET_WIDTH)))
+            .px_2()
+            .pb(px(insets.below() + 8.))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(card);
+        Some(
+            self.sheet_backdrop("link-sheet-backdrop")
+                // Darker than other sheets', and reddened.
+                .bg(rgba(0x2a050acc))
+                .on_click(choose(LinkChoice::Cancel))
+                .child(sheet.with_animation(
+                    ("link-sheet", confirm.key),
+                    Animation::new(Duration::from_millis(260))
+                        .with_easing(|t| 1. - (1. - t).powi(3)),
+                    |d, t| d.relative().top(px((1. - t) * 200.)).opacity(t),
+                ))
+                .into_any_element(),
+        )
+    }
+
     /// Dims the screen behind a sheet, which sits at its bottom.
     fn sheet_backdrop(&self, id: &'static str) -> Stateful<Div> {
         div()

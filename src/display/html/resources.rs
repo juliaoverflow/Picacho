@@ -139,13 +139,22 @@ impl NetProvider for Resources {
 }
 
 /// Only a deliberate link activation can leave the reader. Forms cannot submit.
-pub struct Links;
+/// Links clicked in the email. Nothing is opened here: the addresses are
+/// kept for the view (`Output::Open`), whose owner decides (it may ask
+/// first, or open it in the system's browser).
+#[derive(Default)]
+pub struct Links {
+    pub clicked: Arc<std::sync::Mutex<Vec<String>>>,
+}
 impl NavigationProvider for Links {
     fn navigate_to(&self, options: NavigationOptions) {
         if options.method == blitz_traits::net::Method::GET
             && (remote_url(&options.url) || options.url.scheme() == "mailto")
         {
-            let _ = open::that_detached(options.url.as_str());
+            self.clicked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(options.url.into());
         }
     }
 }

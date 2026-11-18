@@ -105,6 +105,8 @@ pub(super) struct EmailDocument {
     tone: Tone,
     cancelled: Arc<AtomicBool>,
     pub(super) changed: Arc<AtomicBool>,
+    /// Links clicked since last taken (see `take_clicked`).
+    clicked: Arc<Mutex<Vec<String>>>,
 }
 impl Drop for EmailDocument {
     fn drop(&mut self) {
@@ -131,6 +133,8 @@ impl EmailDocument {
         let changed = Arc::new(AtomicBool::new(false));
         let resources =
             resources::Resources::new(blocked, inline, changed.clone(), cancelled.clone());
+        let links = resources::Links::default();
+        let clicked = links.clicked.clone();
         let doc = HtmlDocument::from_html(
             &as_html(html),
             DocumentConfig {
@@ -138,7 +142,7 @@ impl EmailDocument {
                 base_url: Some("about:blank".into()),
                 font_ctx: Some(fonts()),
                 net_provider: Some(Arc::new(resources)),
-                navigation_provider: Some(Arc::new(resources::Links)),
+                navigation_provider: Some(Arc::new(links)),
                 ua_stylesheets: [
                     Some(UserAgentStylesheet::default_sheet()),
                     Some(UserAgentStylesheet::parse(if tone == Tone::NativeDark {
@@ -160,7 +164,31 @@ impl EmailDocument {
             tone,
             cancelled,
             changed,
+            clicked,
         }
+    }
+    /// The links clicked since the last call, oldest first.
+    pub(super) fn take_clicked(&self) -> Vec<String> {
+        std::mem::take(&mut *self.clicked.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    /// The openable link under the pointer, if any (see `openable_url`).
+    pub(super) fn hovered_link(&self) -> Option<String> {
+        let mut next = self
+            .doc
+            .get_hover_node_id()
+            .and_then(|id| self.doc.get_node(id));
+        while let Some(node) = next {
+            if let Some(element) = node.element_data()
+                && element.is_link()
+            {
+                return element
+                    .attr(blitz_dom::local_name!("href"))
+                    .and_then(super::openable_url)
+                    .map(String::from);
+            }
+            next = node.parent.and_then(|id| self.doc.get_node(id));
+        }
+        None
     }
     pub(super) fn layout(&mut self, width: u32) -> f32 {
         self.doc.set_viewport(Viewport::new(

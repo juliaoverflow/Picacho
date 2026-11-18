@@ -1,5 +1,7 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[path = "links.rs"]
+mod links;
 #[path = "proton_login.rs"]
 mod proton_login;
 use crate::manage::backend::{KeyMethod, KeyPrompt};
@@ -75,7 +77,7 @@ mod window;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[path = "shell.rs"]
 mod shell;
-use super::html::{HtmlContextMenu, HtmlView};
+use super::html::{HtmlContextMenu, HtmlLink, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::subscriptions::Subscription as MailSubscription;
@@ -741,6 +743,15 @@ enum Action {
     SaveOriginal,
     CopyText(String),
     OpenUrl(String),
+    /// A link (or image) address from an email: opened as `open_email_link`
+    /// decides.
+    OpenEmailLink(String),
+    /// The answer to the warning before opening a link (phones).
+    LinkChoice(links::LinkChoice),
+    /// Warn before opening links from email (phones).
+    SetLinkWarnings(bool),
+    /// Stop trusting this site's links.
+    UntrustSite(String),
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -1175,6 +1186,9 @@ pub struct MailApp {
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
+    /// Opening links from email: the phone's warning, trusted sites, the
+    /// desktop's hovered address (see `links`).
+    links: links::LinkSafety,
     /// Picacho keeps checking mail once its windows close (Settings →
     /// General; on Android, its mail service), and shows its tray icon while
     /// a window is open too.
@@ -1326,6 +1340,7 @@ impl MailApp {
         let alias_routes = fwd::routes(&store);
         let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        let link_safety = links::LinkSafety::load(&store);
         let local_ai = crate::manage::local_ai::enabled(&store);
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         let understand_dates = crate::manage::local_ai::when_enabled(&store);
@@ -1677,6 +1692,17 @@ impl MailApp {
                 this.html_menu(menu, cx)
             }),
         );
+        subscriptions.push(
+            cx.subscribe(&html_view, |this, _, link: &HtmlLink, cx| match link {
+                HtmlLink::Hovered(url) => {
+                    if this.links.hovered != *url {
+                        this.links.hovered = url.clone();
+                        cx.notify();
+                    }
+                }
+                HtmlLink::Opened(url) => this.open_email_link(url.clone(), cx),
+            }),
+        );
         // Android's Back, from its back callback (see `platform_back`).
         #[cfg(target_os = "android")]
         {
@@ -1930,6 +1956,7 @@ impl MailApp {
             reverse_contacts,
             contacts_fetched: HashSet::new(),
             clean_links,
+            links: link_safety,
             background,
             tray_icon,
             retired: false,
@@ -4879,7 +4906,7 @@ impl MailApp {
                     "Open Link in Browser"
                 },
                 "external-link",
-                Action::OpenUrl(link.clone()),
+                Action::OpenEmailLink(link.clone()),
             ));
             entries.push(entry(
                 if mailto {
@@ -4902,7 +4929,7 @@ impl MailApp {
             entries.push(entry(
                 "Open Image in Browser",
                 "external-link",
-                Action::OpenUrl(image.clone()),
+                Action::OpenEmailLink(image.clone()),
             ));
             entries.push(entry(
                 "Copy Image Address",
@@ -5647,6 +5674,10 @@ impl MailApp {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.menu = None;
             }
+            Action::OpenEmailLink(url) => self.open_email_link(url, cx),
+            Action::LinkChoice(choice) => self.choose_link(choice, cx),
+            Action::SetLinkWarnings(on) => self.set_link_warnings(on, cx),
+            Action::UntrustSite(site) => self.untrust_site(&site, cx),
             Action::OpenUrl(url) => {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
