@@ -504,6 +504,19 @@ impl MailApp {
                 self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
                     .debug_selector(|| "all-mail".into()),
             ))
+            .when(self.mobile.touch, |d| {
+                d.child(self.section("Layout")).child(self.toggle_row(
+                    "Desktop layout",
+                    "Show Picacho as on a computer, with the mailboxes, messages and the open message side by side. Best on a tablet.",
+                    self.switch(
+                        "desktop-layout".into(),
+                        !self.mobile.on,
+                        Action::SetDesktopLayout(self.mobile.on),
+                        cx,
+                    )
+                    .debug_selector(|| "desktop-layout".into()),
+                ))
+            })
             .map(|d| self.background_settings(d, cx))
             // A phone lists About in Settings' own list instead.
             .when(!self.mobile.on, |d| d.child(self.section("Picacho")).child(
@@ -732,7 +745,7 @@ impl MailApp {
             ))
             // Phones warn before opening a link; desktops show its address
             // on hover instead.
-            .when(self.mobile.on, |d| d.child(self.link_warning_settings(cx)))
+            .when(self.mobile.touch, |d| d.child(self.link_warning_settings(cx)))
             .into_any_element()
     }
     /// Warn before opening links, and the sites trusted not to (phones).
@@ -820,6 +833,8 @@ impl MailApp {
                     ("New window", ComposeOpen::Window),
                 ]
                 .into_iter()
+                // A touch device has no other windows.
+                .filter(|(_, value)| !self.mobile.touch || *value != ComposeOpen::Window)
                 .map(|(label, value)| {
                     (
                         label.to_string(),
@@ -1661,6 +1676,10 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A touch device has no other windows.
+        if place == SettingsPlace::Window && self.mobile.touch {
+            return;
+        }
         if place == SettingsPlace::Window {
             if self.settings_place == SettingsPlace::Window {
                 self.reveal_settings_window(cx);
@@ -1767,14 +1786,16 @@ impl MailApp {
                 false,
                 cx,
             ))
-            .child(self.button(
-                "settings-popout",
-                "@Open in new window",
-                "popout",
-                Action::PlaceSettings(SettingsPlace::Window),
-                false,
-                cx,
-            ))
+            .when(!self.mobile.touch, |d| {
+                d.child(self.button(
+                    "settings-popout",
+                    "@Open in new window",
+                    "popout",
+                    Action::PlaceSettings(SettingsPlace::Window),
+                    false,
+                    cx,
+                ))
+            })
     }
     /// Preset pictures drawn over Settings, so choosing one never closes
     /// Settings or loses its place.

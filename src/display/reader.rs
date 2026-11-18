@@ -1,6 +1,10 @@
 //! Reader view components.
 use super::*;
 
+/// The reader's narrowest width for labelled Reply, Reply all and Forward
+/// buttons beside the others, at a fingertip's size.
+const TOUCH_LABELS: f32 = 640.;
+
 impl MailApp {
     /// Takes the reader's place while several messages are selected: how
     /// many, from whom, and the actions for all of them.
@@ -276,8 +280,11 @@ impl MailApp {
                 .into_any_element();
         };
         let width = super::window::content_size(window).width;
-        let compact = width < px(1180.);
         let single = width < px(900.);
+        // Fingertip-sized buttons take more room: on a touch device the
+        // labels go once the reader itself is too narrow for them.
+        let compact = width < px(1180.)
+            || (self.mobile.touch && !single && self.reader_shown.get() < TOUCH_LABELS);
         let toolbar = div()
             .id("reader-toolbar")
             .debug_selector(|| "reader-toolbar".into())
@@ -328,14 +335,16 @@ impl MailApp {
                 cx,
             ))
             .child(div().flex_1())
-            .child(self.button(
-                "open-window",
-                "@Open in new window · ⌘O",
-                "popout",
-                Action::OpenWindow(m.id.clone()),
-                false,
-                cx,
-            ))
+            .when(!self.mobile.touch, |d| {
+                d.child(self.button(
+                    "open-window",
+                    "@Open in new window · ⌘O",
+                    "popout",
+                    Action::OpenWindow(m.id.clone()),
+                    false,
+                    cx,
+                ))
+            })
             .child(self.button(
                 "archive",
                 "@Archive message",

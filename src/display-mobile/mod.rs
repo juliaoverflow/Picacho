@@ -22,6 +22,10 @@
 //!
 //! The presentation is on for iOS and Android builds. On a desktop,
 //! `PICACHO_MOBILE=1` previews it in a phone-sized window.
+//!
+//! A touch device can show the desktop window instead (Settings → General →
+//! Desktop layout), as suits a tablet; `touch_desktop` keeps that window
+//! inside the safe area, above the keyboard and answering Back.
 use super::*;
 
 mod chrome;
@@ -35,6 +39,7 @@ mod settings;
 mod sheets;
 #[cfg(test)]
 mod tests;
+mod touch_desktop;
 
 pub(super) use platform::Keys;
 
@@ -65,11 +70,19 @@ pub(super) fn desktop_preview() -> bool {
         && std::env::var_os("PICACHO_MOBILE").is_some_and(|v| v != "0")
 }
 
+/// "true" when a touch device shows the desktop window rather than the
+/// phone presentation.
+const DESKTOP_LAYOUT_PREFERENCE: &str = "desktop_layout";
+
 /// The touch presentation's own state. Everything about mail, accounts and
 /// settings stays in `MailApp`, shared with the desktop.
 pub(super) struct Mobile {
     /// The phone presentation is shown.
     pub(super) on: bool,
+    /// This is a touch device (a phone, a tablet, or a desktop previewing
+    /// one), whichever layout it shows: one window, a software keyboard,
+    /// no pointer to hover with.
+    pub(super) touch: bool,
     /// The mailboxes screen is shown in place of the message list: the
     /// bottom of the navigation stack.
     pub(super) mailboxes: bool,
@@ -156,9 +169,12 @@ pub(super) struct Mobile {
 }
 
 impl Mobile {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(store: &Store) -> Self {
+        let touch = cfg!(any(target_os = "android", target_os = "ios")) || desktop_preview();
+        let desktop = store.preference(DESKTOP_LAYOUT_PREFERENCE).as_deref() == Some("true");
         Self {
-            on: cfg!(any(target_os = "android", target_os = "ios")) || desktop_preview(),
+            on: touch && !desktop,
+            touch,
             mailboxes: false,
             settings_page: false,
             settings_seen: false,
@@ -499,9 +515,67 @@ impl MailApp {
         platform::insets(window)
     }
 
-    /// Goes back one level, as Back or Escape does. Returns false when the
-    /// desktop's own `close` should handle it.
-    pub(super) fn mobile_back(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Switches a touch device between the phone presentation and the
+    /// desktop window (`desktop`), remembering the choice.
+    pub(super) fn set_desktop_layout(
+        &mut self,
+        desktop: bool,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mobile.touch {
+            return;
+        }
+        self.backend.store.set_preference_soon(
+            DESKTOP_LAYOUT_PREFERENCE,
+            if desktop { "true" } else { "false" },
+        );
+        if self.mobile.on != desktop {
+            return;
+        }
+        // Gestures and menus belong to the layout they started in.
+        self.menu = None;
+        self.mobile.swipe = None;
+        self.mobile.pan = None;
+        self.mobile.pull = 0.;
+        self.mobile.pull_armed = false;
+        self.mobile.edge_pending = false;
+        self.mobile.back_drag = None;
+        self.mobile.back_release = None;
+        self.mobile.reordering = false;
+        self.mobile.reorder_drag = None;
+        self.mobile.slide = Slide::None;
+        self.mobile.slide_at = None;
+        self.mobile.mailboxes = false;
+        self.mobile.on = !desktop;
+        // Open composers take the new layout's controls; on a phone they
+        // cover the screen.
+        for composer in self.composers.clone() {
+            composer.update(cx, |c, cx| {
+                c.mobile = !desktop;
+                if !desktop && c.placement != Placement::Window {
+                    c.placement = Placement::Maximized;
+                    c.minimized = false;
+                    c.origin = None;
+                }
+                cx.notify();
+            });
+        }
+        // Settings stays open at the page the switch is on.
+        if self.modal == Some(Modal::Settings) {
+            self.mobile.settings_seen = true;
+            self.mobile.settings_page = true;
+            self.mobile.settings_last = Some(self.page.clone());
+        }
+        self.mobile.place = None;
+        self.follow_keyboard(w, cx);
+        cx.notify();
+    }
+
+    /// What Back closes first on any touch device, before the layout's own
+    /// back: the software keyboard and the warning before a link. True when
+    /// it closed one.
+    pub(super) fn touch_back(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
         // The keyboard goes first. One the system already put away (Android
         // closes it on Back itself) lets go of its field on the way back.
         if self.mobile.keyboard_for.is_some() {
@@ -517,6 +591,15 @@ impl MailApp {
         // The warning before a link: Back is Go Back.
         if self.links.confirm.take().is_some() {
             cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Goes back one level, as Back or Escape does. Returns false when the
+    /// desktop's own `close` should handle it.
+    pub(super) fn mobile_back(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.touch_back(w, cx) {
             return true;
         }
         // An open full-screen composer closes, keeping its draft.
@@ -587,7 +670,7 @@ impl MailApp {
 
     /// A text field has the software keyboard, and it is on screen: Android
     /// may have put it away without telling (Back closes it first).
-    fn keyboard_shown(&self, w: &Window) -> bool {
+    pub(super) fn keyboard_shown(&self, w: &Window) -> bool {
         self.mobile.keyboard_for.is_some()
             && (self.mobile_insets(w).keyboard > 0. || !cfg!(target_os = "android"))
     }
@@ -636,6 +719,13 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) {
         use crate::android::Back;
+        // The desktop window has no screens to drag: Back acts once let go.
+        if !self.mobile.on {
+            if matches!(back, Back::Go) {
+                self.close(w, cx);
+            }
+            return;
+        }
         let gesture = |phase, progress| BackGestureEvent {
             phase,
             progress,
@@ -926,7 +1016,7 @@ impl MailApp {
     }
 
     /// Keeps the status bar's text readable on the app's background.
-    fn sync_system_chrome(&mut self) {
+    pub(super) fn sync_system_chrome(&mut self) {
         if self.mobile.chrome_dark != Some(self.dark) {
             self.mobile.chrome_dark = Some(self.dark);
             platform::system_chrome(self.dark, self.colors().bg);
@@ -935,7 +1025,7 @@ impl MailApp {
 
     /// Opens the keyboard a newly focused field wants, and closes it once
     /// no field has focus. iOS raises no keyboard by itself.
-    fn follow_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn follow_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let place = Some((
             self.mobile_screen(),
             self.modal.clone(),

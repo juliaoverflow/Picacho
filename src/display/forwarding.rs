@@ -193,7 +193,7 @@ impl MailApp {
     ) -> Stateful<Div> {
         let c = self.colors();
         self.button(id, label, icon, action, false, cx)
-            .h(px(28.))
+            .h(px(if self.mobile.touch { 36. } else { 28. }))
             .border_1()
             .border_color(rgb(c.border))
     }
@@ -210,7 +210,7 @@ impl MailApp {
         div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id.clone())
-            .size(px(28.))
+            .size(px(if self.mobile.touch { 36. } else { 28. }))
             .flex_shrink_0()
             .rounded(px(7.))
             .flex()

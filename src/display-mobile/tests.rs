@@ -1209,3 +1209,235 @@ fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(new));
     assert_eq!(screen(&view, cx), Screen::Reader);
 }
+
+#[gpui::test]
+fn a_tablet_can_show_the_desktop_window(cx: &mut TestAppContext) {
+    let (view, cx) = phone(TABLET, cx);
+    view.update(cx, |this, _| this.mobile.touch = true);
+    // Settings → General offers the switch on a touch device.
+    act(&view, Action::Settings, cx);
+    assert!(shown(cx, "desktop-layout"));
+    act(&view, Action::SetDesktopLayout(true), cx);
+    view.read_with(cx, |this, _| {
+        assert!(!this.mobile.on, "the desktop window is shown");
+        assert_eq!(
+            this.backend
+                .store
+                .preference(DESKTOP_LAYOUT_PREFERENCE)
+                .as_deref(),
+            Some("true"),
+            "and remembered"
+        );
+        assert!(this.modal == Some(Modal::Settings), "Settings stays open");
+    });
+    // The switch back is in the desktop's Settings too.
+    assert!(shown(cx, "desktop-layout"));
+    assert!(!shown(cx, "mobile-screen"));
+    act(&view, Action::Close, cx);
+    // The desktop window keeps out of the status bar and home indicator.
+    let frame_ = bounds(cx, "touch-desktop");
+    let list = bounds(cx, "message-list");
+    assert!(
+        list.top() >= frame_.top() + px(NOTCH.top),
+        "{list:?} is under the status bar"
+    );
+    assert!(
+        list.bottom() <= frame_.bottom() - px(NOTCH.bottom),
+        "{list:?} is under the home indicator"
+    );
+    // One window: a message opens in it, not in a window of its own.
+    let id = first_message(&view, cx);
+    let windows = cx.update(|_, cx| cx.windows().len());
+    act(&view, Action::OpenWindow(id.clone()), cx);
+    assert_eq!(cx.update(|_, cx| cx.windows().len()), windows);
+    assert_eq!(
+        view.read_with(cx, |this, _| this.selected.clone()),
+        Some(id)
+    );
+    // Its buttons take a fingertip, and a long press (a right click)
+    // names an icon-only one, as its tooltip would.
+    touchable(cx, "archive");
+    let archive = bounds(cx, "archive");
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: archive.center(),
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |this, _| this.status.clone()),
+        "Archive message"
+    );
+    // A pane's edge can be dragged with a finger.
+    assert!(bounds(cx, "resize-reader").size.width >= px(24.));
+    let before = view.read_with(cx, |this, _| this.reader_shown.get());
+    let edge = bounds(cx, "resize-reader").center();
+    for (dx, phase) in [
+        (-10., TouchPhase::Started),
+        (-30., TouchPhase::Moved),
+        (0., TouchPhase::Ended),
+    ] {
+        // Only the pan's start is on the edge (which then moves away).
+        let position = if phase == TouchPhase::Started {
+            edge
+        } else {
+            edge - point(px(200.), px(0.))
+        };
+        cx.simulate_event(ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+    }
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.reader_width, Some(before + 40.), "the reader widened");
+        assert!(this.resizing.is_none());
+    });
+    // And back to the phone presentation.
+    act(&view, Action::SetDesktopLayout(false), cx);
+    assert!(view.read_with(cx, |this, _| this.mobile.on));
+    assert!(shown(cx, "mobile-screen"));
+    assert!(!shown(cx, "touch-desktop"));
+}
+
+/// Tablets in both orientations, as (width, height) in points: iPad mini,
+/// iPad Air, a 10" Android tablet and the 13" iPad Pro.
+const TABLETS: [(f32, f32); 8] = [
+    (744., 1133.),
+    (1133., 744.),
+    (820., 1180.),
+    (1180., 820.),
+    (800., 1280.),
+    (1280., 800.),
+    (1024., 1366.),
+    (1366., 1024.),
+];
+
+/// A tablet's status bar and home indicator.
+const TABLET_INSETS: Insets = Insets {
+    top: 24.,
+    bottom: 20.,
+    left: 0.,
+    right: 0.,
+    keyboard: 0.,
+};
+
+/// Every one of `buttons` that `bar` shows lies inside it, without
+/// covering another.
+fn fits(
+    cx: &mut VisualTestContext,
+    size_: (f32, f32),
+    bar: &'static str,
+    buttons: &[&'static str],
+) {
+    let outer = bounds(cx, bar);
+    let width = cx.update(|w, _| w.viewport_size().width);
+    assert!(
+        outer.right() <= width + px(0.5),
+        "{bar} runs out of the window at {size_:?}: {outer:?}"
+    );
+    let shown: Vec<_> = buttons
+        .iter()
+        .filter_map(|&b| cx.debug_bounds(b).map(|bounds| (b, bounds)))
+        .collect();
+    assert!(!shown.is_empty(), "{bar} shows none of {buttons:?}");
+    for (i, (name, b)) in shown.iter().enumerate() {
+        assert!(
+            b.left() >= outer.left() - px(0.5) && b.right() <= outer.right() + px(0.5),
+            "{name} runs out of {bar} at {size_:?}: {b:?} in {outer:?}"
+        );
+        for (other, o) in &shown[i + 1..] {
+            assert!(
+                b.right() <= o.left() + px(0.5) || o.right() <= b.left() + px(0.5),
+                "{name} covers {other} at {size_:?}: {b:?}, {o:?}"
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn the_desktop_windows_bars_fit_on_tablets(cx: &mut TestAppContext) {
+    let (view, cx) = phone(TABLETS[0], cx);
+    view.update(cx, |this, _| {
+        this.mobile.touch = true;
+        this.mobile.fake_insets = Some(TABLET_INSETS);
+    });
+    act(&view, Action::SetDesktopLayout(true), cx);
+    for size_ in TABLETS {
+        cx.simulate_resize(size(px(size_.0), px(size_.1)));
+        act(&view, Action::Close, cx);
+        let id = first_message(&view, cx);
+        act(&view, Action::Select(id), cx);
+        fits(cx, size_, "topbar", &["theme", "about", "accounts"]);
+        if shown(cx, "list-header") {
+            fits(
+                cx,
+                size_,
+                "list-header",
+                &["search-toggle", "select-toggle", "filter", "refresh"],
+            );
+        }
+        fits(
+            cx,
+            size_,
+            "reader-toolbar",
+            &[
+                "reader-back",
+                "reply",
+                "reply-all",
+                "forward",
+                "archive",
+                "snooze",
+                "read",
+                "trash",
+            ],
+        );
+        // A new message, floating and full size.
+        act(&view, Action::Compose, cx);
+        let header = &[
+            "compose-save",
+            "compose-minimize",
+            "compose-maximize",
+            "compose-pop-out",
+            "compose-close",
+        ];
+        fits(cx, size_, "compose-header", header);
+        // A long press (a right click) names its icon-only buttons.
+        let close = bounds(cx, "compose-close");
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: close.center(),
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this.status.clone()),
+            "Save and close"
+        );
+        let composer = view.read_with(cx, |this, _| this.composers.last().cloned().unwrap());
+        composer.update(cx, |c, cx| {
+            c.placement = Placement::Maximized;
+            cx.notify();
+        });
+        fits(cx, size_, "compose-header", header);
+        assert!(shown(cx, "compose-send"));
+        let send = bounds(cx, "compose-send");
+        let height = cx.update(|w, _| w.viewport_size().height);
+        assert!(
+            send.bottom() <= height - px(TABLET_INSETS.bottom),
+            "Send is under the home indicator at {size_:?}: {send:?}"
+        );
+        composer.update(cx, |_, cx| cx.emit(composer::ComposerEvent::Discard));
+        cx.run_until_parked();
+        // Settings, with its full-size control.
+        act(&view, Action::Settings, cx);
+        fits(cx, size_, "modal-panel", &["settings-maximize"]);
+        act(&view, Action::Close, cx);
+    }
+}

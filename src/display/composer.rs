@@ -72,6 +72,9 @@ pub(super) enum ComposerEvent {
     /// The draft passed its checks and should be sent at this time
     /// (seconds since the epoch): Send Later.
     Schedule(i64),
+    /// Show this briefly in the main window: an icon-only button's name,
+    /// long-pressed on a touch device.
+    Notice(String),
 }
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -129,6 +132,8 @@ pub(super) struct Composer {
     /// Shown full screen on a phone or tablet, with touch-sized controls
     /// (display-mobile).
     pub(super) mobile: bool,
+    /// The device has one window (a touch device): no window of its own.
+    pub(super) single_window: bool,
     pub(super) minimized: bool,
     /// Top-left inside the main window once moved; until then it sits at the
     /// lower right.
@@ -289,6 +294,7 @@ impl Composer {
             draft,
             placement,
             mobile: false,
+            single_window: false,
             minimized: false,
             origin: None,
             grab: Point::default(),
@@ -1208,7 +1214,13 @@ impl Composer {
             .id(id)
             .debug_selector(move || format!("compose-{id}"))
             // A fingertip needs a bigger target than a pointer.
-            .size(px(if self.mobile { super::mobile::TOUCH } else { 28. }))
+            .size(px(if self.mobile {
+                super::mobile::TOUCH
+            } else if self.single_window {
+                36.
+            } else {
+                28.
+            }))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -1220,11 +1232,30 @@ impl Composer {
             .active(|s| s.opacity(0.7))
             .child(icon_el(icon, if self.mobile { 20. } else { 15. }, if on { c.accent } else { c.muted }))
             .tooltip(move |w, cx| Tooltip::new(keys(tip)).build(w, cx))
+            .map(|d| self.long_press_tip(d, tip, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, w, cx| {
                 cx.stop_propagation();
                 click(this, w, cx)
             }))
+    }
+
+    /// An icon-only button's name, shown in the main window on a long press
+    /// (which arrives as a right click) in the desktop layout on a touch
+    /// device, where there is no pointer to hover for its tooltip.
+    fn long_press_tip(&self, el: Stateful<Div>, tip: &str, cx: &Context<Self>) -> Stateful<Div> {
+        if !self.single_window || self.mobile {
+            return el;
+        }
+        // Without its keyboard shortcut.
+        let tip = tip.split(" · ").next().unwrap_or_default().to_owned();
+        el.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                cx.emit(ComposerEvent::Notice(tip.clone()));
+            }),
+        )
     }
 
     /// A compose window's title bar: its title, Save draft and Move into
@@ -1367,14 +1398,16 @@ impl Composer {
                             }));
                         },
                     ))
-                    .child(self.icon_button(
-                        "new-window",
-                        "popout",
-                        "Open in new window",
-                        false,
-                        cx,
-                        |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Window)),
-                    ));
+                    .when(!self.single_window, |d| {
+                        d.child(self.icon_button(
+                            "new-window",
+                            "popout",
+                            "Open in new window",
+                            false,
+                            cx,
+                            |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Window)),
+                        ))
+                    });
             }
             Placement::Inline => {
                 header = header
@@ -1386,14 +1419,16 @@ impl Composer {
                         cx,
                         |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Floating)),
                     ))
-                    .child(self.icon_button(
-                        "new-window",
-                        "popout",
-                        "Open in new window",
-                        false,
-                        cx,
-                        |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Window)),
-                    ));
+                    .when(!self.single_window, |d| {
+                        d.child(self.icon_button(
+                            "new-window",
+                            "popout",
+                            "Open in new window",
+                            false,
+                            cx,
+                            |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Window)),
+                        ))
+                    });
             }
             Placement::Window => {
                 header = header.child(self.icon_button(
@@ -1515,7 +1550,7 @@ impl Composer {
             div()
                 .id(id)
                 .debug_selector(move || format!("{}-{}", id.0, id.1))
-                .size(px(24.))
+                .size(px(if self.single_window { 32. } else { 24. }))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -1524,6 +1559,7 @@ impl Composer {
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(c.soft)))
                 .child(icon_el("alias", 14., c.muted))
+                .map(|d| self.long_press_tip(d, &tip, cx))
                 .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2189,7 +2225,7 @@ impl Composer {
                     .child(
                         div()
                             .id(("remove-attachment", i))
-                            .size(px(20.))
+                            .size(px(if self.single_window { 28. } else { 20. }))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -2198,6 +2234,7 @@ impl Composer {
                             .hover(move |s| s.bg(rgb(c.border)))
                             .child(icon_el("close", 11., c.muted))
                             .tooltip(|w, cx| Tooltip::new("Remove").build(w, cx))
+                            .map(|d| self.long_press_tip(d, "Remove", cx))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if i < this.draft.attachments.len() {
                                     this.draft.attachments.remove(i);

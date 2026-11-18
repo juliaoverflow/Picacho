@@ -334,8 +334,9 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Composer>> {
-        // A phone has one window: every composer covers it.
-        let placement = if self.mobile.on {
+        // A phone has one window: every composer covers it. The desktop
+        // window on a touch device has no others either.
+        let placement = if self.mobile.on || (self.mobile.touch && placement == Placement::Window) {
             Placement::Maximized
         } else {
             placement
@@ -400,9 +401,11 @@ impl MailApp {
                 )
             });
             let mobile = self.mobile.on;
+            let single_window = self.mobile.touch;
             composer.update(cx, |c, cx| {
                 c.answers = answers.clone();
                 c.mobile = mobile;
+                c.single_window = single_window;
                 c.focus_first(w, cx);
             });
             composer
@@ -462,6 +465,7 @@ impl MailApp {
                 self.handle(Action::NewAliasFor(service.clone(), mailbox.clone()), w, cx);
             }
             ComposerEvent::Schedule(at) => self.schedule_send(composer, *at, cx),
+            ComposerEvent::Notice(text) => self.notice(text.clone(), false, cx),
         }
         cx.notify();
     }
@@ -534,6 +538,10 @@ impl MailApp {
         let from = composer.read(cx).placement;
         // A phone keeps composers full screen.
         if self.mobile.on && placement != Placement::Maximized {
+            return;
+        }
+        // A touch device has no other windows.
+        if self.mobile.touch && placement == Placement::Window {
             return;
         }
         let windowed = |p: Placement| p == Placement::Window;
@@ -960,6 +968,7 @@ impl MailApp {
                     this.pending_new_alias = Some((service.clone(), mailbox.clone()));
                 }
                 ComposerEvent::Schedule(at) => this.schedule_send(composer, *at, cx),
+                ComposerEvent::Notice(text) => this.notice(text.clone(), false, cx),
             }
             cx.notify();
         });

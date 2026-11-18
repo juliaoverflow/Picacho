@@ -134,7 +134,7 @@ impl MailApp {
         };
         let web = parsed.scheme() != "mailto";
         if web
-            && self.mobile.on
+            && self.mobile.touch
             && self.links.warn
             && !self.links.trusts(&parsed)
             && let Some(site) = site(&parsed)
@@ -216,7 +216,7 @@ impl MailApp {
     /// The address of the link under the pointer, at the bottom left of
     /// the mail view, as a browser shows it (desktop).
     pub(super) fn link_status(&self) -> Option<AnyElement> {
-        if self.mobile.on {
+        if self.mobile.touch {
             return None;
         }
         let url = self.links.hovered.as_deref()?;

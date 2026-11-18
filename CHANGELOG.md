@@ -13,6 +13,13 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Phones and tablets: Settings → General → Desktop layout shows the desktop
+  window instead of the phone layout, as suits a tablet. A long press opens
+  the context menus that a right click opens on a computer, or names an
+  icon-only button (the composer's too); buttons are fingertip-sized,
+  stars show on every message, pane edges can be dragged with a finger, and
+  the reader's toolbar drops its labels when the reader is too narrow for
+  them.
 - Phones and tablets: tapping a link in an email first shows where it goes,
   warns of known tricks (look-alike letters, bare IP addresses, unencrypted
   pages), and offers Go Back, Open Anyway or Always Trust the site. Turn it

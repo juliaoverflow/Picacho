@@ -357,6 +357,9 @@ pub(super) struct Resize {
     pane: Pane,
     origin: f32,
     start: f32,
+    /// How far a finger has moved it (a touch pan reports where it
+    /// started, and each movement since).
+    pan: f32,
 }
 
 /// Pane widths for one layout of the three-pane window.
@@ -406,8 +409,18 @@ impl MailApp {
             pane,
             origin: x,
             start,
+            pan: 0.,
         });
         cx.notify();
+    }
+    /// Follows a finger dragging a pane's edge by `dx` more.
+    fn pan_resize(&mut self, dx: f32, cx: &mut Context<Self>) {
+        let Some(r) = &mut self.resizing else {
+            return;
+        };
+        r.pan += dx;
+        let x = r.origin + r.pan;
+        self.resize_to(x, cx);
     }
     /// Follows the pointer. Past half way below a pane's smallest useful
     /// width, the pane snaps into its rail; dragging back out reopens it.
@@ -476,6 +489,9 @@ impl MailApp {
     pub(super) fn resize_handle(&self, pane: Pane, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
         let active = self.resizing.is_some_and(|r| r.pane == pane);
+        // A fingertip needs a wider grab area, and a line to see where.
+        let touch = self.mobile.touch;
+        let grab = if touch { 24. } else { 8. };
         let selector = match pane {
             Pane::Sidebar => "resize-sidebar",
             Pane::Reader => "resize-reader",
@@ -487,8 +503,8 @@ impl MailApp {
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(-4.))
-                .w(px(8.))
+                .left(px(-grab / 2.))
+                .w(px(grab))
                 .flex()
                 .justify_center()
                 .cursor(CursorStyle::ResizeLeftRight)
@@ -498,10 +514,29 @@ impl MailApp {
                         .w(px(2.))
                         .h_full()
                         .when(active, |d| d.bg(rgb(c.accent)))
-                        .when(!active, |d| {
+                        .when(!active && touch, |d| d.bg(rgb(c.border)))
+                        .when(!active && !touch, |d| {
                             d.group_hover("resize-handle", |s| s.bg(rgb(c.border)))
                         }),
                 )
+                // A finger drags as a pan rather than moving a pointer.
+                .when(touch, |d| {
+                    d.on_scroll(cx.listener(move |this, e: &ScrollEvent, _, cx| {
+                        let ScrollDelta::Pixels(delta) = e.delta else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        let dx = f32::from(delta.x);
+                        match e.touch_phase {
+                            TouchPhase::Started => {
+                                this.begin_resize(pane, f32::from(e.position.x), cx);
+                                this.pan_resize(dx, cx);
+                            }
+                            TouchPhase::Moved => this.pan_resize(dx, cx),
+                            _ => this.end_resize(cx),
+                        }
+                    }))
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -517,11 +552,35 @@ impl MailApp {
         if self.resizing.is_none() {
             return d;
         }
+        let this = cx.weak_entity();
+        let touch = self.mobile.touch;
         d.child(
             // The window's cursor can only be set while painting.
             canvas(
                 |_, _, _| {},
-                |_, _, w, _| w.set_window_cursor_style(CursorStyle::ResizeLeftRight),
+                move |_, _, w, _| {
+                    w.set_window_cursor_style(CursorStyle::ResizeLeftRight);
+                    if !touch {
+                        return;
+                    }
+                    // A finger's pan reports where it started, which the
+                    // edge has moved away from: follow it anywhere, before
+                    // what is under it scrolls.
+                    let this = this.clone();
+                    w.on_mouse_event(move |e: &ScrollEvent, phase, _, cx| {
+                        let ScrollDelta::Pixels(delta) = e.delta else {
+                            return;
+                        };
+                        if phase != DispatchPhase::Capture || e.touch_phase == TouchPhase::Started {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        let _ = this.update(cx, |this, cx| match e.touch_phase {
+                            TouchPhase::Moved => this.pan_resize(f32::from(delta.x), cx),
+                            _ => this.end_resize(cx),
+                        });
+                    });
+                },
             )
             .absolute()
             .size_0(),

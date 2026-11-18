@@ -41,12 +41,36 @@ pub(super) fn window_corners(w: &Window) -> Corners<Pixels> {
     }
 }
 
+thread_local! {
+    /// The system's reserved edges (status bar, notch, navigation bar, the
+    /// software keyboard) while a touch device shows the desktop window,
+    /// which keeps out of them; zero otherwise.
+    static SAFE_AREA: std::cell::Cell<Edges<Pixels>> = std::cell::Cell::new(Edges::default());
+}
+
+/// Sets the safe area the desktop window keeps out of (see `SAFE_AREA`).
+pub(super) fn set_safe_area(edges: Edges<Pixels>) {
+    SAFE_AREA.with(|s| s.set(edges));
+}
+
+fn safe_area() -> Edges<Pixels> {
+    SAFE_AREA.with(|s| s.get())
+}
+
 /// How far the visible frame sits inside the window, each side. While
 /// Picacho draws its own decorations, a transparent shadow band surrounds
 /// the frame (none on edges that are tiled or maximized), and anything
-/// drawn there is clipped; with the system's decorations it is zero.
+/// drawn there is clipped; with the system's decorations it is zero. A
+/// touch device's safe area counts too.
 pub(super) fn frame_insets(w: &Window) -> Edges<Pixels> {
-    gpui_component::window_paddings(w)
+    let band = gpui_component::window_paddings(w);
+    let safe = safe_area();
+    Edges {
+        top: band.top + safe.top,
+        right: band.right + safe.right,
+        bottom: band.bottom + safe.bottom,
+        left: band.left + safe.left,
+    }
 }
 
 /// The space inside the window's visible frame, where the app is laid out,
@@ -58,7 +82,14 @@ pub(super) fn frame_insets(w: &Window) -> Edges<Pixels> {
 pub(super) fn content_bounds(w: &Window) -> Bounds<Pixels> {
     let viewport = w.viewport_size();
     let Decorations::Client { tiling } = w.window_decorations() else {
-        return Bounds::new(Point::default(), viewport);
+        let safe = safe_area();
+        return Bounds::new(
+            point(safe.left, safe.top),
+            size(
+                (viewport.width - safe.left - safe.right).max(px(0.)),
+                (viewport.height - safe.top - safe.bottom).max(px(0.)),
+            ),
+        );
     };
     inner_bounds(viewport, frame_insets(w), tiling, is_client_decorated(w))
 }

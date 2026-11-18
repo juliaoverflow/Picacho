@@ -763,6 +763,9 @@ enum Action {
     SetLinkWarnings(bool),
     /// Stop trusting this site's links.
     UntrustSite(String),
+    /// A touch device shows the desktop window (true) or the phone
+    /// presentation.
+    SetDesktopLayout(bool),
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -1353,6 +1356,7 @@ impl MailApp {
         let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
         let link_safety = links::LinkSafety::load(&store);
+        let mobile = mobile::Mobile::new(&store);
         let local_ai = crate::manage::local_ai::enabled(&store);
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         let understand_dates = crate::manage::local_ai::when_enabled(&store);
@@ -2043,7 +2047,7 @@ impl MailApp {
             filters: HashMap::new(),
             filter_inputs,
             server_notes: HashMap::new(),
-            mobile: mobile::Mobile::new(),
+            mobile,
             open_listed: None,
         };
         this.update_scope();
@@ -3105,6 +3109,10 @@ impl MailApp {
             },
             Entry::Separator,
         ];
+        // A touch device has one window: no Open in New Window.
+        if self.mobile.touch {
+            entries.drain(..2);
+        }
         for (folder, label, icon) in [
             (Folder::Inbox, "Move to Inbox", "inbox"),
             (Folder::Archive, "Archive", "archive"),
@@ -4447,6 +4455,10 @@ impl MailApp {
         if self.mobile.on && self.mobile_back(w, cx) {
             return;
         }
+        // The desktop window on a touch device: the keyboard first.
+        if !self.mobile.on && self.mobile.touch && self.touch_back(w, cx) {
+            return;
+        }
         if self.menu.take().is_some()
             || self.presets_for.take().is_some()
             || self.model_confirm.take().is_some()
@@ -5125,6 +5137,8 @@ impl MailApp {
                     self.select(id, cx);
                 }
             }
+            // A touch device has one window: the message opens in it.
+            Action::OpenWindow(id) if self.mobile.touch => self.handle(Action::Select(id), w, cx),
             Action::OpenWindow(id) => self.open_message_window(id, w, cx),
             Action::Star(id) => {
                 if let Some(m) = self.messages.iter().find(|m| m.id == id) {
@@ -5777,6 +5791,7 @@ impl MailApp {
             Action::LinkChoice(choice) => self.choose_link(choice, cx),
             Action::SetLinkWarnings(on) => self.set_link_warnings(on, cx),
             Action::UntrustSite(site) => self.untrust_site(&site, cx),
+            Action::SetDesktopLayout(on) => self.set_desktop_layout(on, w, cx),
             Action::OpenUrl(url) => {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
@@ -6396,9 +6411,14 @@ impl MailApp {
             .items_center()
             .justify_center()
             .gap_2()
-            .h(px(if self.mobile.on { mobile::TOUCH } else { 36. }))
+            // A fingertip needs a bigger target than a pointer.
+            .h(px(if self.mobile.touch {
+                mobile::TOUCH
+            } else {
+                36.
+            }))
             .px_3()
-            .rounded(px(if self.mobile.on { 12. } else { 9. }))
+            .rounded(px(if self.mobile.touch { 12. } else { 9. }))
             .cursor_pointer()
             .text_size(px(if self.mobile.on { 15. } else { 13. }))
             .font_weight(FontWeight::MEDIUM)
@@ -6413,18 +6433,31 @@ impl MailApp {
             el.child(icon_el(icon, 16., icon_color))
         };
         if label.starts_with('@') {
-            el.w(px(if self.mobile.on { mobile::TOUCH } else { 34. }))
+            let tip = label
+                .trim_start_matches('@')
+                .split(" · ")
+                .next()
+                .unwrap_or_default();
+            let el = el
+                .w(px(if self.mobile.touch {
+                    mobile::TOUCH
+                } else {
+                    34.
+                }))
                 .px_0()
-                .tooltip(move |w, cx| Tooltip::new(tooltip.clone()).build(w, cx))
+                .tooltip(move |w, cx| Tooltip::new(tooltip.clone()).build(w, cx));
+            self.long_press_tip(el, tip.to_owned(), cx)
         } else {
             el.child(label)
         }
     }
     fn topbar(&self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors();
-        let small = |el: Stateful<Div>| window::no_drag(el.h(px(28.)).w(px(28.)).rounded(px(7.)));
+        let side = self.small_control();
+        let small = |el: Stateful<Div>| window::no_drag(el.h(px(side)).w(px(side)).rounded(px(7.)));
         let bar = div()
             .id("topbar")
+            .debug_selector(|| "topbar".into())
             .flex()
             .items_center()
             .h(px(TITLEBAR_HEIGHT))
@@ -6705,9 +6738,14 @@ impl MailApp {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let c = self.colors();
-        div()
+        let tip = tooltip.clone();
+        let el = div()
             .id(SharedString::from(id))
-            .size(px(36.))
+            .size(px(if self.mobile.touch {
+                mobile::TOUCH
+            } else {
+                36.
+            }))
             .flex_shrink_0()
             .rounded(px(9.))
             .flex()
@@ -6718,7 +6756,8 @@ impl MailApp {
             .hover(move |s| s.bg(rgb(if active { c.soft } else { c.surface })))
             .child(child)
             .tooltip(move |w, cx| Tooltip::new(tooltip.clone()).build(w, cx))
-            .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
+            .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)));
+        self.long_press_tip(el, tip, cx)
     }
     fn sidebar_rail(&self, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
@@ -7166,11 +7205,13 @@ impl MailApp {
     }
     fn list_header(&self, _count: usize, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
-        let small = |el: Stateful<Div>| el.h(px(28.)).w(px(28.)).rounded(px(7.));
+        let side = self.small_control();
+        let small = |el: Stateful<Div>| el.h(px(side)).w(px(side)).rounded(px(7.));
         let anchor = self.filter_anchor.clone();
         let filtered = self.filter_by != Filter::All || self.oldest_first;
         let unread = self.mailbox_unread();
         let mut header = div()
+            .debug_selector(|| "list-header".into())
             .px_3()
             .py(px(8.))
             .border_b_1()
@@ -7564,6 +7605,7 @@ impl MailApp {
         let star = m.starred;
         let drafts = self.folder == Folder::Drafts;
         let row_group = SharedString::from(format!("row-group-{id}"));
+        let touch = self.mobile.touch;
         let lead_group = SharedString::from(format!("lead-group-{id}"));
         let check_fg = c.on_accent;
         let checkbox = div()
@@ -7745,12 +7787,15 @@ impl MailApp {
                                     div()
                                         .id(SharedString::from(format!("star-{}", m.id)))
                                         .size(px(20.))
+                                        // No pointer to hover with: a bigger
+                                        // target, without a taller row.
+                                        .when(touch, |d| d.size(px(30.)).my(px(-5.)))
                                         .flex_shrink_0()
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .rounded(px(5.))
-                                        .when(!star, |d| {
+                                        .when(!star && !touch, |d| {
                                             d.opacity(0.)
                                                 .group_hover(row_group.clone(), |s| s.opacity(1.))
                                         })
@@ -9278,10 +9323,15 @@ impl Render for MailApp {
         self.apply_pending_listed(cx);
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
-        let root = if self.mobile.on {
-            self.mobile_root(window, cx)
+        let root = if self.mobile.touch && !self.mobile.on {
+            self.touch_desktop_root(window, cx)
         } else {
-            self.root(window, cx)
+            window::set_safe_area(Edges::default());
+            if self.mobile.on {
+                self.mobile_root(window, cx)
+            } else {
+                self.root(window, cx)
+            }
         };
         // The email's images, once the reader no longer paints it.
         self.html_view.update(cx, |view, _| view.release(window));
