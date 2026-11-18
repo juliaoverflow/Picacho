@@ -73,6 +73,8 @@ pub struct HtmlView {
     requested: HashMap<u32, (u64, u32, u32)>,
     retired: Vec<Arc<RenderImage>>,
     context_at: Option<gpui::Point<Pixels>>,
+    /// Where the current long press began, in document coordinates.
+    pressed_at: Option<(f32, f32)>,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
 
@@ -125,6 +127,7 @@ impl HtmlView {
             requested: HashMap::new(),
             retired: Vec::new(),
             context_at: None,
+            pressed_at: None,
         }
     }
     #[cfg(test)]
@@ -350,6 +353,54 @@ impl HtmlView {
             _ => UiEvent::PointerMove(event),
         }));
     }
+    /// A long press on a touch screen, where there is no drag to select:
+    /// it selects the word under the finger, moving the finger before
+    /// lifting it extends the selection, and lifting it offers the menu a
+    /// secondary click does (Copy, and the link or image pressed).
+    /// `visible` is the part of the email on screen.
+    fn long_press(
+        &mut self,
+        e: &LongPressEvent,
+        visible: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity();
+        match e.phase {
+            TouchPhase::Started => {
+                if window.default_prevented()
+                    || self.worker.is_none()
+                    || !self.laid_out
+                    || !visible.contains(&e.start_position)
+                {
+                    return;
+                }
+                window.prevent_default();
+                window.capture_long_press(&entity);
+                cx.stop_propagation();
+                let (x, y) = self.local(e.start_position);
+                self.pressed_at = Some((x, y));
+                self.send(Command::SelectWord { x, y });
+            }
+            _ if !window.has_long_press_capture(&entity) => {}
+            TouchPhase::Moved => {
+                cx.stop_propagation();
+                let (x, y) = self.local(e.position);
+                self.send(Command::ExtendWord { x, y });
+            }
+            TouchPhase::Ended => {
+                cx.stop_propagation();
+                if let Some((x, y)) = self.pressed_at.take() {
+                    self.context_at = Some(e.position);
+                    self.send(Command::Context { x, y });
+                }
+            }
+            TouchPhase::Cancelled => {
+                cx.stop_propagation();
+                self.pressed_at = None;
+            }
+        }
+    }
     /// Lays out for the frame's width and picks the strips to draw, asking the
     /// worker for any that are missing or out of date.
     fn prepare(
@@ -496,6 +547,7 @@ impl Render for HtmlView {
                 .into_any_element();
         }
         let view = cx.entity();
+        let pressed = view.clone();
         let loading = self.is_loading();
         div()
             .id("html-email")
@@ -574,7 +626,7 @@ impl Render for HtmlView {
             .child(
                 canvas(
                     move |bounds, w, cx| view.update(cx, |this, _| this.prepare(bounds, w)),
-                    |_, tiles, w, _| {
+                    move |bounds, tiles, w, _| {
                         for (bounds, image) in tiles {
                             let _ = w.paint_image(
                                 bounds,
@@ -585,6 +637,13 @@ impl Render for HtmlView {
                                 false,
                             );
                         }
+                        let visible = bounds.intersect(&w.content_mask().bounds);
+                        let pressed = pressed.clone();
+                        w.on_mouse_event(move |e: &LongPressEvent, phase, w, cx| {
+                            if phase == DispatchPhase::Bubble {
+                                pressed.update(cx, |this, cx| this.long_press(e, visible, w, cx));
+                            }
+                        });
                     },
                 )
                 .size_full(),

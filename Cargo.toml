@@ -275,7 +275,8 @@ fontique = { version = "0.12", features = ["fontconfig-dlopen"] }
 # Patched crates, one folder each with its patches and README:
 # https://github.com/pinaltech/Picacho-Patches
 # After changing that repository, run `cargo update -p gpui` to use it here.
-# An email's unresolvable image or link address no longer panics.
+# An email's unresolvable image or link address no longer panics; text in
+# padded inline blocks and centered cells is hit (selected, clicked) where shown.
 blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
 # Inline boxes paint gradient backgrounds (emails' dark styles).
 blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
