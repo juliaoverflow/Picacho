@@ -244,8 +244,10 @@ impl MailApp {
             .into_any_element()
     }
 
-    /// The filters as chips under the title, so changing one is a tap.
+    /// The filters as chips under the title, so changing one is a tap. An
+    /// edge with chips scrolled past it fades out, showing there are more.
     fn mobile_filter_chips(&self, insets: Insets, cx: &Context<Self>) -> impl IntoElement {
+        let c = self.colors();
         let chip = |id: &'static str, filter: Filter, label: &'static str| {
             let on = self.filter_by == filter;
             self.chip(
@@ -256,10 +258,15 @@ impl MailApp {
                 cx,
             )
         };
-        div()
+        let scroll = &self.mobile.filters_scroll;
+        let (offset, max) = (
+            -f32::from(scroll.offset().x),
+            f32::from(scroll.max_offset().x),
+        );
+        let chips = div()
             .id("mobile-filters")
             .debug_selector(|| "mobile-filters".into())
-            .flex_shrink_0()
+            .track_scroll(scroll)
             .overflow_x_scroll()
             .pl(px(insets.left + GUTTER))
             .pr(px(insets.right + GUTTER))
@@ -279,7 +286,17 @@ impl MailApp {
                 self.oldest_first,
                 act(Action::OldestFirst(!self.oldest_first)),
                 cx,
-            ))
+            ));
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(chips)
+            .when(offset > 0.5, |d| {
+                d.child(edge_fade("mobile-filters-fade-leading", true, c.bg))
+            })
+            .when(max - offset > 0.5, |d| {
+                d.child(edge_fade("mobile-filters-fade-trailing", false, c.bg))
+            })
     }
 
     /// A message's row, sized for a fingertip, sliding under a swipe.
@@ -1030,4 +1047,27 @@ fn ease_out_back(t: f32) -> f32 {
     const OVERSHOOT: f32 = 1.2;
     let u = t - 1.;
     1. + (OVERSHOOT + 1.) * u.powi(3) + OVERSHOOT * u.powi(2)
+}
+
+/// How wide the fade over a sideways-scrolling row's edge is.
+const EDGE_FADE: f32 = 28.;
+
+/// A fade over the `leading` (or trailing) edge of a row that scrolls
+/// sideways, from the row's background `bg` to clear: what scrolled past
+/// that edge is there to scroll back to. It takes no taps.
+fn edge_fade(id: &'static str, leading: bool, bg: u32) -> impl IntoElement {
+    let solid: Hsla = rgb(bg).into();
+    let clear = Hsla { a: 0., ..solid };
+    div()
+        .debug_selector(move || id.into())
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(px(EDGE_FADE))
+        .map(|d| if leading { d.left_0() } else { d.right_0() })
+        .bg(linear_gradient(
+            if leading { 90. } else { 270. },
+            linear_color_stop(solid, 0.),
+            linear_color_stop(clear, 1.),
+        ))
 }

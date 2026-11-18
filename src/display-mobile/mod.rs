@@ -122,6 +122,17 @@ pub(super) struct Mobile {
     pub(super) push_anim: u64,
     /// How the screen that just came in enters, and when it started.
     pub(super) slide: Slide,
+    /// The screen last drawn.
+    pub(super) drawn: Option<Screen>,
+    /// The `push_anim` the last change of screen was worked out for.
+    pub(super) seen_anim: u64,
+    /// On a wide screen, a change between the mailboxes, the list and the
+    /// message moves only the column that changed: which one (none when
+    /// neither did), for this `push_anim`. The screen stays in place.
+    pub(super) pane_slide: Option<(Option<SplitPane>, u64)>,
+    /// A pan from the leading edge on a wide screen, where the screen
+    /// doesn't follow the finger: how far it has gone.
+    pub(super) split_edge: Option<f32>,
     pub(super) slide_at: Option<std::time::Instant>,
     /// A pan that started at the leading edge and hasn't moved yet.
     pub(super) edge_pending: bool,
@@ -137,6 +148,8 @@ pub(super) struct Mobile {
     pub(super) mailboxes_scroll: ScrollHandle,
     pub(super) settings_scroll: ScrollHandle,
     pub(super) sheet_scroll: ScrollHandle,
+    /// The filter chips' sideways scroll.
+    pub(super) filters_scroll: ScrollHandle,
     /// Stands in for the system's insets in tests.
     #[cfg(test)]
     pub(super) fake_insets: Option<Insets>,
@@ -166,6 +179,10 @@ impl Mobile {
             place: None,
             chrome_dark: None,
             push_anim: 0,
+            drawn: None,
+            seen_anim: 0,
+            pane_slide: None,
+            split_edge: None,
             slide: Slide::None,
             slide_at: None,
             edge_pending: false,
@@ -176,6 +193,7 @@ impl Mobile {
             mailboxes_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             sheet_scroll: ScrollHandle::new(),
+            filters_scroll: ScrollHandle::new(),
             #[cfg(test)]
             fake_insets: None,
         }
@@ -219,6 +237,18 @@ pub(super) enum Slide {
     Next,
     Previous,
 }
+
+/// A column of the wide screen's list and message, side by side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitPane {
+    /// The mailboxes or the message list.
+    Leading,
+    /// The open message, or the empty space for one.
+    Reader,
+}
+
+/// How far a pan from the leading edge of a wide screen goes to go back.
+const SPLIT_EDGE: f32 = 80.;
 
 /// Pans starting this close to the leading edge go back.
 const EDGE: f32 = 24.;
@@ -281,6 +311,7 @@ impl MailApp {
         let screen = self.mobile_screen();
         let split = Self::mobile_split(window);
         self.mobile.split = split;
+        self.follow_split_slide(screen);
         let content = match screen {
             Screen::Setup => self.mobile_setup(insets, window, cx),
             Screen::Settings => self.mobile_settings(insets, window, cx),
@@ -337,7 +368,12 @@ impl MailApp {
                     .into_any_element()
             }
             _ => {
-                let kind = self.mobile.slide;
+                // A column moving on its own leaves the screen in place.
+                let kind = if self.mobile_pane_slide().is_some() {
+                    Slide::None
+                } else {
+                    self.mobile.slide
+                };
                 slide
                     .with_animation(
                         ("mobile-push", self.mobile.push_anim),
@@ -643,6 +679,7 @@ impl MailApp {
     /// nothing (a sheet, a composer) over it.
     fn mobile_can_go_back(&self, cx: &App) -> bool {
         !matches!(self.mobile_screen(), Screen::Mailboxes | Screen::Setup)
+            && !self.mobile_split_frame()
             && self.menu.is_none()
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
@@ -680,6 +717,9 @@ impl MailApp {
         let width = f32::from(w.viewport_size().width);
         // For a touch pan, the position is where it started.
         let at_edge = f32::from(e.position.x) <= EDGE;
+        if self.mobile_split_edge_pan(e.touch_phase, at_edge, dx, dy, w, cx) {
+            return;
+        }
         match e.touch_phase {
             TouchPhase::Started if at_edge && self.mobile_can_go_back(cx) => {
                 self.mobile.edge_pending = true;
@@ -999,6 +1039,159 @@ impl MailApp {
         }
     }
 
+    /// The mailboxes, the list or a message, on a wide screen: the list (or
+    /// the mailboxes) and the message side by side.
+    fn split_framed(screen: Screen) -> bool {
+        matches!(screen, Screen::Mailboxes | Screen::List | Screen::Reader)
+    }
+
+    /// Whether the screen shows the list and the message side by side.
+    fn mobile_split_frame(&self) -> bool {
+        self.mobile.split && Self::split_framed(self.mobile_screen())
+    }
+
+    /// Works out, once for each change of screen, whether it stays side by
+    /// side, so only a column moves (and which), not the whole screen:
+    /// closing the message leaves the list where it is.
+    fn follow_split_slide(&mut self, screen: Screen) {
+        let key = self.mobile.push_anim;
+        if self.mobile.seen_anim != key {
+            self.mobile.seen_anim = key;
+            let framed = |s: Screen| self.mobile.split && Self::split_framed(s);
+            self.mobile.pane_slide = match self.mobile.drawn {
+                Some(old) if framed(old) && framed(screen) => Some((
+                    match self.mobile.slide {
+                        Slide::Next | Slide::Previous => Some(SplitPane::Reader),
+                        _ if old == screen => None,
+                        _ if (old == Screen::Reader) != (screen == Screen::Reader) => {
+                            Some(SplitPane::Reader)
+                        }
+                        _ => Some(SplitPane::Leading),
+                    },
+                    key,
+                )),
+                _ => None,
+            };
+        }
+        self.mobile.drawn = Some(screen);
+    }
+
+    /// The column moving on its own for the current change of screen, if
+    /// the screen stays side by side (`Some(None)` when neither changed).
+    fn mobile_pane_slide(&self) -> Option<Option<SplitPane>> {
+        self.mobile
+            .pane_slide
+            .filter(|(_, key)| *key == self.mobile.push_anim)
+            .map(|(pane, _)| pane)
+    }
+
+    /// `content` entering as its column of the wide screen, when it is the
+    /// one that changed: a short slide and fade within the column.
+    fn mobile_pane_motion(&self, pane: SplitPane, content: AnyElement) -> AnyElement {
+        if self.mobile_pane_slide() != Some(Some(pane)) {
+            return content;
+        }
+        let kind = self.mobile.slide;
+        let name = match pane {
+            SplitPane::Leading => "mobile-pane-leading",
+            SplitPane::Reader => "mobile-pane-reader",
+        };
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(content)
+            .with_animation(
+                (name, self.mobile.push_anim),
+                Animation::new(PUSH).with_easing(|t| 1. - (1. - t).powi(3)),
+                move |d, t| match kind {
+                    Slide::None => d,
+                    Slide::Push => d.left(px(48. * (1. - t))).opacity(t),
+                    Slide::Pop => d.left(px(-48. * (1. - t))).opacity(t),
+                    Slide::Next => d.top(px(48. * (1. - t))).opacity(t),
+                    Slide::Previous => d.top(px(-48. * (1. - t))).opacity(t),
+                },
+            )
+            .into_any_element()
+    }
+
+    /// Whether a pan from the leading edge of the wide screen can go back:
+    /// closing the message, or from the list to the mailboxes.
+    fn mobile_split_can_go_back(&self, cx: &App) -> bool {
+        self.mobile_split_frame()
+            && self.mobile_screen() != Screen::Mailboxes
+            && self.menu.is_none()
+            && self.modal.is_none()
+            && self.mobile_composer(cx).is_none()
+            && self.links.confirm.is_none()
+            && !self.selecting
+            && !self.search_open
+    }
+
+    /// On a wide screen, a pan from the leading edge goes back once it has
+    /// gone far enough, without the screen following the finger: only a
+    /// column changes. True when the pan is this one's.
+    fn mobile_split_edge_pan(
+        &mut self,
+        phase: TouchPhase,
+        at_edge: bool,
+        dx: f32,
+        dy: f32,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match phase {
+            TouchPhase::Started if at_edge && self.mobile_split_can_go_back(cx) => {
+                // Undecided until its first movement.
+                self.mobile.split_edge = Some(0.);
+                self.mobile_follow_split_edge(dx, dy, cx)
+            }
+            TouchPhase::Started | TouchPhase::Moved if self.mobile.split_edge.is_some() => {
+                self.mobile_follow_split_edge(dx, dy, cx)
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let Some(x) = self.mobile.split_edge.take() else {
+                    return false;
+                };
+                if x <= 0. {
+                    return false;
+                }
+                cx.stop_propagation();
+                if phase == TouchPhase::Ended && x >= SPLIT_EDGE {
+                    platform::haptic(platform::Haptic::Selection);
+                    self.close(w, cx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Follows a pan from the wide screen's leading edge. Its first
+    /// movement settles it: toward the trailing edge it goes back; anything
+    /// else is left to what is under the finger.
+    fn mobile_follow_split_edge(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) -> bool {
+        let Some(x) = self.mobile.split_edge else {
+            return false;
+        };
+        if x <= 0. {
+            if dx == 0. && dy == 0. {
+                return false;
+            }
+            if !(dx > 0. && dx > dy.abs()) {
+                self.mobile.split_edge = None;
+                return false;
+            }
+            // Nothing under the finger may also take this pan.
+            self.mobile.pan = None;
+            self.mobile.swipe = None;
+        }
+        cx.stop_propagation();
+        self.mobile.split_edge = Some((x + dx).max(f32::MIN_POSITIVE));
+        true
+    }
+
     /// The list and the open message side by side, on a wide screen.
     fn mobile_split_view(
         &mut self,
@@ -1020,6 +1213,7 @@ impl MailApp {
                 cx,
             )
         };
+        let list = self.mobile_pane_motion(SplitPane::Leading, list);
         let reader = if self.selected.is_some() {
             self.mobile_reader(Insets { left: 0., ..insets }, false, window, cx)
         } else {
@@ -1037,6 +1231,7 @@ impl MailApp {
                 .child("No message selected")
                 .into_any_element()
         };
+        let reader = self.mobile_pane_motion(SplitPane::Reader, reader);
         div()
             .size_full()
             .flex()
@@ -1047,9 +1242,17 @@ impl MailApp {
                     .h_full()
                     .border_r_1()
                     .border_color(rgb(c.border))
+                    .overflow_hidden()
                     .child(list),
             )
-            .child(div().flex_1().min_w_0().h_full().child(reader))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(reader),
+            )
             .into_any_element()
     }
 }

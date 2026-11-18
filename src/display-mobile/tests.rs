@@ -950,3 +950,132 @@ fn accounts_sort_by_dragging_their_handles(cx: &mut TestAppContext) {
     let second: &'static str = Box::leak(format!("mobile-account-{}", after[1]).into_boxed_str());
     assert!(bounds(cx, first).top() < bounds(cx, second).top());
 }
+
+#[gpui::test]
+fn going_back_beside_the_list_moves_only_the_column_that_changes(cx: &mut TestAppContext) {
+    let (view, cx) = phone(TABLET, cx);
+    let id = first_message(&view, cx);
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::Select(id.clone()), w, cx)
+    });
+    // Opening the message: only the reader's column comes in.
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    let list = bounds(cx, "mobile-list");
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    // Back closes the message; the list stays where it is.
+    act(&view, Action::Close, cx);
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::List);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    assert_eq!(
+        cx.debug_bounds("mobile-screen").map(|b| b.origin),
+        Some(point(px(0.), px(0.))),
+        "the whole screen moved"
+    );
+    assert_eq!(cx.debug_bounds("mobile-list"), Some(list));
+    // An edge swipe goes back too, without dragging the screen along.
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::Select(id.clone()), w, cx)
+    });
+    settle(cx);
+    let at = point(px(4.), px(400.));
+    for (dx, phase) in [
+        (12., TouchPhase::Started),
+        (60., TouchPhase::Moved),
+        (40., TouchPhase::Moved),
+    ] {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+        view.read_with(cx, |this, _| {
+            assert!(
+                this.mobile.back_drag.is_none(),
+                "the screen follows the finger"
+            );
+            assert!(this.mobile.swipe.is_none(), "a row swipes");
+        });
+    }
+    assert_eq!(screen(&view, cx), Screen::Reader, "back before letting go");
+    cx.simulate_event(ScrollEvent {
+        position: at,
+        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Ended,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::List);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    // A short one doesn't.
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::Select(id.clone()), w, cx)
+    });
+    settle(cx);
+    for (dx, phase) in [(10., TouchPhase::Started), (0., TouchPhase::Ended)] {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+    }
+    assert_eq!(screen(&view, cx), Screen::Reader);
+}
+
+#[gpui::test]
+fn the_filter_chips_fade_where_more_are_scrolled_past(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    // At the start: more to the trailing side only.
+    assert!(!shown(cx, "mobile-filters-fade-leading"));
+    assert!(shown(cx, "mobile-filters-fade-trailing"));
+    let row = bounds(cx, "mobile-filters");
+    let fade = bounds(cx, "mobile-filters-fade-trailing");
+    assert_eq!(fade.right(), row.right());
+    let max = view.read_with(cx, |this, _| this.mobile.filters_scroll.max_offset().x);
+    assert!(max > px(0.), "the chips don't overflow a phone");
+    // Partway: both sides.
+    view.update(cx, |this, cx| {
+        this.mobile
+            .filters_scroll
+            .set_offset(point(-max / 2., px(0.)));
+        cx.notify();
+    });
+    assert!(shown(cx, "mobile-filters-fade-leading"));
+    assert!(shown(cx, "mobile-filters-fade-trailing"));
+    // At the end: the leading side only.
+    view.update(cx, |this, cx| {
+        this.mobile.filters_scroll.set_offset(point(-max, px(0.)));
+        cx.notify();
+    });
+    assert!(shown(cx, "mobile-filters-fade-leading"));
+    assert!(!shown(cx, "mobile-filters-fade-trailing"));
+    assert_eq!(bounds(cx, "mobile-filters-fade-leading").left(), row.left());
+    // The fades take no taps: the chip under one still turns on.
+    let fade = bounds(cx, "mobile-filters-fade-leading");
+    let at = point(fade.center().x, row.center().y);
+    let (filter, chip) = [
+        (Filter::Unread, "mobile-filter-unread"),
+        (Filter::Starred, "mobile-filter-starred"),
+        (Filter::Attachments, "mobile-filter-attachments"),
+    ]
+    .into_iter()
+    .find(|(_, chip)| cx.debug_bounds(chip).is_some_and(|b| b.contains(&at)))
+    .expect("a chip under the fade");
+    cx.simulate_click(at, Modifiers::none());
+    assert!(
+        view.read_with(cx, |this, _| this.filter_by == filter),
+        "{chip} under the fade didn't turn on"
+    );
+}

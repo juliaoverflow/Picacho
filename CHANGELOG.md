@@ -51,6 +51,12 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Phones and tablets: the filter chips over the message list fade out at an
+  edge with more chips scrolled past it.
+- Tablets: with the list and a message side by side, going back (Back, the
+  back button or an edge swipe) only moves the column that changes; closing
+  the message no longer slides the whole screen. Opening a message, and the
+  next or previous one, likewise moves only the message's column.
 - Tapping a notification opens what it tells of: new mail opens the message
   in its mailbox, mail back from snooze the inbox (or the message), a sent or
   failed scheduled message Sent or Drafts. On Android it did nothing; on Linux
