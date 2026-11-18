@@ -45,6 +45,9 @@ impl Backend {
         if a.provider == Provider::Proton {
             return self.search_proton(a, mailbox, query, limit);
         }
+        if a.provider == Provider::Jmap {
+            return self.search_jmap(a, mailbox, query, limit);
+        }
         self.with_imap(a, |c| {
             let names = c.names(false)?.to_vec();
             let starred = mailbox.folder() == Folder::Starred;

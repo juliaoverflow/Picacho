@@ -85,6 +85,15 @@ impl Backend {
     /// Sends queued changes to Proton, oldest first, as `replay_offline`
     /// does for IMAP. Callers hold the lock.
     pub(super) fn replay_offline_proton(&self, a: &Account) -> Result<()> {
+        self.replay_offline_with(a, |mails, change| self.change_proton(a, mails, change))
+    }
+    /// Sends queued changes with `apply` (an API's own change), oldest
+    /// first. Callers hold the lock.
+    pub(super) fn replay_offline_with(
+        &self,
+        a: &Account,
+        apply: impl Fn(&[Mail], &Change) -> Result<()>,
+    ) -> Result<()> {
         let mut queue = self.queued_changes(&a.id);
         if queue.is_empty() {
             return Ok(());
@@ -95,7 +104,7 @@ impl Backend {
                 queue.remove(0);
                 continue;
             }
-            match self.change_proton(a, &next.mails, &next.change) {
+            match apply(&next.mails, &next.change) {
                 Ok(()) => {
                     queue.remove(0);
                 }
@@ -104,7 +113,7 @@ impl Backend {
                     return Err(e);
                 }
                 // A message or folder that's gone: the change can't be made
-                // as it was. The next sync shows Proton's state.
+                // as it was. The next sync shows the server's state.
                 Err(_) => {
                     queue.remove(0);
                 }

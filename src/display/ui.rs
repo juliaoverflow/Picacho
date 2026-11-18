@@ -657,6 +657,8 @@ enum Action {
     SubmitReconnect(String),
     SettingsPage(Page),
     SetAppearance(Appearance),
+    /// Signs in to the JMAP server in the form in the browser (OAuth).
+    JmapBrowser,
     SetAccent(Accent),
     SetSync(String, SyncSettings),
     SetReadingDefaults(ReadingOptions),
@@ -3379,8 +3381,9 @@ impl MailApp {
         let folder = mailbox.folder();
         let fetchable = match a.provider {
             Provider::Pop3 => folder == Folder::Inbox,
-            // Proton lists Starred and All Mail as labels of their own.
-            Provider::Proton => true,
+            // Proton lists Starred and All Mail as labels of their own, and
+            // JMAP asks for them as queries.
+            Provider::Proton | Provider::Jmap => true,
             _ => !matches!(folder, Folder::Starred | Folder::All),
         };
         if self.subs_open || !fetchable || folder == Folder::Drafts {
@@ -4566,9 +4569,16 @@ impl MailApp {
                 this.discovering = false;
                 // A known service, such as a Google Workspace domain, gets
                 // that service's sign-in.
-                let service = match found.as_ref().map(|f| f.provider) {
-                    Some(Provider::Gmail) => Service::Gmail,
-                    Some(Provider::Outlook) => Service::Outlook,
+                let service = match found.as_ref() {
+                    Some(f) if f.provider == Provider::Gmail => Service::Gmail,
+                    Some(f) if f.provider == Provider::Outlook => Service::Outlook,
+                    // Fastmail, and custom domains at Fastmail.
+                    Some(f)
+                        if f.provider == Provider::Jmap
+                            && f.incoming_host == crate::sync::oauth::FASTMAIL_JMAP =>
+                    {
+                        Service::Fastmail
+                    }
                     _ => Service::Other,
                 };
                 if service != Service::Other {
@@ -4597,13 +4607,15 @@ impl MailApp {
         cx.notify();
     }
     fn set_protocol(&mut self, p: Provider, w: &mut Window, cx: &mut Context<Self>) {
-        let (old, new) = if p == Provider::Pop3 {
-            ("993", "995")
-        } else {
-            ("995", "993")
+        let port = |p: Provider| match p {
+            Provider::Pop3 => "995",
+            Provider::Jmap => "443",
+            _ => "993",
         };
-        if Self::value(&self.form[IMAP_PORT], cx).trim() == old {
-            Self::set(&self.form[IMAP_PORT], new, w, cx);
+        // The usual port follows the protocol, unless one was typed.
+        let current = Self::value(&self.form[IMAP_PORT], cx);
+        if current.trim().is_empty() || ["993", "995", "443"].contains(&current.trim()) {
+            Self::set(&self.form[IMAP_PORT], port(p), w, cx);
         }
         self.provider = p;
         self.oauth = false;
@@ -4616,8 +4628,15 @@ impl MailApp {
         let mut a = match self.service.sign_in() {
             SignIn::Pinal => Service::Pinal.account("").unwrap(),
             SignIn::Browser => {
-                let mut a = Account::new(self.service.provider());
-                let client = crate::sync::oauth::client(a.provider);
+                let mut a = self
+                    .service
+                    .account(&email)
+                    .unwrap_or_else(|| Account::new(self.service.provider()));
+                let client = if a.provider == Provider::Jmap {
+                    crate::sync::oauth::jmap_client(&a)
+                } else {
+                    crate::sync::oauth::client(a.provider)
+                };
                 a.oauth = true;
                 a.client_id = client.id;
                 a.client_secret = client.secret;
@@ -4637,6 +4656,16 @@ impl MailApp {
                     a.smtp_host = value(SMTP_HOST);
                     a.smtp_port = value(SMTP_PORT).parse().unwrap_or(0);
                     a.username = value(LOGIN);
+                    // JMAP sends through the server it reads from.
+                    if a.provider == Provider::Jmap {
+                        a.smtp_host = a.incoming_host.clone();
+                        a.smtp_port = a.incoming_port;
+                    }
+                }
+                // A JMAP server's own browser sign-in, chosen in the form.
+                if a.provider == Provider::Jmap && self.oauth {
+                    a.oauth = true;
+                    a.client_id = crate::sync::oauth::jmap_client(&a).id;
                 }
                 a
             }
@@ -4669,7 +4698,7 @@ impl MailApp {
                 self.notice(e.to_string(), true, cx);
                 return;
             }
-            if password.is_empty() {
+            if password.is_empty() && !a.oauth {
                 self.notice(
                     format!(
                         "Enter your {}.",
@@ -5772,6 +5801,14 @@ impl MailApp {
             Action::Protocol(p) => {
                 if !self.connecting {
                     self.set_protocol(p, w, cx)
+                }
+            }
+            Action::JmapBrowser => {
+                if !self.connecting && self.provider == Provider::Jmap {
+                    // For this sign-in only: the form keeps its password.
+                    self.oauth = true;
+                    self.connect(cx);
+                    self.oauth = false;
                 }
             }
             Action::SubmitAccount => {
@@ -7997,7 +8034,7 @@ impl MailApp {
                     div()
                         .flex()
                         .gap_2()
-                        .children([Provider::Imap, Provider::Pop3].map(|p| {
+                        .children([Provider::Imap, Provider::Pop3, Provider::Jmap].map(|p| {
                             self.button(
                                 format!("protocol-{}", p.label()),
                                 p.label(),
@@ -8023,17 +8060,39 @@ impl MailApp {
                     div()
                         .flex()
                         .gap_3()
-                        .child(self.field("Incoming server", IMAP_HOST))
+                        .child(self.field(
+                            if self.provider == Provider::Jmap {
+                                "JMAP server"
+                            } else {
+                                "Incoming server"
+                            },
+                            IMAP_HOST,
+                        ))
                         .child(div().w(px(80.)).child(self.field("Port", IMAP_PORT))),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(self.field("SMTP server", SMTP_HOST))
-                        .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
-                )
-                .child(self.field("Sign-in name, if not the email address", LOGIN));
+                // JMAP sends through the same server.
+                .when(self.provider != Provider::Jmap, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(self.field("SMTP server", SMTP_HOST))
+                            .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
+                    )
+                })
+                .child(self.field("Sign-in name, if not the email address", LOGIN))
+                .when(self.provider == Provider::Jmap, |d| {
+                    d.child(notice_box(
+                        "Some JMAP services, such as Fastmail, want an API token with mail access as the password.",
+                        c,
+                    ))
+                    .child(div().flex().child(self.link(
+                        "jmap-browser",
+                        "Sign in with the browser instead",
+                        Action::JmapBrowser,
+                        cx,
+                    )))
+                });
         }
         if let Some(why) = self.service.browser_unavailable() {
             content = content.child(notice_box(why, c));
@@ -10580,6 +10639,18 @@ mod tests {
             assert!(this.step == Step::Credentials);
             assert!(this.service == Service::Gmail && !this.manual);
             assert_eq!(MailApp::value(&this.form[IMAP_HOST], cx), "imap.gmail.com");
+        });
+        act(&view, Action::SetupBack, cx);
+        // A Fastmail address gets Fastmail, over JMAP.
+        act(&view, Action::ChooseService(Service::Other), cx);
+        type_email(&view, "someone@fastmail.com", cx);
+        act(&view, Action::Discover, cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.service == Service::Fastmail && this.provider == Provider::Jmap);
+            let a = this.setup_account(cx);
+            assert_eq!(a.provider, Provider::Jmap);
+            assert_eq!(a.incoming_host, "api.fastmail.com");
+            assert!(a.validate().is_ok());
         });
         act(&view, Action::SetupBack, cx);
         view.read_with(cx, |this, _| assert!(this.step == Step::Provider));

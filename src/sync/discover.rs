@@ -1,6 +1,10 @@
 //! Finds server settings from an email address, following the order used by
 //! Thunderbird: the provider's own autoconfig file, the public ISPDB, the
 //! domain's MX records, and finally well-known hostnames.
+//!
+//! JMAP (RFC 8620 §2.2) comes first where the domain names a JMAP server
+//! itself, with an `_jmap._tcp` SRV record; a domain that only answers at
+//! `/.well-known/jmap` is used when nothing else is found.
 use crate::manage::model::{Account, Provider};
 use std::{
     io::Read,
@@ -17,6 +21,16 @@ pub struct Settings {
     pub smtp_port: u16,
 }
 impl Settings {
+    /// A JMAP server, which sends mail too.
+    fn jmap(host: &str, port: u16) -> Self {
+        Self {
+            provider: Provider::Jmap,
+            incoming_host: host.to_owned(),
+            incoming_port: port,
+            smtp_host: host.to_owned(),
+            smtp_port: port,
+        }
+    }
     fn hosted(provider: Provider) -> Self {
         let a = Account::new(provider);
         Self {
@@ -47,6 +61,8 @@ pub fn discover(email: &str) -> Option<Settings> {
     }
     let domain = domain.as_str();
     std::thread::scope(|s| {
+        let srv = s.spawn(|| jmap_srv(domain));
+        let well_known = s.spawn(|| jmap_well_known(domain));
         let direct = [
             format!("https://autoconfig.{domain}/mail/config-v1.1.xml"),
             format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml"),
@@ -54,6 +70,10 @@ pub fn discover(email: &str) -> Option<Settings> {
         ]
         .map(|url| s.spawn(move || fetch_config(&url, domain)));
         let mx = s.spawn(|| mx_host(domain));
+        // The domain names its JMAP server: that is what it wants used.
+        if let Ok(Some(found)) = srv.join() {
+            return Some(found);
+        }
         for job in direct {
             if let Ok(Some(found)) = job.join() {
                 return Some(found);
@@ -71,8 +91,74 @@ pub fn discover(email: &str) -> Option<Settings> {
                 }
             }
         }
+        if let Ok(Some(found)) = well_known.join() {
+            return Some(found);
+        }
         probe(domain)
     })
+}
+
+/// The JMAP server a domain's `_jmap._tcp` SRV record names.
+fn jmap_srv(domain: &str) -> Option<Settings> {
+    let (host, port) = crate::sync::auth::srv(&format!("_jmap._tcp.{domain}"))
+        .ok()?
+        .into_iter()
+        .next()?;
+    Some(Settings::jmap(&host, port))
+}
+
+/// Whether the domain's web server answers as a JMAP server would, before
+/// signing in: a session resource that wants credentials (401 with a Basic
+/// or Bearer challenge), or a redirect to one on another host (Fastmail's
+/// sends `fastmail.com` on to `api.fastmail.com`).
+fn jmap_well_known(domain: &str) -> Option<Settings> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("https://{domain}/.well-known/jmap"))
+        .send()
+        .ok()?;
+    jmap_answer(
+        domain,
+        response.status().as_u16(),
+        response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+/// The JMAP server an unauthenticated `/.well-known/jmap` answer shows.
+fn jmap_answer(
+    domain: &str,
+    status: u16,
+    challenge: Option<&str>,
+    location: Option<&str>,
+) -> Option<Settings> {
+    match status {
+        401 => {
+            let challenge = challenge?.to_ascii_lowercase();
+            (challenge.starts_with("basic") || challenge.starts_with("bearer"))
+                .then(|| Settings::jmap(domain, 443))
+        }
+        301 | 302 | 307 | 308 => {
+            let base = url::Url::parse(&format!("https://{domain}/.well-known/jmap")).ok()?;
+            let next = base.join(location?).ok()?;
+            (next.scheme() == "https" && next.path().contains("jmap")).then(|| {
+                Settings::jmap(
+                    next.host_str().unwrap_or(domain),
+                    next.port().unwrap_or(443),
+                )
+            })
+        }
+        _ => None,
+    }
 }
 
 fn ispdb(domain: &str) -> String {
@@ -84,10 +170,14 @@ fn known(domain: &str) -> Option<Settings> {
         .iter()
         .any(|p| domain.starts_with(p) && domain.matches('.').count() <= 2)
         || domain == "msn.com";
+    let fastmail = (domain.starts_with("fastmail.") && domain.matches('.').count() <= 2)
+        || domain == "messagingengine.com";
     if matches!(domain, "gmail.com" | "googlemail.com") {
         Some(Settings::hosted(Provider::Gmail))
     } else if microsoft {
         Some(Settings::hosted(Provider::Outlook))
+    } else if fastmail {
+        Some(Settings::jmap(crate::sync::oauth::FASTMAIL_JMAP, 443))
     } else {
         None
     }
@@ -99,6 +189,9 @@ fn known_mx(mx: &str) -> Option<Settings> {
         Some(Settings::hosted(Provider::Gmail))
     } else if mx.ends_with(".outlook.com") {
         Some(Settings::hosted(Provider::Outlook))
+    } else if mx.ends_with(".messagingengine.com") {
+        // A custom domain at Fastmail.
+        Some(Settings::jmap(crate::sync::oauth::FASTMAIL_JMAP, 443))
     } else {
         None
     }
@@ -365,6 +458,39 @@ mod tests {
             base_domains("mx1.mail.example.co.uk"),
             ["co.uk", "example.co.uk"]
         );
+    }
+
+    #[test]
+    fn finds_fastmail_and_jmap_servers() {
+        let fastmail = Settings::jmap("api.fastmail.com", 443);
+        assert_eq!(known("fastmail.com"), Some(fastmail.clone()));
+        assert_eq!(known("fastmail.fm"), Some(fastmail.clone()));
+        assert_eq!(
+            known_mx("in1-smtp.messagingengine.com"),
+            Some(fastmail.clone())
+        );
+        assert!(known("notfastmail.com").is_none());
+        // A session that wants credentials, or a redirect to one.
+        assert_eq!(
+            jmap_answer("mail.example.com", 401, Some("Basic realm=\"jmap\""), None),
+            Some(Settings::jmap("mail.example.com", 443))
+        );
+        assert_eq!(jmap_answer("example.com", 401, None, None), None);
+        assert_eq!(
+            jmap_answer(
+                "fastmail.com",
+                307,
+                None,
+                Some("https://api.fastmail.com/jmap/session")
+            ),
+            Some(fastmail)
+        );
+        // A web site's ordinary redirect isn't a JMAP server.
+        assert_eq!(
+            jmap_answer("example.com", 301, None, Some("https://www.example.com/")),
+            None
+        );
+        assert_eq!(jmap_answer("example.com", 404, None, None), None);
     }
 }
 

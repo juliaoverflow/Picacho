@@ -80,6 +80,13 @@ impl Backend {
             }
             return;
         }
+        if a.provider == Provider::Jmap {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_jmap_watch(a, Arc::new(changed)) {
+                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+            }
+            return;
+        }
         // POP3 has no IDLE: its mail is checked on a timer.
         if !a.provider.imap() {
             return;
@@ -267,6 +274,115 @@ impl Backend {
             for b in boxes {
                 changed(b);
             }
+        }
+    }
+    /// JMAP: the server's event source stands in for IDLE (or, where it has
+    /// none, asking for changes every minute). One watcher per account
+    /// hears about every mailbox, so no folder needs one of its own.
+    fn spawn_jmap_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(true)),
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("jmap-events-{}", a.id))
+            .spawn(move || {
+                let mut retry = FIRST_RETRY;
+                while !stop.load(Ordering::Acquire) {
+                    let mut watched = false;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend.jmap_events(&a, &stop, &*changed, &mut watched)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("JMAP's events failed")));
+                    let Err(error) = outcome else {
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if watched {
+                        retry = FIRST_RETRY;
+                    }
+                    let wait = if error.downcast_ref::<AccessFailure>().is_some() {
+                        LONGEST_RETRY
+                    } else {
+                        retry
+                    };
+                    retry = (retry * 2).min(LONGEST_RETRY);
+                    let until = std::time::Instant::now() + wait;
+                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    // Mail may have arrived while the watch was down.
+                    if !stop.load(Ordering::Acquire) {
+                        changed(Mailbox::Standard(Folder::Inbox));
+                    }
+                }
+            });
+        spawned.ok().map(|_| watcher)
+    }
+    /// Follows a JMAP account's changes until `stop`, saying which
+    /// mailboxes changed. Like IDLE, it only notices: the regular check
+    /// syncs. Returns only with an error (or once stopped).
+    fn jmap_events(
+        &self,
+        a: &Account,
+        stop: &AtomicBool,
+        changed: &(dyn Fn(Mailbox) + Send + Sync),
+        watched: &mut bool,
+    ) -> Result<()> {
+        let mut since = self.with_jmap(a, |s| s.state())?;
+        *watched = true;
+        let tell = |since: &mut String| -> Result<()> {
+            let (boxes, next) = self.with_jmap(a, |s| self.jmap_changed_mailboxes(a, s, since))?;
+            if !next.is_empty() {
+                *since = next;
+            }
+            if !stop.load(Ordering::Acquire) {
+                for b in boxes {
+                    changed(b);
+                }
+            }
+            Ok(())
+        };
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let pushes = self.with_jmap(a, |s| Ok(s.pushes()))?;
+            let wait = if pushes {
+                let started = std::time::Instant::now();
+                self.with_jmap(a, |s| s.listen(stop, &mut || tell(&mut since)))?;
+                // A stream the server keeps ending at once isn't reopened
+                // in a hurry.
+                if started.elapsed() < Duration::from_secs(10) {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::ZERO
+                }
+            } else {
+                Duration::from_secs(60)
+            };
+            {
+                let until = std::time::Instant::now() + wait;
+                while std::time::Instant::now() < until {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // The stream ended, or a minute passed: something may have
+            // changed meanwhile.
+            tell(&mut since)?;
         }
     }
     fn spawn_watch(

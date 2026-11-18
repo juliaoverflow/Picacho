@@ -394,6 +394,50 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
     })
 }
 
+/// A service's SRV records (RFC 2782), such as `_jmap._tcp.<domain>`:
+/// (target, port), the most preferred first. Empty when there are none or
+/// the record says the service isn't offered (a target of ".").
+pub(crate) fn srv(name: &str) -> anyhow::Result<Vec<(String, u16)>> {
+    use anyhow::Context as _;
+    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
+    let checker = checker().context("DNS isn't available")?;
+    checker.runtime.block_on(async {
+        tokio::time::timeout(TIMEOUT, async {
+            let found = match checker
+                .authenticator
+                .resolver()
+                .lookup(name, RecordType::SRV)
+                .await
+            {
+                Ok(found) => found,
+                Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(vec![]),
+                Err(e) => anyhow::bail!("{e}"),
+            };
+            let mut records: Vec<(u16, u16, String, u16)> = found
+                .answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::SRV(s) => Some((
+                        s.priority,
+                        u16::MAX - s.weight,
+                        s.target
+                            .to_ascii()
+                            .trim_end_matches('.')
+                            .to_ascii_lowercase(),
+                        s.port,
+                    )),
+                    _ => None,
+                })
+                .filter(|(.., target, port)| !target.is_empty() && *port > 0)
+                .collect();
+            records.sort();
+            Ok(records.into_iter().map(|(.., t, p)| (t, p)).collect())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+    })
+}
+
 /// How long ago, in seconds, a message says it was written.
 fn age(raw: &[u8]) -> Option<i64> {
     use mailparse::MailHeaderMap;

@@ -6,6 +6,7 @@ pub(crate) mod fido;
 pub mod forwarding;
 mod imap;
 mod imap_ext;
+pub(crate) mod jmap;
 pub mod mime;
 pub mod models;
 pub(crate) mod mta_sts;

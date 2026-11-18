@@ -58,6 +58,149 @@ pub fn client(provider: Provider) -> Client {
 pub fn configured(provider: Provider) -> bool {
     !client(provider).id.is_empty()
 }
+/// Fastmail's JMAP server, whose browser sign-in needs the app's own
+/// registration with Fastmail.
+pub const FASTMAIL_JMAP: &str = "api.fastmail.com";
+/// The app's registration with Fastmail, if this build has one.
+pub fn fastmail() -> Client {
+    Client {
+        id: setting(
+            "PICACHO_FASTMAIL_CLIENT_ID",
+            option_env!("PICACHO_FASTMAIL_CLIENT_ID"),
+        ),
+        secret: String::new(),
+    }
+}
+/// The app's own registration for a JMAP account's server, if there is
+/// one: Fastmail's. Other servers register Picacho when it signs in
+/// (RFC 7591), where they allow that.
+pub fn jmap_client(account: &Account) -> Client {
+    if account.incoming_host.eq_ignore_ascii_case(FASTMAIL_JMAP) {
+        fastmail()
+    } else {
+        Client {
+            id: String::new(),
+            secret: String::new(),
+        }
+    }
+}
+
+/// A JMAP server's OAuth endpoints (RFC 8414 metadata).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Metadata {
+    pub authorization: String,
+    pub token: String,
+    pub registration: Option<String>,
+    pub scopes: Vec<String>,
+}
+/// Reads a server's metadata document, keeping only https endpoints.
+pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
+    let https = |key: &str| -> Option<String> {
+        let u = v[key].as_str()?;
+        let parsed = url::Url::parse(u).ok()?;
+        (parsed.scheme() == "https" || cfg!(test)).then(|| u.to_owned())
+    };
+    Ok(Metadata {
+        authorization: https("authorization_endpoint")
+            .context("The server's sign-in settings have no https authorization endpoint.")?,
+        token: https("token_endpoint")
+            .context("The server's sign-in settings have no https token endpoint.")?,
+        registration: https("registration_endpoint"),
+        scopes: v["scopes_supported"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_owned))
+            .collect(),
+    })
+}
+/// The scopes to ask a JMAP server for: JMAP's own (mail, sending,
+/// filters) and a refresh token, among those it lists, or JMAP's when it
+/// lists none.
+pub fn jmap_scopes(supported: &[String]) -> String {
+    use crate::sync::jmap::{CORE, MAIL, SIEVE, SUBMISSION};
+    if supported.is_empty() {
+        return [CORE, MAIL, SUBMISSION].join(" ");
+    }
+    [
+        CORE,
+        MAIL,
+        SUBMISSION,
+        SIEVE,
+        "offline_access",
+        "openid",
+        "email",
+    ]
+    .into_iter()
+    .filter(|s| supported.iter().any(|x| x == s))
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+/// A JMAP server's OAuth metadata, from the server itself
+/// (`/.well-known/oauth-authorization-server`, else OpenID Connect's
+/// configuration), kept for the session.
+pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
+    static KNOWN: Mutex<Vec<(String, Metadata)>> = Mutex::new(Vec::new());
+    let origin = if port == 443 || port == 0 {
+        format!("https://{host}")
+    } else {
+        format!("https://{host}:{port}")
+    };
+    if let Some((_, m)) = KNOWN.lock().unwrap().iter().find(|(o, _)| *o == origin) {
+        return Ok(m.clone());
+    }
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut last = None;
+    for path in [
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
+    ] {
+        let found = http
+            .get(format!("{origin}{path}"))
+            .header("Accept", "application/json")
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<serde_json::Value>());
+        match found {
+            Ok(v) => {
+                let m = parse_metadata(&v)?;
+                KNOWN.lock().unwrap().push((origin, m.clone()));
+                return Ok(m);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "{host} doesn't offer browser sign-in for mail apps{}. Use a password or an API token instead.",
+        last.map(|e| format!(" ({e})")).unwrap_or_default()
+    ))
+}
+/// Registers Picacho with a server that allows apps to (RFC 7591), for
+/// `redirect`: a public client, without a secret (RFC 8252).
+fn register(endpoint: &str, redirect: &str) -> Result<String> {
+    let v: serde_json::Value = http()?
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "client_name": "Picacho",
+            "application_type": "native",
+            "redirect_uris": [redirect],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        }))
+        .send()
+        .context("Couldn't reach the server to register Picacho for sign-in.")?
+        .error_for_status()
+        .context("The server didn't register Picacho for browser sign-in.")?
+        .json()?;
+    Ok(v["client_id"]
+        .as_str()
+        .context("The server registered Picacho without a client id.")?
+        .to_owned())
+}
 fn pinal_accounts() -> String {
     let origin = setting(
         "PICACHO_PINAL_ACCOUNTS",
@@ -369,6 +512,10 @@ pub struct Grant {
     code: String,
     redirect: String,
     verifier: String,
+    /// JMAP: the client the server knows Picacho by (registered for this
+    /// sign-in, or the app's own), and where the code is redeemed.
+    pub client_id: String,
+    token: String,
 }
 impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -379,6 +526,9 @@ impl std::fmt::Debug for Grant {
 /// Signs in to Gmail or Outlook in the browser. The account's email may be
 /// empty: the provider's ID token says which account was chosen.
 pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
+    if account.provider == Provider::Jmap {
+        return authorize_jmap(account, cancel);
+    }
     let microsoft = account.provider == Provider::Outlook;
     let browser = Browser::new(if microsoft { "localhost" } else { "127.0.0.1" }, "/")?;
     let (auth, _, scope) = endpoints(account.provider);
@@ -408,6 +558,54 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         code,
         redirect: browser.redirect.clone(),
         verifier: browser.verifier.clone(),
+        client_id: account.client_id.clone(),
+        token: String::new(),
+    })
+}
+
+/// Signs in to a JMAP server in the browser, with the endpoints its
+/// metadata names: as the app's own registration where there is one
+/// (Fastmail), else registered for this sign-in.
+fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
+    let metadata = jmap_metadata(&account.incoming_host, account.incoming_port)?;
+    let browser = Browser::new("127.0.0.1", "/callback")?;
+    let own = jmap_client(account);
+    let client_id = if !own.id.is_empty() {
+        own.id
+    } else if let Some(endpoint) = &metadata.registration {
+        register(endpoint, &browser.redirect)?
+    } else if !account.client_id.is_empty() {
+        account.client_id.clone()
+    } else {
+        bail!(
+            "{} doesn't let mail apps sign in in the browser without registering them first. Use a password or an API token instead.",
+            account.incoming_host
+        );
+    };
+    let mut url = url::Url::parse(&metadata.authorization)?;
+    let scope = jmap_scopes(&metadata.scopes);
+    url.query_pairs_mut().extend_pairs([
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", &browser.redirect),
+        ("response_type", "code"),
+        ("state", &browser.state),
+        ("code_challenge", &browser.challenge),
+        ("code_challenge_method", "S256"),
+    ]);
+    if !scope.is_empty() {
+        url.query_pairs_mut().append_pair("scope", &scope);
+    }
+    if !account.email.is_empty() {
+        url.query_pairs_mut()
+            .append_pair("login_hint", &account.email);
+    }
+    let code = browser.code(&url, &cancel)?;
+    Ok(Grant {
+        code,
+        redirect: browser.redirect.clone(),
+        verifier: browser.verifier.clone(),
+        client_id,
+        token: metadata.token,
     })
 }
 
@@ -415,9 +613,19 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
 /// provider rejection (`AccessFailure::Authentication`) means the code is
 /// spent; any other failure may be retried with the same grant.
 pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
-    let (_, token, _) = endpoints(account.provider);
+    let jmap = account.provider == Provider::Jmap;
+    let token = if jmap {
+        grant.token.as_str()
+    } else {
+        endpoints(account.provider).1
+    };
+    let client_id = if jmap {
+        grant.client_id.as_str()
+    } else {
+        account.client_id.as_str()
+    };
     let mut fields = vec![
-        ("client_id", account.client_id.as_str()),
+        ("client_id", client_id),
         ("code", &grant.code),
         ("redirect_uri", &grant.redirect),
         ("grant_type", "authorization_code"),
@@ -600,7 +808,14 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
                 .context(crate::manage::status::AccessFailure::Authentication),
         );
     }
-    let (_, token, scope) = endpoints(account.provider);
+    let jmap_token;
+    let (token, scope) = if account.provider == Provider::Jmap {
+        jmap_token = jmap_metadata(&account.incoming_host, account.incoming_port)?.token;
+        (jmap_token.as_str(), "")
+    } else {
+        let (_, token, scope) = endpoints(account.provider);
+        (token, scope)
+    };
     let mut fields = vec![
         ("client_id", account.client_id.as_str()),
         ("refresh_token", &secret.refresh_token),
@@ -624,6 +839,38 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jmap_servers_name_their_endpoints_and_scopes() {
+        let m = parse_metadata(&serde_json::json!({
+            "issuer": "https://mail.example.com",
+            "authorization_endpoint": "https://mail.example.com/authorize",
+            "token_endpoint": "https://mail.example.com/token",
+            "registration_endpoint": "https://mail.example.com/register",
+            "scopes_supported": ["offline_access", "urn:ietf:params:jmap:mail", "other"],
+        }))
+        .unwrap();
+        assert_eq!(m.token, "https://mail.example.com/token");
+        assert_eq!(
+            m.registration.as_deref(),
+            Some("https://mail.example.com/register")
+        );
+        assert_eq!(
+            jmap_scopes(&m.scopes),
+            "urn:ietf:params:jmap:mail offline_access"
+        );
+        // None listed: JMAP's own.
+        assert_eq!(
+            jmap_scopes(&[]),
+            "urn:ietf:params:jmap:core urn:ietf:params:jmap:mail urn:ietf:params:jmap:submission"
+        );
+        assert!(parse_metadata(&serde_json::json!({ "token_endpoint": "x" })).is_err());
+        // Fastmail's server uses the app's own registration.
+        let mut a = Account::new(Provider::Jmap);
+        a.incoming_host = "API.fastmail.com".into();
+        assert_eq!(jmap_client(&a).id, fastmail().id);
+        a.incoming_host = "mail.example.com".into();
+        assert!(jmap_client(&a).id.is_empty());
+    }
     #[test]
     fn pkce_is_url_safe_and_correct_length() {
         let v = random_url_token();
