@@ -235,7 +235,7 @@ arboard = { version = "3.7", default-features = false, features = ["wayland-data
 [target.'cfg(target_os = "android")'.dependencies]
 # GPUI's Android platform: the window, input, text and wgpu renderer.
 # `vibration`: haptic feedback for the phone presentation's gestures.
-gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android", default-features = false, features = ["vibration"] }
+gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev", default-features = false, features = ["vibration"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 log = "0.4"
@@ -261,7 +261,7 @@ async-trait = "0.1"
 # GPUI's iOS platform: the UIKit window, touch and keyboard input, Core Text
 # and the wgpu (Metal) renderer. The Xcode host app is packaging/ios.
 # `vibration`: haptic feedback for the phone presentation's gestures.
-gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android", default-features = false, features = ["vibration"] }
+gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev", default-features = false, features = ["vibration"] }
 log = "0.4"
 # keyring's own Entry has no iOS store; credentials go to the app's
 # Keychain (Protected Data) through keyring-core directly (manage/store.rs).
@@ -305,14 +305,14 @@ libc = "0.2"
 # After changing that repository, run `cargo update -p gpui` to use it here.
 # An email's unresolvable image or link address no longer panics; text in
 # padded inline blocks and centered cells is hit (selected, clicked) where shown.
-blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
+blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Inline boxes paint gradient backgrounds (emails' dark styles).
-blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
+blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # ToCss error inference with GPUI's log/serde feature.
-stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
+stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,
 # BINARY, ESEARCH, SORT, THREAD and QRESYNC's VANISHED (its patch 0004).
-imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
+imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Maximized windows' content is no longer a resize edge.
-gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "gpui-pre-android" }
+gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 
