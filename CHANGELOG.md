@@ -13,6 +13,13 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Messages drag onto the sidebar's mailboxes to move them there (onto
+  Starred, to star them): with a pointer, or on a tablet by a long press on
+  the message that then moves. The selection drags together.
+- Phones and tablets: pinching an email zooms it in (up to three times),
+  around the point between the fingers; a pan moves the zoomed email
+  sideways. Needs Picacho-Patches' gpui-mobile patch 0003, which
+  recognizes two-finger pinches.
 - Phones and tablets: Settings → General → Desktop layout shows the desktop
   window instead of the phone layout, as suits a tablet. A long press opens
   the context menus that a right click opens on a computer, or names an
@@ -21,8 +28,8 @@ same version in `Cargo.toml`.
   calendars are fingertip-sized, stars show on every message, pane edges
   can be dragged with a finger, and the reader's toolbar drops its labels
   when the reader is too narrow for them. Sidebar menus offer Move Up, Move
-  Down and Move Out of Folder in place of dragging, and a floating composer
-  moves with a finger on its title.
+  Down, Move Into Folder and Move Out of Folder in place of dragging, and a
+  floating composer moves with a finger on its title.
 - Phones and tablets: tapping a link in an email first shows where it goes,
   warns of known tricks (look-alike letters, bare IP addresses, unencrypted
   pages), and offers Go Back, Open Anyway or Always Trust the site. Turn it
@@ -61,6 +68,8 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Phones and tablets: an account's server filter and away message fields
+  raise the keyboard.
 - Phones and tablets: the filter chips over the message list fade out at an
   edge with more chips scrolled past it.
 - Tablets: with the list and a message side by side, going back (Back, the

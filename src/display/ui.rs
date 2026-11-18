@@ -2,6 +2,8 @@
 mod accounts;
 #[path = "links.rs"]
 mod links;
+#[path = "mail_drag.rs"]
+mod mail_drag;
 #[path = "proton_login.rs"]
 mod proton_login;
 use crate::manage::backend::{KeyMethod, KeyPrompt};
@@ -77,7 +79,7 @@ mod window;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[path = "shell.rs"]
 mod shell;
-use super::html::{HtmlContextMenu, HtmlLink, HtmlView};
+use super::html::{HtmlContextMenu, HtmlLink, HtmlView, HtmlZoomed};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::subscriptions::Subscription as MailSubscription;
@@ -768,6 +770,8 @@ enum Action {
     SetDesktopLayout(bool),
     /// Move a sidebar entry from its menu, where it can't be dragged.
     Arrange(String, tree::DropAt),
+    /// The folders a sidebar entry can move into, as a menu.
+    ArrangeIntoMenu(String),
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -1060,6 +1064,14 @@ pub struct MailApp {
     pending_place: Option<(EntityId, Placement)>,
     /// Where a finger moved such a composer to (see `move_composer`).
     pending_move: Option<(EntityId, Point<Pixels>)>,
+    /// Messages a finger is carrying to a mailbox (see `mail_drag`).
+    touch_mail_drag: Option<mail_drag::TouchMailDrag>,
+    /// Where the sidebar's mailboxes were last drawn, while it does.
+    drop_rects: mail_drag::DropRects,
+    /// The last messages dropped on a mailbox, and what it did: tests'
+    /// accounts have no server, so the change itself is soon undone.
+    #[cfg(test)]
+    last_drop: Option<(Vec<String>, Change)>,
     /// Any message is being delivered now; quitting waits for it.
     sending: bool,
     /// A spinner tick is pending (see `spinner`).
@@ -1712,6 +1724,14 @@ impl MailApp {
                 this.html_menu(menu, cx)
             }),
         );
+        // A pinch zoomed the email around a point: the reader scrolls so
+        // that it stays under the fingers.
+        subscriptions.push(cx.subscribe(&html_view, |this, _, z: &HtmlZoomed, cx| {
+            let offset = this.reader_scroll.offset();
+            this.reader_scroll
+                .set_offset(point(offset.x, offset.y - z.shift));
+            cx.notify();
+        }));
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, link: &HtmlLink, cx| match link {
                 HtmlLink::Hovered(url) => {
@@ -1920,6 +1940,10 @@ impl MailApp {
             main_window: Some(window.window_handle()),
             pending_place: None,
             pending_move: None,
+            touch_mail_drag: None,
+            drop_rects: Rc::default(),
+            #[cfg(test)]
+            last_drop: None,
             sending: false,
             spin_scheduled: false,
             menu_anim: 0,
@@ -5798,6 +5822,10 @@ impl MailApp {
             Action::UntrustSite(site) => self.untrust_site(&site, cx),
             Action::SetDesktopLayout(on) => self.set_desktop_layout(on, w, cx),
             Action::Arrange(key, at) => self.arrange(key, at, cx),
+            Action::ArrangeIntoMenu(key) => {
+                let entries = self.arrange_into_entries(&key);
+                self.open_menu(w.mouse_position(), entries, cx);
+            }
             Action::OpenUrl(url) => {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
@@ -6637,6 +6665,7 @@ impl MailApp {
                     this.open_menu(e.position, entries.clone(), cx)
                 }),
             )
+            .map(|d| self.mail_drop_target(d, account, &mailbox, cx))
     }
     fn sidebar_tree(&self, cx: &Context<Self>) -> impl IntoElement {
         let c = self.colors();
@@ -7506,10 +7535,12 @@ impl MailApp {
                         format!("{} selected", fmt_count(n))
                     })
                     .when(n == 0, |d| {
-                        d.tooltip(|w, cx| {
-                            Tooltip::new("Click messages to select them; Shift-click selects a range")
-                                .build(w, cx)
-                        })
+                        let tip = if self.mobile.touch {
+                            "Tap messages to select them"
+                        } else {
+                            "Click messages to select them; Shift-click selects a range"
+                        };
+                        d.tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
                     }),
             )
             .child(
@@ -7611,6 +7642,7 @@ impl MailApp {
         let star = m.starred;
         let drafts = self.folder == Folder::Drafts;
         let row_group = SharedString::from(format!("row-group-{id}"));
+        let drag_id = id.clone();
         let touch = self.mobile.touch;
         let lead_group = SharedString::from(format!("lead-group-{id}"));
         let check_fg = c.on_accent;
@@ -7865,6 +7897,8 @@ impl MailApp {
                     }
                 }
             }))
+            // Drafts aren't moved to folders.
+            .when(!drafts, |d| self.draggable_mail(d, &drag_id, cx))
             .into_any_element()
     }
     /// Whether every selected message is `test`; false when none is selected.
@@ -9331,6 +9365,7 @@ impl Render for MailApp {
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         window::set_touch(self.mobile.touch);
+        self.drop_rects.borrow_mut().clear();
         let root = if self.mobile.touch && !self.mobile.on {
             self.touch_desktop_root(window, cx)
         } else {
@@ -9396,6 +9431,9 @@ impl MailApp {
             .map(|d| self.track_resize(d, cx))
             .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ComposerDrag>, w, cx| {
                 this.drag_composer(e, w, cx)
+            }))
+            .on_drop(cx.listener(|this, d: &mail_drag::MailDrag, w, cx| {
+                this.mail_dropped_elsewhere(d, w, cx)
             }))
             .when(!self.onboarding, |d| {
                 d.children(self.composer_layer(window, cx))

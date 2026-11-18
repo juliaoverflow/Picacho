@@ -577,7 +577,10 @@ impl MailApp {
                 let shown = masked.as_deref().unwrap_or(shown);
                 let shown = self.hide_codes_html(m, shown);
                 let shown = shown.as_ref();
+                // A pinch zooms it on a touch device.
+                let touch = self.mobile.touch;
                 self.html_view.update(cx, |view, cx| {
+                    view.zoomable = touch;
                     view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
                 content = content.child(self.html_view.clone());

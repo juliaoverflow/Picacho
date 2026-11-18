@@ -2027,6 +2027,11 @@ impl Composer {
                     .text_color(rgb(c.muted))
                     .cursor_pointer()
                     .hover(move |s| s.text_color(rgb(c.text)))
+                    // A fingertip's target, not just the word (on a touch
+                    // device).
+                    .when(!on && self.single_window, |d| {
+                        d.h(px(32.)).px_2().flex().items_center()
+                    })
                     .when(!on, |d| d.child(label))
                     .on_click(cx.listener(move |this, _, w, cx| {
                         match which {
@@ -2118,7 +2123,11 @@ impl Composer {
         div()
             .id("compose-toolbar")
             .debug_selector(|| "compose-toolbar".into())
-            .h(px(if self.single_window && !self.mobile { 44. } else { 36. }))
+            .h(px(if self.single_window && !self.mobile {
+                44.
+            } else {
+                36.
+            }))
             .flex_shrink_0()
             .px_3()
             .flex()
@@ -2404,7 +2413,11 @@ impl Composer {
             .child(self.icon_button(
                 "attach",
                 "paperclip",
-                "Attach files (or drop them here)",
+                if self.single_window {
+                    "Attach files"
+                } else {
+                    "Attach files (or drop them here)"
+                },
                 false,
                 cx,
                 |t, _, cx| t.attach(cx),

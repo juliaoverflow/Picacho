@@ -1116,7 +1116,19 @@ impl MailApp {
         }
         add(&self.fwd_server, Keys::Url);
         add(&self.fwd_contact_new, Keys::Email);
+        // An account's server filters and away message (Settings); its
+        // from and until are dates.
+        let filters = &self.filter_inputs;
+        for state in [
+            &filters.value,
+            &filters.subject,
+            &filters.from,
+            &filters.until,
+        ] {
+            add(state, Keys::Text);
+        }
         out.push((self.signature_input.read(cx).focus_handle(cx), Keys::Text));
+        out.push((filters.body.read(cx).focus_handle(cx), Keys::Text));
         if let Some(focus) = self
             .picker
             .as_ref()

@@ -1569,3 +1569,121 @@ fn the_desktop_windows_controls_take_a_fingertip(cx: &mut TestAppContext) {
     });
     assert!(!composer.read_with(cx, |c, _| c.touch_moving));
 }
+
+#[gpui::test]
+fn a_finger_moves_sidebar_entries_into_folders(cx: &mut TestAppContext) {
+    use super::super::tree::{DropAt, Node};
+    let (view, cx) = desktop_tablet(cx);
+    let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    view.update(cx, |this, cx| {
+        this.tree.push(Node::Folder {
+            id: "group:test".into(),
+            name: "Work stuff".into(),
+            children: vec![],
+        });
+        cx.notify();
+    });
+    // The account's menu offers the folder.
+    let labels = |entries: Vec<Entry>| {
+        entries
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, .. } => Some(label.to_string()),
+                Entry::Separator => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let menu = view.read_with(cx, |this, _| labels(this.with_arranging(&first, vec![])));
+    assert!(menu.contains(&"Move Into Folder…".to_owned()), "{menu:?}");
+    act(&view, Action::ArrangeIntoMenu(first.clone()), cx);
+    let offered = view.read_with(cx, |this, _| {
+        labels(
+            this.menu
+                .as_ref()
+                .map(|m| m.entries.clone())
+                .unwrap_or_default(),
+        )
+    });
+    assert_eq!(offered, ["Work stuff"]);
+    act(
+        &view,
+        Action::Arrange(first.clone(), DropAt::Into("group:test".into())),
+        cx,
+    );
+    view.read_with(cx, |this, _| match this.tree.last() {
+        Some(Node::Folder { children, .. }) => {
+            assert_eq!(children.first().map(|n| n.key()), Some(first.as_str()))
+        }
+        other => panic!("the folder moved: {other:?}"),
+    });
+    // Inside it now: out again, but not into it again.
+    let menu = view.read_with(cx, |this, _| labels(this.with_arranging(&first, vec![])));
+    assert!(menu.contains(&"Move Out of Folder".to_owned()), "{menu:?}");
+    assert!(!menu.contains(&"Move Into Folder…".to_owned()), "{menu:?}");
+    // The away message's fields raise the software keyboard.
+    view.read_with(cx, |this, cx| {
+        let fields: Vec<_> = this
+            .keyboard_fields(cx)
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        let subject = this.filter_inputs.subject.read(cx).focus_handle(cx);
+        let body = this.filter_inputs.body.read(cx).focus_handle(cx);
+        assert!(fields.contains(&subject) && fields.contains(&body));
+    });
+}
+
+#[gpui::test]
+fn a_finger_carries_messages_onto_mailboxes(cx: &mut TestAppContext) {
+    let (view, cx) = desktop_tablet(cx);
+    let (id, account) = view.read_with(cx, |this, _| {
+        let m = &this.messages[this.visible[0]];
+        (m.id.clone(), m.account.clone())
+    });
+    let row: &'static str = Box::leak(format!("row-{id}").into_boxed_str());
+    let archive: &'static str = Box::leak(format!("nav-{account}-archive").into_boxed_str());
+    let start = bounds(cx, row).center();
+    let end = bounds(cx, archive).center();
+    let press = |phase, at: Point<Pixels>, cx: &mut VisualTestContext| {
+        cx.simulate_event(LongPressEvent {
+            phase,
+            start_position: start,
+            position: at,
+        });
+    };
+    // Picked up by a long press, carried over Archive, let go there.
+    press(TouchPhase::Started, start, cx);
+    let midway = point((start.x + end.x) / 2., (start.y + end.y) / 2.);
+    press(TouchPhase::Moved, midway, cx);
+    assert!(shown(cx, "touch-mail-drag"), "the pill follows the finger");
+    press(TouchPhase::Moved, end, cx);
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.menu.is_none(), "no menu while carrying")
+    });
+    press(TouchPhase::Ended, end, cx);
+    assert_eq!(
+        view.update(cx, |this, _| this.last_drop.take()),
+        Some((vec![id.clone()], Change::Move(Folder::Archive)))
+    );
+    assert!(!shown(cx, "touch-mail-drag"));
+    // Let go elsewhere: nothing moves.
+    let start = bounds(cx, row).center();
+    let press = |phase, at: Point<Pixels>, cx: &mut VisualTestContext| {
+        cx.simulate_event(LongPressEvent {
+            phase,
+            start_position: start,
+            position: at,
+        });
+    };
+    press(TouchPhase::Started, start, cx);
+    press(TouchPhase::Moved, start + point(px(0.), px(120.)), cx);
+    press(TouchPhase::Ended, start + point(px(0.), px(120.)), cx);
+    assert_eq!(view.update(cx, |this, _| this.last_drop.take()), None);
+    // Held without moving: the row's menu, as before.
+    press(TouchPhase::Started, start, cx);
+    press(TouchPhase::Ended, start, cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.menu.is_some(), "the row's menu opens")
+    });
+}

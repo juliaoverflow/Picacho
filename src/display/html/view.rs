@@ -37,6 +37,19 @@ pub enum HtmlLink {
     Opened(String),
 }
 
+/// A pinch zoomed the email around a point, which moved this far down the
+/// email (`HtmlView::pinch`): its owner scrolls as much, so the point stays
+/// under the fingers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HtmlZoomed {
+    pub shift: Pixels,
+}
+
+/// The most a pinch zooms an email in.
+const MAX_ZOOM: f32 = 3.;
+/// The widest strip painted, in device pixels: a texture's usual limit.
+const MAX_STRIP: f32 = 8192.;
+
 /// The whole email, scaled down, for the collapsed reader.
 struct Thumbnail {
     revision: u64,
@@ -85,9 +98,20 @@ pub struct HtmlView {
     pressed_at: Option<(f32, f32)>,
     /// The link under the pointer.
     hovered: Option<String>,
+    /// A pinch zooms the email (on a touch device; its owner says).
+    pub zoomable: bool,
+    /// How far a pinch zoomed in: 1 shows the email as laid out. The layout
+    /// stays; its strips are painted and placed that much larger.
+    zoom: f32,
+    /// How far the zoomed email is panned sideways, in view pixels.
+    pan_x: f32,
+    /// A pinch is under way: strips are stretched until it ends, rather
+    /// than painted anew for each step.
+    pinching: bool,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
 impl EventEmitter<HtmlLink> for HtmlView {}
+impl EventEmitter<HtmlZoomed> for HtmlView {}
 
 impl HtmlView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -140,6 +164,65 @@ impl HtmlView {
             context_at: None,
             pressed_at: None,
             hovered: None,
+            zoomable: false,
+            zoom: 1.,
+            pan_x: 0.,
+            pinching: false,
+        }
+    }
+    /// How far a pinch zoomed the email in (1 when not).
+    #[cfg(test)]
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+    /// The most this email zooms in: `MAX_ZOOM`, short of strips wider than
+    /// a texture.
+    fn max_zoom(&self, scale: f32) -> f32 {
+        let width = f32::from(self.bounds.size.width).max(1.) * scale;
+        MAX_ZOOM.min(MAX_STRIP / width).max(1.)
+    }
+    /// Keeps the sideways pan within the zoomed email.
+    fn clamp_pan(&mut self) {
+        let room = f32::from(self.bounds.size.width) * (self.zoom - 1.);
+        self.pan_x = self.pan_x.clamp(0., room.max(0.));
+    }
+    /// Follows a pinch on the email: it zooms around the point between the
+    /// fingers, which stays where it is (the owner scrolls for the up and
+    /// down of that; see `HtmlZoomed`).
+    fn pinch(&mut self, e: &PinchEvent, window: &Window, cx: &mut Context<Self>) {
+        if !self.zoomable || self.worker.is_none() || !self.laid_out {
+            return;
+        }
+        cx.stop_propagation();
+        self.pinching = matches!(e.phase, TouchPhase::Started | TouchPhase::Moved);
+        let old = self.zoom;
+        let zoom = (old * (1. + e.delta)).clamp(1., self.max_zoom(window.scale_factor()));
+        if zoom != old {
+            let x = f32::from(e.position.x - self.bounds.left());
+            let y = f32::from(e.position.y - self.bounds.top());
+            self.zoom = zoom;
+            self.pan_x = (x + self.pan_x) / old * zoom - x;
+            self.clamp_pan();
+            cx.emit(HtmlZoomed {
+                shift: px(y * (zoom / old - 1.)),
+            });
+        }
+        cx.notify();
+    }
+    /// A pan over the zoomed email moves it sideways; up and down is the
+    /// reader's scrolling, so the event goes on.
+    fn pan(&mut self, e: &ScrollEvent, cx: &mut Context<Self>) {
+        if self.zoom <= 1. {
+            return;
+        }
+        let ScrollDelta::Pixels(delta) = e.delta else {
+            return;
+        };
+        let before = self.pan_x;
+        self.pan_x -= f32::from(delta.x);
+        self.clamp_pan();
+        if self.pan_x != before {
+            cx.notify();
         }
     }
     /// Says the pointer is over `link` now, if that changed.
@@ -178,6 +261,10 @@ impl HtmlView {
         self.laid_out = false;
         self.selection = None;
         self.cursor = CursorStyle::Arrow;
+        // Another email starts as laid out.
+        self.zoom = 1.;
+        self.pan_x = 0.;
+        self.pinching = false;
         self.hover(None, cx);
         if had_document {
             cx.notify();
@@ -335,10 +422,11 @@ impl HtmlView {
             }
         }
     }
+    /// Where `position` (in the window) is in the document, zoomed or not.
     fn local(&self, position: gpui::Point<Pixels>) -> (f32, f32) {
         (
-            f32::from(position.x - self.bounds.origin.x),
-            f32::from(position.y - self.bounds.origin.y),
+            (f32::from(position.x - self.bounds.origin.x) + self.pan_x) / self.zoom,
+            f32::from(position.y - self.bounds.origin.y) / self.zoom,
         )
     }
     fn pointer(&mut self, position: gpui::Point<Pixels>, kind: u8, pressed: bool) {
@@ -447,9 +535,13 @@ impl HtmlView {
         if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
             return Vec::new();
         }
-        let scale = window.scale_factor();
-        let top = f32::from(visible.top() - bounds.top()).max(0.);
-        let bottom = top + f32::from(visible.size.height);
+        // Zoomed, strips are painted that much finer; while a pinch goes
+        // on, the ones there are stretched instead. In steps, so a small
+        // change of zoom doesn't paint everything again.
+        let zoom = self.zoom;
+        let scale = window.scale_factor() * ((zoom * 4.).round() / 4.).max(1.);
+        let top = f32::from(visible.top() - bounds.top()).max(0.) / zoom;
+        let bottom = top + f32::from(visible.size.height) / zoom;
         let strip = band_height(scale);
         let first = (top / strip).floor() as u32;
         // Prefetch one strip below so scrolling down shows finished content.
@@ -464,7 +556,7 @@ impl HtmlView {
                 t.revision == self.revision && t.width == width && t.scale == scale
             });
             let key = (self.revision, width, scale.to_bits());
-            if !fresh && current && self.requested.get(&band) != Some(&key) {
+            if !fresh && current && !self.pinching && self.requested.get(&band) != Some(&key) {
                 self.requested.insert(band, key);
                 self.send(Command::Paint { band, width, scale });
             }
@@ -472,10 +564,34 @@ impl HtmlView {
             // Its transparent padding reaches past the email, showing nothing.
             if let Some(tile) = tile {
                 drawn.push((
-                    Bounds::new(point(bounds.left(), bounds.top() + px(tile.top)), tile.size),
+                    Bounds::new(
+                        point(
+                            bounds.left() - px(self.pan_x),
+                            bounds.top() + px(tile.top * zoom),
+                        ),
+                        size(tile.size.width * zoom, tile.size.height * zoom),
+                    ),
                     tile.image.clone(),
                 ));
             }
+        }
+        // Mid-pinch, strips of another zoom are left where they are, as the
+        // ones for this zoom aren't asked for until it ends.
+        if self.pinching {
+            for (band, tile) in &self.tiles {
+                if (first..=last).contains(band) {
+                    continue;
+                }
+                let top = bounds.top() + px(tile.top * zoom);
+                let size = size(tile.size.width * zoom, tile.size.height * zoom);
+                if top < visible.bottom() && top + size.height > visible.top() {
+                    drawn.push((
+                        Bounds::new(point(bounds.left() - px(self.pan_x), top), size),
+                        tile.image.clone(),
+                    ));
+                }
+            }
+            return drawn;
         }
         // Keep a few strips around the viewport; drop the rest.
         let keep = first.saturating_sub(2)..=last + 2;
@@ -576,7 +692,11 @@ impl Render for HtmlView {
             .debug_selector(|| "html-email".into())
             .relative()
             .w_full()
-            .h(px(if self.laid_out { self.height } else { 160. }))
+            .h(px(if self.laid_out {
+                self.height * self.zoom
+            } else {
+                160.
+            }))
             .flex_shrink_0()
             .bg(rgb(page_color(self.tone)))
             .cursor(self.cursor)
@@ -603,6 +723,8 @@ impl Render for HtmlView {
                     }
                 }),
             )
+            .on_pinch(cx.listener(|this, e: &PinchEvent, w, cx| this.pinch(e, w, cx)))
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| this.pan(e, cx)))
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
                 this.pointer(e.position, 0, e.pressed_button == Some(MouseButton::Left))
             }))
@@ -650,16 +772,19 @@ impl Render for HtmlView {
                 canvas(
                     move |bounds, w, cx| view.update(cx, |this, _| this.prepare(bounds, w)),
                     move |bounds, tiles, w, _| {
-                        for (bounds, image) in tiles {
-                            let _ = w.paint_image(
-                                bounds,
-                                bounds,
-                                Corners::default(),
-                                image,
-                                0,
-                                false,
-                            );
-                        }
+                        // A zoomed email is wider than the view: kept inside it.
+                        w.with_content_mask(Some(ContentMask { bounds }), |w| {
+                            for (tile, image) in tiles {
+                                let _ = w.paint_image(
+                                    tile,
+                                    tile,
+                                    Corners::default(),
+                                    image,
+                                    0,
+                                    false,
+                                );
+                            }
+                        });
                         let visible = bounds.intersect(&w.content_mask().bounds);
                         let pressed = pressed.clone();
                         w.on_mouse_event(move |e: &LongPressEvent, phase, w, cx| {

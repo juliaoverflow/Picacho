@@ -10,7 +10,7 @@ mod worker;
 // Called at startup, not in tests.
 #[cfg_attr(test, allow(unused_imports))]
 pub use document::warm_up;
-pub use view::{HtmlContextMenu, HtmlLink, HtmlView, thumbnail};
+pub use view::{HtmlContextMenu, HtmlLink, HtmlView, HtmlZoomed, thumbnail};
 
 /// An address from an email that may be handed to the system to open: a web
 /// page, or an email link. Anything else (`file:`, `smb:`, UNC paths, an

@@ -68,7 +68,8 @@ impl Render for AppPrompt {
                 .flex()
                 .items_center()
                 .justify_center()
-                .h(px(36.))
+                // Taller for a fingertip (on a touch device).
+                .h(px(if window::touch() { 44. } else { 36. }))
                 .px_3()
                 .rounded(px(9.))
                 .cursor_pointer()

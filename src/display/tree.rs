@@ -157,6 +157,27 @@ fn neighbours(nodes: &[Node], key: &str) -> (Option<String>, Option<String>, Opt
     let after = list.get(last + 1).map(|n| n.key().to_owned());
     (before, after, folder)
 }
+/// The folders `key` can move into, in the sidebar's order, each with its
+/// name and how deep it is: not the one already holding it, nor itself or
+/// a folder inside it.
+fn folders_for(nodes: &[Node], key: &str) -> Vec<(String, String, usize)> {
+    fn walk(nodes: &[Node], depth: usize, out: &mut Vec<(String, String, usize)>) {
+        for n in nodes {
+            if let Node::Folder { id, name, children } = n {
+                out.push((id.clone(), name.clone(), depth));
+                walk(children, depth + 1, out);
+            }
+        }
+    }
+    let Some(moving) = find(nodes, key) else {
+        return vec![];
+    };
+    let (_, _, holder) = neighbours(nodes, key);
+    let mut all = vec![];
+    walk(nodes, 0, &mut all);
+    all.retain(|(id, _, _)| !moving.contains(id) && Some(id) != holder.as_ref());
+    all
+}
 /// Moves `key` to `at`. A folder cannot go inside itself.
 pub(super) fn move_node(nodes: &mut Vec<Node>, key: &str, at: &DropAt) -> bool {
     match find(nodes, key) {
@@ -398,9 +419,17 @@ impl MailApp {
         }
         let (before, after, folder) = neighbours(&self.tree, key);
         let arrange = |label, icon, at| entry(label, icon, Action::Arrange(key.to_owned(), at));
+        let into = (!folders_for(&self.tree, key).is_empty()).then(|| {
+            entry(
+                "Move Into Folder…",
+                "folder-input",
+                Action::ArrangeIntoMenu(key.to_owned()),
+            )
+        });
         let moves: Vec<Entry> = [
             before.map(|k| arrange("Move Up", "arrow-up", DropAt::Before(k))),
             after.map(|k| arrange("Move Down", "arrow-down", DropAt::After(k))),
+            into,
             folder.map(|k| arrange("Move Out of Folder", "folder-output", DropAt::After(k))),
         ]
         .into_iter()
@@ -412,11 +441,30 @@ impl MailApp {
         entries.extend(moves);
         entries
     }
+    /// The folders a sidebar entry can move into, as a menu (see
+    /// `with_arranging`).
+    pub(super) fn arrange_into_entries(&self, key: &str) -> Vec<Entry> {
+        folders_for(&self.tree, key)
+            .into_iter()
+            .map(|(id, name, depth)| {
+                entry(
+                    format!("{}{name}", "\u{2003}".repeat(depth)),
+                    "folder-closed",
+                    Action::Arrange(key.to_owned(), DropAt::Into(id)),
+                )
+            })
+            .collect()
+    }
     /// Moves a sidebar entry from its menu (see `with_arranging`).
     pub(super) fn arrange(&mut self, key: String, at: DropAt, cx: &mut Context<Self>) {
         if move_node(&mut self.tree, &key, &at) {
             self.save_tree();
-            self.mark_landed(key);
+            // A closed folder flashes to show where the entry went.
+            let shown = match &at {
+                DropAt::Into(f) if !self.open(f) => f.clone(),
+                _ => key,
+            };
+            self.mark_landed(shown);
             cx.notify();
         }
     }
@@ -1139,7 +1187,7 @@ impl MailApp {
                 nav = nav.child(
                     div()
                         .id(SharedString::from(format!("subfolders-{id}")))
-                        .size(px(18.))
+                        .size(self.tap(18., 32.))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1302,7 +1350,12 @@ impl MailApp {
                             .items_center()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child("Drag accounts here")
+                            .child(if self.mobile.touch {
+                                // Nothing is dragged with a finger.
+                                "Move accounts here from their menus"
+                            } else {
+                                "Drag accounts here"
+                            })
                             .on_drag_move(cx.listener({
                                 let id = id.to_owned();
                                 move |this, e: &DragMoveEvent<Dragged>, _, cx| {

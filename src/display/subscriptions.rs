@@ -747,7 +747,7 @@ impl MailApp {
             div()
                 .id(id)
                 .debug_selector(move || id.into())
-                .h(px(26.))
+                .h(self.tap(26., 36.))
                 .px_3()
                 .flex()
                 .items_center()

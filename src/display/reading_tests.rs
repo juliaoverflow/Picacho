@@ -686,3 +686,238 @@ fn a_long_press_selects_a_word_in_an_email_and_offers_to_copy_it(cx: &mut TestAp
         );
     });
 }
+
+#[gpui::test]
+fn a_pinch_zooms_an_email_on_a_touch_device(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some(
+            "<body style='margin:0'><div style='display:flex'>\
+             <a href='https://left.example/' style='flex:1;display:block;height:600px'>Left</a>\
+             <a href='https://right.example/' style='flex:1;display:block;height:600px'>Right</a>\
+             </div></body>"
+                .into(),
+        );
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    let pinch = |at: Point<Pixels>, delta: f32, cx: &mut VisualTestContext| {
+        for (phase, delta) in [
+            (TouchPhase::Started, 0.),
+            (TouchPhase::Moved, delta),
+            (TouchPhase::Ended, 0.),
+        ] {
+            cx.simulate_event(PinchEvent {
+                position: at,
+                delta,
+                modifiers: Modifiers::none(),
+                phase,
+            });
+        }
+    };
+    // The link a secondary click (a long press) at `at` lands on.
+    let link_at = |at: Point<Pixels>, cx: &mut VisualTestContext| {
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        settle(cx);
+        view.update(cx, |this, cx| {
+            let menu = this.menu.take();
+            cx.notify();
+            menu.into_iter()
+                .flat_map(|m| m.entries)
+                .find_map(|e| match e {
+                    Entry::Item {
+                        action: Action::OpenEmailLink(url),
+                        ..
+                    } => Some(url),
+                    _ => None,
+                })
+        })
+    };
+    settle(cx);
+    let email = cx.debug_bounds("html-email").expect("the email is shown");
+    let width = email.size.width;
+    // Without touch, a pinch (a trackpad's) leaves the email as it is.
+    pinch(point(email.left() + px(1.), email.top() + px(100.)), 1., cx);
+    assert_eq!(
+        view.read_with(cx, |this, cx| this.html_view.read(cx).zoom()),
+        1.
+    );
+    view.update(cx, |this, cx| {
+        this.mobile.touch = true;
+        cx.notify();
+    });
+    settle(cx);
+    let email = cx.debug_bounds("html-email").unwrap();
+    let three_quarters = point(email.left() + width * 0.75, email.top() + px(100.));
+    assert_eq!(
+        link_at(three_quarters, cx).as_deref(),
+        Some("https://right.example/")
+    );
+    // Doubled around its leading edge: the leading link fills the view.
+    let scrolled = view.read_with(cx, |this, _| this.reader_scroll.offset().y);
+    pinch(point(email.left() + px(1.), email.top() + px(100.)), 1., cx);
+    settle(cx);
+    view.read_with(cx, |this, cx| {
+        assert_eq!(this.html_view.read(cx).zoom(), 2.);
+        // The point between the fingers stays put: the reader scrolled
+        // as far as it moved down the email.
+        assert_eq!(this.reader_scroll.offset().y, scrolled - px(100.));
+    });
+    let zoomed = cx.debug_bounds("html-email").unwrap();
+    assert_eq!(zoomed.size.height, email.size.height * 2.);
+    assert_eq!(
+        zoomed.size.width, width,
+        "the email stays inside the reader"
+    );
+    let three_quarters = point(zoomed.left() + width * 0.75, zoomed.top() + px(400.));
+    assert_eq!(
+        link_at(three_quarters, cx).as_deref(),
+        Some("https://left.example/")
+    );
+    // Panned sideways by half the view: the trailing link is there.
+    cx.simulate_event(ScrollEvent {
+        position: three_quarters,
+        delta: ScrollDelta::Pixels(point(-width / 2., px(0.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+        ..Default::default()
+    });
+    settle(cx);
+    assert_eq!(
+        link_at(three_quarters, cx).as_deref(),
+        Some("https://right.example/")
+    );
+    // Another message starts as laid out.
+    view.update(cx, |this, cx| {
+        this.selected = Some(this.messages[1].id.clone());
+        cx.notify();
+    });
+    settle(cx);
+    assert_eq!(
+        view.read_with(cx, |this, cx| this.html_view.read(cx).zoom()),
+        1.
+    );
+}
+
+#[gpui::test]
+fn messages_drag_onto_mailboxes_in_the_sidebar(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    frame(cx);
+    cx.run_until_parked();
+    // Two listed messages of one account, the first not starred.
+    let (first, second, account) = view.read_with(cx, |this, _| {
+        let listed: Vec<Mail> = this
+            .visible
+            .iter()
+            .map(|&i| this.messages[i].clone())
+            .collect();
+        let first = listed
+            .iter()
+            .find(|m| !m.starred)
+            .expect("an unstarred message")
+            .clone();
+        let second = listed
+            .iter()
+            .find(|m| m.id != first.id && m.account == first.account)
+            .expect("another of its account's")
+            .clone();
+        let account = first.account.clone();
+        (first, second, account)
+    });
+    let drag = |from: &'static str, to: &'static str, cx: &mut VisualTestContext| {
+        let start = cx
+            .debug_bounds(from)
+            .unwrap_or_else(|| panic!("{from}"))
+            .center();
+        let end = cx
+            .debug_bounds(to)
+            .unwrap_or_else(|| panic!("{to}"))
+            .center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        for step in 1..=5 {
+            let t = step as f32 / 5.;
+            let at = point(
+                start.x + (end.x - start.x) * t,
+                start.y + (end.y - start.y) * t,
+            );
+            cx.simulate_mouse_move(at, Some(MouseButton::Left), Modifiers::none());
+        }
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        // Checked at once: the test accounts have no server, so the change
+        // fails there and the list reloads as it was.
+        cx.run_until_parked();
+    };
+    let row = |id: &str| -> &'static str { Box::leak(format!("row-{id}").into_boxed_str()) };
+    let nav = |mailbox: &str| -> &'static str {
+        Box::leak(format!("nav-{account}-{mailbox}").into_boxed_str())
+    };
+    let dropped = |cx: &mut VisualTestContext| view.update(cx, |this, _| this.last_drop.take());
+    // Onto Starred: starred.
+    drag(row(&first.id), nav("starred"), cx);
+    assert_eq!(
+        dropped(cx),
+        Some((vec![first.id.clone()], Change::Star(true)))
+    );
+    // Onto Archive: moved there.
+    frame(cx);
+    drag(row(&first.id), nav("archive"), cx);
+    assert_eq!(
+        dropped(cx),
+        Some((vec![first.id.clone()], Change::Move(Folder::Archive)))
+    );
+    // Not onto Sent, nor the other account's mailboxes.
+    frame(cx);
+    drag(row(&second.id), nav("sent"), cx);
+    assert_eq!(dropped(cx), None);
+    let other = view.read_with(cx, |this, _| {
+        this.accounts
+            .iter()
+            .find(|a| a.id != account)
+            .unwrap()
+            .id
+            .clone()
+    });
+    view.read_with(cx, |this, _| {
+        assert!(
+            this.drop_change(
+                &[second.id.clone()],
+                &other,
+                &Mailbox::Standard(Folder::Archive)
+            )
+            .is_none()
+        );
+    });
+    // A press that shook a little is still a click.
+    let at = cx.debug_bounds(row(&second.id)).unwrap().center();
+    cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        at + point(px(3.), px(0.)),
+        Some(MouseButton::Left),
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        at + point(px(3.), px(0.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |this, _| this.selected.clone()),
+        Some(second.id.clone())
+    );
+}

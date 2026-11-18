@@ -183,7 +183,7 @@ impl MailApp {
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector)
-            .size(px(22.))
+            .size(self.tap(22., 32.))
             .flex_shrink_0()
             .rounded(px(4.))
             .bg(rgb(c.bg))

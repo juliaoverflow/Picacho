@@ -45,7 +45,13 @@ impl MailApp {
             .pb(px(insets.below()))
             .pl(px(insets.left))
             .child(long_press_menus())
+            .children(
+                self.touch_mail_drag
+                    .is_some()
+                    .then(|| self.carry_listener(cx)),
+            )
             .child(div().relative().flex_1().min_h_0().child(root))
+            .children(self.touch_mail_drag_layer())
             .children(self.link_sheet(insets, window, cx))
     }
 
@@ -85,6 +91,30 @@ impl MailApp {
                 this.notice(tip.clone(), false, cx);
             }),
         )
+    }
+
+    /// While a finger carries messages, its long press goes on to
+    /// `carry_mail`, before anything under it.
+    fn carry_listener(&self, cx: &Context<Self>) -> impl IntoElement {
+        let this = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let this = this.clone();
+                window.on_mouse_event(move |e: &LongPressEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        let _ = this.update(cx, |this, cx| this.carry_mail(e, window, cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    /// The tap a touch device gives as something is picked up.
+    pub(in crate::display::ui) fn touch_haptic(&self) {
+        platform::haptic(platform::Haptic::Selection);
     }
 
     /// Whether Back has something to close in the desktop window: what its
