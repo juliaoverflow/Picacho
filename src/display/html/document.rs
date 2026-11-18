@@ -433,7 +433,91 @@ pub struct ContextTarget {
     pub image: Option<String>,
 }
 
+/// The word a long press selected: its text block and byte range.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Word {
+    root: blitz_dom::NodeId,
+    start: usize,
+    end: usize,
+    /// Where the press was, in document coordinates.
+    at: (f32, f32),
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '\'' | '\u{2019}' | '-')
+}
+
 impl EmailDocument {
+    /// Selects the word at a point, as a long press does on a touch screen.
+    /// On a space or punctuation it selects that one character.
+    pub(super) fn select_word_at(&mut self, x: f32, y: f32) -> Option<Word> {
+        let Some((root, offset)) = self.doc.find_text_position(x, y) else {
+            self.doc.clear_text_selection();
+            return None;
+        };
+        let text = &self
+            .doc
+            .get_node(root)?
+            .element_data()?
+            .inline_layout_data
+            .as_ref()?
+            .text;
+        let offset = offset.min(text.len());
+        let (before, after) = text.split_at(offset);
+        let start = offset
+            - before
+                .chars()
+                .rev()
+                .take_while(|c| is_word_char(*c))
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let mut end = offset
+            + after
+                .chars()
+                .take_while(|c| is_word_char(*c))
+                .map(char::len_utf8)
+                .sum::<usize>();
+        if start == end {
+            // Not on a word: the character under the press, if any.
+            match after.chars().next().filter(|c| !c.is_whitespace()) {
+                Some(c) => end += c.len_utf8(),
+                None => {
+                    self.doc.clear_text_selection();
+                    return None;
+                }
+            }
+        }
+        self.doc.set_text_selection(root, start, root, end);
+        Some(Word {
+            root,
+            start,
+            end,
+            at: (x, y),
+        })
+    }
+    /// Extends a long press's word selection to a point the finger moved to,
+    /// keeping the whole word selected whichever way it goes.
+    pub(super) fn extend_word_to(&mut self, word: Word, x: f32, y: f32) {
+        let Some((node, offset)) = self.doc.find_text_position(x, y) else {
+            return;
+        };
+        let before = if node == word.root {
+            offset < word.start
+        } else {
+            // Another text block: above the press, or beside it to the left.
+            y < word.at.1 - 8. || (y <= word.at.1 + 8. && x < word.at.0)
+        };
+        if node == word.root && (word.start..=word.end).contains(&offset) {
+            self.doc
+                .set_text_selection(word.root, word.start, word.root, word.end);
+        } else if before {
+            self.doc
+                .set_text_selection(word.root, word.end, node, offset);
+        } else {
+            self.doc
+                .set_text_selection(word.root, word.start, node, offset);
+        }
+    }
     /// The cursor the author's CSS (or the content under the pointer) asks for.
     pub(super) fn cursor(&self) -> gpui::CursorStyle {
         use cursor_icon::CursorIcon as I;

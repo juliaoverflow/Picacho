@@ -69,6 +69,17 @@ pub enum Command {
         max_height: f32,
         scale: f32,
     },
+    /// A long press: select the word at this point.
+    SelectWord {
+        x: f32,
+        y: f32,
+    },
+    /// The finger still down after a long press moved here: extend its
+    /// selection.
+    ExtendWord {
+        x: f32,
+        y: f32,
+    },
     /// Report what is under a secondary click.
     Context {
         x: f32,
@@ -161,6 +172,7 @@ fn run(
     let mut height = 1f32;
     let mut revision = 0u64;
     let mut selection = None;
+    let mut word = None;
     loop {
         let first = match rx.recv_timeout(Duration::from_millis(40)) {
             Ok(command) => Some(command),
@@ -199,6 +211,19 @@ fn run(
                         ..event
                     }));
                     relayout = width > 0;
+                }
+                Command::SelectWord { x, y } => {
+                    word = doc.select_word_at(x, y);
+                    // Repaint even when the same text is selected elsewhere.
+                    selection_changed = true;
+                    restyle = true;
+                }
+                Command::ExtendWord { x, y } => {
+                    if let Some(word) = word {
+                        doc.extend_word_to(word, x, y);
+                        selection_changed = true;
+                        restyle = true;
+                    }
                 }
                 Command::Paint { band, width, scale } => {
                     paints.insert(band, (width, scale));

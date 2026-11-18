@@ -16,6 +16,9 @@ same version in `Cargo.toml`.
 - Selecting text in an email starts and ends under the pointer. In columns
   and centered layouts it ran well to the right of it, and in vertically
   centered cells a line away; links there are clicked where they are shown.
+- Phones and tablets: text in an email can be selected and copied. A long
+  press selects a word, moving the finger before lifting it selects more,
+  and lifting it offers Copy, with the link or image pressed.
 
 ## [0.1.0] - 2026-11-16
 

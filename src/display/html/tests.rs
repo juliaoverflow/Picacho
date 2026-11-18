@@ -703,3 +703,28 @@ fn selection_follows_the_pointer_in_inline_blocks_and_centered_cells() {
     let picked = drag_select(&mut email, (x + 1., line), (x + 60., line)).unwrap();
     assert!(picked.starts_with("second") || picked.starts_with("line"), "{picked:?}");
 }
+
+#[test]
+fn a_long_press_selects_the_word_and_dragging_extends_it_both_ways() {
+    let mut email = EmailDocument::new(
+        "<body style='margin:0'><p id='p' style='margin:0; font: 20px/30px monospace'>alpha beta gamma</p></body>",
+        true,
+    );
+    email.layout(600);
+    let (_, y, _, _) = element_box(&email, "p");
+    let char_width = 12.;
+    // Just inside the character's leading or trailing half.
+    let at = |i: f32| i * char_width + char_width / 2.;
+    let after = |i: f32| i * char_width + char_width * 0.8;
+    let before = |i: f32| i * char_width + char_width * 0.2;
+    let line = y + 15.;
+    let word = email.select_word_at(at(7.), line).unwrap();
+    assert_eq!(email.doc.get_selected_text().as_deref(), Some("beta"));
+    email.extend_word_to(word, after(13.), line);
+    assert_eq!(email.doc.get_selected_text().as_deref(), Some("beta gam"));
+    email.extend_word_to(word, before(2.), line);
+    assert_eq!(email.doc.get_selected_text().as_deref(), Some("pha beta"));
+    // Below the text there is nothing to select.
+    assert!(email.select_word_at(at(2.), y + 200.).is_none());
+    assert_eq!(email.doc.get_selected_text(), None);
+}
