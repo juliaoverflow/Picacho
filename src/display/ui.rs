@@ -1496,8 +1496,16 @@ impl MailApp {
                 cx.notify();
             }
         }));
-        subscriptions.push(cx.observe_window_activation(window, |this, w, _| {
+        subscriptions.push(cx.observe_window_activation(window, |this, w, cx| {
             this.active = w.is_window_active();
+            // Text copied here (from a message, a sign-in code) reaches
+            // other apps as Picacho goes to the background.
+            #[cfg(target_os = "android")]
+            if !this.active {
+                cx.defer(crate::android::clipboard_to_system);
+            }
+            #[cfg(not(target_os = "android"))]
+            let _ = cx;
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.persist_draft(cx);
@@ -1663,6 +1671,38 @@ impl MailApp {
                 this.html_menu(menu, cx)
             }),
         );
+        // Android's Back, from its back callback (see `platform_back`).
+        #[cfg(target_os = "android")]
+        {
+            let mut backs = crate::android::back_events();
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while let Some(back) = backs.next().await {
+                    if this
+                        .update_in(cx, |this, w, cx| this.platform_back(back, w, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // The system bars and keyboard moved: lay out again (see
+        // `android::system_insets`).
+        #[cfg(target_os = "android")]
+        {
+            let mut changes = crate::android::insets_events();
+            cx.spawn(async move |this, cx| {
+                use futures::StreamExt;
+                while changes.next().await.is_some() {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<(String, Mailbox)>();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
@@ -8996,6 +9036,7 @@ impl MailApp {
         d
             .on_action(cx.listener(|this, _: &Compose, w, cx| this.new_compose(0, w, cx)))
             .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit_app(cx)))
+            .map(android_clipboard)
             .on_action(cx.listener(|this, _: &CloseWindow, w, cx| {
                 if this.modal.is_some() {
                     this.close(w, cx);
@@ -9112,6 +9153,20 @@ impl MailApp {
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
     }
+}
+/// GPUI's Android clipboard is the app's own: text fields' Paste first takes
+/// what other apps copied, and their Copy and Cut hand it on (see
+/// `android::clipboard_from_system`). Elsewhere GPUI uses the system's.
+fn android_clipboard(d: Stateful<Div>) -> Stateful<Div> {
+    #[cfg(target_os = "android")]
+    {
+        use gpui_component::input::{Copy, Cut, Paste};
+        d.capture_action(|_: &Paste, _, cx| crate::android::clipboard_from_system(cx))
+            .capture_action(|_: &Copy, _, cx| cx.defer(crate::android::clipboard_to_system))
+            .capture_action(|_: &Cut, _, cx| cx.defer(crate::android::clipboard_to_system))
+    }
+    #[cfg(not(target_os = "android"))]
+    d
 }
 impl MailApp {
     fn main(&self, d: Stateful<Div>, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {

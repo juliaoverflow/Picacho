@@ -247,6 +247,12 @@ impl MailApp {
     ) -> Stateful<Div> {
         let c = self.colors();
         let insets = self.mobile_insets(window);
+        // Back is Picacho's while it has somewhere to go back to.
+        #[cfg(target_os = "android")]
+        crate::android::set_back_enabled(self.mobile_has_back(window, cx));
+        // A frame is being drawn: the display runs at its fastest meanwhile.
+        #[cfg(target_os = "android")]
+        crate::android::drawing();
         if self.mobile_screen() != Screen::Settings {
             self.mobile.settings_seen = false;
             self.mobile.settings_last = None;
@@ -440,13 +446,17 @@ impl MailApp {
     /// Goes back one level, as Back or Escape does. Returns false when the
     /// desktop's own `close` should handle it.
     pub(super) fn mobile_back(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {
-        // The keyboard goes first.
+        // The keyboard goes first. One the system already put away (Android
+        // closes it on Back itself) lets go of its field on the way back.
         if self.mobile.keyboard_for.is_some() {
+            let shown = self.keyboard_shown(w);
             self.mobile.keyboard_for = None;
             self.focus.focus(w, cx);
             platform::hide_keyboard();
             cx.notify();
-            return true;
+            if shown {
+                return true;
+            }
         }
         // An open full-screen composer closes, keeping its draft.
         if let Some(composer) = self.mobile_composer(cx) {
@@ -488,7 +498,95 @@ impl MailApp {
                 self.mobile_popped(cx);
                 true
             }
-            Screen::Mailboxes | Screen::Setup | Screen::Settings => true,
+            Screen::Setup => {
+                if self.setup_has_back() {
+                    self.handle(Action::SetupBack, w, cx);
+                } else {
+                    Self::leave_app();
+                }
+                true
+            }
+            Screen::Mailboxes => {
+                Self::leave_app();
+                true
+            }
+            Screen::Settings => true,
+        }
+    }
+
+    /// A text field has the software keyboard, and it is on screen: Android
+    /// may have put it away without telling (Back closes it first).
+    fn keyboard_shown(&self, w: &Window) -> bool {
+        self.mobile.keyboard_for.is_some()
+            && (self.mobile_insets(w).keyboard > 0. || !cfg!(target_os = "android"))
+    }
+
+    /// Setup's step has a way back, as its own "Back" link offers.
+    fn setup_has_back(&self) -> bool {
+        matches!(self.step, Step::Provider | Step::Email | Step::Credentials)
+    }
+
+    /// Back at the first screen leaves Picacho, as Android's Back does
+    /// (where Android doesn't do it itself, see `android::leave`).
+    fn leave_app() {
+        #[cfg(target_os = "android")]
+        crate::android::leave();
+    }
+
+    /// Whether Back has somewhere to go here: anything `mobile_back` (or
+    /// the desktop's `close` after it) would close, or a screen to go back
+    /// to. Android leaves Back to the system where there isn't (home).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(super) fn mobile_has_back(&self, w: &Window, cx: &App) -> bool {
+        self.keyboard_shown(w)
+            || self.mobile_composer(cx).is_some()
+            || self.menu.is_some()
+            || self.presets_for.is_some()
+            || self.model_confirm.is_some()
+            || self.modal.is_some()
+            || self.selecting
+            || self.search_open
+            || match self.mobile_screen() {
+                Screen::Mailboxes => false,
+                Screen::Setup => self.setup_has_back(),
+                _ => true,
+            }
+    }
+
+    /// Android's Back (its back callback, see `PicachoActivity`): a back
+    /// swipe drags the screen as the iOS edge swipe does; letting go past
+    /// the point, or the back button, goes back.
+    #[cfg(target_os = "android")]
+    pub(super) fn platform_back(
+        &mut self,
+        back: crate::android::Back,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::android::Back;
+        let gesture = |phase, progress| BackGestureEvent {
+            phase,
+            progress,
+            ..Default::default()
+        };
+        match back {
+            Back::Swiping { started, progress } => {
+                let phase = if started {
+                    BackGesturePhase::Started
+                } else {
+                    BackGesturePhase::Progressed
+                };
+                self.mobile_back_gesture(&gesture(phase, progress), w, cx);
+            }
+            Back::Go if self.mobile.back_drag.is_some() => {
+                self.mobile_back_gesture(&gesture(BackGesturePhase::Committed, 1.), w, cx);
+            }
+            // A sheet or the keyboard (no drag for those), or the button.
+            Back::Go if self.mobile.back_release.is_none() => self.close(w, cx),
+            Back::Go => {}
+            Back::Cancelled => {
+                self.mobile_back_gesture(&gesture(BackGesturePhase::Cancelled, 0.), w, cx);
+            }
         }
     }
 

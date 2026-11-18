@@ -832,6 +832,61 @@ fn the_snooze_buttons_stay_in_view(cx: &mut TestAppContext) {
     }
 }
 
+/// Back goes back one screen at a time; at the mailboxes, Picacho's first
+/// screen, it has nowhere to go and Android's own Back takes over.
+#[gpui::test]
+fn back_goes_back_a_screen_until_the_first(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let has_back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |this, w, cx| this.mobile_has_back(w, cx))
+    };
+    let back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |this, w, cx| this.close(w, cx));
+        settle(cx);
+    };
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    assert!(has_back(&view, cx));
+    back(&view, cx);
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert!(has_back(&view, cx));
+    back(&view, cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    assert!(!has_back(&view, cx), "the first screen leaves Back to Android");
+    // A sheet over it has somewhere to go back to again.
+    act(&view, Action::Settings, cx);
+    settle(cx);
+    assert!(has_back(&view, cx));
+}
+
+/// In setup, Back goes to the step before, as its "Back" link does, until
+/// the welcome screen.
+#[gpui::test]
+fn back_in_setup_returns_to_the_step_before(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    view.update(cx, |this, cx| {
+        this.onboarding = true;
+        this.step = Step::Email;
+        cx.notify();
+    });
+    settle(cx);
+    let step = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |this, w, cx| (this.step, this.mobile_has_back(w, cx)))
+    };
+    assert!(step(&view, cx) == (Step::Email, true), "not back to Email");
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert!(step(&view, cx) == (Step::Provider, true), "not back to Provider");
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert!(step(&view, cx) == (Step::Welcome, false), "not at Welcome");
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert!(step(&view, cx) == (Step::Welcome, false), "not at Welcome");
+}
+
 #[gpui::test]
 fn all_accounts_lists_every_accounts_subscriptions(cx: &mut TestAppContext) {
     let (view, cx) = phone(PHONE, cx);

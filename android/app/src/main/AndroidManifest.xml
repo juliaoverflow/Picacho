@@ -4,6 +4,29 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Checking for mail in the background: MailService, started again at boot. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Proton's security keys: held to the phone (NFC) or plugged in (USB). -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <!-- Proton's passkeys: Credential Manager, asked as a browser asks for a
+         site's passkeys (src/main/java/.../Passkeys.java). -->
+    <uses-permission android:name="android.permission.CREDENTIAL_MANAGER_SET_ORIGIN" />
+
+    <!-- Browser sign-ins open in a Custom Tab where the browser has them. -->
+    <queries>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
 
     <!-- wgpu renders with Vulkan (or GLES as a fallback). -->
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
@@ -13,24 +36,97 @@
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.Picacho"
-        android:hasCode="false"
         android:allowBackup="false"
         android:extractNativeLibs="false"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:enableOnBackInvokedCallback="true">
 
-        <!-- All of the app is Rust: NativeActivity loads libpicacho.so and
-             android-activity calls android_main (src/android.rs). -->
+        <!-- The app is Rust: PicachoActivity is a NativeActivity that loads
+             libpicacho.so, and android-activity calls android_main
+             (src/android.rs). The Java beside it (src/main/java) runs the
+             background mail service and notifications. -->
         <activity
-            android:name="android.app.NativeActivity"
-            android:exported="true"
+            android:name=".PicachoActivity"
+            android:exported="false"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale">
+            <meta-data android:name="android.app.lib_name" android:value="picacho" />
+        </activity>
+
+        <!-- The launcher entry keeps the component name earlier versions had,
+             so icons people placed on their home screens keep working. -->
+        <activity-alias
+            android:name="android.app.NativeActivity"
+            android:targetActivity=".PicachoActivity"
+            android:exported="true">
+            <!-- NativeActivity reads this from the component it was started
+                 as, which is this alias when launched from the home screen. -->
             <meta-data android:name="android.app.lib_name" android:value="picacho" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+            <!-- A browser sign-in's last page brings Picacho back over the
+                 browser with the app's own scheme, its package name. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="${applicationId}" android:host="signed-in" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Proton's human verification, in a WebView. -->
+        <activity
+            android:name=".VerifyActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Picacho.Verify"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale" />
+
+        <!-- gpui-mobile's file prompts (attachments, pictures). -->
+        <activity
+            android:name="dev.gpui.mobile.GpuiPathPicker"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale" />
+
+        <!-- Restarts the app's process when a new activity can't start in it
+             (see PicachoActivity). -->
+        <activity
+            android:name=".RestartActivity"
+            android:process=":restart"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <service
+            android:name=".MailService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="An email client keeps its connections to the user's mail servers (IMAP IDLE, Proton events) open while closed, to notify of new mail as it arrives." />
+        </service>
+
+        <service
+            android:name=".SignInService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="While the user signs in to their mail account in the browser (OAuth), the app's loopback listener must stay unfrozen to receive the browser's redirect with the authorization code." />
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

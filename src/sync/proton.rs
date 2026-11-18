@@ -219,13 +219,47 @@ pub struct SignedIn {
     pub addresses: Vec<String>,
 }
 
+/// The check's result from one of Proton's verification page's messages
+/// (`display::verify` on desktops, `android::verify`), if it is the one
+/// saying it passed: (token, type). `Err` when the page asks to close.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+pub(crate) fn verification_result(message: &str) -> std::result::Result<Option<(String, String)>, ()> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return Ok(None);
+    };
+    let text = |v: &serde_json::Value| v.as_str().map(str::trim).unwrap_or_default().to_owned();
+    let (token, kind) = match value["type"].as_str().unwrap_or_default() {
+        // verify.proton.me
+        "HUMAN_VERIFICATION_SUCCESS" => (
+            text(&value["payload"]["token"]),
+            text(&value["payload"]["type"]),
+        ),
+        // Proton's older CAPTCHA page (/core/v4/captcha)
+        "pm_captcha" => (text(&value["token"]), "captcha".to_owned()),
+        "CLOSE" | "HUMAN_VERIFICATION_CLOSE" => return Err(()),
+        _ => return Ok(None),
+    };
+    let fits = |s: &str, max: usize| {
+        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_graphic())
+    };
+    if !fits(&token, 4096) {
+        return Ok(None);
+    }
+    let kind = if fits(&kind, 32) {
+        kind
+    } else {
+        "captcha".to_owned()
+    };
+    Ok(Some((token, kind)))
+}
+
 /// The argument that starts Picacho as Proton's verification window
 /// (`display::verify`) rather than as the app.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const VERIFY_FLAG: &str = "--proton-verify";
 
 /// Proton's verification page for a sign-in it wants checked.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 fn verification_url(methods: &[String], token: &str) -> String {
     let methods: Vec<&str> = methods
         .iter()
@@ -263,11 +297,23 @@ fn verified(output: &[u8]) -> Option<HumanVerification> {
 /// text where it offers those) in the system webview, in a window of its
 /// own, and waits until it passes, the window is closed, or the sign-in is
 /// cancelled.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 fn verify_human(_: &[String], _: &str, _: &AtomicBool) -> Result<HumanVerification> {
     bail!(
-        "Proton wants to check that it's you, but its check can't be shown on phones yet. Sign in once at account.proton.me and try again."
+        "Proton wants to check that it's you, but its check can't be shown on iPhones yet. Sign in once at account.proton.me and try again."
     )
+}
+/// On Android the page opens in an activity of its own, with a WebView
+/// (`VerifyActivity`).
+#[cfg(target_os = "android")]
+fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<HumanVerification> {
+    match crate::android::verify(&verification_url(methods, token), cancel)? {
+        Some((token, kind)) => Ok(HumanVerification {
+            token,
+            methods: vec![kind],
+        }),
+        None => bail!("Proton's check was closed before it finished. Sign in again to try it again."),
+    }
 }
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<HumanVerification> {

@@ -5,5 +5,7 @@
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
+    <!-- Proton's verification page: the system's look, with a title bar. -->
+    <style name="Theme.Picacho.Verify" parent="android:Theme.Material" />
     <color name="window">#1E1E1E</color>
 </resources>

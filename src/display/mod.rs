@@ -1,7 +1,7 @@
 //! Display: GPUI views, assets, and desktop notifications.
 mod assets;
 mod desktop;
-mod notify;
+pub mod notify;
 mod ui;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use ui::run;

@@ -246,6 +246,16 @@ native-tls = { version = "0.2", features = ["vendored"] }
 # keyring-core directly (manage/store.rs).
 keyring-core = "1"
 android-native-keyring-store = "1"
+# The app's Java side (android/app/src/main/java): its background mail
+# service and notifications, called both ways (src/android.rs). The same
+# versions android-activity and gpui-mobile use.
+jni = "0.22"
+ndk-context = "0.1"
+# Proton's security keys over USB and NFC: CTAP2 here, the USB and NFC I/O
+# through the Java side (sync/fido/android.rs).
+webauthn-authenticator-rs = { version = "0.6.2", features = ["ctap2"] }
+# Its `Token` trait, implemented for those keys.
+async-trait = "0.1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 # GPUI's iOS platform: the UIKit window, touch and keyboard input, Core Text

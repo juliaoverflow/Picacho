@@ -221,9 +221,19 @@ impl Browser {
         }
     }
     /// Opens `url` in the system browser and waits for the authorization code.
+    #[cfg(not(target_os = "android"))]
     fn code(&self, url: &url::Url, cancel: &AtomicBool) -> Result<String> {
         open::that(url.as_str()).context("Could not open the system browser")?;
         self.wait(cancel)
+    }
+    /// On Android, in a Custom Tab over Picacho (or the browser), with the
+    /// process kept from being frozen until the browser comes back.
+    #[cfg(target_os = "android")]
+    fn code(&self, url: &url::Url, cancel: &AtomicBool) -> Result<String> {
+        crate::android::open_sign_in(url.as_str())?;
+        let code = self.wait(cancel);
+        crate::android::sign_in_ended();
+        code
     }
     fn wait(&self, cancel: &AtomicBool) -> Result<String> {
         let start = Instant::now();
@@ -263,13 +273,9 @@ impl Browser {
                         .unwrap_or("/");
                     let callback = url::Url::parse(&format!("http://localhost{target}"))?;
                     let answer = self.answer(&callback);
-                    let body = if matches!(answer, Some(Ok(_))) {
-                        "Sign-in complete. You can return to Picacho."
-                    } else {
-                        "Sign-in could not be completed. Return to Picacho and try again."
-                    };
+                    let (kind, body) = callback_page(matches!(answer, Some(Ok(_))));
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = stream.write_all(response.as_bytes());
@@ -299,6 +305,29 @@ impl Browser {
         }
         params.get("code").cloned().map(Ok)
     }
+}
+
+/// The page the browser shows once it has handed back the sign-in: its
+/// content type and body.
+fn callback_page(ok: bool) -> (&'static str, String) {
+    let text = if ok {
+        "Sign-in complete. You can return to Picacho."
+    } else {
+        "Sign-in could not be completed. Return to Picacho and try again."
+    };
+    #[cfg(target_os = "android")]
+    if let Some(back) = crate::android::return_url() {
+        // The browser is over Picacho (a Custom Tab) or in front of it:
+        // the page goes back to it, and has a button for when the browser
+        // won't open apps on its own.
+        return (
+            "text/html",
+            format!(
+                "<!doctype html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Picacho</title><style>body{{font:16px system-ui,sans-serif;margin:48px 24px;text-align:center}}a{{display:inline-block;margin-top:16px;padding:12px 24px;border-radius:24px;background:#18b965;color:#fff;text-decoration:none}}</style></head><body><p>{text}</p><a href=\"{back}\">Return to Picacho</a><script>location.replace(\"{back}\")</script></body></html>"
+            ),
+        );
+    }
+    ("text/plain", text.to_owned())
 }
 
 /// Who signed in, from the ID token.

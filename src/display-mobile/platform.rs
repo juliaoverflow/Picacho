@@ -43,8 +43,8 @@ pub(super) fn insets(window: &Window) -> Insets {
     }
     #[cfg(target_os = "android")]
     {
-        // The keyboard resizes Android's content area, so it arrives here
-        // as part of the bottom inset.
+        // Before Android 15 the keyboard resizes the content area, so it
+        // arrives here as part of the bottom inset.
         if let Some(window) = gpui_mobile::android::jni::platform().and_then(|p| p.primary_window())
         {
             let safe = window.safe_area_insets_logical();
@@ -54,6 +54,15 @@ pub(super) fn insets(window: &Window) -> Insets {
             insets.right = insets.right.max(safe.right);
         }
         insets.keyboard = insets.keyboard.max(gpui_mobile::keyboard_height());
+        // Edge to edge (Android 15 and later) the safe area above covers
+        // the whole screen and the keyboard resizes nothing: the bars and
+        // keyboard come from Android's window insets.
+        let system = crate::android::system_insets();
+        insets.top = insets.top.max(system.top);
+        insets.bottom = insets.bottom.max(system.bottom);
+        insets.left = insets.left.max(system.left);
+        insets.right = insets.right.max(system.right);
+        insets.keyboard = insets.keyboard.max(system.keyboard);
     }
     // A desktop preview leaves room where a notched phone would.
     if super::desktop_preview() {

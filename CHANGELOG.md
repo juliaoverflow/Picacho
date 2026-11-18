@@ -28,9 +28,31 @@ same version in `Cargo.toml`.
 - Scheduled mail (Send Later) is sent, and snoozed mail comes back to the
   inbox, while Picacho runs in the background (desktop and Android), each
   with a notification.
+- Android: new-mail notifications, and checking for mail in the background
+  (with an ongoing notification) after Picacho is closed, also after a
+  restart. Turn it off in Settings → General.
+- Android: signing in to Gmail, Outlook and Pinal opens the provider's page
+  over Picacho (a Custom Tab), and its last page brings Picacho back.
+- Android: Proton's human verification (its CAPTCHA) shows in Picacho.
+- Android: Proton's second factor with a security key, held to the phone
+  (NFC) or plugged in (USB), or with a passkey from your password manager
+  (Android 14 and later, where it lets Picacho ask).
+- Android: attaching files, and choosing an account picture, with the
+  system's file picker.
+- Android: Back goes back through Picacho's screens (a back swipe drags the
+  screen as it goes), and from the first screen home, keeping Picacho where
+  it was.
 
 ### Fixed
 
+- Android: the keyboard shows for text fields, and Paste pastes what other
+  apps copied (and Copy reaches them).
+- Android: Picacho scrolls and animates at the display's full refresh rate
+  (such as 120 Hz) rather than 60, also where the system caps apps it
+  doesn't know (ColorOS), and lets the display slow down again when still.
+- Android 15 and later: the top of the app no longer runs under the status
+  bar, nor the bottom under the navigation bar, and the keyboard no longer
+  covers the field being typed in.
 - Selecting text in an email starts and ends under the pointer. In columns
   and centered layouts it ran well to the right of it, and in vertically
   centered cells a line away; links there are clicked where they are shown.
