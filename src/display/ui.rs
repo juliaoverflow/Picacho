@@ -952,6 +952,9 @@ pub struct MailApp {
     sync_again: HashMap<(String, String), usize>,
     downloading: HashSet<String>,
     retrying: HashSet<String>,
+    /// Syncs Refresh asked for, by (account, mailbox key): only the open
+    /// mailbox (or the inbox) is fetched, and they show as checking.
+    manual_refresh: HashSet<(String, String)>,
     /// Unread inbox messages already seen per account, to spot new mail.
     known: HashMap<String, HashSet<String>>,
     busy: usize,
@@ -1801,6 +1804,7 @@ impl MailApp {
             sync_again: HashMap::new(),
             downloading: HashSet::new(),
             retrying: HashSet::new(),
+            manual_refresh: HashSet::new(),
             known: HashMap::new(),
             busy: 0,
             syncing: false,
@@ -3281,6 +3285,56 @@ impl MailApp {
         }
         self.sync_mailbox(a, self.mailbox(), SYNC_WINDOW, cx);
     }
+    /// Refresh (the button, the menu, pulling the list down): fetches new
+    /// mail for the open mailbox only, in each account it shows; see
+    /// `refresh_mailbox`. Drafts are synced as Drafts' own. An account that
+    /// can't sign in is tried again instead.
+    fn refresh_now(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.account.clone() else {
+            return;
+        };
+        if self.folder == Folder::Drafts && !self.subs_open {
+            self.refresh(cx);
+            return;
+        }
+        let ids = if fwd::is_view(&open) {
+            self.scope.accounts.clone()
+        } else {
+            vec![open]
+        };
+        for id in ids {
+            let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                continue;
+            };
+            if self.account_blocked(&id) {
+                self.retry_account(id, cx);
+                continue;
+            }
+            let mailbox = self.refresh_mailbox(&a);
+            self.manual_refresh.insert((id, mailbox.key()));
+            self.sync_mailbox(a, mailbox, SYNC_WINDOW, cx);
+        }
+        cx.notify();
+    }
+    /// What Refresh fetches in `a`: the open mailbox, or the inbox where
+    /// the open one can't be fetched on its own: Starred and All Mail over
+    /// IMAP (assembled from every folder), POP3's folders besides the
+    /// inbox (kept only here), and the subscriptions list.
+    pub(super) fn refresh_mailbox(&self, a: &Account) -> Mailbox {
+        let mailbox = self.mailbox();
+        let folder = mailbox.folder();
+        let fetchable = match a.provider {
+            Provider::Pop3 => folder == Folder::Inbox,
+            // Proton lists Starred and All Mail as labels of their own.
+            Provider::Proton => true,
+            _ => !matches!(folder, Folder::Starred | Folder::All),
+        };
+        if self.subs_open || !fetchable || folder == Folder::Drafts {
+            Folder::Inbox.into()
+        } else {
+            mailbox
+        }
+    }
     fn sync_mailbox(&mut self, a: Account, mailbox: Mailbox, limit: usize, cx: &mut Context<Self>) {
         let id = a.id.clone();
         let key = mailbox.key();
@@ -3310,6 +3364,13 @@ impl MailApp {
             move |this, result, cx| {
                 this.sync_requests.remove(&(id.clone(), key.clone()));
                 let again = this.sync_again.remove(&(id.clone(), key.clone()));
+                // Asked for by Refresh. A sync asked for again runs once
+                // more; that one finishes the refresh.
+                let manual = if again.is_some() {
+                    this.manual_refresh.contains(&(id.clone(), key.clone()))
+                } else {
+                    this.manual_refresh.remove(&(id.clone(), key.clone()))
+                };
                 this.account_result(&id, IssueSource::Sync(key.clone()), &result);
                 let visible = this.shows(&id) && this.mailbox().key() == key;
                 if visible {
@@ -3326,8 +3387,10 @@ impl MailApp {
                     if inbox {
                         this.note_inbox(&id, &messages);
                         // Drafts written on other devices appear, and ones
-                        // written here reach them, with the inbox's checks.
-                        let due = this
+                        // written here reach them, with the inbox's checks
+                        // (not Refresh's, which fetches only new mail).
+                        let due = !manual
+                            && this
                             .draft_synced
                             .get(&id)
                             .is_none_or(|t| t.elapsed() >= Duration::from_secs(120));
@@ -3342,8 +3405,16 @@ impl MailApp {
                         {
                             this.catalog_mailbox(a, catalog, cx);
                         }
+                    } else if manual && this.shows(&id) {
+                        // The inbox, fetched for a mailbox assembled from
+                        // others (Starred, All Mail) or the subscriptions.
+                        this.reload_if_changed(cx);
                     }
-                    if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
+                    // Downloading bodies waits for the next check, not
+                    // Refresh's.
+                    if !manual
+                        && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
+                    {
                         this.download_account(a, cx);
                     }
                 }
@@ -3352,6 +3423,9 @@ impl MailApp {
                     && !this.account_blocked(&id)
                 {
                     this.sync_mailbox(a, again_mailbox, limit, cx);
+                } else if manual {
+                    // Not run again: the refresh ends here.
+                    this.manual_refresh.remove(&(id.clone(), key.clone()));
                 }
                 this.refresh_counts(cx);
             },
@@ -4917,15 +4991,7 @@ impl MailApp {
                 self.new_compose(if all { 2 } else { 1 }, w, cx)
             }
             Action::Forward => self.new_compose(3, w, cx),
-            Action::Refresh => {
-                if let Some(id) = self.account.clone() {
-                    if fwd::is_view(&id) {
-                        self.refresh(cx);
-                    } else {
-                        self.retry_account(id, cx);
-                    }
-                }
-            }
+            Action::Refresh => self.refresh_now(cx),
             Action::Select(id) => {
                 if self.folder == Folder::Drafts {
                     self.handle(Action::OpenDraft(id), w, cx);
@@ -6795,7 +6861,7 @@ impl MailApp {
     /// Listing a large mailbox in the background has its own progress bar
     /// and leaves Refresh available.
     fn checking_server(&self) -> bool {
-        if self.syncing {
+        if self.syncing || self.manual_refresh.iter().any(|(id, _)| self.shows(id)) {
             return true;
         }
         if self.account.is_none() || self.folder == Folder::Drafts {

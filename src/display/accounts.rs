@@ -22,8 +22,10 @@ impl MailApp {
             move |this, _, cx| {
                 this.retrying.remove(&id);
                 let visible = this.shows(&id) && this.folder != Folder::Drafts;
+                // As Refresh fetches: the open mailbox, or the inbox where
+                // that can't be fetched on its own.
                 let mailbox = if visible {
-                    this.mailbox()
+                    this.refresh_mailbox(&a)
                 } else {
                     Folder::Inbox.into()
                 };
