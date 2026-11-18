@@ -92,6 +92,20 @@ pub(super) struct Mobile {
     pub(super) swipe_ended: Option<std::time::Instant>,
     /// How far a pull-to-refresh has been dragged down at the list's top.
     pub(super) pull: f32,
+    /// The current touch began with the list at its top, so pulling past
+    /// it may refresh. A fling that scrolls up to the top doesn't count.
+    pub(super) pull_armed: bool,
+    /// A pull let go of past the point: since when its box has said
+    /// Refreshing. It hides once mail is no longer being checked.
+    pub(super) refreshing: Option<std::time::Instant>,
+    /// The pull box going back up out of sight: where it starts, and its
+    /// animation's key.
+    pub(super) pull_hide: Option<(f32, u64)>,
+    /// The pull box settling from where it was let go of into its
+    /// Refreshing place: where it starts, and its animation's key.
+    pub(super) pull_settle: Option<(f32, u64)>,
+    /// Bumped for each time the pull box settles or hides.
+    pub(super) pull_anim: u64,
     /// The mailboxes screen is sorting accounts: each is a row with a handle.
     pub(super) reordering: bool,
     /// The account being dragged by its handle, and how far its row has
@@ -141,6 +155,11 @@ impl Mobile {
             swipe_ended: None,
             pan: None,
             pull: 0.,
+            pull_armed: false,
+            refreshing: None,
+            pull_hide: None,
+            pull_settle: None,
+            pull_anim: 0,
             reordering: false,
             reorder_drag: None,
             keyboard_for: None,
