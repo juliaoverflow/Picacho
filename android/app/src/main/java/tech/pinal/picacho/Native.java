@@ -42,6 +42,9 @@ final class Native {
      */
     static native void insets(float top, float bottom, float left, float right, float keyboard);
 
+    /** A notification was tapped: {@code target} is where it goes (see Notifier). */
+    static native void open(String target);
+
     /**
      * An answer to a request Rust made ({@link VerifyActivity}, {@link Passkeys}):
      * {@code value} is the answer, or null when there is nothing more.

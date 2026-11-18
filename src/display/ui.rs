@@ -1264,6 +1264,9 @@ pub struct MailApp {
     fwd_adding: bool,
     /// The touch presentation's own state; `mobile.on` picks it.
     mobile: mobile::Mobile,
+    /// A tapped notification's message, opened once the mailbox listing
+    /// with this `load_generation` is in (see `open_notified`).
+    open_listed: Option<(u64, String)>,
 }
 fn input(
     placeholder: &str,
@@ -1703,6 +1706,25 @@ impl MailApp {
             })
             .detach();
         }
+        // A notification tapped while the window is up opens its mail.
+        {
+            let mut clicks = crate::display::notify::clicks();
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while clicks.next().await.is_some() {
+                    let opened = this.update_in(cx, |this, w, cx| {
+                        if let Some(target) = crate::display::notify::take_clicked() {
+                            w.activate_window();
+                            this.open_notified(target, w, cx);
+                        }
+                    });
+                    if opened.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<(String, Mailbox)>();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
@@ -1958,6 +1980,7 @@ impl MailApp {
             filter_inputs,
             server_notes: HashMap::new(),
             mobile: mobile::Mobile::new(),
+            open_listed: None,
         };
         this.update_scope();
         this.load_snoozed();
@@ -1973,8 +1996,11 @@ impl MailApp {
         if this.account.is_some() {
             cx.defer_in(window, |this, w, cx| {
                 this.refresh_counts(cx);
-                // Back where the person was, else the first mailbox.
-                if this.restore_place(w, cx) {
+                // A tapped notification's mail (it opened Picacho), else
+                // back where the person was, else the first mailbox.
+                if let Some(target) = crate::display::notify::take_clicked() {
+                    this.open_notified(target, w, cx);
+                } else if this.restore_place(w, cx) {
                 } else if this.messages.is_empty() {
                     let first = this.account.clone();
                     this.open_mailbox(first, Folder::Inbox.into(), w, cx);
@@ -2358,6 +2384,8 @@ impl MailApp {
             let subject = self.hide_codes(latest, &latest.subject);
             crate::display::notify::new_mail(
                 &a.email,
+                &a.id,
+                &latest.id,
                 (&latest.sender, &subject),
                 fresh.len(),
             );
@@ -3401,6 +3429,13 @@ impl MailApp {
                     this.set_messages(ms, cx);
                     this.listed = Some(key);
                 }
+                if let Some((generation, message)) = this.open_listed.take() {
+                    if generation == gen_ {
+                        this.open_listed_message(&message, cx);
+                    } else {
+                        this.open_listed = Some((generation, message));
+                    }
+                }
                 this.refresh(cx);
             });
         }
@@ -3585,6 +3620,59 @@ impl MailApp {
                 }
             },
         );
+    }
+    /// Opens what a tapped notification tells of: its mailbox, and the
+    /// message in it once listed. Menus and Settings over the mail close.
+    fn open_notified(
+        &mut self,
+        target: crate::display::notify::Target,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.onboarding
+            || self.retired
+            || !self.accounts.iter().any(|a| a.id == target.account)
+        {
+            return;
+        }
+        self.menu = None;
+        self.presets_for = None;
+        if self.modal == Some(Modal::Settings) {
+            self.modal = None;
+        }
+        let open = self.account.as_deref() == Some(target.account.as_str())
+            && self.mailbox() == target.mailbox
+            && !self.subs_open;
+        if !open {
+            self.open_mailbox(Some(target.account), target.mailbox, w, cx);
+        }
+        self.open_listed = None;
+        if let Some(message) = target.message {
+            if open || !self.cache_loading {
+                self.open_listed_message(&message, cx);
+            } else {
+                self.open_listed = Some((self.load_generation, message));
+            }
+        }
+        if self.mobile.on {
+            self.mobile.mailboxes = false;
+            self.mobile_pushed(cx);
+        }
+        cx.notify();
+    }
+    /// Opens `message` (an id or a Message-ID) when the list has it.
+    fn open_listed_message(&mut self, message: &str, cx: &mut Context<Self>) {
+        let found = self
+            .messages
+            .iter()
+            .find(|m| m.id == message || (!m.message_id.is_empty() && m.message_id == message))
+            .map(|m| m.id.clone());
+        if let Some(id) = found {
+            self.selection.clear();
+            self.selecting = false;
+            self.select_mode = false;
+            self.select(id, cx);
+        }
     }
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
         // A placeholder has nothing to open until it is listed.
@@ -9812,7 +9900,7 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
     let backend = Arc::new(Backend::new(store));
     backend.on_proton_notice(|a, title, body| {
         if a.sync.notify {
-            crate::display::notify::account_notice(&a.email, title, body);
+            crate::display::notify::account_notice(&a.email, &a.id, title, body);
         }
     });
     backend

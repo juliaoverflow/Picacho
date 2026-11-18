@@ -24,6 +24,10 @@ public final class RestartActivity extends Activity {
                 .setAction(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        String target = getIntent().getStringExtra(Notifier.EXTRA_OPEN);
+        if (target != null) {
+            open.putExtra(Notifier.EXTRA_OPEN, target);
+        }
         startActivity(open);
         finish();
         Process.killProcess(Process.myPid());

@@ -63,16 +63,22 @@ const RETRY: Duration = Duration::from_secs(5 * 60);
 pub enum Announcement<'a> {
     /// New unread mail: the latest message's sender and subject (as it may
     /// be shown), and how many arrived.
+    /// `account_id` and `message` (the latest's id) say where tapping the
+    /// notification goes.
     NewMail {
         account: &'a str,
+        account_id: &'a str,
+        message: &'a str,
         sender: &'a str,
         subject: &'a str,
         count: usize,
     },
-    /// Snoozed messages came back to the inbox: the latest's sender and
-    /// subject, and how many.
+    /// Snoozed messages came back to the inbox: the latest's sender,
+    /// subject and Message-ID, and how many.
     BackFromSnooze {
         account: &'a str,
+        account_id: &'a str,
+        message_id: &'a str,
         sender: &'a str,
         subject: &'a str,
         count: usize,
@@ -80,12 +86,15 @@ pub enum Announcement<'a> {
     /// A scheduled message went.
     ScheduledSent {
         account: &'a str,
+        account_id: &'a str,
         to: &'a str,
         subject: &'a str,
     },
     /// A scheduled message couldn't be sent; it stays in Drafts, saying why.
+    /// `account_id` is `None` when its account was removed.
     ScheduledFailed {
         account: &'a str,
+        account_id: Option<&'a str>,
         draft: &'a str,
         subject: &'a str,
         error: &'a str,
@@ -286,6 +295,8 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
                         let subject = codes.hide(store, &latest.subject);
                         announce(Announcement::NewMail {
                             account: &a.email,
+                            account_id: &a.id,
+                            message: &latest.id,
                             sender: &latest.sender,
                             subject: &subject,
                             count: fresh.len(),
@@ -371,6 +382,7 @@ fn send_due(
             backend.schedule_failed(&d.id, error);
             announce(Announcement::ScheduledFailed {
                 account: &d.account,
+                account_id: None,
                 draft: &d.id,
                 subject: &d.subject,
                 error,
@@ -390,6 +402,7 @@ fn send_due(
                 }
                 announce(Announcement::ScheduledSent {
                     account: &a.email,
+                    account_id: &a.id,
                     to: &sent.to,
                     subject: &sent.subject,
                 });
@@ -405,6 +418,7 @@ fn send_due(
                 backend.schedule_failed(&d.id, &error);
                 announce(Announcement::ScheduledFailed {
                     account: &a.email,
+                    account_id: Some(&a.id),
                     draft: &d.id,
                     subject: &d.subject,
                     error: &error,
@@ -447,6 +461,8 @@ fn wake_snoozed(
                 let subject = codes.hide(&backend.store, &latest.subject);
                 announce(Announcement::BackFromSnooze {
                     account: &a.email,
+                    account_id: &a.id,
+                    message_id: &latest.message_id,
                     sender: &latest.sender,
                     subject: &subject,
                     count: woken.len(),

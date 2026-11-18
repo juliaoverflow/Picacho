@@ -23,6 +23,8 @@ final class Notifier {
     private static final String BACKGROUND_CHANNEL = "background";
     private static final String SIGN_IN_CHANNEL = "sign-in";
     private static final int PERMISSION_REQUEST = 1;
+    /** Where a tapped notification goes (Rust's notify::Target, as JSON). */
+    static final String EXTRA_OPEN = "tech.pinal.picacho.OPEN";
 
     private Notifier() {}
 
@@ -44,8 +46,13 @@ final class Notifier {
         return manager;
     }
 
-    /** Called from Rust. A notification with the same id is replaced. */
-    public static void show(Context context, int id, String title, String text, String subText) {
+    /**
+     * Called from Rust. A notification with the same id is replaced. Tapping
+     * it opens Picacho at {@code target} (empty for none; see
+     * {@link #targetOf}).
+     */
+    public static void show(
+            Context context, int id, String title, String text, String subText, String target) {
         Notification notification = new Notification.Builder(context, MAIL_CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(title)
@@ -53,7 +60,7 @@ final class Notifier {
                 .setSubText(subText)
                 .setStyle(new Notification.BigTextStyle().bigText(text))
                 .setCategory(Notification.CATEGORY_EMAIL)
-                .setContentIntent(openApp(context))
+                .setContentIntent(open(context, id, target))
                 .setAutoCancel(true)
                 .build();
         try {
@@ -99,12 +106,41 @@ final class Notifier {
     }
 
     private static PendingIntent openApp(Context context) {
-        Intent open = new Intent(context, PicachoActivity.class)
-                .setAction(Intent.ACTION_MAIN)
+        return open(context, 0, null);
+    }
+
+    /**
+     * Opens Picacho as its launcher icon does (the same component, so the
+     * same task comes forward), carrying {@code target} when there is one.
+     * Each notification has its own request code: one PendingIntent per
+     * notification, so each keeps its own target.
+     */
+    private static PendingIntent open(Context context, int requestCode, String target) {
+        Intent open = new Intent(Intent.ACTION_MAIN)
+                .setClassName(context, "android.app.NativeActivity")
                 .addCategory(Intent.CATEGORY_LAUNCHER)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (target != null && !target.isEmpty()) {
+            open.putExtra(EXTRA_OPEN, target);
+        }
         return PendingIntent.getActivity(
-                context, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                context,
+                requestCode,
+                open,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
+    /**
+     * The target a tapped notification's intent carries, or null. An intent
+     * relaunched from Recents carries what it first did; that isn't a tap.
+     */
+    static String targetOf(Intent intent) {
+        if (intent == null
+                || (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
+            return null;
+        }
+        String target = intent.getStringExtra(EXTRA_OPEN);
+        return target == null || target.isEmpty() ? null : target;
     }
 
     /** Asks for permission to notify (Android 13 and later) if not granted. */

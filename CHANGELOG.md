@@ -45,6 +45,10 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Tapping a notification opens what it tells of: new mail opens the message
+  in its mailbox, mail back from snooze the inbox (or the message), a sent or
+  failed scheduled message Sent or Drafts. On Android it did nothing; on Linux
+  clicking one now does this too while Picacho's window is open.
 - Android: the keyboard shows for text fields, and Paste pastes what other
   apps copied (and Copy reaches them).
 - Android: Picacho scrolls and animates at the display's full refresh rate

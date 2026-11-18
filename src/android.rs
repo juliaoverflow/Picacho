@@ -196,17 +196,20 @@ pub fn set_background(on: bool) {
 }
 
 /// Shows a notification (`Notifier.show`). `key` picks the notification:
-/// one with the same key replaces it.
-pub fn notify(key: &str, title: &str, text: &str, sub_text: &str) {
+/// one with the same key replaces it. Tapping it opens Picacho and hands
+/// `target` (`notify::Target`'s JSON; empty for none) back through
+/// `Native.open`.
+pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str) {
     with_java("Notifier.show", |env, java| {
         let title = env.new_string(title)?;
         let text = env.new_string(text)?;
         let sub_text = env.new_string(sub_text)?;
+        let target = env.new_string(target)?;
         env.call_static_method(
             &java.notifier,
             jni_str!("show"),
             jni_sig!(
-                "(Landroid/content/Context;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+                "(Landroid/content/Context;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
             ),
             &[
                 JValue::Object(java.context.as_obj()),
@@ -214,6 +217,7 @@ pub fn notify(key: &str, title: &str, text: &str, sub_text: &str) {
                 JValue::Object(&title),
                 JValue::Object(&text),
                 JValue::Object(&sub_text),
+                JValue::Object(&target),
             ],
         )
         .map(drop)
@@ -407,6 +411,23 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_back<'caller>(
         };
         if let Some(sender) = BACK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = sender.unbounded_send(back);
+        }
+        Ok(())
+    });
+}
+
+/// `Native.open(String target)`: a notification was tapped, opening the
+/// activity (`PicachoActivity`); `target` is what it showed. The window
+/// opens it, now or once it is up (`notify::clicked`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_open<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    target: JString<'caller>,
+) {
+    native(env, |_| {
+        if !target.is_null() {
+            display::notify::clicked(&target.to_string());
         }
         Ok(())
     });

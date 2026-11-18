@@ -65,6 +65,11 @@ public final class PicachoActivity extends GpuiInputActivity {
         }
         started = true;
         Native.beforeActivity();
+        // A tapped notification's target, before the window starts: it opens
+        // there once it's up.
+        if (savedInstanceState == null) {
+            opened(getIntent());
+        }
         super.onCreate(savedInstanceState);
         current = this;
         // Android 15 and later draw apps edge to edge: the window runs under
@@ -237,12 +242,22 @@ public final class PicachoActivity extends GpuiInputActivity {
     /**
      * Opened again while it runs: from the launcher, a notification, or a
      * browser sign-in's last page (the app's own scheme), which brings
-     * Picacho back over the browser. Nothing in the intent is used.
+     * Picacho back over the browser. A notification's target is opened.
      */
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        opened(intent);
+    }
+
+    /** Hands a tapped notification's target to Rust, once. */
+    private static void opened(Intent intent) {
+        String target = Notifier.targetOf(intent);
+        if (target != null) {
+            intent.removeExtra(Notifier.EXTRA_OPEN);
+            Native.open(target);
+        }
     }
 
     @Override
@@ -335,6 +350,8 @@ public final class PicachoActivity extends GpuiInputActivity {
         Native.shutdown();
         Intent restart = new Intent(this, RestartActivity.class)
                 .putExtra(RestartActivity.EXTRA_PID, Process.myPid())
+                // A tapped notification's target goes to the new process.
+                .putExtra(Notifier.EXTRA_OPEN, Notifier.targetOf(getIntent()))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
         startActivity(restart);
         finish();
