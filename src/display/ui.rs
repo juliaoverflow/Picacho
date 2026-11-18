@@ -326,6 +326,12 @@ impl Appearance {
     }
 }
 fn system_dark(w: &Window) -> bool {
+    // The activity's own configuration, which gpui-mobile's window appearance
+    // lags behind (see `android::system_dark`).
+    #[cfg(target_os = "android")]
+    if let Some(dark) = crate::android::system_dark() {
+        return dark;
+    }
     matches!(
         w.appearance(),
         WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -1729,6 +1735,27 @@ impl MailApp {
                 use futures::StreamExt;
                 while changes.next().await.is_some() {
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // The system's dark mode changed (see `android::system_dark`).
+        #[cfg(target_os = "android")]
+        {
+            let mut changes = crate::android::dark_events();
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while changes.next().await.is_some() {
+                    let updated = this.update_in(cx, |this, w, cx| {
+                        if this.appearance == Appearance::System {
+                            this.dark = system_dark(w);
+                            this.apply_theme(w, cx);
+                            cx.notify();
+                        }
+                    });
+                    if updated.is_err() {
                         break;
                     }
                 }

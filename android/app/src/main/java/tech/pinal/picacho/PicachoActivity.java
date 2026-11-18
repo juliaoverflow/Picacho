@@ -2,6 +2,7 @@ package tech.pinal.picacho;
 
 import android.annotation.TargetApi;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
@@ -65,6 +66,7 @@ public final class PicachoActivity extends GpuiInputActivity {
         }
         started = true;
         Native.beforeActivity();
+        nightMode(getResources().getConfiguration());
         // A tapped notification's target, before the window starts: it opens
         // there once it's up.
         if (savedInstanceState == null) {
@@ -78,6 +80,25 @@ public final class PicachoActivity extends GpuiInputActivity {
         // covers the whole screen, so the bars and keyboard are told apart.
         getWindow().getDecorView().setOnApplyWindowInsetsListener(this::onInsets);
         Notifier.requestPermission(this);
+    }
+
+    /**
+     * The activity handles its configuration changes itself (the manifest's
+     * configChanges), dark mode among them. gpui-mobile reads dark mode from
+     * the native asset manager, which a dark mode change alone leaves stale,
+     * so Rust is told it from the configuration here.
+     */
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (current == this) {
+            nightMode(newConfig);
+        }
+    }
+
+    private static void nightMode(Configuration config) {
+        Native.nightMode((config.uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                == Configuration.UI_MODE_NIGHT_YES);
     }
 
     /** Hands the system bars', cutout's and keyboard's insets to Rust, in points. */

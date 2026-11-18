@@ -42,6 +42,9 @@ final class Native {
      */
     static native void insets(float top, float bottom, float left, float right, float keyboard);
 
+    /** Whether the system is in dark mode, from PicachoActivity's configuration. */
+    static native void nightMode(boolean dark);
+
     /** A notification was tapped: {@code target} is where it goes (see Notifier). */
     static native void open(String target);
 

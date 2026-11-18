@@ -485,6 +485,52 @@ pub fn insets_events() -> futures::channel::mpsc::UnboundedReceiver<()> {
     receiver
 }
 
+/// The system's dark mode as the activity's configuration has it: 0 not yet
+/// told, 1 light, 2 dark. gpui-mobile reads it from the native asset
+/// manager's configuration, which isn't up to date yet when a dark mode
+/// change alone arrives (it only caught up at the next change, such as the
+/// screen turning), so the activity tells it here instead.
+static SYSTEM_DARK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Where a change of the system's dark mode is told: the window's.
+static DARK_CHANGED: Mutex<Option<futures::channel::mpsc::UnboundedSender<()>>> =
+    Mutex::new(None);
+
+/// Whether the system is in dark mode, once the activity has told.
+pub fn system_dark() -> Option<bool> {
+    match SYSTEM_DARK.load(Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Changes of the system's dark mode from now on. A window opened later
+/// takes them over; the earlier one's stream then ends.
+pub fn dark_events() -> futures::channel::mpsc::UnboundedReceiver<()> {
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    *DARK_CHANGED.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+    receiver
+}
+
+/// `Native.nightMode(dark)`: from the activity's configuration, on Android's
+/// UI thread, at its start and at each configuration change.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_nightMode<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    dark: jni::sys::jboolean,
+) {
+    native(env, |_| {
+        let now = if dark { 2 } else { 1 };
+        if SYSTEM_DARK.swap(now, Ordering::Relaxed) != now
+            && let Some(sender) = DARK_CHANGED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        {
+            let _ = sender.unbounded_send(());
+        }
+        Ok(())
+    });
+}
+
 /// `Native.insets(top, bottom, left, right, keyboard)`: from the activity's
 /// window insets listener, on Android's UI thread.
 #[unsafe(no_mangle)]
