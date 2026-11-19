@@ -164,9 +164,12 @@ pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
             .send()
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.json::<serde_json::Value>());
-        match found {
-            Ok(v) => {
-                let m = parse_metadata(&v)?;
+        // A document that can't be used is passed over for the next one.
+        match found
+            .map_err(anyhow::Error::from)
+            .and_then(|v| issued_by(&v, &origin).and_then(|()| parse_metadata(&v)))
+        {
+            Ok(m) => {
                 KNOWN.lock().unwrap().push((origin, m.clone()));
                 return Ok(m);
             }
@@ -175,8 +178,19 @@ pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
     }
     Err(anyhow::anyhow!(
         "{host} doesn't offer browser sign-in for mail apps{}. Use a password or an API token instead.",
-        last.map(|e| format!(" ({e})")).unwrap_or_default()
+        last.map(|e| format!(" ({e:#})")).unwrap_or_default()
     ))
+}
+/// Checks that a metadata document fetched from `origin` is that server's
+/// own (RFC 8414 §3.3): its `issuer`, where it names one, is `origin`.
+fn issued_by(v: &serde_json::Value, origin: &str) -> Result<()> {
+    match v["issuer"].as_str() {
+        None => Ok(()),
+        Some(issuer) if issuer.trim_end_matches('/').eq_ignore_ascii_case(origin) => Ok(()),
+        Some(issuer) => Err(anyhow::anyhow!(
+            "its sign-in settings are for {issuer}, not {origin}"
+        )),
+    }
 }
 /// Registers Picacho with a server that allows apps to (RFC 7591), for
 /// `redirect`: a public client, without a secret (RFC 8252).
@@ -839,6 +853,15 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jmap_metadata_must_be_the_servers_own() {
+        let origin = "https://api.fastmail.com";
+        let own = serde_json::json!({"issuer": "https://api.fastmail.com/"});
+        assert!(issued_by(&own, origin).is_ok());
+        assert!(issued_by(&serde_json::json!({}), origin).is_ok());
+        let other = serde_json::json!({"issuer": "https://login.example.net"});
+        assert!(issued_by(&other, origin).is_err());
+    }
     #[test]
     fn jmap_servers_name_their_endpoints_and_scopes() {
         let m = parse_metadata(&serde_json::json!({

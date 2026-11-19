@@ -59,22 +59,37 @@ impl LinkSafety {
         }
     }
 
-    /// Whether `url` goes to a trusted site or one under it.
+    /// Whether `url` goes to a trusted site or one under it. Under a
+    /// public suffix (a site trusted before it was checked for one), only
+    /// the site itself and its `www.` are trusted: the names under it
+    /// belong to other people.
     fn trusts(&self, url: &url::Url) -> bool {
-        let Some(host) = url.host_str().map(str::to_lowercase) else {
+        let Some(host) = url.host_str().map(|h| h.trim_end_matches('.').to_lowercase()) else {
             return false;
         };
-        self.trusted
-            .iter()
-            .any(|site| host == *site || host.ends_with(&format!(".{site}")))
+        self.trusted.iter().any(|site| {
+            host == *site
+                || host.strip_prefix("www.") == Some(site.as_str())
+                || (!public_suffix(site) && host.ends_with(&format!(".{site}")))
+        })
     }
 }
 
 /// The site a link goes to, as it is shown and trusted: its host, without
-/// a leading `www.`.
+/// a leading `www.` unless what remains is a public suffix
+/// (`www.blogspot.com` stays itself, or trusting it would trust every blog).
 pub(super) fn site(url: &url::Url) -> Option<String> {
     let host = url.host_str()?.trim_end_matches('.').to_lowercase();
-    Some(host.strip_prefix("www.").unwrap_or(&host).to_owned())
+    Some(match host.strip_prefix("www.") {
+        Some(rest) if !public_suffix(rest) => rest.to_owned(),
+        _ => host,
+    })
+}
+
+/// Whether `name` is a public suffix (`com`, `co.uk`, `blogspot.com`):
+/// a name under which different people register their own.
+fn public_suffix(name: &str) -> bool {
+    psl::suffix_str(name) == Some(name)
 }
 
 /// What about `url` is a known trick, in a few words each.
@@ -267,6 +282,27 @@ mod tests {
         assert!(links.trusts(&url("https://login.example.com/x")));
         assert!(!links.trusts(&url("https://example.com.evil.net/x")));
         assert!(!links.trusts(&url("https://notexample.com/x")));
+    }
+
+    #[test]
+    fn shared_suffixes_trust_only_themselves() {
+        assert_eq!(site(&url("https://www.example.com/")).unwrap(), "example.com");
+        assert_eq!(
+            site(&url("https://www.blogspot.com/")).unwrap(),
+            "www.blogspot.com"
+        );
+        let links = LinkSafety {
+            warn: true,
+            trusted: vec!["blogspot.com".into(), "www.github.io".into()],
+            confirm: None,
+            hovered: None,
+            shown: 0,
+        };
+        assert!(links.trusts(&url("https://blogspot.com/")));
+        assert!(links.trusts(&url("https://www.blogspot.com/")));
+        assert!(!links.trusts(&url("https://someone.blogspot.com/")));
+        assert!(links.trusts(&url("https://www.github.io/")));
+        assert!(!links.trusts(&url("https://attacker.github.io/")));
     }
 
     #[test]

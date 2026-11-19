@@ -8,9 +8,13 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.Icon;
 import android.os.Build;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.Arrays;
 
 /** Picacho's notifications: new mail (from Rust) and the ongoing service one. */
@@ -25,6 +29,15 @@ final class Notifier {
     private static final int PERMISSION_REQUEST = 1;
     /** Where a tapped notification goes (Rust's notify::Target, as JSON). */
     static final String EXTRA_OPEN = "tech.pinal.picacho.OPEN";
+    /**
+     * Proof that a target came from Picacho's own notification: the launcher
+     * entry is exported, so any app can start it with an {@link #EXTRA_OPEN}
+     * of its choosing. A random key, kept in the app's private preferences
+     * (it outlives the process, as notifications do), goes with each one.
+     */
+    static final String EXTRA_KEY = "tech.pinal.picacho.OPEN_KEY";
+    private static final String KEY_PREFERENCES = "notifications";
+    private static final String KEY = "open_key";
 
     private Notifier() {}
 
@@ -121,7 +134,7 @@ final class Notifier {
                 .addCategory(Intent.CATEGORY_LAUNCHER)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         if (target != null && !target.isEmpty()) {
-            open.putExtra(EXTRA_OPEN, target);
+            open.putExtra(EXTRA_OPEN, target).putExtra(EXTRA_KEY, key(context));
         }
         return PendingIntent.getActivity(
                 context,
@@ -133,14 +146,44 @@ final class Notifier {
     /**
      * The target a tapped notification's intent carries, or null. An intent
      * relaunched from Recents carries what it first did; that isn't a tap.
+     * One without Picacho's key came from another app and is ignored.
      */
-    static String targetOf(Intent intent) {
+    static String targetOf(Context context, Intent intent) {
         if (intent == null
                 || (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
             return null;
         }
         String target = intent.getStringExtra(EXTRA_OPEN);
-        return target == null || target.isEmpty() ? null : target;
+        if (target == null || target.isEmpty()) {
+            return null;
+        }
+        String given = intent.getStringExtra(EXTRA_KEY);
+        if (given == null
+                || !MessageDigest.isEqual(
+                        given.getBytes(StandardCharsets.UTF_8),
+                        key(context).getBytes(StandardCharsets.UTF_8))) {
+            return null;
+        }
+        return target;
+    }
+
+    /** The app's notification key (see {@link #EXTRA_KEY}), made on first use. */
+    static synchronized String key(Context context) {
+        SharedPreferences preferences =
+                context.getSharedPreferences(KEY_PREFERENCES, Context.MODE_PRIVATE);
+        String key = preferences.getString(KEY, null);
+        if (key == null || key.isEmpty()) {
+            byte[] random = new byte[32];
+            new SecureRandom().nextBytes(random);
+            StringBuilder hex = new StringBuilder();
+            for (byte b : random) {
+                hex.append(String.format("%02x", b));
+            }
+            key = hex.toString();
+            // Written at once: the restart process (RestartActivity) reads it.
+            preferences.edit().putString(KEY, key).commit();
+        }
+        return key;
     }
 
     /** Asks for permission to notify (Android 13 and later) if not granted. */

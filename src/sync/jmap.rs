@@ -1203,7 +1203,12 @@ impl Session {
             } else if let Some(v) = line.strip_prefix("event:") {
                 event = v.trim().to_owned();
             } else if let Some(v) = line.strip_prefix("data:") {
-                data.push_str(v.trim_start());
+                // A field's lines are one value, joined by line feeds.
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                // One space after the colon is the field's, not the value's.
+                data.push_str(v.strip_prefix(' ').unwrap_or(v));
             }
         }
         Ok(())

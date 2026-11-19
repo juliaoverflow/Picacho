@@ -26,7 +26,8 @@ public final class RestartActivity extends Activity {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
         String target = getIntent().getStringExtra(Notifier.EXTRA_OPEN);
         if (target != null) {
-            open.putExtra(Notifier.EXTRA_OPEN, target);
+            // Checked before the restart (PicachoActivity.restartProcess).
+            open.putExtra(Notifier.EXTRA_OPEN, target).putExtra(Notifier.EXTRA_KEY, Notifier.key(this));
         }
         startActivity(open);
         finish();

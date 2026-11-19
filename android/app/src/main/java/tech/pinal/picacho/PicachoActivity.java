@@ -70,7 +70,7 @@ public final class PicachoActivity extends GpuiInputActivity {
         // A tapped notification's target, before the window starts: it opens
         // there once it's up.
         if (savedInstanceState == null) {
-            opened(getIntent());
+            opened(this, getIntent());
         }
         super.onCreate(savedInstanceState);
         current = this;
@@ -269,14 +269,15 @@ public final class PicachoActivity extends GpuiInputActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        opened(intent);
+        opened(this, intent);
     }
 
     /** Hands a tapped notification's target to Rust, once. */
-    private static void opened(Intent intent) {
-        String target = Notifier.targetOf(intent);
+    private static void opened(android.content.Context context, Intent intent) {
+        String target = Notifier.targetOf(context, intent);
         if (target != null) {
             intent.removeExtra(Notifier.EXTRA_OPEN);
+            intent.removeExtra(Notifier.EXTRA_KEY);
             Native.open(target);
         }
     }
@@ -372,7 +373,7 @@ public final class PicachoActivity extends GpuiInputActivity {
         Intent restart = new Intent(this, RestartActivity.class)
                 .putExtra(RestartActivity.EXTRA_PID, Process.myPid())
                 // A tapped notification's target goes to the new process.
-                .putExtra(Notifier.EXTRA_OPEN, Notifier.targetOf(getIntent()))
+                .putExtra(Notifier.EXTRA_OPEN, Notifier.targetOf(this, getIntent()))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
         startActivity(restart);
         finish();

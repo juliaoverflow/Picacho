@@ -152,6 +152,13 @@ fn bytes(v: Option<&Value>) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Whether `rp_id` is one of Proton's sites (or a site under one).
+fn proton_rp(rp_id: &str) -> bool {
+    ["proton.me", "protonmail.com", "protonmail.ch"]
+        .iter()
+        .any(|d| rp_id == *d || rp_id.ends_with(&format!(".{d}")))
+}
+
 /// Proton's `AuthenticationOptions` (bytes as arrays of numbers) as a
 /// WebAuthn request.
 pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOptions> {
@@ -164,7 +171,14 @@ pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOpti
         .get("rpId")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Proton didn't name itself for the key."))?
-        .to_owned();
+        .to_ascii_lowercase();
+    // The relying party becomes the origin a passkey is asked for (Android's
+    // Credential Manager, Windows Hello): only Proton's own sites, so an
+    // answer naming another site can't get its passkeys signed.
+    anyhow::ensure!(
+        proton_rp(&rp_id),
+        "Proton asked for a security key for {rp_id}, which isn't Proton."
+    );
     let allow_credentials = pk
         .get("allowCredentials")
         .and_then(Value::as_array)
@@ -508,6 +522,14 @@ mod tests {
             UserVerificationPolicy::Discouraged_DO_NOT_USE
         );
         assert!(usable(Some(&options)));
+        // Another site's passkeys aren't asked for.
+        let elsewhere = serde_json::json!({"publicKey": {
+            "challenge": [1], "rpId": "google.com"
+        }});
+        assert!(request_options(&elsewhere).is_err());
+        assert!(proton_rp("account.proton.me"));
+        assert!(!proton_rp("evilproton.me"));
+        assert!(!proton_rp("proton.me.evil.com"));
         assert!(!usable(Some(&serde_json::json!({}))));
         assert!(!usable(None));
     }
