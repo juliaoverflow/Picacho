@@ -57,6 +57,15 @@ same version in `Cargo.toml`.
   back button or an edge swipe) only moves the column that changes; closing
   the message no longer slides the whole screen. Opening a message, and the
   next or previous one, likewise moves only the message's column.
+- Tablets: in Settings beside its list, choosing a page or going back from
+  an alias's reverse aliases moves only the page's column, and a back swipe
+  no longer drags the whole screen. Back from reverse aliases returns to
+  Forwarding instead of closing Settings.
+- Phones and tablets: All Accounts (or an alias's view) names itself under
+  the mailbox's name, rather than one of its accounts.
+- Tapping a new mail notification for a message not synced yet (such as one
+  just pushed) no longer leaves the message open before on screen; the new
+  one opens once it arrives.
 - Tapping a notification opens what it tells of: new mail opens the message
   in its mailbox, mail back from snooze the inbox (or the message), a sent or
   failed scheduled message Sent or Drafts. On Android it did nothing; on Linux

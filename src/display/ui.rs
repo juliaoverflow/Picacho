@@ -171,6 +171,9 @@ const STAR: u32 = 0xe0a526;
 const ROW_HEIGHT: f32 = 86.;
 /// The newest messages a sync keeps current; the catalog lists the rest.
 const SYNC_WINDOW: usize = 300;
+/// How long a tapped notification's message, not yet listed, is waited
+/// for (see `open_notified`).
+const NOTIFIED_WAIT: Duration = Duration::from_secs(120);
 /// Setup form inputs.
 const EMAIL: usize = 0;
 const PASSWORD: usize = 1;
@@ -1290,8 +1293,9 @@ pub struct MailApp {
     /// The touch presentation's own state; `mobile.on` picks it.
     mobile: mobile::Mobile,
     /// A tapped notification's message, opened once the mailbox listing
-    /// with this `load_generation` is in (see `open_notified`).
-    open_listed: Option<(u64, String)>,
+    /// with this `load_generation` has it (see `open_notified`): it may
+    /// only just have arrived, not yet synced. Until the `Instant`.
+    open_listed: Option<(u64, String, std::time::Instant)>,
 }
 fn input(
     placeholder: &str,
@@ -3560,13 +3564,7 @@ impl MailApp {
                     this.set_messages(ms, cx);
                     this.listed = Some(key);
                 }
-                if let Some((generation, message)) = this.open_listed.take() {
-                    if generation == gen_ {
-                        this.open_listed_message(&message, cx);
-                    } else {
-                        this.open_listed = Some((generation, message));
-                    }
-                }
+                this.apply_pending_listed(cx);
                 this.refresh(cx);
             });
         }
@@ -3779,10 +3777,21 @@ impl MailApp {
         }
         self.open_listed = None;
         if let Some(message) = target.message {
-            if open || !self.cache_loading {
-                self.open_listed_message(&message, cx);
-            } else {
-                self.open_listed = Some((self.load_generation, message));
+            let listed = (open || !self.cache_loading) && self.open_listed_message(&message, cx);
+            if !listed {
+                // Not listed yet: it may have only just arrived (a push
+                // announces it before it is synced). Whatever was open
+                // before gives way, and it opens once the list has it.
+                if self.selected.is_some() {
+                    self.html_view.update(cx, |view, cx| view.clear(cx));
+                    self.selected = None;
+                    self.read_generation += 1;
+                }
+                let until = std::time::Instant::now() + NOTIFIED_WAIT;
+                self.open_listed = Some((self.load_generation, message, until));
+                if open {
+                    self.refresh(cx);
+                }
             }
         }
         if self.mobile.on {
@@ -3791,18 +3800,44 @@ impl MailApp {
         }
         cx.notify();
     }
-    /// Opens `message` (an id or a Message-ID) when the list has it.
-    fn open_listed_message(&mut self, message: &str, cx: &mut Context<Self>) {
+    /// Opens `message` (an id or a Message-ID) when the list has it (not
+    /// as a placeholder). True when it did.
+    fn open_listed_message(&mut self, message: &str, cx: &mut Context<Self>) -> bool {
         let found = self
             .messages
             .iter()
-            .find(|m| m.id == message || (!m.message_id.is_empty() && m.message_id == message))
+            .find(|m| {
+                !m.pending
+                    && (m.id == message || (!m.message_id.is_empty() && m.message_id == message))
+            })
             .map(|m| m.id.clone());
-        if let Some(id) = found {
-            self.selection.clear();
-            self.selecting = false;
-            self.select_mode = false;
-            self.select(id, cx);
+        let Some(id) = found else {
+            return false;
+        };
+        self.selection.clear();
+        self.selecting = false;
+        self.select_mode = false;
+        self.select(id, cx);
+        true
+    }
+    /// Opens a tapped notification's message once the open mailbox's list
+    /// has it (see `open_notified`). Another mailbox opened since, or a
+    /// message opened meanwhile, ends the wait.
+    fn apply_pending_listed(&mut self, cx: &mut Context<Self>) {
+        let Some((generation, message, until)) = self.open_listed.take() else {
+            return;
+        };
+        if generation != self.load_generation
+            || self.selected.is_some()
+            || self.subs_open
+            || std::time::Instant::now() > until
+        {
+            return;
+        }
+        if self.cache_loading || !self.open_listed_message(&message, cx) {
+            self.open_listed = Some((generation, message, until));
+        } else if self.mobile.on {
+            self.mobile_pushed(cx);
         }
     }
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
@@ -9227,6 +9262,7 @@ impl Render for MailApp {
         self.apply_reveal(window, cx);
         self.apply_pending_place(window, cx);
         self.apply_pending_new_alias(window, cx);
+        self.apply_pending_listed(cx);
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = if self.mobile.on {

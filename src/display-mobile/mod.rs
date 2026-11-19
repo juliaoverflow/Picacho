@@ -529,7 +529,17 @@ impl MailApp {
         }
         // Settings: a page goes back to the list of pages.
         if self.modal == Some(Modal::Settings) {
-            if self.mobile.settings_page && !Self::mobile_split(w) {
+            // Beside the list, reverse aliases go back to Forwarding, in
+            // their column; anything else leaves Settings.
+            if Self::mobile_split(w) {
+                self.mobile.settings_page = false;
+                if self.fwd_reverse.take().is_some() {
+                    self.mobile_popped(cx);
+                    return true;
+                }
+                return false;
+            }
+            if self.mobile.settings_page {
                 if self.fwd_reverse.take().is_none() {
                     self.mobile.settings_page = false;
                 }
@@ -680,6 +690,7 @@ impl MailApp {
     fn mobile_can_go_back(&self, cx: &App) -> bool {
         !matches!(self.mobile_screen(), Screen::Mailboxes | Screen::Setup)
             && !self.mobile_split_frame()
+            && !self.mobile_split_settings()
             && self.menu.is_none()
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
@@ -1050,6 +1061,12 @@ impl MailApp {
         self.mobile.split && Self::split_framed(self.mobile_screen())
     }
 
+    /// Whether Settings shows its list beside the open page (a wide
+    /// screen): going back changes the page's column, not the screen.
+    fn mobile_split_settings(&self) -> bool {
+        self.mobile.split && self.mobile_screen() == Screen::Settings
+    }
+
     /// Works out, once for each change of screen, whether it stays side by
     /// side, so only a column moves (and which), not the whole screen:
     /// closing the message leaves the list where it is.
@@ -1059,6 +1076,10 @@ impl MailApp {
             self.mobile.seen_anim = key;
             let framed = |s: Screen| self.mobile.split && Self::split_framed(s);
             self.mobile.pane_slide = match self.mobile.drawn {
+                // Settings beside its list: only the page's column changes.
+                Some(Screen::Settings) if self.mobile.split && screen == Screen::Settings => {
+                    Some((Some(SplitPane::Reader), key))
+                }
                 Some(old) if framed(old) && framed(screen) => Some((
                     match self.mobile.slide {
                         Slide::Next | Slide::Previous => Some(SplitPane::Reader),
@@ -1119,10 +1140,10 @@ impl MailApp {
     /// Whether a pan from the leading edge of the wide screen can go back:
     /// closing the message, or from the list to the mailboxes.
     fn mobile_split_can_go_back(&self, cx: &App) -> bool {
-        self.mobile_split_frame()
+        (self.mobile_split_frame() || self.mobile_split_settings())
             && self.mobile_screen() != Screen::Mailboxes
             && self.menu.is_none()
-            && self.modal.is_none()
+            && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
             && self.links.confirm.is_none()
             && !self.selecting

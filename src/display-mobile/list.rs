@@ -68,6 +68,23 @@ impl SwipeAct {
 }
 
 impl MailApp {
+    /// What the list's title bar says under the mailbox's name: its
+    /// account's address. A view (All Accounts, an alias) names itself
+    /// rather than one of the accounts it draws from. None while selecting.
+    pub(super) fn mobile_list_subtitle(&self, title: &str) -> Option<String> {
+        match self.account.as_deref() {
+            _ if self.selecting => None,
+            Some(id) if fwd::is_view(id) => self
+                .view_title(id)
+                .map(|(name, _, _)| name)
+                .filter(|name| name != title),
+            _ => self
+                .current_account()
+                .filter(|a| a.label() != title)
+                .map(|a| a.email.clone()),
+        }
+    }
+
     pub(super) fn mobile_list(
         &mut self,
         insets: Insets,
@@ -121,10 +138,7 @@ impl MailApp {
         } else {
             self.mailbox_label()
         };
-        let subtitle = self
-            .current_account()
-            .filter(|a| !self.selecting && a.label() != title)
-            .map(|a| a.email.clone());
+        let subtitle = self.mobile_list_subtitle(&title);
         let list = if count == 0 {
             div()
                 .flex_1()

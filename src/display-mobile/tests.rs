@@ -1079,3 +1079,133 @@ fn the_filter_chips_fade_where_more_are_scrolled_past(cx: &mut TestAppContext) {
         "{chip} under the fade didn't turn on"
     );
 }
+
+#[gpui::test]
+fn settings_beside_its_list_go_back_in_the_pages_column(cx: &mut TestAppContext) {
+    let (view, cx) = phone(TABLET, cx);
+    view.update_in(cx, |this, w, cx| this.mobile_open_settings(w, cx));
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Settings);
+    // Choosing a page moves only the page's column, not the screen.
+    let forwarding = bounds(cx, "mobile-settings-forwarding");
+    cx.simulate_click(forwarding.center(), Modifiers::none());
+    cx.run_until_parked();
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.page == Page::Forwarding);
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    assert_eq!(
+        cx.debug_bounds("mobile-screen").map(|b| b.origin),
+        Some(point(px(0.), px(0.))),
+        "the whole screen moved"
+    );
+    // A back swipe doesn't drag the screen along.
+    view.update_in(cx, |this, w, cx| {
+        let e = BackGestureEvent {
+            phase: BackGesturePhase::Started,
+            progress: 0.3,
+            ..Default::default()
+        };
+        this.mobile_back_gesture(&e, w, cx);
+    });
+    view.read_with(cx, |this, _| {
+        assert!(this.mobile.back_drag.is_none(), "the screen follows the finger")
+    });
+    // Reverse aliases go back to Forwarding, in their column.
+    view.update(cx, |this, cx| {
+        this.fwd_reverse = Some("sl:1".into());
+        cx.notify();
+    });
+    settle(cx);
+    act(&view, Action::Close, cx);
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.fwd_reverse.is_none());
+        assert!(this.modal == Some(Modal::Settings), "Settings closed");
+        assert!(this.page == Page::Forwarding);
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    assert_eq!(
+        cx.debug_bounds("mobile-screen").map(|b| b.origin),
+        Some(point(px(0.), px(0.))),
+        "the whole screen moved"
+    );
+    // Then Back leaves Settings.
+    act(&view, Action::Close, cx);
+    assert_ne!(screen(&view, cx), Screen::Settings);
+}
+
+#[gpui::test]
+fn all_accounts_names_itself_under_the_mailbox(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    view.update_in(cx, |this, w, cx| {
+        this.open_mailbox(Some(ALL_MAIL.into()), Folder::Inbox.into(), w, cx)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert_eq!(
+            this.mobile_list_subtitle("Inbox").as_deref(),
+            Some("All Accounts")
+        );
+    });
+    // An account's mailbox says whose it is.
+    let (id, email) = view.read_with(cx, |this, _| {
+        (this.accounts[1].id.clone(), this.accounts[1].email.clone())
+    });
+    view.update_in(cx, |this, w, cx| {
+        this.open_mailbox(Some(id), Folder::Inbox.into(), w, cx)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_list_subtitle("Inbox"), Some(email));
+    });
+}
+
+#[gpui::test]
+fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    view.update(cx, |this, cx| {
+        this.mobile.on = true;
+        this.mobile.fake_insets = Some(NOTCH);
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(PHONE.0), px(PHONE.1)));
+    let account = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    view.update_in(cx, |this, w, cx| {
+        this.open_mailbox(Some(account.clone()), Folder::Inbox.into(), w, cx)
+    });
+    cx.run_until_parked();
+    // An older message is open.
+    let old = first_message(&view, cx);
+    act(&view, Action::Select(old.clone()), cx);
+    assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(old));
+    // A notification for mail not synced yet: the older one doesn't stay.
+    let new = format!("{account}:just-in");
+    view.update_in(cx, |this, w, cx| {
+        let target = crate::display::notify::Target {
+            account: account.clone(),
+            mailbox: Folder::Inbox.into(),
+            message: Some(new.clone()),
+        };
+        this.open_notified(target, w, cx)
+    });
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selected, None, "the older message is still open");
+    });
+    // Once it is synced and listed, it opens.
+    let mut mail = crate::manage::model::demo_mail()
+        .into_iter()
+        .find(|m| m.folder == Folder::Inbox)
+        .unwrap();
+    mail.account = account.clone();
+    mail.id = new.clone();
+    mail.message_id = "<just-in@example.com>".into();
+    mail.date = chrono::Utc::now().timestamp();
+    store.save_messages(&[mail]).unwrap();
+    view.update(cx, |this, cx| this.reload_cached(cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(new));
+    assert_eq!(screen(&view, cx), Screen::Reader);
+}
