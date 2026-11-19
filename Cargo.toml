@@ -77,6 +77,9 @@ htmd = "0.5"
 md-5 = "0.11"
 # Attachment content types from their file names.
 mime_guess = "2"
+# The public suffix list: a trusted link site is never a shared suffix such
+# as blogspot.com, whose subdomains belong to different people.
+psl = "2"
 native-tls = "0.2"
 notify-rust = "4"
 open = "5"
@@ -319,8 +322,6 @@ gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch 
 # Proton push notifications: Android messaging tokens registered against
 # their Firebase installation (see the folder's README). A [patch] only
 # applies from the top-level workspace, so it must be here rather than in
-# protected_email_bridge. Points at a local Picacho-Patches checkout until
-# the folder is published to its vendor-split-dev branch.
+# protected_email_bridge.
 [patch."https://github.com/agusibrahim/fcm_receiver.rs"]
-fcm_receiver_rs = { path = "../Picacho-Patches/fcm_receiver_rs/crate" }
-# fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
