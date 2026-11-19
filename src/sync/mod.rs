@@ -13,6 +13,7 @@ pub(crate) mod mta_sts;
 pub mod oauth;
 mod pop;
 pub(crate) mod proton;
+pub(crate) mod proton_push;
 pub(crate) mod retry;
 pub(crate) mod sasl;
 pub(crate) mod sieve;

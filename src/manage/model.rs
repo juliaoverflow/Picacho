@@ -239,6 +239,13 @@ pub struct SyncSettings {
     /// check (`refresh_minutes`).
     #[serde(default = "default_proton_events_seconds")]
     pub proton_events_seconds: u32,
+    /// Proton Direct: receive Proton's push notifications as its Android
+    /// app does (`sync::proton_push`), where this copy has a Firebase
+    /// project for them. Needs `notify`; with both on, pushes announce new
+    /// mail instead of the regular checks (`Account::pushes_new_mail`). Off
+    /// unless turned on.
+    #[serde(default)]
+    pub proton_push: bool,
 }
 /// `SyncSettings::offline_days`: download message contents only when opened.
 pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
@@ -267,6 +274,7 @@ impl Default for SyncSettings {
             notify: true,
             offline_days: default_offline_days(),
             proton_events_seconds: default_proton_events_seconds(),
+            proton_push: false,
         }
     }
 }
@@ -381,6 +389,15 @@ impl Identity {
     }
 }
 impl Account {
+    /// Whether Proton's pushes announce this account's new mail
+    /// (`SyncSettings::proton_push`, which needs `notify`), in place of the
+    /// announcements from checking for mail.
+    pub fn pushes_new_mail(&self) -> bool {
+        self.provider == Provider::Proton
+            && self.sync.notify
+            && self.sync.proton_push
+            && crate::sync::proton_push::available()
+    }
     /// One of the addresses it sends as, by id.
     pub fn identity(&self, id: &str) -> Option<&Identity> {
         self.identities.iter().find(|i| i.id == id)

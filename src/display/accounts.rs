@@ -12,6 +12,9 @@ impl MailApp {
             return;
         }
         self.retrying.insert(id.clone());
+        if a.pushes_new_mail() {
+            self.backend.retry_proton_push();
+        }
         let retry = id.clone();
         self.task(
             cx,
@@ -135,6 +138,42 @@ impl MailApp {
         self.modal = Some(Modal::Settings);
         self.page = Page::Account(id.clone());
         self.retry_account(id, cx);
+    }
+    /// Shows Proton push registration failures as their accounts'
+    /// critical issues, now and whenever they change. The newest window
+    /// takes them over from earlier ones.
+    pub(super) fn listen_push_failures(&mut self, cx: &mut Context<Self>) {
+        let (changed, mut changes) = futures::channel::mpsc::unbounded::<()>();
+        self.backend
+            .on_proton_push_change(move || drop(changed.unbounded_send(())));
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while changes.next().await.is_some() {
+                let shown = this.update(cx, |this, cx| {
+                    this.show_push_failures();
+                    cx.notify();
+                });
+                if shown.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        self.show_push_failures();
+    }
+    /// Each account's `IssueSource::Push` issue, from the backend's failures.
+    fn show_push_failures(&mut self) {
+        let failures = self.backend.proton_push_failures();
+        let ids: Vec<String> = self.accounts.iter().map(|a| a.id.clone()).collect();
+        for id in ids {
+            let result =
+                match failures.get(&id) {
+                    Some(why) => Err(anyhow::anyhow!(why.clone())
+                        .context(crate::manage::status::PushRegistration)),
+                    None => Ok(()),
+                };
+            self.account_result(&id, IssueSource::Push, &result);
+        }
     }
     pub(super) fn account_warning(&self, id: &str, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();

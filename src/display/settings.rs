@@ -561,6 +561,7 @@ impl MailApp {
             self.retrying.contains(&a.id) || self.sync_requests.iter().any(|(id, _)| id == &a.id);
         // Red for a sign-in problem; otherwise yellow warnings.
         let critical = self.issues_critical(&a.id);
+        let sign_in = issues.iter().any(|(_, issue)| issue.access.is_some());
         let tone = if critical { c.danger } else { c.warning };
         div()
             .id("account-error-details")
@@ -646,8 +647,9 @@ impl MailApp {
                         )
                         .when(busy, |d| d.opacity(0.6)),
                     )
-                    // Signing in again fixes sign-in problems, not warnings.
-                    .when(critical, |d| {
+                    // Signing in again fixes sign-in problems, not warnings
+                    // or push registrations.
+                    .when(sign_in, |d| {
                         d.child(self.button(
                             "account-reconnect",
                             "Sign In Again",
@@ -1301,7 +1303,9 @@ impl MailApp {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(rgb(c.muted))
-                                    .child(if sync.refresh_minutes == 0 {
+                                    .child(if a.pushes_new_mail() {
+                                        "Announce new inbox mail. Proton's push notifications announce it as it arrives, so checks for new mail don't."
+                                    } else if sync.refresh_minutes == 0 {
                                         "Announce new inbox mail. Only works while Picacho checks for mail."
                                     } else {
                                         "Announce new inbox mail while Picacho is in the background."
@@ -1311,10 +1315,18 @@ impl MailApp {
                     .child(self.switch(
                         format!("notify-{}", a.id),
                         sync.notify,
-                        set(SyncSettings { notify: !sync.notify, ..sync }),
+                        // Push needs Notifications: turning them off turns it off too.
+                        set(SyncSettings {
+                            notify: !sync.notify,
+                            proton_push: sync.proton_push && !sync.notify,
+                            ..sync
+                        }),
                         cx,
                     )),
             )
+            .when(a.provider == Provider::Proton, |page| {
+                page.child(self.proton_push_setting(a, cx))
+            })
             .child(self.section("Account"))
             .child(
                 div()
@@ -1349,6 +1361,31 @@ impl MailApp {
 }
 
 impl MailApp {
+    /// Proton's push notifications for a Proton Direct account: offered
+    /// while its Notifications are on, and announcing new mail in place of
+    /// the regular checks once turned on.
+    fn proton_push_setting(&self, a: &Account, cx: &Context<Self>) -> Div {
+        const TITLE: &str = "Push notifications";
+        let sync = a.sync;
+        if !crate::sync::proton_push::available() {
+            return self.setting(
+                TITLE,
+                "This copy of Picacho was built without a Firebase project, so it can't receive Proton's push notifications.",
+                div(),
+            );
+        }
+        if !sync.notify {
+            return self.setting(TITLE, "Turn on Notifications to receive Proton's push notifications.", div());
+        }
+        self.switch_setting(
+            TITLE,
+            "Proton sends new mail and its notices here as it would to its Android app, so they arrive at once. Picacho must be running, in the background too.",
+            format!("proton-push-{}", a.id),
+            sync.proton_push,
+            Action::SetSync(a.id.clone(), SyncSettings { proton_push: !sync.proton_push, ..sync }),
+            cx,
+        )
+    }
     /// An account's other sending addresses, and the form for adding or
     /// changing one.
     fn identities_setting(&self, a: &Account, cx: &Context<Self>) -> Div {

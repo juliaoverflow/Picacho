@@ -110,8 +110,13 @@ fn config() -> Arc<DeploymentConfig> {
         .clone()
 }
 
+/// The deployment every Proton client here uses (push's too).
+pub(crate) fn deployment() -> Arc<DeploymentConfig> {
+    config()
+}
+
 /// One runtime for every Proton account, started on first use.
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -727,6 +732,16 @@ impl Session {
         let mut renewed = self.renewed.lock().unwrap();
         if renewed.is_none() {
             *renewed = Some(saved.tokens());
+        }
+    }
+    /// What registering this session for push notifications needs
+    /// (`proton_push`); `account` is Picacho's id for the account.
+    pub fn push_registration(&self, account: &str) -> crate::sync::proton_push::Registration {
+        crate::sync::proton_push::Registration {
+            account: account.to_owned(),
+            uid: self.saved.lock().unwrap().uid.clone(),
+            user_id: self.ctx.user_id(),
+            client: self.ctx.client.clone(),
         }
     }
     /// The account's folders and labels (not Proton's own mailboxes).

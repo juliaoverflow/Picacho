@@ -83,6 +83,19 @@ impl std::fmt::Display for Throttled {
 }
 impl std::error::Error for Throttled {}
 
+/// Proton refused to register this device for an account's push
+/// notifications, or push couldn't start. Critical, like a refused sign-in:
+/// with push on, nothing else announces the account's new mail
+/// (`Account::pushes_new_mail`). Unlike one, it doesn't pause mail checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PushRegistration;
+impl std::fmt::Display for PushRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Proton didn't register this device for push notifications")
+    }
+}
+impl std::error::Error for PushRegistration {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IssueSource {
     Sync(String),
@@ -90,6 +103,7 @@ pub enum IssueSource {
     Read,
     Change,
     Send,
+    Push,
 }
 impl IssueSource {
     pub fn label(&self) -> &str {
@@ -99,6 +113,7 @@ impl IssueSource {
             Self::Read => "Opening a message",
             Self::Change => "Updating messages",
             Self::Send => "Sending mail",
+            Self::Push => "Push notifications",
         }
     }
 }
@@ -107,6 +122,8 @@ impl IssueSource {
 pub struct AccountIssue {
     pub access: Option<AccessFailure>,
     pub throttled: bool,
+    /// A `PushRegistration` failure.
+    pub push: bool,
     pub details: String,
     pub occurred_at: i64,
 }
@@ -115,18 +132,23 @@ impl AccountIssue {
         Self {
             access: error.downcast_ref::<AccessFailure>().copied(),
             throttled: error.downcast_ref::<Throttled>().is_some(),
+            push: error.downcast_ref::<PushRegistration>().is_some(),
             details: format!("{error:#}"),
             occurred_at: chrono::Utc::now().timestamp(),
         }
     }
     /// Whether it needs the person before the account works again: its
-    /// sign-in was refused, or its saved credentials couldn't be read.
-    /// Anything else (a dropped connection, a refused command, a message
-    /// that wouldn't send) is a warning, and can be dismissed.
+    /// sign-in was refused, its saved credentials couldn't be read, or its
+    /// push notifications couldn't be registered. Anything else (a dropped
+    /// connection, a refused command, a message that wouldn't send) is a
+    /// warning, and can be dismissed.
     pub fn critical(&self) -> bool {
-        self.access.is_some()
+        self.access.is_some() || self.push
     }
     pub fn guidance(&self, source: &IssueSource) -> &'static str {
+        if self.push {
+            return "This mailbox gets no new-mail notifications until Proton accepts this device: with push notifications on, checks for new mail don't announce it. Choose Try Again, or turn Push notifications off to have checks announce new mail again.";
+        }
         if *source == IssueSource::Send {
             return "Your draft has been kept. Check your sign-in, recipient, and outgoing server settings before sending again.";
         }

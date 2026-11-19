@@ -288,7 +288,8 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
                     without_returning(&mut fresh, later.returning.remove(&a.id));
                     // An account added since the monitor started: what it
                     // has now was there before, like the window's first check.
-                    if first || !a.sync.notify || shared.stopped() {
+                    // Proton's pushes announce mail for accounts that take them.
+                    if first || !a.sync.notify || a.pushes_new_mail() || shared.stopped() {
                         continue;
                     }
                     if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {

@@ -2057,6 +2057,7 @@ impl MailApp {
         #[cfg(all(debug_assertions, target_os = "macos"))]
         devdriver::start(window, cx);
         this.watch_inboxes();
+        this.listen_push_failures(cx);
         if this.account.is_some() {
             cx.defer_in(window, |this, w, cx| {
                 this.refresh_counts(cx);
@@ -2440,7 +2441,14 @@ impl MailApp {
         let present: HashSet<&String> = messages.iter().map(|m| &m.id).collect();
         known.retain(|m| present.contains(m));
         known.extend(messages.iter().filter(|m| m.unread).map(|m| m.id.clone()));
-        if first || fresh.is_empty() || !a.sync.notify || self.active || self.retired {
+        // Proton's pushes announce mail for accounts that take them.
+        if first
+            || fresh.is_empty()
+            || !a.sync.notify
+            || a.pushes_new_mail()
+            || self.active
+            || self.retired
+        {
             return;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
@@ -6072,6 +6080,7 @@ impl MailApp {
         let window = a.sync.days != sync.days;
         let events = (a.sync.proton_events_seconds != sync.proton_events_seconds)
             .then(|| a.id.clone());
+        let push = a.sync.proton_push != sync.proton_push;
         a.sync = sync;
         if let Err(e) = self.backend.store.save_account(a) {
             self.notice(e.to_string(), true, cx);
@@ -6091,6 +6100,10 @@ impl MailApp {
         if let Some(id) = events {
             self.backend.stop_watching(&id);
             self.watch_inboxes();
+        }
+        // Proton's pushes start, stop, or take this account in or out.
+        if push {
+            self.backend.reconcile_proton_push();
         }
         self.refresh_counts(cx);
     }
@@ -10114,7 +10127,11 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
 }
 
 /// The app's backend for `store`, announcing the provider's own notices
-/// (Proton's) as the window and the background monitor run it.
+/// (Proton's) as the window and the background monitor run it, and
+/// Proton's pushes for the accounts that receive them. Every process that
+/// opens the app's store (the window's, the background one, Android's
+/// service) comes here, so pushes resume with the saved registration
+/// whenever one starts.
 pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
     let backend = Arc::new(Backend::new(store));
     backend.on_proton_notice(|a, title, body| {
@@ -10122,6 +10139,17 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
             crate::display::notify::account_notice(&a.email, &a.id, title, body);
         }
     });
+    backend.on_proton_push(|a, pushed| match pushed {
+        crate::manage::backend::ProtonPushed::NewMail {
+            message,
+            sender,
+            subject,
+        } => crate::display::notify::new_mail(&a.email, &a.id, message, (sender, subject), 1),
+        crate::manage::backend::ProtonPushed::Notice { from, body } => {
+            crate::display::notify::account_notice(&a.email, &a.id, from, body)
+        }
+    });
+    backend.reconcile_proton_push();
     backend
 }
 
@@ -10738,6 +10766,7 @@ mod tests {
             notify: false,
             offline_days: 365,
             proton_events_seconds: 60,
+            proton_push: true,
         };
         act(&view, Action::SetSync(first.clone(), sync), cx);
         let saved = store.accounts().unwrap();

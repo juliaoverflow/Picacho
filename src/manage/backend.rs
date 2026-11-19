@@ -35,6 +35,9 @@ mod large;
 mod extras;
 #[path = "proton.rs"]
 mod proton;
+#[path = "proton_push.rs"]
+mod proton_push;
+pub use proton_push::ProtonPushed;
 #[path = "jmap.rs"]
 mod jmap;
 pub use crate::sync::fido::{Method as KeyMethod, NeedsPin, Prompt as KeyPrompt};
@@ -257,6 +260,13 @@ pub struct Backend {
     proton_prompt: Arc<Mutex<KeyPrompt>>,
     /// Called with Proton's account notices; see `on_proton_notice`.
     proton_notice: Mutex<Option<ProtonNotice>>,
+    /// Called with Proton's pushes; see `on_proton_push`.
+    proton_push: Mutex<Option<proton_push::ProtonPushHear>>,
+    /// Why accounts' push notifications aren't registered; see
+    /// `proton_push_failures`.
+    proton_push_failures: Mutex<HashMap<String, String>>,
+    /// Called when those change; see `on_proton_push_change`.
+    proton_push_change: Mutex<Option<proton_push::ProtonPushChange>>,
     /// Signed-in JMAP sessions by account, in memory only, with when their
     /// access token expires (0 for a password); see `jmap.rs`.
     jmap: Mutex<HashMap<String, (Arc<crate::sync::jmap::Session>, i64)>>,
@@ -307,6 +317,9 @@ impl Backend {
             proton_login: Mutex::new(None),
             proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
             proton_notice: Mutex::new(None),
+            proton_push: Mutex::new(None),
+            proton_push_failures: Mutex::new(HashMap::new()),
+            proton_push_change: Mutex::new(None),
             jmap: Mutex::new(HashMap::new()),
             scheduled_sending: Mutex::new(HashSet::new()),
             #[cfg(test)]

@@ -316,3 +316,11 @@ imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "v
 # Maximized windows' content is no longer a resize edge.
 gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 
+# Proton push notifications: Android messaging tokens registered against
+# their Firebase installation (see the folder's README). A [patch] only
+# applies from the top-level workspace, so it must be here rather than in
+# protected_email_bridge. Points at a local Picacho-Patches checkout until
+# the folder is published to its vendor-split-dev branch.
+[patch."https://github.com/agusibrahim/fcm_receiver.rs"]
+fcm_receiver_rs = { path = "../Picacho-Patches/fcm_receiver_rs/crate" }
+# fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }

@@ -310,6 +310,7 @@ impl Backend {
             // A replaced sign-in must not keep using the old session.
             let old = self.proton.lock().unwrap().remove(&account.id);
             drop(old);
+            self.update_proton_push();
             let previous = existing
                 .as_ref()
                 .and_then(|_| self.saved_credentials(&account.id).ok())
@@ -356,6 +357,8 @@ impl Backend {
             .lock()
             .unwrap()
             .insert(a.id.clone(), session.clone());
+        // Pushes for the account now come for this session.
+        self.update_proton_push();
         Ok(session)
     }
     /// Runs `work` with the account's session, then saves any tokens Proton
@@ -373,6 +376,7 @@ impl Backend {
             && e.downcast_ref::<AccessFailure>().is_some()
         {
             self.proton.lock().unwrap().remove(&a.id);
+            self.update_proton_push();
         }
         result
     }
@@ -398,6 +402,7 @@ impl Backend {
     /// Ends the account's Proton session (it is being removed).
     pub(super) fn forget_proton(&self, a: &Account) {
         self.proton.lock().unwrap().remove(&a.id);
+        self.update_proton_push();
         if let Ok(secret) = self.saved_credentials(&a.id) {
             let saved = secret.proton();
             if !saved.uid.is_empty() {
