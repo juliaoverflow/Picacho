@@ -1687,3 +1687,48 @@ fn a_finger_carries_messages_onto_mailboxes(cx: &mut TestAppContext) {
         assert!(this.menu.is_some(), "the row's menu opens")
     });
 }
+
+/// Back in the desktop window on a touch device closes what is on top: a
+/// composer (keeping its draft), then the open message, beside the list
+/// too; only then is it Android's.
+#[gpui::test]
+fn back_in_the_desktop_window_closes_the_composer_then_the_message(cx: &mut TestAppContext) {
+    for size_ in [PHONE, TABLET] {
+        let (view, cx) = phone(size_, cx);
+        view.update(cx, |this, _| this.mobile.touch = true);
+        act(&view, Action::SetDesktopLayout(true), cx);
+        act(&view, Action::Close, cx);
+        let has_back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+            view.update_in(cx, |this, w, cx| this.touch_desktop_has_back(w, cx))
+        };
+        let back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+            view.update_in(cx, |this, w, cx| {
+                // The keyboard Android already put away.
+                this.mobile.fake_insets = Some(NOTCH);
+                this.close(w, cx)
+            });
+            cx.run_until_parked();
+        };
+        assert!(!has_back(&view, cx), "nothing to close at {size_:?}");
+        let id = first_message(&view, cx);
+        act(&view, Action::Select(id), cx);
+        act(&view, Action::Compose, cx);
+        view.update_in(cx, |this, w, cx| {
+            this.mobile.keyboard_for = None;
+            this.focus.focus(w, cx);
+        });
+        settle(cx);
+        assert!(has_back(&view, cx), "the composer at {size_:?}");
+        back(&view, cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.mobile_composer(cx).is_none(), "the composer stays at {size_:?}");
+            assert!(this.selected.is_some(), "the message closed first at {size_:?}");
+        });
+        assert!(has_back(&view, cx), "the message at {size_:?}");
+        back(&view, cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.selected.is_none(), "the message stays open at {size_:?}")
+        });
+        assert!(!has_back(&view, cx), "nothing left to close at {size_:?}");
+    }
+}

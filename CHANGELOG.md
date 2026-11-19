@@ -29,7 +29,8 @@ same version in `Cargo.toml`.
   can be dragged with a finger, and the reader's toolbar drops its labels
   when the reader is too narrow for them. Sidebar menus offer Move Up, Move
   Down, Move Into Folder and Move Out of Folder in place of dragging, and a
-  floating composer moves with a finger on its title.
+  floating composer moves with a finger on its title. Back closes an open
+  composer (keeping its draft), then the open message, also beside the list.
 - Phones and tablets: tapping a link in an email first shows where it goes,
   warns of known tricks (look-alike letters, bare IP addresses, unencrypted
   pages), and offers Go Back, Open Anyway or Always Trust the site. Turn it

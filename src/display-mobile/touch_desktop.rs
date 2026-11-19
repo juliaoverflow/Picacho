@@ -15,7 +15,7 @@ impl MailApp {
     ) -> Stateful<Div> {
         // Back is Picacho's while there is something for it to close.
         #[cfg(target_os = "android")]
-        crate::android::set_back_enabled(self.touch_desktop_has_back(window));
+        crate::android::set_back_enabled(self.touch_desktop_has_back(window, cx));
         // A frame is being drawn: the display runs at its fastest meanwhile.
         #[cfg(target_os = "android")]
         crate::android::drawing();
@@ -118,9 +118,11 @@ impl MailApp {
     }
 
     /// Whether Back has something to close in the desktop window: what its
-    /// `close` (Escape) would. Android leaves Back to the system otherwise.
+    /// `close` (Escape) would, including an open composer (its draft kept)
+    /// and the open message however wide the window. Android leaves Back
+    /// to the system otherwise.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    fn touch_desktop_has_back(&self, w: &Window) -> bool {
+    pub(super) fn touch_desktop_has_back(&self, w: &Window, cx: &App) -> bool {
         self.keyboard_shown(w)
             || self.links.confirm.is_some()
             || self.menu.is_some()
@@ -130,8 +132,9 @@ impl MailApp {
             || self.modal.is_some()
             || self.selecting
             || self.search_open
+            || self.mobile_composer(cx).is_some()
             || (self.subs_open && (self.selected.is_some() || self.subs_sender.is_some()))
-            || (self.selected.is_some() && window::content_size(w).width < px(900.))
+            || self.selected.is_some()
     }
 }
 

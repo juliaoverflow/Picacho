@@ -4499,6 +4499,15 @@ impl MailApp {
             return;
         }
         if self.modal.is_none() {
+            // The desktop window on a touch device: Back closes the
+            // composer over the mail, keeping its draft.
+            if !self.mobile.on
+                && self.mobile.touch
+                && let Some(composer) = self.mobile_composer(cx)
+            {
+                composer.update(cx, |_, cx| cx.emit(composer::ComposerEvent::Close));
+                return;
+            }
             if self.selecting {
                 self.selection.clear();
                 self.select_mode = false;
@@ -4509,7 +4518,12 @@ impl MailApp {
                 self.handle(Action::BackToList, w, cx);
             } else if self.subs_open && self.subs_sender.is_some() {
                 self.close_subscription(w, cx);
-            } else if self.mobile.on || window::content_size(w).width < px(900.) {
+            } else if self.mobile.on
+                || self.mobile.touch
+                || window::content_size(w).width < px(900.)
+            {
+                // A touch device has no pointer to click away from the
+                // message with: Back closes it beside the list too.
                 self.selected = None;
                 self.read_generation += 1;
             }
