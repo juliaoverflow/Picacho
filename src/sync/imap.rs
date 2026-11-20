@@ -45,6 +45,62 @@ pub(crate) fn imap_login(
 ) -> Result<ImapSession> {
     imap_login_interruptible(a, s, tls).map(|(session, ..)| session)
 }
+/// Signs in, also returning a copy of what the server sends when asked
+/// (see `Tap`), for response codes the imap crate drops (COPYUID,
+/// APPENDUID in a tagged OK).
+pub(crate) fn imap_login_tapped(
+    a: &Account,
+    s: &Secret,
+    tls: &native_tls::TlsConnector,
+) -> Result<(ImapSession, super::stream::Tap)> {
+    imap_login_interruptible(a, s, tls).map(|(session, _, tap)| (session, tap))
+}
+/// The new UIDs a server gave copied or moved messages (UIDPLUS's
+/// `[COPYUID validity from to]`): the target's UIDVALIDITY, and each
+/// source UID with its new one.
+pub(crate) fn copy_uids(heard: &[u8]) -> Option<(u32, Vec<(u32, u32)>)> {
+    let text = String::from_utf8_lossy(heard);
+    let start = text.find("[COPYUID ")? + "[COPYUID ".len();
+    let end = start + text[start..].find(']')?;
+    let mut words = text[start..end].split_ascii_whitespace();
+    let validity = words.next()?.parse().ok()?;
+    let from = uid_set_list(words.next()?)?;
+    let to = uid_set_list(words.next()?)?;
+    (from.len() == to.len()).then(|| (validity, from.into_iter().zip(to).collect()))
+}
+/// The UID a server gave an appended message (`[APPENDUID validity uid]`).
+pub(crate) fn append_uid(heard: &[u8]) -> Option<(u32, u32)> {
+    let text = String::from_utf8_lossy(heard);
+    let start = text.find("[APPENDUID ")? + "[APPENDUID ".len();
+    let end = start + text[start..].find(']')?;
+    let mut words = text[start..end].split_ascii_whitespace();
+    let validity = words.next()?.parse().ok()?;
+    let uid = words.next()?;
+    // One message appended: one UID (MULTIAPPEND isn't used).
+    uid.parse().ok().map(|uid| (validity, uid))
+}
+/// A UID set ("4,7:9") in order, as COPYUID pairs them: a range counts
+/// from its first number to its second, either way.
+fn uid_set_list(set: &str) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in set.split(',') {
+        match part.split_once(':') {
+            Some((a, b)) => {
+                let (a, b): (u32, u32) = (a.parse().ok()?, b.parse().ok()?);
+                if b.abs_diff(a) > 100_000 {
+                    return None;
+                }
+                if a <= b {
+                    out.extend(a..=b);
+                } else {
+                    out.extend((b..=a).rev());
+                }
+            }
+            None => out.push(part.parse().ok()?),
+        }
+    }
+    Some(out)
+}
 /// Signs in, also returning a handle that closes the connection from
 /// another thread (to end a session waiting in IDLE), and one that copies
 /// what the server sends (to see what woke an IDLE).
@@ -300,48 +356,172 @@ impl Name {
         self.delimiter().is_some() && !self.has("NoInferiors") && !self.has("Noinferiors")
     }
 }
-/// Every mailbox on the server. Servers with SPECIAL-USE (RFC 6154) are
-/// asked to mark the standard ones (\\Sent, \\Trash…), so they are found by
-/// role rather than guessed from their names.
-pub(crate) fn list(session: &mut ImapSession, special_use: bool, utf8: bool) -> Result<Vec<Name>> {
-    let names = list_wire(session, special_use)?;
-    Ok(names
-        .into_iter()
-        .map(|n| Name {
-            name: super::imap_ext::cache_name(&n.name, utf8),
-            ..n
-        })
-        .collect())
+/// What a listing asks for besides the names.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ListOptions {
+    /// Standard folders by role (SPECIAL-USE).
+    pub(crate) special_use: bool,
+    /// Each folder's counters in the same reply (LIST-STATUS, RFC 5819),
+    /// with HIGHESTMODSEQ where the server has CONDSTORE.
+    pub(crate) list_status: bool,
+    pub(crate) condstore: bool,
+    /// Only subscribed folders are shown: the others get `HIDDEN`, unless
+    /// none of the account's own folders is subscribed (a server or person
+    /// that doesn't use subscriptions).
+    pub(crate) subscribed_only: bool,
 }
-fn list_wire(session: &mut ImapSession, special_use: bool) -> Result<Vec<Name>> {
-    if !special_use {
-        return Ok(session
-            .list(None, Some("*"))?
-            .iter()
-            .map(|n| Name {
-                name: n.name().into(),
-                attributes: n.attributes().iter().map(|a| format!("{a:?}")).collect(),
-                delimiter: n.delimiter().map(Into::into),
-            })
-            .collect());
+
+/// A folder's counters from the listing (LIST-STATUS).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FolderStatus {
+    pub(crate) validity: u32,
+    pub(crate) uid_next: u32,
+    pub(crate) messages: u32,
+    pub(crate) modseq: Option<u64>,
+}
+
+/// Picacho's own mark on a listed folder that isn't shown (an
+/// unsubscribed one): never an attribute a server sends.
+const HIDDEN: &str = "\\PicachoHidden";
+
+/// Every mailbox on the server, also in the namespaces `others` names
+/// (other users' and shared folders, where the server doesn't list them
+/// with the rest), with what `options` asks for. Names as the cache keeps
+/// them; counters by name too.
+pub(crate) fn list_full(
+    session: &mut ImapSession,
+    options: &ListOptions,
+    others: &[String],
+    utf8: bool,
+) -> Result<(Vec<Name>, std::collections::HashMap<String, FolderStatus>)> {
+    let extended = options.special_use || options.list_status;
+    let mut returns = Vec::new();
+    if options.special_use {
+        returns.push("SPECIAL-USE".to_owned());
     }
-    let data = session.run_command_and_read_response("LIST \"\" \"*\" RETURN (SPECIAL-USE)")?;
+    if options.subscribed_only && extended {
+        returns.push("SUBSCRIBED".to_owned());
+    }
+    if options.list_status {
+        returns.push(format!(
+            "STATUS (UIDVALIDITY UIDNEXT MESSAGES{})",
+            if options.condstore { " HIGHESTMODSEQ" } else { "" }
+        ));
+    }
+    let returns = returns.join(" ");
+    let (mut names, mut status) = list_pattern(session, "*", &returns)?;
+    for prefix in others {
+        if prefix.is_empty() || names.iter().any(|n| n.name.starts_with(prefix.as_str())) {
+            continue;
+        }
+        // A namespace the server lists apart; one it refuses is skipped.
+        let pattern = format!("{prefix}*");
+        let Ok((more, counted)) = list_pattern(session, &pattern, &returns) else {
+            continue;
+        };
+        for n in more {
+            if !names.iter().any(|m| m.name == n.name) {
+                names.push(n);
+            }
+        }
+        status.extend(counted);
+    }
+    if options.subscribed_only {
+        let subscribed: std::collections::HashSet<String> = if extended {
+            names
+                .iter()
+                .filter(|n| n.has("\\Subscribed"))
+                .map(|n| n.name.clone())
+                .collect()
+        } else {
+            session
+                .lsub(Some(""), Some("*"))?
+                .iter()
+                .map(|n| n.name().to_owned())
+                .collect()
+        };
+        let any = custom_folders(&names)
+            .iter()
+            .any(|f| subscribed.contains(&f.name));
+        if any {
+            for n in &mut names {
+                if !subscribed.contains(&n.name) && !n.name.eq_ignore_ascii_case("INBOX") {
+                    n.attributes.push(HIDDEN.to_owned());
+                }
+            }
+        }
+    }
+    let cache = |name: &str| super::imap_ext::cache_name(name, utf8);
+    Ok((
+        names
+            .into_iter()
+            .map(|n| Name {
+                name: cache(&n.name),
+                ..n
+            })
+            .collect(),
+        status.into_iter().map(|(k, v)| (cache(&k), v)).collect(),
+    ))
+}
+
+/// The mailboxes `pattern` matches, with `returns` (RETURN options, empty
+/// for none) and the counters LIST-STATUS sends with them. Wire names.
+fn list_pattern(
+    session: &mut ImapSession,
+    pattern: &str,
+    returns: &str,
+) -> Result<(Vec<Name>, std::collections::HashMap<String, FolderStatus>)> {
+    let mut status = std::collections::HashMap::new();
+    if returns.is_empty() {
+        return Ok((
+            session
+                .list(Some(""), Some(pattern))?
+                .iter()
+                .map(|n| Name {
+                    name: n.name().into(),
+                    attributes: n.attributes().iter().map(|a| format!("{a:?}")).collect(),
+                    delimiter: n.delimiter().map(Into::into),
+                })
+                .collect(),
+            status,
+        ));
+    }
+    let data = session.run_command_and_read_response(format!(
+        "LIST \"\" {} RETURN ({returns})",
+        quote(pattern)?
+    ))?;
     let mut names = Vec::new();
     for response in responses(&data)? {
-        if let imap_proto::Response::MailboxData(imap_proto::MailboxDatum::List {
-            flags,
-            delimiter,
-            name,
-        }) = response
-        {
-            names.push(Name {
+        match response {
+            imap_proto::Response::MailboxData(imap_proto::MailboxDatum::List {
+                flags,
+                delimiter,
+                name,
+            }) => names.push(Name {
                 name: name.into(),
                 attributes: flags.iter().map(|f| (*f).into()).collect(),
                 delimiter: delimiter.map(Into::into),
-            });
+            }),
+            imap_proto::Response::MailboxData(imap_proto::MailboxDatum::Status {
+                mailbox,
+                status: attributes,
+            }) => {
+                let mut s = FolderStatus::default();
+                for a in attributes {
+                    match a {
+                        imap_proto::StatusAttribute::UidValidity(v) => s.validity = v,
+                        imap_proto::StatusAttribute::UidNext(v) => s.uid_next = v,
+                        imap_proto::StatusAttribute::Messages(v) => s.messages = v,
+                        imap_proto::StatusAttribute::HighestModSeq(v) => s.modseq = Some(v),
+                        _ => {}
+                    }
+                }
+                status.insert(mailbox.to_owned(), s);
+            }
+            _ => {}
         }
     }
-    Ok(names)
+    Ok((names, status))
 }
 const STANDARD_ATTRIBUTES: [&str; 8] = [
     "Sent",
@@ -376,7 +556,7 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
         .iter()
         // Placeholders in the hierarchy can't be opened: \\Noselect, and
         // \\NonExistent from servers with LIST-EXTENDED.
-        .filter(|n| !n.has("NoSelect") && !n.has("NonExistent"))
+        .filter(|n| !n.has("NoSelect") && !n.has("NonExistent") && !n.has(HIDDEN))
         .filter(|n| !STANDARD_ATTRIBUTES.iter().any(|a| n.has(a)))
         .filter(|n| !gmail_system(&n.name))
         .filter_map(|n| {
@@ -401,6 +581,43 @@ pub(crate) fn custom_folders(names: &[Name]) -> Vec<RemoteFolder> {
         })
         .collect();
     out.sort_by_key(|f| f.name.to_lowercase());
+    // A folder whose parents aren't listed (another user's or a shared
+    // folder, under a namespace that can't be opened, or one inside a
+    // hidden folder) sits under the nearest one that is, its label naming
+    // the path between: "alice/Projects" rather than an orphan "Projects".
+    let delimiters: std::collections::HashMap<&str, &str> = names
+        .iter()
+        .filter_map(|n| Some((n.name.as_str(), n.delimiter()?)))
+        .collect();
+    let mut placed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_length: Vec<usize> = (0..out.len()).collect();
+    by_length.sort_by_key(|&i| out[i].name.len());
+    for i in by_length {
+        let name = out[i].name.clone();
+        let Some(d) = delimiters.get(name.as_str()).copied() else {
+            placed.insert(name, out[i].depth);
+            continue;
+        };
+        let parts: Vec<&str> = name.split(d).collect();
+        let first = usize::from(parts.len() > 1 && parts[0].eq_ignore_ascii_case("INBOX"));
+        let parent = (first + 1..parts.len()).rev().find_map(|end| {
+            let ancestor = parts[..end].join(d);
+            placed.get(&ancestor).map(|&depth| (end, depth))
+        });
+        let (from, depth) = match parent {
+            Some((end, depth)) => (end, depth + 1),
+            None => (first, 0),
+        };
+        if from + 1 < parts.len() || depth != out[i].depth {
+            out[i].depth = depth;
+            out[i].label = parts[from..]
+                .iter()
+                .map(|p| decode_name(p))
+                .collect::<Vec<_>>()
+                .join("/");
+        }
+        placed.insert(name, depth);
+    }
     out
 }
 /// Whether `name` is Gmail's system container ("[Gmail]", or "[Google
@@ -832,6 +1049,15 @@ pub(crate) struct Extensions {
     pub(crate) binary: bool,
     /// RFC 7888: literals that need no go-ahead (LITERAL+ or LITERAL-).
     pub(crate) literal_plus: bool,
+    /// RFC 9051: the server speaks only IMAP4rev2, whose base protocol has
+    /// MOVE, UIDPLUS, ESEARCH, NAMESPACE, SPECIAL-USE, LIST-STATUS… without
+    /// listing them (they are set here too), and answers SEARCH with
+    /// ESEARCH.
+    pub(crate) rev2: bool,
+    /// RFC 5819: folder counts in the listing (LIST … RETURN (STATUS)).
+    pub(crate) list_status: bool,
+    /// RFC 9394: results a page at a time (PARTIAL).
+    pub(crate) partial: bool,
 }
 pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
     let caps = session.capabilities()?;
@@ -850,30 +1076,37 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         })
     };
     let append_limit = with("APPENDLIMIT=").and_then(|n| n.parse::<u64>().ok());
+    // A server that speaks only IMAP4rev2 runs its sessions as rev2 from
+    // the start, with its folded-in extensions. One offering IMAP4rev1 too
+    // stays rev1 (Picacho doesn't ENABLE rev2), with what it lists.
+    let rev2 = caps.has_str("IMAP4rev2") && !caps.has_str("IMAP4rev1");
     Ok(Extensions {
         condstore: caps.has_str("CONDSTORE"),
         gmail: caps.has_str("X-GM-EXT-1"),
-        moves: caps.has_str("MOVE"),
-        uidplus: caps.has_str("UIDPLUS"),
-        idle: caps.has_str("IDLE"),
-        namespace: caps.has_str("NAMESPACE"),
+        moves: rev2 || caps.has_str("MOVE"),
+        uidplus: rev2 || caps.has_str("UIDPLUS"),
+        idle: rev2 || caps.has_str("IDLE"),
+        namespace: rev2 || caps.has_str("NAMESPACE"),
         quota: caps.has_str("QUOTA") || with("QUOTA=").is_some(),
         acl: caps.has_str("ACL"),
-        special_use: caps.has_str("SPECIAL-USE"),
+        special_use: rev2 || caps.has_str("SPECIAL-USE"),
         append_limit,
         qresync: caps.has_str("QRESYNC"),
-        esearch: caps.has_str("ESEARCH"),
+        esearch: rev2 || caps.has_str("ESEARCH"),
         sort: caps.has_str("SORT"),
         thread: caps.has_str("THREAD=REFERENCES"),
         utf8_accept: caps.has_str("UTF8=ACCEPT") || caps.has_str("UTF8=ONLY"),
-        enable: caps.has_str("ENABLE"),
+        enable: rev2 || caps.has_str("ENABLE"),
         notify: caps.has_str("NOTIFY"),
         metadata: caps.has_str("METADATA") || caps.has_str("METADATA-SERVER"),
         objectid: caps.has_str("OBJECTID"),
         preview: caps.has_str("PREVIEW"),
         savedate: caps.has_str("SAVEDATE"),
-        binary: caps.has_str("BINARY"),
-        literal_plus: caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
+        binary: rev2 || caps.has_str("BINARY"),
+        literal_plus: rev2 || caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
+        rev2,
+        list_status: rev2 || caps.has_str("LIST-STATUS"),
+        partial: caps.has_str("PARTIAL"),
     })
 }
 
@@ -953,12 +1186,59 @@ fn personal_namespace(line: &str) -> Option<String> {
         _ => None,
     }
 }
-/// Where the server keeps personal folders, if it says (NAMESPACE).
-pub(crate) fn namespace(session: &mut ImapSession) -> Result<Option<String>> {
+/// The personal namespace's prefix, and those of other users' and shared
+/// folders (NAMESPACE).
+pub(crate) fn namespaces(session: &mut ImapSession) -> Result<(Option<String>, Vec<String>)> {
     let data = session.run_command_and_read_response("NAMESPACE")?;
-    Ok(other_lines(&data, "NAMESPACE")?
-        .first()
-        .and_then(|line| personal_namespace(line)))
+    let lines = other_lines(&data, "NAMESPACE")?;
+    let Some(line) = lines.first() else {
+        return Ok((None, Vec::new()));
+    };
+    Ok((personal_namespace(line), other_namespaces(line)))
+}
+/// The prefixes of the other users' and shared namespaces (the second and
+/// third groups of a NAMESPACE reply).
+fn other_namespaces(line: &str) -> Vec<String> {
+    let tokens = tokens(line);
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() && groups.len() < 3 {
+        match &tokens[i] {
+            Token::Nil => {
+                groups.push(Vec::new());
+                i += 1;
+            }
+            Token::Open => {
+                // (("prefix" "delim" ext…) …): each namespace's first word.
+                let mut depth = 0;
+                let mut prefixes = Vec::new();
+                while i < tokens.len() {
+                    match &tokens[i] {
+                        Token::Open => {
+                            depth += 1;
+                            if depth == 2
+                                && let Some(Token::Text(prefix)) = tokens.get(i + 1)
+                            {
+                                prefixes.push(prefix.clone());
+                            }
+                        }
+                        Token::Close => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                groups.push(prefixes);
+            }
+            _ => i += 1,
+        }
+    }
+    groups.into_iter().skip(1).flatten().collect()
 }
 /// How much of a mailbox's storage is used and allowed, in KiB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1550,6 +1830,20 @@ mod extension_tests {
             Some("")
         );
         assert_eq!(personal_namespace("NIL NIL NIL"), None);
+        assert_eq!(
+            copy_uids(b"* OK [COPYUID 38505 304,319:320 3956:3958] Done\r\n"),
+            Some((38505, vec![(304, 3956), (319, 3957), (320, 3958)]))
+        );
+        assert_eq!(copy_uids(b"a3 OK [COPYUID 9 1:2 5] Odd\r\n"), None);
+        assert_eq!(
+            append_uid(b"a4 OK [APPENDUID 38505 3955] APPEND completed\r\n"),
+            Some((38505, 3955))
+        );
+        assert_eq!(
+            other_namespaces(r#"(("" "/")) (("Other Users/" "/")) (("Shared/" "/") ("Public/" "/"))"#),
+            ["Other Users/", "Shared/", "Public/"]
+        );
+        assert!(other_namespaces(r#"(("INBOX." ".")) NIL NIL"#).is_empty());
         assert_eq!(
             storage_quota(r#""" (MESSAGE 4 1000 STORAGE 10 512)"#),
             Some(Quota {

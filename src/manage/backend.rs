@@ -605,9 +605,26 @@ impl Backend {
         if let Some(secret) = &self.test_secret {
             return Ok(secret.clone());
         }
-        let mut s = self.saved_credentials(&a.id)?;
-        if crate::sync::oauth::refresh(a, &mut s)? {
-            self.save_credentials(&a.id, &s)?;
+        // A JMAP account shared with another's sign-in uses that one's.
+        let owner = if a.credentials_of.is_empty() {
+            None
+        } else {
+            Some(
+                self.store
+                    .accounts()?
+                    .into_iter()
+                    .find(|o| o.id == a.credentials_of)
+                    .context("The account this one was shared with is gone. Remove this one.")?,
+            )
+        };
+        let who = owner.as_ref().unwrap_or(a);
+        // One renewal at a time: an account and those sharing its sign-in
+        // renew the same token.
+        static RENEWING: Mutex<()> = Mutex::new(());
+        let _renewing = RENEWING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.saved_credentials(&who.id)?;
+        if crate::sync::oauth::refresh(who, &mut s)? {
+            self.save_credentials(&who.id, &s)?;
         }
         Ok(s)
     }
@@ -748,6 +765,19 @@ impl Backend {
         }
     }
     pub fn remove_account(&self, id: &str) -> Result<()> {
+        let sharing: Vec<String> = self
+            .store
+            .accounts()?
+            .into_iter()
+            .filter(|a| a.credentials_of == id)
+            .map(|a| a.label().to_owned())
+            .collect();
+        ensure!(
+            sharing.is_empty(),
+            "Remove {} first: {} with this account's sign-in.",
+            sharing.join(", "),
+            if sharing.len() == 1 { "it was shared" } else { "they were shared" }
+        );
         let lock = self.account_lock(id);
         let _operation = lock.lock().unwrap();
         self.disconnect(id);
@@ -792,6 +822,16 @@ impl Backend {
         password: String,
         cancel: Arc<AtomicBool>,
     ) -> Result<Account> {
+        if !account.credentials_of.is_empty() {
+            let owner = self
+                .store
+                .accounts()?
+                .into_iter()
+                .find(|o| o.id == account.credentials_of)
+                .map(|o| o.label().to_owned())
+                .unwrap_or_else(|| "the account it was shared with".into());
+            bail!("This account signs in as {owner}: sign in again there.");
+        }
         let mut next = account.clone();
         if next.oauth && next.client_secret.is_empty() {
             let registration = if next.provider == Provider::Jmap {
@@ -1044,13 +1084,13 @@ impl Backend {
                 Err(_) if source != Folder::Inbox => continue,
                 Err(e) => return Err(e),
             };
-            if visited.insert(remote.clone()) {
+            if visited.insert(remote.clone()) && !self.unchanged(c, a, &remote) {
                 self.sync_remote(c, a, &source.into(), &remote, limit)?;
             }
         }
         if a.provider != Provider::Gmail {
             for folder in folders {
-                if !visited.insert(folder.name.clone()) {
+                if !visited.insert(folder.name.clone()) || self.unchanged(c, a, &folder.name) {
                     continue;
                 }
                 let mailbox = Mailbox::Remote(folder.name.clone());
@@ -1063,6 +1103,25 @@ impl Backend {
             }
         }
         self.store.newest(&a.id, Folder::All, limit)
+    }
+    /// Whether a mailbox is as its cache last saw it, by the counters the
+    /// listing gave (LIST-STATUS): the same UIDVALIDITY, UIDNEXT, message
+    /// count and HIGHESTMODSEQ, so nothing arrived, left or changed flags,
+    /// and it needn't even be selected. Without HIGHESTMODSEQ a flag change
+    /// wouldn't show, so it's synced as usual.
+    fn unchanged(&self, c: &Connection, a: &Account, remote: &str) -> bool {
+        let Some(now) = c.statuses.get(remote) else {
+            return false;
+        };
+        let Ok(Some(saved)) = self.store.mailbox_state(&a.id, remote) else {
+            return false;
+        };
+        now.modseq.is_some()
+            && saved.modseq == now.modseq
+            && saved.validity == now.validity
+            && saved.uid_next == now.uid_next
+            && saved.exists == now.messages
+            && saved.days == a.sync.days
     }
     /// Brings one server mailbox's cache up to date. After a first full
     /// synchronization, later ones ask only for what changed: messages past
@@ -2207,7 +2266,7 @@ impl Backend {
             let remote = resolve_in(c.names(false)?, a.provider, folder)?;
             c.select(&remote)?;
             c.require_rights(&remote, "te", "delete messages")?;
-            let uids: Vec<u32> = c.session.uid_search("ALL")?.into_iter().collect();
+            let uids: Vec<u32> = c.uid_search("ALL")?.into_iter().collect();
             for chunk in uids.chunks(500) {
                 c.erase(chunk)?;
             }
@@ -2384,6 +2443,7 @@ impl Backend {
             .filter(|_| selected.keywords && !gmail);
             for chunk in uids.chunks(200) {
                 let set = uid_set(chunk);
+                let mut moved_to: Option<(u32, Vec<(u32, u32)>)> = None;
                 if let Some((add, remove)) = training {
                     // A server that refuses the keywords still moves the mail.
                     optional(c.session.uid_store(&set, format!("+FLAGS.SILENT ({add})")).map(|_| ()))?;
@@ -2436,18 +2496,20 @@ impl Backend {
                     }
                     Change::Move(_) | Change::MoveTo(_) => {
                         let target = c.mailbox(target.as_deref().unwrap_or_default())?;
-                        if c.extensions()?.moves {
+                        let heard = if c.extensions()?.moves {
                             // Atomic, and leaves other deleted messages alone.
-                            c.session
-                                .run_command_and_check_ok(format!("UID MOVE {set} {target}"))?;
+                            c.heard(&format!("UID MOVE {set} {target}"))?
                         } else {
                             // RFC 6851's fallback: copy, then remove just these
                             // (refused up front where that can't be done).
                             c.can_erase(chunk)?;
-                            c.session
-                                .run_command_and_check_ok(format!("UID COPY {set} {target}"))?;
+                            let heard = c.heard(&format!("UID COPY {set} {target}"))?;
                             c.erase(chunk)?;
-                        }
+                            heard
+                        };
+                        // Where they went (UIDPLUS's COPYUID), so they show
+                        // there before its next check.
+                        moved_to = crate::sync::transport::copy_uids(&heard);
                         // The source mailbox now has fewer messages; keep its
                         // saved state in step so the next check stays incremental.
                         if let Some(mut state) =
@@ -2481,12 +2543,49 @@ impl Backend {
                     .collect();
                 if commit {
                     self.commit_change(&confirmed, change.clone(), true)?;
+                    if let (Some((validity, pairs)), Some(target)) = (moved_to.take(), &target) {
+                        self.place_moved(a, &confirmed, &change, target, validity, &pairs)?;
+                    }
                 } else if change.moves() {
                     // Replayed: the cache already shows it moved; the copy
                     // in its new mailbox arrives with that mailbox's sync.
                     self.store.commit_changes(&confirmed, true)?;
                 }
             }
+        }
+        Ok(())
+    }
+    /// Saves moved messages in the mailbox they went to, under the UIDs the
+    /// server gave them there (`pairs`: old UID, new UID; COPYUID), so the
+    /// mailbox shows them, with what was downloaded of them, before its
+    /// next check. That check lists them again under the same ids.
+    fn place_moved(
+        &self,
+        a: &Account,
+        moved: &[Mail],
+        change: &Change,
+        target: &str,
+        validity: u32,
+        pairs: &[(u32, u32)],
+    ) -> Result<()> {
+        let placed: Vec<Mail> = moved
+            .iter()
+            .filter_map(|m| {
+                let (_, uid) = pairs.iter().find(|(old, _)| *old == m.uid)?;
+                let mut next = m.clone();
+                change.apply(&mut next);
+                next.uid = *uid;
+                next.remote_folder = target.to_owned();
+                next.id = format!("{}:{target}:{validity}:{uid}", a.id);
+                Some(next)
+            })
+            .collect();
+        if placed.is_empty() {
+            return Ok(());
+        }
+        self.store.save_messages(&placed)?;
+        if let Some(mailbox) = placed.first().map(Mail::mailbox) {
+            self.extend_layout(a, &mailbox, validity, placed.iter().map(|m| m.uid), &[]);
         }
         Ok(())
     }
@@ -2532,7 +2631,7 @@ impl Backend {
             self.with_imap(a, |c| {
                 let remote = remote_name(c.names(false)?, a, mailbox)?;
                 c.selected(&remote)?;
-                let unseen: Vec<u32> = c.session.uid_search("UNSEEN")?.into_iter().collect();
+                let unseen: Vec<u32> = c.uid_search("UNSEEN")?.into_iter().collect();
                 if !unseen.is_empty() {
                     c.session
                         .uid_store(uid_ranges(&unseen), "+FLAGS.SILENT (\\Seen)")?;
@@ -2749,6 +2848,32 @@ impl Backend {
     /// Sends a draft. Once the server accepts it, it is sent: anything that
     /// then didn't work (a copy in Sent, receipts) is a note, not an error.
     pub fn send_noting(&self, a: &Account, d: &Draft) -> Result<Vec<String>> {
+        self.send_held(a, d, None)
+    }
+    /// Hands a scheduled draft to its server, which holds it and sends it at
+    /// its time even with Picacho closed (SMTP FUTURERELEASE, JMAP
+    /// HOLDUNTIL), where the account allows it and the server can. False
+    /// when it stays scheduled here (nothing was sent). Once handed over it
+    /// is sent as far as Picacho is concerned: it's no longer a draft, and
+    /// can't be changed or taken back.
+    pub fn hand_to_server(&self, a: &Account, id: &str) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let Some(d) = self.store.draft(id)? else {
+            return Ok(false);
+        };
+        let Some(at) = d.send_at.filter(|t| *t > now + 60) else {
+            return Ok(false);
+        };
+        if !a.server_send_later || a.provider == Provider::Proton {
+            return Ok(false);
+        }
+        match self.send_held(a, &d, Some(at)) {
+            Ok(_) => Ok(true),
+            Err(e) if e.downcast_ref::<crate::sync::smtp::NoServerHold>().is_some() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    fn send_held(&self, a: &Account, d: &Draft, hold_until: Option<i64>) -> Result<Vec<String>> {
         // Sending as an alias asks its service for the routed addresses
         // first, outside the account's lock, once it knows the alias is
         // still there.
@@ -2809,18 +2934,34 @@ impl Backend {
                 .map(|f| f.to_string())
                 .context("The message has no sender.")?;
             let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
-            if a.provider == Provider::Jmap {
-                self.send_jmap(a, &from, &to, &message.formatted())?;
+            let receipts = if a.provider == Provider::Jmap {
+                // Encryption all the way and delivery reports, as SMTP
+                // asks for them, where the JMAP server can.
+                let options = crate::sync::jmap::SendOptions {
+                    require_tls: a.require_tls,
+                    receipts: a.delivery_receipts.then(|| d.id.clone()),
+                    hold_until,
+                };
+                if let Some(at) = hold_until {
+                    let ahead = (at - chrono::Utc::now().timestamp()).max(0) as u64;
+                    let can = self.with_jmap(a, |s| Ok(s.max_delayed_send() >= ahead))?;
+                    if !can {
+                        return Err(crate::sync::smtp::NoServerHold.into());
+                    }
+                }
+                self.send_jmap(a, &from, &to, &message.formatted(), &options)?
+                    .receipts
             } else {
                 self.send_proton(a, &from, &to, &message.formatted())?;
-            }
+                false
+            };
             crate::sync::smtp::Delivered {
                 message,
-                receipts_unsupported: a.delivery_receipts,
+                receipts_unsupported: a.delivery_receipts && !receipts,
             }
         } else {
             let tls = self.tls_connector()?;
-            crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls)?
+            crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls, hold_until)?
         };
         let message = delivered.message;
         let mut notes = Vec::new();
@@ -2903,9 +3044,7 @@ impl Backend {
         let id = message_id_of(raw);
         if !id.is_empty() {
             c.select(&sent)?;
-            let found = match c
-                .session
-                .uid_search(format!("HEADER Message-ID {}", quote(&id)?))
+            let found = match c.uid_search(&format!("HEADER Message-ID {}", quote(&id)?))
             {
                 Ok(found) => found,
                 // A server that can't search headers: file it anyway.
@@ -2917,8 +3056,15 @@ impl Backend {
             }
         }
         let wire = c.wire(&sent);
-        c.session
-            .append_with_flags(&wire, raw, &[imap::types::Flag::Seen])?;
+        let heard = c.append_heard(&wire, raw, &[imap::types::Flag::Seen])?;
+        // Where it went (UIDPLUS's APPENDUID): Sent shows it at once.
+        if let Some((validity, uid)) = crate::sync::transport::append_uid(&heard) {
+            let id = format!("{}:{sent}:{validity}:{uid}", a.id);
+            if let Ok(mut m) = parse_message(raw, a, &id, Folder::Sent, &sent, uid) {
+                m.unread = false;
+                self.store.save_messages(&[m])?;
+            }
+        }
         Ok(())
     }
     /// Where copies for Sent that couldn't be saved yet wait, per account.
@@ -3065,7 +3211,7 @@ impl Backend {
                 self.save_draft_removals(&a.id, &[])?;
             }
             // What the server has, and which of Picacho's drafts each is.
-            let mut on_server: Vec<u32> = c.session.uid_search("ALL")?.into_iter().collect();
+            let mut on_server: Vec<u32> = c.uid_search("ALL")?.into_iter().collect();
             on_server.sort_unstable();
             let mut tagged: HashMap<u32, String> = HashMap::new();
             if !on_server.is_empty() {
@@ -3154,7 +3300,8 @@ impl Backend {
                 )?;
                 // The new copy is the newest message carrying this draft's
                 // id: mail another app added meanwhile can't be taken for it.
-                let copies = draft_copies(&mut c.session, &d.id, floor)?;
+                let esearch = c.extensions()?.esearch;
+                let copies = draft_copies(&mut c.session, esearch, &d.id, floor)?;
                 let Some(uid) = copies.iter().copied().filter(|u| *u > floor).max() else {
                     bail!("The server didn't keep the uploaded draft.");
                 };
@@ -3313,9 +3460,9 @@ fn message_id_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-fn draft_copies(session: &mut ImapSession, id: &str, floor: u32) -> Result<Vec<u32>> {
+fn draft_copies(session: &mut ImapSession, esearch: bool, id: &str, floor: u32) -> Result<Vec<u32>> {
     let header = crate::sync::smtp::DRAFT_HEADER;
-    let found = match session.uid_search(format!("HEADER {header} {}", quote(id)?)) {
+    let found = match uid_search_any(session, esearch, &format!("HEADER {header} {}", quote(id)?)) {
         Ok(found) => found,
         Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => Default::default(),
         Err(e) => return Err(e.into()),
@@ -3326,8 +3473,7 @@ fn draft_copies(session: &mut ImapSession, id: &str, floor: u32) -> Result<Vec<u
         return Ok(found);
     }
     // `n:*` always includes the highest UID, even below n.
-    let newer: Vec<u32> = session
-        .uid_search(format!("UID {}:*", floor.saturating_add(1)))?
+    let newer: Vec<u32> = uid_search_any(session, esearch, &format!("UID {}:*", floor.saturating_add(1)))?
         .into_iter()
         .filter(|u| *u > floor)
         .collect();

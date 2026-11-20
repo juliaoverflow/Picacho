@@ -87,7 +87,7 @@ impl Backend {
         } else if a.provider == Provider::Jmap {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
-            self.send_jmap(a, &a.email, &[to], &raw)?;
+            self.send_jmap(a, &a.email, &[to], &raw, &Default::default())?;
         } else {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();

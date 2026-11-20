@@ -19,27 +19,32 @@ pub(crate) struct Enabled {
 /// Turns on QRESYNC (RFC 7162) and UTF8=ACCEPT (RFC 6855) where offered.
 /// Must come before any SELECT. A refusal turns on nothing.
 pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enabled> {
+    // IMAP4rev2's mailbox names are UTF-8 (RFC 9051 §5.1), as UTF8=ACCEPT's.
+    let base = Enabled {
+        utf8: ext.rev2,
+        ..Enabled::default()
+    };
     if !ext.enable {
-        return Ok(Enabled::default());
+        return Ok(base);
     }
     let mut wanted = Vec::new();
     if ext.qresync {
         wanted.push("QRESYNC");
     }
-    if ext.utf8_accept {
+    if ext.utf8_accept && !ext.rev2 {
         wanted.push("UTF8=ACCEPT");
     }
     if wanted.is_empty() {
-        return Ok(Enabled::default());
+        return Ok(base);
     }
     let data = match session.run_command_and_read_response(format!("ENABLE {}", wanted.join(" "))) {
         Ok(data) => data,
         Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => {
-            return Ok(Enabled::default());
+            return Ok(base);
         }
         Err(e) => return Err(e.into()),
     };
-    let mut enabled = Enabled::default();
+    let mut enabled = base;
     for line in other_lines(&data, "ENABLED")? {
         for word in line.split_ascii_whitespace() {
             enabled.qresync |= word.eq_ignore_ascii_case("QRESYNC");
@@ -105,6 +110,25 @@ fn esearch_uids(data: &[u8]) -> Result<Vec<u32>> {
         }
     }
     Ok(out)
+}
+
+/// UID SEARCH as the imap crate's `uid_search`, answered with ESEARCH
+/// where the server has it (and must, speaking IMAP4rev2, whose SEARCH
+/// replies are ESEARCH, which the imap crate doesn't read). Refusals come
+/// back as the crate's `No` and `Bad`, as from `uid_search`.
+pub(crate) fn uid_search_any(
+    session: &mut ImapSession,
+    esearch: bool,
+    criteria: &str,
+) -> imap::error::Result<std::collections::HashSet<u32>> {
+    if !esearch {
+        return session.uid_search(criteria);
+    }
+    let data =
+        session.run_command_and_read_response(format!("UID SEARCH RETURN (ALL) {criteria}"))?;
+    esearch_uids(&data)
+        .map(|uids| uids.into_iter().collect())
+        .map_err(|e| imap::error::Error::Bad(format!("{e:#}")))
 }
 
 /// UIDs of the selected mailbox's messages matching `criteria` (UID
@@ -210,6 +234,56 @@ pub(crate) fn sorted_search(
     let mut uids = search_uids(session, ext, selected, &format!("{charset}{criteria}"))?;
     uids.reverse();
     Ok(uids)
+}
+
+/// The newest `limit` messages matching `criteria` (newest first) and how
+/// many match in all. Sorted by the server where it can; otherwise, where
+/// it has PARTIAL (RFC 9394), only the newest page is asked for, so a
+/// search matching most of a large mailbox doesn't bring back every UID.
+pub(crate) fn newest_search(
+    session: &mut ImapSession,
+    ext: &Extensions,
+    selected: &Selected,
+    criteria: &str,
+    utf8: bool,
+    limit: usize,
+) -> Result<(Vec<u32>, usize)> {
+    if !ext.sort && ext.partial && ext.esearch && limit > 0 {
+        let charset = search_charset(criteria, utf8);
+        let data = session.run_command_and_read_response(format!(
+            "UID SEARCH RETURN (COUNT PARTIAL -1:-{limit}) {charset}{criteria}"
+        ))?;
+        let (mut uids, count) = partial_uids(&data)?;
+        uids.sort_unstable_by(|a, b| b.cmp(a));
+        uids.truncate(limit);
+        let count = count.unwrap_or(uids.len());
+        return Ok((uids, count));
+    }
+    let uids = sorted_search(session, ext, selected, criteria, utf8)?;
+    let total = uids.len();
+    Ok((uids.into_iter().take(limit).collect(), total))
+}
+
+/// The UIDs and match count of an ESEARCH reply with PARTIAL and COUNT:
+/// `* ESEARCH (TAG "a1") UID COUNT 120 PARTIAL (-1:-100 3:90,200)`.
+fn partial_uids(data: &[u8]) -> Result<(Vec<u32>, Option<usize>)> {
+    let mut uids = Vec::new();
+    let mut count = None;
+    for line in other_lines(data, "ESEARCH")? {
+        let words: Vec<&str> = line.split_ascii_whitespace().collect();
+        if let Some(i) = words.iter().position(|w| w.eq_ignore_ascii_case("COUNT")) {
+            count = words.get(i + 1).and_then(|n| n.parse().ok());
+        }
+        if let Some(i) = words.iter().position(|w| w.eq_ignore_ascii_case("PARTIAL"))
+            && let Some(set) = words.get(i + 2)
+        {
+            let set = set.trim_end_matches(')');
+            if !set.eq_ignore_ascii_case("NIL") && !set.is_empty() {
+                uids.extend(parse_set(set)?);
+            }
+        }
+    }
+    Ok((uids, count))
 }
 
 /// Conversations among the selected mailbox's messages matching
@@ -592,6 +666,15 @@ mod tests {
         assert_eq!(
             esearch_uids(b"* ESEARCH (TAG \"a7\") UID ALL 4:6,10\r\n").unwrap(),
             vec![4, 5, 6, 10]
+        );
+        assert_eq!(
+            partial_uids(b"* ESEARCH (TAG \"a8\") UID COUNT 120 PARTIAL (-1:-3 90,95:96)\r\n")
+                .unwrap(),
+            (vec![90, 95, 96], Some(120))
+        );
+        assert_eq!(
+            partial_uids(b"* ESEARCH (TAG \"a9\") UID COUNT 0 PARTIAL (-1:-3 NIL)\r\n").unwrap(),
+            (vec![], Some(0))
         );
         assert_eq!(
             status_mailboxes(

@@ -13,6 +13,27 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- JMAP: delivery receipts are asked for where the server can (DSN), the
+  away reply works on servers that have only JMAP's own (VacationResponse,
+  such as Fastmail), mail accounts shared with your sign-in can be added
+  from the account's settings (Shared with you), search results show the
+  part of each message that matched, and servers that push changes only
+  over a WebSocket are followed too. Picacho reads the session again when
+  the server says it changed, and keeps to its request limits.
+- Settings → Sending → Let the server send scheduled messages: a message
+  sent later goes to the server at once, which holds it and sends it at
+  its time even with Picacho closed (SMTP FUTURERELEASE, JMAP HOLDUNTIL).
+- Outgoing servers: TLS from the start on any port (not only 465), chosen
+  in setup and for sending addresses' own servers, and found by
+  autoconfiguration; relays that take mail without signing in work too.
+- IMAP: Only subscribed folders (account settings) shows the folders
+  subscribed to on the server; other users' and shared folders (NAMESPACE)
+  are listed; servers speaking only IMAP4rev2 are understood (with
+  Picacho-Patches' imap-proto patch 0005); moved and saved messages show in
+  their new folder at once (COPYUID, APPENDUID); folders the listing shows
+  unchanged aren't opened to check (LIST-STATUS); and server searches ask
+  only for the newest page of results where the server can (PARTIAL).
+
 - Phones and tablets: tapping a link in an email first shows where it goes,
   warns of known tricks (look-alike letters, bare IP addresses, unencrypted
   pages), and offers Go Back, Open Anyway or Always Trust the site. Turn it
@@ -51,6 +72,9 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- JMAP: Require encryption in transit was ignored; messages now go only
+  where the server can ask for it (REQUIRETLS), and are refused otherwise,
+  as over SMTP.
 - Phones and tablets: the filter chips over the message list fade out at an
   edge with more chips scrolled past it.
 - Tablets: with the list and a message side by side, going back (Back, the

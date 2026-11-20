@@ -20,4 +20,5 @@ pub(crate) mod sieve;
 pub(crate) mod smtp;
 pub(crate) mod stream;
 pub(crate) mod transport;
+pub(crate) mod websocket;
 pub(crate) mod wire;

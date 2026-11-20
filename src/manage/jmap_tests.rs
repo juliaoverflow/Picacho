@@ -36,6 +36,19 @@ struct Server {
     scripts: Vec<(String, String, String, bool)>,
     /// A method refused as Cyrus does, naming an argument.
     refuse: Option<&'static str>,
+    /// Newer features: submission extensions (DSN, REQUIRETLS,
+    /// FUTURERELEASE), an away reply in place of Sieve, a shared account
+    /// (`u2`), search snippets.
+    modern: bool,
+    /// Each submission's whole envelope.
+    envelopes: Vec<Value>,
+    /// The away reply (VacationResponse's singleton).
+    vacation: Value,
+    /// The session state responses name; changing it makes the client
+    /// read the session again.
+    session_state: String,
+    /// How many times the session resource was read.
+    session_reads: usize,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -43,6 +56,45 @@ const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@e
 const TOKEN: &str = "Bearer fixture-token";
 
 impl Server {
+    fn state_name(&self) -> String {
+        if self.session_state.is_empty() {
+            "s1".into()
+        } else {
+            self.session_state.clone()
+        }
+    }
+    /// The session resource with the newer features (`modern`).
+    fn modern_session(&self, base: &str) -> Value {
+        let account = json!({
+            "urn:ietf:params:jmap:mail": {},
+            "urn:ietf:params:jmap:submission": {
+                "maxDelayedSend": 86400,
+                "submissionExtensions": { "DSN": [], "REQUIRETLS": [], "FUTURERELEASE": ["86400"] },
+            },
+            "urn:ietf:params:jmap:vacationresponse": {},
+        });
+        json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxObjectsInGet": 100, "maxObjectsInSet": 100,
+                    "maxCallsInRequest": 2, "maxSizeRequest": 1_000_000,
+                },
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:submission": {},
+                "urn:ietf:params:jmap:vacationresponse": {},
+            },
+            "accounts": {
+                "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
+                "u2": { "name": "Team", "isPersonal": false, "accountCapabilities": account },
+            },
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
+            "username": "qa@example.com",
+            "apiUrl": format!("{base}/api"),
+            "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
+            "uploadUrl": format!("{base}/upload/{{accountId}}/"),
+            "state": self.state_name(),
+        })
+    }
     fn touch(&mut self, id: &str, destroyed: bool) {
         self.state += 1;
         self.log.push((self.state, id.to_owned(), destroyed));
@@ -290,6 +342,7 @@ impl Server {
                 } else {
                     email_id.to_owned()
                 };
+                self.envelopes.push(s["envelope"].clone());
                 self.sent.push((
                     s["identityId"].as_str().unwrap().to_owned(),
                     s["envelope"]["mailFrom"]["email"]
@@ -367,6 +420,34 @@ impl Server {
                 }
                 vec![(name.into(), json!({ "created": created, "updated": {} }))]
             }
+            "VacationResponse/get" => vec![(
+                name.into(),
+                json!({ "list": [ { "id": "singleton", "isEnabled": false } ] }),
+            )]
+            .into_iter()
+            .map(|(n, mut v)| {
+                if !self.vacation.is_null() {
+                    v["list"][0] = self.vacation.clone();
+                }
+                (n, v)
+            })
+            .collect(),
+            "VacationResponse/set" => {
+                let mut reply = args["update"]["singleton"].clone();
+                reply["id"] = json!("singleton");
+                self.vacation = reply;
+                vec![(name.into(), json!({ "updated": { "singleton": null } }))]
+            }
+            "SearchSnippet/get" => {
+                let list: Vec<Value> = args["emailIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| json!({ "emailId": id, "subject": null,
+                                      "preview": "…the <mark>fixture</mark> &amp; more" }))
+                    .collect();
+                vec![(name.into(), json!({ "list": list }))]
+            }
             "Quota/get" => vec![(
                 name.into(),
                 json!({ "list": [{ "id": "q", "resourceType": "octets", "scope": "account",
@@ -381,6 +462,10 @@ impl Server {
         }
         let base = format!("https://localhost:{}", self.port);
         if method == "GET" && path == "/.well-known/jmap" {
+            self.session_reads += 1;
+            if self.modern {
+                return (200, self.modern_session(&base).to_string().into_bytes());
+            }
             return (
                 200,
                 json!({
@@ -400,7 +485,7 @@ impl Server {
                     "apiUrl": format!("{base}/api"),
                     "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
                     "uploadUrl": format!("{base}/upload/{{accountId}}/"),
-                    "state": "s1",
+                    "state": self.state_name(),
                 })
                 .to_string()
                 .into_bytes(),
@@ -412,7 +497,10 @@ impl Server {
             let mut earlier: Vec<Value> = Vec::new();
             for call in request["methodCalls"].as_array().unwrap() {
                 let (name, args, id) = (call[0].as_str().unwrap(), &call[1], &call[2]);
-                assert_eq!(args["accountId"], "u1", "{name} names the account");
+                assert!(
+                    args["accountId"] == "u1" || (self.modern && args["accountId"] == "u2"),
+                    "{name} names the account"
+                );
                 for (n, v) in self.method(name, args, &earlier) {
                     responses.push(json!([n, v, id]));
                     if n == name {
@@ -422,12 +510,12 @@ impl Server {
             }
             return (
                 200,
-                json!({ "methodResponses": responses, "sessionState": "s1" })
+                json!({ "methodResponses": responses, "sessionState": self.state_name() })
                     .to_string()
                     .into_bytes(),
             );
         }
-        if method == "POST" && path.starts_with("/upload/u1/") {
+        if method == "POST" && (path.starts_with("/upload/u1/") || path.starts_with("/upload/u2/")) {
             self.next += 1;
             let blob = format!("B{}", self.next);
             self.blobs.insert(blob.clone(), body.to_vec());
@@ -881,4 +969,244 @@ impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Sending with encryption required, delivery reports asked for and a
+/// message held for later: the envelope carries REQUIRETLS, RET/ENVID and
+/// NOTIFY, and HOLDUNTIL, as the server offers them.
+#[test]
+fn jmap_submission_extensions_reach_the_envelope() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    a.require_tls = true;
+    a.delivery_receipts = true;
+    let d = Draft {
+        id: "dsn-draft".into(),
+        account: a.id.clone(),
+        to: "recipient@example.com".into(),
+        subject: "Encrypted all the way".into(),
+        body: "Hello.".into(),
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let notes = b.send_noting(&a, &d)?;
+    assert!(
+        !notes.iter().any(|n| n.contains("delivery receipts")),
+        "{notes:?}"
+    );
+    let envelope = server.lock().unwrap().envelopes[0].clone();
+    let from = &envelope["mailFrom"]["parameters"];
+    assert!(from.as_object().unwrap().contains_key("REQUIRETLS"), "{envelope}");
+    assert_eq!(from["RET"], "HDRS");
+    assert_eq!(from["ENVID"], "dsn-draft");
+    assert_eq!(
+        envelope["rcptTo"][0]["parameters"]["NOTIFY"],
+        "SUCCESS,FAILURE,DELAY"
+    );
+
+    // Held at the server for later, within what it allows.
+    let options = crate::sync::jmap::SendOptions {
+        hold_until: Some(chrono::Utc::now().timestamp() + 3600),
+        ..Default::default()
+    };
+    b.send_jmap(&a, "qa@example.com", &["recipient@example.com".into()], MESSAGE, &options)?;
+    let envelope = server.lock().unwrap().envelopes[1].clone();
+    let until = envelope["mailFrom"]["parameters"]["HOLDUNTIL"].as_str().unwrap().to_owned();
+    assert!(until.ends_with('Z') && until.len() == 20, "{until}");
+    // Too far ahead for it: refused before anything is sent.
+    let too_far = crate::sync::jmap::SendOptions {
+        hold_until: Some(chrono::Utc::now().timestamp() + 3 * 86400),
+        ..Default::default()
+    };
+    assert!(b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &too_far).is_err());
+
+    // A scheduled draft handed to the server, which holds it.
+    a.require_tls = false;
+    a.delivery_receipts = false;
+    a.server_send_later = true;
+    let later = Draft {
+        id: "later".into(),
+        account: a.id.clone(),
+        to: "recipient@example.com".into(),
+        subject: "Later".into(),
+        body: "Hello.".into(),
+        send_at: Some(chrono::Utc::now().timestamp() + 7200),
+        ..Default::default()
+    };
+    b.store.save_draft(&later)?;
+    assert!(b.hand_to_server(&a, "later")?);
+    assert!(b.store.draft("later")?.is_none());
+    let envelope = server.lock().unwrap().envelopes.last().unwrap().clone();
+    assert!(envelope["mailFrom"]["parameters"]["HOLDUNTIL"].is_string(), "{envelope}");
+    // Too far ahead for it: stays scheduled here.
+    let far = Draft {
+        id: "far".into(),
+        send_at: Some(chrono::Utc::now().timestamp() + 5 * 86400),
+        ..later
+    };
+    b.store.save_draft(&far)?;
+    assert!(!b.hand_to_server(&a, "far")?);
+    assert!(b.store.draft("far")?.is_some());
+    Ok(())
+}
+
+/// Encryption required where the JMAP server can't ask for it: refused,
+/// as SMTP refuses it, rather than sent without.
+#[test]
+fn jmap_without_requiretls_refuses_to_send_when_it_is_required() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    a.require_tls = true;
+    let d = Draft {
+        id: "plain".into(),
+        account: a.id.clone(),
+        to: "recipient@example.com".into(),
+        subject: "Must be encrypted".into(),
+        body: "Hello.".into(),
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let error = format!("{:#}", b.send(&a, &d).unwrap_err());
+    assert!(error.contains("REQUIRETLS"), "{error}");
+    assert!(server.lock().unwrap().sent.is_empty());
+    Ok(())
+}
+
+/// A server with only JMAP's away reply: the filter settings offer it
+/// alone, and saving writes VacationResponse.
+#[test]
+fn jmap_away_reply_without_sieve() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let state = b.filters(&a)?;
+    assert!(state.vacation_only && state.has("vacation") && !state.active);
+    let mut filters = state.filters.clone();
+    filters.vacation = crate::sync::sieve::Vacation {
+        on: true,
+        subject: "Away".into(),
+        body: "Back Monday.".into(),
+        days: 7,
+        from: Some("2026-12-01".into()),
+        until: Some("2026-12-05".into()),
+    };
+    let saved = b.save_filters(&a, &filters)?;
+    assert!(saved.active && saved.vacation_only);
+    let reply = server.lock().unwrap().vacation.clone();
+    assert_eq!(reply["isEnabled"], true);
+    assert_eq!(reply["fromDate"], "2026-12-01T00:00:00Z");
+    assert_eq!(reply["toDate"], "2026-12-05T23:59:59Z");
+    assert_eq!(reply["textBody"], "Back Monday.");
+    // Read back as saved.
+    assert_eq!(b.filters(&a)?.filters.vacation, filters.vacation);
+    // Rules can't be kept here.
+    filters.rules.push(crate::sync::sieve::Rule {
+        field: crate::sync::sieve::Field::From,
+        value: "x".into(),
+        act: crate::sync::sieve::Act::Star,
+        stop: false,
+    });
+    assert!(b.save_filters(&a, &filters).is_err());
+    Ok(())
+}
+
+/// A mail account shared with the sign-in is found, added as an account of
+/// its own that signs in as its owner, and read; the owner can't be
+/// removed while it's there.
+#[test]
+fn jmap_shared_accounts_are_added_and_sign_in_as_their_owner() -> Result<()> {
+    let (cert, port, _server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let found = b.jmap_shared(&a)?;
+    assert_eq!(found, vec![("u2".to_owned(), "Team".to_owned())]);
+    let team = b.add_jmap_shared(&a, "u2", "Team")?;
+    assert_eq!(team.jmap_account, "u2");
+    assert_eq!(team.credentials_of, a.id);
+    assert_eq!(team.label(), "Team");
+    assert!(b.jmap_shared(&a)?.is_empty(), "already added");
+    b.sync(&team, Folder::Inbox, 50)?;
+    let error = format!("{:#}", b.remove_account(&a.id).unwrap_err());
+    assert!(error.contains("Team"), "{error}");
+    b.remove_account(&team.id)?;
+    b.remove_account(&a.id)?;
+    Ok(())
+}
+
+/// A response naming another session state: the session is read again
+/// before the next request. More calls than the server takes at once go
+/// in several requests.
+#[test]
+fn jmap_session_changes_and_request_limits() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let ask = || b.with_jmap(&a, |s| s.identities().map(drop));
+    ask()?;
+    assert_eq!(server.lock().unwrap().session_reads, 1);
+    server.lock().unwrap().session_state = "s2".into();
+    ask()?;
+    ask()?;
+    assert_eq!(server.lock().unwrap().session_reads, 2, "read again once");
+    // Three independent calls, two at a time.
+    b.with_jmap(&a, |s| {
+        let calls: Vec<(&str, Value)> = (0..3)
+            .map(|_| ("Identity/get", json!({ "accountId": "u1" })))
+            .collect();
+        assert_eq!(s.call(&calls)?.len(), 3);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Search results show the part of each message that matched.
+#[test]
+fn jmap_search_results_show_what_matched() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    fixture.emails.push(Message {
+        id: "e1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["i".into()],
+        keywords: vec![],
+        subject: "Over JMAP".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, _server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let results = b.search_server(&a, &Folder::Inbox.into(), "jmap", 10)?;
+    assert_eq!(results.mails.len(), 1);
+    assert_eq!(results.mails[0].snippet, "…the fixture & more");
+    Ok(())
 }

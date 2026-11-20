@@ -723,6 +723,8 @@ enum Action {
     ToggleDeliveryReceipts(String),
     /// Turns requiring encryption all the way (REQUIRETLS) on or off.
     ToggleRequireTls(String),
+    /// Turns handing scheduled messages to the server on or off.
+    ToggleServerSendLater(String),
     /// Starts adding a sending address to an account.
     AddIdentity(String),
     /// Edits one of an account's sending addresses: (account, identity).
@@ -732,6 +734,17 @@ enum Action {
     /// Switches the address being edited between the mailbox's outgoing
     /// server and one of its own.
     ToggleIdentityServer,
+    /// Looks up the JMAP accounts shared with this account's sign-in.
+    FindShared(String),
+    /// Adds a JMAP account shared with this one's sign-in: (account, id at
+    /// the server, name).
+    AddShared(String, String, String),
+    /// Switches the address being edited's own outgoing server between TLS
+    /// from the start and STARTTLS.
+    ToggleIdentityTls,
+    /// Switches the outgoing server being set up between TLS from the
+    /// start and STARTTLS.
+    ToggleSmtpTls,
     SaveIdentity,
     CancelIdentity,
     /// Asks before deleting messages for good.
@@ -1008,6 +1021,9 @@ pub struct MailApp {
     step: Step,
     discovering: bool,
     manual: bool,
+    /// The outgoing server being set up takes TLS from the first byte
+    /// (true) or STARTTLS (false); `None` goes by its port.
+    smtp_tls: Option<bool>,
     setup_generation: u64,
     notice_generation: u64,
     drafts: Vec<Draft>,
@@ -1154,6 +1170,11 @@ pub struct MailApp {
     filter_inputs: filters::FilterInputs,
     /// What each account's server says about itself (METADATA).
     server_notes: HashMap<String, crate::manage::backend::ServerNotes>,
+    /// JMAP accounts shared with each account's sign-in, as last looked
+    /// up: (id at the server, name), or why they couldn't be. Absent while
+    /// looking (`shared_looking`) or before.
+    jmap_shared: HashMap<String, Result<Vec<(String, String)>, String>>,
+    shared_looking: HashSet<String>,
     /// Watchers (IDLE, NOTIFY) send their account's id and the mailbox
     /// here when the server reports a change.
     pushed: futures::channel::mpsc::UnboundedSender<(String, Mailbox)>,
@@ -1886,6 +1907,7 @@ impl MailApp {
             step: Step::Welcome,
             discovering: false,
             manual: false,
+            smtp_tls: None,
             setup_generation: 0,
             notice_generation: 0,
             drafts: vec![],
@@ -2043,6 +2065,8 @@ impl MailApp {
             filters: HashMap::new(),
             filter_inputs,
             server_notes: HashMap::new(),
+            jmap_shared: HashMap::new(),
+            shared_looking: HashSet::new(),
             mobile: mobile::Mobile::new(),
             open_listed: None,
         };
@@ -4550,6 +4574,7 @@ impl MailApp {
                     incoming_port: a.incoming_port,
                     smtp_host: a.smtp_host,
                     smtp_port: a.smtp_port,
+                    smtp_tls: a.smtp_tls,
                 },
                 w,
                 cx,
@@ -4577,6 +4602,7 @@ impl MailApp {
         );
         Self::set(&self.form[SMTP_HOST], settings.smtp_host.clone(), w, cx);
         Self::set(&self.form[SMTP_PORT], settings.smtp_port.to_string(), w, cx);
+        self.smtp_tls = settings.smtp_tls;
     }
     fn discover(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.discovering {
@@ -4636,6 +4662,7 @@ impl MailApp {
                         incoming_port: 993,
                         smtp_host: format!("smtp.{domain}"),
                         smtp_port: 587,
+                        smtp_tls: None,
                     }
                 });
                 this.apply_settings(&settings, w, cx);
@@ -4698,6 +4725,7 @@ impl MailApp {
                     a.incoming_port = value(IMAP_PORT).parse().unwrap_or(0);
                     a.smtp_host = value(SMTP_HOST);
                     a.smtp_port = value(SMTP_PORT).parse().unwrap_or(0);
+                    a.smtp_tls = self.smtp_tls;
                     a.username = value(LOGIN);
                     // JMAP sends through the server it reads from.
                     if a.provider == Provider::Jmap {
@@ -5395,6 +5423,9 @@ impl MailApp {
             Action::ToggleDeliveryReceipts(id) => {
                 self.edit_account(&id, |a| a.delivery_receipts = !a.delivery_receipts, cx)
             }
+            Action::ToggleServerSendLater(id) => {
+                self.edit_account(&id, |a| a.server_send_later = !a.server_send_later, cx)
+            }
             Action::ToggleRequireTls(id) => {
                 self.edit_account(&id, |a| a.require_tls = !a.require_tls, cx)
             }
@@ -5406,6 +5437,15 @@ impl MailApp {
                     edit.own_server = !edit.own_server;
                 }
             }
+            Action::FindShared(id) => self.find_shared(id, cx),
+            Action::AddShared(owner, jmap_id, name) => self.add_shared(owner, jmap_id, name, cx),
+            Action::ToggleIdentityTls => {
+                let on = self.identity_tls(cx);
+                if let Some(edit) = &mut self.identity_edit {
+                    edit.tls = Some(!on);
+                }
+            }
+            Action::ToggleSmtpTls => self.smtp_tls = Some(!self.setup_smtp_tls(cx)),
             Action::SaveIdentity => self.save_identity(cx),
             Action::CancelIdentity => self.identity_edit = None,
             Action::DeleteForever(ids) => {
@@ -6081,6 +6121,7 @@ impl MailApp {
         let events = (a.sync.proton_events_seconds != sync.proton_events_seconds)
             .then(|| a.id.clone());
         let push = a.sync.proton_push != sync.proton_push;
+        let subscribed = a.sync.subscribed_only != sync.subscribed_only;
         a.sync = sync;
         if let Err(e) = self.backend.store.save_account(a) {
             self.notice(e.to_string(), true, cx);
@@ -6094,7 +6135,7 @@ impl MailApp {
         }
         // A wider offline range starts downloading now; any change recounts.
         if offline != OFFLINE_WHEN_OPENED {
-            self.download_account(account, cx);
+            self.download_account(account.clone(), cx);
         }
         // Proton's event watcher restarts at the new pace (or stops).
         if let Some(id) = events {
@@ -6105,7 +6146,77 @@ impl MailApp {
         if push {
             self.backend.reconcile_proton_push();
         }
+        // The folder list changes with the subscriptions shown.
+        if subscribed {
+            self.check_inbox(account, cx);
+        }
         self.refresh_counts(cx);
+    }
+    /// Looks up the JMAP accounts shared with `id`'s sign-in.
+    fn find_shared(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        if !self.shared_looking.insert(id.clone()) {
+            return;
+        }
+        self.task(
+            cx,
+            move |b| b.jmap_shared(&a),
+            move |this, result, cx| {
+                this.shared_looking.remove(&id);
+                this.jmap_shared
+                    .insert(id, result.map_err(|e| format!("{e:#}")));
+                cx.notify();
+            },
+        );
+    }
+    /// Adds the JMAP account `jmap_id` shared with `owner`'s sign-in.
+    fn add_shared(&mut self, owner: String, jmap_id: String, name: String, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == owner).cloned() else {
+            return;
+        };
+        let key = format!("{owner}:{jmap_id}");
+        if !self.shared_looking.insert(key.clone()) {
+            return;
+        }
+        self.task(
+            cx,
+            move |b| b.add_jmap_shared(&a, &jmap_id, &name),
+            move |this, result, cx| {
+                this.shared_looking.remove(&key);
+                match result {
+                    Ok(added) => {
+                        if let Some(Ok(list)) = this.jmap_shared.get_mut(&owner) {
+                            list.retain(|(id, _)| *id != added.jmap_account);
+                        }
+                        this.accounts.push(added.clone());
+                        this.sync_tree();
+                        this.load_avatar(added.clone(), cx);
+                        this.watch_inboxes();
+                        this.notice(format!("Added {}", added.label()), false, cx);
+                        this.refresh_counts(cx);
+                    }
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                }
+                cx.notify();
+            },
+        );
+    }
+    /// Whether the outgoing server being set up takes TLS from the start:
+    /// as chosen, else by its port.
+    fn setup_smtp_tls(&self, cx: &App) -> bool {
+        let port = Self::value(&self.form[SMTP_PORT], cx).trim().parse().unwrap_or(0);
+        crate::manage::model::smtp_implicit_tls(self.smtp_tls, port)
+    }
+    /// Whether the address being edited's own outgoing server takes TLS
+    /// from the start: as chosen, else by its port.
+    fn identity_tls(&self, cx: &App) -> bool {
+        let port = Self::value(&self.identity_inputs[4], cx).trim().parse().unwrap_or(0);
+        crate::manage::model::smtp_implicit_tls(
+            self.identity_edit.as_ref().and_then(|e| e.tls),
+            port,
+        )
     }
     /// Opens the form for a new sending address of `account`, or for
     /// changing one (`id`).
@@ -6144,6 +6255,7 @@ impl MailApp {
         self.identity_edit = Some(settings::IdentityEdit {
             account,
             id: existing.map(|i| i.id),
+            tls: server.tls,
             own_server: i.smtp.is_some(),
             had_password: i.smtp.is_some(),
             saving: false,
@@ -6174,6 +6286,7 @@ impl MailApp {
                 host: value(3),
                 port,
                 username: value(5),
+                tls: edit.tls,
             })
         } else {
             None
@@ -8127,6 +8240,14 @@ impl MailApp {
                             .child(self.field("SMTP server", SMTP_HOST))
                             .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
                     )
+                    .child(self.switch_setting(
+                        "TLS from the start",
+                        "On for servers that encrypt from the first byte (usually port 465); off for STARTTLS (usually 587).",
+                        "setup-smtp-tls".into(),
+                        self.setup_smtp_tls(cx),
+                        Action::ToggleSmtpTls,
+                        cx,
+                    ))
                 })
                 .child(self.field("Sign-in name, if not the email address", LOGIN))
                 .when(self.provider == Provider::Jmap, |d| {
@@ -10767,6 +10888,7 @@ mod tests {
             offline_days: 365,
             proton_events_seconds: 60,
             proton_push: true,
+            subscribed_only: true,
         };
         act(&view, Action::SetSync(first.clone(), sync), cx);
         let saved = store.accounts().unwrap();

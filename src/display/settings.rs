@@ -9,6 +9,9 @@ pub(super) struct IdentityEdit {
     pub(super) id: Option<String>,
     /// It goes through an outgoing server of its own.
     pub(super) own_server: bool,
+    /// That server takes TLS from the start (true) or STARTTLS (false);
+    /// `None` goes by its port.
+    pub(super) tls: Option<bool>,
     /// It had its own server (and password) before: an empty password
     /// keeps the saved one.
     pub(super) had_password: bool,
@@ -1101,6 +1104,16 @@ impl MailApp {
                 Action::ToggleRequireTls(a.id.clone()),
                 cx,
             ))
+            .when(a.provider != Provider::Proton, |page| {
+                page.child(self.switch_setting(
+                    "Let the server send scheduled messages",
+                    "A message sent later goes to your outgoing server right away, which sends it at its time even with Picacho closed, where the server can hold it (FUTURERELEASE). Once handed over it can't be changed or taken back, and with SMTP its copy is in Sent from then. Where the server can't, Picacho sends it itself, as without this.",
+                    format!("server-send-later-{}", a.id),
+                    a.server_send_later,
+                    Action::ToggleServerSendLater(a.id.clone()),
+                    cx,
+                ))
+            })
             .child(self.identities_setting(a, cx))
             .when(a.provider != Provider::Pop3, |page| {
                 page.child(self.section("Storage"))
@@ -1327,6 +1340,25 @@ impl MailApp {
             .when(a.provider == Provider::Proton, |page| {
                 page.child(self.proton_push_setting(a, cx))
             })
+            .when(a.provider.imap(), |page| {
+                page.child(self.switch_setting(
+                    "Only subscribed folders",
+                    "Show only the folders subscribed to on the server, as other mail apps do. Folders Picacho makes are subscribed. If none are, all show.",
+                    format!("subscribed-only-{}", a.id),
+                    sync.subscribed_only,
+                    Action::SetSync(
+                        a.id.clone(),
+                        SyncSettings {
+                            subscribed_only: !sync.subscribed_only,
+                            ..sync
+                        },
+                    ),
+                    cx,
+                ))
+            })
+            .when(a.provider == Provider::Jmap && a.credentials_of.is_empty(), |page| {
+                page.child(self.jmap_shared_setting(a, cx))
+            })
             .child(self.section("Account"))
             .child(
                 div()
@@ -1361,6 +1393,79 @@ impl MailApp {
 }
 
 impl MailApp {
+    /// The JMAP accounts shared with this account's sign-in (a team's
+    /// mailbox, another person's), each added as an account of its own.
+    fn jmap_shared_setting(&self, a: &Account, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let looking = self.shared_looking.contains(&a.id);
+        let find = self
+            .button(
+                format!("find-shared-{}", a.id),
+                if looking { "Looking…" } else { "Look for Shared Accounts" },
+                "",
+                Action::FindShared(a.id.clone()),
+                false,
+                cx,
+            )
+            .border_1()
+            .border_color(rgb(c.border))
+            .when(looking, |d| d.opacity(0.6));
+        let mut list = div().flex().flex_col().gap_2();
+        match self.jmap_shared.get(&a.id) {
+            Some(Ok(found)) if found.is_empty() => {
+                list = list.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Nothing else is shared with this sign-in, or it's all added."),
+                );
+            }
+            Some(Ok(found)) => {
+                for (jmap_id, name) in found {
+                    let adding = self.shared_looking.contains(&format!("{}:{jmap_id}", a.id));
+                    list = list.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                            .child(
+                                self.button(
+                                    format!("add-shared-{}-{jmap_id}", a.id),
+                                    if adding { "Adding…" } else { "Add" },
+                                    "",
+                                    Action::AddShared(a.id.clone(), jmap_id.clone(), name.clone()),
+                                    false,
+                                    cx,
+                                )
+                                .border_1()
+                                .border_color(rgb(c.border))
+                                .when(adding, |d| d.opacity(0.6)),
+                            ),
+                    );
+                }
+            }
+            Some(Err(e)) => {
+                list = list.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.danger))
+                        .child(e.clone()),
+                );
+            }
+            None => {}
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.setting(
+                "Shared with you",
+                "Mail accounts others share with this sign-in. Each is added as an account of its own, signing in as this one.",
+                find,
+            ))
+            .child(list)
+    }
     /// Proton's push notifications for a Proton Direct account: offered
     /// while its Notifications are on, and announcing new mail in place of
     /// the regular checks once turned on.
@@ -1562,12 +1667,14 @@ impl MailApp {
                             "identity-password",
                         )),
                 )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(c.muted))
-                        .child("Port 465 uses TLS from the start; other ports must offer STARTTLS. Picacho signs in once to check before saving."),
-                );
+                .child(self.switch_setting(
+                    "TLS from the start",
+                    "On for servers that encrypt from the first byte (usually port 465); off for STARTTLS (usually 587). Picacho signs in once to check before saving.",
+                    "identity-tls".into(),
+                    self.identity_tls(cx),
+                    Action::ToggleIdentityTls,
+                    cx,
+                ));
         }
         if let Some(error) = &edit.error {
             form = form.child(

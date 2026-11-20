@@ -191,7 +191,21 @@ pub(crate) struct ServerLimits {
     pub(crate) starttls: bool,
     /// SASL mechanisms it takes (AUTH), uppercase.
     pub(crate) auth: Vec<String>,
+    /// FUTURERELEASE (RFC 4865): how far ahead it holds a message for
+    /// release, in seconds (0 where it doesn't).
+    pub(crate) future_release: u64,
 }
+
+/// The outgoing server can't hold a message for sending later (no
+/// FUTURERELEASE, or not that far ahead): nothing was sent.
+#[derive(Debug)]
+pub(crate) struct NoServerHold;
+impl std::fmt::Display for NoServerHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The outgoing server can't hold this message until it's due.")
+    }
+}
+impl std::error::Error for NoServerHold {}
 pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerLimits {
     let mut limits = ServerLimits::default();
     for line in lines {
@@ -208,6 +222,9 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
             Some("CHUNKING") => limits.chunking = true,
             Some("REQUIRETLS") => limits.require_tls = true,
             Some("STARTTLS") => limits.starttls = true,
+            Some("FUTURERELEASE") => {
+                limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0)
+            }
             // Some servers still write "AUTH=PLAIN LOGIN".
             Some(word) if word == "AUTH" || word.starts_with("AUTH=") => {
                 let first = word.strip_prefix("AUTH=").filter(|w| !w.is_empty());
@@ -245,6 +262,8 @@ pub(crate) struct Endpoint {
     pub(crate) user: String,
     /// Signs in with an access token rather than a password.
     pub(crate) oauth: bool,
+    /// TLS from the first byte, rather than STARTTLS.
+    pub(crate) implicit_tls: bool,
 }
 impl Endpoint {
     /// The account's own outgoing server.
@@ -258,6 +277,7 @@ impl Endpoint {
                 a.login().to_owned()
             },
             oauth: a.oauth,
+            implicit_tls: crate::manage::model::smtp_implicit_tls(a.smtp_tls, a.smtp_port),
         }
     }
     /// A sending address's own outgoing server.
@@ -268,6 +288,7 @@ impl Endpoint {
             port: s.port,
             user: i.login().to_owned(),
             oauth: false,
+            implicit_tls: crate::manage::model::smtp_implicit_tls(s.tls, s.port),
         })
     }
 }
@@ -543,15 +564,17 @@ impl<S: Read + Write + Patience> Session<S> {
     }
 }
 
-/// Connects, secures and signs in to an outgoing server: implicit TLS on
-/// port 465, else STARTTLS, never in the clear.
+/// Connects, secures and signs in to an outgoing server: TLS from the
+/// first byte or STARTTLS (`Endpoint::implicit_tls`), never in the clear.
+/// A server that offers no sign-in at all (a relay that knows its senders
+/// by their network) is sent to without one.
 fn open(
     endpoint: &Endpoint,
     secret: &str,
     tls: &native_tls::TlsConnector,
 ) -> Result<(Session<native_tls::TlsStream<Wire>>, ServerLimits)> {
     let socket = crate::sync::transport::tcp(&endpoint.host, endpoint.port)?;
-    let mut session = if endpoint.port == 465 {
+    let mut session = if endpoint.implicit_tls {
         let stream = tls
             .connect(&endpoint.host, socket)
             .map_err(|e| anyhow::anyhow!("TLS with {} failed: {e}", endpoint.host))?;
@@ -577,7 +600,7 @@ fn open(
         // Never send credentials or mail unencrypted.
         ensure!(
             limits.starttls,
-            "{} doesn't offer STARTTLS on port {}; Picacho only sends over encrypted connections.",
+            "{} doesn't offer STARTTLS on port {}; Picacho only sends over encrypted connections. If this server uses TLS from the start, turn on \"TLS from the start\" for it.",
             endpoint.host,
             endpoint.port
         );
@@ -600,7 +623,11 @@ fn open(
         Session::new(stream)
     };
     let limits = session.ehlo()?;
-    session.authenticate(endpoint, &limits, secret)?;
+    // A relay that takes mail by its senders' network offers no AUTH.
+    // An access token is only for servers that sign in.
+    if !limits.auth.is_empty() || endpoint.oauth {
+        session.authenticate(endpoint, &limits, secret)?;
+    }
     Ok((session, limits))
 }
 
@@ -616,12 +643,16 @@ pub(crate) fn check_server(
     Ok(())
 }
 
+/// Delivers `d`. With `hold_until` (a Unix time) the server holds it and
+/// sends it then (FUTURERELEASE's HOLDFOR); a server that can't, or not
+/// that far ahead, is left before anything is sent, with `NoServerHold`.
 pub(crate) fn deliver(
     a: &Account,
     d: &Draft,
     endpoint: &Endpoint,
     secret: &str,
     tls: &native_tls::TlsConnector,
+    hold_until: Option<i64>,
 ) -> Result<Delivered> {
     let message = build(a, d, false)?;
     let bytes = message.formatted();
@@ -645,6 +676,18 @@ pub(crate) fn deliver(
             a.email
         );
     }
+    // Held for later: for how long, from the server's own clock.
+    let hold_for = match hold_until {
+        None => None,
+        Some(at) => {
+            let ahead = (at - chrono::Utc::now().timestamp()).max(1) as u64;
+            if limits.future_release < ahead {
+                let _ = session.command("QUIT");
+                return Err(NoServerHold.into());
+            }
+            Some(ahead)
+        }
+    };
     let envelope = message.envelope();
     let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
     let mut mail = format!("MAIL FROM:<{from}>");
@@ -674,6 +717,9 @@ pub(crate) fn deliver(
     }
     if a.require_tls {
         mail.push_str(" REQUIRETLS");
+    }
+    if let Some(seconds) = hold_for {
+        mail.push_str(&format!(" HOLDFOR={seconds}"));
     }
     let rcpt = |to: &lettre::Address| {
         let mut line = format!("RCPT TO:<{to}>");

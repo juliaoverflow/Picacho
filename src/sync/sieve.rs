@@ -108,6 +108,9 @@ pub struct State {
     pub other_active: Option<String>,
     /// Picacho's script is the active one.
     pub active: bool,
+    /// The server has no Sieve, only an automatic reply while away (JMAP's
+    /// VacationResponse): no rules, and no choice of how often it answers.
+    pub vacation_only: bool,
 }
 impl State {
     pub fn has(&self, extension: &str) -> bool {
@@ -622,6 +625,7 @@ pub fn save(
         extensions,
         other_active: other,
         active: !empty,
+        vacation_only: false,
     })
 }
 

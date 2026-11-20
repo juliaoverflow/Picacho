@@ -34,12 +34,21 @@ pub(super) struct Connection {
     names: Option<Vec<Name>>,
     /// The personal namespace's prefix, once asked (NAMESPACE).
     namespace: Option<Option<String>>,
+    /// Other users' and shared namespaces' prefixes, asked with it.
+    others: Vec<String>,
+    /// Only subscribed folders are listed (the account's setting).
+    pub(super) subscribed_only: bool,
+    /// Each folder's counters from the last listing, where the server
+    /// sends them with it (LIST-STATUS).
+    pub(super) statuses: std::collections::HashMap<String, crate::sync::transport::FolderStatus>,
     /// Rights by mailbox, as MYRIGHTS gave them and when.
     rights: std::collections::HashMap<String, (Option<String>, Instant)>,
     selected: Option<Selected>,
     used: Instant,
     /// What ENABLE turned on (QRESYNC, UTF8=ACCEPT).
     pub(super) enabled: crate::sync::transport::Enabled,
+    /// A copy of what the server sends, when asked (`heard`).
+    tap: Option<crate::sync::stream::Tap>,
 }
 impl Connection {
     pub(super) fn new(session: ImapSession) -> Self {
@@ -48,16 +57,54 @@ impl Connection {
             extensions: None,
             names: None,
             namespace: None,
+            others: Vec::new(),
+            subscribed_only: false,
+            statuses: std::collections::HashMap::new(),
             rights: std::collections::HashMap::new(),
             selected: None,
             used: Instant::now(),
             enabled: Default::default(),
+            tap: None,
         }
+    }
+    /// Runs `command` (a raw IMAP command) and returns what the server
+    /// sent for it, tagged reply included, where the session keeps a copy
+    /// (`Tap`); empty otherwise.
+    pub(super) fn heard(&mut self, command: &str) -> imap::error::Result<Vec<u8>> {
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result = self.session.run_command_and_check_ok(command);
+        let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        result.map(|()| copy)
+    }
+    /// Appends a message with `flags` to `mailbox` (a wire name), returning
+    /// what the server sent for it (see `heard`).
+    pub(super) fn append_heard(
+        &mut self,
+        mailbox: &str,
+        raw: &[u8],
+        flags: &[imap::types::Flag<'_>],
+    ) -> imap::error::Result<Vec<u8>> {
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result = self.session.append_with_flags(mailbox, raw, flags);
+        let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        result.map(|()| copy)
     }
     /// A new session, with QRESYNC and UTF8=ACCEPT turned on where the
     /// server has them (ENABLE comes before any SELECT).
     pub(super) fn open(session: ImapSession) -> Result<Self> {
+        Self::open_tapped(session, None)
+    }
+    /// As `open`, keeping `tap` to read response codes with (`heard`).
+    pub(super) fn open_tapped(
+        session: ImapSession,
+        tap: Option<crate::sync::stream::Tap>,
+    ) -> Result<Self> {
         let mut c = Self::new(session);
+        c.tap = tap;
         let ext = c.extensions()?;
         c.enabled = crate::sync::transport::enable(&mut c.session, &ext)?;
         Ok(c)
@@ -79,15 +126,36 @@ impl Connection {
         self.extensions = Some(e);
         Ok(e)
     }
+    /// UID SEARCH in the selected mailbox, with ESEARCH where the server
+    /// has it (see `uid_search_any`).
+    pub(super) fn uid_search(
+        &mut self,
+        criteria: &str,
+    ) -> imap::error::Result<std::collections::HashSet<u32>> {
+        let esearch = self.extensions().map(|e| e.esearch).unwrap_or(false);
+        crate::sync::transport::uid_search_any(&mut self.session, esearch, criteria)
+    }
     /// The server's mailboxes, listed once per connection unless `fresh`.
     pub(super) fn names(&mut self, fresh: bool) -> Result<&[Name]> {
         if fresh || self.names.is_none() {
-            let special_use = self.extensions()?.special_use;
-            self.names = Some(crate::sync::transport::list(
+            let ext = self.extensions()?;
+            // Other users' and shared folders, where the server has them.
+            self.namespace()?;
+            let options = crate::sync::transport::ListOptions {
+                special_use: ext.special_use,
+                list_status: ext.list_status,
+                condstore: ext.condstore,
+                subscribed_only: self.subscribed_only,
+            };
+            let others = self.others.clone();
+            let (names, statuses) = crate::sync::transport::list_full(
                 &mut self.session,
-                special_use,
+                &options,
+                &others,
                 self.enabled.utf8,
-            )?);
+            )?;
+            self.names = Some(names);
+            self.statuses = statuses;
         }
         Ok(self.names.as_deref().unwrap_or_default())
     }
@@ -97,7 +165,9 @@ impl Connection {
             return Ok(n.clone());
         }
         let n = if self.extensions()?.namespace {
-            crate::sync::transport::namespace(&mut self.session)?
+            let (personal, others) = crate::sync::transport::namespaces(&mut self.session)?;
+            self.others = others;
+            personal
         } else {
             None
         };
@@ -140,7 +210,7 @@ impl Connection {
         if self.extensions()?.uidplus {
             return Ok(());
         }
-        let marked = self.session.uid_search("DELETED")?;
+        let marked = self.uid_search("DELETED")?;
         ensure!(
             marked.iter().all(|uid| uids.contains(uid)),
             "Other messages in this folder are already marked for deletion, and this server can't remove only some (no UIDPLUS). Remove or unmark them in another mail app first."
@@ -252,9 +322,19 @@ impl Backend {
             Some(c) => c,
             None => {
                 let secret = self.credentials(a)?;
-                Connection::open(self.imap_login(a, &secret)?)?
+                let (session, tap) = crate::sync::transport::imap_login_tapped(
+                    a,
+                    &secret,
+                    &self.tls_connector()?,
+                )?;
+                Connection::open_tapped(session, Some(tap))?
             }
         };
+        // The account's choice of folders; a change lists them again.
+        if connection.subscribed_only != a.sync.subscribed_only {
+            connection.subscribed_only = a.sync.subscribed_only;
+            connection.names = None;
+        }
         let result = work(&mut connection);
         match &result {
             Ok(_) => {

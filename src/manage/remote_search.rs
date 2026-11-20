@@ -102,9 +102,10 @@ impl Backend {
                     }
                     Err(e) => return Err(e),
                 };
-                let uids = sorted_search(&mut c.session, &ext, &selected, &criteria, utf8)?;
-                out.total += uids.len();
-                let newest = &uids[..uids.len().min(limit)];
+                let (uids, total) =
+                    newest_search(&mut c.session, &ext, &selected, &criteria, utf8, limit)?;
+                out.total += total;
+                let newest = &uids[..];
                 let prefix = format!("{}:{remote}:{}:", a.id, selected.validity);
                 let mut missing = Vec::new();
                 for uid in newest {

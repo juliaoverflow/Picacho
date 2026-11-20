@@ -491,7 +491,10 @@ impl MailApp {
                     )),
             );
         }
-        page = page.child(self.setting("Filters", "", rules));
+        // A server with only an away reply (JMAP's) runs no rules.
+        if !state.vacation_only {
+            page = page.child(self.setting("Filters", "", rules));
+        }
         // A new rule.
         let fields = self.segmented(
             &format!("filter-field-{id}"),
@@ -625,13 +628,19 @@ impl MailApp {
                 .border_color(rgb(c.border)),
             ),
         );
-        page = page.child(form);
+        if !state.vacation_only {
+            page = page.child(form);
+        }
         // Vacation.
         if state.has("vacation") {
             let v = &ui.draft.vacation;
             page = page.child(self.switch_setting(
                 "Vacation reply",
-                "The server answers mail to this account's addresses while you're away, once per sender in the days chosen below.",
+                if state.vacation_only {
+                    "The server answers mail to this account while you're away, once per sender."
+                } else {
+                    "The server answers mail to this account's addresses while you're away, once per sender in the days chosen below."
+                },
                 format!("vacation-{id}"),
                 v.on,
                 act(FilterAction::ToggleVacation(id.clone())),
@@ -658,7 +667,7 @@ impl MailApp {
                             ),
                         ),
                     )
-                    .child(
+                    .when(!state.vacation_only, |page| page.child(
                         self.setting(
                             "Answer each sender once every",
                             "",
@@ -677,7 +686,7 @@ impl MailApp {
                                 cx,
                             ),
                         ),
-                    );
+                    ));
                 if state.has("date") && state.has("relational") {
                     page = page.child(
                         self.setting(

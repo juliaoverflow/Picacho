@@ -23,6 +23,10 @@ pub struct Settings {
     pub incoming_port: u16,
     pub smtp_host: String,
     pub smtp_port: u16,
+    /// The outgoing server takes TLS from the first byte (true) or
+    /// STARTTLS (false), where the configuration says; `None` goes by the
+    /// port (`model::smtp_implicit_tls`).
+    pub smtp_tls: Option<bool>,
 }
 impl Settings {
     /// A JMAP server, which sends mail too.
@@ -33,6 +37,7 @@ impl Settings {
             incoming_port: port,
             smtp_host: host.to_owned(),
             smtp_port: port,
+            smtp_tls: None,
         }
     }
     fn hosted(provider: Provider) -> Self {
@@ -43,6 +48,7 @@ impl Settings {
             incoming_port: a.incoming_port,
             smtp_host: a.smtp_host,
             smtp_port: a.smtp_port,
+            smtp_tls: a.smtp_tls,
         }
     }
 }
@@ -259,7 +265,7 @@ fn fetch_config(url: &str, domain: &str) -> Option<Settings> {
 
 /// Parses a Mozilla autoconfig document. Only transports this client
 /// supports are accepted: implicit TLS for incoming mail, and STARTTLS or
-/// implicit TLS on port 465 for SMTP.
+/// implicit TLS (on any port) for SMTP.
 pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
     let mut incoming: Option<(Provider, String, u16)> = None;
     for (attrs, inner) in blocks(xml, "incomingServer") {
@@ -290,17 +296,16 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         let (Some(host), Some(port)) = (tag(inner, "hostname"), port(inner)) else {
             continue;
         };
-        let usable = match tag(inner, "socketType") {
-            Some("STARTTLS") => port != 465,
-            Some("SSL") => port == 465,
-            _ => false,
+        let tls = match tag(inner, "socketType") {
+            Some("STARTTLS") => false,
+            Some("SSL") => true,
+            _ => continue,
         };
-        if usable {
-            smtp = Some((substitute(host, domain), port));
-            break;
-        }
+        smtp = Some((substitute(host, domain), port, tls));
+        break;
     }
-    let ((kind, incoming_host, incoming_port), (smtp_host, smtp_port)) = (incoming?, smtp?);
+    let ((kind, incoming_host, incoming_port), (smtp_host, smtp_port, smtp_tls)) =
+        (incoming?, smtp?);
     let provider = if incoming_host.ends_with(".gmail.com") {
         Provider::Gmail
     } else if incoming_host.ends_with(".office365.com") || incoming_host.ends_with(".outlook.com") {
@@ -314,6 +319,7 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         incoming_port,
         smtp_host,
         smtp_port,
+        smtp_tls: Some(smtp_tls),
     })
 }
 
@@ -428,6 +434,7 @@ fn probe(domain: &str) -> Option<Settings> {
         incoming_port,
         smtp_host,
         smtp_port,
+        smtp_tls: None,
     })
 }
 
@@ -467,6 +474,7 @@ mod tests {
                 incoming_port: 993,
                 smtp_host: "smtp.fastmail.com".into(),
                 smtp_port: 465,
+                smtp_tls: Some(true),
             })
         );
         assert_eq!(parse_config("<html>not found</html>", "x.com"), None);

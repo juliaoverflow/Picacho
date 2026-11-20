@@ -30,6 +30,10 @@ pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 pub const QUOTA: &str = "urn:ietf:params:jmap:quota";
 /// JMAP for Sieve Scripts (RFC 9661).
 pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
+/// The automatic reply while away (RFC 8621 §8).
+pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
+/// Pushed changes over a WebSocket (RFC 8887).
+pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
 
 /// What a listing asks of each message: what the message list shows, and
 /// the headers Picacho keeps from a source it hasn't downloaded.
@@ -270,6 +274,8 @@ enum Auth {
 /// A signed-in JMAP session.
 pub struct Session {
     http: reqwest::blocking::Client,
+    /// Verifies the server, for connections outside `http` (the WebSocket).
+    tls: native_tls::TlsConnector,
     auth: Auth,
     login: String,
     password: String,
@@ -280,10 +286,34 @@ pub struct Session {
     account_id: String,
     /// Capabilities the server and the mail account have.
     submission: bool,
+    /// The SMTP extensions submissions may use, with their arguments
+    /// (`submissionExtensions`, RFC 8621 §1.3.2): DSN, REQUIRETLS,
+    /// FUTURERELEASE…, by upper-case name.
+    submission_extensions: HashMap<String, Vec<String>>,
+    /// How far ahead a submission may be held for sending later, in
+    /// seconds (`maxDelayedSend`); 0 where it can't.
+    max_delayed_send: u64,
     quota: bool,
+    /// The account has the automatic reply while away.
+    vacation: bool,
     max_get: usize,
     max_set: usize,
     max_upload: usize,
+    /// The most method calls one request may hold, and its largest size in
+    /// bytes (`maxCallsInRequest`, `maxSizeRequest`).
+    max_calls: usize,
+    max_request: usize,
+    /// The session resource's state when it was read. A response naming
+    /// another one means the session changed (new addresses, limits or
+    /// accounts): `stale` is set, and the session is read again.
+    session_state: String,
+    stale: std::sync::atomic::AtomicBool,
+    /// Where pushed changes arrive over a WebSocket, where the server has
+    /// one (RFC 8887).
+    websocket_url: String,
+    /// Other accounts with mail that this sign-in reaches (shared with
+    /// it): (id, name). The one used is `account_id`.
+    other_accounts: Vec<(String, String)>,
     mailboxes: Mutex<Vec<Mailbox>>,
     /// The account's name for itself (the session's `username`).
     username: String,
@@ -361,6 +391,7 @@ impl Session {
         port: u16,
         login: &str,
         password: &str,
+        account: &str,
         tls: native_tls::TlsConnector,
     ) -> Result<Self> {
         ensure!(!password.is_empty(), "Enter your password or API token.");
@@ -370,31 +401,33 @@ impl Session {
         } else {
             [Auth::Basic, Auth::Bearer]
         };
-        Self::open_with(host, port, login, password, &order, tls)
+        Self::open_with(host, port, login, password, account, &order, tls)
     }
     /// Signs in with an OAuth access token.
     pub fn open_token(
         host: &str,
         port: u16,
         token: &str,
+        account: &str,
         tls: native_tls::TlsConnector,
     ) -> Result<Self> {
         ensure!(
             !token.is_empty(),
             "Your sign-in expired. Reconnect the account."
         );
-        Self::open_with(host, port, "", token, &[Auth::Bearer], tls)
+        Self::open_with(host, port, "", token, account, &[Auth::Bearer], tls)
     }
     fn open_with(
         host: &str,
         port: u16,
         login: &str,
         password: &str,
+        account: &str,
         order: &[Auth],
         tls: native_tls::TlsConnector,
     ) -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
-            .use_preconfigured_tls(tls)
+            .use_preconfigured_tls(tls.clone())
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(12))
             // Redirects are followed here, keeping credentials on one host.
@@ -410,7 +443,9 @@ impl Session {
             }
             match Self::fetch_session(&http, &start, auth, login, password) {
                 Ok(resource) => {
-                    return Self::from_resource(http, auth, login, password, &resource);
+                    return Self::from_resource(
+                        http, tls, auth, login, password, account, &resource,
+                    );
                 }
                 Err(e) if e.downcast_ref::<AccessFailure>().is_some() => tried.push(e),
                 Err(e) => return Err(e),
@@ -472,11 +507,15 @@ impl Session {
         bail!("The JMAP server redirected too many times.")
     }
 
+    /// The session for the mail account `chosen` (empty: the sign-in's
+    /// own, its primary mail account).
     fn from_resource(
         http: reqwest::blocking::Client,
+        tls: native_tls::TlsConnector,
         auth: Auth,
         login: &str,
         password: &str,
+        chosen: &str,
         v: &Value,
     ) -> Result<Self> {
         let caps = &v["capabilities"];
@@ -484,11 +523,48 @@ impl Session {
             caps.get(MAIL).is_some(),
             "This JMAP server doesn't offer mail."
         );
-        let account_id = v["primaryAccounts"][MAIL]
-            .as_str()
-            .context("This JMAP account has no mail.")?
-            .to_owned();
+        let account_id = if chosen.is_empty() {
+            v["primaryAccounts"][MAIL]
+                .as_str()
+                .context("This JMAP account has no mail.")?
+                .to_owned()
+        } else {
+            ensure!(
+                v["accounts"][chosen]["accountCapabilities"].get(MAIL).is_some(),
+                "This shared mail account is no longer shared with you."
+            );
+            chosen.to_owned()
+        };
         let account = &v["accounts"][&account_id]["accountCapabilities"];
+        let other_accounts = v["accounts"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(id, a)| {
+                **id != account_id
+                    && a["accountCapabilities"].get(MAIL).is_some()
+                    && Some(id.as_str()) != v["primaryAccounts"][MAIL].as_str()
+            })
+            .map(|(id, a)| {
+                let name = a["name"].as_str().unwrap_or(id).to_owned();
+                (id.clone(), name)
+            })
+            .collect();
+        let submission_caps = &account[SUBMISSION];
+        let submission_extensions = submission_caps["submissionExtensions"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, args)| {
+                let args = args
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.as_str().map(str::to_owned))
+                    .collect();
+                (name.to_ascii_uppercase(), args)
+            })
+            .collect();
         let core = &caps[CORE];
         let url = |key: &str| -> Result<String> {
             let u = v[key]
@@ -504,6 +580,7 @@ impl Session {
         };
         Ok(Self {
             http,
+            tls,
             auth,
             login: login.to_owned(),
             password: password.to_owned(),
@@ -513,10 +590,25 @@ impl Session {
             event_source_url: url("eventSourceUrl").unwrap_or_default(),
             submission: caps.get(SUBMISSION).is_some()
                 && (account.get(SUBMISSION).is_some() || account.is_null()),
+            submission_extensions,
+            max_delayed_send: submission_caps["maxDelayedSend"].as_u64().unwrap_or(0),
             quota: caps.get(QUOTA).is_some(),
+            vacation: caps.get(VACATION).is_some()
+                && (account.get(VACATION).is_some() || account.is_null()),
             max_get: usize_of(&core["maxObjectsInGet"], 500).min(500),
             max_set: usize_of(&core["maxObjectsInSet"], 500).min(500),
             max_upload: usize_of(&core["maxSizeUpload"], 50_000_000),
+            // RFC 8620 asks servers for at least 16 calls and 10 MB.
+            max_calls: usize_of(&core["maxCallsInRequest"], 16),
+            max_request: usize_of(&core["maxSizeRequest"], 10_000_000),
+            session_state: v["state"].as_str().unwrap_or_default().to_owned(),
+            stale: std::sync::atomic::AtomicBool::new(false),
+            websocket_url: caps[WEBSOCKET]["url"]
+                .as_str()
+                .filter(|u| u.starts_with("wss://") || cfg!(test))
+                .unwrap_or_default()
+                .to_owned(),
+            other_accounts,
             username: v["username"].as_str().unwrap_or_default().to_owned(),
             sieve: caps.get(SIEVE).map(|_| {
                 let ext = &account[SIEVE]["sieveExtensions"];
@@ -555,14 +647,61 @@ impl Session {
     pub fn username(&self) -> &str {
         &self.username
     }
-    /// Whether the server pushes changes (an event source).
+    /// Other accounts with mail this sign-in reaches: (id, name).
+    pub fn other_accounts(&self) -> &[(String, String)] {
+        &self.other_accounts
+    }
+    /// The session changed at the server since it was read (a response
+    /// named another session state): it should be read again.
+    pub fn stale(&self) -> bool {
+        self.stale.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Whether submissions may use this SMTP extension (DSN, REQUIRETLS,
+    /// FUTURERELEASE…).
+    pub fn submits_with(&self, extension: &str) -> bool {
+        self.submission_extensions
+            .contains_key(&extension.to_ascii_uppercase())
+    }
+    /// How far ahead the server holds a submission for sending later, in
+    /// seconds; 0 where it doesn't (FUTURERELEASE).
+    pub fn max_delayed_send(&self) -> u64 {
+        if self.submits_with("FUTURERELEASE") {
+            self.max_delayed_send.max(
+                self.submission_extensions["FUTURERELEASE"]
+                    .first()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+            )
+        } else {
+            0
+        }
+    }
+    /// Whether the account has the automatic reply while away.
+    pub fn has_vacation(&self) -> bool {
+        self.vacation
+    }
+    /// Whether the server pushes changes (an event source or a WebSocket).
     pub fn pushes(&self) -> bool {
-        !self.event_source_url.is_empty()
+        !self.event_source_url.is_empty() || !self.websocket_url.is_empty()
     }
 
     /// Sends method calls in one request, returning each response's name
     /// and arguments in order. A method's error fails the whole.
     pub fn call(&self, calls: &[(&str, Value)]) -> Result<Vec<(String, Value)>> {
+        // More calls than the server takes at once go in several requests,
+        // where none uses another's result.
+        if calls.len() > self.max_calls {
+            ensure!(
+                !calls.iter().any(|(_, args)| uses_results(args)),
+                "This JMAP server takes only {} method calls at a time.",
+                self.max_calls
+            );
+            let mut out = Vec::with_capacity(calls.len());
+            for chunk in calls.chunks(self.max_calls) {
+                out.extend(self.call(chunk)?);
+            }
+            return Ok(out);
+        }
         let mut using = vec![CORE, MAIL];
         if calls
             .iter()
@@ -576,16 +715,25 @@ impl Session {
         if calls.iter().any(|(n, _)| n.starts_with("SieveScript/")) {
             using.push(SIEVE);
         }
+        if calls.iter().any(|(n, _)| n.starts_with("VacationResponse/")) {
+            using.push(VACATION);
+        }
         let method_calls: Vec<Value> = calls
             .iter()
             .enumerate()
             .map(|(i, (name, args))| json!([name, args, format!("c{i}")]))
             .collect();
-        let body = json!({ "using": using, "methodCalls": method_calls });
+        let body = serde_json::to_vec(&json!({ "using": using, "methodCalls": method_calls }))?;
+        ensure!(
+            body.len() <= self.max_request,
+            "This request is larger than the JMAP server takes ({} bytes at most).",
+            self.max_request
+        );
         let response = self
             .signed(self.http.post(&self.api_url))
             .header("Accept", "application/json")
-            .json(&body)
+            .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .map_err(|e| transport(e, "request"))?;
         let status = response.status();
@@ -599,6 +747,12 @@ impl Session {
         }
         let v: Value =
             serde_json::from_str(&text).context("The JMAP server's reply isn't JSON.")?;
+        if let Some(state) = v["sessionState"].as_str()
+            && !self.session_state.is_empty()
+            && state != self.session_state
+        {
+            self.stale.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let responses = v["methodResponses"]
             .as_array()
             .context("The JMAP server's reply has no method responses.")?;
@@ -1071,8 +1225,53 @@ impl Session {
         raw: &[u8],
         drafts: Option<&str>,
         sent: Option<&str>,
-    ) -> Result<()> {
+        options: &SendOptions,
+    ) -> Result<Submitted> {
         ensure!(self.submission, "This JMAP server doesn't send mail.");
+        // The envelope's SMTP parameters (RFC 8621 §7: `parameters`).
+        let mut from_params = Map::new();
+        let mut rcpt_params = Map::new();
+        if options.require_tls {
+            ensure!(
+                self.submits_with("REQUIRETLS"),
+                "This JMAP server can't promise this message stays encrypted all the way (it doesn't offer REQUIRETLS), so it wasn't sent. Turn off Require encryption in transit (Settings → Sending) to send it anyway."
+            );
+            from_params.insert("REQUIRETLS".into(), Value::Null);
+        }
+        let receipts = options.receipts.is_some() && self.submits_with("DSN");
+        if let (true, Some(envid)) = (receipts, &options.receipts) {
+            from_params.insert("RET".into(), json!("HDRS"));
+            from_params.insert("ENVID".into(), json!(envid));
+            rcpt_params.insert("NOTIFY".into(), json!("SUCCESS,FAILURE,DELAY"));
+        }
+        if let Some(at) = options.hold_until {
+            let ahead = (at - chrono::Utc::now().timestamp()).max(0) as u64;
+            ensure!(
+                self.max_delayed_send() >= ahead,
+                "This JMAP server can't hold a message that long before sending it."
+            );
+            let when = chrono::DateTime::from_timestamp(at, 0)
+                .context("The time to send is out of range.")?;
+            from_params.insert(
+                "HOLDUNTIL".into(),
+                json!(when.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            );
+        }
+        let mail_from = if from_params.is_empty() {
+            json!({ "email": from })
+        } else {
+            json!({ "email": from, "parameters": from_params })
+        };
+        let rcpt_to: Vec<Value> = to
+            .iter()
+            .map(|t| {
+                if rcpt_params.is_empty() {
+                    json!({ "email": t })
+                } else {
+                    json!({ "email": t, "parameters": rcpt_params })
+                }
+            })
+            .collect();
         let blob = self.upload(raw, "message/rfc822")?;
         let first: Vec<&str> = drafts.or(sent).into_iter().collect();
         ensure!(
@@ -1100,10 +1299,7 @@ impl Session {
                     "create": { "s": {
                         "identityId": identity,
                         "emailId": "#m",
-                        "envelope": {
-                            "mailFrom": { "email": from },
-                            "rcptTo": to.iter().map(|t| json!({ "email": t })).collect::<Vec<_>>(),
-                        },
+                        "envelope": { "mailFrom": mail_from, "rcptTo": rcpt_to },
                     } },
                     "onSuccessUpdateEmail": { "#s": after },
                 }),
@@ -1125,11 +1321,73 @@ impl Session {
             let _ = self.destroy(&[id]);
             bail!("The server didn't send the message: {}", set_error(e));
         }
+        submission["created"]
+            .get("s")
+            .context("The server didn't say whether it sent the message.")?;
+        Ok(Submitted { receipts })
+    }
+    /// The automatic reply while away (RFC 8621 §8), where the account has
+    /// it.
+    pub fn vacation(&self) -> Result<Option<VacationResponse>> {
+        if !self.vacation {
+            return Ok(None);
+        }
+        let v = self.one(
+            "VacationResponse/get",
+            json!({ "accountId": self.account_id, "ids": ["singleton"] }),
+        )?;
+        Ok(v["list"]
+            .get(0)
+            .map(|r| serde_json::from_value(r.clone()))
+            .transpose()
+            .context("The JMAP server's away reply isn't in a form Picacho can read.")?)
+    }
+    /// Sets the automatic reply while away.
+    pub fn set_vacation(&self, reply: &VacationResponse) -> Result<()> {
         ensure!(
-            submission["created"].get("s").is_some(),
-            "The server didn't say whether it sent the message."
+            self.vacation,
+            "This JMAP server doesn't offer an automatic reply while away."
         );
+        let v = self.one(
+            "VacationResponse/set",
+            json!({
+                "accountId": self.account_id,
+                "update": { "singleton": {
+                    "isEnabled": reply.is_enabled,
+                    "fromDate": reply.from_date,
+                    "toDate": reply.to_date,
+                    "subject": reply.subject,
+                    "textBody": reply.text_body,
+                } },
+            }),
+        )?;
+        if let Some(e) = v["notUpdated"].get("singleton") {
+            bail!("The server didn't save the away reply: {}", set_error(e));
+        }
         Ok(())
+    }
+
+    /// The parts of each message that matched a search, with the matches
+    /// marked (RFC 8621 §5): message id → its preview, as plain text.
+    pub fn search_snippets(&self, filter: &Value, ids: &[String]) -> Result<HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(self.max_get) {
+            let v = self.one(
+                "SearchSnippet/get",
+                json!({ "accountId": self.account_id, "filter": filter, "emailIds": chunk }),
+            )?;
+            for snippet in v["list"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(preview)) =
+                    (snippet["emailId"].as_str(), snippet["preview"].as_str())
+                {
+                    out.insert(id.to_owned(), unmark(preview));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Storage used and allowed, in bytes (RFC 9425), where the server
@@ -1160,6 +1418,9 @@ impl Session {
     ) -> Result<()> {
         use std::sync::atomic::Ordering;
         ensure!(self.pushes(), "This JMAP server doesn't push changes.");
+        if self.event_source_url.is_empty() {
+            return self.listen_websocket(stop, heard);
+        }
         let url = self
             .event_source_url
             .replace("{types}", "Email,Mailbox")
@@ -1301,6 +1562,56 @@ impl Session {
 }
 
 /// Whether an event stream's StateChange says mail of `account` changed.
+impl Session {
+    /// Follows pushed changes over a WebSocket (RFC 8887), where the server
+    /// has no event source: as `listen`.
+    fn listen_websocket(
+        &self,
+        stop: &std::sync::atomic::AtomicBool,
+        heard: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        use base64::Engine as _;
+        use std::sync::atomic::Ordering;
+        let authorization = match self.auth {
+            Auth::Basic => format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", self.login, self.password))
+            ),
+            Auth::Bearer => format!("Bearer {}", self.password),
+        };
+        let mut socket = super::websocket::connect(
+            &self.websocket_url,
+            "jmap",
+            &authorization,
+            &self.tls,
+            Duration::from_secs(u64::from(PING_SECONDS) * 2),
+        )?;
+        socket.send_text(
+            &json!({ "@type": "WebSocketPushEnable", "dataTypes": ["Email", "Mailbox"] })
+                .to_string(),
+        )?;
+        // Reconnected now and then, as servers and proxies end long
+        // connections anyway.
+        let until = std::time::Instant::now() + Duration::from_secs(10 * 60);
+        while std::time::Instant::now() < until {
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match socket.receive()? {
+                super::websocket::Incoming::Text(text) => {
+                    if state_change_for(&text, &self.account_id) {
+                        heard()?;
+                    }
+                }
+                super::websocket::Incoming::Idle => socket.ping()?,
+                super::websocket::Incoming::Closed => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+}
+
 fn state_change_for(data: &str, account: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(data) else {
         return false;
@@ -1308,6 +1619,63 @@ fn state_change_for(data: &str, account: &str) -> bool {
     v["changed"][account]
         .as_object()
         .is_some_and(|types| types.contains_key("Email") || types.contains_key("Mailbox"))
+}
+
+/// Whether a method call's arguments use an earlier call's result (a
+/// back-reference, `#name`).
+fn uses_results(args: &Value) -> bool {
+    args.as_object()
+        .is_some_and(|m| m.keys().any(|k| k.starts_with('#')))
+}
+
+/// A search snippet as plain text: its `<mark>` tags gone and its
+/// entities read (RFC 8621 §5.1 escapes the rest).
+fn unmark(html: &str) -> String {
+    html.replace("<mark>", "")
+        .replace("</mark>", "")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// How a message is submitted, beyond its envelope.
+#[derive(Clone, Debug, Default)]
+pub struct SendOptions {
+    /// Every server on the way must use TLS (REQUIRETLS): refused where
+    /// the server can't ask for it.
+    pub require_tls: bool,
+    /// Ask for delivery reports (DSN), identified by this envelope id,
+    /// where the server can.
+    pub receipts: Option<String>,
+    /// Held at the server and sent then (FUTURERELEASE `HOLDUNTIL`), a
+    /// Unix time.
+    pub hold_until: Option<i64>,
+}
+
+/// A submission the server took.
+#[derive(Clone, Debug, Default)]
+pub struct Submitted {
+    /// Delivery reports were asked for.
+    pub receipts: bool,
+}
+
+/// The automatic reply while away (RFC 8621 §8.1).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VacationResponse {
+    #[serde(default)]
+    pub is_enabled: bool,
+    /// UTC date-times (`2026-11-20T00:00:00Z`) it answers from and until.
+    #[serde(default)]
+    pub from_date: Option<String>,
+    #[serde(default)]
+    pub to_date: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub text_body: Option<String>,
 }
 
 fn import_args(blob: &str, mailboxes: &[&str], keywords: &[&str]) -> Value {

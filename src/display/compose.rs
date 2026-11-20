@@ -741,12 +741,45 @@ impl MailApp {
             c.save_now(cx);
         });
         let account = composer.read(cx).draft.account.clone();
-        self.scheduled_retry.remove(&composer.read(cx).draft.id);
+        let id = composer.read(cx).draft.id.clone();
+        self.scheduled_retry.remove(&id);
         self.close_composer(&composer, cx);
         let when = crate::manage::composing::describe_later(at, chrono::Local::now());
         self.notice(format!("Scheduled to send {when}."), false, cx);
         self.refresh_drafts(cx);
         self.sync_drafts_soon(&account, cx);
+        // Handed to a server that holds it until then, where the account
+        // lets it; otherwise it stays scheduled here.
+        if let Some(a) = self
+            .accounts
+            .iter()
+            .find(|a| a.id == account && a.server_send_later)
+            .cloned()
+        {
+            self.scheduled_sending.insert(id.clone());
+            let handed = id.clone();
+            self.task(
+                cx,
+                move |b| b.hand_to_server(&a, &handed),
+                move |this, result, cx| {
+                    match result {
+                        Ok(true) => this.notice(
+                            format!("Handed to the server, which sends it {when}, even with Picacho closed."),
+                            false,
+                            cx,
+                        ),
+                        Ok(false) => {}
+                        Err(e) => this.notice(
+                            format!("The server couldn't take it ({e:#}); Picacho sends it {when}."),
+                            true,
+                            cx,
+                        ),
+                    }
+                    this.scheduled_sending.remove(&id);
+                    this.refresh_drafts(cx);
+                },
+            );
+        }
     }
 
     /// Sends the scheduled drafts whose time has come, except any open in

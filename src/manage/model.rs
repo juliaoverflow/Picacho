@@ -246,6 +246,10 @@ pub struct SyncSettings {
     /// unless turned on.
     #[serde(default)]
     pub proton_push: bool,
+    /// IMAP: only the folders subscribed to on the server are shown (as
+    /// other mail apps show them), unless none of them is.
+    #[serde(default)]
+    pub subscribed_only: bool,
 }
 /// `SyncSettings::offline_days`: download message contents only when opened.
 pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
@@ -275,6 +279,7 @@ impl Default for SyncSettings {
             offline_days: default_offline_days(),
             proton_events_seconds: default_proton_events_seconds(),
             proton_push: false,
+            subscribed_only: false,
         }
     }
 }
@@ -300,6 +305,11 @@ pub struct Account {
     /// with TLS. Only Proton Mail Bridge, on this computer, needs it.
     #[serde(default)]
     pub incoming_starttls: bool,
+    /// How the outgoing server is secured: TLS from the first byte (true)
+    /// or a plain connection upgraded with STARTTLS (false). Unset: TLS on
+    /// port 465, STARTTLS elsewhere (`smtp_implicit_tls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp_tls: Option<bool>,
     #[serde(default)]
     pub sync: SyncSettings,
     /// The name the servers know this sign-in by, when it isn't the email
@@ -327,6 +337,19 @@ pub struct Account {
     /// own outgoing server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identities: Vec<Identity>,
+    /// JMAP: the mail account this one reads, when it isn't the sign-in's
+    /// own (one shared with it); its id at the server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jmap_account: String,
+    /// Signs in with another account's credentials (by its id): a JMAP
+    /// account shared with that one's sign-in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credentials_of: String,
+    /// Scheduled messages are handed to the server, which sends them at
+    /// their time even with Picacho closed (SMTP FUTURERELEASE, JMAP
+    /// HOLDUNTIL), where it can.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_send_later: bool,
 }
 /// An address a mailbox sends as besides its own (a sending identity): the
 /// name and address recipients see, where replies go, and the outgoing
@@ -350,6 +373,16 @@ pub struct OutgoingServer {
     pub port: u16,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub username: String,
+    /// TLS from the first byte (true) or STARTTLS (false); unset, by port
+    /// as `Account::smtp_tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
+}
+/// Whether an outgoing server on `port` takes TLS from its first byte:
+/// `setting` when chosen, else by the port (465 is submission over TLS,
+/// RFC 8314; the others start plain and upgrade with STARTTLS).
+pub fn smtp_implicit_tls(setting: Option<bool>, port: u16) -> bool {
+    setting.unwrap_or(port == 465)
 }
 impl Identity {
     /// Where its outgoing server's password is kept in the keychain.
@@ -441,6 +474,7 @@ impl Account {
                 _ => Service::Other,
             },
             incoming_starttls: false,
+            smtp_tls: None,
             sync: SyncSettings::default(),
             username: String::new(),
             reply_to: String::new(),
@@ -448,6 +482,9 @@ impl Account {
             delivery_receipts: false,
             require_tls: false,
             identities: Vec::new(),
+            jmap_account: String::new(),
+            credentials_of: String::new(),
+            server_send_later: false,
         }
     }
     /// The name shown for the account: its nickname, if it has one.

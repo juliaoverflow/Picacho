@@ -574,9 +574,7 @@ impl Backend {
     /// still there.
     fn wake(&self, c: &mut Connection, account: &str, s: &Snoozed) -> Result<bool> {
         let selected = c.select(&s.folder)?;
-        let uids: Vec<u32> = c
-            .session
-            .uid_search(format!("HEADER Message-ID {}", quote(&s.message_id)?))?
+        let uids: Vec<u32> = c.uid_search(&format!("HEADER Message-ID {}", quote(&s.message_id)?))?
             .into_iter()
             .collect();
         if uids.is_empty() {

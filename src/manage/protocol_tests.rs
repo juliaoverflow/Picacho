@@ -405,6 +405,78 @@ fn smtp_starttls_auth_delivery_and_attachment() -> Result<()> {
     Ok(())
 }
 
+/// An outgoing server taking TLS from the first byte on a port other than
+/// 465, chosen in its settings, and offering no sign-in (a relay that knows
+/// its senders by their network): the message goes without AUTH.
+#[test]
+fn smtp_tls_from_the_start_on_any_port_and_relays_without_auth() -> Result<()> {
+    let (cert, tls_acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r = BufReader::new(tls_acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"220 localhost ESMTP fixture\r\n").unwrap();
+        let mut commands = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            commands.push(line.trim_end().to_owned());
+            let response = if line.starts_with("EHLO") {
+                "250-localhost\r\n250 8BITMIME\r\n"
+            } else if line.starts_with("MAIL FROM:") || line.starts_with("RCPT TO:") {
+                "250 OK\r\n"
+            } else if line == "DATA\r\n" {
+                r.get_mut().write_all(b"354 Go ahead\r\n").unwrap();
+                loop {
+                    let mut data = Vec::new();
+                    r.read_until(b'\n', &mut data).unwrap();
+                    if data == b".\r\n" {
+                        break;
+                    }
+                }
+                "250 Queued\r\n"
+            } else if line == "QUIT\r\n" {
+                r.get_mut().write_all(b"221 Bye\r\n").unwrap();
+                break;
+            } else {
+                panic!("Unexpected SMTP command: {line}")
+            };
+            r.get_mut().write_all(response.as_bytes()).unwrap();
+        }
+        commands
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.smtp_tls = Some(true);
+    let d = Draft {
+        id: "smtp-tls".into(),
+        account: a.id.clone(),
+        to: "recipient@example.com".into(),
+        subject: "Implicit TLS".into(),
+        body: "Hello.".into(),
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let result = b.send(&a, &d);
+    let commands = server.join().unwrap();
+    result?;
+    assert!(commands[0].starts_with("EHLO"), "{commands:?}");
+    assert!(
+        !commands.iter().any(|c| c.starts_with("AUTH") || c == "STARTTLS"),
+        "{commands:?}"
+    );
+    assert!(commands.iter().any(|c| c == "DATA"));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 #[test]
 fn pop3_tls_download_is_deduplicated_and_local_moves_survive_sync() -> Result<()> {
     let (cert, acceptor) = tls_fixture()?;

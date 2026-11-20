@@ -923,6 +923,17 @@ fn scripted_smtp(
     a: impl FnOnce(&mut Account),
     draft: Draft,
 ) -> Result<(Result<Vec<String>>, SmtpSeen)> {
+    scripted_smtp_with(ehlo, recipients, a, draft, |b, a, d| b.send_noting(a, d))
+}
+
+/// As `scripted_smtp`, sending with `send` (the draft is saved first).
+fn scripted_smtp_with<T>(
+    ehlo: &'static str,
+    recipients: usize,
+    a: impl FnOnce(&mut Account),
+    draft: Draft,
+    send: impl FnOnce(&Backend, &Account, &Draft) -> Result<T>,
+) -> Result<(Result<T>, SmtpSeen)> {
     let (cert, acceptor) = tls_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -1049,7 +1060,8 @@ fn scripted_smtp(
         account: account.id.clone(),
         ..draft
     };
-    let result = b.send_noting(&account, &draft);
+    b.store.save_draft(&draft)?;
+    let result = send(&b, &account, &draft);
     let seen = server.join().unwrap();
     drop(b);
     std::fs::remove_dir_all(path)?;
@@ -1245,6 +1257,7 @@ fn other_addresses_send_through_their_own_server() -> Result<()> {
                     host: "localhost".into(),
                     port: a.smtp_port,
                     username: "desk-login".into(),
+                    tls: None,
                 }),
             }];
             // Nothing listens here: the mailbox's server mustn't be used.
@@ -1331,5 +1344,197 @@ fn sending_addresses_are_saved_and_removed() -> Result<()> {
     assert!(b.remove_identity(&a.id, "desk")?.identities.is_empty());
     drop(b);
     std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A server listing MOVE, UIDPLUS, ESEARCH, NAMESPACE, SPECIAL-USE and
+/// LIST-STATUS: searches go by ESEARCH; the listing brings each folder's
+/// counters, subscriptions and a shared namespace's folders; moved and
+/// saved mail is placed under the UIDs the server gave it (COPYUID,
+/// APPENDUID).
+#[test]
+fn listing_subscriptions_shared_folders_and_new_uids() -> Result<()> {
+    listing_fixture(
+        "* CAPABILITY IMAP4rev1 CONDSTORE MOVE UIDPLUS ESEARCH ENABLE NAMESPACE SPECIAL-USE LIST-STATUS\r\n",
+    )
+}
+
+/// The same from a server speaking only IMAP4rev2, whose base protocol has
+/// all of those without listing them. Needs Picacho-Patches' imap-proto
+/// patch 0005, which reads a CAPABILITY list without IMAP4rev1.
+#[test]
+#[ignore = "needs Picacho-Patches imap-proto 0005 (IMAP4rev2-only CAPABILITY)"]
+fn imap4rev2_only_servers_get_the_same() -> Result<()> {
+    listing_fixture("* CAPABILITY IMAP4rev2 CONDSTORE\r\n")
+}
+
+fn listing_fixture(capabilities: &'static str) -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+            return seen;
+        };
+        while let Some((tag, command, literal)) = p.command() {
+            let upper = command.to_ascii_uppercase();
+            seen.push(command.clone());
+            if upper == "CAPABILITY" {
+                p.send(capabilities);
+            } else if upper == "NAMESPACE" {
+                p.send("* NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) ((\"Shared/\" \"/\"))\r\n");
+            } else if upper.starts_with("LIST \"\" \"*\"") {
+                assert_eq!(
+                    command,
+                    "LIST \"\" \"*\" RETURN (SPECIAL-USE SUBSCRIBED STATUS (UIDVALIDITY UIDNEXT MESSAGES HIGHESTMODSEQ))"
+                );
+                p.send("* LIST (\\Subscribed) \"/\" INBOX\r\n");
+                p.send("* STATUS INBOX (UIDVALIDITY 77 UIDNEXT 9 MESSAGES 3 HIGHESTMODSEQ 40)\r\n");
+                p.send("* LIST (\\Sent \\Subscribed) \"/\" Sent\r\n");
+                p.send("* LIST (\\Subscribed) \"/\" Receipts\r\n");
+                p.send("* STATUS Receipts (UIDVALIDITY 77 UIDNEXT 101 MESSAGES 4 HIGHESTMODSEQ 12)\r\n");
+                p.send("* LIST () \"/\" Old\r\n");
+            } else if upper.starts_with("LIST \"\" \"SHARED/*\"") {
+                p.send("* LIST (\\Noselect) \"/\" Shared\r\n");
+                p.send("* LIST (\\Noselect) \"/\" Shared/team\r\n");
+                p.send("* LIST (\\Subscribed) \"/\" Shared/team/Projects\r\n");
+            } else if upper.starts_with("LIST \"\" \"OTHER USERS/*\"") {
+            } else if upper.starts_with("SELECT") {
+                p.send("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n* OK [HIGHESTMODSEQ 40] ok\r\n");
+            } else if upper.starts_with("UID MOVE") {
+                p.send("* OK [COPYUID 77 7 101] Moved\r\n* 1 EXPUNGE\r\n");
+            } else if upper.starts_with("UID SEARCH") {
+                assert!(upper.starts_with("UID SEARCH RETURN (ALL) "), "{command}");
+                p.send(&format!("* ESEARCH (TAG \"{tag}\") UID\r\n"));
+            } else if upper.starts_with("APPEND") {
+                assert!(!literal.is_empty());
+                p.send(&format!("{tag} OK [APPENDUID 77 55] Saved\r\n"));
+                continue;
+            } else if upper == "LOGOUT" {
+                p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                break;
+            } else if !upper.starts_with("LOGIN") && !upper.starts_with("NOOP") {
+                panic!("Unexpected IMAP command: {command}");
+            }
+            p.ok(&tag);
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    a.sync.subscribed_only = true;
+    let folders = b.with_imap(&a, |c| Ok(custom_folders(c.names(true)?)))?;
+    let shown: Vec<(&str, &str, usize)> = folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.label.as_str(), f.depth))
+        .collect();
+    // "Old" isn't subscribed; the shared folder sits at the top, naming
+    // the path to it, its parents being placeholders.
+    assert_eq!(
+        shown,
+        [("Receipts", "Receipts", 0), ("Shared/team/Projects", "Shared/team/Projects", 0)]
+    );
+    // The listing's counters tell an unchanged folder from a changed one.
+    b.store.save_mailbox_state(
+        &a.id,
+        "Receipts",
+        Some(&crate::manage::store::MailboxState {
+            validity: 77,
+            uid_next: 101,
+            exists: 4,
+            modseq: Some(12),
+            days: a.sync.days,
+        }),
+    )?;
+    assert!(b.with_imap(&a, |c| Ok(b.unchanged(c, &a, "Receipts")))?);
+    assert!(!b.with_imap(&a, |c| Ok(b.unchanged(c, &a, "INBOX")))?);
+    // A moved message shows in its new folder under its new UID.
+    let moved = Mail {
+        id: format!("{}:INBOX:77:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: 7,
+        subject: "Receipt".into(),
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&moved))?;
+    b.change(&a, &moved, Change::MoveTo("Receipts".into()))?;
+    assert!(b.store.message(&moved.id)?.is_none());
+    let placed = b
+        .store
+        .message(&format!("{}:Receipts:77:101", a.id))?
+        .expect("placed under its new UID");
+    assert_eq!((placed.uid, placed.remote_folder.as_str()), (101, "Receipts"));
+    assert_eq!(placed.subject, "Receipt");
+    // A sent copy saved in Sent is there at once, searched for by ESEARCH.
+    let raw = b"From: qa@example.com\r\nTo: r@example.com\r\nSubject: Sent copy\r\nMessage-ID: <sent@example.com>\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\n\r\nHello.\r\n";
+    b.with_imap(&a, |c| b.file_sent_copy(c, &a, raw))?;
+    let sent = b
+        .store
+        .message(&format!("{}:Sent:77:55", a.id))?
+        .expect("saved under its new UID");
+    assert_eq!(sent.folder, Folder::Sent);
+    assert!(!sent.unread);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c == "UID MOVE 7 \"Receipts\""), "{seen:?}");
+    assert!(!seen.iter().any(|c| c.starts_with("ENABLE")), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A scheduled message handed to a server with FUTURERELEASE goes now,
+/// held for its time (HOLDFOR); one the server can't hold that long stays
+/// scheduled here, with nothing sent.
+#[test]
+fn scheduled_mail_is_handed_to_a_server_that_holds_it() -> Result<()> {
+    let at = chrono::Utc::now().timestamp() + 3600;
+    let draft = Draft {
+        id: "later".into(),
+        to: "ana@example.com".into(),
+        subject: "Tomorrow".into(),
+        body: "Hello.".into(),
+        send_at: Some(at),
+        ..Default::default()
+    };
+    let (handed, seen) = scripted_smtp_with(
+        "250-fixture\r\n250-FUTURERELEASE 604800 2030-01-01T00:00:00Z\r\n250 AUTH PLAIN\r\n",
+        1,
+        |a| a.server_send_later = true,
+        draft.clone(),
+        |b, a, d| {
+            let handed = b.hand_to_server(a, &d.id)?;
+            // Sent as far as Picacho is concerned: no longer a draft.
+            assert!(b.store.draft(&d.id)?.is_none());
+            Ok(handed)
+        },
+    )?;
+    assert!(handed?);
+    let mail = seen.commands.iter().find(|c| c.starts_with("MAIL")).unwrap();
+    let seconds: u64 = mail
+        .split("HOLDFOR=")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .unwrap()
+        .parse()?;
+    assert!((3590..=3600).contains(&seconds), "{mail}");
+
+    // Not that far ahead: left at once, the draft still scheduled.
+    let (handed, seen) = scripted_smtp_with(
+        "250-fixture\r\n250-FUTURERELEASE 600\r\n250 AUTH PLAIN\r\n",
+        1,
+        |a| a.server_send_later = true,
+        draft,
+        |b, a, d| {
+            let handed = b.hand_to_server(a, &d.id)?;
+            assert!(b.store.draft(&d.id)?.is_some());
+            Ok(handed)
+        },
+    )?;
+    assert!(!handed?);
+    assert!(!seen.commands.iter().any(|c| c.starts_with("MAIL")), "{:?}", seen.commands);
     Ok(())
 }

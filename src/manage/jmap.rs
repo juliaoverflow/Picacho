@@ -210,6 +210,47 @@ pub(super) fn location(e: &Email, places: &[Place]) -> (Folder, String) {
 
 /// A JMAP draft, as a `RemoteDraft` (which IMAP fills with its mailbox,
 /// UIDVALIDITY and UID): the message's id, after `jmap:`.
+/// The away reply as the filter settings show it, from JMAP's automatic
+/// reply (whose dates are UTC date-times; the settings keep days).
+fn vacation_state(reply: &jmap::VacationResponse) -> sieve::State {
+    let day = |d: &Option<String>| d.as_deref().and_then(|d| d.get(..10)).map(str::to_owned);
+    sieve::State {
+        filters: sieve::Filters {
+            rules: Vec::new(),
+            vacation: sieve::Vacation {
+                on: reply.is_enabled,
+                subject: reply.subject.clone().unwrap_or_default(),
+                body: reply.text_body.clone().unwrap_or_default(),
+                days: 7,
+                from: day(&reply.from_date),
+                until: day(&reply.to_date),
+            },
+            include: None,
+        },
+        // What the settings offer for it: the reply, between two dates.
+        extensions: vec!["vacation".into(), "date".into(), "relational".into()],
+        other_active: None,
+        active: reply.is_enabled,
+        vacation_only: true,
+    }
+}
+/// JMAP's automatic reply for the away reply in the settings: from the
+/// start of its first day until the end of its last, in UTC.
+fn vacation_response(v: &sieve::Vacation) -> jmap::VacationResponse {
+    let valid = |d: &Option<String>| {
+        d.as_deref()
+            .filter(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+            .map(str::to_owned)
+    };
+    jmap::VacationResponse {
+        is_enabled: v.on,
+        from_date: valid(&v.from).map(|d| format!("{d}T00:00:00Z")),
+        to_date: valid(&v.until).map(|d| format!("{d}T23:59:59Z")),
+        subject: Some(v.subject.clone()).filter(|s| !s.trim().is_empty()),
+        text_body: Some(v.body.clone()),
+    }
+}
+
 fn jmap_remote(id: &str) -> RemoteDraft {
     RemoteDraft {
         mailbox: format!("jmap:{id}"),
@@ -291,8 +332,10 @@ impl Backend {
     /// the token is renewed (`credentials`) and the session opened again.
     fn jmap_session(&self, a: &Account) -> Result<Arc<Session>> {
         let now = chrono::Utc::now().timestamp();
+        // A session the server says changed (`stale`) is read again.
         if let Some((s, expires)) = self.jmap.lock().unwrap().get(&a.id)
             && (*expires == 0 || *expires > now + 120)
+            && !s.stale()
         {
             return Ok(s.clone());
         }
@@ -312,6 +355,7 @@ impl Backend {
                 &a.incoming_host,
                 a.incoming_port,
                 &secret.access_token,
+                &a.jmap_account,
                 self.tls_connector()?,
             )
         } else {
@@ -320,6 +364,7 @@ impl Backend {
                 a.incoming_port,
                 a.login(),
                 &secret.password,
+                &a.jmap_account,
                 self.tls_connector()?,
             )
         }
@@ -344,6 +389,56 @@ impl Backend {
             self.jmap.lock().unwrap().remove(&a.id);
         }
         result
+    }
+    /// The other JMAP accounts with mail that `a`'s sign-in reaches (shared
+    /// with it), not added yet: (id at the server, name).
+    pub fn jmap_shared(&self, a: &Account) -> Result<Vec<(String, String)>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP accounts are shared this way.");
+        let added: Vec<String> = self
+            .store
+            .accounts()?
+            .into_iter()
+            .filter(|o| o.credentials_of == a.id)
+            .map(|o| o.jmap_account)
+            .collect();
+        let owner = if a.credentials_of.is_empty() { a.id.as_str() } else { a.credentials_of.as_str() };
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| {
+            Ok(s.other_accounts()
+                .iter()
+                .filter(|(id, _)| !added.contains(id) && owner == a.id)
+                .cloned()
+                .collect())
+        })
+    }
+    /// Adds the JMAP account `jmap_id` (`name`) shared with `owner`'s
+    /// sign-in, as an account of its own that signs in as `owner` does.
+    pub fn add_jmap_shared(&self, owner: &Account, jmap_id: &str, name: &str) -> Result<Account> {
+        ensure!(
+            owner.provider == Provider::Jmap && owner.credentials_of.is_empty(),
+            "Only a JMAP account's own sign-in has accounts shared with it."
+        );
+        ensure!(
+            !self
+                .store
+                .accounts()?
+                .iter()
+                .any(|o| o.credentials_of == owner.id && o.jmap_account == jmap_id),
+            "This shared account is already added."
+        );
+        let mut shared = owner.clone();
+        shared.id = uuid::Uuid::new_v4().to_string();
+        shared.jmap_account = jmap_id.to_owned();
+        shared.credentials_of = owner.id.clone();
+        shared.name = name.to_owned();
+        shared.nickname = String::new();
+        shared.identities = Vec::new();
+        shared.server_send_later = false;
+        // It must open before it's added.
+        self.with_jmap(&shared, |s| s.reload_mailboxes().map(drop))?;
+        self.store.save_account(&shared)?;
+        Ok(shared)
     }
     /// Signs in to check the account (adding or reconnecting it).
     pub(super) fn check_jmap(&self, a: &Account, secret: &Secret) -> Result<()> {
@@ -781,7 +876,9 @@ impl Backend {
         self.with_jmap(a, |s| {
             let places = self.jmap_places(a, s, false)?;
             let mut conditions = vec![filter_for(&places, mailbox, 0, 0)?];
-            conditions.extend(search.jmap_conditions());
+            let searched = search.jmap_conditions();
+            let text = !searched.is_empty();
+            conditions.extend(searched);
             let filter = json!({ "operator": "AND", "conditions": conditions });
             let page = s.query(&filter, 0, limit.clamp(1, SEARCH_MOST), true)?;
             let mut out = ServerResults::default();
@@ -790,6 +887,19 @@ impl Backend {
             }
             out.total = page.total.unwrap_or(out.mails.len());
             self.store.save_messages(&out.mails)?;
+            // Each result shows the part of it that matched (SearchSnippet),
+            // not just its beginning; kept out of the cache, which keeps
+            // the message's own preview. Without them, the preview stays.
+            if text {
+                let ids: Vec<String> = page.emails.iter().map(|e| e.id.clone()).collect();
+                if let Ok(snippets) = s.search_snippets(&filter, &ids) {
+                    for (m, e) in out.mails.iter_mut().zip(&page.emails) {
+                        if let Some(preview) = snippets.get(&e.id).filter(|p| !p.trim().is_empty()) {
+                            m.snippet = preview.clone();
+                        }
+                    }
+                }
+            }
             out.mails.sort_by(Mail::newest_first);
             Ok(out)
         })
@@ -846,7 +956,8 @@ impl Backend {
         from: &str,
         to: &[String],
         raw: &[u8],
-    ) -> Result<()> {
+        options: &jmap::SendOptions,
+    ) -> Result<jmap::Submitted> {
         ensure!(!to.is_empty(), "Add at least one recipient.");
         self.with_jmap(a, |s| {
             let identity = s
@@ -865,6 +976,7 @@ impl Backend {
                 raw,
                 id(Folder::Drafts).as_deref(),
                 id(Folder::Sent).as_deref(),
+                options,
             )
         })
     }
@@ -1101,6 +1213,11 @@ impl Backend {
     /// Scripts (RFC 9661): the same script as through ManageSieve.
     pub(super) fn filters_jmap(&self, a: &Account) -> Result<sieve::State> {
         self.with_jmap(a, |s| {
+            // Without Sieve, the automatic reply while away alone.
+            if s.sieve_extensions().is_none() && s.has_vacation() {
+                let reply = s.vacation()?.unwrap_or_default();
+                return Ok(vacation_state(&reply));
+            }
             let scripts = s.sieve_scripts()?;
             let listed: Vec<(String, bool)> = scripts
                 .iter()
@@ -1127,6 +1244,15 @@ impl Backend {
         addresses: &[String],
     ) -> Result<sieve::State> {
         self.with_jmap(a, |s| {
+            if s.sieve_extensions().is_none() && s.has_vacation() {
+                ensure!(
+                    filters.rules.is_empty(),
+                    "This JMAP server has no server filters, only an away reply."
+                );
+                let reply = vacation_response(&filters.vacation);
+                s.set_vacation(&reply)?;
+                return Ok(vacation_state(&reply));
+            }
             let extensions = s.sieve_extensions().unwrap_or_default().to_vec();
             ensure!(
                 s.sieve_extensions().is_some(),
@@ -1162,6 +1288,7 @@ impl Backend {
                 extensions,
                 other_active: other,
                 active: !empty,
+                vacation_only: false,
             })
         })
     }
