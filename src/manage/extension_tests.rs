@@ -1486,6 +1486,117 @@ fn listing_fixture(capabilities: &'static str) -> Result<()> {
     Ok(())
 }
 
+/// A server offering UIDONLY (RFC 9586) has it turned on where the IMAP
+/// parser reads its UIDFETCH replies (Picacho-Patches' imap-proto patch
+/// 0006), and not otherwise: sync, flag changes and deletion work either
+/// way, never naming a message by sequence number.
+#[test]
+fn uidonly_is_enabled_only_where_uidfetch_is_read() -> Result<()> {
+    uidonly_fixture(crate::sync::transport::reads_uidfetch())
+}
+
+/// With UIDONLY on, messages come back as UIDFETCH (numbered by UID,
+/// without a UID item) and removals as VANISHED.
+#[test]
+#[ignore = "needs Picacho-Patches imap-proto 0006 (UIDONLY's UIDFETCH)"]
+fn uidonly_servers_report_messages_by_uid() -> Result<()> {
+    assert!(crate::sync::transport::reads_uidfetch());
+    uidonly_fixture(true)
+}
+
+fn uidonly_fixture(expect_uidonly: bool) -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut uidonly = false;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                // UIDONLY refuses anything numbered by sequence (RFC 9586 §3).
+                let numbered = ["FETCH ", "STORE ", "SEARCH ", "COPY ", "MOVE "]
+                    .iter()
+                    .any(|c| upper.starts_with(c));
+                if uidonly && numbered {
+                    p.send(&format!("{tag} BAD [UIDREQUIRED] Use UIDs\r\n"));
+                    continue;
+                }
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 ENABLE UIDONLY UIDPLUS\r\n");
+                } else if upper.starts_with("ENABLE ") {
+                    if upper.split_ascii_whitespace().any(|w| w == "UIDONLY") {
+                        uidonly = true;
+                        p.send("* ENABLED UIDONLY\r\n");
+                    }
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send(
+                        "* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 8] next\r\n",
+                    );
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH 7\r\n");
+                } else if upper.starts_with("UID FETCH") {
+                    let header = if upper.contains("HEADER") {
+                        format!(
+                            " RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{HEADER}",
+                            HEADER.len()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    p.send(&if uidonly {
+                        format!("* 7 UIDFETCH (FLAGS (\\Seen){header})\r\n")
+                    } else {
+                        format!("* 1 FETCH (UID 7 FLAGS (\\Seen){header})\r\n")
+                    });
+                } else if upper.starts_with("UID STORE") {
+                    // Reported back although SILENT, as another app's
+                    // change could be.
+                    p.send(if uidonly {
+                        "* 7 UIDFETCH (FLAGS ())\r\n"
+                    } else {
+                        "* 1 FETCH (UID 7 FLAGS ())\r\n"
+                    });
+                } else if upper.starts_with("UID EXPUNGE") {
+                    p.send(if uidonly {
+                        "* VANISHED 7\r\n"
+                    } else {
+                        "* 1 EXPUNGE\r\n"
+                    });
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else if !upper.starts_with("NOOP") {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        (seen, uidonly)
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let synced = b.sync(&a, Folder::Inbox, 300)?;
+    assert_eq!(synced.len(), 1);
+    let m = &synced[0];
+    assert_eq!((m.uid, m.subject.as_str(), m.unread), (7, "Receipt", false));
+    let m = b.change(&a, m, Change::Read(false))?;
+    assert!(m.unread);
+    b.delete_forever(&a, std::slice::from_ref(&m))?;
+    assert!(b.store.message(&m.id)?.is_none());
+    b.disconnect(&a.id);
+    let (seen, uidonly) = server.join().unwrap();
+    assert_eq!(uidonly, expect_uidonly, "{seen:?}");
+    assert!(seen.iter().any(|c| c == "UID EXPUNGE 7"), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 /// A scheduled message handed to a server with FUTURERELEASE goes now,
 /// held for its time (HOLDFOR); one the server can't hold that long stays
 /// scheduled here, with nothing sent.

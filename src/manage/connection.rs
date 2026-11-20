@@ -45,7 +45,7 @@ pub(super) struct Connection {
     rights: std::collections::HashMap<String, (Option<String>, Instant)>,
     selected: Option<Selected>,
     used: Instant,
-    /// What ENABLE turned on (QRESYNC, UTF8=ACCEPT).
+    /// What ENABLE turned on (QRESYNC, UTF8=ACCEPT, UIDONLY).
     pub(super) enabled: crate::sync::transport::Enabled,
     /// A copy of what the server sends, when asked (`heard`).
     tap: Option<crate::sync::stream::Tap>,
@@ -93,8 +93,8 @@ impl Connection {
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
     }
-    /// A new session, with QRESYNC and UTF8=ACCEPT turned on where the
-    /// server has them (ENABLE comes before any SELECT).
+    /// A new session, with QRESYNC, UTF8=ACCEPT and UIDONLY turned on
+    /// where the server has them (ENABLE comes before any SELECT).
     pub(super) fn open(session: ImapSession) -> Result<Self> {
         Self::open_tapped(session, None)
     }

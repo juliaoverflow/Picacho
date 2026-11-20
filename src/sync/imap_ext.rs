@@ -1,5 +1,5 @@
 //! IMAP extensions beyond the basics in `imap.rs`: ENABLE (QRESYNC,
-//! UTF8=ACCEPT), compact and windowed searches (ESEARCH), SORT and THREAD,
+//! UTF8=ACCEPT, UIDONLY), compact and windowed searches (ESEARCH), SORT and THREAD,
 //! QRESYNC's resynchronizing SELECT, METADATA, NOTIFY, message structure
 //! (BODYSTRUCTURE), single parts (BINARY) and partial downloads.
 //!
@@ -15,9 +15,13 @@ use anyhow::{Context, Result, bail, ensure};
 pub(crate) struct Enabled {
     pub(crate) qresync: bool,
     pub(crate) utf8: bool,
+    /// UIDONLY (RFC 9586): the server reports messages by UID (UIDFETCH,
+    /// VANISHED) and refuses sequence numbers, which Picacho never sends.
+    pub(crate) uidonly: bool,
 }
-/// Turns on QRESYNC (RFC 7162) and UTF8=ACCEPT (RFC 6855) where offered.
-/// Must come before any SELECT. A refusal turns on nothing.
+/// Turns on QRESYNC (RFC 7162), UTF8=ACCEPT (RFC 6855) and UIDONLY (RFC
+/// 9586) where offered. Must come before any SELECT. A refusal turns on
+/// nothing.
 pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enabled> {
     // IMAP4rev2's mailbox names are UTF-8 (RFC 9051 §5.1), as UTF8=ACCEPT's.
     let base = Enabled {
@@ -34,6 +38,13 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
     if ext.utf8_accept && !ext.rev2 {
         wanted.push("UTF8=ACCEPT");
     }
+    // Every command Picacho sends names messages by UID already; UIDONLY
+    // spares the server its sequence numbers. Its replies come as
+    // UIDFETCH, which only a parser with Picacho-Patches' imap-proto patch
+    // 0006 reads; without it, every fetch would fail.
+    if ext.uidonly && reads_uidfetch() {
+        wanted.push("UIDONLY");
+    }
     if wanted.is_empty() {
         return Ok(base);
     }
@@ -49,9 +60,19 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
         for word in line.split_ascii_whitespace() {
             enabled.qresync |= word.eq_ignore_ascii_case("QRESYNC");
             enabled.utf8 |= word.eq_ignore_ascii_case("UTF8=ACCEPT");
+            enabled.uidonly |= word.eq_ignore_ascii_case("UIDONLY");
         }
     }
     Ok(enabled)
+}
+/// Whether the IMAP parser reads UIDONLY's `UIDFETCH` replies as UID
+/// FETCH replies (RFC 9586; Picacho-Patches' imap-proto patch 0006).
+pub(crate) fn reads_uidfetch() -> bool {
+    matches!(
+        imap_proto::parse_response(b"* 9 UIDFETCH (FLAGS ())\r\n"),
+        Ok((rest, imap_proto::Response::Fetch(9, attributes)))
+            if rest.is_empty() && attributes.contains(&imap_proto::AttributeValue::Uid(9))
+    )
 }
 
 /// A mailbox name as the session takes it: the cache always keeps modified

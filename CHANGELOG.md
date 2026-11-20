@@ -33,6 +33,9 @@ same version in `Cargo.toml`.
   their new folder at once (COPYUID, APPENDUID); folders the listing shows
   unchanged aren't opened to check (LIST-STATUS); and server searches ask
   only for the newest page of results where the server can (PARTIAL).
+- IMAP: on servers offering UIDONLY, messages are named only by their UIDs,
+  sparing the server its sequence numbers (with Picacho-Patches' imap-proto
+  patch 0006, which reads its UIDFETCH replies; until then it stays off).
 
 - Phones and tablets: tapping a link in an email first shows where it goes,
   warns of known tricks (look-alike letters, bare IP addresses, unencrypted

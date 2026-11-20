@@ -1058,6 +1058,8 @@ pub(crate) struct Extensions {
     pub(crate) list_status: bool,
     /// RFC 9394: results a page at a time (PARTIAL).
     pub(crate) partial: bool,
+    /// RFC 9586: messages named by UID alone, once enabled (UIDONLY).
+    pub(crate) uidonly: bool,
 }
 pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
     let caps = session.capabilities()?;
@@ -1107,6 +1109,7 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         rev2,
         list_status: rev2 || caps.has_str("LIST-STATUS"),
         partial: caps.has_str("PARTIAL"),
+        uidonly: caps.has_str("UIDONLY"),
     })
 }
 
