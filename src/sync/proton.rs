@@ -170,6 +170,29 @@ fn explain(e: ProtonError) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
+/// A failure during a sign-in. There is no saved session yet for Proton
+/// to have ended, so a refusal that would mean that elsewhere (401, 10013)
+/// is reported with Proton's own words and which step it came at.
+fn explain_sign_in(e: ProtonError, step: &str) -> anyhow::Error {
+    let refused = matches!(e, ProtonError::Deauthenticated)
+        || e.status() == Some(401)
+        || e.api().is_some_and(|a| a.code == 10013);
+    if !refused {
+        return explain(e);
+    }
+    let said = match e.api() {
+        Some(a) if !a.message.trim().is_empty() => format!(
+            " Proton said: “{}” (HTTP {}, code {}).",
+            a.message.trim(),
+            a.status,
+            a.code
+        ),
+        Some(a) => format!(" (HTTP {}, code {}).", a.status, a.code),
+        None => format!(" ({e})."),
+    };
+    anyhow!("Proton refused this sign-in {step}.{said} Start again with your password.")
+}
+
 trait Explained<T> {
     fn explained(self) -> Result<T>;
 }
@@ -423,7 +446,10 @@ impl Login {
                     Err(ProtonError::Srp(why)) => bail!(
                         "Proton's sign-in couldn't be verified ({why}). Nothing was sent; try again."
                     ),
-                    Err(e) => return Err(explain(e)).context("Couldn't sign in to Proton"),
+                    Err(e) => {
+                        return Err(explain_sign_in(e, "at the password"))
+                            .context("Couldn't sign in to Proton");
+                    }
                 }
             }
         })
@@ -467,7 +493,7 @@ impl Login {
             if e.api().is_some_and(|a| a.status == 422 || a.code == 8002) {
                 anyhow!("Proton didn't accept that code. Enter the current one from your authenticator app.")
             } else {
-                explain(e)
+                explain_sign_in(e, "at the authenticator code")
             }
         })
     }
@@ -481,7 +507,9 @@ impl Login {
         cancel: &AtomicBool,
     ) -> Result<()> {
         let pending = self.pending_mut()?;
-        let request = pending.fido2_request().explained()?;
+        let request = pending
+            .fido2_request()
+            .map_err(|e| explain_sign_in(e, "at the security key"))?;
         let options = crate::sync::fido::request_options(&request.options)?;
         block_on(async {
             let signed = crate::sync::fido::assert(
@@ -517,7 +545,7 @@ impl Login {
                     if e.api().is_some_and(|a| a.status == 422 || a.code == 8002) {
                         anyhow!("Proton didn't accept that security key or passkey. Use one registered with this account.")
                     } else {
-                        explain(e)
+                        explain_sign_in(e, "at the security key")
                     }
                 })
         })
@@ -545,7 +573,7 @@ impl Login {
             // The library signed the session out.
             Err(e) => {
                 self.pending = None;
-                return Err(explain(e));
+                return Err(explain_sign_in(e, "while unlocking the account"));
             }
         };
         // Signed in: the session is the account's now, not to be signed out.
@@ -1114,6 +1142,43 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal during a sign-in names the step and keeps Proton's words,
+    /// not "Proton ended this session" (there is none yet); the same
+    /// refusal of a saved session still asks to sign in again.
+    #[test]
+    fn sign_in_refusals_keep_protons_words() {
+        let refused = || {
+            ProtonError::Api(protected_email_bridge::error::ApiError {
+                status: 401,
+                code: 10013,
+                message: "Invalid refresh token".into(),
+                details: None,
+            })
+        };
+        let text = format!("{:#}", explain_sign_in(refused(), "at the password"));
+        assert!(!text.contains("ended this session"), "{text}");
+        assert!(text.contains("at the password"), "{text}");
+        assert!(
+            text.contains("Invalid refresh token") && text.contains("10013"),
+            "{text}"
+        );
+        let text = format!(
+            "{:#}",
+            explain_sign_in(ProtonError::Deauthenticated, "while unlocking the account")
+        );
+        assert!(text.contains("while unlocking"), "{text}");
+        let saved = explain(refused());
+        assert!(format!("{saved:#}").contains("ended this session"));
+        assert!(
+            saved
+                .downcast_ref::<crate::manage::status::AccessFailure>()
+                .is_some()
+        );
+        // Other failures read as they always did.
+        let wrong = explain_sign_in(ProtonError::KeyUnlock, "while unlocking the account");
+        assert!(!format!("{wrong:#}").contains("refused this sign-in"));
+    }
 
     /// A sign-in Proton ended (a failed last step signs it out) says so
     /// at each later step rather than panicking.

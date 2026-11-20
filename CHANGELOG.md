@@ -75,6 +75,8 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Proton (Direct): a refused sign-in no longer says Proton ended the
+  session; it says which step was refused and what Proton answered.
 - JMAP: Require encryption in transit was ignored; messages now go only
   where the server can ask for it (REQUIRETLS), and are refused otherwise,
   as over SMTP.
