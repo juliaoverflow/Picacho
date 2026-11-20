@@ -115,9 +115,11 @@ gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] 
 [features]
 # Offers a fictional sample inbox from onboarding, for development and screenshots.
 sample-data = []
-# Offers Pinal Mail when adding an account. Off while Pinal's services are not
-# public; existing Pinal accounts keep working either way.
+# Offers Pinal Mail when adding an account: sign in with Pinal Accounts and
+# its tokens open the mailbox. Build with --no-default-features to hide it;
+# existing Pinal accounts keep working either way.
 pinal = []
+default = ["pinal"]
 
 [profile.release]
 lto = "thin"

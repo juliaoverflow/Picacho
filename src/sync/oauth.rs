@@ -656,60 +656,47 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     ))
 }
 
-/// A Pinal mailbox with the app password issued to this device.
-#[derive(Debug, serde::Deserialize)]
-pub struct PinalMailbox {
-    pub address: String,
-    #[serde(default)]
-    pub name: String,
-    pub password: String,
-    pub imap: PinalServer,
-    pub smtp: PinalServer,
-    #[serde(default)]
-    pub encryption: Option<PinalEncryption>,
+/// What Picacho asks Pinal for: who you are, and reading, organizing,
+/// writing and sending mail and changing its filters. Pinal issues a token
+/// addressed to its mail server, which accepts it over IMAP, SMTP and
+/// ManageSieve; `offline_access` keeps the account signed in.
+const PINAL_SCOPES: &str = "openid profile email offline_access mail.read mail.labels mail.compose mail.send mail.settings";
+
+/// Pinal's sign-in and token endpoints, from its OpenID discovery document.
+/// Cached for the session: every token refresh needs the token endpoint.
+#[derive(Clone)]
+struct PinalEndpoints {
+    authorize: url::Url,
+    token: url::Url,
+    userinfo: url::Url,
 }
-/// Zero-access encryption: the bundle is ciphertext that only the person's
-/// password (or recovery key) opens, on this device.
-#[derive(Debug, serde::Deserialize)]
-pub struct PinalEncryption {
-    #[serde(default)]
-    pub bundle: Option<crate::manage::crypto::KeyBundle>,
-}
-#[derive(Debug, serde::Deserialize)]
-pub struct PinalServer {
-    pub host: String,
-    pub port: u16,
-}
-impl PinalMailbox {
-    pub fn account(&self) -> Account {
-        let mut a = Service::Pinal.account(&self.address).unwrap();
-        a.name = if self.name.is_empty() {
-            self.address.clone()
-        } else {
-            self.name.clone()
-        };
-        a.incoming_host = self.imap.host.clone();
-        a.incoming_port = self.imap.port;
-        a.smtp_host = self.smtp.host.clone();
-        a.smtp_port = self.smtp.port;
-        a
-    }
-}
-/// Signs in to Pinal Accounts with OpenID Connect, then exchanges the
-/// access token for the primary mailbox's settings and an app password.
-/// `answered` runs once the browser hands back its code.
-pub fn pinal(cancel: Arc<AtomicBool>, answered: &dyn Fn()) -> Result<PinalMailbox> {
+fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
+    static FOUND: Mutex<Option<(String, PinalEndpoints)>> = Mutex::new(None);
     let origin = pinal_accounts();
-    let client_id = pinal_client_id();
-    let http = http()?;
-    let config: serde_json::Value = http
-        .get(format!(
-            "{origin}/api/auth/.well-known/openid-configuration"
-        ))
-        .send()
-        .and_then(|r| r.error_for_status())
-        .context("Could not reach Pinal Accounts. Check your connection.")?
-        .json()?;
+    if let Some((o, found)) = FOUND.lock().unwrap().clone()
+        && o == origin
+    {
+        return Ok(found);
+    }
+    let mut config = None;
+    // The issuer root first, then where Better Auth also publishes it.
+    for path in [
+        "/.well-known/openid-configuration",
+        "/api/auth/.well-known/openid-configuration",
+    ] {
+        let response = http
+            .get(format!("{origin}{path}"))
+            .send()
+            .context("Could not reach Pinal Accounts. Check your connection.")?;
+        if response.status().is_success()
+            && let Ok(value) = response.json::<serde_json::Value>()
+            && value["authorization_endpoint"].is_string()
+        {
+            config = Some(value);
+            break;
+        }
+    }
+    let config = config.context("Pinal Accounts is not answering sign-in requests right now.")?;
     let endpoint = |key: &str| -> Result<url::Url> {
         let url = url::Url::parse(
             config[key]
@@ -723,55 +710,183 @@ pub fn pinal(cancel: Arc<AtomicBool>, answered: &dyn Fn()) -> Result<PinalMailbo
         );
         Ok(url)
     };
-    let (auth, token) = (
-        endpoint("authorization_endpoint")?,
-        endpoint("token_endpoint")?,
+    let found = PinalEndpoints {
+        authorize: endpoint("authorization_endpoint")?,
+        token: endpoint("token_endpoint")?,
+        userinfo: endpoint("userinfo_endpoint")?,
+    };
+    *FOUND.lock().unwrap() = Some((origin, found.clone()));
+    Ok(found)
+}
+
+/// The domains Pinal Mail gives addresses on.
+fn pinal_domains() -> Vec<String> {
+    let domains = setting(
+        "PICACHO_PINAL_MAIL_DOMAINS",
+        option_env!("PICACHO_PINAL_MAIL_DOMAINS"),
     );
-    let browser = if bundled() {
-        Browser::hosted(format!("{origin}/native/callback"))
+    let domains = if domains.is_empty() {
+        "sonoran.exchange".to_owned()
+    } else {
+        domains
+    };
+    domains
+        .split(',')
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+/// A `host:port` override for one of Pinal Mail's servers (development).
+fn pinal_server(name: &str, built: Option<&'static str>) -> Option<(String, u16)> {
+    let value = setting(name, built);
+    let (host, port) = value.rsplit_once(':')?;
+    Some((host.to_owned(), port.parse().ok()?))
+}
+/// The Pinal Mail account for an address: Pinal's mail servers, signed in
+/// to with Pinal tokens.
+pub fn pinal_account(email: &str, name: &str) -> Account {
+    let mut a = Service::Pinal.account(email).unwrap();
+    a.name = if name.is_empty() {
+        email.to_owned()
+    } else {
+        name.to_owned()
+    };
+    if let Some((host, port)) =
+        pinal_server("PICACHO_PINAL_IMAP", option_env!("PICACHO_PINAL_IMAP"))
+    {
+        a.incoming_host = host;
+        a.incoming_port = port;
+    }
+    if let Some((host, port)) =
+        pinal_server("PICACHO_PINAL_SMTP", option_env!("PICACHO_PINAL_SMTP"))
+    {
+        a.smtp_host = host;
+        a.smtp_port = port;
+    }
+    a.oauth = true;
+    a.client_id = pinal_client_id();
+    a
+}
+
+/// A pending Pinal sign-in: the address to open in the browser, and the
+/// callback that answers it.
+struct PinalRequest {
+    url: url::Url,
+    endpoints: PinalEndpoints,
+    browser: Browser,
+}
+fn pinal_request(hint: &str, hosted: bool) -> Result<PinalRequest> {
+    let endpoints = pinal_endpoints(&http()?)?;
+    let browser = if hosted {
+        Browser::hosted(format!("{}/native/callback", pinal_accounts()))
     } else {
         Browser::new("127.0.0.1", "/callback")?
     };
-    let mut url = auth;
-    let nonce = random_url_token();
+    let mut url = endpoints.authorize.clone();
+    let client_id = pinal_client_id();
     url.query_pairs_mut().extend_pairs([
         ("client_id", client_id.as_str()),
         ("redirect_uri", &browser.redirect),
         ("response_type", "code"),
-        ("scope", "openid profile email"),
+        ("scope", PINAL_SCOPES),
         ("state", &browser.state),
-        ("nonce", &nonce),
+        ("nonce", &random_url_token()),
         ("code_challenge", &browser.challenge),
         ("code_challenge_method", "S256"),
     ]);
-    let code = browser.code(&url, &cancel)?;
-    answered();
-    let (secret, _) = exchange(
-        token.as_str(),
+    if !hint.is_empty() {
+        url.query_pairs_mut().append_pair("login_hint", hint);
+    }
+    Ok(PinalRequest {
+        url,
+        endpoints,
+        browser,
+    })
+}
+/// Turns Pinal's code into tokens and says whose mailbox they open.
+fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)> {
+    let client_id = pinal_client_id();
+    let (secret, value) = exchange(
+        request.endpoints.token.as_str(),
         &[
             ("client_id", client_id.as_str()),
-            ("code", &code),
-            ("redirect_uri", &browser.redirect),
+            ("code", code),
+            ("redirect_uri", &request.browser.redirect),
             ("grant_type", "authorization_code"),
-            ("code_verifier", &browser.verifier),
+            ("code_verifier", &request.browser.verifier),
         ],
     )?;
-    ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
-    let response = http
-        .post(format!("{origin}/api/native/mail"))
-        .bearer_auth(&secret.access_token)
-        .send()
-        .context("Could not reach Pinal Accounts. Check your connection.")?;
-    let status = response.status();
-    if !status.is_success() {
-        let message = response
-            .json::<serde_json::Value>()
-            .ok()
-            .and_then(|v| v["error"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| format!("Pinal could not set up your mailbox ({status})."));
-        bail!(message);
+    let mut who = identity(value["id_token"].as_str().unwrap_or_default());
+    if who.email.is_empty() {
+        // Pinal keeps the ID token small; the address is in its userinfo.
+        let info: serde_json::Value = http()?
+            .get(request.endpoints.userinfo.clone())
+            .bearer_auth(&secret.access_token)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .context("Could not reach Pinal Accounts. Check your connection.")?
+            .json()?;
+        let text = |key: &str| info[key].as_str().unwrap_or_default().to_owned();
+        if info["email_verified"].as_bool() != Some(false) {
+            who.email = text("email");
+        }
+        if who.name.is_empty() {
+            who.name = text("name");
+        }
     }
-    Ok(response.json()?)
+    let domain = who
+        .email
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_ascii_lowercase())
+        .unwrap_or_default();
+    ensure!(
+        pinal_domains().contains(&domain),
+        "{} has no Pinal Mail address. Pinal Mail is for accounts made with a @{} address.",
+        if who.email.is_empty() {
+            "This Pinal account"
+        } else {
+            who.email.as_str()
+        },
+        pinal_domains()
+            .first()
+            .map(String::as_str)
+            .unwrap_or("sonoran.exchange")
+    );
+    ensure!(
+        !secret.refresh_token.is_empty(),
+        "Pinal did not let Picacho stay signed in. Please try again."
+    );
+    Ok((secret, who))
+}
+/// Signs in to Pinal Accounts in the browser. The tokens it issues are
+/// accepted by Pinal's mail server directly, so no password is kept.
+/// `hint` is the address being reconnected, if any; `answered` runs once
+/// the browser hands back its code.
+pub fn pinal(
+    hint: &str,
+    cancel: Arc<AtomicBool>,
+    answered: &dyn Fn(),
+) -> Result<(Secret, Identity)> {
+    let request = pinal_request(hint, bundled())?;
+    let code = request.browser.code(&request.url, &cancel)?;
+    answered();
+    let signed_in = pinal_redeem(&request, &code)?;
+    ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+    Ok(signed_in)
+}
+
+/// The Pinal sign-in with `visit` standing in for the browser: it gets the
+/// address that would be opened, on a thread of its own (live tests).
+#[cfg(test)]
+pub(crate) fn pinal_driven(
+    visit: impl FnOnce(url::Url) + Send + 'static,
+) -> Result<(Secret, Identity)> {
+    let request = pinal_request("", false)?;
+    let url = request.url.clone();
+    let visitor = std::thread::spawn(move || visit(url));
+    let code = request.browser.wait(&AtomicBool::new(false));
+    let _ = visitor.join();
+    pinal_redeem(&request, &code?)
 }
 
 fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_json::Value)> {
@@ -822,10 +937,15 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
                 .context(crate::manage::status::AccessFailure::Authentication),
         );
     }
-    let jmap_token;
-    let (token, scope) = if account.provider == Provider::Jmap {
-        jmap_token = jmap_metadata(&account.incoming_host, account.incoming_port)?.token;
-        (jmap_token.as_str(), "")
+    let found_token;
+    let (token, scope) = if account.service == Service::Pinal {
+        found_token = pinal_endpoints(&http()?)?.token.to_string();
+        (found_token.as_str(), "")
+    } else if account.provider == Provider::Jmap {
+        found_token = jmap_metadata(&account.incoming_host, account.incoming_port)?
+            .token
+            .to_string();
+        (found_token.as_str(), "")
     } else {
         let (_, token, scope) = endpoints(account.provider);
         (token, scope)
@@ -947,6 +1067,17 @@ mod tests {
             browser.wait(&AtomicBool::new(true)).is_err(),
             "cancel stops waiting"
         );
+    }
+    #[test]
+    fn pinal_accounts_use_tokens_on_pinal_servers() {
+        let a = pinal_account("sam@sonoran.exchange", "");
+        assert!(a.oauth && a.service == Service::Pinal);
+        assert_eq!(a.name, "sam@sonoran.exchange");
+        assert_eq!(a.client_id, pinal_client_id());
+        a.validate().unwrap();
+        assert!(PINAL_SCOPES.split(' ').any(|s| s == "offline_access"));
+        assert!(PINAL_SCOPES.split(' ').any(|s| s == "mail.send"));
+        assert_eq!(pinal_domains(), vec!["sonoran.exchange".to_owned()]);
     }
     #[test]
     fn opened_url_answers_hosted_sign_in() {

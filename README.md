@@ -148,6 +148,17 @@ Browser sign-in uses Picacho's own registration with each provider. Set these wh
 | `PICACHO_MICROSOFT_CLIENT_ID`                              | Microsoft Entra public client with `http://localhost` as a mobile and desktop redirect URI, and delegated `IMAP.AccessAsUser.All` and `SMTP.Send` |
 | `PICACHO_FASTMAIL_CLIENT_ID`                               | Fastmail OAuth public client with a loopback redirect (`http://127.0.0.1:<port>/callback`) and the JMAP core, mail, submission and Sieve scopes |
 
+Pinal Mail signs in with Pinal Accounts, and the mail server accepts Pinal's tokens over IMAP, SMTP and ManageSieve (XOAUTH2/OAUTHBEARER), so no password is stored. Picacho is an ordinary **native** app in Pinal's Developers portal, with redirect URIs `http://127.0.0.1/callback` (any port) and `https://accounts.pinal.tech/native/callback` (used by the macOS bundle, which Pinal hands back to `picacho://`), and the scopes `openid profile email offline_access mail.read mail.labels mail.compose mail.send mail.settings`.
+
+| Variable                       | Used for                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------ |
+| `PICACHO_PINAL_CLIENT_ID`      | That app's client ID                                                                       |
+| `PICACHO_PINAL_ACCOUNTS`       | Pinal Accounts' origin (default `https://accounts.pinal.tech`)                             |
+| `PICACHO_PINAL_MAIL_DOMAINS`   | Comma-separated Pinal Mail domains (default `sonoran.exchange`)                            |
+| `PICACHO_PINAL_IMAP`, `PICACHO_PINAL_SMTP` | `host:port` of the mail servers (default `mail.sonoran.exchange:993` and `:465`) |
+
+`src/manage/pinal_tests.rs` has an ignored live test that signs in to a local Pinal Accounts and checks IMAP, SMTP and token refresh against a local Picacho Server; its header shows how to run it.
+
 Without a Fastmail client, Fastmail asks for an API token. Other JMAP servers sign in in the browser where their OAuth metadata allows apps to register themselves (RFC 7591), with no registration built in. Without a Google client, Gmail falls back to an app password. Without a Microsoft client, Outlook asks for a password, which most Microsoft accounts no longer accept for IMAP.
 
 Proton Mail without Bridge (Direct) identifies the app to Proton's API as `<platform>-<token>@<version>` (`x-pm-appversion`), from `PICACHO_PROTON_APP_TOKEN` and `PICACHO_PROTON_APP_VERSION`. Direct is offered only when at least one of them is set; the other then defaults to `picacho` or Picacho's own version. `<platform>` is the system Picacho was built for (`linux`, `macos` or `windows`); `PICACHO_PROTON_APP_PLATFORM_OVERRIDE` names another, such as `linux` on a Windows build. It doesn't make Direct available by itself. Without either of the first two, Proton Mail connects through Proton Mail Bridge alone. Unlike the variables above, these are only read at build time.
@@ -160,6 +171,7 @@ The setup lists the supported services. Each one signs in the simplest way it al
 
 | Service          | Sign-in                                   | Servers                                                          |
 | ---------------- | ----------------------------------------- | ---------------------------------------------------------------- |
+| Pinal Mail       | Pinal Accounts in the browser             | `mail.sonoran.exchange:993`, `:465`                              |
 | Gmail            | Google in the browser, or an app password | `imap.gmail.com:993`, `smtp.gmail.com:587`                       |
 | Outlook          | Microsoft in the browser                  | `outlook.office365.com:993`, `smtp.office365.com:587`            |
 | iCloud Mail      | App-specific password                     | `imap.mail.me.com:993`, `smtp.mail.me.com:587`                   |
