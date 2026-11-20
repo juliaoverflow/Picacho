@@ -50,6 +50,9 @@ mod dovecot_tests;
 #[path = "incremental_tests.rs"]
 mod incremental_tests;
 #[cfg(test)]
+#[path = "pinal_tests.rs"]
+mod pinal_tests;
+#[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
 #[cfg(test)]
@@ -394,34 +397,29 @@ impl Backend {
             "Sign in to Proton with its own steps."
         );
         if account.service == crate::manage::model::Service::Pinal {
-            let mailbox = crate::sync::oauth::pinal(cancel.clone(), &|| {
+            let (secret, who) = crate::sync::oauth::pinal(&account.email, cancel.clone(), &|| {
                 self.step(&cancel, SignInStep::Finishing)
             })?;
-            let issued = mailbox.account();
             ensure!(
-                account.email.is_empty() || account.email.eq_ignore_ascii_case(&issued.email),
+                account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
                 "Choose the same email address to reconnect this mailbox."
             );
+            let issued = crate::sync::oauth::pinal_account(&who.email, &who.name);
+            // Reconnecting keeps the account's place, settings and names.
             account = Account {
                 id: account.id.clone(),
                 sync: account.sync,
                 nickname: account.nickname.clone(),
-                name: if account.name.is_empty() {
+                identities: account.identities.clone(),
+                reply_to: account.reply_to.clone(),
+                read_receipts: account.read_receipts,
+                delivery_receipts: account.delivery_receipts,
+                name: if account.name.is_empty() || account.name == account.email {
                     issued.name.clone()
                 } else {
                     account.name.clone()
                 },
                 ..issued
-            };
-            let secret = Secret {
-                password: mailbox.password,
-                mail_bundle: mailbox
-                    .encryption
-                    .and_then(|e| e.bundle)
-                    .map(|b| serde_json::to_string(&b))
-                    .transpose()?
-                    .unwrap_or_default(),
-                ..Default::default()
             };
             self.verify(account, secret, taken, &cancel, true)
         } else if account.oauth {

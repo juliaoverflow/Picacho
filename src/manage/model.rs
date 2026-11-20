@@ -54,7 +54,7 @@ pub enum Service {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignIn {
-    /// Pinal Accounts in the browser; the server issues an app password.
+    /// Pinal Accounts in the browser; Pinal's mail server takes its tokens.
     Pinal,
     /// Proton's own sign-in (SRP), with a two-factor code and mailbox
     /// password where the account has them.
@@ -493,8 +493,9 @@ impl Account {
                 || matches!(
                     self.provider,
                     Provider::Gmail | Provider::Outlook | Provider::Jmap
-                ),
-            "OAuth is available for Gmail, Outlook and JMAP servers."
+                )
+                || self.service == Service::Pinal,
+            "OAuth is available for Pinal Mail, Gmail, Outlook and JMAP servers."
         );
         // STARTTLS is only accepted from Bridge on this computer, where the
         // first, unencrypted exchange never leaves the machine.
