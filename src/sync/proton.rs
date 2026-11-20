@@ -62,6 +62,13 @@ const APP_VERSION: Option<&str> = option_env!("PICACHO_PROTON_APP_VERSION");
 /// (`linux`, `macos` or `windows`): `PICACHO_PROTON_APP_PLATFORM_OVERRIDE`.
 /// It doesn't make Direct available by itself.
 const APP_PLATFORM: Option<&str> = option_env!("PICACHO_PROTON_APP_PLATFORM_OVERRIDE");
+/// The same three for registering this device for push notifications
+/// alone (`POST /core/v4/devices`): `PICACHO_PROTON_PUSH_APP_TOKEN`,
+/// `PICACHO_PROTON_PUSH_APP_VERSION` and `PICACHO_PROTON_PUSH_APP_PLATFORM`.
+/// Each one unset is the one above.
+const PUSH_APP_TOKEN: Option<&str> = option_env!("PICACHO_PROTON_PUSH_APP_TOKEN");
+const PUSH_APP_VERSION: Option<&str> = option_env!("PICACHO_PROTON_PUSH_APP_VERSION");
+const PUSH_APP_PLATFORM: Option<&str> = option_env!("PICACHO_PROTON_PUSH_APP_PLATFORM");
 
 fn set(value: Option<&'static str>) -> Option<&'static str> {
     value.filter(|v| !v.trim().is_empty())
@@ -103,6 +110,9 @@ fn config() -> Arc<DeploymentConfig> {
                 app_product_token: app_token().into(),
                 app_version: app_version().into(),
                 app_platform: set(APP_PLATFORM).map(|p| p.trim().to_owned()),
+                push_app_product_token: set(PUSH_APP_TOKEN).map(|t| t.trim().to_owned()),
+                push_app_version: set(PUSH_APP_VERSION).map(|v| v.trim().to_owned()),
+                push_app_platform: set(PUSH_APP_PLATFORM).map(|p| p.trim().to_owned()),
                 product_name: "Picacho".into(),
                 api_tls_pins: Vec::new(),
             })
