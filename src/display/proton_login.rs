@@ -399,6 +399,9 @@ impl MailApp {
                 )
                 .into_any_element(),
             KeyPrompt::Touch => line("Touch your security key."),
+            KeyPrompt::Insert if cfg!(target_os = "android") => {
+                line("Hold your security key against the back of your phone, or plug it in…")
+            }
             KeyPrompt::Insert => line("Plug in your security key…"),
             KeyPrompt::Phone(status) => line(status),
             KeyPrompt::Working | KeyPrompt::Idle => line("Waiting for your key…"),

@@ -24,8 +24,6 @@ const RENEW_IDLE: Duration = Duration::from_secs(9 * 60);
 /// Waits after a failure, doubling up to the longest.
 const FIRST_RETRY: Duration = Duration::from_secs(30);
 const LONGEST_RETRY: Duration = Duration::from_secs(15 * 60);
-/// How often Proton's events are asked for, before a random 0–20 s more.
-const PROTON_EVENTS: Duration = Duration::from_secs(20);
 
 pub(super) struct Watcher {
     stop: Arc<AtomicBool>,
@@ -52,8 +50,15 @@ enum Ended {
 }
 /// The callback watchers call with the mailbox that changed.
 type Changed = Arc<dyn Fn(Mailbox) + Send + Sync>;
+/// Hears a Proton account notice: the account, its title and its body.
+pub type ProtonNotice = Arc<dyn Fn(&Account, &str, &str) + Send + Sync>;
 
 impl Backend {
+    /// Who hears the notices Proton's event stream carries (its
+    /// `Notifications`): messages Proton shows its apps' users.
+    pub fn on_proton_notice(&self, hear: impl Fn(&Account, &str, &str) + Send + Sync + 'static) {
+        *self.proton_notice.lock().unwrap() = Some(Arc::new(hear));
+    }
     /// Watches the account's inbox for new mail with IDLE (and, with
     /// NOTIFY, every other mailbox), calling `changed` with the mailbox
     /// whenever the server reports a change, until `stop_watching`. A
@@ -65,7 +70,19 @@ impl Backend {
     ) {
         if a.provider == Provider::Proton {
             self.stop_watching(&a.id);
+            // Asking Proton for changes is turned off: the regular check
+            // finds new mail.
+            if a.sync.proton_events_seconds == 0 {
+                return;
+            }
             if let Some(w) = self.spawn_proton_watch(a, Arc::new(changed)) {
+                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+            }
+            return;
+        }
+        if a.provider == Provider::Jmap {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_jmap_watch(a, Arc::new(changed)) {
                 self.watchers.lock().unwrap().insert(a.id.clone(), w);
             }
             return;
@@ -180,9 +197,13 @@ impl Backend {
     ) -> Result<()> {
         let mut since = self.with_proton(a, |s| s.latest_event())?;
         *watched = true;
+        // Notices already told, should a later event repeat one.
+        let mut told = std::collections::HashSet::<String>::new();
         loop {
-            // Proton's own apps ask about every 20–40 seconds.
-            let wait = PROTON_EVENTS + Duration::from_millis(rand::random::<u64>() % 20_000);
+            // As often as the account says, and up to a quarter more, so
+            // the requests don't settle into lockstep with anything else.
+            let every = Duration::from_secs(u64::from(a.sync.proton_events_seconds.max(1)));
+            let wait = every + every.mul_f64(rand::random::<f64>() / 4.0);
             let until = std::time::Instant::now() + wait;
             while std::time::Instant::now() < until {
                 if stop.load(Ordering::Acquire) {
@@ -190,11 +211,39 @@ impl Backend {
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let (latest, events, refresh, folders) = self.with_proton(a, |s| {
-                let (latest, events, refresh) = s.events_since(&since)?;
-                Ok((latest, events, refresh, s.folders()))
-            })?;
+            let (news, folders) =
+                self.with_proton(a, |s| Ok((s.events_since(&since)?, s.folders())))?;
+            let crate::sync::proton::Events {
+                latest,
+                messages: events,
+                refresh,
+                notices,
+            } = news;
             since = latest;
+            let hear = self.proton_notice.lock().unwrap().clone();
+            for n in notices {
+                let key = if n.id.is_empty() {
+                    format!("{}\n{}\n{}", n.time, n.payload.title, n.payload.body)
+                } else {
+                    n.id.clone()
+                };
+                if !told.insert(key) {
+                    continue;
+                }
+                if let Some(hear) = &hear {
+                    let title = if n.payload.title.is_empty() {
+                        "Proton"
+                    } else {
+                        &n.payload.title
+                    };
+                    let body = [n.payload.subtitle.as_str(), n.payload.body.as_str()]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    hear(a, title, &body);
+                }
+            }
             let mut boxes: Vec<Mailbox> = Vec::new();
             if refresh {
                 boxes.push(Mailbox::Standard(Folder::Inbox));
@@ -225,6 +274,115 @@ impl Backend {
             for b in boxes {
                 changed(b);
             }
+        }
+    }
+    /// JMAP: the server's event source stands in for IDLE (or, where it has
+    /// none, asking for changes every minute). One watcher per account
+    /// hears about every mailbox, so no folder needs one of its own.
+    fn spawn_jmap_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(true)),
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("jmap-events-{}", a.id))
+            .spawn(move || {
+                let mut retry = FIRST_RETRY;
+                while !stop.load(Ordering::Acquire) {
+                    let mut watched = false;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend.jmap_events(&a, &stop, &*changed, &mut watched)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("JMAP's events failed")));
+                    let Err(error) = outcome else {
+                        break;
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if watched {
+                        retry = FIRST_RETRY;
+                    }
+                    let wait = if error.downcast_ref::<AccessFailure>().is_some() {
+                        LONGEST_RETRY
+                    } else {
+                        retry
+                    };
+                    retry = (retry * 2).min(LONGEST_RETRY);
+                    let until = std::time::Instant::now() + wait;
+                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    // Mail may have arrived while the watch was down.
+                    if !stop.load(Ordering::Acquire) {
+                        changed(Mailbox::Standard(Folder::Inbox));
+                    }
+                }
+            });
+        spawned.ok().map(|_| watcher)
+    }
+    /// Follows a JMAP account's changes until `stop`, saying which
+    /// mailboxes changed. Like IDLE, it only notices: the regular check
+    /// syncs. Returns only with an error (or once stopped).
+    fn jmap_events(
+        &self,
+        a: &Account,
+        stop: &AtomicBool,
+        changed: &(dyn Fn(Mailbox) + Send + Sync),
+        watched: &mut bool,
+    ) -> Result<()> {
+        let mut since = self.with_jmap(a, |s| s.state())?;
+        *watched = true;
+        let tell = |since: &mut String| -> Result<()> {
+            let (boxes, next) = self.with_jmap(a, |s| self.jmap_changed_mailboxes(a, s, since))?;
+            if !next.is_empty() {
+                *since = next;
+            }
+            if !stop.load(Ordering::Acquire) {
+                for b in boxes {
+                    changed(b);
+                }
+            }
+            Ok(())
+        };
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let pushes = self.with_jmap(a, |s| Ok(s.pushes()))?;
+            let wait = if pushes {
+                let started = std::time::Instant::now();
+                self.with_jmap(a, |s| s.listen(stop, &mut || tell(&mut since)))?;
+                // A stream the server keeps ending at once isn't reopened
+                // in a hurry.
+                if started.elapsed() < Duration::from_secs(10) {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::ZERO
+                }
+            } else {
+                Duration::from_secs(60)
+            };
+            {
+                let until = std::time::Instant::now() + wait;
+                while std::time::Instant::now() < until {
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // The stream ended, or a minute passed: something may have
+            // changed meanwhile.
+            tell(&mut since)?;
         }
     }
     fn spawn_watch(
@@ -311,6 +469,29 @@ impl Backend {
             w.stop();
         }
         if let Some(w) = self.folder_watchers.lock().unwrap().remove(id) {
+            w.stop();
+        }
+    }
+    /// Ends every account's watches. Whoever watches next (the window or
+    /// the background monitor, see `background.rs`) starts its own, with its
+    /// own callback: a watch outliving its owner would keep its connection
+    /// and thread, and report to nobody.
+    pub fn stop_all_watching(&self) {
+        let inboxes: Vec<Watcher> = self
+            .watchers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, w)| w)
+            .collect();
+        let folders: Vec<Watcher> = self
+            .folder_watchers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, w)| w)
+            .collect();
+        for w in inboxes.iter().chain(&folders) {
             w.stop();
         }
     }

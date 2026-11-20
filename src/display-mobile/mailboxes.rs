@@ -25,6 +25,52 @@ impl MailApp {
             .pb_6()
             .flex()
             .flex_col();
+        if self.mobile.reordering {
+            body = body.child(self.mobile_reorder_list(cx));
+        } else {
+            body = self.mobile_mailbox_sections(body, cx);
+        }
+        let settings = self.bar_icon(
+            "mobile-settings",
+            "settings",
+            "Settings",
+            Rc::new(
+                |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
+                    this.mobile_open_settings(w, cx)
+                },
+            ),
+            cx,
+        );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.bg))
+            .child(self.nav_bar(
+                "mobile-mailboxes-bar",
+                insets,
+                None,
+                "Mailboxes",
+                None,
+                self.mobile_reorder_button(cx).into_iter().collect(),
+            ))
+            .child(super::super::panes::scroll_frame(
+                body,
+                &self.mobile.mailboxes_scroll,
+            ))
+            .child(self.tool_row(
+                "mobile-mailboxes-toolbar",
+                insets,
+                vec![settings],
+                Some(self.mobile_status_line()),
+                vec![self.compose_button(cx)],
+            ))
+            .into_any_element()
+    }
+
+    /// Every account (and view) with its folders, then Add Account.
+    fn mobile_mailbox_sections(&self, mut body: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors();
         if self.shows_all_mail() {
             body = body.child(self.mobile_view_section(ALL_MAIL, cx));
         }
@@ -67,42 +113,7 @@ impl MailApp {
                     )
                     .into_any_element(),
                 ])));
-        let settings = self.bar_icon(
-            "mobile-settings",
-            "settings",
-            "Settings",
-            Rc::new(
-                |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
-                    this.mobile_open_settings(w, cx)
-                },
-            ),
-            cx,
-        );
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(c.bg))
-            .child(self.nav_bar(
-                "mobile-mailboxes-bar",
-                insets,
-                None,
-                "Mailboxes",
-                None,
-                vec![],
-            ))
-            .child(super::super::panes::scroll_frame(
-                body,
-                &self.mobile.mailboxes_scroll,
-            ))
-            .child(self.tool_row(
-                "mobile-mailboxes-toolbar",
-                insets,
-                vec![settings],
-                Some(self.mobile_status_line()),
-                vec![self.compose_button(cx)],
-            ))
-            .into_any_element()
+        body
     }
 
     /// Opens Settings at its list of pages.
@@ -164,6 +175,24 @@ impl MailApp {
         .into_any_element()
     }
 
+    /// The row opening an account's subscriptions, or every account's.
+    fn mobile_subscriptions_cell(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        // Only beside an open list (a wide screen) is the open one marked.
+        let active = self.mobile.split && self.subs_open && self.account.as_deref() == Some(id);
+        self.cell(
+            format!("mobile-subscriptions-{id}"),
+            icon_el("subscriptions", 22., c.accent).into_any_element(),
+            "Subscriptions",
+            None,
+            true,
+            active,
+            super::chrome::push(Action::OpenSubscriptions(id.to_owned())),
+            cx,
+        )
+        .into_any_element()
+    }
+
     /// An account: its picture and name, then its folders.
     fn mobile_account_section(&self, a: &Account, index: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -198,19 +227,7 @@ impl MailApp {
             }
         }
         if a.provider != Provider::Pop3 {
-            rows.push(
-                self.cell(
-                    format!("mobile-subscriptions-{id}"),
-                    icon_el("subscriptions", 22., c.accent).into_any_element(),
-                    "Subscriptions",
-                    None,
-                    true,
-                    false,
-                    super::chrome::push(Action::OpenSubscriptions(id.clone())),
-                    cx,
-                )
-                .into_any_element(),
-            );
+            rows.push(self.mobile_subscriptions_cell(&id, cx));
         }
         let menu_id = id.clone();
         let header = div()
@@ -285,7 +302,7 @@ impl MailApp {
         let Some((title, subtitle, icon)) = self.view_title(id) else {
             return div().into_any_element();
         };
-        let rows = Self::view_folders(id)
+        let mut rows: Vec<AnyElement> = Self::view_folders(id)
             .iter()
             .map(|&folder| {
                 self.mobile_folder_cell(
@@ -298,6 +315,11 @@ impl MailApp {
                 )
             })
             .collect();
+        // Every account's subscriptions, as the sidebar lists under All
+        // Accounts (aliases' views have none of their own).
+        if id == ALL_MAIL {
+            rows.push(self.mobile_subscriptions_cell(id, cx));
+        }
         let menu_id = id.to_owned();
         div()
             .flex()

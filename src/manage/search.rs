@@ -101,6 +101,38 @@ impl Search {
         }
         Ok(if parts.is_empty() { "ALL".into() } else { parts.join(" ") })
     }
+    /// The search as JMAP filter conditions (RFC 8621 §4.4.1), all of which
+    /// a message must match. Words search the whole message (`text`).
+    pub fn jmap_conditions(&self) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        self.terms
+            .iter()
+            .map(|t| {
+                let v = &t.value;
+                let c = match t.field {
+                    Field::Any => json!({ "text": v }),
+                    Field::From => json!({ "from": v }),
+                    Field::ReplyTo => json!({ "header": ["Reply-To", v] }),
+                    Field::To => {
+                        json!({ "operator": "OR", "conditions": [{ "to": v }, { "cc": v }] })
+                    }
+                    Field::Cc => json!({ "cc": v }),
+                    Field::Subject => json!({ "subject": v }),
+                    Field::Label => json!({ "hasKeyword": v }),
+                    Field::Unread => json!({ "notKeyword": "$seen" }),
+                    Field::Read => json!({ "hasKeyword": "$seen" }),
+                    Field::Starred => json!({ "hasKeyword": "$flagged" }),
+                    Field::Unstarred => json!({ "notKeyword": "$flagged" }),
+                    Field::Attachment => json!({ "hasAttachment": true }),
+                };
+                if t.negated {
+                    json!({ "operator": "NOT", "conditions": [c] })
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
 }
 
 impl Term {

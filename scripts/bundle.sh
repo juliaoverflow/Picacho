@@ -4,7 +4,8 @@ cd "$(dirname "$0")/.."
 profile="${1:-release}"
 # Optional built-in sign-in registrations (see README, "Connect email"):
 # PICACHO_GOOGLE_CLIENT_ID, PICACHO_GOOGLE_CLIENT_SECRET,
-# PICACHO_MICROSOFT_CLIENT_ID, PICACHO_PINAL_ACCOUNTS, PICACHO_PINAL_CLIENT_ID.
+# PICACHO_MICROSOFT_CLIENT_ID, PICACHO_FASTMAIL_CLIENT_ID, PICACHO_PINAL_ACCOUNTS,
+# PICACHO_PINAL_CLIENT_ID.
 # They are compiled in, so load them from .env (if present) before building.
 if [ -f .env ]; then
     set -a

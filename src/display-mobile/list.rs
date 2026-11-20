@@ -5,7 +5,9 @@
 //! leading edge to archive (or delete where archiving makes no sense). A
 //! long press opens the row's actions on iOS and starts selecting on
 //! Android, as each system's own mail apps do. Pulling the top of the list
-//! down checks for mail.
+//! down draws a box out from above it, which checks for mail when let go
+//! of far enough, says Refreshing meanwhile, and goes back up when done.
+//! The list itself stays where it is.
 use super::chrome::{Tap, act};
 use super::*;
 
@@ -15,6 +17,25 @@ pub(super) const ROW: f32 = 98.;
 const COMMIT: f32 = 88.;
 /// After a swipe ends, the fling's own momentum must not start another.
 const SWIPE_REST: Duration = Duration::from_millis(450);
+/// The pull-to-refresh box's height.
+const PULL_BOX: f32 = 40.;
+/// Where the pull box rests, below the list's top, once pulled far enough.
+const PULL_REST: f32 = 12.;
+/// Where the pull box waits out of sight, its shadow too.
+const PULL_HIDDEN: f32 = -PULL_BOX - 12.;
+/// The Refreshing box shows at least this long, so a quick check doesn't
+/// flash it.
+const REFRESH_MIN: Duration = Duration::from_millis(700);
+/// It hides after this long whatever mail is doing.
+const REFRESH_MAX: Duration = Duration::from_secs(60);
+/// How long the pull box takes to go back up.
+const PULL_HIDE: Duration = Duration::from_millis(220);
+/// How long the pull box takes to settle into its Refreshing place, its
+/// words changing meanwhile.
+const PULL_SETTLE: Duration = Duration::from_millis(340);
+/// The pull box's width: the same pulling and refreshing, so it doesn't
+/// jump as its words change.
+const PULL_BOX_WIDTH: f32 = 200.;
 
 /// What a swipe does, by direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +68,23 @@ impl SwipeAct {
 }
 
 impl MailApp {
+    /// What the list's title bar says under the mailbox's name: its
+    /// account's address. A view (All Accounts, an alias) names itself
+    /// rather than one of the accounts it draws from. None while selecting.
+    pub(super) fn mobile_list_subtitle(&self, title: &str) -> Option<String> {
+        match self.account.as_deref() {
+            _ if self.selecting => None,
+            Some(id) if fwd::is_view(id) => self
+                .view_title(id)
+                .map(|(name, _, _)| name)
+                .filter(|name| name != title),
+            _ => self
+                .current_account()
+                .filter(|a| a.label() != title)
+                .map(|a| a.email.clone()),
+        }
+    }
+
     pub(super) fn mobile_list(
         &mut self,
         insets: Insets,
@@ -100,10 +138,7 @@ impl MailApp {
         } else {
             self.mailbox_label()
         };
-        let subtitle = self
-            .current_account()
-            .filter(|a| !self.selecting && a.label() != title)
-            .map(|a| a.email.clone());
+        let subtitle = self.mobile_list_subtitle(&title);
         let list = if count == 0 {
             div()
                 .flex_1()
@@ -131,7 +166,6 @@ impl MailApp {
             .map(|list| super::super::panes::scroll_frame(list, &self.list_scroll))
             .into_any_element()
         };
-        let pull = self.mobile.pull;
         div()
             .id("mobile-list")
             .debug_selector(|| "mobile-list".into())
@@ -164,19 +198,13 @@ impl MailApp {
                     .bg(rgb(c.surface))
                     .border_t_1()
                     .border_color(rgb(c.border))
+                    // The pull box waits above, out of sight.
+                    .overflow_hidden()
                     .on_scroll(
                         cx.listener(|this, e: &ScrollEvent, w, cx| this.mobile_pull(e, w, cx)),
                     )
-                    .when(pull > 0., |d| d.child(self.pull_indicator(pull)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .mt(px(pull.min(COMMIT)))
-                            .child(list),
-                    ),
+                    .child(div().flex_1().min_h_0().flex().flex_col().child(list))
+                    .children(self.pull_box()),
             )
             .when_some(self.catalog_progress(), |d, progress| {
                 d.child(
@@ -230,8 +258,10 @@ impl MailApp {
             .into_any_element()
     }
 
-    /// The filters as chips under the title, so changing one is a tap.
+    /// The filters as chips under the title, so changing one is a tap. An
+    /// edge with chips scrolled past it fades out, showing there are more.
     fn mobile_filter_chips(&self, insets: Insets, cx: &Context<Self>) -> impl IntoElement {
+        let c = self.colors();
         let chip = |id: &'static str, filter: Filter, label: &'static str| {
             let on = self.filter_by == filter;
             self.chip(
@@ -242,10 +272,15 @@ impl MailApp {
                 cx,
             )
         };
-        div()
+        let scroll = &self.mobile.filters_scroll;
+        let (offset, max) = (
+            -f32::from(scroll.offset().x),
+            f32::from(scroll.max_offset().x),
+        );
+        let chips = div()
             .id("mobile-filters")
             .debug_selector(|| "mobile-filters".into())
-            .flex_shrink_0()
+            .track_scroll(scroll)
             .overflow_x_scroll()
             .pl(px(insets.left + GUTTER))
             .pr(px(insets.right + GUTTER))
@@ -265,7 +300,17 @@ impl MailApp {
                 self.oldest_first,
                 act(Action::OldestFirst(!self.oldest_first)),
                 cx,
-            ))
+            ));
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(chips)
+            .when(offset > 0.5, |d| {
+                d.child(edge_fade("mobile-filters-fade-leading", true, c.bg))
+            })
+            .when(max - offset > 0.5, |d| {
+                d.child(edge_fade("mobile-filters-fade-trailing", false, c.bg))
+            })
     }
 
     /// A message's row, sized for a fingertip, sliding under a swipe.
@@ -643,10 +688,19 @@ impl MailApp {
             return;
         };
         let dy = f32::from(d.y);
+        // Scroll events bubble here whether or not the list could take them,
+        // so only a touch that starts (and stays) at the top pulls. The list
+        // handles the event first, so its offset already includes this one.
+        let at_top = self.list_scroll.0.borrow().base_handle.offset().y >= px(0.);
+        if e.touch_phase == TouchPhase::Started {
+            self.mobile.pull_armed = at_top;
+        }
+        // While it says Refreshing, the box stays put.
+        let pulling = self.mobile.refreshing.is_none()
+            && (self.mobile.pull > 0. || (self.mobile.pull_armed && at_top && dy > 0.));
         match e.touch_phase {
-            // The list itself takes scrolling it can do; what reaches here
-            // pulls past its top.
-            TouchPhase::Started | TouchPhase::Moved if dy > 0. || self.mobile.pull > 0. => {
+            TouchPhase::Started | TouchPhase::Moved if pulling => {
+                self.mobile.pull_hide = None;
                 let before = self.mobile.pull >= COMMIT;
                 // Resistance: the further pulled, the slower it follows.
                 self.mobile.pull = (self.mobile.pull + dy * 0.5).clamp(0., COMMIT * 1.5);
@@ -655,38 +709,169 @@ impl MailApp {
                 }
                 cx.notify();
             }
-            TouchPhase::Ended | TouchPhase::Cancelled if self.mobile.pull > 0. => {
-                if self.mobile.pull >= COMMIT {
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                // Momentum after the finger lifts mustn't start a pull.
+                self.mobile.pull_armed = false;
+                let pull = std::mem::take(&mut self.mobile.pull);
+                if pull >= COMMIT {
+                    self.mobile.refreshing = Some(std::time::Instant::now());
+                    self.mobile.pull_anim += 1;
+                    self.mobile.pull_settle = Some((pull_box_top(pull), self.mobile.pull_anim));
                     self.handle(Action::Refresh, w, cx);
+                    self.watch_refresh(cx);
+                    cx.notify();
+                } else if pull > 0. {
+                    self.hide_pull_box(pull_box_top(pull));
+                    cx.notify();
                 }
-                self.mobile.pull = 0.;
-                cx.notify();
             }
             _ => {}
         }
     }
 
-    fn pull_indicator(&self, pull: f32) -> impl IntoElement {
+    /// Sends the pull box back up from `from`.
+    fn hide_pull_box(&mut self, from: f32) {
+        self.mobile.pull_settle = None;
+        self.mobile.pull_anim += 1;
+        self.mobile.pull_hide = Some((from, self.mobile.pull_anim));
+    }
+
+    /// Mail is being checked for the open mailbox, by a sync or a retried
+    /// sign-in.
+    fn mobile_refreshing(&self) -> bool {
+        self.checking_server()
+            || self.mailbox_loading()
+            || self.retrying.iter().any(|id| self.shows(id))
+    }
+
+    /// Hides the Refreshing box once the check it started is done.
+    fn watch_refresh(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let done = this.update(cx, |this, cx| {
+                    let Some(since) = this.mobile.refreshing else {
+                        return true;
+                    };
+                    let waited = since.elapsed();
+                    let done = waited >= REFRESH_MAX
+                        || (waited >= REFRESH_MIN && !this.mobile_refreshing());
+                    if done {
+                        this.mobile.refreshing = None;
+                        this.hide_pull_box(PULL_REST);
+                        cx.notify();
+                    }
+                    done
+                });
+                if done.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The pull-to-refresh box: drawn out from above the list as it is
+    /// pulled, resting there with Refreshing while mail is checked, and
+    /// going back up after. `None` while out of sight.
+    fn pull_box(&self) -> Option<AnyElement> {
         let c = self.colors();
-        let ready = pull >= COMMIT;
-        div()
+        let (top, refreshing) = if self.mobile.refreshing.is_some() {
+            (PULL_REST, true)
+        } else if self.mobile.pull > 0. {
+            (pull_box_top(self.mobile.pull), false)
+        } else if self.mobile.pull_hide.is_some() {
+            (PULL_HIDDEN, false)
+        } else {
+            return None;
+        };
+        // Its words, one layer for each state, laid over each other so one
+        // can fade into the other.
+        let layer = || {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+        };
+        let pulling = |progress: f32| {
+            layer()
+                .child(
+                    div()
+                        .size(px(16.))
+                        .flex_shrink_0()
+                        .child(ring(progress, c.border, c.accent).size_full()),
+                )
+                .child("Pull down to refresh")
+        };
+        let busy = || layer().child(spinner(14., c.accent)).child("Refreshing…");
+        let settle = self.mobile.pull_settle.filter(|_| refreshing);
+        let card = div()
+            .relative()
+            .w(px(PULL_BOX_WIDTH))
+            .h(px(PULL_BOX))
+            .rounded_full()
+            .bg(rgb(c.raised))
+            .border_1()
+            .border_color(rgb(c.border))
+            .shadow_md()
+            .text_size(px(13.))
+            .text_color(rgb(c.text))
+            .map(|d| match settle {
+                // Pulling's words give way to Refreshing's as it settles.
+                Some((_, key)) => d
+                    .child(pulling(1.).with_animation(
+                        ("mobile-pull-out", key),
+                        Animation::new(PULL_SETTLE / 2).with_easing(ease_out),
+                        |d, t| d.opacity(1. - t),
+                    ))
+                    .child(busy().with_animation(
+                        ("mobile-pull-in", key),
+                        Animation::new(PULL_SETTLE).with_easing(|t: f32| {
+                            // In once pulling's words are mostly gone.
+                            ease_out(((t - 0.35) / 0.65).clamp(0., 1.))
+                        }),
+                        |d, t| d.opacity(t),
+                    )),
+                None if refreshing => d.child(busy()),
+                None => d.child(pulling((self.mobile.pull / COMMIT).min(1.))),
+            });
+        let row = div()
+            .id("mobile-pull-box")
+            .debug_selector(|| "mobile-pull-box".into())
             .absolute()
-            .top_0()
             .left_0()
             .right_0()
-            .h(px(pull.min(COMMIT)))
+            .top(px(top))
             .flex()
-            .items_center()
             .justify_center()
-            .gap_2()
-            .text_size(px(13.))
-            .text_color(rgb(c.muted))
-            .child(ring((pull / COMMIT).min(1.), c.border, c.accent))
-            .child(if ready {
-                "Release to check for mail"
-            } else {
-                "Pull to check for mail"
-            })
+            .child(card);
+        Some(match (settle, self.mobile.pull_hide) {
+            // From where it was let go of into its place, overshooting a
+            // little as it springs back.
+            (Some((from, key)), _) => row
+                .with_animation(
+                    ("mobile-pull-settle", key),
+                    Animation::new(PULL_SETTLE).with_easing(ease_out_back),
+                    move |d, t| d.top(px(from + (PULL_REST - from) * t)),
+                )
+                .into_any_element(),
+            (None, Some((from, key))) if !refreshing && self.mobile.pull <= 0. => row
+                .with_animation(
+                    ("mobile-pull-hide", key),
+                    Animation::new(PULL_HIDE).with_easing(|t: f32| t * t),
+                    move |d, t| {
+                        d.top(px(from + (PULL_HIDDEN - from) * t))
+                            .opacity(1. - t * 0.6)
+                    },
+                )
+                .into_any_element(),
+            _ => row.into_any_element(),
+        })
     }
 
     /// The bar's search field, closed: tapping it searches. Until then it
@@ -854,4 +1039,49 @@ impl MailApp {
             ],
         )
     }
+}
+
+/// Where the pull box's top is, `pull` points into a pull: out of sight at
+/// none, at rest at the point where letting go refreshes, a little further
+/// (resisting) past it.
+fn pull_box_top(pull: f32) -> f32 {
+    if pull <= COMMIT {
+        PULL_HIDDEN + (PULL_REST - PULL_HIDDEN) * (pull / COMMIT).max(0.)
+    } else {
+        PULL_REST + (pull - COMMIT) * 0.25
+    }
+}
+
+fn ease_out(t: f32) -> f32 {
+    1. - (1. - t).powi(3)
+}
+
+/// Eases out past the end a little, then back: a soft spring.
+fn ease_out_back(t: f32) -> f32 {
+    const OVERSHOOT: f32 = 1.2;
+    let u = t - 1.;
+    1. + (OVERSHOOT + 1.) * u.powi(3) + OVERSHOOT * u.powi(2)
+}
+
+/// How wide the fade over a sideways-scrolling row's edge is.
+const EDGE_FADE: f32 = 28.;
+
+/// A fade over the `leading` (or trailing) edge of a row that scrolls
+/// sideways, from the row's background `bg` to clear: what scrolled past
+/// that edge is there to scroll back to. It takes no taps.
+fn edge_fade(id: &'static str, leading: bool, bg: u32) -> impl IntoElement {
+    let solid: Hsla = rgb(bg).into();
+    let clear = Hsla { a: 0., ..solid };
+    div()
+        .debug_selector(move || id.into())
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(px(EDGE_FADE))
+        .map(|d| if leading { d.left_0() } else { d.right_0() })
+        .bg(linear_gradient(
+            if leading { 90. } else { 270. },
+            linear_color_stop(solid, 0.),
+            linear_color_stop(clear, 1.),
+        ))
 }

@@ -6,7 +6,7 @@ use crate::manage::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,7 +20,7 @@ mod connection;
 use connection::{Connection, Limits};
 #[path = "watch.rs"]
 mod watch;
-use watch::Watcher;
+use watch::{ProtonNotice, Watcher};
 #[path = "offline.rs"]
 mod offline;
 #[path = "snooze.rs"]
@@ -35,6 +35,11 @@ mod large;
 mod extras;
 #[path = "proton.rs"]
 mod proton;
+#[path = "proton_push.rs"]
+mod proton_push;
+pub use proton_push::ProtonPushed;
+#[path = "jmap.rs"]
+mod jmap;
 pub use crate::sync::fido::{Method as KeyMethod, NeedsPin, Prompt as KeyPrompt};
 pub use proton::ProtonNext;
 pub use extras::ServerNotes;
@@ -53,6 +58,9 @@ mod extension_tests;
 #[cfg(test)]
 #[path = "reliability_tests.rs"]
 mod reliability_tests;
+#[cfg(test)]
+#[path = "jmap_tests.rs"]
+mod jmap_tests;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     Read(bool),
@@ -250,6 +258,21 @@ pub struct Backend {
     proton_login: Mutex<Option<proton::ProtonLogin>>,
     /// What a security key or phone is waiting for during a sign-in.
     proton_prompt: Arc<Mutex<KeyPrompt>>,
+    /// Called with Proton's account notices; see `on_proton_notice`.
+    proton_notice: Mutex<Option<ProtonNotice>>,
+    /// Called with Proton's pushes; see `on_proton_push`.
+    proton_push: Mutex<Option<proton_push::ProtonPushHear>>,
+    /// Why accounts' push notifications aren't registered; see
+    /// `proton_push_failures`.
+    proton_push_failures: Mutex<HashMap<String, String>>,
+    /// Called when those change; see `on_proton_push_change`.
+    proton_push_change: Mutex<Option<proton_push::ProtonPushChange>>,
+    /// Signed-in JMAP sessions by account, in memory only, with when their
+    /// access token expires (0 for a password); see `jmap.rs`.
+    jmap: Mutex<HashMap<String, (Arc<crate::sync::jmap::Session>, i64)>>,
+    /// Scheduled drafts being sent now, by id, by the window or the
+    /// background monitor; see `send_scheduled`.
+    scheduled_sending: Mutex<HashSet<String>>,
     #[cfg(test)]
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
@@ -293,6 +316,12 @@ impl Backend {
             proton_opening: Mutex::new(HashMap::new()),
             proton_login: Mutex::new(None),
             proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
+            proton_notice: Mutex::new(None),
+            proton_push: Mutex::new(None),
+            proton_push_failures: Mutex::new(HashMap::new()),
+            proton_push_change: Mutex::new(None),
+            jmap: Mutex::new(HashMap::new()),
+            scheduled_sending: Mutex::new(HashSet::new()),
             #[cfg(test)]
             test_certificate: None,
             #[cfg(test)]
@@ -454,7 +483,7 @@ impl Backend {
         cancel: &AtomicBool,
     ) -> Result<Account> {
         self.step(cancel, SignInStep::Finishing);
-        let (secret, who) = match crate::sync::oauth::redeem(&account, &grant) {
+        let (secret, mut who) = match crate::sync::oauth::redeem(&account, &grant) {
             Ok(signed_in) => signed_in,
             Err(e) => {
                 if e.downcast_ref::<AccessFailure>().is_none() {
@@ -467,6 +496,24 @@ impl Backend {
                 return Err(e);
             }
         };
+        if account.provider == Provider::Jmap {
+            // The client the server knows Picacho by, for renewing tokens.
+            account.client_id = grant.client_id.clone();
+            // The address entered stays the account's (a JMAP sign-in can be
+            // a user name, or an address the mailbox has as an alias). With
+            // none entered, it is the one the token or the session names.
+            if account.email.is_empty() {
+                if !who.email.contains('@') {
+                    who.email = self.jmap_username(&account, &secret).unwrap_or_default();
+                }
+                ensure!(
+                    who.email.contains('@'),
+                    "The server didn't say which address signed in. Enter your email address and try again."
+                );
+            } else {
+                who.email = account.email.clone();
+            }
+        }
         ensure!(
             account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
             "Choose the same email address to reconnect this mailbox."
@@ -529,6 +576,9 @@ impl Backend {
         }
         // A retry can come long after the browser; renew an expiring token.
         crate::sync::oauth::refresh(account, secret)?;
+        if account.provider == Provider::Jmap {
+            return self.check_jmap(account, secret);
+        }
         let mut session = match self.imap_login(account, secret) {
             Err(e)
                 if account.oauth
@@ -746,7 +796,11 @@ impl Backend {
     ) -> Result<Account> {
         let mut next = account.clone();
         if next.oauth && next.client_secret.is_empty() {
-            let registration = crate::sync::oauth::client(next.provider);
+            let registration = if next.provider == Provider::Jmap {
+                crate::sync::oauth::jmap_client(&next)
+            } else {
+                crate::sync::oauth::client(next.provider)
+            };
             if !registration.id.is_empty() {
                 next.client_id = registration.id;
                 next.client_secret = registration.secret;
@@ -878,8 +932,12 @@ impl Backend {
         limit: usize,
     ) -> Result<Vec<Mail>> {
         let mailbox = mailbox.into();
+        // Background downloads and listing give way to a sync between
+        // messages, so new mail isn't stuck behind a whole batch.
+        let waiting = self.wait_for(&a.id);
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        drop(waiting);
         match self.sync_once(a, &mailbox, limit) {
             Err(error) if crate::sync::retry::transient(&error) => {
                 // Only downloads/snapshots are replayed, never MOVE or SMTP.
@@ -897,6 +955,9 @@ impl Backend {
         }
         if a.provider == Provider::Proton {
             return self.sync_proton(a, mailbox, limit);
+        }
+        if a.provider == Provider::Jmap {
+            return self.sync_jmap(a, mailbox, limit);
         }
         if folder == Folder::Drafts {
             return Ok(vec![]);
@@ -1167,6 +1228,9 @@ impl Backend {
         }
         if a.provider == Provider::Proton {
             return self.catalog_proton(a, mailbox, batch);
+        }
+        if a.provider == Provider::Jmap {
+            return self.catalog_jmap(a, mailbox, batch);
         }
         self.with_imap(a, |c| {
             let remote = remote_name(c.names(false)?, a, mailbox)?;
@@ -1791,6 +1855,16 @@ impl Backend {
                 return Ok(next);
             }
             self.download_proton(a, m)?
+        } else if a.provider == Provider::Jmap {
+            if m.size as usize > large::MAX_DOWNLOAD {
+                if m.partial && m.body.is_some() {
+                    return Ok(m.clone());
+                }
+                let next = self.read_jmap_parts(a, m)?;
+                self.store.save_messages(std::slice::from_ref(&next))?;
+                return Ok(next);
+            }
+            self.download_jmap(a, m)?
         } else {
             ensure!(
                 a.provider != Provider::Pop3,
@@ -1901,6 +1975,11 @@ impl Backend {
         if a.provider == Provider::Proton {
             return self.create_folder_proton(a, parent, leaf);
         }
+        if a.provider == Provider::Jmap {
+            let change = self.create_folder_jmap(a, parent, leaf)?;
+            self.store.save_folders(&a.id, &change.folders)?;
+            return Ok(change);
+        }
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             let namespace = c.namespace()?;
@@ -1941,6 +2020,9 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Proton {
             return self.rename_folder_proton(a, name, leaf);
+        }
+        if a.provider == Provider::Jmap {
+            return self.rename_folder_jmap(a, name, leaf);
         }
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
@@ -2000,6 +2082,9 @@ impl Backend {
         if a.provider == Provider::Proton {
             return self.delete_folder_proton(a, name);
         }
+        if a.provider == Provider::Jmap {
+            return self.delete_folder_jmap(a, name);
+        }
         let folders = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             deletable(&names, a.provider, name)?;
@@ -2051,6 +2136,9 @@ impl Backend {
         }
         if a.provider == Provider::Proton {
             return self.delete_proton(a, mails);
+        }
+        if a.provider == Provider::Jmap {
+            return self.delete_jmap(a, mails);
         }
         self.with_imap(a, |c| {
             let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
@@ -2113,6 +2201,9 @@ impl Backend {
         if a.provider == Provider::Proton {
             return self.empty_proton(a, folder);
         }
+        if a.provider == Provider::Jmap {
+            return self.empty_jmap(a, folder);
+        }
         let mailbox = Mailbox::Standard(folder);
         let count = self.with_imap(a, |c| {
             let remote = resolve_in(c.names(false)?, a.provider, folder)?;
@@ -2145,6 +2236,9 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Proton {
             return self.quota_proton(a);
+        }
+        if a.provider == Provider::Jmap {
+            return self.quota_jmap(a);
         }
         self.with_imap(a, |c| {
             if !c.extensions()?.quota {
@@ -2183,6 +2277,19 @@ impl Backend {
                 Err(e) => Err(e),
                 // The message keeps its id at Proton wherever it is: its row
                 // changes rather than going.
+                Ok(()) => self.commit_change(&current, change, false),
+            };
+        }
+        if a.provider == Provider::Jmap {
+            // Changes made while offline go first, in order.
+            let result = self
+                .replay_offline_jmap(a)
+                .and_then(|()| self.change_jmap(a, &current, &change));
+            return match result {
+                Err(e) if crate::sync::retry::later(&e) => self.queue_offline(a, &current, &change),
+                Err(e) => Err(e),
+                // The message keeps its id wherever it is: its row changes
+                // rather than going.
                 Ok(()) => self.commit_change(&current, change, false),
             };
         }
@@ -2406,6 +2513,12 @@ impl Backend {
             let _operation = lock.lock().unwrap();
             return self.mark_all_read_proton(a, mailbox);
         }
+        // JMAP: the same, by query.
+        if a.provider == Provider::Jmap && mailbox.folder() != Folder::Drafts {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            return self.mark_all_read_jmap(a, mailbox);
+        }
         if mailbox.folder().is_virtual() {
             let unread: Vec<Mail> = self
                 .store
@@ -2452,6 +2565,9 @@ impl Backend {
         self.ensure_background(a)?;
         if a.provider == Provider::Proton {
             return self.download_batch_proton(a, max, since);
+        }
+        if a.provider == Provider::Jmap {
+            return self.download_batch_jmap(a, max, since);
         }
         // A Gmail message appears once per label; download it only once.
         let shared = if a.provider == Provider::Gmail {
@@ -2582,6 +2698,53 @@ impl Backend {
     ) -> Result<crate::manage::subscriptions::Outcome> {
         crate::manage::subscriptions::unsubscribe(plan, &a.id, |d| self.send(a, d))
     }
+    /// Sends the scheduled draft `id` if it is due. The window and the
+    /// background monitor (one taking over from the other) may both find it
+    /// due: whichever comes second while the first is sending, or after it
+    /// sent (and so discarded) the draft, gets `Ok(None)` and sends nothing.
+    /// It is read again here, so a time changed meanwhile counts.
+    pub fn send_scheduled(
+        &self,
+        a: &Account,
+        id: &str,
+    ) -> Result<Option<(Draft, Vec<String>)>> {
+        if !self.scheduled_sending.lock().unwrap().insert(id.to_owned()) {
+            return Ok(None);
+        }
+        struct Claim<'a>(&'a Mutex<HashSet<String>>, &'a str);
+        impl Drop for Claim<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(self.1);
+            }
+        }
+        let _claim = Claim(&self.scheduled_sending, id);
+        let now = chrono::Utc::now().timestamp();
+        let Some(d) = self.store.draft(id)? else {
+            return Ok(None);
+        };
+        if !d.send_at.is_some_and(|t| t <= now) || !d.send_error.is_empty() {
+            return Ok(None);
+        }
+        let notes = self.send_noting(a, &d)?;
+        Ok(Some((d, notes)))
+    }
+    /// Whether the scheduled draft `id` is being sent now (see `send_scheduled`).
+    pub fn sending_scheduled(&self, id: &str) -> bool {
+        self.scheduled_sending.lock().unwrap().contains(id)
+    }
+    /// Whether any scheduled draft is being sent now: a background process
+    /// handing over to the window waits for it, so it isn't sent twice.
+    pub fn sending_any_scheduled(&self) -> bool {
+        !self.scheduled_sending.lock().unwrap().is_empty()
+    }
+    /// A scheduled draft that can't be sent stays in Drafts, saying why,
+    /// for the person to fix and send.
+    pub fn schedule_failed(&self, id: &str, error: &str) {
+        if let Ok(Some(mut d)) = self.store.draft(id) {
+            d.send_error = error.to_owned();
+            let _ = self.store.save_draft(&d);
+        }
+    }
     pub fn send(&self, a: &Account, d: &Draft) -> Result<()> {
         self.send_noting(a, d).map(|_| ())
     }
@@ -2637,9 +2800,10 @@ impl Backend {
                 )
             }
         };
-        let delivered = if a.provider == Provider::Proton && own_server.is_none() {
+        let delivered = if a.provider.api_sending() && own_server.is_none() {
             // Through Proton's API: it encrypts for the recipients it can,
-            // signs, and files the message in Sent itself.
+            // signs, and files the message in Sent itself. A JMAP server
+            // submits it and files it in Sent.
             let message = crate::sync::smtp::build(a, d, false)?;
             let envelope = message.envelope();
             let from = envelope
@@ -2647,7 +2811,11 @@ impl Backend {
                 .map(|f| f.to_string())
                 .context("The message has no sender.")?;
             let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
-            self.send_proton(a, &from, &to, &message.formatted())?;
+            if a.provider == Provider::Jmap {
+                self.send_jmap(a, &from, &to, &message.formatted())?;
+            } else {
+                self.send_proton(a, &from, &to, &message.formatted())?;
+            }
             crate::sync::smtp::Delivered {
                 message,
                 receipts_unsupported: a.delivery_receipts,
@@ -2678,13 +2846,17 @@ impl Backend {
         // another server is added to its Sent, as Bridge does for a mail
         // app's copy.
         let proton_copy = a.provider == Provider::Proton && own_server.is_some();
+        let jmap_copy = a.provider == Provider::Jmap && own_server.is_some();
         if a.provider == Provider::Imap
             || (a.provider.imap() && own_server.is_some())
             || proton_copy
+            || jmap_copy
         {
             let raw = message.formatted();
             let saved = if proton_copy {
                 self.file_sent_copy_proton(a, &raw)
+            } else if jmap_copy {
+                self.file_sent_copy_jmap(a, &raw)
             } else {
                 self.with_imap(a, |c| self.file_sent_copy(c, a, &raw))
             };
@@ -2873,6 +3045,9 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Proton {
             return self.sync_drafts_proton(a);
+        }
+        if a.provider == Provider::Jmap {
+            return self.sync_drafts_jmap(a);
         }
         self.with_imap(a, |c| {
             // Copies for Sent that couldn't be saved when sent go first; a
@@ -3072,6 +3247,9 @@ impl Backend {
             if a.provider == Provider::Proton {
                 return self.proton_attachment(a, m, &attachment.section);
             }
+            if a.provider == Provider::Jmap {
+                return self.jmap_attachment(a, &attachment);
+            }
             return self.with_imap(a, |c| {
                 c.select_for(m)?;
                 self.fetch_attachment(c, m, &attachment)
@@ -3268,6 +3446,20 @@ mod layout_tests {
         let next = b.layout(&a.id, &inbox).unwrap();
         assert_eq!(*next.uids, [2, 3, 4]);
         assert_ne!(b.list_revision(&a.id), revision);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A Proton account set not to ask for changes gets no event watcher;
+    /// the regular check finds its new mail.
+    #[test]
+    fn proton_events_turned_off_start_no_watcher() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-events-{}", uuid::Uuid::new_v4()));
+        let b = Arc::new(Backend::new(Arc::new(Store::open(&path)?)));
+        let mut a = Account::new(Provider::Proton);
+        a.sync.proton_events_seconds = 0;
+        b.watch_inbox(&a, |_| {});
+        assert!(b.watching().is_empty());
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

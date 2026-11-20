@@ -236,6 +236,87 @@ A sent copy that couldn't be appended is queued as a file under `sent-copies/<ac
 
 MTA-STS checks (`sync/mta_sts.rs`) only run when encryption in transit is required. The `_mta-sts` TXT record goes through the resolver used for sender checks. The policy is fetched from `https://mta-sts.<domain>/.well-known/mta-sts.txt` without redirects (at most 64 KB, `text/plain`) and kept until its max_age or a new record id, for at most a day. A policy in `testing` counts, since REQUIRETLS treats it as enforce. DANE means a TLSA record at `_25._tcp.<mx>` for the most preferred MX; the sending servers check its DNSSEC signatures. These checks only inform: delivery is the outgoing server's.
 
+## JMAP
+
+JMAP accounts (RFC 8620 core, RFC 8621 mail) talk HTTPS and JSON to one
+server for reading and sending (`sync/jmap.rs`, `manage/jmap.rs`). The
+session comes from `https://<server>/.well-known/jmap`. Redirects are
+followed only on the same host, so credentials never go to another one.
+Sign-in is HTTP Basic with the sign-in name and password, then the same
+password as a bearer token (Fastmail's API tokens). A 401 or 403 is a typed
+`Authentication` access failure, and the session is dropped so that the
+next try signs in again.
+
+- Identity: a message keeps its JMAP id wherever it goes, so it is one row
+  (`{account}:jmap:{id}`). Moving a message replaces its `mailboxIds` and
+  updates the row instead of removing it and finding it again.
+- Mailboxes: standard folders are found by role (RFC 8457). Servers without
+  roles fall back to the usual names at the top level. Other mailboxes are
+  the account's own folders, named by path. Collections (`all`, `flagged`…)
+  are left out. A message in several mailboxes shows in the inbox, then
+  Trash, Spam, Drafts, Sent, Archive, then its first own folder.
+- Flags: `$seen`, `$flagged`, `$answered`, `$forwarded` and `$mdnsent`.
+  Other keywords are labels, except the system keywords IMAP hides too.
+  Starred is a `hasKeyword` query and All Mail an `inMailboxOtherThan`
+  (Drafts) query, so neither is put together from the other mailboxes.
+- Sync: each mailbox remembers the Email state it was last read in. If
+  `Email/changes` reports nothing since then, a check costs that one
+  request. Otherwise the newest messages are listed (`Email/query` and
+  `Email/get` in one request, through a back-reference). Cached messages
+  that weren't listed are asked about again: moved ones update their row,
+  and ones that are gone are removed. The catalog pages on with `position`.
+- Bodies download as blobs. Messages over the download limit read their
+  text and HTML body values alone, and each attachment downloads by its
+  blob id when it is saved.
+- Changes are one `Email/set` per change. Offline changes queue and replay
+  as they do for IMAP. Deleting for good is `Email/set destroy`.
+- Sending uploads the message, imports it into Drafts (`$draft`) and creates
+  an `EmailSubmission` for the identity that covers the From address, all
+  in one request. Once the server accepts it, `onSuccessUpdateEmail` moves
+  it to Sent. If the submission is refused, the imported copy is destroyed.
+  Mail sent as an address with its own SMTP server gets a copy imported into
+  Sent, as for IMAP. Copies that couldn't be filed are queued the same way.
+- Drafts sync with the Drafts mailbox, as Proton's do (`jmap:` remote ids).
+- Push: the event source (`types=Email,Mailbox`, a ping every 30 seconds)
+  stands in for IDLE. When it reports a change, `Email/changes` says which
+  mailboxes to check. Servers without an event source are asked for changes
+  every minute.
+- Search sends Picacho's search terms as JMAP filter conditions, so the
+  server searches message contents too. Quota comes from RFC 9425
+  `Quota/get` (octets) where offered.
+
+- Filters: where the server offers JMAP for Sieve Scripts (RFC 9661),
+  Settings → Filters & vacation writes the same `picacho` script that
+  ManageSieve gets. It is uploaded as a blob, checked with
+  `SieveScript/validate`, created or replaced, and turned on with
+  `onSuccessActivateScript`. With no rules and no vacation reply, the
+  script it included is turned back on (`onSuccessDeactivateScript` if
+  there wasn't one). Reading the scripts and choosing what to include work
+  the same as with ManageSieve (`sieve::loaded`).
+- Browser sign-in (OAuth): the server's RFC 8414 metadata
+  (`/.well-known/oauth-authorization-server`, else OpenID Connect's
+  configuration) gives the endpoints. Fastmail uses Picacho's built-in
+  registration (`PICACHO_FASTMAIL_CLIENT_ID`). Other servers register
+  Picacho for each sign-in where their metadata has a registration
+  endpoint (RFC 7591, a public native client). The flow is PKCE through a
+  loopback redirect. The scopes are JMAP's (core, mail, submission, Sieve)
+  plus `offline_access`, among those the server lists. The client id is kept
+  with the account so tokens can be renewed. A session opened with a token
+  is opened again shortly before the token expires, after renewing it. If
+  neither the token nor the address entered names the account, the session's
+  `username` does.
+- Discovery: Fastmail's domains and custom domains whose MX is at
+  `messagingengine.com` go to Fastmail (`api.fastmail.com`). For other
+  domains, an `_jmap._tcp` SRV record (looked up with the resolver used for
+  sender checks) wins over autoconfig, since the domain names its JMAP server
+  itself. A domain that only answers at `/.well-known/jmap` (a 401 with a
+  Basic or Bearer challenge, or a redirect to a JMAP path) is used when
+  autoconfig, the ISPDB and MX records found nothing, before ports are
+  probed.
+
+Fastmail is offered over JMAP. Fastmail accounts added over IMAP before
+this keep using IMAP.
+
 ## Reference implementation review
 
 Reviewed these pinned upstream sources on October 26, 2026 (no upstream source was copied into Picacho):

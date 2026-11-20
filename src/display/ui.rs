@@ -1,5 +1,7 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[path = "links.rs"]
+mod links;
 #[path = "proton_login.rs"]
 mod proton_login;
 use crate::manage::backend::{KeyMethod, KeyPrompt};
@@ -45,6 +47,8 @@ mod message_window;
 mod mobile;
 #[path = "panes.rs"]
 mod panes;
+#[path = "paste.rs"]
+mod paste;
 #[path = "prompt.rs"]
 mod prompt;
 use panes::{LIST_MIN, Pane, Resize};
@@ -69,7 +73,11 @@ mod tree;
 mod views;
 #[path = "window.rs"]
 mod window;
-use super::html::{HtmlContextMenu, HtmlView};
+/// The desktop app's life beyond its windows: background and tray.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[path = "shell.rs"]
+mod shell;
+use super::html::{HtmlContextMenu, HtmlLink, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::subscriptions::Subscription as MailSubscription;
@@ -163,6 +171,9 @@ const STAR: u32 = 0xe0a526;
 const ROW_HEIGHT: f32 = 86.;
 /// The newest messages a sync keeps current; the catalog lists the rest.
 const SYNC_WINDOW: usize = 300;
+/// How long a tapped notification's message, not yet listed, is waited
+/// for (see `open_notified`).
+const NOTIFIED_WAIT: Duration = Duration::from_secs(120);
 /// Setup form inputs.
 const EMAIL: usize = 0;
 const PASSWORD: usize = 1;
@@ -318,6 +329,12 @@ impl Appearance {
     }
 }
 fn system_dark(w: &Window) -> bool {
+    // The activity's own configuration, which gpui-mobile's window appearance
+    // lags behind (see `android::system_dark`).
+    #[cfg(target_os = "android")]
+    if let Some(dark) = crate::android::system_dark() {
+        return dark;
+    }
     matches!(
         w.appearance(),
         WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -643,11 +660,17 @@ enum Action {
     SubmitReconnect(String),
     SettingsPage(Page),
     SetAppearance(Appearance),
+    /// Signs in to the JMAP server in the form in the browser (OAuth).
+    JmapBrowser,
     SetAccent(Accent),
     SetSync(String, SyncSettings),
     SetReadingDefaults(ReadingOptions),
     /// Removes tracking from links in mail, or stops.
     SetCleanLinks(bool),
+    /// Keep running in the background once the windows close.
+    SetBackground(bool),
+    /// Show the tray icon while a window is open too.
+    SetTrayIcon(bool),
     /// Turns Local AI on, or off (deleting its models).
     SetLocalAi(bool),
     /// Hides sign-in codes (downloading the model), or stops (deleting it).
@@ -731,6 +754,15 @@ enum Action {
     SaveOriginal,
     CopyText(String),
     OpenUrl(String),
+    /// A link (or image) address from an email: opened as `open_email_link`
+    /// decides.
+    OpenEmailLink(String),
+    /// The answer to the warning before opening a link (phones).
+    LinkChoice(links::LinkChoice),
+    /// Warn before opening links from email (phones).
+    SetLinkWarnings(bool),
+    /// Stop trusting this site's links.
+    UntrustSite(String),
     About,
     ChooseService(Service),
     OpenLink(&'static str),
@@ -936,8 +968,15 @@ pub struct MailApp {
     /// succeeds or fails some other way.
     dismissed_issues: HashMap<String, HashMap<IssueSource, String>>,
     sync_requests: HashSet<(String, String)>,
+    /// Syncs asked for while the same one ran, by (account, mailbox key),
+    /// with the largest limit asked: they run again once it ends, since it
+    /// may have listed the mailbox before the change.
+    sync_again: HashMap<(String, String), usize>,
     downloading: HashSet<String>,
     retrying: HashSet<String>,
+    /// Syncs Refresh asked for, by (account, mailbox key): only the open
+    /// mailbox (or the inbox) is fetched, and they show as checking.
+    manual_refresh: HashSet<(String, String)>,
     /// Unread inbox messages already seen per account, to spot new mail.
     known: HashMap<String, HashSet<String>>,
     busy: usize,
@@ -1158,6 +1197,17 @@ pub struct MailApp {
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
+    /// Opening links from email: the phone's warning, trusted sites, the
+    /// desktop's hovered address (see `links`).
+    links: links::LinkSafety,
+    /// Picacho keeps checking mail once its windows close (Settings →
+    /// General; on Android, its mail service), and shows its tray icon while
+    /// a window is open too.
+    background: bool,
+    tray_icon: bool,
+    /// Its window closed and the background monitor checks mail now (see
+    /// `retire`).
+    retired: bool,
     /// Local AI and its sign-in code hiding (Settings → Local AI).
     local_ai: bool,
     hide_codes: bool,
@@ -1242,6 +1292,10 @@ pub struct MailApp {
     fwd_adding: bool,
     /// The touch presentation's own state; `mobile.on` picks it.
     mobile: mobile::Mobile,
+    /// A tapped notification's message, opened once the mailbox listing
+    /// with this `load_generation` has it (see `open_notified`): it may
+    /// only just have arrived, not yet synced. Until the `Instant`.
+    open_listed: Option<(u64, String, std::time::Instant)>,
 }
 fn input(
     placeholder: &str,
@@ -1283,13 +1337,22 @@ fn textarea(placeholder: &str, window: &mut Window, cx: &mut App) -> Entity<Text
     cx.new(|cx| TextareaState::new(window, cx).placeholder(placeholder.to_owned()))
 }
 impl MailApp {
+    /// A mail view with a backend of its own (tests).
+    #[cfg(test)]
     pub fn new(store: Arc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_backend(new_backend(store), window, cx)
+    }
+    /// The mail view on an existing backend: the app's, which outlives each
+    /// window on a desktop running in the background (see `shell`).
+    pub fn with_backend(backend: Arc<Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let store = backend.store.clone();
         let accounts = store.accounts().unwrap_or_default();
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
         let alias_routes = fwd::routes(&store);
         let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        let link_safety = links::LinkSafety::load(&store);
         let local_ai = crate::manage::local_ai::enabled(&store);
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         let understand_dates = crate::manage::local_ai::when_enabled(&store);
@@ -1313,7 +1376,9 @@ impl MailApp {
             a => a == Appearance::Dark,
         };
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
-        let backend = Arc::new(Backend::new(store));
+        let background = crate::manage::background::enabled(&store);
+        let tray_icon = crate::manage::background::tray_while_open(&store);
+        drop(store);
         let search = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Search, or from: reply-to: is:unread")
@@ -1464,8 +1529,16 @@ impl MailApp {
                 cx.notify();
             }
         }));
-        subscriptions.push(cx.observe_window_activation(window, |this, w, _| {
+        subscriptions.push(cx.observe_window_activation(window, |this, w, cx| {
             this.active = w.is_window_active();
+            // Text copied here (from a message, a sign-in code) reaches
+            // other apps as Picacho goes to the background.
+            #[cfg(target_os = "android")]
+            if !this.active {
+                cx.defer(crate::android::clipboard_to_system);
+            }
+            #[cfg(not(target_os = "android"))]
+            let _ = cx;
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.persist_draft(cx);
@@ -1631,6 +1704,89 @@ impl MailApp {
                 this.html_menu(menu, cx)
             }),
         );
+        subscriptions.push(
+            cx.subscribe(&html_view, |this, _, link: &HtmlLink, cx| match link {
+                HtmlLink::Hovered(url) => {
+                    if this.links.hovered != *url {
+                        this.links.hovered = url.clone();
+                        cx.notify();
+                    }
+                }
+                HtmlLink::Opened(url) => this.open_email_link(url.clone(), cx),
+            }),
+        );
+        // Android's Back, from its back callback (see `platform_back`).
+        #[cfg(target_os = "android")]
+        {
+            let mut backs = crate::android::back_events();
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while let Some(back) = backs.next().await {
+                    if this
+                        .update_in(cx, |this, w, cx| this.platform_back(back, w, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // The system bars and keyboard moved: lay out again (see
+        // `android::system_insets`).
+        #[cfg(target_os = "android")]
+        {
+            let mut changes = crate::android::insets_events();
+            cx.spawn(async move |this, cx| {
+                use futures::StreamExt;
+                while changes.next().await.is_some() {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // The system's dark mode changed (see `android::system_dark`).
+        #[cfg(target_os = "android")]
+        {
+            let mut changes = crate::android::dark_events();
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while changes.next().await.is_some() {
+                    let updated = this.update_in(cx, |this, w, cx| {
+                        if this.appearance == Appearance::System {
+                            this.dark = system_dark(w);
+                            this.apply_theme(w, cx);
+                            cx.notify();
+                        }
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // A notification tapped while the window is up opens its mail.
+        {
+            let mut clicks = crate::display::notify::clicks();
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while clicks.next().await.is_some() {
+                    let opened = this.update_in(cx, |this, w, cx| {
+                        if let Some(target) = crate::display::notify::take_clicked() {
+                            w.activate_window();
+                            this.open_notified(target, w, cx);
+                        }
+                    });
+                    if opened.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         let (pushed, mut pushes) = futures::channel::mpsc::unbounded::<(String, Mailbox)>();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
@@ -1704,8 +1860,10 @@ impl MailApp {
             account_issues: HashMap::new(),
             dismissed_issues: HashMap::new(),
             sync_requests: HashSet::new(),
+            sync_again: HashMap::new(),
             downloading: HashSet::new(),
             retrying: HashSet::new(),
+            manual_refresh: HashSet::new(),
             known: HashMap::new(),
             busy: 0,
             syncing: false,
@@ -1831,6 +1989,10 @@ impl MailApp {
             reverse_contacts,
             contacts_fetched: HashSet::new(),
             clean_links,
+            links: link_safety,
+            background,
+            tray_icon,
+            retired: false,
             local_ai,
             hide_codes,
             otp: None,
@@ -1882,6 +2044,7 @@ impl MailApp {
             filter_inputs,
             server_notes: HashMap::new(),
             mobile: mobile::Mobile::new(),
+            open_listed: None,
         };
         this.update_scope();
         this.load_snoozed();
@@ -1894,11 +2057,15 @@ impl MailApp {
         #[cfg(all(debug_assertions, target_os = "macos"))]
         devdriver::start(window, cx);
         this.watch_inboxes();
+        this.listen_push_failures(cx);
         if this.account.is_some() {
             cx.defer_in(window, |this, w, cx| {
                 this.refresh_counts(cx);
-                // Back where the person was, else the first mailbox.
-                if this.restore_place(w, cx) {
+                // A tapped notification's mail (it opened Picacho), else
+                // back where the person was, else the first mailbox.
+                if let Some(target) = crate::display::notify::take_clicked() {
+                    this.open_notified(target, w, cx);
+                } else if this.restore_place(w, cx) {
                 } else if this.messages.is_empty() {
                     let first = this.account.clone();
                     this.open_mailbox(first, Folder::Inbox.into(), w, cx);
@@ -1915,13 +2082,17 @@ impl MailApp {
             loop {
                 cx.background_executor().timer(Duration::from_secs(20)).await;
                 let checked = this.update(cx, |this, cx| {
+                    if this.retired {
+                        return false;
+                    }
                     this.watch_inboxes();
                     this.check_due(cx);
                     this.send_due(cx);
                     this.wake_snoozed(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
+                    true
                 });
-                if checked.is_err() {
+                if !checked.unwrap_or(false) {
                     break;
                 }
             }
@@ -1931,6 +2102,44 @@ impl MailApp {
     }
     fn colors(&self) -> Colors {
         Colors::new(self.dark, self.accent)
+    }
+    /// Stops checking mail: the window is gone and the background monitor
+    /// checks instead. The view is normally dropped with its window; should
+    /// anything keep it, it must not check (and announce) alongside the
+    /// monitor.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn retire(&mut self) {
+        self.retired = true;
+    }
+    /// Quits Picacho (not just the window), unless a message is being sent.
+    fn quit_app(&mut self, cx: &mut Context<Self>) {
+        if self.sending {
+            self.notice("Wait for the current message to finish sending.", true, cx);
+        } else {
+            self.persist_draft(cx);
+            cx.quit();
+        }
+    }
+    fn set_background(&mut self, on: bool, cx: &mut Context<Self>) {
+        use crate::manage::background::PREFERENCE;
+        self.background = on;
+        // Read back at once (the shell reads it when the last window closes).
+        self.backend
+            .store
+            .set_preference_soon(PREFERENCE, if on { "true" } else { "false" });
+        #[cfg(target_os = "android")]
+        crate::android::set_background(on);
+        cx.notify();
+    }
+    fn set_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
+        use crate::manage::background::TRAY_PREFERENCE;
+        self.tray_icon = on;
+        self.backend
+            .store
+            .set_preference_soon(TRAY_PREFERENCE, if on { "true" } else { "false" });
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        cx.defer(shell::update_tray);
+        cx.notify();
     }
     fn account_of(&self, m: &Mail) -> Option<Account> {
         self.accounts.iter().find(|a| a.id == m.account).cloned()
@@ -2145,6 +2354,9 @@ impl MailApp {
     /// at once rather than at the next check; ends watches of accounts that
     /// are gone or can't sign in. Polling carries on regardless.
     fn watch_inboxes(&mut self) {
+        if self.retired {
+            return;
+        }
         let watching = self.backend.watching();
         for id in &watching {
             let keep = self.accounts.iter().any(|a| &a.id == id) && !self.account_blocked(id);
@@ -2171,6 +2383,9 @@ impl MailApp {
     /// its own), unless its account's inbox watcher already hears about
     /// every mailbox (NOTIFY). Other accounts' folder watches end.
     fn watch_open_folder(&mut self) {
+        if self.retired {
+            return;
+        }
         let open = self
             .account
             .clone()
@@ -2188,6 +2403,9 @@ impl MailApp {
     /// The server reported a change in one of an account's mailboxes (IDLE,
     /// NOTIFY): check it now, as the regular check would.
     fn on_push(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
+        if self.retired {
+            return;
+        }
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
@@ -2223,7 +2441,14 @@ impl MailApp {
         let present: HashSet<&String> = messages.iter().map(|m| &m.id).collect();
         known.retain(|m| present.contains(m));
         known.extend(messages.iter().filter(|m| m.unread).map(|m| m.id.clone()));
-        if first || fresh.is_empty() || !a.sync.notify || self.active {
+        // Proton's pushes announce mail for accounts that take them.
+        if first
+            || fresh.is_empty()
+            || !a.sync.notify
+            || a.pushes_new_mail()
+            || self.active
+            || self.retired
+        {
             return;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
@@ -2231,6 +2456,8 @@ impl MailApp {
             let subject = self.hide_codes(latest, &latest.subject);
             crate::display::notify::new_mail(
                 &a.email,
+                &a.id,
+                &latest.id,
                 (&latest.sender, &subject),
                 fresh.len(),
             );
@@ -3126,10 +3353,63 @@ impl MailApp {
         }
         self.sync_mailbox(a, self.mailbox(), SYNC_WINDOW, cx);
     }
+    /// Refresh (the button, the menu, pulling the list down): fetches new
+    /// mail for the open mailbox only, in each account it shows; see
+    /// `refresh_mailbox`. Drafts are synced as Drafts' own. An account that
+    /// can't sign in is tried again instead.
+    fn refresh_now(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.account.clone() else {
+            return;
+        };
+        if self.folder == Folder::Drafts && !self.subs_open {
+            self.refresh(cx);
+            return;
+        }
+        let ids = if fwd::is_view(&open) {
+            self.scope.accounts.clone()
+        } else {
+            vec![open]
+        };
+        for id in ids {
+            let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                continue;
+            };
+            if self.account_blocked(&id) {
+                self.retry_account(id, cx);
+                continue;
+            }
+            let mailbox = self.refresh_mailbox(&a);
+            self.manual_refresh.insert((id, mailbox.key()));
+            self.sync_mailbox(a, mailbox, SYNC_WINDOW, cx);
+        }
+        cx.notify();
+    }
+    /// What Refresh fetches in `a`: the open mailbox, or the inbox where
+    /// the open one can't be fetched on its own: Starred and All Mail over
+    /// IMAP (assembled from every folder), POP3's folders besides the
+    /// inbox (kept only here), and the subscriptions list.
+    pub(super) fn refresh_mailbox(&self, a: &Account) -> Mailbox {
+        let mailbox = self.mailbox();
+        let folder = mailbox.folder();
+        let fetchable = match a.provider {
+            Provider::Pop3 => folder == Folder::Inbox,
+            // Proton lists Starred and All Mail as labels of their own, and
+            // JMAP asks for them as queries.
+            Provider::Proton | Provider::Jmap => true,
+            _ => !matches!(folder, Folder::Starred | Folder::All),
+        };
+        if self.subs_open || !fetchable || folder == Folder::Drafts {
+            Folder::Inbox.into()
+        } else {
+            mailbox
+        }
+    }
     fn sync_mailbox(&mut self, a: Account, mailbox: Mailbox, limit: usize, cx: &mut Context<Self>) {
         let id = a.id.clone();
         let key = mailbox.key();
         if !self.sync_requests.insert((id.clone(), key.clone())) {
+            let again = self.sync_again.entry((id, key)).or_default();
+            *again = (*again).max(limit);
             return;
         }
         let inbox = mailbox == Mailbox::Standard(Folder::Inbox);
@@ -3142,6 +3422,7 @@ impl MailApp {
             self.syncing = true;
         }
         let catalog = mailbox.clone();
+        let again_mailbox = mailbox.clone();
         self.task(
             cx,
             move |b| {
@@ -3151,6 +3432,14 @@ impl MailApp {
             },
             move |this, result, cx| {
                 this.sync_requests.remove(&(id.clone(), key.clone()));
+                let again = this.sync_again.remove(&(id.clone(), key.clone()));
+                // Asked for by Refresh. A sync asked for again runs once
+                // more; that one finishes the refresh.
+                let manual = if again.is_some() {
+                    this.manual_refresh.contains(&(id.clone(), key.clone()))
+                } else {
+                    this.manual_refresh.remove(&(id.clone(), key.clone()))
+                };
                 this.account_result(&id, IssueSource::Sync(key.clone()), &result);
                 let visible = this.shows(&id) && this.mailbox().key() == key;
                 if visible {
@@ -3167,8 +3456,10 @@ impl MailApp {
                     if inbox {
                         this.note_inbox(&id, &messages);
                         // Drafts written on other devices appear, and ones
-                        // written here reach them, with the inbox's checks.
-                        let due = this
+                        // written here reach them, with the inbox's checks
+                        // (not Refresh's, which fetches only new mail).
+                        let due = !manual
+                            && this
                             .draft_synced
                             .get(&id)
                             .is_none_or(|t| t.elapsed() >= Duration::from_secs(120));
@@ -3183,10 +3474,27 @@ impl MailApp {
                         {
                             this.catalog_mailbox(a, catalog, cx);
                         }
+                    } else if manual && this.shows(&id) {
+                        // The inbox, fetched for a mailbox assembled from
+                        // others (Starred, All Mail) or the subscriptions.
+                        this.reload_if_changed(cx);
                     }
-                    if let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned() {
+                    // Downloading bodies waits for the next check, not
+                    // Refresh's.
+                    if !manual
+                        && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
+                    {
                         this.download_account(a, cx);
                     }
+                }
+                if let Some(limit) = again
+                    && let Some(a) = this.accounts.iter().find(|a| a.id == id).cloned()
+                    && !this.account_blocked(&id)
+                {
+                    this.sync_mailbox(a, again_mailbox, limit, cx);
+                } else if manual {
+                    // Not run again: the refresh ends here.
+                    this.manual_refresh.remove(&(id.clone(), key.clone()));
                 }
                 this.refresh_counts(cx);
             },
@@ -3264,6 +3572,7 @@ impl MailApp {
                     this.set_messages(ms, cx);
                     this.listed = Some(key);
                 }
+                this.apply_pending_listed(cx);
                 this.refresh(cx);
             });
         }
@@ -3448,6 +3757,96 @@ impl MailApp {
                 }
             },
         );
+    }
+    /// Opens what a tapped notification tells of: its mailbox, and the
+    /// message in it once listed. Menus and Settings over the mail close.
+    fn open_notified(
+        &mut self,
+        target: crate::display::notify::Target,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.onboarding
+            || self.retired
+            || !self.accounts.iter().any(|a| a.id == target.account)
+        {
+            return;
+        }
+        self.menu = None;
+        self.presets_for = None;
+        if self.modal == Some(Modal::Settings) {
+            self.modal = None;
+        }
+        let open = self.account.as_deref() == Some(target.account.as_str())
+            && self.mailbox() == target.mailbox
+            && !self.subs_open;
+        if !open {
+            self.open_mailbox(Some(target.account), target.mailbox, w, cx);
+        }
+        self.open_listed = None;
+        if let Some(message) = target.message {
+            let listed = (open || !self.cache_loading) && self.open_listed_message(&message, cx);
+            if !listed {
+                // Not listed yet: it may have only just arrived (a push
+                // announces it before it is synced). Whatever was open
+                // before gives way, and it opens once the list has it.
+                if self.selected.is_some() {
+                    self.html_view.update(cx, |view, cx| view.clear(cx));
+                    self.selected = None;
+                    self.read_generation += 1;
+                }
+                let until = std::time::Instant::now() + NOTIFIED_WAIT;
+                self.open_listed = Some((self.load_generation, message, until));
+                if open {
+                    self.refresh(cx);
+                }
+            }
+        }
+        if self.mobile.on {
+            self.mobile.mailboxes = false;
+            self.mobile_pushed(cx);
+        }
+        cx.notify();
+    }
+    /// Opens `message` (an id or a Message-ID) when the list has it (not
+    /// as a placeholder). True when it did.
+    fn open_listed_message(&mut self, message: &str, cx: &mut Context<Self>) -> bool {
+        let found = self
+            .messages
+            .iter()
+            .find(|m| {
+                !m.pending
+                    && (m.id == message || (!m.message_id.is_empty() && m.message_id == message))
+            })
+            .map(|m| m.id.clone());
+        let Some(id) = found else {
+            return false;
+        };
+        self.selection.clear();
+        self.selecting = false;
+        self.select_mode = false;
+        self.select(id, cx);
+        true
+    }
+    /// Opens a tapped notification's message once the open mailbox's list
+    /// has it (see `open_notified`). Another mailbox opened since, or a
+    /// message opened meanwhile, ends the wait.
+    fn apply_pending_listed(&mut self, cx: &mut Context<Self>) {
+        let Some((generation, message, until)) = self.open_listed.take() else {
+            return;
+        };
+        if generation != self.load_generation
+            || self.selected.is_some()
+            || self.subs_open
+            || std::time::Instant::now() > until
+        {
+            return;
+        }
+        if self.cache_loading || !self.open_listed_message(&message, cx) {
+            self.open_listed = Some((generation, message, until));
+        } else if self.mobile.on {
+            self.mobile_pushed(cx);
+        }
     }
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
         // A placeholder has nothing to open until it is listed.
@@ -4213,9 +4612,16 @@ impl MailApp {
                 this.discovering = false;
                 // A known service, such as a Google Workspace domain, gets
                 // that service's sign-in.
-                let service = match found.as_ref().map(|f| f.provider) {
-                    Some(Provider::Gmail) => Service::Gmail,
-                    Some(Provider::Outlook) => Service::Outlook,
+                let service = match found.as_ref() {
+                    Some(f) if f.provider == Provider::Gmail => Service::Gmail,
+                    Some(f) if f.provider == Provider::Outlook => Service::Outlook,
+                    // Fastmail, and custom domains at Fastmail.
+                    Some(f)
+                        if f.provider == Provider::Jmap
+                            && f.incoming_host == crate::sync::oauth::FASTMAIL_JMAP =>
+                    {
+                        Service::Fastmail
+                    }
                     _ => Service::Other,
                 };
                 if service != Service::Other {
@@ -4244,13 +4650,15 @@ impl MailApp {
         cx.notify();
     }
     fn set_protocol(&mut self, p: Provider, w: &mut Window, cx: &mut Context<Self>) {
-        let (old, new) = if p == Provider::Pop3 {
-            ("993", "995")
-        } else {
-            ("995", "993")
+        let port = |p: Provider| match p {
+            Provider::Pop3 => "995",
+            Provider::Jmap => "443",
+            _ => "993",
         };
-        if Self::value(&self.form[IMAP_PORT], cx).trim() == old {
-            Self::set(&self.form[IMAP_PORT], new, w, cx);
+        // The usual port follows the protocol, unless one was typed.
+        let current = Self::value(&self.form[IMAP_PORT], cx);
+        if current.trim().is_empty() || ["993", "995", "443"].contains(&current.trim()) {
+            Self::set(&self.form[IMAP_PORT], port(p), w, cx);
         }
         self.provider = p;
         self.oauth = false;
@@ -4263,8 +4671,15 @@ impl MailApp {
         let mut a = match self.service.sign_in() {
             SignIn::Pinal => Service::Pinal.account("").unwrap(),
             SignIn::Browser => {
-                let mut a = Account::new(self.service.provider());
-                let client = crate::sync::oauth::client(a.provider);
+                let mut a = self
+                    .service
+                    .account(&email)
+                    .unwrap_or_else(|| Account::new(self.service.provider()));
+                let client = if a.provider == Provider::Jmap {
+                    crate::sync::oauth::jmap_client(&a)
+                } else {
+                    crate::sync::oauth::client(a.provider)
+                };
                 a.oauth = true;
                 a.client_id = client.id;
                 a.client_secret = client.secret;
@@ -4284,6 +4699,16 @@ impl MailApp {
                     a.smtp_host = value(SMTP_HOST);
                     a.smtp_port = value(SMTP_PORT).parse().unwrap_or(0);
                     a.username = value(LOGIN);
+                    // JMAP sends through the server it reads from.
+                    if a.provider == Provider::Jmap {
+                        a.smtp_host = a.incoming_host.clone();
+                        a.smtp_port = a.incoming_port;
+                    }
+                }
+                // A JMAP server's own browser sign-in, chosen in the form.
+                if a.provider == Provider::Jmap && self.oauth {
+                    a.oauth = true;
+                    a.client_id = crate::sync::oauth::jmap_client(&a).id;
                 }
                 a
             }
@@ -4316,7 +4741,7 @@ impl MailApp {
                 self.notice(e.to_string(), true, cx);
                 return;
             }
-            if password.is_empty() {
+            if password.is_empty() && !a.oauth {
                 self.notice(
                     format!(
                         "Enter your {}.",
@@ -4580,7 +5005,7 @@ impl MailApp {
                     "Open Link in Browser"
                 },
                 "external-link",
-                Action::OpenUrl(link.clone()),
+                Action::OpenEmailLink(link.clone()),
             ));
             entries.push(entry(
                 if mailto {
@@ -4603,7 +5028,7 @@ impl MailApp {
             entries.push(entry(
                 "Open Image in Browser",
                 "external-link",
-                Action::OpenUrl(image.clone()),
+                Action::OpenEmailLink(image.clone()),
             ));
             entries.push(entry(
                 "Copy Image Address",
@@ -4692,15 +5117,7 @@ impl MailApp {
                 self.new_compose(if all { 2 } else { 1 }, w, cx)
             }
             Action::Forward => self.new_compose(3, w, cx),
-            Action::Refresh => {
-                if let Some(id) = self.account.clone() {
-                    if fwd::is_view(&id) {
-                        self.refresh(cx);
-                    } else {
-                        self.retry_account(id, cx);
-                    }
-                }
-            }
+            Action::Refresh => self.refresh_now(cx),
             Action::Select(id) => {
                 if self.folder == Folder::Drafts {
                     self.handle(Action::OpenDraft(id), w, cx);
@@ -4952,7 +5369,7 @@ impl MailApp {
             }
             Action::Start => self.begin_setup(Step::Provider, w, cx),
             Action::ChooseService(service) => self.choose_service(service, w, cx),
-            Action::OpenLink(url) => cx.open_url(url),
+            Action::OpenLink(url) => self.open_external(url, cx),
             Action::Discover => {
                 if self.step == Step::Email
                     && (self.onboarding || self.modal == Some(Modal::Connect))
@@ -5274,6 +5691,8 @@ impl MailApp {
             Action::CloseModelSheet => {
                 self.model_confirm = None;
             }
+            Action::SetBackground(on) => self.set_background(on, cx),
+            Action::SetTrayIcon(on) => self.set_tray_icon(on, cx),
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
                 if on {
@@ -5354,6 +5773,10 @@ impl MailApp {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.menu = None;
             }
+            Action::OpenEmailLink(url) => self.open_email_link(url, cx),
+            Action::LinkChoice(choice) => self.choose_link(choice, cx),
+            Action::SetLinkWarnings(on) => self.set_link_warnings(on, cx),
+            Action::UntrustSite(site) => self.untrust_site(&site, cx),
             Action::OpenUrl(url) => {
                 self.menu = None;
                 // Addresses can come from an email; only web and email links
@@ -5364,7 +5787,7 @@ impl MailApp {
                     url
                 };
                 match super::html::openable_url(&url) {
-                    Some(url) => cx.open_url(url.as_str()),
+                    Some(url) => self.open_external(url.as_str(), cx),
                     None => self.notice("Picacho only opens web and email links.", true, cx),
                 }
             }
@@ -5421,6 +5844,14 @@ impl MailApp {
             Action::Protocol(p) => {
                 if !self.connecting {
                     self.set_protocol(p, w, cx)
+                }
+            }
+            Action::JmapBrowser => {
+                if !self.connecting && self.provider == Provider::Jmap {
+                    // For this sign-in only: the form keeps its password.
+                    self.oauth = true;
+                    self.connect(cx);
+                    self.oauth = false;
                 }
             }
             Action::SubmitAccount => {
@@ -5647,6 +6078,9 @@ impl MailApp {
             return;
         };
         let window = a.sync.days != sync.days;
+        let events = (a.sync.proton_events_seconds != sync.proton_events_seconds)
+            .then(|| a.id.clone());
+        let push = a.sync.proton_push != sync.proton_push;
         a.sync = sync;
         if let Err(e) = self.backend.store.save_account(a) {
             self.notice(e.to_string(), true, cx);
@@ -5661,6 +6095,15 @@ impl MailApp {
         // A wider offline range starts downloading now; any change recounts.
         if offline != OFFLINE_WHEN_OPENED {
             self.download_account(account, cx);
+        }
+        // Proton's event watcher restarts at the new pace (or stops).
+        if let Some(id) = events {
+            self.backend.stop_watching(&id);
+            self.watch_inboxes();
+        }
+        // Proton's pushes start, stop, or take this account in or out.
+        if push {
+            self.backend.reconcile_proton_push();
         }
         self.refresh_counts(cx);
     }
@@ -6561,7 +7004,7 @@ impl MailApp {
     /// Listing a large mailbox in the background has its own progress bar
     /// and leaves Refresh available.
     fn checking_server(&self) -> bool {
-        if self.syncing {
+        if self.syncing || self.manual_refresh.iter().any(|(id, _)| self.shows(id)) {
             return true;
         }
         if self.account.is_none() || self.folder == Folder::Drafts {
@@ -7639,7 +8082,7 @@ impl MailApp {
                     div()
                         .flex()
                         .gap_2()
-                        .children([Provider::Imap, Provider::Pop3].map(|p| {
+                        .children([Provider::Imap, Provider::Pop3, Provider::Jmap].map(|p| {
                             self.button(
                                 format!("protocol-{}", p.label()),
                                 p.label(),
@@ -7665,17 +8108,39 @@ impl MailApp {
                     div()
                         .flex()
                         .gap_3()
-                        .child(self.field("Incoming server", IMAP_HOST))
+                        .child(self.field(
+                            if self.provider == Provider::Jmap {
+                                "JMAP server"
+                            } else {
+                                "Incoming server"
+                            },
+                            IMAP_HOST,
+                        ))
                         .child(div().w(px(80.)).child(self.field("Port", IMAP_PORT))),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(self.field("SMTP server", SMTP_HOST))
-                        .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
-                )
-                .child(self.field("Sign-in name, if not the email address", LOGIN));
+                // JMAP sends through the same server.
+                .when(self.provider != Provider::Jmap, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(self.field("SMTP server", SMTP_HOST))
+                            .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
+                    )
+                })
+                .child(self.field("Sign-in name, if not the email address", LOGIN))
+                .when(self.provider == Provider::Jmap, |d| {
+                    d.child(notice_box(
+                        "Some JMAP services, such as Fastmail, want an API token with mail access as the password.",
+                        c,
+                    ))
+                    .child(div().flex().child(self.link(
+                        "jmap-browser",
+                        "Sign in with the browser instead",
+                        Action::JmapBrowser,
+                        cx,
+                    )))
+                });
         }
         if let Some(why) = self.service.browser_unavailable() {
             content = content.child(notice_box(why, c));
@@ -8810,6 +9275,7 @@ impl Render for MailApp {
         self.apply_reveal(window, cx);
         self.apply_pending_place(window, cx);
         self.apply_pending_new_alias(window, cx);
+        self.apply_pending_listed(cx);
         self.sync_nickname_input(window, cx);
         SPINNING.with(|s| s.set(false));
         let root = if self.mobile.on {
@@ -8889,14 +9355,8 @@ impl MailApp {
     fn app_actions(&self, d: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
         d
             .on_action(cx.listener(|this, _: &Compose, w, cx| this.new_compose(0, w, cx)))
-            .on_action(cx.listener(|this, _: &Quit, _, cx| {
-                if this.sending {
-                    this.notice("Wait for the current message to finish sending.", true, cx);
-                } else {
-                    this.persist_draft(cx);
-                    cx.quit();
-                }
-            }))
+            .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit_app(cx)))
+            .map(android_clipboard)
             .on_action(cx.listener(|this, _: &CloseWindow, w, cx| {
                 if this.modal.is_some() {
                     this.close(w, cx);
@@ -9013,6 +9473,20 @@ impl MailApp {
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
     }
+}
+/// GPUI's Android clipboard is the app's own: text fields' Paste first takes
+/// what other apps copied, and their Copy and Cut hand it on (see
+/// `android::clipboard_from_system`). Elsewhere GPUI uses the system's.
+fn android_clipboard(d: Stateful<Div>) -> Stateful<Div> {
+    #[cfg(target_os = "android")]
+    {
+        use gpui_component::input::{Copy, Cut, Paste};
+        d.capture_action(|_: &Paste, _, cx| crate::android::clipboard_from_system(cx))
+            .capture_action(|_: &Copy, _, cx| cx.defer(crate::android::clipboard_to_system))
+            .capture_action(|_: &Cut, _, cx| cx.defer(crate::android::clipboard_to_system))
+    }
+    #[cfg(not(target_os = "android"))]
+    d
 }
 impl MailApp {
     fn main(&self, d: Stateful<Div>, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -9359,6 +9833,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "answered",
         "forwarded",
         "keyboard",
+        "grip",
     ]
     .contains(&name)
     {
@@ -9651,16 +10126,64 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
     ]
 }
 
-/// Runs the app on this system's own GPUI platform.
+/// The app's backend for `store`, announcing the provider's own notices
+/// (Proton's) as the window and the background monitor run it, and
+/// Proton's pushes for the accounts that receive them. Every process that
+/// opens the app's store (the window's, the background one, Android's
+/// service) comes here, so pushes resume with the saved registration
+/// whenever one starts.
+pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
+    let backend = Arc::new(Backend::new(store));
+    backend.on_proton_notice(|a, title, body| {
+        if a.sync.notify {
+            crate::display::notify::account_notice(&a.email, &a.id, title, body);
+        }
+    });
+    backend.on_proton_push(|a, pushed| match pushed {
+        crate::manage::backend::ProtonPushed::NewMail {
+            message,
+            sender,
+            subject,
+        } => crate::display::notify::new_mail(&a.email, &a.id, message, (sender, subject), 1),
+        crate::manage::backend::ProtonPushed::Notice { from, body } => {
+            crate::display::notify::account_notice(&a.email, &a.id, from, body)
+        }
+    });
+    backend.reconcile_proton_push();
+    backend
+}
+
+/// Runs the app on this system's own GPUI platform. `instance` answers
+/// later launches of Picacho (see `instance`).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn run(store: Arc<Store>) {
-    run_on(gpui_platform::application(), store);
+pub fn run(store: Arc<Store>, instance: Option<super::instance::Listener>) {
+    // Closing the last window may leave Picacho running in the background;
+    // the shell decides, and quits when it doesn't.
+    let app = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
+    app.on_reopen(shell::open);
+    start(app, move |cx| shell::launch(store, instance, cx));
 }
 
 /// Runs the app on `app`'s platform (a phone's comes from its activity or
-/// app delegate). On iOS this returns once the window is set up to open; the
-/// host app's delegate then opens it (`gpui_ios_did_finish_launching`).
-pub fn run_on(app: Application, store: Arc<Store>) {
+/// app delegate) with `backend`. On iOS this returns once the window is set
+/// up to open; the host app's delegate then opens it
+/// (`gpui_ios_did_finish_launching`).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn run_on(app: Application, backend: Arc<Backend>) {
+    start(app, move |cx| {
+        open_main_window(backend, cx).expect("Could not open the mail window");
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
+}
+
+/// Sets up the app, then runs `open` to open its window.
+fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
     let app = app.with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::sync::oauth::opened);
     super::desktop::register();
@@ -9676,64 +10199,7 @@ pub fn run_on(app: Application, store: Arc<Store>) {
         cx.bind_keys(bindings);
         let bindings = app_bindings(cx);
         cx.bind_keys(bindings);
-        // A desktop previewing the phone presentation opens phone-sized.
-        let (width, height) = if mobile::desktop_preview() {
-            (390., 844.)
-        } else {
-            (1280., 820.)
-        };
-        let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-        cx.open_window(
-            WindowOptions {
-                // A phone's window is the whole screen.
-                window_bounds: (!cfg!(any(target_os = "android", target_os = "ios")))
-                    .then_some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(360.), px(320.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Picacho".into()),
-                    // macOS draws the window buttons over the app's own bar.
-                    appears_transparent: cfg!(target_os = "macos"),
-                    traffic_light_position: Some(point(px(13.), px(12.))),
-                }),
-                // Draw the title bar ourselves on Linux so the topbar is the
-                // window's title bar (GNOME never offers server decorations).
-                window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
-                    .then_some(WindowDecorations::Client),
-                app_id: Some(super::desktop::APP_ID.into()),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view = cx.new(|cx| MailApp::new(store, window, cx));
-                { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
-                let close_view = view.downgrade();
-                window.on_window_should_close(cx, move |_, cx| {
-                    close_view
-                        .update(cx, |this, cx| {
-                            if this.sending {
-                                this.notice(
-                                    "Wait for the current message to finish sending.",
-                                    true,
-                                    cx,
-                                );
-                                false
-                            } else {
-                                this.persist_draft(cx);
-                                true
-                            }
-                        })
-                        .unwrap_or(true)
-                });
-                cx.new(|cx| Root::new(view, window, cx))
-            },
-        )
-        .expect("Could not open the mail window");
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        cx.activate(true);
+        open(cx);
     };
     // UIKit owns iOS's run loop, so `run` returns at once there; keep the
     // app alive for as long as the process runs.
@@ -9756,6 +10222,71 @@ pub(crate) fn version_label() -> String {
 pub(crate) const REPO_URL: &str = "https://github.com/pinaltech/Picacho";
 /// Picacho's website.
 pub(crate) const WEBSITE_URL: &str = "https://pinal.tech/apps/picacho";
+
+/// Opens the main window with a new mail view on `backend`.
+fn open_main_window(
+    backend: Arc<Backend>,
+    cx: &mut App,
+) -> anyhow::Result<(AnyWindowHandle, WeakEntity<MailApp>)> {
+    // A desktop previewing the phone presentation opens phone-sized.
+    let (width, height) = if mobile::desktop_preview() {
+        (390., 844.)
+    } else {
+        (1280., 820.)
+    };
+    let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+    let created: Rc<std::cell::RefCell<Option<WeakEntity<MailApp>>>> = Rc::default();
+    let view_slot = created.clone();
+    let window = cx.open_window(
+        WindowOptions {
+            // A phone's window is the whole screen.
+            window_bounds: (!cfg!(any(target_os = "android", target_os = "ios")))
+                .then_some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(360.), px(320.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Picacho".into()),
+                // macOS draws the window buttons over the app's own bar.
+                appears_transparent: cfg!(target_os = "macos"),
+                traffic_light_position: Some(point(px(13.), px(12.))),
+            }),
+            // Draw the title bar ourselves on Linux so the topbar is the
+            // window's title bar (GNOME never offers server decorations).
+            window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
+                .then_some(WindowDecorations::Client),
+            app_id: Some(super::desktop::APP_ID.into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            let view = cx.new(|cx| MailApp::with_backend(backend, window, cx));
+            *view_slot.borrow_mut() = Some(view.downgrade());
+            { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
+            let close_view = view.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| {
+                        if this.sending {
+                            this.notice(
+                                "Wait for the current message to finish sending.",
+                                true,
+                                cx,
+                            );
+                            false
+                        } else {
+                            this.persist_draft(cx);
+                            true
+                        }
+                    })
+                    .unwrap_or(true)
+            });
+            cx.new(|cx| Root::new(view, window, cx))
+        },
+    )?;
+    let view = created
+        .borrow_mut()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("the mail window opened without its view"))?;
+    Ok((window.into(), view))
+}
 
 /// The menu bar. On macOS the first menu is the application menu.
 fn menus() -> Vec<Menu> {
@@ -10174,6 +10705,18 @@ mod tests {
             assert_eq!(MailApp::value(&this.form[IMAP_HOST], cx), "imap.gmail.com");
         });
         act(&view, Action::SetupBack, cx);
+        // A Fastmail address gets Fastmail, over JMAP.
+        act(&view, Action::ChooseService(Service::Other), cx);
+        type_email(&view, "someone@fastmail.com", cx);
+        act(&view, Action::Discover, cx);
+        view.read_with(cx, |this, cx| {
+            assert!(this.service == Service::Fastmail && this.provider == Provider::Jmap);
+            let a = this.setup_account(cx);
+            assert_eq!(a.provider, Provider::Jmap);
+            assert_eq!(a.incoming_host, "api.fastmail.com");
+            assert!(a.validate().is_ok());
+        });
+        act(&view, Action::SetupBack, cx);
         view.read_with(cx, |this, _| assert!(this.step == Step::Provider));
         act(&view, Action::ChooseService(Service::Other), cx);
         type_email(&view, "someone@no-such-domain.invalid", cx);
@@ -10222,6 +10765,8 @@ mod tests {
             refresh_minutes: 15,
             notify: false,
             offline_days: 365,
+            proton_events_seconds: 60,
+            proton_push: true,
         };
         act(&view, Action::SetSync(first.clone(), sync), cx);
         let saved = store.accounts().unwrap();
@@ -10988,6 +11533,30 @@ mod tests {
                 .top()
         };
         assert!(top(cx, &second) < top(cx, &first));
+    }
+
+    #[gpui::test]
+    fn background_settings_are_saved_and_shown_in_general(cx: &mut TestAppContext) {
+        use crate::manage::background;
+        let (view, cx, store) = two_accounts(cx);
+        view.read_with(cx, |this, _| {
+            assert!(this.background, "runs in the background by default");
+            assert!(!this.tray_icon, "no tray icon while open by default");
+        });
+        assert!(background::enabled(&store) && !background::tray_while_open(&store));
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::General), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("background").is_some());
+        assert!(cx.debug_bounds("tray-icon").is_some());
+        act(&view, Action::SetBackground(false), cx);
+        act(&view, Action::SetTrayIcon(true), cx);
+        view.read_with(cx, |this, _| assert!(!this.background && this.tray_icon));
+        store.flush();
+        // Saved: the shell reads them when the window closes, and the next
+        // window starts from them.
+        assert!(!background::enabled(&store) && background::tray_while_open(&store));
     }
 
     #[gpui::test]

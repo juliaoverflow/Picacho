@@ -293,6 +293,8 @@ impl Backend {
     }
     /// Signs out of an account's pooled connection, if any.
     pub(super) fn disconnect(&self, id: &str) {
+        // A JMAP session holds its credentials; a new sign-in makes a new one.
+        self.jmap.lock().unwrap().remove(id);
         let pooled = self.connections.lock().unwrap().remove(id);
         if let Some(mut c) = pooled {
             let _ = c.session.logout();

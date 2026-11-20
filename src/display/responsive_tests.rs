@@ -367,3 +367,19 @@ fn app_password_sign_in_scrolls_only_when_it_does_not_fit(cx: &mut TestAppContex
         act(&view, Action::SetupBack, cx);
     }
 }
+
+/// The background keeps none of the window's state: closing it frees the
+/// whole view.
+#[gpui::test]
+fn closing_the_window_frees_the_app(cx: &mut TestAppContext) {
+    let (view, vcx, _) = two_accounts(cx);
+    let id = view.read_with(vcx, |this, _| this.messages[0].id.clone());
+    act(&view, Action::Select(id), vcx);
+    frame(vcx);
+    let weak = view.downgrade();
+    drop(view);
+    vcx.update(|w, _| w.remove_window());
+    vcx.run_until_parked();
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "MailApp outlives its window");
+}

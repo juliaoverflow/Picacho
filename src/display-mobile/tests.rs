@@ -831,3 +831,381 @@ fn the_snooze_buttons_stay_in_view(cx: &mut TestAppContext) {
         assert!(b.top() < panel.bottom(), "{b:?}");
     }
 }
+
+/// Back goes back one screen at a time; at the mailboxes, Picacho's first
+/// screen, it has nowhere to go and Android's own Back takes over.
+#[gpui::test]
+fn back_goes_back_a_screen_until_the_first(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let has_back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |this, w, cx| this.mobile_has_back(w, cx))
+    };
+    let back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |this, w, cx| this.close(w, cx));
+        settle(cx);
+    };
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    assert!(has_back(&view, cx));
+    back(&view, cx);
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert!(has_back(&view, cx));
+    back(&view, cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    assert!(!has_back(&view, cx), "the first screen leaves Back to Android");
+    // A sheet over it has somewhere to go back to again.
+    act(&view, Action::Settings, cx);
+    settle(cx);
+    assert!(has_back(&view, cx));
+}
+
+/// In setup, Back goes to the step before, as its "Back" link does, until
+/// the welcome screen.
+#[gpui::test]
+fn back_in_setup_returns_to_the_step_before(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    view.update(cx, |this, cx| {
+        this.onboarding = true;
+        this.step = Step::Email;
+        cx.notify();
+    });
+    settle(cx);
+    let step = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |this, w, cx| (this.step, this.mobile_has_back(w, cx)))
+    };
+    assert!(step(&view, cx) == (Step::Email, true), "not back to Email");
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert!(step(&view, cx) == (Step::Provider, true), "not back to Provider");
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert!(step(&view, cx) == (Step::Welcome, false), "not at Welcome");
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert!(step(&view, cx) == (Step::Welcome, false), "not at Welcome");
+}
+
+#[gpui::test]
+fn all_accounts_lists_every_accounts_subscriptions(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    assert!(view.read_with(cx, |this, _| this.shows_all_mail()));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    let row = bounds(cx, "mobile-subscriptions-all-mail");
+    cx.simulate_click(row.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::Subscriptions);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.account.as_deref(), Some(ALL_MAIL));
+    });
+}
+
+#[gpui::test]
+fn accounts_sort_by_dragging_their_handles(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    let before = view.read_with(cx, |this, _| this.mobile_sortable());
+    assert_eq!(before.len(), 2);
+    // Edit shows a row with a handle per account.
+    let edit = bounds(cx, "mobile-reorder");
+    cx.simulate_click(edit.center(), Modifiers::none());
+    let handle: &'static str =
+        Box::leak(format!("mobile-reorder-handle-{}", before[0]).into_boxed_str());
+    touchable(cx, handle);
+    // Its icon is one Picacho draws (the component library's set lacks it).
+    assert!(matches!(
+        gpui::AssetSource::load(&crate::display::assets::Assets, "mail/grip.svg"),
+        Ok(Some(_))
+    ));
+    let at = bounds(cx, handle).center();
+    let pan = |dy: f32, phase: TouchPhase, cx: &mut VisualTestContext| {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+    };
+    // Less than halfway past the next row: still in its place.
+    pan(5., TouchPhase::Started, cx);
+    pan(15., TouchPhase::Moved, cx);
+    assert_eq!(view.read_with(cx, |this, _| this.mobile_sortable()), before);
+    // Past halfway: the two swap, and the list didn't scroll.
+    pan(20., TouchPhase::Moved, cx);
+    pan(0., TouchPhase::Ended, cx);
+    let after = view.read_with(cx, |this, _| this.mobile_sortable());
+    assert_eq!(after, vec![before[1].clone(), before[0].clone()]);
+    view.read_with(cx, |this, _| {
+        assert!(this.mobile.reorder_drag.is_none());
+        assert_eq!(this.mobile.mailboxes_scroll.offset().y, px(0.));
+    });
+    // Done goes back to the mailboxes, in the new order.
+    let done = bounds(cx, "mobile-reorder");
+    cx.simulate_click(done.center(), Modifiers::none());
+    assert!(!view.read_with(cx, |this, _| this.mobile.reordering));
+    let first: &'static str = Box::leak(format!("mobile-account-{}", after[0]).into_boxed_str());
+    let second: &'static str = Box::leak(format!("mobile-account-{}", after[1]).into_boxed_str());
+    assert!(bounds(cx, first).top() < bounds(cx, second).top());
+}
+
+#[gpui::test]
+fn going_back_beside_the_list_moves_only_the_column_that_changes(cx: &mut TestAppContext) {
+    let (view, cx) = phone(TABLET, cx);
+    let id = first_message(&view, cx);
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::Select(id.clone()), w, cx)
+    });
+    // Opening the message: only the reader's column comes in.
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    let list = bounds(cx, "mobile-list");
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    // Back closes the message; the list stays where it is.
+    act(&view, Action::Close, cx);
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::List);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    assert_eq!(
+        cx.debug_bounds("mobile-screen").map(|b| b.origin),
+        Some(point(px(0.), px(0.))),
+        "the whole screen moved"
+    );
+    assert_eq!(cx.debug_bounds("mobile-list"), Some(list));
+    // An edge swipe goes back too, without dragging the screen along.
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::Select(id.clone()), w, cx)
+    });
+    settle(cx);
+    let at = point(px(4.), px(400.));
+    for (dx, phase) in [
+        (12., TouchPhase::Started),
+        (60., TouchPhase::Moved),
+        (40., TouchPhase::Moved),
+    ] {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+        view.read_with(cx, |this, _| {
+            assert!(
+                this.mobile.back_drag.is_none(),
+                "the screen follows the finger"
+            );
+            assert!(this.mobile.swipe.is_none(), "a row swipes");
+        });
+    }
+    assert_eq!(screen(&view, cx), Screen::Reader, "back before letting go");
+    cx.simulate_event(ScrollEvent {
+        position: at,
+        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Ended,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::List);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    // A short one doesn't.
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::Select(id.clone()), w, cx)
+    });
+    settle(cx);
+    for (dx, phase) in [(10., TouchPhase::Started), (0., TouchPhase::Ended)] {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            ..Default::default()
+        });
+    }
+    assert_eq!(screen(&view, cx), Screen::Reader);
+}
+
+#[gpui::test]
+fn the_filter_chips_fade_where_more_are_scrolled_past(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    // At the start: more to the trailing side only.
+    assert!(!shown(cx, "mobile-filters-fade-leading"));
+    assert!(shown(cx, "mobile-filters-fade-trailing"));
+    let row = bounds(cx, "mobile-filters");
+    let fade = bounds(cx, "mobile-filters-fade-trailing");
+    assert_eq!(fade.right(), row.right());
+    let max = view.read_with(cx, |this, _| this.mobile.filters_scroll.max_offset().x);
+    assert!(max > px(0.), "the chips don't overflow a phone");
+    // Partway: both sides.
+    view.update(cx, |this, cx| {
+        this.mobile
+            .filters_scroll
+            .set_offset(point(-max / 2., px(0.)));
+        cx.notify();
+    });
+    assert!(shown(cx, "mobile-filters-fade-leading"));
+    assert!(shown(cx, "mobile-filters-fade-trailing"));
+    // At the end: the leading side only.
+    view.update(cx, |this, cx| {
+        this.mobile.filters_scroll.set_offset(point(-max, px(0.)));
+        cx.notify();
+    });
+    assert!(shown(cx, "mobile-filters-fade-leading"));
+    assert!(!shown(cx, "mobile-filters-fade-trailing"));
+    assert_eq!(bounds(cx, "mobile-filters-fade-leading").left(), row.left());
+    // The fades take no taps: the chip under one still turns on.
+    let fade = bounds(cx, "mobile-filters-fade-leading");
+    let at = point(fade.center().x, row.center().y);
+    let (filter, chip) = [
+        (Filter::Unread, "mobile-filter-unread"),
+        (Filter::Starred, "mobile-filter-starred"),
+        (Filter::Attachments, "mobile-filter-attachments"),
+    ]
+    .into_iter()
+    .find(|(_, chip)| cx.debug_bounds(chip).is_some_and(|b| b.contains(&at)))
+    .expect("a chip under the fade");
+    cx.simulate_click(at, Modifiers::none());
+    assert!(
+        view.read_with(cx, |this, _| this.filter_by == filter),
+        "{chip} under the fade didn't turn on"
+    );
+}
+
+#[gpui::test]
+fn settings_beside_its_list_go_back_in_the_pages_column(cx: &mut TestAppContext) {
+    let (view, cx) = phone(TABLET, cx);
+    view.update_in(cx, |this, w, cx| this.mobile_open_settings(w, cx));
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Settings);
+    // Choosing a page moves only the page's column, not the screen.
+    let forwarding = bounds(cx, "mobile-settings-forwarding");
+    cx.simulate_click(forwarding.center(), Modifiers::none());
+    cx.run_until_parked();
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.page == Page::Forwarding);
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    assert_eq!(
+        cx.debug_bounds("mobile-screen").map(|b| b.origin),
+        Some(point(px(0.), px(0.))),
+        "the whole screen moved"
+    );
+    // A back swipe doesn't drag the screen along.
+    view.update_in(cx, |this, w, cx| {
+        let e = BackGestureEvent {
+            phase: BackGesturePhase::Started,
+            progress: 0.3,
+            ..Default::default()
+        };
+        this.mobile_back_gesture(&e, w, cx);
+    });
+    view.read_with(cx, |this, _| {
+        assert!(this.mobile.back_drag.is_none(), "the screen follows the finger")
+    });
+    // Reverse aliases go back to Forwarding, in their column.
+    view.update(cx, |this, cx| {
+        this.fwd_reverse = Some("sl:1".into());
+        cx.notify();
+    });
+    settle(cx);
+    act(&view, Action::Close, cx);
+    frame(cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.fwd_reverse.is_none());
+        assert!(this.modal == Some(Modal::Settings), "Settings closed");
+        assert!(this.page == Page::Forwarding);
+        assert_eq!(this.mobile_pane_slide(), Some(Some(SplitPane::Reader)));
+    });
+    assert_eq!(
+        cx.debug_bounds("mobile-screen").map(|b| b.origin),
+        Some(point(px(0.), px(0.))),
+        "the whole screen moved"
+    );
+    // Then Back leaves Settings.
+    act(&view, Action::Close, cx);
+    assert_ne!(screen(&view, cx), Screen::Settings);
+}
+
+#[gpui::test]
+fn all_accounts_names_itself_under_the_mailbox(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    view.update_in(cx, |this, w, cx| {
+        this.open_mailbox(Some(ALL_MAIL.into()), Folder::Inbox.into(), w, cx)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert_eq!(
+            this.mobile_list_subtitle("Inbox").as_deref(),
+            Some("All Accounts")
+        );
+    });
+    // An account's mailbox says whose it is.
+    let (id, email) = view.read_with(cx, |this, _| {
+        (this.accounts[1].id.clone(), this.accounts[1].email.clone())
+    });
+    view.update_in(cx, |this, w, cx| {
+        this.open_mailbox(Some(id), Folder::Inbox.into(), w, cx)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.mobile_list_subtitle("Inbox"), Some(email));
+    });
+}
+
+#[gpui::test]
+fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    view.update(cx, |this, cx| {
+        this.mobile.on = true;
+        this.mobile.fake_insets = Some(NOTCH);
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(PHONE.0), px(PHONE.1)));
+    let account = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    view.update_in(cx, |this, w, cx| {
+        this.open_mailbox(Some(account.clone()), Folder::Inbox.into(), w, cx)
+    });
+    cx.run_until_parked();
+    // An older message is open.
+    let old = first_message(&view, cx);
+    act(&view, Action::Select(old.clone()), cx);
+    assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(old));
+    // A notification for mail not synced yet: the older one doesn't stay.
+    let new = format!("{account}:just-in");
+    view.update_in(cx, |this, w, cx| {
+        let target = crate::display::notify::Target {
+            account: account.clone(),
+            mailbox: Folder::Inbox.into(),
+            message: Some(new.clone()),
+        };
+        this.open_notified(target, w, cx)
+    });
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.selected, None, "the older message is still open");
+    });
+    // Once it is synced and listed, it opens.
+    let mut mail = crate::manage::model::demo_mail()
+        .into_iter()
+        .find(|m| m.folder == Folder::Inbox)
+        .unwrap();
+    mail.account = account.clone();
+    mail.id = new.clone();
+    mail.message_id = "<just-in@example.com>".into();
+    mail.date = chrono::Utc::now().timestamp();
+    store.save_messages(&[mail]).unwrap();
+    view.update(cx, |this, cx| this.reload_cached(cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(new));
+    assert_eq!(screen(&view, cx), Screen::Reader);
+}

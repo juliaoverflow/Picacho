@@ -1584,6 +1584,32 @@ pub fn read_secret(id: &str) -> Result<Secret> {
     )
     .context("Saved credentials could not be read")
 }
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use keyring::Error as KeychainError;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+use keyring_core::Error as KeychainError;
+/// A keychain entry's text as stored, or `None` when there is none.
+pub fn read_secret_text(id: &str) -> Result<Option<String>> {
+    match secret_entry(id)?.get_password() {
+        Ok(text) => Ok(Some(text)),
+        Err(KeychainError::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context("The keychain entry is locked, or access was denied")),
+    }
+}
+/// Saves text to a keychain entry, replacing what it had.
+pub fn write_secret_text(id: &str, text: &str) -> Result<()> {
+    secret_entry(id)?
+        .set_password(text)
+        .context("Could not securely save to the system keychain")
+}
+/// Removes a keychain entry; one that isn't there is already removed.
+pub fn delete_secret(id: &str) -> Result<()> {
+    match secret_entry(id)?.delete_credential() {
+        Ok(()) | Err(KeychainError::NoEntry) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context("Could not remove a keychain entry")),
+    }
+}
 pub fn write_secret(id: &str, s: &Secret) -> Result<()> {
     secret_entry(id)?
         .set_password(&serde_json::to_string(s)?)

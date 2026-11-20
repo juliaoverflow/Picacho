@@ -1044,6 +1044,15 @@ const SYSTEM_KEYWORDS: [&str; 16] = [
     "$AutoNotJunk",
     "$Important",
 ];
+/// Whether a JMAP keyword is a label a person set: not IMAP's system flags
+/// (`$seen`, `$flagged`, `$answered`, `$draft`, which JMAP spells as
+/// keywords) nor `SYSTEM_KEYWORDS`.
+pub(crate) fn label_keyword(k: &str) -> bool {
+    !["$seen", "$flagged", "$answered", "$draft", "$recent"]
+        .iter()
+        .chain(SYSTEM_KEYWORDS.iter())
+        .any(|s| s.eq_ignore_ascii_case(k))
+}
 /// A label as an IMAP keyword: an atom, which can't hold spaces or IMAP's
 /// special characters.
 pub(crate) fn keyword(label: &str) -> Result<String> {

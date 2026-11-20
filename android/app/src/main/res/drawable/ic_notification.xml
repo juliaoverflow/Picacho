@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The status bar icon: android/icon/monochrome.svg's logo, centered. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="680"
+    android:viewportHeight="680">
+    <group
+        android:translateX="20"
+        android:translateY="70">
+        <group>
+            <clip-path android:pathData="M 40 396 L 40 352 L 222 201 Q 228 196 235 200 L 258 214 L 318 88 Q 330 64 344 86 L 600 352 L 600 396 Q 600 403 592 397 C 550 362 493 339 432 327 Q 320 306 208 327 C 147 339 90 362 48 397 Q 40 403 40 396 Z" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M 0 0 L 640 0 L 640 196 L 320 262 L 0 196 Z" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M 0 216 L 320 282 L 640 216 L 640 540 L 0 540 Z" />
+        </group>
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M 40 500 A 280 142 0 0 1 600 500 Z" />
+    </group>
+</vector>

@@ -16,7 +16,7 @@ use protected_email_bridge::{
     api::{
         ApiClient, HumanVerification, SessionTokens,
         mail::MessageFilter,
-        types::{Label, MessageEvent, MessageMetadata, label_type},
+        types::{Label, MessageEvent, MessageMetadata, Notification, label_type},
     },
     auth,
     config::{DeploymentConfig, GatewaySettings, LocalArtifacts},
@@ -110,8 +110,13 @@ fn config() -> Arc<DeploymentConfig> {
         .clone()
 }
 
+/// The deployment every Proton client here uses (push's too).
+pub(crate) fn deployment() -> Arc<DeploymentConfig> {
+    config()
+}
+
 /// One runtime for every Proton account, started on first use.
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -219,13 +224,47 @@ pub struct SignedIn {
     pub addresses: Vec<String>,
 }
 
+/// The check's result from one of Proton's verification page's messages
+/// (`display::verify` on desktops, `android::verify`), if it is the one
+/// saying it passed: (token, type). `Err` when the page asks to close.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+pub(crate) fn verification_result(message: &str) -> std::result::Result<Option<(String, String)>, ()> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return Ok(None);
+    };
+    let text = |v: &serde_json::Value| v.as_str().map(str::trim).unwrap_or_default().to_owned();
+    let (token, kind) = match value["type"].as_str().unwrap_or_default() {
+        // verify.proton.me
+        "HUMAN_VERIFICATION_SUCCESS" => (
+            text(&value["payload"]["token"]),
+            text(&value["payload"]["type"]),
+        ),
+        // Proton's older CAPTCHA page (/core/v4/captcha)
+        "pm_captcha" => (text(&value["token"]), "captcha".to_owned()),
+        "CLOSE" | "HUMAN_VERIFICATION_CLOSE" => return Err(()),
+        _ => return Ok(None),
+    };
+    let fits = |s: &str, max: usize| {
+        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_graphic())
+    };
+    if !fits(&token, 4096) {
+        return Ok(None);
+    }
+    let kind = if fits(&kind, 32) {
+        kind
+    } else {
+        "captcha".to_owned()
+    };
+    Ok(Some((token, kind)))
+}
+
 /// The argument that starts Picacho as Proton's verification window
 /// (`display::verify`) rather than as the app.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const VERIFY_FLAG: &str = "--proton-verify";
 
 /// Proton's verification page for a sign-in it wants checked.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 fn verification_url(methods: &[String], token: &str) -> String {
     let methods: Vec<&str> = methods
         .iter()
@@ -263,11 +302,23 @@ fn verified(output: &[u8]) -> Option<HumanVerification> {
 /// text where it offers those) in the system webview, in a window of its
 /// own, and waits until it passes, the window is closed, or the sign-in is
 /// cancelled.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 fn verify_human(_: &[String], _: &str, _: &AtomicBool) -> Result<HumanVerification> {
     bail!(
-        "Proton wants to check that it's you, but its check can't be shown on phones yet. Sign in once at account.proton.me and try again."
+        "Proton wants to check that it's you, but its check can't be shown on iPhones yet. Sign in once at account.proton.me and try again."
     )
+}
+/// On Android the page opens in an activity of its own, with a WebView
+/// (`VerifyActivity`).
+#[cfg(target_os = "android")]
+fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<HumanVerification> {
+    match crate::android::verify(&verification_url(methods, token), cancel)? {
+        Some((token, kind)) => Ok(HumanVerification {
+            token,
+            methods: vec![kind],
+        }),
+        None => bail!("Proton's check was closed before it finished. Sign in again to try it again."),
+    }
 }
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<HumanVerification> {
@@ -541,6 +592,18 @@ impl Drop for Login {
     }
 }
 
+/// What Proton's event stream said since an earlier event.
+pub struct Events {
+    /// The newest event id, to ask from next time.
+    pub latest: String,
+    /// Message changes.
+    pub messages: Vec<MessageEvent>,
+    /// Proton says to refresh everything.
+    pub refresh: bool,
+    /// Account notices Proton shows its users (`Notifications`).
+    pub notices: Vec<Notification>,
+}
+
 /// Ends a saved session at Proton (removing the account here).
 pub fn sign_out(saved: &Saved) {
     block_on(async {
@@ -669,6 +732,16 @@ impl Session {
         let mut renewed = self.renewed.lock().unwrap();
         if renewed.is_none() {
             *renewed = Some(saved.tokens());
+        }
+    }
+    /// What registering this session for push notifications needs
+    /// (`proton_push`); `account` is Picacho's id for the account.
+    pub fn push_registration(&self, account: &str) -> crate::sync::proton_push::Registration {
+        crate::sync::proton_push::Registration {
+            account: account.to_owned(),
+            uid: self.saved.lock().unwrap().uid.clone(),
+            user_id: self.ctx.user_id(),
+            client: self.ctx.client.clone(),
         }
     }
     /// The account's folders and labels (not Proton's own mailboxes).
@@ -872,9 +945,8 @@ impl Session {
     pub fn latest_event(&self) -> Result<String> {
         block_on(self.ctx.client.get_latest_event_id()).explained()
     }
-    /// What changed since event `since`: the newest event id, the message
-    /// changes, and whether Proton says to refresh everything.
-    pub fn events_since(&self, since: &str) -> Result<(String, Vec<MessageEvent>, bool)> {
+    /// What changed since event `since`; see `Events`.
+    pub fn events_since(&self, since: &str) -> Result<Events> {
         let events = block_on(self.ctx.client.get_events_chained(since)).explained()?;
         let latest = events
             .last()
@@ -884,8 +956,18 @@ impl Session {
         if events.iter().any(|e| !e.labels.is_empty()) {
             let _ = self.reload_folders();
         }
-        let messages = events.into_iter().flat_map(|e| e.messages).collect();
-        Ok((latest, messages, refresh))
+        let mut messages = Vec::new();
+        let mut notices = Vec::new();
+        for e in events {
+            messages.extend(e.messages);
+            notices.extend(e.notifications);
+        }
+        Ok(Events {
+            latest,
+            messages,
+            refresh,
+            notices,
+        })
     }
     /// Every message of a mailbox, newest first, up to `most`.
     pub fn list_all(&self, label_id: &str, most: usize) -> Result<Vec<MessageMetadata>> {

@@ -62,8 +62,8 @@ pub struct Snoozed {
     pub until: i64,
     /// The server folder it waits in.
     pub folder: String,
-    /// Proton (without Bridge): its message ids, which don't change when it
-    /// moves, so it is found again by them rather than its Message-ID.
+    /// Proton (without Bridge) and JMAP: its message ids, which don't change
+    /// when it moves, so it is found again by them rather than its Message-ID.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ids: Vec<String>,
 }
@@ -205,6 +205,9 @@ impl Backend {
         if a.provider == Provider::Proton {
             return self.snooze_proton(a, &current, until);
         }
+        if a.provider == Provider::Jmap {
+            return self.snooze_jmap(a, &current, until);
+        }
         self.with_imap(a, |c| {
             self.replay_offline(c, a)?;
             let folder = self.snooze_folder(c, a)?;
@@ -255,6 +258,9 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Proton {
             return self.wake_due_proton(a);
+        }
+        if a.provider == Provider::Jmap {
+            return self.wake_due_jmap(a);
         }
         self.with_imap(a, |c| {
             let list = self.merged_snoozed(c, &a.id)?;
@@ -416,6 +422,144 @@ impl Backend {
             let mut rows = Vec::new();
             for id in &still {
                 if let Some(mut m) = self.store.message(&super::proton::row_id(a, id))? {
+                    m.folder = Folder::Inbox;
+                    m.remote_folder = "Inbox".into();
+                    m.unread = true;
+                    rows.push(m);
+                }
+            }
+            self.store.save_messages(&rows)?;
+            Ok(true)
+        })
+    }
+    /// JMAP: snoozed mail waits in Picacho/Snoozed on the server, made if
+    /// missing; the times are kept on this computer, with the messages'
+    /// ids, which stay the same when they move.
+    fn snooze_jmap(&self, a: &Account, current: &[Mail], until: i64) -> Result<String> {
+        let folder = self.with_jmap(a, |s| {
+            let places = super::jmap::places(&s.reload_mailboxes()?);
+            let parent = match places
+                .iter()
+                .find(|p| p.folder.is_none() && p.depth == 0 && p.path.eq_ignore_ascii_case(PARENT))
+            {
+                Some(p) => p.clone(),
+                None => {
+                    let id = s.create_mailbox(PARENT, None)?;
+                    super::jmap::places(&s.mailboxes()?)
+                        .into_iter()
+                        .find(|p| p.id == id)
+                        .context("The server didn't keep the new folder.")?
+                }
+            };
+            let inside = format!("{}/{FOLDER}", parent.path);
+            let places = super::jmap::places(&s.mailboxes()?);
+            let path = match places
+                .iter()
+                .find(|p| p.folder.is_none() && p.path.eq_ignore_ascii_case(&inside))
+            {
+                Some(p) => p.path.clone(),
+                None => {
+                    s.create_mailbox(FOLDER, Some(&parent.id))?;
+                    inside
+                }
+            };
+            self.store.save_folders(
+                &a.id,
+                &super::jmap::remote_folders(&super::jmap::places(&s.mailboxes()?)),
+            )?;
+            Ok(path)
+        })?;
+        let moving: Vec<Mail> = current
+            .iter()
+            .filter(|m| !(m.folder == Folder::Other && m.remote_folder == folder))
+            .cloned()
+            .collect();
+        if !moving.is_empty() {
+            let change = Change::MoveTo(folder.clone());
+            self.change_jmap(a, &moving, &change)?;
+            self.commit_change(&moving, change, false)?;
+        }
+        let mut list = self.snoozed(&a.id);
+        for m in current {
+            list.retain(|s| s.message_id != m.message_id);
+            list.push(Snoozed {
+                message_id: m.message_id.trim().to_owned(),
+                subject: m.subject.clone(),
+                sender: m.sender.clone(),
+                until,
+                folder: folder.clone(),
+                ids: super::jmap::jmap_id(a, m)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        self.save_snoozed(None, &a.id, &list)?;
+        Ok(folder)
+    }
+    /// JMAP: brings back the messages whose time has come.
+    fn wake_due_jmap(&self, a: &Account) -> Result<Vec<Snoozed>> {
+        let now = chrono::Utc::now().timestamp();
+        let (due, waiting): (Vec<Snoozed>, Vec<Snoozed>) = self
+            .snoozed(&a.id)
+            .into_iter()
+            .partition(|s| s.until <= now);
+        if due.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut woken = Vec::new();
+        let mut kept = waiting;
+        for s in due {
+            match self.wake_jmap(a, &s) {
+                Ok(true) => woken.push(s),
+                // Moved out of Snoozed by hand, or its folder is gone.
+                Ok(false) => {}
+                Err(e) if crate::sync::retry::later(&e) => {
+                    kept.push(s);
+                    self.save_snoozed(None, &a.id, &kept)?;
+                    return Err(e);
+                }
+                Err(_) => {}
+            }
+        }
+        self.save_snoozed(None, &a.id, &kept)?;
+        Ok(woken)
+    }
+    /// JMAP: moves one snoozed message back to the inbox, unread. Whether
+    /// it was still in the Snoozed folder.
+    fn wake_jmap(&self, a: &Account, s: &Snoozed) -> Result<bool> {
+        if s.ids.is_empty() {
+            return Ok(false);
+        }
+        self.with_jmap(a, |j| {
+            let places = super::jmap::places(&j.mailboxes()?);
+            let Ok(snoozed) = super::jmap::mailbox_id(&places, &Mailbox::Remote(s.folder.clone()))
+            else {
+                return Ok(false);
+            };
+            let inbox = super::jmap::mailbox_id(&places, &Mailbox::Standard(Folder::Inbox))?;
+            let still: Vec<String> = j
+                .emails(&s.ids)?
+                .into_iter()
+                .filter(|e| e.in_mailbox(&snoozed))
+                .map(|e| e.id)
+                .collect();
+            if still.is_empty() {
+                return Ok(false);
+            }
+            let patches: serde_json::Map<String, serde_json::Value> = still
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        serde_json::json!({ "mailboxIds": { &inbox: true }, "keywords/$seen": null }),
+                    )
+                })
+                .collect();
+            j.update(patches)?;
+            let mut rows = Vec::new();
+            for id in &still {
+                if let Some(mut m) = self.store.message(&super::jmap::row_id(a, id))? {
                     m.folder = Folder::Inbox;
                     m.remote_folder = "Inbox".into();
                     m.unread = true;

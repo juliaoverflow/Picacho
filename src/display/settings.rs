@@ -504,6 +504,7 @@ impl MailApp {
                 self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
                     .debug_selector(|| "all-mail".into()),
             ))
+            .map(|d| self.background_settings(d, cx))
             // A phone lists About in Settings' own list instead.
             .when(!self.mobile.on, |d| d.child(self.section("Picacho")).child(
                 div()
@@ -560,6 +561,7 @@ impl MailApp {
             self.retrying.contains(&a.id) || self.sync_requests.iter().any(|(id, _)| id == &a.id);
         // Red for a sign-in problem; otherwise yellow warnings.
         let critical = self.issues_critical(&a.id);
+        let sign_in = issues.iter().any(|(_, issue)| issue.access.is_some());
         let tone = if critical { c.danger } else { c.warning };
         div()
             .id("account-error-details")
@@ -645,8 +647,9 @@ impl MailApp {
                         )
                         .when(busy, |d| d.opacity(0.6)),
                     )
-                    // Signing in again fixes sign-in problems, not warnings.
-                    .when(critical, |d| {
+                    // Signing in again fixes sign-in problems, not warnings
+                    // or push registrations.
+                    .when(sign_in, |d| {
                         d.child(self.button(
                             "account-reconnect",
                             "Sign In Again",
@@ -727,7 +730,60 @@ impl MailApp {
             .child(self.setting(
                 "Remove tracking from links", "Take campaign and click identifiers (such as utm_source and fbclid) out of links, and open the real address behind known redirects (Google, Outlook Safe Links, Facebook). Applies to every email.", clean,
             ))
+            // Phones warn before opening a link; desktops show its address
+            // on hover instead.
+            .when(self.mobile.on, |d| d.child(self.link_warning_settings(cx)))
             .into_any_element()
+    }
+    /// Warn before opening links, and the sites trusted not to (phones).
+    fn link_warning_settings(&self, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let warn = self
+            .switch(
+                "link-warnings".into(),
+                self.links.warn,
+                Action::SetLinkWarnings(!self.links.warn),
+                cx,
+            )
+            .debug_selector(|| "link-warnings".into());
+        let trusted = &self.links.trusted;
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(self.setting(
+                "Warn before opening links",
+                "Show where a link in an email goes, and ask before opening it. Links are how fake sign-in pages steal passwords.",
+                warn,
+            ))
+            .when(self.links.warn, |d| {
+                d.child(self.setting(
+                    "Trusted sites",
+                    if trusted.is_empty() {
+                        "Links to sites you trust open without asking. Trust a site from the warning."
+                    } else {
+                        "Links to these sites, and the sites under them, open without asking."
+                    },
+                    div().flex().flex_col().gap_2().children(trusted.iter().enumerate().map(
+                        |(i, site)| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(icon_el("shield", 16., c.muted))
+                                .child(div().flex_1().min_w_0().truncate().child(site.clone()))
+                                .child(self.button(
+                                    format!("untrust-site-{i}"),
+                                    "Remove",
+                                    "",
+                                    Action::UntrustSite(site.clone()),
+                                    false,
+                                    cx,
+                                ))
+                        },
+                    )),
+                ))
+            })
     }
     pub(super) fn composing_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -878,6 +934,13 @@ impl MailApp {
                 "Replies quote the message they answer.",
                 toggle("quote-original", o.quote_original, &|o| {
                     o.quote_original = !o.quote_original
+                }),
+            ))
+            .child(row(
+                "Paste with formatting",
+                "Text copied with bold, links or lists keeps them. After pasting you can switch to the other.",
+                toggle("paste-formatted", o.paste_formatted, &|o| {
+                    o.paste_formatted = !o.paste_formatted
                 }),
             ))
             .child(self.section("Sending"))
@@ -1193,7 +1256,32 @@ impl MailApp {
                         .collect(),
                     cx,
                 ),
-            ))
+            ));
+        if a.provider == Provider::Proton {
+            page = page.child(self.setting(
+                "Check Proton for changes",
+                if sync.proton_events_seconds == 0 {
+                    "New mail, moves and notices from Proton appear at the next check for new mail."
+                } else {
+                    "How often Picacho asks Proton about new mail, moves and notices. Less often uses less data and battery."
+                },
+                self.segmented(
+                    &format!("proton-events-{}", a.id),
+                    [(15, "15 sec"), (30, "30 sec"), (60, "1 min"), (300, "5 min"), (900, "15 min"), (0, "Off")]
+                        .into_iter()
+                        .map(|(seconds, label)| {
+                            (
+                                label.to_owned(),
+                                set(SyncSettings { proton_events_seconds: seconds, ..sync }),
+                                sync.proton_events_seconds == seconds,
+                            )
+                        })
+                        .collect(),
+                    cx,
+                ),
+            ));
+        }
+        page = page
             .child(
                 div()
                     .flex()
@@ -1215,7 +1303,9 @@ impl MailApp {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(rgb(c.muted))
-                                    .child(if sync.refresh_minutes == 0 {
+                                    .child(if a.pushes_new_mail() {
+                                        "Announce new inbox mail. Proton's push notifications announce it as it arrives, so checks for new mail don't."
+                                    } else if sync.refresh_minutes == 0 {
                                         "Announce new inbox mail. Only works while Picacho checks for mail."
                                     } else {
                                         "Announce new inbox mail while Picacho is in the background."
@@ -1225,10 +1315,18 @@ impl MailApp {
                     .child(self.switch(
                         format!("notify-{}", a.id),
                         sync.notify,
-                        set(SyncSettings { notify: !sync.notify, ..sync }),
+                        // Push needs Notifications: turning them off turns it off too.
+                        set(SyncSettings {
+                            notify: !sync.notify,
+                            proton_push: sync.proton_push && !sync.notify,
+                            ..sync
+                        }),
                         cx,
                     )),
             )
+            .when(a.provider == Provider::Proton, |page| {
+                page.child(self.proton_push_setting(a, cx))
+            })
             .child(self.section("Account"))
             .child(
                 div()
@@ -1263,6 +1361,31 @@ impl MailApp {
 }
 
 impl MailApp {
+    /// Proton's push notifications for a Proton Direct account: offered
+    /// while its Notifications are on, and announcing new mail in place of
+    /// the regular checks once turned on.
+    fn proton_push_setting(&self, a: &Account, cx: &Context<Self>) -> Div {
+        const TITLE: &str = "Push notifications";
+        let sync = a.sync;
+        if !crate::sync::proton_push::available() {
+            return self.setting(
+                TITLE,
+                "This copy of Picacho was built without a Firebase project, so it can't receive Proton's push notifications.",
+                div(),
+            );
+        }
+        if !sync.notify {
+            return self.setting(TITLE, "Turn on Notifications to receive Proton's push notifications.", div());
+        }
+        self.switch_setting(
+            TITLE,
+            "Proton sends new mail and its notices here as it would to its Android app, so they arrive at once. Picacho must be running, in the background too.",
+            format!("proton-push-{}", a.id),
+            sync.proton_push,
+            Action::SetSync(a.id.clone(), SyncSettings { proton_push: !sync.proton_push, ..sync }),
+            cx,
+        )
+    }
     /// An account's other sending addresses, and the form for adding or
     /// changing one.
     fn identities_setting(&self, a: &Account, cx: &Context<Self>) -> Div {
@@ -1489,6 +1612,47 @@ impl MailApp {
         .into_any_element()
     }
 
+    /// Running in the background once Picacho's windows close, and its tray
+    /// icon (desktop); its mail service (Android). iOS has neither.
+    fn background_settings(&self, page: Div, cx: &Context<Self>) -> Div {
+        let background = self
+            .switch(
+                "background".into(),
+                self.background,
+                Action::SetBackground(!self.background),
+                cx,
+            )
+            .debug_selector(|| "background".into());
+        if cfg!(target_os = "ios") {
+            return page;
+        }
+        if cfg!(target_os = "android") {
+            return page.child(self.section("Background")).child(self.toggle_row(
+                "Check for mail in the background",
+                "After Picacho is closed, keep checking for new mail and notify you of it, send scheduled mail, and bring back snoozed mail. Android shows an ongoing notification while Picacho does.",
+                background,
+            ));
+        }
+        let tray = self
+            .switch(
+                "tray-icon".into(),
+                self.tray_icon,
+                Action::SetTrayIcon(!self.tray_icon),
+                cx,
+            )
+            .debug_selector(|| "tray-icon".into());
+        page.child(self.section("Background"))
+            .child(self.toggle_row(
+                "Keep running in the background",
+                "When you close Picacho's window, keep checking for new mail and notify you of it, send scheduled mail, and bring back snoozed mail. Open Picacho again or quit it from its icon in the tray.",
+                background,
+            ))
+            .child(self.toggle_row(
+                "Show tray icon while open",
+                "Also show Picacho's tray icon while its window is open. It always shows while Picacho runs in the background.",
+                tray,
+            ))
+    }
     /// Moves Settings between a dialog, the full main window and a window
     /// of its own, keeping the page and everything on it.
     pub(super) fn place_settings(

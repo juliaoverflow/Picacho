@@ -643,3 +643,46 @@ fn server_search_line_stays_inside_a_narrow_list(cx: &mut TestAppContext) {
         );
     }
 }
+
+#[gpui::test]
+fn a_long_press_selects_a_word_in_an_email_and_offers_to_copy_it(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some(
+            "<p style='margin:0; font: 16px monospace'>Your code is ABCD1234 today</p>".into(),
+        );
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    // The email is laid out on its own thread.
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..40 {
+            frame(cx);
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    settle(cx);
+    let email = cx.debug_bounds("html-email").unwrap();
+    // "ABCD1234" starts 13 characters in, past the body's 12px margin.
+    let word = point(email.left() + px(12. + 9.6 * 15.), email.top() + px(22.));
+    let press = |phase, cx: &mut VisualTestContext| {
+        cx.simulate_event(LongPressEvent {
+            phase,
+            start_position: word,
+            position: word,
+        })
+    };
+    press(TouchPhase::Started, cx);
+    press(TouchPhase::Ended, cx);
+    settle(cx);
+    view.read_with(cx, |this, _| {
+        let menu = this.menu.as_ref().expect("lifting the finger opens the menu");
+        assert!(
+            menu.entries.iter().any(|e| matches!(e,
+                Entry::Item { label, action: Action::CopyText(text), .. }
+                    if label.as_ref() == "Copy" && text == "ABCD1234")),
+            "the pressed word is offered to copy"
+        );
+    });
+}

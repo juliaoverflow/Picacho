@@ -54,7 +54,10 @@ pub extern "C" fn picacho_ios_start() -> bool {
     // The platform keeps the launch callback for `gpui_ios_did_finish_launching`.
     ffi::gpui_ios_initialize();
     let platform = Rc::new(gpui_mobile::ios::IosPlatform::new());
-    display::run_on(gpui::Application::with_platform(platform), store);
+    display::run_on(
+        gpui::Application::with_platform(platform),
+        display::new_backend(store),
+    );
     ffi::gpui_ios_did_finish_launching(std::ptr::null_mut());
     !ffi::gpui_ios_get_window().is_null()
 }

@@ -189,3 +189,47 @@ fn warnings_are_yellow_and_dismissable_until_they_change(cx: &mut TestAppContext
         assert!(this.account_issues[&id].contains_key(&IssueSource::Sync("inbox".into())));
     });
 }
+
+#[gpui::test]
+fn push_registration_failures_are_critical_but_dont_need_signing_in(cx: &mut TestAppContext) {
+    use crate::manage::status::PushRegistration;
+    let (view, cx, _) = two_accounts(cx);
+    let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    let refused: anyhow::Result<()> = Err(anyhow::anyhow!(
+        "API error (HTTP 400, code 2001): Invalid input"
+    )
+    .context(PushRegistration));
+    view.update_in(cx, |this, _, cx| {
+        this.account_issues.clear();
+        this.account_result(&id, IssueSource::Push, &refused);
+        assert!(this.issues_critical(&id), "red, like a refused sign-in");
+        assert!(!this.account_blocked(&id), "mail checks go on");
+        this.dismiss_issue(&id, IssueSource::Push);
+        assert!(
+            this.account_issues[&id].contains_key(&IssueSource::Push),
+            "can't be dismissed"
+        );
+        // Checking mail doesn't resolve it; registering does.
+        this.account_result(&id, IssueSource::Sync("inbox".into()), &Ok(()));
+        assert!(this.account_issues[&id].contains_key(&IssueSource::Push));
+        cx.notify();
+    });
+    frame(cx);
+    let selector: &'static str = Box::leak(format!("account-warning-{id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(selector).is_some(),
+        "red warning in the sidebar"
+    );
+    act(&view, Action::AccountSettings(id.clone()), cx);
+    frame(cx);
+    assert!(cx.debug_bounds("account-error-details").is_some());
+    assert!(cx.debug_bounds("account-retry").is_some());
+    assert!(
+        cx.debug_bounds("account-reconnect").is_none(),
+        "signing in again doesn't register a device"
+    );
+    view.update_in(cx, |this, _, _| {
+        this.account_result(&id, IssueSource::Push, &Ok(()));
+        assert!(this.account_issues[&id].is_empty());
+    });
+}

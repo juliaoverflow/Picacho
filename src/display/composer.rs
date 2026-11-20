@@ -102,6 +102,20 @@ fn service_badge(service: fwd::ForwardingService, c: Colors) -> Div {
         .child(service.label())
 }
 
+/// Just after pasting copied rich text: what went in, so the composer can
+/// offer the other version (with or without its formatting) in its place.
+struct PasteOffer {
+    /// Byte offset of the pasted text in the body.
+    start: usize,
+    inserted: String,
+    other: String,
+    inserted_formatted: bool,
+    /// Whether the draft was formatted before the paste turned it on.
+    was_formatted: bool,
+    /// The body's length after pasting; any other edit lets the offer go.
+    body_len: usize,
+}
+
 /// Recipient fields, in order.
 const TO: usize = 0;
 const CC: usize = 1;
@@ -135,6 +149,8 @@ pub(super) struct Composer {
     show_bcc: bool,
     show_reply_to: bool,
     preview: bool,
+    /// The last paste's other version, offered until the body changes.
+    paste: Option<PasteOffer>,
     from_open: bool,
     /// When a press outside closed the From menu: the same press on its
     /// button must not open it again.
@@ -256,8 +272,13 @@ impl Composer {
                 this.changed(cx);
             }
         }));
-        subscriptions.push(cx.subscribe(&body, |this, _, e, cx| {
+        subscriptions.push(cx.subscribe(&body, |this, body, e, cx| {
             if matches!(e, InputEvent::Change) {
+                // Typing or another edit after a paste lets its offer go.
+                let len = body.read(cx).value().len();
+                if this.paste.as_ref().is_some_and(|p| p.body_len != len) {
+                    this.paste = None;
+                }
                 this.changed(cx);
             }
         }));
@@ -282,6 +303,7 @@ impl Composer {
             show_bcc,
             show_reply_to,
             preview: false,
+            paste: None,
             from_open: false,
             from_closed: None,
             from_filter,
@@ -644,6 +666,126 @@ impl Composer {
             (with, cursor)
         };
         self.edit(range, &with, cursor, window, cx);
+    }
+
+    /// Pastes copied rich text as plain text or with its formatting (as
+    /// Markdown), per Settings, and offers the other. Returns false when the
+    /// clipboard has no formatting, leaving the paste to the text field.
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.paste = None;
+        let Some(plain) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return false;
+        };
+        let Some(pasted) = super::paste::Pasted::from_clipboard(plain) else {
+            return false;
+        };
+        self.insert_pasted(pasted, window, cx);
+        true
+    }
+
+    pub(super) fn insert_pasted(
+        &mut self,
+        pasted: super::paste::Pasted,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let formatted = self.options.paste_formatted;
+        let (inserted, other) = if formatted {
+            (pasted.formatted, pasted.plain)
+        } else {
+            (pasted.plain, pasted.formatted)
+        };
+        let was_formatted = self.draft.formatted;
+        if formatted && !was_formatted {
+            self.set_formatted(true, cx);
+        }
+        let (_, range) = self.selection(window, cx);
+        let start = range.start;
+        self.edit(range, &inserted, start + inserted.len(), window, cx);
+        self.paste = Some(PasteOffer {
+            start,
+            inserted,
+            other,
+            inserted_formatted: formatted,
+            was_formatted,
+            body_len: self.body.read(cx).value().len(),
+        });
+        cx.notify();
+    }
+
+    /// Puts the last paste's other version in its place.
+    pub(super) fn swap_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(offer) = self.paste.take() else {
+            return;
+        };
+        let end = offer.start + offer.inserted.len();
+        let text = self.body.read(cx).value().to_string();
+        if text.get(offer.start..end) != Some(offer.inserted.as_str()) {
+            cx.notify();
+            return;
+        }
+        let formatted = !offer.inserted_formatted;
+        if formatted && !self.draft.formatted {
+            self.set_formatted(true, cx);
+        } else if !formatted && !offer.was_formatted && self.draft.formatted {
+            self.set_formatted(false, cx);
+        }
+        let cursor = offer.start + offer.other.len();
+        self.edit(offer.start..end, &offer.other, cursor, window, cx);
+        self.body.update(cx, |s, cx| s.focus(window, cx));
+        self.paste = Some(PasteOffer {
+            start: offer.start,
+            inserted: offer.other,
+            other: offer.inserted,
+            inserted_formatted: formatted,
+            was_formatted: offer.was_formatted,
+            body_len: self.body.read(cx).value().len(),
+        });
+        cx.notify();
+    }
+
+    pub(super) fn paste_offer_label(&self) -> Option<&'static str> {
+        Some(if self.paste.as_ref()?.inserted_formatted {
+            "Paste without formatting"
+        } else {
+            "Paste with formatting"
+        })
+    }
+
+    /// The button offering the last paste's other version.
+    fn paste_offer(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let label = self.paste_offer_label()?;
+        let c = self.colors;
+        Some(
+            div()
+                .id("compose-paste-offer")
+                .debug_selector(|| "compose-paste-offer".into())
+                .absolute()
+                .bottom(px(8.))
+                .right(px(12.))
+                .h(px(if self.mobile { 36. } else { 28. }))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.surface))
+                .shadow_md()
+                .text_size(px(if self.mobile { 15. } else { 12. }))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(c.accent))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(c.soft)))
+                .child(label)
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    // Keep the body focused (and its keyboard up).
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.swap_paste(window, cx))),
+        )
     }
 
     fn set_formatted(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -1973,10 +2115,16 @@ impl Composer {
         div()
             .id("compose-body")
             .debug_selector(|| "compose-body".into())
+            .relative()
             .when(!inline, |d| d.flex_1().min_h_0())
             .when(inline, |d| d.h(px(240.)))
             .px_2()
             .py_1()
+            .capture_action(cx.listener(|this, _: &gpui_component::input::Paste, w, cx| {
+                if this.paste(w, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 Textarea::new(&self.body)
                     .appearance(false)
@@ -1985,6 +2133,8 @@ impl Composer {
                     // Phones read body text at their system size (17pt).
                     .text_size(px(if self.mobile { 17. } else { 14. })),
             )
+            // Over the text, so it comes after.
+            .children(self.paste_offer(cx))
             .bg(rgb(c.surface))
             .into_any_element()
     }

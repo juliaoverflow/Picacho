@@ -18,6 +18,8 @@ use tao::{
 };
 use wry::{NewWindowResponse, WebViewBuilder};
 
+use crate::sync::proton::verification_result as result;
+
 /// Hands the page's messages to Picacho. Proton's verification page reports
 /// its result with `postMessage` (to its parent when framed, otherwise to
 /// itself) and, in Proton's mobile apps, through a native bridge; every one
@@ -68,38 +70,6 @@ fn allowed(url: &str) -> bool {
     .any(under)
         || (host == "www.google.com" && url.path().starts_with("/recaptcha/"))
         || host == "www.gstatic.com"
-}
-
-/// The check's result from one of the page's messages, if it is the one
-/// saying it passed: (token, type). `Err` when the page asks to close.
-pub(crate) fn result(message: &str) -> Result<Option<(String, String)>, ()> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
-        return Ok(None);
-    };
-    let text = |v: &serde_json::Value| v.as_str().map(str::trim).unwrap_or_default().to_owned();
-    let (token, kind) = match value["type"].as_str().unwrap_or_default() {
-        // verify.proton.me
-        "HUMAN_VERIFICATION_SUCCESS" => (
-            text(&value["payload"]["token"]),
-            text(&value["payload"]["type"]),
-        ),
-        // Proton's older CAPTCHA page (/core/v4/captcha)
-        "pm_captcha" => (text(&value["token"]), "captcha".to_owned()),
-        "CLOSE" | "HUMAN_VERIFICATION_CLOSE" => return Err(()),
-        _ => return Ok(None),
-    };
-    let fits = |s: &str, max: usize| {
-        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_graphic())
-    };
-    if !fits(&token, 4096) {
-        return Ok(None);
-    }
-    let kind = if fits(&kind, 32) {
-        kind
-    } else {
-        "captcha".to_owned()
-    };
-    Ok(Some((token, kind)))
 }
 
 fn finish(found: Option<(String, String)>) -> ! {

@@ -10,16 +10,20 @@
 //! - on Windows, Windows Hello, which covers the computer's own passkeys,
 //!   security keys and phones itself.
 //!
+//! On Android a security key is held to the phone (NFC) or plugged in
+//! (USB), and the phone's own passkeys come from Android's Credential
+//! Manager (`android::keys`).
+//!
 //! USB keys and phones sign exactly the client data Proton's library built
 //! (its hash goes to the authenticator); Windows Hello builds its own, which
 //! is sent instead. While one waits, `Prompt` says what for (touch the key,
 //! scan the QR code), and the window shows it.
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 use webauthn_authenticator_rs::{
     AuthenticatorBackendHashedClientData,
     error::WebauthnCError,
@@ -33,9 +37,11 @@ use webauthn_rs_proto::{
 /// How to reach the authenticator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
-    /// A security key plugged into this computer.
+    /// A security key plugged into this computer (or, on Android, held to
+    /// the phone).
     SecurityKey,
-    /// A passkey on a phone, by QR code.
+    /// A passkey on a phone, by QR code; on Android, this phone's own
+    /// passkeys (its password manager).
     Phone,
     /// Windows Hello: the system's own passkeys, keys and phones.
     #[cfg(windows)]
@@ -52,6 +58,7 @@ impl Method {
     pub fn label(self) -> &'static str {
         match self {
             Self::SecurityKey => "Use a security key",
+            Self::Phone if cfg!(target_os = "android") => "Use a passkey",
             Self::Phone => "Use a passkey on your phone",
             #[cfg(windows)]
             Self::Windows => "Use a passkey or security key",
@@ -60,7 +67,7 @@ impl Method {
 }
 
 /// What an authenticator is waiting for, for the window to show.
-#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Prompt {
     #[default]
@@ -97,20 +104,20 @@ pub struct Assertion {
 }
 
 /// The authenticator library's questions, answered from the sign-in.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 #[derive(Debug)]
 struct Answers {
     pin: Option<String>,
     pin_asked: AtomicBool,
     prompt: Arc<Mutex<Prompt>>,
 }
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 impl Answers {
     fn show(&self, p: Prompt) {
         *self.prompt.lock().unwrap() = p;
     }
 }
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 impl UiCallback for Answers {
     fn request_pin(&self) -> Option<String> {
         self.pin_asked.store(true, Ordering::Relaxed);
@@ -145,6 +152,13 @@ fn bytes(v: Option<&Value>) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Whether `rp_id` is one of Proton's sites (or a site under one).
+fn proton_rp(rp_id: &str) -> bool {
+    ["proton.me", "protonmail.com", "protonmail.ch"]
+        .iter()
+        .any(|d| rp_id == *d || rp_id.ends_with(&format!(".{d}")))
+}
+
 /// Proton's `AuthenticationOptions` (bytes as arrays of numbers) as a
 /// WebAuthn request.
 pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOptions> {
@@ -157,7 +171,14 @@ pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOpti
         .get("rpId")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Proton didn't name itself for the key."))?
-        .to_owned();
+        .to_ascii_lowercase();
+    // The relying party becomes the origin a passkey is asked for (Android's
+    // Credential Manager, Windows Hello): only Proton's own sites, so an
+    // answer naming another site can't get its passkeys signed.
+    anyhow::ensure!(
+        proton_rp(&rp_id),
+        "Proton asked for a security key for {rp_id}, which isn't Proton."
+    );
     let allow_credentials = pk
         .get("allowCredentials")
         .and_then(Value::as_array)
@@ -193,7 +214,7 @@ pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOpti
 }
 
 /// The WebAuthn error, said for a person; a PIN problem asks for the PIN.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 fn explain(e: WebauthnCError, answers: &Answers) -> anyhow::Error {
     use webauthn_authenticator_rs::error::CtapError::*;
     match e {
@@ -225,6 +246,9 @@ fn explain(e: WebauthnCError, answers: &Answers) -> anyhow::Error {
         ),
         WebauthnCError::Ctap(Ctap2NoCredentials) => anyhow!(
             "That key or passkey isn't registered with this Proton account. Use another, or the code from your authenticator app."
+        ),
+        WebauthnCError::ApduTransmission => anyhow!(
+            "The connection to the security key was lost. Keep it in place until it's done, and try again."
         ),
         other => anyhow!("The security key or passkey didn't work ({other:?})."),
     }
@@ -271,18 +295,18 @@ pub async fn assert(
     })
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 enum Failure {
     Webauthn(WebauthnCError),
     Other(anyhow::Error),
 }
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 impl From<WebauthnCError> for Failure {
     fn from(e: WebauthnCError) -> Self {
         Self::Webauthn(e)
     }
 }
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 impl From<anyhow::Error> for Failure {
     fn from(e: anyhow::Error) -> Self {
         Self::Other(e)
@@ -294,6 +318,80 @@ impl From<anyhow::Error> for Failure {
 type Signed =
     std::result::Result<(webauthn_rs_proto::PublicKeyCredential, Option<Vec<u8>>), Failure>;
 
+/// On Android: a security key held to the phone or plugged in, or a
+/// passkey from Android's Credential Manager.
+#[cfg(target_os = "android")]
+pub async fn assert(
+    method: Method,
+    options: PublicKeyCredentialRequestOptions,
+    client_data_json: &[u8],
+    client_data_hash: &[u8],
+    pin: Option<String>,
+    prompt: Arc<Mutex<Prompt>>,
+    cancel: &AtomicBool,
+) -> Result<Assertion> {
+    let answers = Answers {
+        pin: pin.filter(|p| !p.is_empty()),
+        pin_asked: AtomicBool::new(false),
+        prompt,
+    };
+    if method == Method::Phone {
+        answers.show(Prompt::Working);
+        let signed = crate::android::passkey(&options, client_data_json, client_data_hash, cancel);
+        answers.show(Prompt::Idle);
+        return signed;
+    }
+    let result = android_key(&answers, options, client_data_hash, cancel).await;
+    answers.show(Prompt::Idle);
+    let credential = result.map_err(|e| match e {
+        Failure::Webauthn(e) => explain(e, &answers),
+        Failure::Other(e) => e,
+    })?;
+    Ok(Assertion {
+        client_data_json: client_data_json.to_vec(),
+        authenticator_data: credential.response.authenticator_data.into(),
+        signature: credential.response.signature.into(),
+        credential_id: credential.raw_id.into(),
+    })
+}
+
+/// A security key held to the phone (NFC) or plugged in (USB). Each step
+/// blocks this thread; the key stops being waited on once `cancel` is set.
+#[cfg(target_os = "android")]
+async fn android_key(
+    answers: &Answers,
+    options: PublicKeyCredentialRequestOptions,
+    hash: &[u8],
+    cancel: &AtomicBool,
+) -> std::result::Result<webauthn_rs_proto::PublicKeyCredential, Failure> {
+    use crate::android::{KeySearch, Nfc};
+    use webauthn_authenticator_rs::{ctap2::CtapAuthenticator, transport::Token};
+    let search = KeySearch::start()?;
+    answers.show(match search.nfc {
+        Nfc::On => Prompt::Insert,
+        Nfc::Off => Prompt::Phone(
+            "Plug in your security key, or turn on NFC to hold it against your phone…",
+        ),
+        Nfc::Missing => Prompt::Phone("Plug in your security key…"),
+    });
+    let token = search.find(cancel, WAIT)?;
+    let button = token.has_button();
+    answers.show(Prompt::Working);
+    let mut auth = CtapAuthenticator::new(token, answers).await.ok_or_else(|| {
+        anyhow!("That security key couldn't be used. Keep it in place until it's done, or try another.")
+    })?;
+    answers.show(if button { Prompt::Touch } else { Prompt::Working });
+    let signed = AuthenticatorBackendHashedClientData::perform_auth(
+        &mut auth,
+        hash.to_vec(),
+        options,
+        WAIT.as_millis() as u32,
+    )?;
+    drop(auth);
+    drop(search);
+    Ok(signed)
+}
+
 /// Resolves when the sign-in is cancelled.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn cancelled(cancel: &AtomicBool) {
@@ -302,7 +400,7 @@ async fn cancelled(cancel: &AtomicBool) {
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -381,8 +479,8 @@ fn windows(options: PublicKeyCredentialRequestOptions) -> Signed {
     Ok((signed, Some(client_data)))
 }
 
-/// Phones have no security key or phone passkey support here yet.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+/// iPhones have no security key or passkey support here yet.
+#[cfg(target_os = "ios")]
 pub async fn assert(
     _method: Method,
     _options: PublicKeyCredentialRequestOptions,
@@ -392,12 +490,12 @@ pub async fn assert(
     _prompt: Arc<Mutex<Prompt>>,
     _cancel: &AtomicBool,
 ) -> Result<Assertion> {
-    Err(anyhow!("Security keys and passkeys aren't available on phones yet."))
+    Err(anyhow!("Security keys and passkeys aren't available on iPhones yet."))
 }
 
 /// Whether Proton's options name any key at all, and this system can use one.
 pub fn usable(options: Option<&Value>) -> bool {
-    !cfg!(any(target_os = "android", target_os = "ios"))
+    !cfg!(target_os = "ios")
         && options.and_then(|o| request_options(o).ok()).is_some()
 }
 
@@ -424,6 +522,14 @@ mod tests {
             UserVerificationPolicy::Discouraged_DO_NOT_USE
         );
         assert!(usable(Some(&options)));
+        // Another site's passkeys aren't asked for.
+        let elsewhere = serde_json::json!({"publicKey": {
+            "challenge": [1], "rpId": "google.com"
+        }});
+        assert!(request_options(&elsewhere).is_err());
+        assert!(proton_rp("account.proton.me"));
+        assert!(!proton_rp("evilproton.me"));
+        assert!(!proton_rp("proton.me.evil.com"));
         assert!(!usable(Some(&serde_json::json!({}))));
         assert!(!usable(None));
     }

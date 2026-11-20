@@ -22,6 +22,11 @@ impl MailApp {
         self.mobile.settings_last = Some(self.page.clone());
         let c = self.colors();
         if Self::mobile_split(window) {
+            // Going to another page, or back from one, moves only its column.
+            let page = self.mobile_pane_motion(
+                SplitPane::Reader,
+                self.mobile_settings_page(Insets { left: 0., ..insets }, false, cx),
+            );
             return div()
                 .size_full()
                 .flex()
@@ -47,7 +52,7 @@ impl MailApp {
                         .flex_1()
                         .min_w_0()
                         .h_full()
-                        .child(self.mobile_settings_page(Insets { left: 0., ..insets }, false, cx)),
+                        .child(page),
                 )
                 .into_any_element();
         }

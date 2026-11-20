@@ -310,6 +310,7 @@ impl Backend {
             // A replaced sign-in must not keep using the old session.
             let old = self.proton.lock().unwrap().remove(&account.id);
             drop(old);
+            self.update_proton_push();
             let previous = existing
                 .as_ref()
                 .and_then(|_| self.saved_credentials(&account.id).ok())
@@ -356,6 +357,8 @@ impl Backend {
             .lock()
             .unwrap()
             .insert(a.id.clone(), session.clone());
+        // Pushes for the account now come for this session.
+        self.update_proton_push();
         Ok(session)
     }
     /// Runs `work` with the account's session, then saves any tokens Proton
@@ -373,6 +376,7 @@ impl Backend {
             && e.downcast_ref::<AccessFailure>().is_some()
         {
             self.proton.lock().unwrap().remove(&a.id);
+            self.update_proton_push();
         }
         result
     }
@@ -398,6 +402,7 @@ impl Backend {
     /// Ends the account's Proton session (it is being removed).
     pub(super) fn forget_proton(&self, a: &Account) {
         self.proton.lock().unwrap().remove(&a.id);
+        self.update_proton_push();
         if let Ok(secret) = self.saved_credentials(&a.id) {
             let saved = secret.proton();
             if !saved.uid.is_empty() {
@@ -441,6 +446,9 @@ impl Backend {
                 ..Default::default()
             },
         };
+        if mail.date <= 0 {
+            mail.date = m.time;
+        }
         mail.set_cc(addresses(&m.cc_list));
         mail.folder = folder;
         mail.remote_folder = remote;
@@ -518,7 +526,15 @@ impl Backend {
             // What the cache has here that Proton didn't list: within the
             // listed range (or anywhere, when the whole mailbox was listed),
             // it has moved or gone.
-            let oldest = rows.iter().map(|m| m.date).min().unwrap_or(i64::MIN);
+            // Proton's own times, not the cache's: one cached row without a
+            // date made this the start of time, and every sync then looked
+            // up the whole cached mailbox, 150 messages a request.
+            let oldest = listed
+                .iter()
+                .map(|m| m.time)
+                .filter(|&t| t > 0)
+                .min()
+                .unwrap_or(i64::MIN);
             let listed_ids: std::collections::HashSet<&str> =
                 rows.iter().map(|m| m.id.as_str()).collect();
             let unlisted: Vec<Mail> = self
@@ -582,6 +598,10 @@ impl Backend {
             // passed over, a few at a time, until new ones turn up.
             let mut ended = false;
             for _ in 0..8 {
+                // A sync or an opened message is waiting: let it go first.
+                if !added.is_empty() && self.someone_waiting(&a.id) {
+                    break;
+                }
                 let listed = s.list(&label, page, PAGE)?;
                 let last = listed.len() < PAGE;
                 for m in &listed {

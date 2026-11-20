@@ -379,3 +379,57 @@ fn sending_addresses_are_added_in_settings_and_offered_in_from(cx: &mut TestAppC
         );
     });
 }
+
+#[gpui::test]
+fn pasting_rich_text_offers_the_other_formatting(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    let pasted = || paste::Pasted {
+        plain: "bold".into(),
+        formatted: "**bold**".into(),
+    };
+    let body = |cx: &mut VisualTestContext| {
+        composer.read_with(cx, |c, cx| c.body.read(cx).value().to_string())
+    };
+    let label = |cx: &mut VisualTestContext| composer.read_with(cx, |c, _| c.paste_offer_label());
+
+    // Off (the default): plain text goes in, formatting is offered.
+    composer.update_in(cx, |c, w, cx| {
+        c.body.update(cx, |s, cx| s.set_text("", w, cx));
+        c.insert_pasted(pasted(), w, cx);
+    });
+    cx.run_until_parked();
+    assert!(body(cx).starts_with("bold") && !body(cx).contains("**"));
+    assert_eq!(label(cx), Some("Paste with formatting"));
+    frame(cx);
+    assert!(cx.debug_bounds("compose-paste-offer").is_some());
+    composer.update_in(cx, |c, w, cx| c.swap_paste(w, cx));
+    cx.run_until_parked();
+    assert!(body(cx).starts_with("**bold**"));
+    assert_eq!(label(cx), Some("Paste without formatting"));
+    // Typing lets the offer go.
+    composer.update_in(cx, |c, w, cx| {
+        c.body.update(cx, |s, cx| s.insert("!", w, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(label(cx), None);
+
+    // On: the formatting goes in (turning a plain draft formatted), and
+    // switching back to plain text leaves the draft plain again.
+    composer.update_in(cx, |c, w, cx| {
+        c.options.paste_formatted = true;
+        c.draft.formatted = false;
+        c.body.update(cx, |s, cx| s.set_text("", w, cx));
+        c.insert_pasted(pasted(), w, cx);
+    });
+    cx.run_until_parked();
+    assert!(body(cx).starts_with("**bold**"));
+    assert!(composer.read_with(cx, |c, _| c.draft.formatted));
+    assert_eq!(label(cx), Some("Paste without formatting"));
+    composer.update_in(cx, |c, w, cx| c.swap_paste(w, cx));
+    cx.run_until_parked();
+    assert!(body(cx).starts_with("bold") && !body(cx).contains("**"));
+    assert!(!composer.read_with(cx, |c, _| c.draft.formatted));
+    assert_eq!(label(cx), Some("Paste with formatting"));
+}

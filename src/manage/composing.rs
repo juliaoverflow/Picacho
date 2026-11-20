@@ -46,6 +46,9 @@ pub struct ComposeOptions {
     pub attachment_reminder: bool,
     /// Ask before sending a message without a subject.
     pub warn_empty_subject: bool,
+    /// Pasting copied rich text keeps its formatting; otherwise it pastes as
+    /// plain text. Either way the composer offers the other just after.
+    pub paste_formatted: bool,
 }
 
 impl Default for ComposeOptions {
@@ -61,6 +64,7 @@ impl Default for ComposeOptions {
             undo_send_seconds: 5,
             attachment_reminder: true,
             warn_empty_subject: true,
+            paste_formatted: false,
         }
     }
 }

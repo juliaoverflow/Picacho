@@ -75,7 +75,10 @@ impl MailApp {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
-        if !a.provider.imap() || a.incoming_host.is_empty() || self.account_blocked(id) {
+        if !(a.provider.imap() || a.provider == Provider::Jmap)
+            || a.incoming_host.is_empty()
+            || self.account_blocked(id)
+        {
             return;
         }
         let notes_for = a.clone();

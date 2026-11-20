@@ -23,6 +23,8 @@ finish-args:
   # Credentials live in the Secret Service (GNOME Keyring, KWallet).
   - --talk-name=org.freedesktop.secrets
   - --talk-name=org.freedesktop.Notifications
+  # The tray icon while Picacho runs in the background (StatusNotifierItem).
+  - --talk-name=org.kde.StatusNotifierWatcher
 modules:
   - name: picacho
     buildsystem: simple

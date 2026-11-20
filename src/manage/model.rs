@@ -8,6 +8,9 @@ pub enum Provider {
     Pop3,
     /// Proton's own API, without Proton Mail Bridge (`sync/proton.rs`).
     Proton,
+    /// JMAP (RFC 8620/8621) over HTTPS, for reading and sending alike
+    /// (`sync/jmap.rs`).
+    Jmap,
 }
 impl Provider {
     pub fn label(self) -> &'static str {
@@ -17,11 +20,17 @@ impl Provider {
             Self::Imap => "IMAP",
             Self::Pop3 => "POP3",
             Self::Proton => "Proton API",
+            Self::Jmap => "JMAP",
         }
     }
-    /// Whether its mail comes over IMAP (anything but POP3 and Proton's API).
+    /// Whether its mail comes over IMAP (anything but POP3, Proton's API
+    /// and JMAP).
     pub fn imap(self) -> bool {
-        !matches!(self, Self::Pop3 | Self::Proton)
+        !matches!(self, Self::Pop3 | Self::Proton | Self::Jmap)
+    }
+    /// Whether it sends through its own API rather than SMTP.
+    pub fn api_sending(self) -> bool {
+        matches!(self, Self::Proton | Self::Jmap)
     }
 }
 /// The mail services offered when adding an account. `Provider` is the
@@ -93,6 +102,8 @@ impl Service {
             Self::Gmail => Provider::Gmail,
             Self::Outlook => Provider::Outlook,
             Self::Proton => Provider::Proton,
+            // Fastmail made JMAP, and offers it to mail apps.
+            Self::Fastmail => Provider::Jmap,
             _ => Provider::Imap,
         }
     }
@@ -103,12 +114,14 @@ impl Service {
             Self::Gmail | Self::Outlook if crate::sync::oauth::configured(self.provider()) => {
                 SignIn::Browser
             }
+            Self::Fastmail if !crate::sync::oauth::fastmail().id.is_empty() => SignIn::Browser,
             _ => SignIn::Password,
         }
     }
     pub fn password_label(self) -> &'static str {
         match self {
-            Self::Gmail | Self::Outlook | Self::Fastmail | Self::Zoho => "App password",
+            Self::Gmail | Self::Outlook | Self::Zoho => "App password",
+            Self::Fastmail => "API token",
             Self::ICloud => "App-specific password",
             Self::ProtonBridge => "Bridge password",
             Self::Proton => "Proton password",
@@ -144,8 +157,8 @@ impl Service {
                 "https://account.apple.com/account/manage",
             )),
             Self::Fastmail => Some((
-                "Fastmail needs an app password with IMAP and SMTP access.",
-                "https://www.fastmail.help/hc/en-us/search?query=app+passwords",
+                "Picacho talks to Fastmail over JMAP. Make an API token with access to mail (and to sending and filters, to use them here), then paste it here.",
+                "https://app.fastmail.com/settings/security/tokens",
             )),
             Self::Zoho => Some((
                 "Turn on IMAP in Zoho Mail settings, then make an app password.",
@@ -175,7 +188,12 @@ impl Service {
             Self::Gmail | Self::Outlook => return Some(a),
             Self::Pinal => ("mail.sonoran.exchange", 993, "mail.sonoran.exchange", 465),
             Self::ICloud => ("imap.mail.me.com", 993, "smtp.mail.me.com", 587),
-            Self::Fastmail => ("imap.fastmail.com", 993, "smtp.fastmail.com", 465),
+            Self::Fastmail => (
+                crate::sync::oauth::FASTMAIL_JMAP,
+                443,
+                crate::sync::oauth::FASTMAIL_JMAP,
+                443,
+            ),
             Self::Zoho => {
                 // Zoho keeps each region's mail on its own servers.
                 let domain = crate::sync::discover::domain(email).unwrap_or_default();
@@ -216,10 +234,26 @@ pub struct SyncSettings {
     /// Anything else downloads when it is opened.
     #[serde(default = "default_offline_days")]
     pub offline_days: u32,
+    /// Proton Direct: seconds between asking Proton for changes (new mail,
+    /// moves, notices); 0 doesn't ask, leaving new mail to the regular
+    /// check (`refresh_minutes`).
+    #[serde(default = "default_proton_events_seconds")]
+    pub proton_events_seconds: u32,
+    /// Proton Direct: receive Proton's push notifications as its Android
+    /// app does (`sync::proton_push`), where this copy has a Firebase
+    /// project for them. Needs `notify`; with both on, pushes announce new
+    /// mail instead of the regular checks (`Account::pushes_new_mail`). Off
+    /// unless turned on.
+    #[serde(default)]
+    pub proton_push: bool,
 }
 /// `SyncSettings::offline_days`: download message contents only when opened.
 pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
 fn default_offline_days() -> u32 {
+    30
+}
+/// About as often as Proton's own apps ask.
+fn default_proton_events_seconds() -> u32 {
     30
 }
 impl SyncSettings {
@@ -239,6 +273,8 @@ impl Default for SyncSettings {
             refresh_minutes: 5,
             notify: true,
             offline_days: default_offline_days(),
+            proton_events_seconds: default_proton_events_seconds(),
+            proton_push: false,
         }
     }
 }
@@ -353,6 +389,15 @@ impl Identity {
     }
 }
 impl Account {
+    /// Whether Proton's pushes announce this account's new mail
+    /// (`SyncSettings::proton_push`, which needs `notify`), in place of the
+    /// announcements from checking for mail.
+    pub fn pushes_new_mail(&self) -> bool {
+        self.provider == Provider::Proton
+            && self.sync.notify
+            && self.sync.proton_push
+            && crate::sync::proton_push::available()
+    }
     /// One of the addresses it sends as, by id.
     pub fn identity(&self, id: &str) -> Option<&Identity> {
         self.identities.iter().find(|i| i.id == id)
@@ -381,15 +426,11 @@ impl Account {
             incoming_host: host.into(),
             incoming_port: match provider {
                 Provider::Pop3 => 995,
-                Provider::Proton => 443,
+                Provider::Proton | Provider::Jmap => 443,
                 _ => 993,
             },
             smtp_host: smtp.into(),
-            smtp_port: if provider == Provider::Proton {
-                443
-            } else {
-                587
-            },
+            smtp_port: if provider.api_sending() { 443 } else { 587 },
             oauth: provider == Provider::Outlook,
             client_id: String::new(),
             client_secret: String::new(),
@@ -429,7 +470,9 @@ impl Account {
             self.email.parse::<lettre::Address>().is_ok(),
             "Enter a valid email address."
         );
-        for host in [&self.incoming_host, &self.smtp_host] {
+        // JMAP sends through the same server it reads from.
+        let smtp = (self.provider != Provider::Jmap).then_some(&self.smtp_host);
+        for host in std::iter::once(&self.incoming_host).chain(smtp) {
             anyhow::ensure!(
                 !host.is_empty() && !host.contains(['\r', '\n', ' ', '/', ':']),
                 "Enter valid incoming and SMTP server hostnames."
@@ -439,14 +482,19 @@ impl Account {
             self.incoming_port > 0 && self.smtp_port > 0,
             "Ports must be between 1 and 65535."
         );
+        // A JMAP server may register Picacho as it signs in.
         anyhow::ensure!(
-            !self.oauth || !self.client_id.is_empty(),
+            !self.oauth || !self.client_id.is_empty() || self.provider == Provider::Jmap,
             "Browser sign-in isn't set up for {} in this build.",
             self.provider.label()
         );
         anyhow::ensure!(
-            !self.oauth || matches!(self.provider, Provider::Gmail | Provider::Outlook),
-            "OAuth is available for Gmail and Outlook."
+            !self.oauth
+                || matches!(
+                    self.provider,
+                    Provider::Gmail | Provider::Outlook | Provider::Jmap
+                ),
+            "OAuth is available for Gmail, Outlook and JMAP servers."
         );
         // STARTTLS is only accepted from Bridge on this computer, where the
         // first, unencrypted exchange never leaves the machine.
@@ -1373,6 +1421,17 @@ mod tests {
             serde_json::to_string(&Mail::default()).unwrap(),
             r#"{"id":"","account":"","folder":"Inbox","remote_folder":"","uid":0,"from":"","sender":"","to":"","cc":"","subject":"","snippet":"","date":0,"unread":false,"starred":false,"size":0,"body":null,"html":null,"attachments":[],"message_id":"","has_attachments":false}"#
         );
+    }
+
+    /// Accounts saved before Proton's event pace was a setting keep the
+    /// pace they had: about every 30 seconds.
+    #[test]
+    fn sync_settings_saved_before_the_proton_pace_ask_every_30_seconds() {
+        let old: SyncSettings =
+            serde_json::from_str(r#"{"days":0,"refresh_minutes":5,"notify":true,"offline_days":30}"#)
+                .unwrap();
+        assert_eq!(old.proton_events_seconds, 30);
+        assert_eq!(old, SyncSettings::default());
     }
 
     #[test]

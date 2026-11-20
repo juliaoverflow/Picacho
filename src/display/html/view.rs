@@ -29,6 +29,14 @@ pub struct HtmlContextMenu {
     pub selection: Option<String>,
 }
 
+/// A link in the email: hovered (or no longer, `None`), or clicked. The
+/// view opens nothing itself; its owner does, or asks first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HtmlLink {
+    Hovered(Option<String>),
+    Opened(String),
+}
+
 /// The whole email, scaled down, for the collapsed reader.
 struct Thumbnail {
     revision: u64,
@@ -73,8 +81,13 @@ pub struct HtmlView {
     requested: HashMap<u32, (u64, u32, u32)>,
     retired: Vec<Arc<RenderImage>>,
     context_at: Option<gpui::Point<Pixels>>,
+    /// Where the current long press began, in document coordinates.
+    pressed_at: Option<(f32, f32)>,
+    /// The link under the pointer.
+    hovered: Option<String>,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
+impl EventEmitter<HtmlLink> for HtmlView {}
 
 impl HtmlView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -125,6 +138,15 @@ impl HtmlView {
             requested: HashMap::new(),
             retired: Vec::new(),
             context_at: None,
+            pressed_at: None,
+            hovered: None,
+        }
+    }
+    /// Says the pointer is over `link` now, if that changed.
+    fn hover(&mut self, link: Option<String>, cx: &mut Context<Self>) {
+        if self.hovered != link {
+            self.hovered = link.clone();
+            cx.emit(HtmlLink::Hovered(link));
         }
     }
     #[cfg(test)]
@@ -156,6 +178,7 @@ impl HtmlView {
         self.laid_out = false;
         self.selection = None;
         self.cursor = CursorStyle::Arrow;
+        self.hover(None, cx);
         if had_document {
             cx.notify();
         }
@@ -292,6 +315,8 @@ impl HtmlView {
                 }
                 cx.notify();
             }
+            Output::Hover(link) => self.hover(link, cx),
+            Output::Open(url) => cx.emit(HtmlLink::Opened(url)),
             Output::Failed => {
                 self.failed = true;
                 self.laid_out = true;
@@ -349,6 +374,54 @@ impl HtmlView {
             3 => UiEvent::PointerLeave(event),
             _ => UiEvent::PointerMove(event),
         }));
+    }
+    /// A long press on a touch screen, where there is no drag to select:
+    /// it selects the word under the finger, moving the finger before
+    /// lifting it extends the selection, and lifting it offers the menu a
+    /// secondary click does (Copy, and the link or image pressed).
+    /// `visible` is the part of the email on screen.
+    fn long_press(
+        &mut self,
+        e: &LongPressEvent,
+        visible: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity();
+        match e.phase {
+            TouchPhase::Started => {
+                if window.default_prevented()
+                    || self.worker.is_none()
+                    || !self.laid_out
+                    || !visible.contains(&e.start_position)
+                {
+                    return;
+                }
+                window.prevent_default();
+                window.capture_long_press(&entity);
+                cx.stop_propagation();
+                let (x, y) = self.local(e.start_position);
+                self.pressed_at = Some((x, y));
+                self.send(Command::SelectWord { x, y });
+            }
+            _ if !window.has_long_press_capture(&entity) => {}
+            TouchPhase::Moved => {
+                cx.stop_propagation();
+                let (x, y) = self.local(e.position);
+                self.send(Command::ExtendWord { x, y });
+            }
+            TouchPhase::Ended => {
+                cx.stop_propagation();
+                if let Some((x, y)) = self.pressed_at.take() {
+                    self.context_at = Some(e.position);
+                    self.send(Command::Context { x, y });
+                }
+            }
+            TouchPhase::Cancelled => {
+                cx.stop_propagation();
+                self.pressed_at = None;
+            }
+        }
     }
     /// Lays out for the frame's width and picks the strips to draw, asking the
     /// worker for any that are missing or out of date.
@@ -496,6 +569,7 @@ impl Render for HtmlView {
                 .into_any_element();
         }
         let view = cx.entity();
+        let pressed = view.clone();
         let loading = self.is_loading();
         div()
             .id("html-email")
@@ -532,9 +606,10 @@ impl Render for HtmlView {
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
                 this.pointer(e.position, 0, e.pressed_button == Some(MouseButton::Left))
             }))
-            .on_hover(cx.listener(|this, hovered, w, _| {
+            .on_hover(cx.listener(|this, hovered, w, cx| {
                 if !hovered {
                     this.pointer(w.mouse_position(), 3, false);
+                    this.hover(None, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
@@ -574,7 +649,7 @@ impl Render for HtmlView {
             .child(
                 canvas(
                     move |bounds, w, cx| view.update(cx, |this, _| this.prepare(bounds, w)),
-                    |_, tiles, w, _| {
+                    move |bounds, tiles, w, _| {
                         for (bounds, image) in tiles {
                             let _ = w.paint_image(
                                 bounds,
@@ -585,6 +660,13 @@ impl Render for HtmlView {
                                 false,
                             );
                         }
+                        let visible = bounds.intersect(&w.content_mask().bounds);
+                        let pressed = pressed.clone();
+                        w.on_mouse_event(move |e: &LongPressEvent, phase, w, cx| {
+                            if phase == DispatchPhase::Bubble {
+                                pressed.update(cx, |this, cx| this.long_press(e, visible, w, cx));
+                            }
+                        });
                     },
                 )
                 .size_full(),

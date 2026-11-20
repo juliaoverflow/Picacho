@@ -528,18 +528,30 @@ fn scripts(session: &mut Secured) -> Result<Vec<(String, bool)>> {
 pub fn load(endpoint: &Endpoint, secret: &str, tls: &native_tls::TlsConnector) -> Result<State> {
     let (mut session, extensions) = open(endpoint, secret, tls)?;
     let listed = scripts(&mut session)?;
+    let own = if listed.iter().any(|(n, _)| n == SCRIPT) {
+        let data = session.expect(
+            &format!("GETSCRIPT {}", string(SCRIPT)),
+            "read Picacho's filters",
+        )?;
+        data.into_iter().next()
+    } else {
+        None
+    };
+    let _ = session.command("LOGOUT");
+    Ok(loaded(extensions, &listed, own.as_deref()))
+}
+
+/// What a filter server has, from its scripts (name, whether active) and
+/// the text of Picacho's own, if it has one. ManageSieve and JMAP alike.
+pub fn loaded(extensions: Vec<String>, listed: &[(String, bool)], own: Option<&str>) -> State {
     let mut state = State {
         extensions,
         ..State::default()
     };
-    for (name, active) in &listed {
+    for (name, active) in listed {
         if name == SCRIPT {
             state.active = *active;
-            let data = session.expect(
-                &format!("GETSCRIPT {}", string(SCRIPT)),
-                "read Picacho's filters",
-            )?;
-            if let Some(filters) = data.first().and_then(|t| read_script(t)) {
+            if let Some(filters) = own.and_then(read_script) {
                 state.filters = filters;
             }
         } else if *active {
@@ -555,8 +567,7 @@ pub fn load(endpoint: &Endpoint, secret: &str, tls: &native_tls::TlsConnector) -
     {
         state.filters.include = Some(other.clone());
     }
-    let _ = session.command("LOGOUT");
-    Ok(state)
+    state
 }
 
 /// Saves Picacho's rules as its script and makes it the active one.

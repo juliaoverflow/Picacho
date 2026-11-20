@@ -84,6 +84,10 @@ impl Backend {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
             self.send_proton(a, &a.email, &[to], &raw)?;
+        } else if a.provider == Provider::Jmap {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            self.send_jmap(a, &a.email, &[to], &raw)?;
         } else {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
@@ -214,13 +218,15 @@ impl Backend {
         }
     }
     /// Whether the account's provider might have a filter server. Gmail,
-    /// Outlook and POP3 accounts don't offer ManageSieve.
+    /// Outlook and POP3 accounts don't offer ManageSieve; a JMAP server may
+    /// offer JMAP for Sieve Scripts.
     pub fn may_filter(a: &Account) -> bool {
-        a.provider == Provider::Imap
-            && !matches!(
-                a.service,
-                Service::ICloud | Service::ProtonBridge | Service::Zoho
-            )
+        a.provider == Provider::Jmap
+            || a.provider == Provider::Imap
+                && !matches!(
+                    a.service,
+                    Service::ICloud | Service::ProtonBridge | Service::Zoho
+                )
     }
     /// The account's server-side filters and vacation reply.
     pub fn filters(&self, a: &Account) -> Result<sieve::State> {
@@ -230,6 +236,9 @@ impl Backend {
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        if a.provider == Provider::Jmap {
+            return self.filters_jmap(a);
+        }
         let s = self.credentials(a)?;
         let secret = if a.oauth { s.access_token } else { s.password };
         sieve::load(&Self::sieve_endpoint(a), &secret, &self.tls_connector()?)
@@ -243,10 +252,13 @@ impl Backend {
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
-        let s = self.credentials(a)?;
-        let secret = if a.oauth { s.access_token } else { s.password };
         let mut addresses = vec![a.email.clone()];
         addresses.extend(a.identities.iter().map(|i| i.email.trim().to_owned()));
+        if a.provider == Provider::Jmap {
+            return self.save_filters_jmap(a, filters, &addresses);
+        }
+        let s = self.credentials(a)?;
+        let secret = if a.oauth { s.access_token } else { s.password };
         sieve::save(
             &Self::sieve_endpoint(a),
             &secret,
