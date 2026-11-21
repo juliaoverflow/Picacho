@@ -69,6 +69,31 @@ pub enum Source {
     Text,
 }
 
+/// What a line of a receipt is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineKind {
+    /// Something bought.
+    Item,
+    Subtotal,
+    Shipping,
+    Fee,
+    Tip,
+    Tax,
+    /// Money taken off: a discount, coupon, gift card or credit (its
+    /// amount below zero).
+    Discount,
+    Total,
+}
+
+/// A line of a receipt: an item, a tax, a discount, the total…
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Line {
+    pub label: String,
+    /// Below zero for a discount.
+    pub amount: Amount,
+    pub kind: LineKind,
+}
+
 /// A receipt a message is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -80,6 +105,10 @@ pub struct Receipt {
     pub order: Option<String>,
     pub kind: Kind,
     pub source: Source,
+    /// What it lists, in order, up to its total (empty when it can't be
+    /// read).
+    #[serde(default)]
+    pub lines: Vec<Line>,
 }
 
 /// A receipt as each Summary lists it: one purchase, and every email about
@@ -175,6 +204,7 @@ pub fn find(mail: &MailText<'_>) -> Option<Receipt> {
         order: None,
         kind: Kind::Purchase,
         source: Source::Text,
+        lines: Vec::new(),
     });
     if kind == Some(Kind::Refund) {
         receipt.kind = Kind::Refund;
@@ -197,6 +227,11 @@ pub fn find(mail: &MailText<'_>) -> Option<Receipt> {
         receipt.order = crate::manage::parcels::order_numbers(subject, mail.text)
             .into_iter()
             .next();
+    }
+    // What it lists, as its text gives it; else as its markup does.
+    let listed = lines_in(mail.text, receipt.total.as_ref());
+    if !listed.is_empty() {
+        receipt.lines = listed;
     }
     Some(receipt)
 }
@@ -673,7 +708,13 @@ static MONEY_ANYWHERE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The amount, with a currency, at the start of `s`.
 fn money_at(s: &str) -> Option<Amount> {
+    money_span(s).map(|(a, _)| a)
+}
+
+/// The amount, with a currency, at the start of `s`, and where it ends.
+fn money_span(s: &str) -> Option<(Amount, usize)> {
     let caps = MONEY.captures(s)?;
+    let end = caps.get(0)?.end();
     let sign = caps
         .name("pre")
         .or_else(|| caps.name("pre2"))
@@ -682,8 +723,276 @@ fn money_at(s: &str) -> Option<Amount> {
     let currency = currency_of(sign)?;
     // A refund's "-$5.00" is still five back: the sign is left out.
     let cents = parse_number(&caps["num"])?;
-    Some(Amount { cents, currency })
+    Some((Amount { cents, currency }, end))
 }
+
+/// Lines a receipt lists at most.
+const MAX_LINES: usize = 60;
+/// Lines without an amount that may stand between two of a receipt's
+/// lines: more, and what came before is something else.
+const MAX_GAP: usize = 12;
+
+/// What a receipt's text lists, up to its total: its items, subtotal,
+/// shipping, fees, tip, taxes and discounts, each with its amount, as
+/// "Label: $1.00" on one line, a label above its amount, or a column of
+/// labels beside a column of amounts. Empty unless they end in a total
+/// (`total`, when known) and list something else besides.
+fn lines_in(text: &str, total: Option<&Amount>) -> Vec<Line> {
+    let head: String = text.chars().take(TOTAL_TEXT).collect();
+    // (line number, label, amount: None when "Free").
+    let mut pairs: Vec<Pair> = Vec::new();
+    let mut labels: Vec<(usize, &str)> = Vec::new();
+    let mut amounts: Vec<Option<Amount>> = Vec::new();
+    for (n, line) in head.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(amount) = amount_line(line) {
+            amounts.push(amount);
+            continue;
+        }
+        if !amounts.is_empty() {
+            flush_columns(&mut pairs, &mut labels, &mut amounts);
+        }
+        if let Some((label, amount)) = labelled_amount(line) {
+            // "Total" above "Includes all fees and taxes $86.12".
+            let label = match labels.last() {
+                Some((_, above)) if FILLER.is_match(label) => *above,
+                _ => label,
+            };
+            push_pair(&mut pairs, n, label, Some(amount));
+            labels.clear();
+        } else if line_label(line) {
+            labels.push((n, line));
+            if labels.len() > 13 {
+                labels.remove(0);
+            }
+        } else {
+            labels.clear();
+        }
+    }
+    if !amounts.is_empty() {
+        flush_columns(&mut pairs, &mut labels, &mut amounts);
+    }
+    let kinds: Vec<LineKind> = pairs.iter().map(|(_, l, _)| line_kind(l)).collect();
+    // The totals the list may end at: the one known, or else any.
+    let ends: Vec<usize> = (0..pairs.len())
+        .filter(|&i| {
+            kinds[i] == LineKind::Total
+                && match (total, &pairs[i].2) {
+                    (Some(t), Some(a)) => a == t,
+                    (None, Some(_)) => true,
+                    _ => false,
+                }
+        })
+        .collect();
+    // The one with the most listed before it, back to the total before.
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (j, &end) in ends.iter().enumerate() {
+        let start = if j == 0 { 0 } else { ends[j - 1] + 1 };
+        let listed = (start..end).filter(|&i| kinds[i] != LineKind::Total).count();
+        if best.is_none_or(|(_, _, most)| listed > most) {
+            best = Some((start, end, listed));
+        }
+    }
+    let Some((start, end, listed)) = best else {
+        return Vec::new();
+    };
+    if listed == 0 {
+        return Vec::new();
+    }
+    let Some(sum) = pairs[end].2.clone() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in start..=end {
+        let (_, label, amount) = &pairs[i];
+        let mut amount = amount.clone().unwrap_or(Amount {
+            cents: 0,
+            currency: sum.currency.clone(),
+        });
+        if amount.currency != sum.currency {
+            continue;
+        }
+        let mut kind = kinds[i];
+        if kind == LineKind::Total && i != end {
+            // The same total said twice is said once; "Latte total" is an item's.
+            if amount == sum {
+                continue;
+            }
+            kind = LineKind::Item;
+        }
+        if kind == LineKind::Discount {
+            amount.cents = -amount.cents.abs();
+        }
+        out.push(Line {
+            label: label.clone(),
+            amount,
+            kind,
+        });
+        if out.len() >= MAX_LINES {
+            break;
+        }
+    }
+    if out.last().is_none_or(|l| l.kind != LineKind::Total) {
+        return Vec::new();
+    }
+    out
+}
+
+/// A label read with its amount, at its line (None when "Free").
+type Pair = (usize, String, Option<Amount>);
+
+/// Adds a label and its amount at line `n`; one far below the last starts
+/// the list again.
+fn push_pair(pairs: &mut Vec<Pair>, n: usize, label: &str, amount: Option<Amount>) {
+    let label = clean_label(label);
+    if label.is_empty() {
+        return;
+    }
+    if pairs.last().is_some_and(|(at, _, _)| n > at + MAX_GAP) {
+        pairs.clear();
+    }
+    pairs.push((n, label, amount));
+}
+
+/// A column of labels and the column of amounts after it, paired: lined up
+/// from the bottom of the labels (headings come first) and the top of the
+/// amounts.
+fn flush_columns(
+    pairs: &mut Vec<Pair>,
+    labels: &mut Vec<(usize, &str)>,
+    amounts: &mut Vec<Option<Amount>>,
+) {
+    let n = labels.len().min(amounts.len());
+    let from = labels.len() - n;
+    for ((at, label), amount) in labels[from..].iter().zip(amounts.drain(..n)) {
+        push_pair(pairs, *at, label, amount);
+    }
+    amounts.clear();
+    labels.clear();
+}
+
+/// A line that is only an amount (or "Free" in an amount's place).
+fn amount_line(line: &str) -> Option<Option<Amount>> {
+    if FREE.is_match(line) {
+        return Some(None);
+    }
+    if line.chars().count() > 24 {
+        return None;
+    }
+    let (amount, end) = money_span(line)?;
+    line[end..].trim().is_empty().then_some(Some(amount))
+}
+
+/// A line that is a label and then its amount: "Subtotal: $7.75",
+/// "2 × Latte  $9.00", "Sales tax 0,62 €".
+fn labelled_amount(line: &str) -> Option<(&str, Amount)> {
+    if line.chars().count() > 100 {
+        return None;
+    }
+    for (i, ch) in line.char_indices().skip(1) {
+        let before = line[..i].chars().next_back()?;
+        if !(before.is_whitespace() || matches!(before, ':' | '\t' | '|')) {
+            continue;
+        }
+        if !(ch.is_ascii_digit() || ch.is_ascii_uppercase() || "$€£¥₹₩-−z".contains(ch)) {
+            continue;
+        }
+        let Some((amount, end)) = money_span(&line[i..]) else {
+            continue;
+        };
+        if !line[i + end..].trim().is_empty() {
+            continue;
+        }
+        let label = line[..i].trim();
+        return label_like(label).then_some((label, amount));
+    }
+    None
+}
+
+/// A line that may be a label over (or beside) an amount: a few words,
+/// no amount.
+fn line_label(line: &str) -> bool {
+    line.chars().count() <= 60 && label_like(line) && !MONEY_ANYWHERE.is_match(line)
+}
+
+/// Whether text reads like a receipt's label rather than a sentence that
+/// happens to end in an amount.
+fn label_like(label: &str) -> bool {
+    let words = label.split_whitespace().count();
+    label.chars().any(char::is_alphabetic)
+        && words <= 10
+        // Sentences, but not "Total (incl. VAT)".
+        && !(label.contains(". ") && words > 5)
+        && !label.ends_with(['.', '!', '?'])
+        && !FREE.is_match(label)
+}
+
+/// A label as listed: without the colon, dashes and stars around it, its
+/// spaces as one.
+fn clean_label(label: &str) -> String {
+    label
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '*' | '-' | '–' | '|' | '='))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Words that make a label each kind of line, strongest first.
+static LINE_KINDS: LazyLock<Vec<(LineKind, Regex)>> = LazyLock::new(|| {
+    let kind = |k, words: &str| (k, Regex::new(&format!(r"(?i)\b(?:{words})")).expect("pattern"));
+    vec![
+        kind(
+            LineKind::Subtotal,
+            r"sub-?\s?total|zwischensumme|sous-total|subtotale|before\s+tax|pre-?tax|items?\s+total|merchandise\s+total",
+        ),
+        kind(
+            LineKind::Discount,
+            r"discount|coupon|promo|savings|saved|you\s+save|gift\s*card|store\s+credit|credit\s+applied|rebate|voucher|reward|rabatt|gutschein|descuento|remise|réduction|sconto|korting",
+        ),
+        kind(
+            LineKind::Tax,
+            r"tax(?:es)?\b|vat\b|gst\b|hst\b|pst\b|qst\b|mwst|ust\b|iva\b|tva\b|btw\b|steuer|impuesto|taxe|imposta",
+        ),
+        kind(LineKind::Tip, r"tip\b|tips\b|gratuity|trinkgeld|propina|pourboire|mancia"),
+        kind(
+            LineKind::Shipping,
+            r"shipping|delivery|postage|handling|freight|versand|env[ií]o|livraison|spedizione|verzending|porto\b",
+        ),
+        kind(
+            LineKind::Fee,
+            r"fees?\b|service\s+charge|surcharge|deposit|gebühr|frais|cargo\b|commissione",
+        ),
+    ]
+});
+
+/// What a line's label says it is.
+fn line_kind(label: &str) -> LineKind {
+    // "Order total (incl. VAT)" is a total, not a tax.
+    let label = label.split(['(', '[']).next().unwrap_or(label);
+    let label = FILLER_IN
+        .find(label)
+        .map_or(label, |m| &label[..m.start()]);
+    if let Some((kind, _)) = LINE_KINDS.iter().find(|(_, re)| re.is_match(label)) {
+        return *kind;
+    }
+    let lower = label.to_lowercase();
+    let total = TOTAL_LABELS.iter().flat_map(|l| l.iter()).any(|w| {
+        lower.match_indices(w).any(|(i, _)| {
+            let before = lower[..i].chars().next_back();
+            let after = lower[i + w.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    });
+    if total { LineKind::Total } else { LineKind::Item }
+}
+
+/// Words in a label saying what its amount includes.
+static FILLER_IN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\s(?:incl\.?|including|includes|inkl\.?|with|after)(?:\s|$)").expect("pattern")
+});
 
 /// The code a sign or code beside an amount stands for: "USD $" is USD.
 fn currency_of(sign: &str) -> Option<String> {
@@ -799,17 +1108,20 @@ fn walk(value: &Value, depth: usize) -> Option<Receipt> {
         Value::Array(items) => items.iter().find_map(|v| walk(v, depth + 1)),
         Value::Object(map) => {
             if is_type(value, "Order") && order_is_receipt(value) {
+                let total = price_of(value)
+                    .or_else(|| map.get("priceSpecification").and_then(price_of))
+                    .or_else(|| map.get("totalPrice").and_then(price_of));
+                let lines = markup_lines(value, total.as_ref());
                 return Some(Receipt {
                     merchant: map
                         .get("seller")
                         .or_else(|| map.get("merchant"))
                         .and_then(name_of),
-                    total: price_of(value)
-                        .or_else(|| map.get("priceSpecification").and_then(price_of))
-                        .or_else(|| map.get("totalPrice").and_then(price_of)),
+                    total,
                     order: map.get("orderNumber").and_then(text_of),
                     kind: Kind::Purchase,
                     source: Source::Markup,
+                    lines,
                 });
             }
             if is_type(value, "Invoice") && invoice_is_paid(value) {
@@ -828,12 +1140,80 @@ fn walk(value: &Value, depth: usize) -> Option<Receipt> {
                         .and_then(text_of),
                     kind: Kind::Purchase,
                     source: Source::Markup,
+                    lines: Vec::new(),
                 });
             }
             map.values().find_map(|v| walk(v, depth + 1))
         }
         _ => None,
     }
+}
+
+/// What an `Order`'s markup lists: its offers accepted (each an item, with
+/// how many), its discount, and its total. Empty when it lists no item.
+fn markup_lines(order: &Value, total: Option<&Amount>) -> Vec<Line> {
+    let offers: Vec<&Value> = match order.get("acceptedOffer") {
+        Some(Value::Array(offers)) => offers.iter().collect(),
+        Some(offer @ Value::Object(_)) => vec![offer],
+        _ => Vec::new(),
+    };
+    let mut lines: Vec<Line> = offers
+        .into_iter()
+        .take(MAX_LINES)
+        .filter_map(|offer| {
+            let name = offer
+                .get("itemOffered")
+                .and_then(name_of)
+                .or_else(|| offer.get("name").and_then(text_of))?;
+            let amount = price_of(offer)
+                .or_else(|| offer.get("priceSpecification").and_then(price_of))?;
+            let quantity = offer
+                .get("eligibleQuantity")
+                .and_then(|q| q.get("value").and_then(text_of).or_else(|| text_of(q)))
+                .filter(|q| q != "1");
+            let label = match quantity {
+                Some(q) => format!("{q} × {name}"),
+                None => name,
+            };
+            Some(Line {
+                label,
+                amount,
+                kind: LineKind::Item,
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        return lines;
+    }
+    let currency = total.map_or_else(|| lines[0].amount.currency.clone(), |t| t.currency.clone());
+    if let Some(discount) = order.get("discount").and_then(text_of)
+        && let Some(cents) = markup_cents(&discount)
+        && cents != 0
+    {
+        let currency = order
+            .get("discountCurrency")
+            .and_then(text_of)
+            .map_or_else(|| currency.clone(), |c| c.to_uppercase());
+        lines.push(Line {
+            label: order
+                .get("discountCode")
+                .and_then(text_of)
+                .map_or_else(|| "Discount".to_owned(), |code| format!("Discount ({code})")),
+            amount: Amount {
+                cents: -cents.abs(),
+                currency,
+            },
+            kind: LineKind::Discount,
+        });
+    }
+    if let Some(total) = total {
+        lines.push(Line {
+            label: "Total".to_owned(),
+            amount: total.clone(),
+            kind: LineKind::Total,
+        });
+    }
+    lines
 }
 
 /// Whether `value`'s `@type` is (or lists) `name`.
@@ -901,16 +1281,25 @@ fn price_of(value: &Value) -> Option<Amount> {
         .or_else(|| map.get("currency"))
         .and_then(text_of)?
         .to_uppercase();
-    let raw = text_of(price)?;
-    // Markup writes "1234.5", with a point.
+    let cents = markup_cents(&text_of(price)?)?;
+    (currency.len() == 3).then_some(Amount { cents, currency })
+}
+
+/// A price as markup writes it, "1234.5" (with a point), in hundredths.
+fn markup_cents(raw: &str) -> Option<i64> {
+    let (negative, raw) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
     let cents = match raw.split_once('.') {
         Some((w, f)) => {
             let f = format!("{f:0<2}");
-            w.parse::<i64>().ok()? * 100 + f.get(..2)?.parse::<i64>().ok()?
+            let w = if w.is_empty() { 0 } else { w.parse::<i64>().ok()? };
+            w.checked_mul(100)?.checked_add(f.get(..2)?.parse::<i64>().ok()?)?
         }
-        None => raw.parse::<i64>().ok()? * 100,
+        None => raw.parse::<i64>().ok()?.checked_mul(100)?,
     };
-    (currency.len() == 3).then_some(Amount { cents, currency })
+    Some(if negative { -cents } else { cents })
 }
 
 /// A sender as a receipt names it: its name, or else its address's domain
@@ -975,6 +1364,9 @@ pub fn summarize(found: Vec<(Receipt, Sighting)>) -> Vec<Listed> {
             // its total replaces an earlier one (an order's final receipt).
             if receipt.total.is_some() {
                 l.receipt.total = receipt.total;
+            }
+            if !receipt.lines.is_empty() {
+                l.receipt.lines = receipt.lines;
             }
             if l.receipt.merchant.is_none() {
                 l.receipt.merchant = receipt.merchant;
@@ -1091,6 +1483,99 @@ mod tests {
         assert_eq!(
             text("Thanks for your order", "We got it.").unwrap().total,
             None
+        );
+    }
+
+    fn listed(r: &Receipt) -> Vec<(&str, i64, LineKind)> {
+        r.lines
+            .iter()
+            .map(|l| (l.label.as_str(), l.amount.cents, l.kind))
+            .collect()
+    }
+
+    #[test]
+    fn receipts_list_what_they_charged_for() {
+        use LineKind::*;
+        let r = text(
+            "Your receipt from Corner Café",
+            "Latte  Total: $4.50\nCroissant  Total: $3.25\nSubtotal: $7.75\nTax: $0.62\nOrder total: $8.37",
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&r),
+            [
+                ("Latte Total", 450, Item),
+                ("Croissant Total", 325, Item),
+                ("Subtotal", 775, Subtotal),
+                ("Tax", 62, Tax),
+                ("Order total", 837, Total),
+            ]
+        );
+        // Labels over their amounts, a discount and a free line.
+        let r = text(
+            "Thanks for your order.",
+            "Hi Sam,\nThanks for shopping.\n2 × Headphones\n$1,299.99\nPromo code SAVE10\n-$20.00\nShipping\nFree\nEstimated Sales Tax\n$104.00\nTotal\n$1,383.99\nQuestions? Write to us.",
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&r),
+            [
+                ("2 × Headphones", 129_999, Item),
+                ("Promo code SAVE10", -2000, Discount),
+                ("Shipping", 0, Shipping),
+                ("Estimated Sales Tax", 10_400, Tax),
+                ("Total", 138_399, Total),
+            ]
+        );
+        // A column of labels beside a column of amounts.
+        let r = text(
+            "Invoice for your order #507112233445",
+            "Summary\nProduction\nShipping\nSub-total\nSales tax (0%)\nTotal\nUSD 31.40\nUSD 6.50\nUSD 37.90\nUSD 0.00\nUSD 37.90",
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&r),
+            [
+                ("Production", 3140, Item),
+                ("Shipping", 650, Shipping),
+                ("Sub-total", 3790, Subtotal),
+                ("Sales tax (0%)", 0, Tax),
+                ("Total", 3790, Total),
+            ]
+        );
+        // A total alone lists nothing.
+        assert!(text("Payment received", "Amount paid: USD 12.5").unwrap().lines.is_empty());
+        // Nor does a list that doesn't end in the total.
+        assert!(text("Your receipt", "Latte: $4.50\nCookie: $2.00").unwrap().lines.is_empty());
+        // "Total (incl. VAT)" is the total, not a tax; tip and fees.
+        let r = text(
+            "Your receipt from Example Eats",
+            "Pad thai €12,50\nService fee €1,00\nTip €2,00\nTotal (incl. VAT) €15,50",
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&r),
+            [
+                ("Pad thai", 1250, Item),
+                ("Service fee", 100, Fee),
+                ("Tip", 200, Tip),
+                ("Total (incl. VAT)", 1550, Total),
+            ]
+        );
+    }
+
+    #[test]
+    fn markup_lists_its_offers() {
+        let html = r#"<script type="application/ld+json">{"@type":"Order","merchant":{"name":"Gadget Store"},"orderNumber":"GS-1","price":"55.00","priceCurrency":"USD","discount":"5","discountCode":"WELCOME","acceptedOffer":[{"@type":"Offer","itemOffered":{"@type":"Product","name":"Cable"},"price":"10.00","priceCurrency":"USD","eligibleQuantity":{"value":2}},{"@type":"Offer","itemOffered":{"name":"Charger"},"price":"40","priceCurrency":"USD"}]}</script>"#;
+        let r = from_markup(html).unwrap();
+        assert_eq!(
+            listed(&r),
+            [
+                ("2 × Cable", 1000, LineKind::Item),
+                ("Charger", 4000, LineKind::Item),
+                ("Discount (WELCOME)", -500, LineKind::Discount),
+                ("Total", 5500, LineKind::Total),
+            ]
         );
     }
 
@@ -1237,6 +1722,7 @@ mod tests {
             order: order.map(Into::into),
             kind,
             source: Source::Text,
+            lines: Vec::new(),
         };
         let listed = summarize(vec![
             (

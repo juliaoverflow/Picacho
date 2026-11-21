@@ -507,7 +507,7 @@ fn the_summary_lists_receipts_with_what_was_spent(cx: &mut TestAppContext) {
                 now - 120,
                 "Thanks for your order #A-12345",
                 "Gadget Store",
-                "Order total: $120.00",
+                "Charger  $110.00\nShipping  $10.00\nOrder total: $120.00",
             ),
             // The same order's receipt, later: one purchase.
             receipt(
@@ -559,6 +559,35 @@ fn the_summary_lists_receipts_with_what_was_spent(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("summary-receipts-month-0").is_some());
     assert!(cx.debug_bounds("summary-receipts-month-total-0").is_some());
     assert!(cx.debug_bounds("summary-receipt-2").is_some());
+    // A receipt that lists what it charged for shows it under its row.
+    assert!(cx.debug_bounds("summary-receipt-details-0").is_none());
+    assert!(cx.debug_bounds("summary-receipt-lines-2").is_none());
+    let details = cx.debug_bounds("summary-receipt-details-2").unwrap().center();
+    cx.simulate_click(details, Modifiers::none());
+    frame(cx);
+    assert!(cx.debug_bounds("summary-receipt-lines-2").is_some());
+    assert!(cx.debug_bounds("summary-receipt-line-2-2").is_some());
+    assert!(cx.debug_bounds("summary-receipt-line-2-3").is_none());
+    view.read_with(cx, |this, _| {
+        let lines: Vec<(String, String)> = this.receipts[2]
+            .receipt
+            .lines
+            .iter()
+            .map(|l| (l.label.clone(), l.amount.show()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("Charger".into(), "$110.00".into()),
+                ("Shipping".into(), "$10.00".into()),
+                ("Order total".into(), "$120.00".into()),
+            ]
+        );
+    });
+    let details = cx.debug_bounds("summary-receipt-details-2").unwrap().center();
+    cx.simulate_click(details, Modifiers::none());
+    frame(cx);
+    assert!(cx.debug_bounds("summary-receipt-lines-2").is_none());
     let back = cx.debug_bounds("summary-back").unwrap().center();
     cx.simulate_click(back, Modifiers::none());
     frame(cx);

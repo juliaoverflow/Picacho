@@ -13,6 +13,10 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- The Summary's Receipts page shows what each receipt lists, under
+  Details: its items, subtotal, shipping, fees, tip, taxes and discounts,
+  and its total. They're read from the email's text or the sender's
+  markup. Receipts can be searched by what they list too.
 - Settings → Local AI → Suggest replies: a small model on this computer
   reads received mail and offers a few short replies under it (and in the
   Reply menu on phones and tablets), chosen for what the message says and

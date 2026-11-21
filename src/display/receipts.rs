@@ -7,7 +7,7 @@
 //! one taken for a receipt wrongly can be hidden.
 use super::summary::{WIDGET_WIDTH, tag};
 use super::*;
-use crate::manage::receipts::{self, Amount, Kind, Listed};
+use crate::manage::receipts::{self, Amount, Kind, LineKind, Listed};
 use chrono::{Datelike, TimeZone};
 
 /// Receipts the Summary's Receipts widget lists; the rest are on its
@@ -74,6 +74,14 @@ impl MailApp {
             return;
         };
         let mut entries = vec![entry("Open Email", "mail-open", open_email(l))];
+        if !l.receipt.lines.is_empty() {
+            let shown = self.summary_expanded.contains(&format!("receipt:{key}"));
+            entries.push(entry(
+                if shown { "Hide Details" } else { "Show Details" },
+                "list",
+                Action::ToggleReceipt(key.to_owned()),
+            ));
+        }
         if let Some(order) = &l.receipt.order {
             entries.push(entry(
                 "Copy Order Number",
@@ -608,7 +616,9 @@ impl MailApp {
         }
         let key = l.key();
         let open = open_email(l);
-        div()
+        let has_lines = !l.receipt.lines.is_empty();
+        let expanded = has_lines && self.summary_expanded.contains(&format!("receipt:{key}"));
+        let row = div()
             .id(SharedString::from(format!("summary-receipt-{i}")))
             .debug_selector(move || format!("summary-receipt-{i}"))
             .px_3()
@@ -617,7 +627,6 @@ impl MailApp {
             .items_center()
             .gap_3()
             .cursor_pointer()
-            .when(border, |d| d.border_t_1().border_color(rgb(c.border)))
             .hover(move |s| s.bg(rgb(c.raised)))
             .on_mouse_down(MouseButton::Right, {
                 let key = key.clone();
@@ -689,13 +698,75 @@ impl MailApp {
                     ),
             )
             .child(self.receipt_amount(&format!("summary-amount-{i}"), l))
+            .when(has_lines, |d| {
+                d.child(self.summary_link(
+                    &format!("summary-receipt-details-{i}"),
+                    if expanded { "Less" } else { "Details" },
+                    Action::ToggleReceipt(key.clone()),
+                    cx,
+                ))
+            })
             // Phones have no right click: hiding is a link.
             .child(self.summary_link(
                 &format!("summary-receipt-hide-{i}"),
                 if l.hidden { "Show" } else { "Hide" },
                 Action::HideReceipt(key, !l.hidden),
                 cx,
-            ))
+            ));
+        div()
+            .flex()
+            .flex_col()
+            .when(border, |d| d.border_t_1().border_color(rgb(c.border)))
+            .child(row)
+            .when(expanded, |d| d.child(self.receipt_lines(i, l)))
+            .into_any_element()
+    }
+
+    /// What a receipt lists, under its row: each item, tax, discount… with
+    /// its amount, the total last and set apart.
+    fn receipt_lines(&self, i: usize, l: &Listed) -> AnyElement {
+        let c = self.colors();
+        div()
+            .id(SharedString::from(format!("summary-receipt-lines-{i}")))
+            .debug_selector(move || format!("summary-receipt-lines-{i}"))
+            .pl(px(42.))
+            .pr_3()
+            .pb_2()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .children(l.receipt.lines.iter().enumerate().map(|(j, line)| {
+                let total = line.kind == LineKind::Total;
+                let minor = matches!(line.kind, LineKind::Subtotal | LineKind::Total);
+                let discount = line.amount.cents < 0;
+                div()
+                    .id(SharedString::from(format!("summary-receipt-line-{i}-{j}")))
+                    .debug_selector(move || format!("summary-receipt-line-{i}-{j}"))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_size(px(12.))
+                    .when(minor, |d| d.pt(px(2.)).border_t_1().border_color(rgb(c.border)))
+                    .when(total, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(if line.kind == LineKind::Item || total {
+                                c.text
+                            } else {
+                                c.muted
+                            }))
+                            .child(line.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(if discount { c.accent } else { c.text }))
+                            .child(line.amount.show()),
+                    )
+            }))
             .into_any_element()
     }
 }
@@ -726,6 +797,9 @@ fn receipt_matches(
         fields.push("refund");
     }
     fields.extend(account);
+    for line in &r.lines {
+        fields.push(&line.label);
+    }
     for s in &l.emails {
         fields.push(&s.subject);
         fields.push(&s.sender);

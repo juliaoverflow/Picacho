@@ -759,6 +759,9 @@ enum Action {
     ReceiptMenu(String),
     /// Hides a Summary receipt (true) or shows it again, by its key.
     HideReceipt(String, bool),
+    /// Shows or hides what a Summary receipt lists (its items, taxes,
+    /// discounts…), by its key.
+    ToggleReceipt(String),
     /// Lists hidden receipts on the Receipts page too (true), or not.
     ShowHiddenReceipts(bool),
     /// Opens the Receipts page's search field (true), or closes it and
@@ -6133,6 +6136,13 @@ impl MailApp {
             }
             Action::ReceiptMenu(key) => self.receipt_menu(&key, w, cx),
             Action::HideReceipt(key, hide) => self.hide_receipt(&key, hide, cx),
+            Action::ToggleReceipt(key) => {
+                let key = format!("receipt:{key}");
+                if !self.summary_expanded.remove(&key) {
+                    self.summary_expanded.insert(key);
+                }
+                cx.notify();
+            }
             Action::ShowHiddenReceipts(show) => {
                 self.receipts_show_hidden = show;
                 cx.notify();

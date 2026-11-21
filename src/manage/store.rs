@@ -1986,7 +1986,7 @@ const PARCEL_DOWNLOAD_DAYS: i64 = 365;
 
 /// How messages are read for receipts (see `Store::receipts`): raise it
 /// whenever `receipts::find` finds differently.
-const RECEIPT_SCAN: i64 = 2;
+const RECEIPT_SCAN: i64 = 3;
 
 /// What a look through mail for receipts found.
 pub struct ReceiptScan {
