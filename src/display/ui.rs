@@ -694,6 +694,17 @@ enum Action {
     /// Confirms tracking numbers found in mail with the model (installing
     /// it), or stops (deleting it).
     SetFindParcels(bool),
+    /// Suggests replies under received mail with the model (installing
+    /// it), or stops (deleting it).
+    SetSuggestReplies(bool),
+    /// Answers the open message with this suggested reply.
+    SmartReply(String),
+    /// The menu of a suggested reply (right-click).
+    SmartReplyMenu(String),
+    /// Stops suggesting this reply.
+    DismissSmartReply(String),
+    /// Forgets which suggested replies were chosen and turned away.
+    ForgetReplyHistory,
     /// Shows a message's hidden sign-in codes, or hides them again.
     ShowCodes(String, bool),
     /// Copies a message's sign-in code without showing it.
@@ -1323,6 +1334,19 @@ pub struct MailApp {
     /// Parcels found per message for the reader, with the lengths of the
     /// subject and text they were found in and whether the model was used.
     parcels_found: std::cell::RefCell<HashMap<String, summary::Found>>,
+    /// Replies are suggested under received mail (Settings → Local AI),
+    /// with the reply model once loaded; its download, as the sign-in code
+    /// model's above.
+    suggest_replies: bool,
+    reply_model: Option<Rc<crate::manage::local_ai::replies::Suggester>>,
+    replies_busy: bool,
+    replies_error: Option<String>,
+    replies_progress: Arc<std::sync::atomic::AtomicU64>,
+    /// The suggested replies chosen and turned away, and its revision (the
+    /// suggestions found per message are for one revision).
+    reply_history: crate::manage::local_ai::replies::History,
+    reply_history_rev: u64,
+    replies_found: std::cell::RefCell<HashMap<String, ai::Suggested>>,
     /// The open Summary (in place of the list and reader) of the open
     /// account, and the parcels it lists.
     summary_open: bool,
@@ -1514,6 +1538,8 @@ impl MailApp {
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         let understand_dates = crate::manage::local_ai::when_enabled(&store);
         let find_parcels = crate::manage::local_ai::parcel_enabled(&store);
+        let suggest_replies = crate::manage::local_ai::replies_enabled(&store);
+        let reply_history = crate::manage::local_ai::reply_history(&store);
         if clean_links {
             crate::manage::tracking::warm_up();
         }
@@ -2193,6 +2219,14 @@ impl MailApp {
             parcel_error: None,
             parcel_progress: Arc::default(),
             parcels_found: Default::default(),
+            suggest_replies,
+            reply_model: None,
+            replies_busy: false,
+            replies_error: None,
+            replies_progress: Arc::default(),
+            reply_history,
+            reply_history_rev: 0,
+            replies_found: Default::default(),
             summary_open: false,
             summary: Vec::new(),
             summary_loading: false,
@@ -5414,6 +5448,7 @@ impl MailApp {
                 Action::Compose
                     | Action::ComposeTo(_)
                     | Action::Reply(_)
+                    | Action::SmartReply(_)
                     | Action::Forward
                     | Action::Settings
             )
@@ -6010,6 +6045,19 @@ impl MailApp {
             Action::SetHideCodes(on) => self.set_hide_codes(on, cx),
             Action::SetUnderstandDates(on) => self.set_understand_dates(on, cx),
             Action::SetFindParcels(on) => self.set_find_parcels(on, cx),
+            Action::SetSuggestReplies(on) => self.set_suggest_replies(on, cx),
+            Action::SmartReply(intent) => self.smart_reply(intent, w, cx),
+            Action::SmartReplyMenu(intent) => {
+                let entries = vec![entry(
+                    "Don't Suggest This",
+                    "ban",
+                    Action::DismissSmartReply(intent),
+                )];
+                self.open_menu_here(entries, w, cx);
+                return;
+            }
+            Action::DismissSmartReply(intent) => self.dismiss_smart_reply(intent, cx),
+            Action::ForgetReplyHistory => self.forget_reply_history(cx),
             Action::ShowCodes(id, show) => self.show_codes(id, show, cx),
             Action::CopyCode(id) => self.copy_code(id, cx),
             Action::AskDeleteModel(id) => self.ask_delete_model(id, cx),

@@ -183,6 +183,11 @@ impl NativeTagger {
         })
     }
 
+    /// How many labels the model tells apart.
+    pub fn classes(&self) -> usize {
+        self.classes
+    }
+
     /// The probability of each label for one sparse feature vector of
     /// (index, value); features out of range are ignored.
     pub fn probabilities(&self, x: &[(usize, f32)]) -> Vec<f32> {

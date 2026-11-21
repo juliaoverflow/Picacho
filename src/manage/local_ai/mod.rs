@@ -5,11 +5,14 @@
 //!
 //! The features: hiding sign-in and verification codes (see `otp`), and
 //! understanding dates and times typed where Picacho asks when ("tmrw at 6",
-//! see `when`), and confirming tracking numbers found in mail (see `parcel`).
+//! see `when`), confirming tracking numbers found in mail (see `parcel`),
+//! and suggesting replies to received mail in its own language (see
+//! `replies`).
 #[cfg(target_os = "macos")]
 mod coreml;
 pub mod otp;
 pub mod parcel;
+pub mod replies;
 pub mod runtime;
 pub mod when;
 
@@ -27,6 +30,11 @@ pub const OTP_PREFERENCE: &str = "local_ai_otp";
 pub const WHEN_PREFERENCE: &str = "local_ai_when";
 /// Preference: tracking numbers found in mail are confirmed by the model.
 pub const PARCEL_PREFERENCE: &str = "local_ai_parcel";
+/// Preference: replies are suggested under received mail.
+pub const REPLIES_PREFERENCE: &str = "local_ai_replies";
+/// Preference: the suggested replies chosen and turned away (JSON,
+/// `replies::History`).
+pub const REPLY_HISTORY_PREFERENCE: &str = "local_ai_reply_history";
 
 /// Where the models are published: Picacho's model repositories on Hugging
 /// Face (in the pinaltech "Picacho Models" collection), one per model. Each
@@ -169,8 +177,27 @@ const PARCEL_NATIVE: Model = Model {
     threshold: 0.5,
 };
 
+/// Echo Replies, the reply suggestion model (see `models/replies/train.py`):
+/// the same file on every platform, run by Picacho's own runtime. Until it
+/// is on Hugging Face, it is installed from the file `train.py` writes in
+/// `models/replies` (see `local_dir`).
+pub const REPLIES: Model = Model {
+    id: "replies",
+    label: "Reply suggestion model",
+    features: &["Suggest replies"],
+    repo: "echo-replies",
+    kind: Kind::Tagger,
+    file: "replies-v1.bin",
+    local: true,
+    installed: "replies-v1.bin",
+    sha256: "2e70213172b99b6537baf5a4b1c4594a5db1c6a2642c3e215ab0ffc144b27d2b",
+    size: 1_187_716,
+    dim: replies::DIM,
+    threshold: 0.,
+};
+
 /// Every model Local AI can download.
-pub const MODELS: [&Model; 3] = [&OTP, &WHEN, &PARCEL];
+pub const MODELS: [&Model; 4] = [&OTP, &WHEN, &PARCEL, &REPLIES];
 
 /// The model with this id.
 pub fn model(id: &str) -> Option<&'static Model> {
@@ -189,6 +216,17 @@ pub fn otp_enabled(store: &Store) -> bool {
 /// feature on).
 pub fn parcel_enabled(store: &Store) -> bool {
     enabled(store) && store.preference(PARCEL_PREFERENCE).as_deref() == Some("true")
+}
+/// Whether replies are suggested (Local AI on, and the feature on).
+pub fn replies_enabled(store: &Store) -> bool {
+    enabled(store) && store.preference(REPLIES_PREFERENCE).as_deref() == Some("true")
+}
+/// The suggested replies chosen and turned away so far.
+pub fn reply_history(store: &Store) -> replies::History {
+    store
+        .preference(REPLY_HISTORY_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 /// Whether typed dates are understood (Local AI on, and the feature on).
 pub fn when_enabled(store: &Store) -> bool {
@@ -356,6 +394,11 @@ pub fn parcel_confirmer(store: &Store) -> Result<parcel::Confirmer> {
     ))
 }
 
+/// The reply suggester, with the installed model.
+pub fn reply_suggester(store: &Store) -> Result<replies::Suggester> {
+    replies::Suggester::new(REPLIES.load_tagger(store)?)
+}
+
 /// The date and time reader, with the installed model.
 pub fn when_parser(store: &Store) -> Result<when::Parser> {
     Ok(when::Parser::new(WHEN.load_tagger(store)?))
@@ -467,6 +510,25 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
     std::fs::write(&partial, &bytes).unwrap();
     std::fs::rename(&partial, &cached).unwrap();
     cached
+}
+
+/// The reply model `models/replies/train.py` wrote, while it isn't
+/// published: None (and tests needing it skip, saying why) unless it is
+/// there and is the one the app expects.
+#[cfg(test)]
+pub(crate) fn trained_replies() -> Option<PathBuf> {
+    let path = local_dir(&REPLIES).join(REPLIES.file);
+    match std::fs::read(&path) {
+        Ok(bytes) if hex(&Sha256::digest(&bytes)) == REPLIES.sha256 => Some(path),
+        _ => {
+            eprintln!(
+                "skipping: {} isn't the reply model the app expects (run models/replies/train.py \
+                 and update REPLIES' size and digest)",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

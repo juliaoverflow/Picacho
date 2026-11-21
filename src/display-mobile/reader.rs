@@ -73,11 +73,24 @@ impl MailApp {
             .when(!has_next, |d| d.opacity(0.35))
             .into_any_element(),
         ];
-        let reply_entries = vec![
+        let mut reply_entries = vec![
             entry("Reply", "reply", Action::Reply(false)),
             entry("Reply All", "reply-all", Action::Reply(true)),
             entry("Forward", "forward", Action::Forward),
         ];
+        // Suggested replies, under the others, for mail one answers.
+        if !drafts_or_sent {
+            let smart = self.smart_replies(m);
+            if !smart.replies.is_empty() {
+                reply_entries.push(Entry::Separator);
+            }
+            reply_entries.extend(
+                smart
+                    .replies
+                    .iter()
+                    .map(|s| entry(s.text, "sparkle", Action::SmartReply(s.intent.to_owned()))),
+            );
+        }
         let more_id = id.clone();
         let mut tools = vec![
             self.touch_icon(

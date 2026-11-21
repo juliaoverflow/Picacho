@@ -286,3 +286,131 @@ fn finding_tracking_numbers_installs_the_unpublished_model_from_its_training_dir
     });
     assert!(!local_ai::PARCEL.is_installed(&store));
 }
+
+#[gpui::test]
+fn suggested_replies_are_worded_in_the_message_language_and_learn(cx: &mut TestAppContext) {
+    if local_ai::trained_replies().is_none() {
+        return;
+    }
+    let store = store();
+    let mut a = Account::new(Provider::Imap);
+    a.name = "Work".into();
+    a.email = "work@example.com".into();
+    store.save_account(&a).unwrap();
+    let mail = |n: u32, from: &str, subject: &str, body: &str| Mail {
+        id: format!("{}:INBOX:1:{n}", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: n,
+        from: from.into(),
+        sender: "Ana".into(),
+        to: "work@example.com".into(),
+        subject: subject.into(),
+        snippet: body.replace('\n', " "),
+        body: Some(body.into()),
+        date: chrono::Utc::now().timestamp() - i64::from(n) * 60,
+        message_id: format!("<{n}@example.com>"),
+        ..Mail::default()
+    };
+    let meeting = mail(
+        1,
+        "ana@example.com",
+        "Termin",
+        "Hallo,\n\nkönnen wir uns am Dienstag um 10:00 treffen, um das Budget durchzugehen?\n\nViele Grüße\nAna",
+    );
+    let newsletter = mail(
+        2,
+        "news@shop.test",
+        "Unsere Angebote",
+        "Neue Angebote diese Woche!",
+    );
+    let mut newsletter = newsletter;
+    newsletter.list_unsubscribe = "<mailto:leave@shop.test>".into();
+    store
+        .save_messages(&[meeting.clone(), newsletter.clone()])
+        .unwrap();
+    let (view, cx) = open(store.clone(), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.smart_replies(&meeting).replies.is_empty())
+    });
+    // Turned on, the model is installed (from the trained file) and loaded.
+    act(&view, Action::SetLocalAi(true), cx);
+    act(&view, Action::SetSuggestReplies(true), cx);
+    cx.run_until_parked();
+    assert!(local_ai::REPLIES.is_installed(&store));
+    let first = view.read_with(cx, |this, _| {
+        assert!(this.replies_error.is_none(), "{:?}", this.replies_error);
+        let found = this.smart_replies(&meeting);
+        assert_eq!(found.language, "de");
+        assert!(
+            !found.replies.is_empty(),
+            "a meeting request gets suggestions"
+        );
+        let intents: Vec<&str> = found.replies.iter().map(|s| s.intent).collect();
+        assert!(
+            intents.iter().any(|i| [
+                "works_for_me",
+                "see_you_then",
+                "check_calendar",
+                "another_time"
+            ]
+            .contains(i)),
+            "{intents:?}"
+        );
+        // Mailing lists get none.
+        assert!(this.smart_replies(&newsletter).replies.is_empty());
+        found.replies[0].clone()
+    });
+    act(&view, Action::Select(meeting.id.clone()), cx);
+    frame(cx);
+    assert!(cx.debug_bounds("smart-replies").is_some());
+    assert!(cx.debug_bounds("smart-reply-0").is_some());
+    // Choosing one starts a reply with its German wording, and it's
+    // remembered.
+    act(&view, Action::SmartReply(first.intent.to_owned()), cx);
+    view.read_with(cx, |this, cx| {
+        let reply = this
+            .inline_composer(&meeting.id)
+            .expect("the reply opens below the message");
+        let draft = &reply.read(cx).draft;
+        assert!(draft.body.starts_with(first.text), "{:?}", draft.body);
+        assert_eq!(this.reply_history.uses[first.intent].chosen, 1);
+    });
+    let saved = store
+        .preference(local_ai::REPLY_HISTORY_PREFERENCE)
+        .expect("the history is kept");
+    assert!(saved.contains(first.intent));
+    // Turned away, it isn't offered again.
+    act(
+        &view,
+        Action::DismissSmartReply(first.intent.to_owned()),
+        cx,
+    );
+    view.read_with(cx, |this, _| {
+        assert!(
+            !this
+                .smart_replies(&meeting)
+                .replies
+                .iter()
+                .any(|s| s.intent == first.intent)
+        );
+    });
+    act(&view, Action::ForgetReplyHistory, cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.reply_history.is_empty());
+        assert!(
+            this.smart_replies(&meeting)
+                .replies
+                .iter()
+                .any(|s| s.intent == first.intent)
+        );
+    });
+    // Off again: the model is deleted and nothing is suggested.
+    act(&view, Action::SetSuggestReplies(false), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.reply_model.is_none());
+        assert!(this.smart_replies(&meeting).replies.is_empty());
+    });
+    assert!(!local_ai::REPLIES.is_installed(&store));
+}

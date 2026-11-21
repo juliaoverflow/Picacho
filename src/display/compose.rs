@@ -39,21 +39,76 @@ impl MailApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.compose_with(mode, original, placement, None, w, cx);
+        self.compose_with(mode, original, placement, None, None, w, cx);
+    }
+
+    /// Answers the open message with `text` (a suggested reply) written in:
+    /// a reply (to everyone, if Reply does that) where replies open, ready
+    /// to send or go on writing. A reply already open to the message gets
+    /// the text instead.
+    pub(super) fn reply_with_text(&mut self, text: String, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(original) = self.selected_mail() else {
+            return;
+        };
+        if let Some(open) = self.open_answer(&original, false, cx) {
+            // Typed into that reply, brought into view as Reply would.
+            open.update(cx, |c, cx| {
+                c.minimized = false;
+                cx.notify();
+            });
+            match open.read(cx).window {
+                Some(handle) => {
+                    let _ = handle.update(cx, |_, w, cx| {
+                        open.update(cx, |c, cx| c.insert_reply_text(&text, w, cx));
+                        w.activate_window();
+                    });
+                }
+                None => {
+                    open.update(cx, |c, cx| c.insert_reply_text(&text, w, cx));
+                    if open.read(cx).placement == Placement::Inline {
+                        self.scroll_reader_to_end(w);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let mode = if self.compose_options.default_reply_all {
+            2
+        } else {
+            1
+        };
+        let end = text.len();
+        self.compose_with(mode, Some(original.clone()), None, None, Some(text), w, cx);
+        // Writing goes on after the suggested reply, not before it.
+        if let Some(open) = self.open_answer(&original, false, cx) {
+            match open.read(cx).window {
+                Some(handle) => {
+                    let _ = handle.update(cx, |_, w, cx| {
+                        open.update(cx, |c, cx| c.put_cursor(end, w, cx))
+                    });
+                }
+                None => open.update(cx, |c, cx| c.put_cursor(end, w, cx)),
+            }
+        }
     }
 
     /// A new message to `to` (an address list), sent from the account of
     /// the open message, as from a reader's address menu.
     pub(super) fn compose_to(&mut self, to: String, w: &mut Window, cx: &mut Context<Self>) {
-        self.compose_with(0, None, None, Some(to), w, cx);
+        self.compose_with(0, None, None, Some(to), None, w, cx);
     }
 
+    /// `intro` (a suggested reply) starts the body, above the signature and
+    /// quote.
+    #[allow(clippy::too_many_arguments)]
     fn compose_with(
         &mut self,
         mode: u8,
         original: Option<Mail>,
         placement: Option<Placement>,
         to: Option<String>,
+        intro: Option<String>,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -230,6 +285,9 @@ impl MailApp {
         }
         if let Some(to) = to {
             draft.to = to;
+        }
+        if let Some(intro) = intro {
+            draft.body = format!("{intro}{}", draft.body);
         }
         // A mailbox kept to its aliases writes as one of them.
         if draft.send_as.is_empty()

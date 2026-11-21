@@ -725,6 +725,9 @@ impl MailApp {
                             .border_color(rgb(c.border)),
                         ),
                 );
+                if let Some(chips) = self.smart_reply_chips(m, cx) {
+                    content = content.child(chips);
+                }
             }
             content = content.child(self.source_links(cx));
         }
@@ -1636,6 +1639,70 @@ impl MailApp {
             .flex_col()
             .child(body)
             .into_any_element()
+    }
+}
+
+impl MailApp {
+    /// The replies the reply model suggests (Settings → Local AI) as chips
+    /// under a message, each starting a reply with it written in. None for
+    /// mail one doesn't answer (drafts, one's own sent mail) or when there
+    /// is nothing to suggest.
+    pub(super) fn smart_reply_chips(&self, m: &Mail, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        let c = self.colors();
+        if matches!(m.folder, Folder::Drafts | Folder::Sent) {
+            return None;
+        }
+        let smart = self.smart_replies(m);
+        if smart.replies.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id("smart-replies")
+                .debug_selector(|| "smart-replies".into())
+                .mt_3()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .children(smart.replies.iter().enumerate().map(|(i, s)| {
+                    let intent = s.intent.to_owned();
+                    let menu = intent.clone();
+                    let selector = format!("smart-reply-{i}");
+                    div()
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector)
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(12.))
+                        .py(px(5.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(c.soft))
+                        .bg(rgb(c.soft))
+                        .text_size(px(12.5))
+                        .cursor_pointer()
+                        .hover(move |d| d.bg(rgb(c.surface)))
+                        .child(icon_el("sparkle", 12., c.accent))
+                        .child(s.text.to_owned())
+                        .tooltip(|w, cx| {
+                            Tooltip::new(
+                                "Suggested by Local AI. Right-click to stop suggesting it.",
+                            )
+                            .build(w, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.handle(Action::SmartReply(intent.clone()), w, cx)
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                cx.stop_propagation();
+                                this.handle(Action::SmartReplyMenu(menu.clone()), w, cx)
+                            }),
+                        )
+                })),
+        )
     }
 }
 

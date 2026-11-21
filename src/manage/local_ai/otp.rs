@@ -362,9 +362,14 @@ fn fnv1a(s: &str) -> u32 {
 /// Sparse, L2-normalized counts of the hashed features: (index, value),
 /// by index.
 pub(crate) fn vector(features: &[String]) -> Vec<(usize, f32)> {
+    vector_in(features, DIM)
+}
+
+/// `vector` in a hashed feature space of `dim` slots (a power of two).
+pub(crate) fn vector_in(features: &[String], dim: usize) -> Vec<(usize, f32)> {
     let mut counts: std::collections::BTreeMap<usize, f64> = Default::default();
     for f in features {
-        *counts.entry(fnv1a(f) as usize & (DIM - 1)).or_default() += 1.;
+        *counts.entry(fnv1a(f) as usize & (dim - 1)).or_default() += 1.;
     }
     let norm = counts.values().map(|v| v * v).sum::<f64>().sqrt();
     if norm == 0. {

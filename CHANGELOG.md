@@ -13,6 +13,15 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Settings → Local AI → Suggest replies: a small model on this computer
+  reads received mail and offers a few short replies under it (and in the
+  Reply menu on phones and tablets), chosen for what the message says and
+  worded in its language, in 37 languages: "Let me check my calendar." for
+  a meeting request, "Das passt mir." for a German one. Choosing one starts
+  a reply with it written in. Replies you choose are offered more, and
+  right-clicking one stops it (Forget, beside the setting, starts over).
+  Nothing is offered for mailing lists, no-reply senders, sign-in codes,
+  receipts or package updates.
 - JMAP: delivery receipts are asked for where the server can (DSN), the
   away reply works on servers that have only JMAP's own (VacationResponse,
   such as Fastmail), mail accounts shared with your sign-in can be added

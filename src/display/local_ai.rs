@@ -1,11 +1,16 @@
 //! Local AI in the app: the Settings page that turns it and its features on
 //! (downloading their models) and off (deleting them), hiding the sign-in
 //! codes the model finds wherever mail is shown, the date and time model
-//! that reads times typed into Snooze and Send Later, and the tracking
-//! number model that confirms the parcels the reader and Summary show.
+//! that reads times typed into Snooze and Send Later, the tracking number
+//! model that confirms the parcels the reader and Summary show, and the
+//! reply model that suggests replies under received mail.
 use super::*;
-use crate::manage::local_ai::{self, otp};
+use crate::manage::local_ai::{self, otp, replies};
 use std::borrow::Cow;
+
+/// Replies suggested for a message, with the lengths of the subject and
+/// text and the history revision they were suggested for.
+pub(super) type Suggested = ((usize, usize, u64), Rc<replies::Suggestions>);
 
 /// Codes found in messages, kept per message until what was looked at
 /// changes; cleared past this many.
@@ -147,6 +152,166 @@ impl MailApp {
         self.start_otp(cx);
         self.start_when(cx);
         self.start_parcels(cx);
+        self.start_replies(cx);
+    }
+
+    /// The replies the model suggests for received mail `m` (from its body,
+    /// or its preview before the body is downloaded), worded in its
+    /// language. Empty while the feature is off or its model isn't loaded,
+    /// for mail written here, from senders who don't read replies, mailing
+    /// lists, sign-in codes, receipts and package updates, and where the
+    /// model finds the message wants no reply.
+    pub(super) fn smart_replies(&self, m: &Mail) -> Rc<replies::Suggestions> {
+        let Some(model) = self.reply_model.as_ref().filter(|_| self.suggest_replies) else {
+            return Rc::default();
+        };
+        let kinds = self.mail_kinds.as_deref();
+        if matches!(m.folder, Folder::Sent | Folder::Drafts)
+            || replies::wants_no_reply(&m.from, &m.list_unsubscribe)
+            || crate::manage::mail_kinds::Kinds::code(kinds, m)
+            || crate::manage::mail_kinds::Kinds::package(kinds, m)
+            || crate::manage::mail_kinds::Kinds::receipt(kinds, m)
+        {
+            return Rc::default();
+        }
+        let body = m.body.as_deref().unwrap_or(&m.snippet);
+        let key = (m.subject.len(), body.len(), self.reply_history_rev);
+        if let Some((k, found)) = self.replies_found.borrow().get(&m.id)
+            && *k == key
+        {
+            return found.clone();
+        }
+        let found = Rc::new(model.suggest(
+            &m.subject,
+            body,
+            &self.reply_history,
+            replies::fallback_language(),
+            replies::MAX_SUGGESTIONS,
+        ));
+        let mut cache = self.replies_found.borrow_mut();
+        if cache.len() >= FOUND_CACHE {
+            cache.clear();
+        }
+        cache.insert(m.id.clone(), (key, found.clone()));
+        found
+    }
+
+    /// Answers the open message with its suggested reply `intent`, and
+    /// remembers it was chosen.
+    pub(super) fn smart_reply(&mut self, intent: String, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.selected_mail() else {
+            return;
+        };
+        let found = self.smart_replies(&m);
+        let Some(s) = found.replies.iter().find(|s| s.intent == intent) else {
+            return;
+        };
+        let text = s.text.to_owned();
+        self.reply_history.chose(&intent);
+        self.save_reply_history();
+        self.reply_with_text(text, w, cx);
+    }
+
+    /// Stops suggesting reply `intent`.
+    pub(super) fn dismiss_smart_reply(&mut self, intent: String, cx: &mut Context<Self>) {
+        self.reply_history.dismiss(&intent);
+        self.save_reply_history();
+        cx.notify();
+    }
+
+    /// Forgets which suggestions were chosen and turned away.
+    pub(super) fn forget_reply_history(&mut self, cx: &mut Context<Self>) {
+        self.reply_history = replies::History::default();
+        self.save_reply_history();
+        self.notice(
+            "Picacho forgot which replies you chose and turned away",
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn save_reply_history(&mut self) {
+        self.reply_history_rev += 1;
+        if let Ok(json) = serde_json::to_string(&self.reply_history) {
+            self.backend
+                .store
+                .set_preference_soon(local_ai::REPLY_HISTORY_PREFERENCE, &json);
+        }
+    }
+
+    fn start_replies(&mut self, cx: &mut Context<Self>) {
+        if !self.suggest_replies {
+            return;
+        }
+        let _ = local_ai::remove_stale(&self.backend.store);
+        if local_ai::REPLIES.is_installed(&self.backend.store) {
+            self.load_replies(cx);
+        } else {
+            self.install_replies(cx);
+        }
+    }
+    fn load_replies(&mut self, cx: &mut Context<Self>) {
+        match local_ai::reply_suggester(&self.backend.store) {
+            Ok(model) => {
+                self.reply_model = Some(Rc::new(model));
+                self.replies_error = None;
+            }
+            Err(e) => {
+                self.reply_model = None;
+                self.replies_error = Some(format!("{e:#}"));
+            }
+        }
+        self.replies_found.borrow_mut().clear();
+        cx.notify();
+    }
+    fn install_replies(&mut self, cx: &mut Context<Self>) {
+        if self.replies_busy {
+            return;
+        }
+        self.replies_busy = true;
+        self.replies_error = None;
+        self.replies_progress.store(0, Ordering::Relaxed);
+        let received = self.replies_progress.clone();
+        cx.notify();
+        self.task(
+            cx,
+            move |b| local_ai::REPLIES.install(&b.store, &received),
+            |this, result, cx| {
+                this.replies_busy = false;
+                match result {
+                    // Turned off while installing: don't keep it.
+                    Ok(()) if !this.suggest_replies => {
+                        let _ = local_ai::REPLIES.remove(&this.backend.store);
+                    }
+                    Ok(()) => this.load_replies(cx),
+                    Err(e) => {
+                        this.replies_error = Some(format!("{e:#}"));
+                        this.set_suggest_replies(false, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.follow_download(cx);
+    }
+    pub(super) fn set_suggest_replies(&mut self, on: bool, cx: &mut Context<Self>) {
+        let on = on && self.local_ai;
+        self.suggest_replies = on;
+        self.backend.store.set_preference_soon(
+            local_ai::REPLIES_PREFERENCE,
+            if on { "true" } else { "false" },
+        );
+        if on {
+            self.start_replies(cx);
+        } else {
+            self.reply_model = None;
+            self.replies_found.borrow_mut().clear();
+            if let Err(e) = local_ai::REPLIES.remove(&self.backend.store) {
+                self.notice(format!("{e:#}"), true, cx);
+            }
+        }
+        cx.notify();
     }
     fn start_otp(&mut self, cx: &mut Context<Self>) {
         if !self.hide_codes {
@@ -212,7 +377,7 @@ impl MailApp {
                 let busy = this
                     .update(cx, |this, cx| {
                         cx.notify();
-                        this.model_busy || this.when_busy || this.parcel_busy
+                        this.model_busy || this.when_busy || this.parcel_busy || this.replies_busy
                     })
                     .unwrap_or(false);
                 if !busy {
@@ -366,6 +531,8 @@ impl MailApp {
             self.when_busy
         } else if model.id == local_ai::PARCEL.id {
             self.parcel_busy
+        } else if model.id == local_ai::REPLIES.id {
+            self.replies_busy
         } else {
             self.model_busy
         }
@@ -377,6 +544,8 @@ impl MailApp {
             &self.when_progress
         } else if model.id == local_ai::PARCEL.id {
             &self.parcel_progress
+        } else if model.id == local_ai::REPLIES.id {
+            &self.replies_progress
         } else {
             &self.model_progress
         };
@@ -406,6 +575,9 @@ impl MailApp {
         if model.id == local_ai::PARCEL.id {
             self.set_find_parcels(false, cx);
         }
+        if model.id == local_ai::REPLIES.id {
+            self.set_suggest_replies(false, cx);
+        }
         match model.remove(&self.backend.store) {
             Ok(()) => self.notice(
                 format!("Deleted the {}", model.label.to_lowercase()),
@@ -428,9 +600,11 @@ impl MailApp {
             self.set_hide_codes(false, cx);
             self.set_understand_dates(false, cx);
             self.set_find_parcels(false, cx);
+            self.set_suggest_replies(false, cx);
             self.model_error = None;
             self.when_error = None;
             self.parcel_error = None;
+            self.replies_error = None;
             if let Err(e) = local_ai::remove_all(&self.backend.store) {
                 self.notice(format!("{e:#}"), true, cx);
             }
@@ -594,7 +768,54 @@ impl MailApp {
                         self.parcel_error.clone(),
                         Action::SetFindParcels(true),
                         cx,
-                    )),
+                    ))
+                    .child(self.switch_setting(
+                        "Suggest replies",
+                        &format!(
+                            "Offer a few short replies under received mail, chosen for what it \
+                             says and worded in its language (37 languages): “Let me check my \
+                             calendar.”, “Congratulations!”, “¡Tengo muchas ganas!”. Choosing one \
+                             starts a reply with it written in. Replies you choose are offered \
+                             more, and right-clicking one lets you stop it. \
+                             Installs the {} ({}).",
+                            local_ai::REPLIES.label.to_lowercase(),
+                            mb(local_ai::REPLIES.size),
+                        ),
+                        "local-ai-replies".into(),
+                        self.suggest_replies,
+                        Action::SetSuggestReplies(self.local_ai && !self.suggest_replies),
+                        cx,
+                    ))
+                    .children(self.feature_error(
+                        "local-ai-replies-status",
+                        self.replies_error.clone(),
+                        Action::SetSuggestReplies(true),
+                        cx,
+                    ))
+                    .when(!self.reply_history.is_empty(), |d| {
+                        let hidden = self.reply_history.dismissed().len();
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(div().flex_1().min_w_0().child(if hidden == 0 {
+                                    "Picacho remembers which suggested replies you choose, on this computer.".to_owned()
+                                } else {
+                                    format!(
+                                        "Picacho remembers which suggested replies you choose, and stopped {hidden} you turned away."
+                                    )
+                                }))
+                                .child(self.link(
+                                    "local-ai-replies-forget",
+                                    "Forget",
+                                    Action::ForgetReplyHistory,
+                                    cx,
+                                )),
+                        )
+                    }),
             )
             .child(self.section("Models"))
             .child(

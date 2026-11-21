@@ -566,6 +566,34 @@ impl Composer {
         self.changed(cx);
     }
 
+    /// Writes a suggested reply at the top of the body, above any signature
+    /// or quote, with the cursor after it to go on writing.
+    pub(super) fn insert_reply_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let body = self.body.read(cx).value().to_string();
+        // What was written already stays; the reply goes before it.
+        let with = if body.trim().is_empty() || body.starts_with('\n') {
+            text.to_owned()
+        } else {
+            format!("{text}\n\n")
+        };
+        self.edit(0..0, &with, text.len(), window, cx);
+        self.put_cursor(text.len(), window, cx);
+    }
+
+    /// Focuses the body with the cursor at byte `offset` of its text.
+    pub(super) fn put_cursor(&self, offset: usize, window: &mut Window, cx: &mut App) {
+        self.body.update(cx, |s, cx| {
+            s.focus(window, cx);
+            let position = s.text().offset_to_position(offset);
+            s.set_cursor_position(position, window, cx);
+        });
+    }
+
     /// Wraps the selection in `mark` (or unwraps it), as for bold.
     fn wrap(&mut self, mark: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.draft.formatted {

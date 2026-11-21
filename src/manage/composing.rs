@@ -236,6 +236,10 @@ mod tests {
         assert_eq!(o.signature, "— Sam");
         assert_eq!(o.reply_placement, ReplyPlacement::Inline);
         assert_eq!(o.undo_send_seconds, 5);
+        // Lists saved by builds that had quick replies are still read.
+        let o: ComposeOptions =
+            serde_json::from_str(r#"{"quick_replies":["Thanks!"],"signature":"x"}"#).unwrap();
+        assert_eq!(o.signature, "x");
     }
 
     #[test]
