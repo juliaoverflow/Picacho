@@ -261,6 +261,8 @@ pub(super) enum Screen {
     List,
     Reader,
     Subscriptions,
+    /// An account's Summary.
+    Summary,
     Settings,
 }
 
@@ -273,6 +275,8 @@ impl MailApp {
             Screen::Settings
         } else if self.subs_open {
             Screen::Subscriptions
+        } else if self.summary_open {
+            Screen::Summary
         } else if self.selected.is_some() && self.selection.len() <= 1 {
             Screen::Reader
         } else if self.mobile.mailboxes {
@@ -316,6 +320,7 @@ impl MailApp {
             Screen::Setup => self.mobile_setup(insets, window, cx),
             Screen::Settings => self.mobile_settings(insets, window, cx),
             Screen::Subscriptions => self.mobile_subscriptions(insets, window, cx),
+            Screen::Summary => self.mobile_summary(insets, cx),
             _ if split => self.mobile_split_view(screen, insets, window, cx),
             Screen::Mailboxes => self.mobile_mailboxes(insets, cx),
             Screen::List => self.mobile_list(insets, window, cx),
@@ -555,6 +560,31 @@ impl MailApp {
         match self.mobile_screen() {
             Screen::Subscriptions if self.selected.is_none() && self.subs_sender.is_none() => {
                 // Subscriptions were opened from the mailboxes.
+                self.open_mailbox(self.account.clone(), Folder::Inbox.into(), w, cx);
+                self.mobile.mailboxes = true;
+                self.mobile_popped(cx);
+                true
+            }
+            Screen::Summary if self.summary_packages && self.summary_search => {
+                // Back closes the packages' search first.
+                self.search_parcels(false, w, cx);
+                true
+            }
+            Screen::Summary if self.summary_receipts && self.receipts_search => {
+                // Back closes the receipts' search first.
+                self.search_receipts(false, w, cx);
+                true
+            }
+            Screen::Summary if self.summary_packages || self.summary_receipts => {
+                // The Packages and Receipts pages go back to the Summary's
+                // widgets.
+                self.summary_packages = false;
+                self.summary_receipts = false;
+                cx.notify();
+                true
+            }
+            Screen::Summary => {
+                // The Summary was opened from the mailboxes.
                 self.open_mailbox(self.account.clone(), Folder::Inbox.into(), w, cx);
                 self.mobile.mailboxes = true;
                 self.mobile_popped(cx);
@@ -840,6 +870,7 @@ impl MailApp {
             Screen::List => true,
             Screen::Settings => self.fwd_reverse.is_none(),
             Screen::Subscriptions => self.selected.is_none() && self.subs_sender.is_none(),
+            Screen::Summary => true,
             Screen::Mailboxes | Screen::Setup => false,
         }
     }
@@ -857,7 +888,9 @@ impl MailApp {
         }
         Some(match screen {
             Screen::Reader => self.mobile_list(insets, window, cx),
-            Screen::List | Screen::Subscriptions => self.mobile_mailboxes(insets, cx),
+            Screen::List | Screen::Subscriptions | Screen::Summary => {
+                self.mobile_mailboxes(insets, cx)
+            }
             Screen::Settings if self.mobile.settings_page => {
                 self.mobile_settings_list(insets, false, cx)
             }

@@ -1,0 +1,11 @@
+[
+ ["track", ["track", "trace", "verfolg", "seguimiento", "rastre", "suivi", "traccia", "tracking", "śledz", "spårning", "sporing", "seuranta", "追跡", "追踪", "追蹤", "추적", "отслеж", "трек", "takip", "تتبع", "ट्रैकिंग", "=resi", "=vận", "sledov", "=awb", "waybill", "localizador"]],
+ ["parcel", ["parcel", "package", "packet", "shipment", "consignment", "sendung", "paket", "envío", "envio", "paquete", "colis", "envoi", "pacco", "spedizion", "encomenda", "=objeto", "pakket", "zending", "przesył", "paczk", "kolli", "forsendel", "försändelse", "荷物", "伝票", "送り", "包裹", "运单", "快递", "物流", "택배", "운송", "송장", "посыл", "отправлени", "посилк", "відправлен", "kargo", "gönderi", "شحن", "पार्सल", "zásilk", "αποστολ", "barcode"]],
+ ["deliver", ["deliver", "zustell", "liefer", "entrega", "reparto", "livr", "consegn", "bezorg", "dostaw", "lever", "配達", "配送", "派送", "배송", "достав", "teslim", "dağıtım"]],
+ ["ship", ["^ship", "dispatch", "versand", "versandt", "enviad", "expédi", "spedit", "verzonden", "wysłan", "skickat", "sendt", "発送", "发货", "발송", "отправлен", "kargoya", "postad"]],
+ ["order", ["order", "bestell", "auftrag", "pedido", "commande", "ordine", "zamówien", "beställ", "bestill", "tilaus", "注文", "订单", "訂單", "주문", "заказ", "замовл", "sipariş", "طلب", "ऑर्डर", "pesanan", "=hàng", "παραγγελ", "objednáv"]],
+ ["invoice", ["invoice", "receipt", "rechnung", "beleg", "factur", "fattur", "fatur", "fiscal", "faktur", "請求", "发票", "청구", "счёт", "счет", "فاتورة", "payment", "zahlung", "pago", "paiement", "transaction", "transakc", "refund"]],
+ ["customer", ["customer", "client", "kunde", "kund", "klant", "klient", "member", "mitglied", "会員", "客户", "会员", "고객", "회원", "клиент", "müşteri", "account", "konto", "cuenta", "compte", "conto", "policy", "claim", "contract", "vertrag", "договор", "お客"]],
+ ["phone", ["phone", "=call", "=tel", "=fax", "telefon", "teléfono", "téléphone", "telefone", "telefono", "電話", "电话", "전화", "телефон", "support", "hotline"]],
+ ["reference", ["reference", "referenz", "referencia", "référence", "=ref", "booking", "reserv", "ticket", "=case", "serial", "serien", "=sku", "=item", "artikel", "product", "model", "=imei", "voucher", "gift", "=card", "karte", "tarjeta", "carte", "meeting", "受付", "confirmation", "warranty"]]
+]

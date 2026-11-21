@@ -65,6 +65,13 @@ mod responsive_tests;
 mod settings;
 #[path = "subscriptions.rs"]
 mod subscriptions;
+#[path = "receipts.rs"]
+mod receipts;
+#[path = "summary.rs"]
+mod summary;
+#[cfg(test)]
+#[path = "summary_tests.rs"]
+mod summary_tests;
 #[path = "thread.rs"]
 mod thread;
 #[path = "tree.rs"]
@@ -576,6 +583,12 @@ enum MoveTarget {
     /// Every message from a subscription.
     Subscription(Box<MailSubscription>),
 }
+/// What of a Summary parcel is edited by hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ParcelField {
+    Name,
+    Sender,
+}
 #[derive(Clone)]
 enum Action {
     /// Proton sign-in: a security key or passkey, this way.
@@ -678,6 +691,9 @@ enum Action {
     /// Reads dates and times typed where Picacho asks when (downloading the
     /// model), or stops (deleting it).
     SetUnderstandDates(bool),
+    /// Confirms tracking numbers found in mail with the model (installing
+    /// it), or stops (deleting it).
+    SetFindParcels(bool),
     /// Shows a message's hidden sign-in codes, or hides them again.
     ShowCodes(String, bool),
     /// Copies a message's sign-in code without showing it.
@@ -705,6 +721,48 @@ enum Action {
     /// Lists the subscriptions detected in an account, or in every account
     /// (All Accounts' id).
     OpenSubscriptions(String),
+    /// Shows an account's Summary (or All Accounts'): the parcels its mail
+    /// tells of.
+    OpenSummary(String),
+    /// Shows or hides a Summary parcel's history, by its key.
+    ToggleParcel(String),
+    /// Shows every Summary parcel on a page of its own (true), or goes back
+    /// to the Summary's widgets (false).
+    SummaryPackages(bool),
+    /// Shows a Summary parcel on the Packages page with its history open,
+    /// by its key.
+    OpenParcel(String),
+    /// Offers the statuses to set on a Summary parcel by hand, by its key.
+    ParcelMenu(String),
+    /// Sets a Summary parcel's status by hand, by its key; None gives it
+    /// back what its emails say.
+    SetParcelStatus(String, Option<crate::manage::parcels::Status>),
+    /// Hides a Summary parcel (true) or shows it again, by its key.
+    HideParcel(String, bool),
+    /// Lists hidden parcels on the Packages page too (true), or not.
+    ShowHiddenParcels(bool),
+    /// Shows every Summary receipt on a page of its own (true), or goes
+    /// back to the Summary's widgets (false).
+    SummaryReceipts(bool),
+    /// Offers what can be done with a Summary receipt, by its key.
+    ReceiptMenu(String),
+    /// Hides a Summary receipt (true) or shows it again, by its key.
+    HideReceipt(String, bool),
+    /// Lists hidden receipts on the Receipts page too (true), or not.
+    ShowHiddenReceipts(bool),
+    /// Opens the Receipts page's search field (true), or closes it and
+    /// lists every receipt again.
+    SearchReceipts(bool),
+    /// Opens the Packages page's search field (true), or closes it and
+    /// lists every package again.
+    SearchParcels(bool),
+    /// Edits a Summary parcel's name or sender in place, by its key.
+    EditParcel(String, ParcelField),
+    /// Stops downloading shipping mail for the Summary.
+    StopSummaryDownloads,
+    /// Opens a message from the Summary in its mailbox: (account, mailbox,
+    /// message id).
+    OpenSummaryMail(String, Mailbox, String),
     /// Asks a subscription's sender to stop, from the list or an email.
     Unsubscribe(MailSubscription),
     /// Lists a subscription's mail in place of the subscriptions.
@@ -1254,6 +1312,84 @@ pub struct MailApp {
     when_busy: bool,
     when_error: Option<String>,
     when_progress: Arc<std::sync::atomic::AtomicU64>,
+    /// Tracking numbers found in mail are confirmed by the tracking number
+    /// model (Settings → Local AI), once loaded; its download, as the
+    /// sign-in code model's above.
+    find_parcels: bool,
+    parcel_model: Option<Rc<crate::manage::local_ai::parcel::Confirmer>>,
+    parcel_busy: bool,
+    parcel_error: Option<String>,
+    parcel_progress: Arc<std::sync::atomic::AtomicU64>,
+    /// Parcels found per message for the reader, with the lengths of the
+    /// subject and text they were found in and whether the model was used.
+    parcels_found: std::cell::RefCell<HashMap<String, summary::Found>>,
+    /// The open Summary (in place of the list and reader) of the open
+    /// account, and the parcels it lists.
+    summary_open: bool,
+    summary: Vec<crate::manage::parcels::Tracked>,
+    summary_loading: bool,
+    summary_generation: u64,
+    /// The Summary's parcels whose history is shown, by key.
+    summary_expanded: HashSet<String>,
+    /// The Summary shows its Packages page (every parcel) rather than its
+    /// widgets.
+    summary_packages: bool,
+    /// The Packages page lists hidden parcels too.
+    summary_show_hidden: bool,
+    /// The Summary parcel whose name or sender is being edited, by key,
+    /// and its field.
+    parcel_editing: Option<(String, ParcelField)>,
+    parcel_input: Entity<InputState>,
+    /// The Packages page's search field, and whether it is open.
+    parcel_search: Entity<InputState>,
+    summary_search: bool,
+    /// The text of the Summary packages' and receipts' emails, lowercase, by
+    /// message id, for searching what they say; read when a search opens,
+    /// and let go when the Summary closes. An email that couldn't be read
+    /// is kept empty, so it isn't asked for again.
+    parcel_texts: HashMap<String, String>,
+    /// Reading `parcel_texts`; and which reading may still be heard.
+    parcel_texts_loading: bool,
+    parcel_texts_generation: u64,
+    /// Which mail has a code, tells of a package or is a receipt, for the
+    /// search's `has:otp`, `has:package-update` and `has:receipt`; worked
+    /// out when a search first asks, and again once mail changed. What it
+    /// was worked out for (accounts, their list revisions, the parcel
+    /// model), and whether it is being.
+    mail_kinds: Option<Arc<crate::manage::mail_kinds::Kinds>>,
+    mail_kinds_read: Option<MailKindsRead>,
+    mail_kinds_loading: bool,
+    /// Shipping mail known only by its headers being downloaded for the
+    /// Summary: how many so far, of how many; and the ids tried already
+    /// (each only once, whether or not it downloaded).
+    summary_downloads: Option<(usize, usize)>,
+    summary_tried: HashSet<String>,
+    /// Set to stop those downloads (the Summary closed).
+    summary_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// What the Summary last read: its id, the list revisions of its
+    /// accounts, and whether with the model; reading again is skipped while
+    /// they are the same.
+    summary_read: Option<(String, Vec<u64>, bool)>,
+    /// A look asked for while one ran, to run after it.
+    summary_again: bool,
+    /// A batch of shipping mail is downloading.
+    summary_fetching: bool,
+    /// How many emails the last look went through.
+    summary_scanned: usize,
+    /// The receipts the Summary lists, newest first; and how many emails
+    /// were looked through for them.
+    receipts: Vec<crate::manage::receipts::Listed>,
+    receipts_scanned: usize,
+    /// The Summary shows its Receipts page (every receipt) rather than its
+    /// widgets.
+    summary_receipts: bool,
+    /// The Receipts page lists hidden receipts too.
+    receipts_show_hidden: bool,
+    /// The Receipts page's search field, and whether it is open.
+    receipt_search: Entity<InputState>,
+    receipts_search: bool,
+    /// Why the last download of shipping mail stopped.
+    summary_error: Option<String>,
     /// Reverse addresses that write as an alias, to show which alias sent
     /// mail went out as (see `fwd::routes`).
     alias_routes: HashMap<String, String>,
@@ -1377,6 +1513,7 @@ impl MailApp {
         let local_ai = crate::manage::local_ai::enabled(&store);
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
         let understand_dates = crate::manage::local_ai::when_enabled(&store);
+        let find_parcels = crate::manage::local_ai::parcel_enabled(&store);
         if clean_links {
             crate::manage::tracking::warm_up();
         }
@@ -1449,6 +1586,7 @@ impl MailApp {
                 // than keeping the place in the old list.
                 this.apply_filter(cx);
                 this.scroll_list_to_top();
+                this.load_mail_kinds(cx);
                 cx.notify();
             }
         })]);
@@ -1461,6 +1599,26 @@ impl MailApp {
                 }
             }),
         );
+        let parcel_input = input("Name", false, window, cx);
+        subscriptions.push(
+            cx.subscribe_in(&parcel_input, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_parcel_edit(w, cx);
+                }
+            }),
+        );
+        let parcel_search = input("Search packages", false, window, cx);
+        subscriptions.push(cx.subscribe(&parcel_search, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
+        let receipt_search = input("Search receipts", false, window, cx);
+        subscriptions.push(cx.subscribe(&receipt_search, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
         let label_input = input("Label name", false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&label_input, window, |this, _, event, w, cx| {
@@ -2029,6 +2187,43 @@ impl MailApp {
             when_busy: false,
             when_error: None,
             when_progress: Arc::default(),
+            find_parcels,
+            parcel_model: None,
+            parcel_busy: false,
+            parcel_error: None,
+            parcel_progress: Arc::default(),
+            parcels_found: Default::default(),
+            summary_open: false,
+            summary: Vec::new(),
+            summary_loading: false,
+            summary_generation: 0,
+            summary_expanded: HashSet::new(),
+            summary_packages: false,
+            summary_show_hidden: false,
+            parcel_editing: None,
+            parcel_input,
+            parcel_search,
+            summary_search: false,
+            parcel_texts: HashMap::new(),
+            parcel_texts_loading: false,
+            parcel_texts_generation: 0,
+            mail_kinds: None,
+            mail_kinds_read: None,
+            mail_kinds_loading: false,
+            summary_downloads: None,
+            summary_tried: HashSet::new(),
+            summary_cancel: Arc::default(),
+            summary_read: None,
+            summary_again: false,
+            summary_fetching: false,
+            summary_scanned: 0,
+            receipts: Vec::new(),
+            receipts_scanned: 0,
+            summary_receipts: false,
+            receipts_show_hidden: false,
+            receipt_search,
+            receipts_search: false,
+            summary_error: None,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
             fwd_key,
@@ -2221,6 +2416,71 @@ impl MailApp {
             .unwrap_or_else(|| self.remote.clone())
     }
     /// Recomputes the visible list, keeping the scroll on the same message.
+    /// Works out which of the open mailbox's accounts' mail has a code or
+    /// tells of a package, in the background, when the search asks for
+    /// either and mail changed since; the list is filtered again with it.
+    /// Until then, a message's subject and preview decide.
+    fn load_mail_kinds(&mut self, cx: &mut Context<Self>) {
+        let query = Self::value(&self.search, cx);
+        if self.mail_kinds_loading || !crate::manage::search::Search::parse(&query).wants_kinds() {
+            return;
+        }
+        let Some(open) = self.account.clone() else {
+            return;
+        };
+        let accounts = if fwd::is_view(&open) {
+            self.scope.accounts.clone()
+        } else {
+            vec![open]
+        };
+        let read = MailKindsRead {
+            revisions: accounts
+                .iter()
+                .map(|a| self.backend.store.list_revision(a))
+                .collect(),
+            accounts,
+            // As the Summary reads, so what it found is used.
+            parcel_model: self.find_parcels && self.parcel_model.is_some(),
+            code_model: self.hide_codes,
+        };
+        if self.mail_kinds_read.as_ref() == Some(&read) {
+            return;
+        }
+        // What was worked out the same way is kept: only new mail is read.
+        let previous = self.mail_kinds.clone().filter(|_| {
+            self.mail_kinds_read
+                .as_ref()
+                .is_some_and(|r| r.same_way(&read))
+        });
+        self.mail_kinds_loading = true;
+        let (accounts, use_model, use_detector) =
+            (read.accounts.clone(), read.parcel_model, read.code_model);
+        self.task(
+            cx,
+            move |b| {
+                let model = use_model
+                    .then(|| crate::manage::local_ai::parcel_confirmer(&b.store).ok())
+                    .flatten();
+                let detector = use_detector
+                    .then(|| crate::manage::local_ai::otp_detector(&b.store).ok())
+                    .flatten();
+                b.store
+                    .mail_kinds(&accounts, model.as_ref(), detector.as_ref(), previous.as_deref())
+            },
+            move |this, result, cx| {
+                this.mail_kinds_loading = false;
+                match result {
+                    Ok(kinds) => {
+                        this.mail_kinds = Some(Arc::new(kinds));
+                        this.mail_kinds_read = Some(read);
+                        this.filter(cx);
+                    }
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                }
+                cx.notify();
+            },
+        );
+    }
     fn filter(&mut self, cx: &App) {
         let anchor = self.scroll_anchor();
         self.apply_filter(cx);
@@ -2239,7 +2499,8 @@ impl MailApp {
     }
     fn apply_filter(&mut self, cx: &App) {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
-        let search = crate::manage::search::Search::parse(&query);
+        let search =
+            crate::manage::search::Search::parse(&query).with_kinds(self.mail_kinds.clone());
         let server = self
             .current_server_search(Self::value(&self.search, cx).trim())
             .filter(|s| !s.running && s.error.is_none())
@@ -2259,8 +2520,9 @@ impl MailApp {
                     Filter::Attachments => m.has_attachments(),
                 }
                 && match &server {
-                    // Found by the server's search, in its own syntax.
-                    Some(ids) => ids.contains(&m.id),
+                    // Found by the server's search, in its own syntax; what
+                    // it can't tell (code mail, package updates) told here.
+                    Some(ids) => ids.contains(&m.id) && search.matches_kinds(m),
                     None => search.matches(m),
                 }
                 // Views leave out mail of aliases shown on their own, or list
@@ -2835,6 +3097,7 @@ impl MailApp {
     fn show_mailbox_instead(&mut self, mailbox: Mailbox, cx: &mut Context<Self>) {
         self.load_generation += 1;
         self.subs_open = false;
+        self.leave_summary();
         self.folder = mailbox.folder();
         self.remote = match mailbox {
             Mailbox::Remote(name) => name,
@@ -3524,6 +3787,11 @@ impl MailApp {
             },
         );
     }
+    /// Whether the open mailbox's list shows, rather than the Summary or
+    /// Subscriptions opened over it.
+    fn showing_list(&self) -> bool {
+        !self.summary_open && !self.subs_open
+    }
     fn open_mailbox(
         &mut self,
         account: Option<String>,
@@ -3534,6 +3802,7 @@ impl MailApp {
         self.html_view.update(cx, |view, cx| view.clear(cx));
         Self::set(&self.unlock_input, "", w, cx);
         self.subs_open = false;
+        self.leave_summary();
         self.subs_sender = None;
         self.subs_return.set(None);
         self.account = account;
@@ -3619,6 +3888,12 @@ impl MailApp {
             self.reload_subscriptions(cx);
             return;
         }
+        if self.summary_open {
+            // The Summary lists parcels, not the mailbox under it; only the
+            // mail that arrived since is read.
+            self.load_summary(cx);
+            return;
+        }
         if self.account.is_none() {
             return;
         }
@@ -3656,7 +3931,7 @@ impl MailApp {
     /// of several accounts, only the accounts whose mail changed are listed
     /// again and put in place of theirs; the others' mail stays.
     fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
-        if self.subs_open || self.account.is_none() {
+        if self.subs_open || self.summary_open || self.account.is_none() {
             self.reload_cached(cx);
             return;
         }
@@ -3803,7 +4078,8 @@ impl MailApp {
         }
         let open = self.account.as_deref() == Some(target.account.as_str())
             && self.mailbox() == target.mailbox
-            && !self.subs_open;
+            && !self.subs_open
+            && !self.summary_open;
         if !open {
             self.open_mailbox(Some(target.account), target.mailbox, w, cx);
         }
@@ -4478,7 +4754,7 @@ impl MailApp {
             cx.notify();
             return;
         }
-        if self.cancel_rename(w, cx) {
+        if self.cancel_rename(w, cx) || self.cancel_parcel_edit(w, cx) {
             return;
         }
         if self.modal.is_none() {
@@ -4492,6 +4768,13 @@ impl MailApp {
                 self.handle(Action::BackToList, w, cx);
             } else if self.subs_open && self.subs_sender.is_some() {
                 self.close_subscription(w, cx);
+            } else if self.summary_open && self.summary_packages && self.summary_search {
+                self.search_parcels(false, w, cx);
+            } else if self.summary_open && self.summary_receipts && self.receipts_search {
+                self.search_receipts(false, w, cx);
+            } else if self.summary_open && (self.summary_packages || self.summary_receipts) {
+                self.summary_packages = false;
+                self.summary_receipts = false;
             } else if self.mobile.on || window::content_size(w).width < px(900.) {
                 self.selected = None;
                 self.read_generation += 1;
@@ -5183,7 +5466,9 @@ impl MailApp {
             }
             Action::OpenMailbox(id, mailbox) => {
                 let account = (!id.is_empty()).then_some(id);
-                if self.account == account && self.mailbox() == mailbox {
+                // Shown already, it is checked again; under the Summary or
+                // Subscriptions, which open over the Inbox, it is shown.
+                if self.account == account && self.mailbox() == mailbox && self.showing_list() {
                     self.refresh(cx);
                 } else {
                     self.open_mailbox(account, mailbox, w, cx);
@@ -5206,14 +5491,14 @@ impl MailApp {
             }
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
             Action::RefreshAccount(id) if fwd::is_view(&id) => {
-                if self.account.as_ref() == Some(&id) {
+                if self.account.as_ref() == Some(&id) && self.showing_list() {
                     self.refresh(cx);
                 } else {
                     self.open_mailbox(Some(id), Folder::Inbox.into(), w, cx);
                 }
             }
             Action::RefreshAccount(id) => {
-                if self.account.as_ref() == Some(&id) {
+                if self.account.as_ref() == Some(&id) && self.showing_list() {
                     self.retry_account(id, cx);
                 } else {
                     self.open_mailbox(Some(id.clone()), Folder::Inbox.into(), w, cx);
@@ -5724,6 +6009,7 @@ impl MailApp {
             Action::SetLocalAi(on) => self.set_local_ai(on, cx),
             Action::SetHideCodes(on) => self.set_hide_codes(on, cx),
             Action::SetUnderstandDates(on) => self.set_understand_dates(on, cx),
+            Action::SetFindParcels(on) => self.set_find_parcels(on, cx),
             Action::ShowCodes(id, show) => self.show_codes(id, show, cx),
             Action::CopyCode(id) => self.copy_code(id, cx),
             Action::AskDeleteModel(id) => self.ask_delete_model(id, cx),
@@ -5779,6 +6065,57 @@ impl MailApp {
             }
             Action::CheckSender => self.check_sender(cx),
             Action::OpenSubscriptions(id) => self.open_subscriptions(id, w, cx),
+            Action::OpenSummary(id) => self.open_summary(id, w, cx),
+            Action::StopSummaryDownloads => self.stop_summary_downloads(cx),
+            Action::ToggleParcel(key) => {
+                if !self.summary_expanded.remove(&key) {
+                    self.summary_expanded.insert(key);
+                }
+                cx.notify();
+            }
+            Action::SummaryPackages(show) => {
+                self.summary_packages = show;
+                self.summary_receipts = false;
+                cx.notify();
+            }
+            Action::SummaryReceipts(show) => {
+                self.summary_receipts = show;
+                self.summary_packages = false;
+                cx.notify();
+            }
+            Action::ReceiptMenu(key) => self.receipt_menu(&key, w, cx),
+            Action::HideReceipt(key, hide) => self.hide_receipt(&key, hide, cx),
+            Action::ShowHiddenReceipts(show) => {
+                self.receipts_show_hidden = show;
+                cx.notify();
+            }
+            Action::SearchReceipts(open) => self.search_receipts(open, w, cx),
+            Action::OpenParcel(key) => {
+                self.summary_packages = true;
+                self.summary_receipts = false;
+                self.summary_expanded.insert(key);
+                cx.notify();
+            }
+            Action::ParcelMenu(key) => self.parcel_menu(&key, w, cx),
+            Action::SetParcelStatus(key, status) => {
+                self.override_parcel(&key, |o| o.status = status, cx)
+            }
+            Action::HideParcel(key, hide) => self.override_parcel(&key, |o| o.hidden = hide, cx),
+            Action::EditParcel(key, field) => self.edit_parcel(key, field, w, cx),
+            Action::ShowHiddenParcels(show) => {
+                self.summary_show_hidden = show;
+                cx.notify();
+            }
+            Action::SearchParcels(open) => self.search_parcels(open, w, cx),
+            Action::OpenSummaryMail(account, mailbox, id) => self.open_notified(
+                crate::display::notify::Target {
+                    account,
+                    mailbox,
+                    message: Some(id),
+                },
+                w,
+                cx,
+            ),
             Action::Unsubscribe(sub) => self.unsubscribe(sub, w, cx),
             Action::ShowOriginal => self.handle(Action::ShowSource(SourceView::Original), w, cx),
             Action::ShowSource(view) => {
@@ -6627,7 +6964,8 @@ impl MailApp {
         let c = self.colors();
         let active = self.account.as_deref() == Some(account)
             && self.mailbox() == mailbox
-            && !self.subs_open;
+            && !self.subs_open
+            && !self.summary_open;
         let count = self.unread_for(account, &mailbox);
         let entries = self.mailbox_entries(account, mailbox.clone());
         let action = Action::OpenMailbox(account.to_owned(), mailbox.clone());
@@ -9630,8 +9968,9 @@ impl MailApp {
         } else {
             self.selected.is_some()
         };
-        let show_list = !single || !open;
-        let show_reader = !single || open;
+        // The Summary takes the list's and the reader's place.
+        let show_list = (!single || !open) && !self.summary_open;
+        let show_reader = (!single || open) && !self.summary_open;
         let list_corners = Corners {
             bottom_left: if show_sidebar {
                 px(0.)
@@ -9669,6 +10008,18 @@ impl MailApp {
                     })
                     .when(show_sidebar && resizable && !compact, |d| {
                         d.child(self.resize_handle(Pane::Sidebar, cx))
+                    })
+                    .when(self.summary_open, |d| {
+                        let corners = Corners {
+                            bottom_left: if show_sidebar {
+                                px(0.)
+                            } else {
+                                corners.bottom_left
+                            },
+                            bottom_right: corners.bottom_right,
+                            ..Corners::default()
+                        };
+                        d.child(self.summary_page(single, corners, cx))
                     })
                     .when(show_list, |d| {
                         d.child(if self.subs_open {
@@ -9805,6 +10156,28 @@ thread_local! {
     static SPINNING: Cell<bool> = const { Cell::new(false) };
     static SPIN_EPOCH: std::time::Instant = std::time::Instant::now();
 }
+/// What the search's code mail and package updates were worked out for
+/// (`MailApp::load_mail_kinds`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MailKindsRead {
+    accounts: Vec<String>,
+    /// Each account's list revision then.
+    revisions: Vec<u64>,
+    /// Tracking numbers confirmed by the model, and codes.
+    parcel_model: bool,
+    code_model: bool,
+}
+
+impl MailKindsRead {
+    /// Whether `other` is for the same mail, read the same way, though
+    /// the mail may have changed.
+    fn same_way(&self, other: &Self) -> bool {
+        self.accounts == other.accounts
+            && self.parcel_model == other.parcel_model
+            && self.code_model == other.code_model
+    }
+}
+
 /// Spinners turn in steps on a slow clock instead of on every display frame:
 /// each frame redraws the whole window, so a vsync spinner kept the CPU busy
 /// for as long as a sync or download ran.
@@ -9949,6 +10322,10 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "pin",
         "ban",
         "subscriptions",
+        "summary",
+        "package",
+        "package-check",
+        "receipt",
         "tag",
         "snooze",
         "answered",

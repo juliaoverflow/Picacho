@@ -1136,6 +1136,9 @@ impl MailApp {
                     block = add(block, el);
                 }
             }
+            if folder == Folder::Inbox {
+                block = add(block, self.summary_nav(id, cx));
+            }
         }
         block = add(block, self.subscriptions_nav(id, cx));
         Some(block.into_any_element())
@@ -1469,7 +1472,10 @@ impl MailApp {
                     if open {
                         for (index, folder) in Folder::ALL.into_iter().enumerate() {
                             let mailbox: Mailbox = folder.into();
-                            let active = current && self.mailbox() == mailbox;
+                            let active = current
+                                && self.mailbox() == mailbox
+                                && !self.subs_open
+                                && !self.summary_open;
                             let count = self.unread_for(id, &mailbox);
                             let entries = self.mailbox_entries(id, mailbox.clone());
                             let button = self
@@ -1513,17 +1519,27 @@ impl MailApp {
                                         this.open_menu(e.position, entries.clone(), cx)
                                     }),
                                 );
+                            // The Summary comes right after the Inbox.
+                            let place = index + usize::from(index > 0);
                             block = block.child(self.reveal(
                                 id,
                                 div().child(self.stagger(button, Self::next_row(row))),
-                                index,
+                                place,
                             ));
+                            if folder == Folder::Inbox {
+                                let button = self.summary_rail(id, cx);
+                                block = block.child(self.reveal(
+                                    id,
+                                    div().child(self.stagger(button, Self::next_row(row))),
+                                    1,
+                                ));
+                            }
                         }
                         let button = self.subscriptions_rail(id, cx);
                         block = block.child(self.reveal(
                             id,
                             div().child(self.stagger(button, Self::next_row(row))),
-                            Folder::ALL.len(),
+                            Folder::ALL.len() + 1,
                         ));
                     }
                     out.push(block.into_any_element());

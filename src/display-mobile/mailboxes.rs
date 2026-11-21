@@ -149,7 +149,8 @@ impl MailApp {
         let active = self.mobile.split
             && self.account.as_deref() == Some(account)
             && self.mailbox() == mailbox
-            && !self.subs_open;
+            && !self.subs_open
+            && !self.summary_open;
         let count = self.unread_for(account, &mailbox);
         let selector = format!("mobile-nav-{account}-{}", mailbox.key());
         let menu_account = account.to_owned();
@@ -193,6 +194,23 @@ impl MailApp {
         .into_any_element()
     }
 
+    /// The row opening an account's Summary.
+    fn mobile_summary_cell(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let active = self.mobile.split && self.summary_open && self.account.as_deref() == Some(id);
+        self.cell(
+            format!("mobile-summary-{id}"),
+            icon_el("summary", 22., c.accent).into_any_element(),
+            "Summary",
+            None,
+            true,
+            active,
+            super::chrome::push(Action::OpenSummary(id.to_owned())),
+            cx,
+        )
+        .into_any_element()
+    }
+
     /// An account: its picture and name, then its folders.
     fn mobile_account_section(&self, a: &Account, index: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -224,6 +242,7 @@ impl MailApp {
                         ));
                     }
                 }
+                rows.push(self.mobile_summary_cell(&a.id, cx));
             }
         }
         if a.provider != Provider::Pop3 {
@@ -315,9 +334,15 @@ impl MailApp {
                 )
             })
             .collect();
-        // Every account's subscriptions, as the sidebar lists under All
-        // Accounts (aliases' views have none of their own).
+        // Every account's Summary (after the Inbox) and subscriptions, as
+        // the sidebar lists under All Accounts (aliases' views have none of
+        // their own).
         if id == ALL_MAIL {
+            let inbox = Self::view_folders(id)
+                .iter()
+                .position(|f| *f == Folder::Inbox)
+                .map_or(0, |i| i + 1);
+            rows.insert(inbox.min(rows.len()), self.mobile_summary_cell(id, cx));
             rows.push(self.mobile_subscriptions_cell(id, cx));
         }
         let menu_id = id.to_owned();

@@ -549,7 +549,8 @@ impl MailApp {
                 d.child(self.rendering_controls(m, options, narrow, cx))
             })
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6())
-            .children((!locked).then(|| self.codes_banner(m, cx)).flatten());
+            .children((!locked).then(|| self.codes_banner(m, cx)).flatten())
+            .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) });
         if locked {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));

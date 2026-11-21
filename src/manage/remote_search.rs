@@ -84,10 +84,12 @@ impl Backend {
             let ext = c.extensions()?;
             let utf8 = c.enabled.utf8;
             let string = |text: &str| search_string(text, &ext, utf8);
-            let mut criteria = if ext.gmail {
+            let search = crate::manage::search::Search::parse(query);
+            // Gmail's own search knows no code mail or package updates.
+            let mut criteria = if ext.gmail && !search.wants_kinds() {
                 format!("X-GM-RAW {}", string(query)?)
             } else {
-                crate::manage::search::Search::parse(query).imap_criteria(&string)?
+                search.imap_criteria(&string)?
             };
             if starred {
                 criteria.push_str(" FLAGGED");

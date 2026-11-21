@@ -118,7 +118,7 @@ impl MailApp {
     }
     /// The mailboxes a subscriptions list covers: one account, or every
     /// account for All Accounts'.
-    fn subscription_accounts(&self, id: &str) -> Vec<String> {
+    pub(super) fn subscription_accounts(&self, id: &str) -> Vec<String> {
         if id == ALL_MAIL {
             self.accounts.iter().map(|a| a.id.clone()).collect()
         } else {

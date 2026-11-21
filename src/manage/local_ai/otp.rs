@@ -11,10 +11,10 @@ use std::sync::LazyLock;
 
 /// The hashed feature space (a power of two).
 pub const DIM: usize = 1 << 14;
-const WINDOW: usize = 200;
-const CONTEXT: usize = 8;
-const NEAR: usize = 3;
-const SUBJECT_WORDS: usize = 16;
+pub(crate) const WINDOW: usize = 200;
+pub(crate) const CONTEXT: usize = 8;
+pub(crate) const NEAR: usize = 3;
+pub(crate) const SUBJECT_WORDS: usize = 16;
 const MAX_CANDIDATES: usize = 40;
 const MAX_TEXT: usize = 20_000;
 /// What a hidden code's letters and digits are shown as: the light bullet
@@ -53,7 +53,7 @@ static LEXICON: LazyLock<Vec<(String, Vec<String>)>> = LazyLock::new(|| {
 });
 
 /// The concepts named by any of the words, in lexicon order.
-fn concepts(words: &[String]) -> Vec<&'static str> {
+pub(crate) fn concepts(words: &[String]) -> Vec<&'static str> {
     LEXICON
         .iter()
         .filter(|(_, stems)| {
@@ -69,6 +69,25 @@ fn concepts(words: &[String]) -> Vec<&'static str> {
         })
         .map(|(name, _)| name.as_str())
         .collect()
+}
+
+/// Whether any of the words names the concept `name` (as `concepts`
+/// would list it), looking at its stems alone.
+pub(crate) fn names(words: &[String], name: &str) -> bool {
+    LEXICON
+        .iter()
+        .filter(|(concept, _)| concept == name)
+        .any(|(_, stems)| {
+            stems.iter().any(|st| {
+                if let Some(whole) = st.strip_prefix('=') {
+                    words.iter().any(|w| w == whole)
+                } else if let Some(start) = st.strip_prefix('^') {
+                    words.iter().any(|w| w.starts_with(start))
+                } else {
+                    words.iter().any(|w| w.contains(st.as_str()))
+                }
+            })
+        })
 }
 
 /// Scripts written without spaces between words: Hiragana, Katakana, CJK
@@ -88,14 +107,15 @@ fn dense(c: char) -> bool {
     )
 }
 
-/// A message's text as the model sees it, and its candidates' places.
-struct Text {
+/// A message's text as the model sees it (the subject, a newline and the
+/// body), and its candidates' places. The parcel model reads the same text.
+pub(crate) struct Text {
     subject_len: usize,
-    chars: Vec<char>,
+    pub(crate) chars: Vec<char>,
 }
 
 impl Text {
-    fn new(subject: &str, body: &str) -> Self {
+    pub(crate) fn new(subject: &str, body: &str) -> Self {
         let chars: Vec<char> = subject
             .chars()
             .chain(std::iter::once('\n'))
@@ -107,12 +127,12 @@ impl Text {
             chars,
         }
     }
-    fn slice(&self, from: usize, to: usize) -> String {
+    pub(crate) fn slice(&self, from: usize, to: usize) -> String {
         self.chars[from.min(self.chars.len())..to.min(self.chars.len())]
             .iter()
             .collect()
     }
-    fn at(&self, i: usize) -> Option<char> {
+    pub(crate) fn at(&self, i: usize) -> Option<char> {
         self.chars.get(i).copied()
     }
 
@@ -176,7 +196,7 @@ impl Text {
     }
 
     /// The feature strings of the candidate at (start, end).
-    fn features(&self, subject: &str, start: usize, end: usize) -> Vec<String> {
+    pub(crate) fn features(&self, subject: &str, start: usize, end: usize) -> Vec<String> {
         let code = self.slice(start, end);
         let left = self.slice(start.saturating_sub(WINDOW), start);
         let right = self.slice(end, end + WINDOW);
@@ -279,11 +299,17 @@ impl Text {
     }
 }
 
+/// Whether a message has anything shaped like a code at all (see
+/// `Text::candidates`), for telling code mail apart without the model.
+pub(crate) fn has_candidate(subject: &str, body: &str) -> bool {
+    !Text::new(subject, body).candidates().is_empty()
+}
+
 /// Lowercase words: runs of letters, marks, digits and underscores, with
 /// runs in scripts written without spaces split into pairs of characters
 /// (or, without `pairs`, kept whole, so that concepts can be looked for in
 /// them: "ワンタイムコード" names *once* and *code*).
-fn words(text: &str, pairs: bool) -> Vec<String> {
+pub(crate) fn words(text: &str, pairs: bool) -> Vec<String> {
     let lower = text.to_lowercase();
     let mut out = Vec::new();
     for run in WORD.find_iter(&lower) {
@@ -335,7 +361,7 @@ fn fnv1a(s: &str) -> u32 {
 
 /// Sparse, L2-normalized counts of the hashed features: (index, value),
 /// by index.
-fn vector(features: &[String]) -> Vec<(usize, f32)> {
+pub(crate) fn vector(features: &[String]) -> Vec<(usize, f32)> {
     let mut counts: std::collections::BTreeMap<usize, f64> = Default::default();
     for f in features {
         *counts.entry(fnv1a(f) as usize & (DIM - 1)).or_default() += 1.;

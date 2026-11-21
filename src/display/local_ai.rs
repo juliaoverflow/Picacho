@@ -1,7 +1,8 @@
 //! Local AI in the app: the Settings page that turns it and its features on
 //! (downloading their models) and off (deleting them), hiding the sign-in
-//! codes the model finds wherever mail is shown, and the date and time model
-//! that reads times typed into Snooze and Send Later.
+//! codes the model finds wherever mail is shown, the date and time model
+//! that reads times typed into Snooze and Send Later, and the tracking
+//! number model that confirms the parcels the reader and Summary show.
 use super::*;
 use crate::manage::local_ai::{self, otp};
 use std::borrow::Cow;
@@ -145,6 +146,7 @@ impl MailApp {
     pub(super) fn start_local_ai(&mut self, cx: &mut Context<Self>) {
         self.start_otp(cx);
         self.start_when(cx);
+        self.start_parcels(cx);
     }
     fn start_otp(&mut self, cx: &mut Context<Self>) {
         if !self.hide_codes {
@@ -210,7 +212,7 @@ impl MailApp {
                 let busy = this
                     .update(cx, |this, cx| {
                         cx.notify();
-                        this.model_busy || this.when_busy
+                        this.model_busy || this.when_busy || this.parcel_busy
                     })
                     .unwrap_or(false);
                 if !busy {
@@ -285,10 +287,85 @@ impl MailApp {
         self.follow_download(cx);
     }
 
+    fn start_parcels(&mut self, cx: &mut Context<Self>) {
+        if !self.find_parcels {
+            return;
+        }
+        let _ = local_ai::remove_stale(&self.backend.store);
+        if local_ai::PARCEL.is_installed(&self.backend.store) {
+            self.load_parcels(cx);
+        } else {
+            self.install_parcels(cx);
+        }
+    }
+    fn load_parcels(&mut self, cx: &mut Context<Self>) {
+        match local_ai::parcel_confirmer(&self.backend.store) {
+            Ok(model) => {
+                self.parcel_model = Some(Rc::new(model));
+                self.parcel_error = None;
+            }
+            Err(e) => {
+                self.parcel_model = None;
+                self.parcel_error = Some(format!("{e:#}"));
+            }
+        }
+        self.forget_parcels(cx);
+        cx.notify();
+    }
+    fn install_parcels(&mut self, cx: &mut Context<Self>) {
+        if self.parcel_busy {
+            return;
+        }
+        self.parcel_busy = true;
+        self.parcel_error = None;
+        self.parcel_progress.store(0, Ordering::Relaxed);
+        let received = self.parcel_progress.clone();
+        cx.notify();
+        self.task(
+            cx,
+            move |b| local_ai::PARCEL.install(&b.store, &received),
+            |this, result, cx| {
+                this.parcel_busy = false;
+                match result {
+                    // Turned off while installing: don't keep it.
+                    Ok(()) if !this.find_parcels => {
+                        let _ = local_ai::PARCEL.remove(&this.backend.store);
+                    }
+                    Ok(()) => this.load_parcels(cx),
+                    Err(e) => {
+                        this.parcel_error = Some(format!("{e:#}"));
+                        this.set_find_parcels(false, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.follow_download(cx);
+    }
+    pub(super) fn set_find_parcels(&mut self, on: bool, cx: &mut Context<Self>) {
+        let on = on && self.local_ai;
+        self.find_parcels = on;
+        self.backend
+            .store
+            .set_preference_soon(local_ai::PARCEL_PREFERENCE, if on { "true" } else { "false" });
+        if on {
+            self.start_parcels(cx);
+        } else {
+            self.parcel_model = None;
+            self.forget_parcels(cx);
+            if let Err(e) = local_ai::PARCEL.remove(&self.backend.store) {
+                self.notice(format!("{e:#}"), true, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// Whether a model is downloading.
     fn model_downloading(&self, model: &local_ai::Model) -> bool {
         if model.id == local_ai::WHEN.id {
             self.when_busy
+        } else if model.id == local_ai::PARCEL.id {
+            self.parcel_busy
         } else {
             self.model_busy
         }
@@ -298,6 +375,8 @@ impl MailApp {
     pub(super) fn model_fraction(&self, model: &local_ai::Model) -> f32 {
         let progress = if model.id == local_ai::WHEN.id {
             &self.when_progress
+        } else if model.id == local_ai::PARCEL.id {
+            &self.parcel_progress
         } else {
             &self.model_progress
         };
@@ -324,6 +403,9 @@ impl MailApp {
         if model.id == local_ai::WHEN.id {
             self.set_understand_dates(false, cx);
         }
+        if model.id == local_ai::PARCEL.id {
+            self.set_find_parcels(false, cx);
+        }
         match model.remove(&self.backend.store) {
             Ok(()) => self.notice(
                 format!("Deleted the {}", model.label.to_lowercase()),
@@ -345,8 +427,10 @@ impl MailApp {
             // Everything it installed goes with it.
             self.set_hide_codes(false, cx);
             self.set_understand_dates(false, cx);
+            self.set_find_parcels(false, cx);
             self.model_error = None;
             self.when_error = None;
+            self.parcel_error = None;
             if let Err(e) = local_ai::remove_all(&self.backend.store) {
                 self.notice(format!("{e:#}"), true, cx);
             }
@@ -487,6 +571,28 @@ impl MailApp {
                         "local-ai-when-status",
                         self.when_error.clone(),
                         Action::SetUnderstandDates(true),
+                        cx,
+                    ))
+                    .child(self.switch_setting(
+                        "Find tracking numbers",
+                        &format!(
+                            "Confirm the tracking numbers found in mail by the words around \
+                             them, in many languages, so the reader and each account's \
+                             Summary find the ones given without a shipping word beside \
+                             them, and skip order and phone numbers that look like them. \
+                             Installs the {} ({}).",
+                            local_ai::PARCEL.label.to_lowercase(),
+                            mb(local_ai::PARCEL.size),
+                        ),
+                        "local-ai-parcel".into(),
+                        self.find_parcels,
+                        Action::SetFindParcels(self.local_ai && !self.find_parcels),
+                        cx,
+                    ))
+                    .children(self.feature_error(
+                        "local-ai-parcel-status",
+                        self.parcel_error.clone(),
+                        Action::SetFindParcels(true),
                         cx,
                     )),
             )

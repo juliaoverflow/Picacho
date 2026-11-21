@@ -383,6 +383,41 @@ impl MailApp {
     }
 }
 
+impl MailApp {
+    /// An account's Summary, full screen.
+    pub(super) fn mobile_summary(&mut self, insets: Insets, cx: &mut Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let back = self.back_icon("mobile-summary-back", cx);
+        div()
+            .id("mobile-summary")
+            .debug_selector(|| "mobile-summary".into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.surface))
+            .child(self.nav_bar(
+                "mobile-summary-bar",
+                insets,
+                Some(back),
+                "Summary".to_owned(),
+                None,
+                vec![],
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .pl(px(insets.left))
+                    .pr(px(insets.right))
+                    .pb(px(insets.below()))
+                    .flex()
+                    .flex_col()
+                    .child(self.summary_page(true, Corners::default(), cx)),
+            )
+            .into_any_element()
+    }
+}
+
 /// Forwarding's reverse aliases subpage is open.
 fn sub_open(this: &MailApp) -> bool {
     matches!(this.page, Page::Forwarding)

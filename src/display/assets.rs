@@ -153,6 +153,20 @@ impl AssetSource for Assets {
             "mail/subscriptions.svg" => Some(
                 "<path d='M4 4h12v15a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2Z'/><path d='M16 8h4v11a2 2 0 0 1-4 0M8 8h4M8 12h4M8 16h3'/>",
             ),
+            // An account's Summary: a page of lines with a bar chart.
+            "mail/summary.svg" => Some(
+                "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M8 16v-4M12 16V8M16 16v-6'/>",
+            ),
+            // A parcel, and one delivered.
+            "mail/package.svg" => Some(
+                "<path d='m21 8-9-5-9 5v8l9 5 9-5Z'/><path d='m3 8 9 5 9-5M12 13v8M7.5 5.5l9 5'/>",
+            ),
+            "mail/package-check.svg" => Some(
+                "<path d='M21 11V8l-9-5-9 5v8l9 5 1-.6'/><path d='m3 8 9 5 9-5M12 13v8M16 19l2 2 4-4'/>",
+            ),
+            "mail/receipt.svg" => Some(
+                "<path d='M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z'/><path d='M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 0 0 4H8M12 17.5v-11'/>",
+            ),
             // Sorting handles (the phone's account list): two columns of dots.
             "mail/grip.svg" => Some(
                 "<g fill='currentColor' stroke='none'><circle cx='9' cy='6' r='1.6'/><circle cx='15' cy='6' r='1.6'/><circle cx='9' cy='12' r='1.6'/><circle cx='15' cy='12' r='1.6'/><circle cx='9' cy='18' r='1.6'/><circle cx='15' cy='18' r='1.6'/></g>",

@@ -712,6 +712,8 @@ impl MailApp {
                 .child(self.stagger(header, Self::next_row(row)))
         };
         if open {
+            // All Accounts' Summary comes right after its Inbox.
+            let summary = id == ALL_MAIL;
             for (index, folder) in Self::view_folders(id).iter().enumerate() {
                 let nav = self.nav_row(
                     id,
@@ -721,18 +723,27 @@ impl MailApp {
                     0.,
                     cx,
                 );
+                let place = index + 1 + usize::from(summary && index > 0);
                 block = block.child(self.reveal(
                     id,
                     div().child(self.stagger(nav, Self::next_row(row))),
-                    index + 1,
+                    place,
                 ));
+                if summary && *folder == Folder::Inbox {
+                    let nav = self.summary_nav(id, cx);
+                    block = block.child(self.reveal(
+                        id,
+                        div().child(self.stagger(nav, Self::next_row(row))),
+                        2,
+                    ));
+                }
             }
             if id == ALL_MAIL {
                 let nav = self.subscriptions_nav(id, cx);
                 block = block.child(self.reveal(
                     id,
                     div().child(self.stagger(nav, Self::next_row(row))),
-                    Self::view_folders(id).len() + 1,
+                    Self::view_folders(id).len() + 2,
                 ));
             }
         }
@@ -813,9 +824,13 @@ impl MailApp {
                 .child(self.stagger(button, Self::next_row(row)))
         };
         if open {
+            let summary = id == ALL_MAIL;
             for (index, folder) in Self::view_folders(id).iter().enumerate() {
                 let mailbox: Mailbox = (*folder).into();
-                let active = current && self.mailbox() == mailbox;
+                let active = current
+                    && self.mailbox() == mailbox
+                    && !self.subs_open
+                    && !self.summary_open;
                 let count = self.unread_for(id, &mailbox);
                 let button = self.rail_button(
                     format!("rail-{id}-{}", folder.key()),
@@ -850,15 +865,23 @@ impl MailApp {
                 block = block.child(self.reveal(
                     id,
                     div().child(self.stagger(button, Self::next_row(row))),
-                    index,
+                    index + usize::from(summary && index > 0),
                 ));
+                if summary && *folder == Folder::Inbox {
+                    let button = self.summary_rail(id, cx);
+                    block = block.child(self.reveal(
+                        id,
+                        div().child(self.stagger(button, Self::next_row(row))),
+                        1,
+                    ));
+                }
             }
             if id == ALL_MAIL {
                 let button = self.subscriptions_rail(id, cx);
                 block = block.child(self.reveal(
                     id,
                     div().child(self.stagger(button, Self::next_row(row))),
-                    Self::view_folders(id).len(),
+                    Self::view_folders(id).len() + 1,
                 ));
             }
         }

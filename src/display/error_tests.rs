@@ -58,6 +58,8 @@ fn mailbox_warning_opens_its_details_in_tree_and_rail_without_global_errors(
     });
     act(&view, Action::Close, cx);
     act(&view, Action::ToggleSidebar, cx);
+    // Room for both accounts' rows (each Summary is one more) in the rail.
+    cx.simulate_resize(size(px(1440.), px(1200.)));
     frame(cx);
     let warning = cx
         .debug_bounds(selector)

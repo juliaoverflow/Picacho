@@ -2,7 +2,7 @@ use crate::manage::model::*;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
     time::Duration,
@@ -145,7 +145,13 @@ impl Store {
             CREATE INDEX IF NOT EXISTS subscribed ON messages(account) WHERE json_extract(data,'$.list_unsubscribe') IS NOT NULL;
             CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, account TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));")?;
+            CREATE TABLE IF NOT EXISTS mailbox_state (account TEXT NOT NULL, remote TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (account, remote));
+            -- What each message was found to say about parcels (see `parcels`).
+            CREATE TABLE IF NOT EXISTS parcel_scan (id TEXT PRIMARY KEY, account TEXT NOT NULL, state INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS parcel_scan_account ON parcel_scan(account);
+            -- What each message was found to say about receipts (see `receipts`).
+            CREATE TABLE IF NOT EXISTS receipt_scan (id TEXT PRIMARY KEY, account TEXT NOT NULL, state INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS receipt_scan_account ON receipt_scan(account);")?;
         // Compressed sources get a column of their own (see `pack`), so a
         // build from before them finds `raw` empty and downloads the
         // message again, rather than reading compressed bytes as mail.
@@ -298,7 +304,14 @@ impl Store {
         tx.execute(
             "DELETE FROM preferences WHERE substr(key,1,8)='reading:' AND json_valid(substr(key,9)) AND json_extract(substr(key,9),'$[0]')=?1", [id],
         )?;
-        for table in ["accounts", "messages", "drafts", "mailbox_state"] {
+        for table in [
+            "accounts",
+            "messages",
+            "drafts",
+            "mailbox_state",
+            "parcel_scan",
+            "receipt_scan",
+        ] {
             tx.execute(
                 &format!(
                     "DELETE FROM {table} WHERE {}=?1",
@@ -527,6 +540,545 @@ impl Store {
             }
         }
         Ok(crate::manage::subscriptions::group(mails))
+    }
+    /// The text of messages, lowercase, for searching the Summary's
+    /// packages by what their emails say: by message id, as `parcels`
+    /// reads them (the kept text, the HTML's text, or the downloaded
+    /// source's; else the preview), up to `PARCEL_SEARCH_TEXT` characters
+    /// each. Encrypted mail gives only its preview. Read on several
+    /// threads, a batch at a time.
+    pub fn parcel_search_texts(&self, ids: &[String]) -> Result<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(PARCEL_BATCH) {
+            type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+            let rows: Vec<Row> = {
+                let db = self.read();
+                let mut q = db.prepare(&format!(
+                    "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
+                ))?;
+                let mut rows = Vec::new();
+                for id in chunk {
+                    if let Some(r) = q
+                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
+                        .next()
+                    {
+                        let (data, (raw, source)) = r?;
+                        rows.push((id.clone(), data, raw, source));
+                    }
+                }
+                rows
+            };
+            let texts = parallel_map(rows, |(id, data, raw, source)| {
+                let raw = unpack(raw, source).ok().flatten();
+                let text = serde_json::from_str::<Mail>(&data).ok().map(|mail| {
+                    let read = ParcelText::of(mail, raw.as_deref());
+                    let text: String = read.text().chars().take(PARCEL_SEARCH_TEXT).collect();
+                    text.to_lowercase()
+                });
+                (id, text)
+            });
+            out.extend(texts.into_iter().filter_map(|(id, text)| Some((id, text?))));
+        }
+        Ok(out)
+    }
+    /// Every parcel `accounts`' cached mail tells of, outside Sent, Drafts
+    /// and Spam, last updated first (see `parcels::summarize`), and the
+    /// shipping mail known only by its headers, to download (newest first).
+    ///
+    /// What was found in each message is kept in `parcel_scan`, with
+    /// whether its text had been downloaded and how it was read, so a
+    /// message is read again only once it is downloaded, or the way of
+    /// reading (`PARCEL_SCAN`, the model) changes. Messages whose text
+    /// wasn't kept are read from their downloaded source, or from their
+    /// HTML's text; encrypted ones, and those not downloaded, only by their
+    /// subject and preview.
+    pub fn parcels(
+        &self,
+        accounts: &[String],
+        model: Option<&crate::manage::local_ai::parcel::Confirmer>,
+    ) -> Result<ParcelScan> {
+        use crate::manage::parcels::{self, MailText, Parcel, Sighting};
+        let version = PARCEL_SCAN * 2 + i64::from(model.is_some());
+        let download_since = chrono::Utc::now().timestamp() - PARCEL_DOWNLOAD_DAYS * 86_400;
+        let mut found = Vec::new();
+        let mut to_download = Vec::new();
+        let mut scanned = 0;
+        let mut looked_at = HashSet::new();
+        let mut with_parcels = HashSet::new();
+        for account in accounts {
+            let listed = self.scan_rows(account)?;
+            let cached: HashMap<String, (bool, i64, String)> = {
+                let db = self.read();
+                let mut q =
+                    db.prepare("SELECT id, state, version, data FROM parcel_scan WHERE account=?1")?;
+                q.query_map([account], |r| {
+                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            let mut fresh: Vec<(String, bool, Vec<Parcel>)> = Vec::new();
+            let mut results: HashMap<String, Vec<Parcel>> = HashMap::new();
+            let mut unread: Vec<&ScanRow> = Vec::new();
+            for row in &listed {
+                let folder = row.folder();
+                if row.pending || matches!(folder, Folder::Sent | Folder::Drafts | Folder::Junk) {
+                    continue;
+                }
+                scanned += 1;
+                match cached.get(&row.id) {
+                    Some((state, v, data)) if *state == row.content && *v == version => {
+                        let list: Vec<Parcel> = serde_json::from_str(data).unwrap_or_default();
+                        results.insert(row.id.clone(), list);
+                    }
+                    // Downloaded, but nothing in its subject, preview or
+                    // sender is about orders or shipping: not worth
+                    // reading whole (in a large mailbox, minutes of work).
+                    _ if row.content
+                        && !parcels::worth_reading(&row.subject, &row.snippet, &row.from) =>
+                    {
+                        fresh.push((row.id.clone(), true, Vec::new()));
+                        results.insert(row.id.clone(), Vec::new());
+                    }
+                    _ if row.content => unread.push(row),
+                    _ => {
+                        let list = parcels::find_in_mail(
+                            &MailText {
+                                subject: &row.subject,
+                                text: &row.snippet,
+                                html: None,
+                                sent: row.date,
+                            },
+                            model,
+                        );
+                        fresh.push((row.id.clone(), false, list.clone()));
+                        results.insert(row.id.clone(), list);
+                    }
+                }
+                // A message saying a delivery moved is downloaded however
+                // old: without it an old parcel never reaches "Delivered".
+                if !row.content
+                    && (row.date >= download_since || parcels::delivery_news(&row.subject))
+                    && parcels::looks_like_shipping(&row.subject, &row.snippet, &row.from)
+                {
+                    to_download.push((row.date, account.clone(), row.id.clone()));
+                }
+            }
+            // In batches, so other work gets the cache in between. Each
+            // batch's sources are inflated, parsed and read on several
+            // threads; with the model, which reads on one thread, only the
+            // first two.
+            for chunk in unread.chunks(PARCEL_BATCH) {
+                type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+                let rows: Vec<Row> = {
+                    let db = self.read();
+                    let mut q = db.prepare(&format!(
+                        "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
+                    ))?;
+                    let mut rows = Vec::new();
+                    for row in chunk {
+                        if let Some(r) = q
+                            .query_map([&row.id], |r| {
+                                Ok((r.get::<_, String>(0)?, source_columns(r, 1)?))
+                            })?
+                            .next()
+                        {
+                            let (data, (raw, source)) = r?;
+                            rows.push((row.id.clone(), data, raw, source));
+                        }
+                    }
+                    rows
+                };
+                let with_model = model.is_some();
+                let read = parallel_map(rows, |(id, data, raw, source)| {
+                    // A source that can't be read leaves the cached text.
+                    let raw = unpack(raw, source).ok().flatten();
+                    let readable = serde_json::from_str::<Mail>(&data)
+                        .ok()
+                        .map(|mail| ParcelText::of(mail, raw.as_deref()));
+                    let found = readable.as_ref().filter(|_| !with_model).map(|r| r.find(None));
+                    (id, readable, found)
+                });
+                for (id, readable, found) in read {
+                    let list = match (found, readable) {
+                        (Some(list), _) => list,
+                        (None, Some(r)) => r.find(model),
+                        (None, None) => Vec::new(),
+                    };
+                    fresh.push((id.clone(), true, list.clone()));
+                    results.insert(id, list);
+                }
+            }
+            if !fresh.is_empty() {
+                let mut db = self.write();
+                let tx = db.transaction()?;
+                {
+                    let mut put = tx.prepare(
+                        "INSERT OR REPLACE INTO parcel_scan (id, account, state, version, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+                    for (id, content, list) in &fresh {
+                        put.execute(params![
+                            id,
+                            account,
+                            i64::from(*content),
+                            version,
+                            serde_json::to_string(list)?
+                        ])?;
+                    }
+                }
+                // What was found in mail that is gone goes too.
+                if cached.len() > listed.len() {
+                    tx.execute(
+                        "DELETE FROM parcel_scan WHERE account=?1 AND id NOT IN (SELECT id FROM messages WHERE account=?1)",
+                        [account],
+                    )?;
+                }
+                tx.commit()?;
+            }
+            for row in &listed {
+                let Some(list) = results.get(&row.id) else {
+                    continue;
+                };
+                looked_at.insert(row.id.clone());
+                if !list.is_empty() {
+                    with_parcels.insert(row.id.clone());
+                }
+                for parcel in list {
+                    found.push((
+                        parcel.clone(),
+                        Sighting {
+                            account: account.clone(),
+                            mail_id: row.id.clone(),
+                            message_id: row.message_id.clone(),
+                            mailbox: row.mailbox(),
+                            subject: row.subject.clone(),
+                            sender: if row.sender.is_empty() {
+                                row.from.clone()
+                            } else {
+                                row.sender.clone()
+                            },
+                            sent: row.date,
+                        },
+                    ));
+                }
+            }
+        }
+        to_download.sort_by_key(|a| std::cmp::Reverse(a.0));
+        Ok(ParcelScan {
+            tracked: parcels::summarize(found),
+            to_download: to_download.into_iter().map(|(_, a, id)| (a, id)).collect(),
+            scanned,
+            looked_at,
+            with_parcels,
+        })
+    }
+    /// Every receipt `accounts`' cached mail holds, outside Sent, Drafts
+    /// and Spam, newest first (see `receipts::summarize`), and how many
+    /// messages were looked at.
+    ///
+    /// As with `parcels`, what was found in each message is kept (in
+    /// `receipt_scan`), so a message is read again only once its text is
+    /// downloaded or the way of reading (`RECEIPT_SCAN`) changes. Only
+    /// downloaded mail whose subject or sender may be a receipt's
+    /// (`receipts::worth_reading`) is read whole; mail not downloaded is
+    /// read by its subject and preview.
+    pub fn receipts(&self, accounts: &[String]) -> Result<ReceiptScan> {
+        use crate::manage::parcels::Sighting;
+        use crate::manage::receipts::{self, MailText, Receipt};
+        let download_since = chrono::Utc::now().timestamp() - PARCEL_DOWNLOAD_DAYS * 86_400;
+        let mut found = Vec::new();
+        let mut to_download = Vec::new();
+        let mut scanned = 0;
+        for account in accounts {
+            let listed = self.scan_rows(account)?;
+            let cached: HashMap<String, (bool, i64, String)> = {
+                let db = self.read();
+                let mut q = db
+                    .prepare("SELECT id, state, version, data FROM receipt_scan WHERE account=?1")?;
+                q.query_map([account], |r| {
+                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)))
+                })?
+                .collect::<rusqlite::Result<_>>()?
+            };
+            let mut fresh: Vec<(String, bool, Option<Receipt>)> = Vec::new();
+            let mut results: HashMap<String, Option<Receipt>> = HashMap::new();
+            let mut unread: Vec<&ScanRow> = Vec::new();
+            for row in &listed {
+                if row.pending || matches!(row.folder(), Folder::Sent | Folder::Drafts | Folder::Junk)
+                {
+                    continue;
+                }
+                scanned += 1;
+                let from = row.from_line();
+                if !row.content
+                    && row.date >= download_since
+                    && receipts::worth_downloading(&row.subject, &from)
+                {
+                    to_download.push((row.date, account.clone(), row.id.clone()));
+                }
+                match cached.get(&row.id) {
+                    Some((state, v, data)) if *state == row.content && *v == RECEIPT_SCAN => {
+                        let r: Option<Receipt> = serde_json::from_str(data).unwrap_or_default();
+                        results.insert(row.id.clone(), r);
+                    }
+                    _ if !receipts::worth_reading(&row.subject, &from) => {
+                        fresh.push((row.id.clone(), row.content, None));
+                        results.insert(row.id.clone(), None);
+                    }
+                    _ if row.content => unread.push(row),
+                    _ => {
+                        let r = receipts::find(&MailText {
+                            subject: &row.subject,
+                            text: &row.snippet,
+                            html: None,
+                            from: &from,
+                        });
+                        fresh.push((row.id.clone(), false, r.clone()));
+                        results.insert(row.id.clone(), r);
+                    }
+                }
+            }
+            for chunk in unread.chunks(PARCEL_BATCH) {
+                let ids: Vec<&str> = chunk.iter().map(|r| r.id.as_str()).collect();
+                let rows = self.source_rows(&ids)?;
+                let read = parallel_map(rows, |(id, data, raw, source)| {
+                    let raw = unpack(raw, source).ok().flatten();
+                    let r = serde_json::from_str::<Mail>(&data).ok().and_then(|mail| {
+                        let from = format!("{} <{}>", mail.sender, mail.from);
+                        let read = ParcelText::of(mail, raw.as_deref());
+                        receipts::find(&MailText {
+                            subject: &read.mail.subject,
+                            text: read.text(),
+                            html: read.mail.html.as_deref(),
+                            from: &from,
+                        })
+                    });
+                    (id, r)
+                });
+                for (id, r) in read {
+                    fresh.push((id.clone(), true, r.clone()));
+                    results.insert(id, r);
+                }
+            }
+            if !fresh.is_empty() {
+                let mut db = self.write();
+                let tx = db.transaction()?;
+                {
+                    let mut put = tx.prepare(
+                        "INSERT OR REPLACE INTO receipt_scan (id, account, state, version, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+                    for (id, content, r) in &fresh {
+                        put.execute(params![
+                            id,
+                            account,
+                            i64::from(*content),
+                            RECEIPT_SCAN,
+                            serde_json::to_string(r)?
+                        ])?;
+                    }
+                }
+                if cached.len() > listed.len() {
+                    tx.execute(
+                        "DELETE FROM receipt_scan WHERE account=?1 AND id NOT IN (SELECT id FROM messages WHERE account=?1)",
+                        [account],
+                    )?;
+                }
+                tx.commit()?;
+            }
+            for row in &listed {
+                let Some(Some(receipt)) = results.remove(&row.id) else {
+                    continue;
+                };
+                found.push((
+                    receipt,
+                    Sighting {
+                        account: account.clone(),
+                        mail_id: row.id.clone(),
+                        message_id: row.message_id.clone(),
+                        mailbox: row.mailbox(),
+                        subject: row.subject.clone(),
+                        sender: if row.sender.is_empty() {
+                            row.from.clone()
+                        } else {
+                            row.sender.clone()
+                        },
+                        sent: row.date,
+                    },
+                ));
+            }
+        }
+        to_download.sort_by_key(|a| std::cmp::Reverse(a.0));
+        Ok(ReceiptScan {
+            listed: receipts::summarize(found),
+            to_download: to_download.into_iter().map(|(_, a, id)| (a, id)).collect(),
+            scanned,
+        })
+    }
+    /// An account's messages as `parcels` and `receipts` look through
+    /// them, without their text.
+    fn scan_rows(&self, account: &str) -> Result<Vec<ScanRow>> {
+        let db = self.read();
+        let mut q = db.prepare(&format!(
+            "SELECT id, json_extract(data,'$.folder'), json_extract(data,'$.remote_folder'), date, \
+             coalesce(json_extract(data,'$.subject'),''), coalesce(json_extract(data,'$.snippet'),''), \
+             coalesce(json_extract(data,'$.from'),''), coalesce(json_extract(data,'$.sender'),''), \
+             coalesce(json_extract(data,'$.message_id'),''), \
+             (json_type(data,'$.body')='text' OR coalesce(json_extract(data,'$.html'),'')!='' OR {DOWNLOADED}), \
+             coalesce(json_extract(data,'$.pending'),0) \
+             FROM messages WHERE account=?1"
+        ))?;
+        Ok(q
+            .query_map([account], |r| {
+                Ok(ScanRow {
+                    id: r.get(0)?,
+                    folder: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    remote: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    date: r.get(3)?,
+                    subject: r.get(4)?,
+                    snippet: r.get(5)?,
+                    from: r.get(6)?,
+                    sender: r.get(7)?,
+                    message_id: r.get(8)?,
+                    content: r.get::<_, i64>(9)? != 0,
+                    pending: r.get::<_, i64>(10)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    /// The kept data and saved source of messages, by id: (id, data, raw,
+    /// source), for `unpack`.
+    fn source_rows(&self, ids: &[&str]) -> Result<Vec<SourceRow>> {
+        let db = self.read();
+        let mut q = db.prepare(&format!("SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"))?;
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(r) = q
+                .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
+                .next()
+            {
+                let (data, (raw, source)) = r?;
+                rows.push(((*id).to_owned(), data, raw, source));
+            }
+        }
+        Ok(rows)
+    }
+    /// Which of `accounts`' messages have a sign-in or verification code,
+    /// which tell where a package is, and which are receipts (see
+    /// `mail_kinds`). Package updates and receipts are what the Summary
+    /// finds (`parcels`, with the same `parcel_model`, and `receipts`, so
+    /// the findings kept for it are used; receipts hidden by hand are left
+    /// out); code mail is
+    /// what its subject and preview suggest, confirmed by `detector` from
+    /// its text, or else by `mail_kinds::code_by_rule`. Mail `previous`
+    /// looked at (worked out the same way) isn't read again.
+    pub fn mail_kinds(
+        &self,
+        accounts: &[String],
+        parcel_model: Option<&crate::manage::local_ai::parcel::Confirmer>,
+        detector: Option<&crate::manage::local_ai::otp::Detector>,
+        previous: Option<&crate::manage::mail_kinds::Kinds>,
+    ) -> Result<crate::manage::mail_kinds::Kinds> {
+        use crate::manage::mail_kinds::{self, Kinds};
+        let scan = self.parcels(accounts, parcel_model)?;
+        // Receipts as the Summary lists them, without those hidden by hand
+        // (taken for receipts wrongly).
+        let hidden: Vec<String> = self
+            .preference(crate::manage::receipts::HIDDEN_PREFERENCE)
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let mut found = self.receipts(accounts)?.listed;
+        crate::manage::receipts::apply_hidden(&mut found, &hidden);
+        let receipts = found
+            .iter()
+            .filter(|l| !l.hidden)
+            .flat_map(|l| l.emails.iter().map(|s| s.mail_id.clone()))
+            .collect();
+        let mut kinds = Kinds {
+            packages: scan.with_parcels,
+            receipts,
+            checked: scan.looked_at,
+            ..Kinds::default()
+        };
+        for account in accounts {
+            let listed: Vec<(String, String, String, String)> = {
+                let db = self.read();
+                let mut q = db.prepare(
+                    "SELECT id, coalesce(json_extract(data,'$.folder'),''), \
+                     coalesce(json_extract(data,'$.subject'),''), coalesce(json_extract(data,'$.snippet'),'') \
+                     FROM messages WHERE account=?1 AND coalesce(json_extract(data,'$.pending'),0)=0",
+                )?;
+                q.query_map([account], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let mut maybe: Vec<String> = Vec::new();
+            for (id, folder, subject, snippet) in listed {
+                // Codes are received, not sent or drafted.
+                if matches!(folder.as_str(), "Sent" | "Drafts") {
+                    continue;
+                }
+                match previous.filter(|p| p.checked.contains(&id)) {
+                    Some(p) => {
+                        if p.codes.contains(&id) {
+                            kinds.codes.insert(id.clone());
+                        }
+                    }
+                    None if mail_kinds::might_be_code(&subject, &snippet) => maybe.push(id.clone()),
+                    None => {}
+                }
+                kinds.checked.insert(id);
+            }
+            // Each likely one read whole, then judged.
+            for chunk in maybe.chunks(PARCEL_BATCH) {
+                type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+                let rows: Vec<Row> = {
+                    let db = self.read();
+                    let mut q = db.prepare(&format!(
+                        "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
+                    ))?;
+                    let mut rows = Vec::new();
+                    for id in chunk {
+                        if let Some(r) = q
+                            .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
+                            .next()
+                        {
+                            let (data, (raw, source)) = r?;
+                            rows.push((id.clone(), data, raw, source));
+                        }
+                    }
+                    rows
+                };
+                let with_model = detector.is_some();
+                let read = parallel_map(rows, |(id, data, raw, source)| {
+                    let raw = unpack(raw, source).ok().flatten();
+                    let read = serde_json::from_str::<Mail>(&data)
+                        .ok()
+                        .map(|mail| ParcelText::of(mail, raw.as_deref()));
+                    let by_rule = read
+                        .as_ref()
+                        .filter(|_| !with_model)
+                        .map(|r| mail_kinds::code_by_rule(&r.mail.subject, r.text()));
+                    (id, read, by_rule)
+                });
+                for (id, read, by_rule) in read {
+                    let code = match (by_rule, read, detector) {
+                        (Some(code), _, _) => code,
+                        // The model's code, given in a sentence naming it.
+                        (None, Some(r), Some(d)) => {
+                            mail_kinds::code_in_a_sentence(&r.mail.subject, r.text())
+                                && !d.codes(&r.mail.subject, r.text()).is_empty()
+                        }
+                        _ => false,
+                    };
+                    if code {
+                        kinds.codes.insert(id);
+                    }
+                }
+            }
+        }
+        // A tracking number is shaped like a code: package updates aren't
+        // code mail.
+        let Kinds { codes, packages, .. } = &mut kinds;
+        codes.retain(|id| !packages.contains(id));
+        Ok(kinds)
     }
     /// Every copy of the mail from `address` in `account` that offers to
     /// unsubscribe, outside Junk and Trash, newest first. Copies of one
@@ -1423,6 +1975,185 @@ impl Drop for Store {
 const SOURCE_COLUMNS: &str = "raw, source";
 /// The rows whose source has been downloaded.
 const DOWNLOADED: &str = "(raw IS NOT NULL OR source IS NOT NULL)";
+/// How messages are read for parcels (see `Store::parcels`): what was
+/// found by an earlier way is found again. Raise it whenever `parcels`
+/// finds differently, or the Summary keeps the old findings.
+const PARCEL_SCAN: i64 = 8;
+/// How far back shipping mail known only by its headers is downloaded for
+/// the Summary (mail whose subject says a delivery moved is downloaded
+/// whatever its age).
+const PARCEL_DOWNLOAD_DAYS: i64 = 365;
+
+/// How messages are read for receipts (see `Store::receipts`): raise it
+/// whenever `receipts::find` finds differently.
+const RECEIPT_SCAN: i64 = 2;
+
+/// What a look through mail for receipts found.
+pub struct ReceiptScan {
+    pub listed: Vec<crate::manage::receipts::Listed>,
+    /// Receipts known only by their headers, newest first: (account,
+    /// message id), to download so their totals can be read.
+    pub to_download: Vec<(String, String)>,
+    /// How many messages were looked at.
+    pub scanned: usize,
+}
+
+/// A message's id, kept data and saved source (see `Store::source_rows`).
+type SourceRow = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What a look through mail for parcels found.
+pub struct ParcelScan {
+    pub tracked: Vec<crate::manage::parcels::Tracked>,
+    /// Shipping mail known only by its headers, newest first: (account,
+    /// message id).
+    pub to_download: Vec<(String, String)>,
+    /// How many messages were looked at.
+    pub scanned: usize,
+    /// Which messages were looked at, and which a parcel was found in.
+    pub looked_at: HashSet<String>,
+    pub with_parcels: HashSet<String>,
+}
+
+/// A message as `Store::parcels` lists it, without its text.
+struct ScanRow {
+    id: String,
+    folder: String,
+    remote: String,
+    date: i64,
+    subject: String,
+    snippet: String,
+    from: String,
+    sender: String,
+    message_id: String,
+    /// Its text or source was downloaded.
+    content: bool,
+    pending: bool,
+}
+
+impl ScanRow {
+    /// Its sender as "Name <address>".
+    fn from_line(&self) -> String {
+        format!("{} <{}>", self.sender, self.from)
+    }
+    fn folder(&self) -> Folder {
+        serde_json::from_value(serde_json::Value::String(self.folder.clone()))
+            .unwrap_or(Folder::Other)
+    }
+    fn mailbox(&self) -> Mailbox {
+        match self.folder() {
+            Folder::Other => Mailbox::Remote(self.remote.clone()),
+            f => Mailbox::Standard(f),
+        }
+    }
+}
+
+/// Downloaded messages read for parcels at a time (see `Store::parcels`).
+const PARCEL_BATCH: usize = 400;
+/// The most of a message's text the Summary's package search looks
+/// through (`Store::parcel_search_texts`): a long newsletter's tail says
+/// nothing of a parcel.
+const PARCEL_SEARCH_TEXT: usize = 50_000;
+
+/// `f` of each of `items`, in order, on as many threads as there are
+/// cores (up to 8), each a part of the list.
+fn parallel_map<T: Send, U: Send>(items: Vec<T>, f: impl Fn(T) -> U + Sync) -> Vec<U> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    if threads < 2 || items.len() < 2 {
+        return items.into_iter().map(f).collect();
+    }
+    let size = items.len().div_ceil(threads);
+    let mut parts: Vec<Vec<T>> = Vec::new();
+    let mut items = items.into_iter().peekable();
+    while items.peek().is_some() {
+        parts.push(items.by_ref().take(size).collect());
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = parts
+            .into_iter()
+            .map(|part| scope.spawn(move || part.into_iter().map(f).collect::<Vec<U>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
+/// A downloaded message as it is read for parcels: its text, or else its
+/// HTML's text, or else what its source holds (unless encrypted).
+struct ParcelText {
+    mail: Mail,
+    /// Its HTML's text, when it has HTML and no text.
+    converted: Option<String>,
+}
+
+impl ParcelText {
+    fn of(mut mail: Mail, raw: Option<&[u8]>) -> Self {
+        fill_from(&mut mail, raw);
+        let converted = match (&mail.body, &mail.html) {
+            (None, Some(html)) => Some(crate::sync::mime::html_to_text(html)),
+            _ => None,
+        };
+        Self { mail, converted }
+    }
+    /// Its text, or its HTML's, or else its preview.
+    fn text(&self) -> &str {
+        self.mail
+            .body
+            .as_deref()
+            .or(self.converted.as_deref())
+            .unwrap_or(&self.mail.snippet)
+    }
+    /// The parcels in it.
+    fn find(
+        &self,
+        model: Option<&crate::manage::local_ai::parcel::Confirmer>,
+    ) -> Vec<crate::manage::parcels::Parcel> {
+        let mail = &self.mail;
+        let text = self.text();
+        crate::manage::parcels::find_in_mail(
+            &crate::manage::parcels::MailText {
+                subject: &mail.subject,
+                text,
+                html: mail.html.as_deref(),
+                sent: mail.date,
+            },
+            model,
+        )
+    }
+}
+
+/// Gives a message without its text or HTML kept those of its source
+/// (unless encrypted).
+fn fill_from(mail: &mut Mail, raw: Option<&[u8]>) {
+    // An empty HTML kept is as good as none: some mail was cached with
+    // one and nothing else.
+    if mail.html.as_deref().is_some_and(str::is_empty) {
+        mail.html = None;
+    }
+    if mail.body.is_none()
+        && mail.html.is_none()
+        && let Some(raw) = raw.filter(|raw| {
+            crate::manage::crypto::encrypted_part(raw).is_none()
+                && !raw.windows(27).any(|w| w == b"-----BEGIN PGP MESSAGE-----")
+        })
+    {
+        let mut a = Account::new(Provider::Imap);
+        a.id = mail.account.clone();
+        if let Ok(parsed) = crate::sync::mime::parse_message(
+            raw,
+            &a,
+            &mail.id,
+            mail.folder,
+            &mail.remote_folder,
+            mail.uid,
+        ) {
+            mail.body = parsed.body;
+            mail.html = parsed.html;
+        }
+    }
+}
 /// The rows whose source hasn't been. Written exactly as the `downloaded`
 /// index has it, so that the download counts are read from the index.
 const NOT_DOWNLOADED: &str = "(raw IS NULL AND source IS NULL)";

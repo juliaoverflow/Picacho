@@ -451,7 +451,9 @@ fn screens_title_themselves_beside_a_back_chevron(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn account_folders_fold_from_the_header(cx: &mut TestAppContext) {
-    let (view, cx) = phone(PHONE, cx);
+    // A tall phone: the account's header above the tab bar, below All
+    // Accounts' rows.
+    let (view, cx) = phone((PHONE.0, 1000.), cx);
     view.update_in(cx, |this, w, cx| this.close(w, cx));
     let id = view.read_with(cx, |this, _| this.accounts[0].id.clone());
     let fold: &'static str = Box::leak(format!("mobile-fold-{id}").into_boxed_str());
@@ -900,6 +902,29 @@ fn all_accounts_lists_every_accounts_subscriptions(cx: &mut TestAppContext) {
     view.read_with(cx, |this, _| {
         assert_eq!(this.account.as_deref(), Some(ALL_MAIL));
     });
+}
+
+#[gpui::test]
+fn an_accounts_summary_opens_from_under_its_inbox_and_back_returns(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    let row: &'static str = Box::leak(format!("mobile-summary-{first}").into_boxed_str());
+    // Listed under the Inbox (below the fold here), and tapping it pushes
+    // the Summary.
+    bounds(cx, row);
+    view.update_in(cx, |this, w, cx| {
+        this.mobile_push(Action::OpenSummary(first.clone()), w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::Summary);
+    assert!(shown(cx, "mobile-summary"));
+    assert!(shown(cx, "summary-page"));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    view.read_with(cx, |this, _| assert!(!this.summary_open));
 }
 
 #[gpui::test]

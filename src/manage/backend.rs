@@ -1858,6 +1858,349 @@ impl Backend {
         }
         Ok(messages)
     }
+    /// Downloads shipping mail known only by its headers, for the Summary to
+    /// read: (account, message id) each, as `Store::parcels` lists them.
+    /// Returns how many were downloaded; stops after a few failures in a
+    /// row (offline, signed out), and when `cancel` is set.
+    ///
+    /// IMAP mail is fetched many messages per request, mailbox by mailbox,
+    /// rather than one round trip (and perhaps a SELECT) per message.
+    pub fn download_for_parcels(
+        &self,
+        messages: &[(String, String)],
+        cancel: &AtomicBool,
+    ) -> Result<usize> {
+        let accounts = self.store.accounts()?;
+        let mut downloaded = 0;
+        let mut failed = 0;
+        let mut last_error = None;
+        // Each account's messages, in the order given.
+        let mut by_account: Vec<(&Account, Vec<Mail>)> = Vec::new();
+        for (account, id) in messages {
+            let Some(a) = accounts.iter().find(|a| &a.id == account) else {
+                continue;
+            };
+            if a.provider == Provider::Pop3 {
+                continue;
+            }
+            let Some(m) = self.store.message(id)? else {
+                continue;
+            };
+            match by_account.iter_mut().find(|(b, _)| b.id == a.id) {
+                Some((_, list)) => list.push(m),
+                None => by_account.push((a, vec![m])),
+            }
+        }
+        let mut one_by_one: Vec<(&Account, Mail)> = Vec::new();
+        for (a, mails) in by_account {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            // Larger ones download in parts (IMAP), or only their text.
+            let limit = match a.provider {
+                Provider::Proton | Provider::Jmap => MAX_MESSAGE,
+                _ => large::CHUNK,
+            };
+            let (small, large): (Vec<Mail>, Vec<Mail>) =
+                mails.into_iter().partition(|m| (m.size as usize) <= limit);
+            one_by_one.extend(large.into_iter().map(|m| (a, m)));
+            let fetched = match a.provider {
+                Provider::Proton => self.fetch_sources_proton(a, &small, cancel),
+                Provider::Jmap => self.fetch_sources_jmap(a, &small, cancel),
+                _ => self.fetch_sources_for_parcels(a, &small, cancel),
+            };
+            match fetched {
+                Ok(n) => downloaded += n,
+                Err(e) => {
+                    failed += 1;
+                    last_error = Some(e);
+                }
+            }
+        }
+        for (a, m) in one_by_one {
+            if cancel.load(Ordering::Relaxed) || failed >= 5 {
+                break;
+            }
+            match self.read(a, &m) {
+                Ok(_) => {
+                    downloaded += 1;
+                    failed = 0;
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_error = Some(e);
+                    if failed >= 5 {
+                        break;
+                    }
+                }
+            }
+        }
+        match last_error {
+            Some(e) if downloaded == 0 && failed > 0 => Err(e),
+            _ => Ok(downloaded),
+        }
+    }
+    /// Downloads the sources of an IMAP account's messages known only by
+    /// their headers, many per FETCH, for `download_for_parcels`. The
+    /// account's connection is let go between requests, so opening a
+    /// message doesn't wait for the whole download.
+    fn fetch_sources_for_parcels(
+        &self,
+        a: &Account,
+        mails: &[Mail],
+        cancel: &AtomicBool,
+    ) -> Result<usize> {
+        /// Messages asked for per FETCH.
+        const PER_FETCH: usize = 25;
+        let mut stored = 0;
+        let mut pending: Vec<&Mail> = Vec::new();
+        for m in mails {
+            // A Gmail message appears once per label: download it once.
+            if m.gmail_id != 0 {
+                if pending.iter().any(|p| p.gmail_id == m.gmail_id) {
+                    continue;
+                }
+                if let Some(raw) = self.store.gmail_raw(&a.id, m.gmail_id)? {
+                    self.store.save_raw(&m.id, &raw)?;
+                    stored += 1;
+                    continue;
+                }
+            }
+            pending.push(m);
+        }
+        let mut groups: Vec<Vec<&Mail>> = Vec::new();
+        for m in pending {
+            match groups
+                .iter_mut()
+                .find(|g| g[0].remote_folder == m.remote_folder && same_validity(g[0], m))
+            {
+                Some(group) => group.push(m),
+                None => groups.push(vec![m]),
+            }
+        }
+        let mut last_error = None;
+        let mut failed = 0;
+        for group in &groups {
+            for chunk in group.chunks(PER_FETCH) {
+                if cancel.load(Ordering::Relaxed) || failed >= 3 {
+                    return Ok(stored);
+                }
+                let waiting = self.wait_for(&a.id);
+                let lock = self.account_lock(&a.id);
+                let _operation = lock.lock().unwrap();
+                drop(waiting);
+                let result = self.with_imap(a, |c| {
+                    c.select_for(chunk[0])?;
+                    let uids: Vec<u32> = chunk.iter().map(|m| m.uid).collect();
+                    let mut got = 0;
+                    for f in c
+                        .session
+                        .uid_fetch(uid_set(&uids), "(UID BODY.PEEK[])")?
+                        .iter()
+                    {
+                        let (Some(uid), Some(raw)) = (f.uid, f.body()) else {
+                            continue;
+                        };
+                        let Some(m) = chunk.iter().find(|m| m.uid == uid) else {
+                            continue;
+                        };
+                        if raw.len() > MAX_MESSAGE {
+                            continue;
+                        }
+                        self.keep_source(a, m, raw)?;
+                        got += 1;
+                    }
+                    Ok(got)
+                });
+                match result {
+                    Ok(n) => {
+                        stored += n;
+                        failed = 0;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        last_error = Some(e);
+                    }
+                }
+            }
+        }
+        match last_error {
+            Some(e) if stored == 0 => Err(e),
+            _ => Ok(stored),
+        }
+    }
+    /// Keeps a message's downloaded source, and what only it tells: its
+    /// attachments, preview, and the headers a message list may not carry.
+    /// Encrypted mail stays ciphertext on disk.
+    fn keep_source(&self, a: &Account, m: &Mail, raw: &[u8]) -> Result<()> {
+        self.store.save_raw(&m.id, raw)?;
+        if crate::manage::crypto::encrypted_part(raw).is_some() {
+            return Ok(());
+        }
+        if let Ok(mut parsed) = parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid) {
+            let mut next = m.clone();
+            next.has_attachments = !parsed.attachments().is_empty();
+            next.set_attachments(parsed.take_attachments());
+            if next.snippet.is_empty() {
+                next.snippet = std::mem::take(&mut parsed.snippet);
+            }
+            if next.message_id.is_empty() {
+                next.message_id = std::mem::take(&mut parsed.message_id);
+            }
+            if next.references().is_empty() {
+                next.set_references(parsed.references());
+            }
+            if next.receipt_to().is_empty() {
+                next.set_receipt_to(parsed.receipt_to());
+            }
+            if next.list_unsubscribe.is_empty() {
+                next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
+                next.one_click = parsed.one_click;
+            }
+            self.store.save_messages(&[next])?;
+        }
+        Ok(())
+    }
+    /// Downloads Proton messages known only by their headers, for
+    /// `download_for_parcels`: several asked for at once, rather than one
+    /// round trip after another. The account is let go between requests.
+    fn fetch_sources_proton(&self, a: &Account, mails: &[Mail], cancel: &AtomicBool) -> Result<usize> {
+        /// Messages asked for at once.
+        const AT_ONCE: usize = 8;
+        let mut stored = 0;
+        let mut last_error = None;
+        let mut failed = 0;
+        for chunk in mails.chunks(AT_ONCE) {
+            if cancel.load(Ordering::Relaxed) || failed >= 3 {
+                break;
+            }
+            let ids: Vec<(&Mail, String)> = chunk
+                .iter()
+                .filter_map(|m| Some((m, proton::proton_id(a, m)?.to_owned())))
+                .collect();
+            let waiting = self.wait_for(&a.id);
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            drop(waiting);
+            let asked: Vec<String> = ids.iter().map(|(_, id)| id.clone()).collect();
+            let result = self.with_proton(a, |s| {
+                let mut got = s.literals(&asked);
+                // A signed-out session fails them all: its error is the
+                // request's, so the session is let go.
+                let signed_out = !got.is_empty()
+                    && got.iter().all(|r| {
+                        r.as_ref().is_err_and(|e| e.downcast_ref::<AccessFailure>().is_some())
+                    });
+                if signed_out {
+                    return Err(got.swap_remove(0).unwrap_err());
+                }
+                Ok(got)
+            });
+            match result {
+                Ok(got) => {
+                    let mut any = false;
+                    for ((m, _), raw) in ids.iter().zip(got) {
+                        match raw {
+                            Ok(raw) if raw.len() <= large::MAX_DOWNLOAD => {
+                                self.note_traffic(a, raw.len());
+                                self.keep_source(a, m, &raw)?;
+                                stored += 1;
+                                any = true;
+                            }
+                            Ok(_) => {}
+                            Err(e) => last_error = Some(e),
+                        }
+                    }
+                    failed = if any { 0 } else { failed + 1 };
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_error = Some(e);
+                }
+            }
+        }
+        match last_error {
+            Some(e) if stored == 0 => Err(e),
+            _ => Ok(stored),
+        }
+    }
+    /// Downloads JMAP messages known only by their headers, for
+    /// `download_for_parcels`: each batch's sources found in one request,
+    /// and downloaded several at a time.
+    fn fetch_sources_jmap(&self, a: &Account, mails: &[Mail], cancel: &AtomicBool) -> Result<usize> {
+        /// Messages per batch, and downloads at a time.
+        const PER_BATCH: usize = 25;
+        const AT_ONCE: usize = 6;
+        let mut stored = 0;
+        let mut last_error = None;
+        let mut failed = 0;
+        for chunk in mails.chunks(PER_BATCH) {
+            if cancel.load(Ordering::Relaxed) || failed >= 3 {
+                break;
+            }
+            let waiting = self.wait_for(&a.id);
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            drop(waiting);
+            let result = self.with_jmap(a, |s| {
+                let ids: Vec<String> = chunk
+                    .iter()
+                    .filter_map(|m| jmap::jmap_id(a, m).map(str::to_owned))
+                    .collect();
+                let blobs = s.blob_ids(&ids)?;
+                let wanted: Vec<(&Mail, &String)> = chunk
+                    .iter()
+                    .filter_map(|m| Some((m, blobs.get(jmap::jmap_id(a, m)?)?)))
+                    .collect();
+                let mut got: Vec<(&Mail, Result<Vec<u8>>)> = Vec::new();
+                for part in wanted.chunks(AT_ONCE) {
+                    let downloaded: Vec<Result<Vec<u8>>> = std::thread::scope(|scope| {
+                        let handles: Vec<_> = part
+                            .iter()
+                            .map(|(_, blob)| {
+                                scope.spawn(move || {
+                                    s.download(blob, "message.eml", "message/rfc822", MAX_MESSAGE)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("A download failed."))))
+                            .collect()
+                    });
+                    got.extend(part.iter().map(|(m, _)| *m).zip(downloaded));
+                }
+                if !got.is_empty() && got.iter().all(|(_, r)| r.is_err()) {
+                    let (_, first) = got.swap_remove(0);
+                    return Err(first.unwrap_err());
+                }
+                Ok(got)
+            });
+            match result {
+                Ok(got) => {
+                    for (m, raw) in got {
+                        match raw {
+                            Ok(raw) => {
+                                self.note_traffic(a, raw.len());
+                                self.keep_source(a, m, &raw)?;
+                                stored += 1;
+                            }
+                            Err(e) => last_error = Some(e),
+                        }
+                    }
+                    failed = 0;
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_error = Some(e);
+                }
+            }
+        }
+        match last_error {
+            Some(e) if stored == 0 => Err(e),
+            _ => Ok(stored),
+        }
+    }
     /// The message exactly as the server delivered it, downloading it first
     /// when only its headers are cached.
     pub fn original(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {

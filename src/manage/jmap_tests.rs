@@ -1210,3 +1210,64 @@ fn jmap_search_results_show_what_matched() -> Result<()> {
     assert_eq!(results.mails[0].snippet, "…the fixture & more");
     Ok(())
 }
+
+#[test]
+fn jmap_shipping_mail_downloads_in_batches_for_the_summary() -> Result<()> {
+    let (cert, tls) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let server = Arc::new(Mutex::new(Server {
+        port,
+        state: 1,
+        ..Default::default()
+    }));
+    {
+        let mut s = server.lock().unwrap();
+        for n in 1..=3 {
+            let blob = format!("B-S{n}");
+            let source = String::from_utf8_lossy(MESSAGE).replace("local JMAP fixture", &format!("parcel {n}"));
+            s.blobs.insert(blob.clone(), source.into_bytes());
+            s.emails.push(Message {
+                id: format!("S{n}"),
+                blob,
+                mailboxes: vec!["i".into()],
+                keywords: vec![],
+                subject: format!("Shipped {n}"),
+                received: format!("2026-10-2{n}T10:00:00Z"),
+            });
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let (server, stop) = (server.clone(), stop.clone());
+        std::thread::spawn(move || serve(listener, tls, server, stop))
+    };
+    let result = (|| -> Result<()> {
+        let (b, mut a, path) = backend(&cert)?;
+        let _cleanup = Cleanup(path);
+        a.provider = Provider::Jmap;
+        a.incoming_port = port;
+        b.check_jmap(&a, &b.test_secret.clone().unwrap())?;
+        // Listed with the account's provider, as a signed-in account is.
+        b.store.save_account(&a)?;
+        let inbox = b.sync(&a, Folder::Inbox, 50)?;
+        assert_eq!(inbox.len(), 3);
+        let wanted: Vec<(String, String)> = inbox.iter().map(|m| (a.id.clone(), m.id.clone())).collect();
+        let before = server.lock().unwrap().calls.len();
+        let got = b.download_for_parcels(&wanted, &AtomicBool::new(false))?;
+        assert_eq!(got, 3);
+        // One request finds every source.
+        let calls = server.lock().unwrap().calls[before..].to_vec();
+        assert_eq!(calls, ["Email/get"]);
+        for m in &inbox {
+            let n = m.subject.trim_start_matches("Shipped ");
+            let raw = b.store.raw(&m.id)?.expect("downloaded");
+            assert!(String::from_utf8_lossy(&raw).contains(&format!("parcel {n}")));
+        }
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    thread.join().unwrap();
+    result
+}

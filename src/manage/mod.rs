@@ -10,10 +10,14 @@ pub mod composing;
 pub mod crypto;
 pub mod forwarding;
 pub mod local_ai;
+pub mod mail_kinds;
 /// Keeping memory small in the background (desktop).
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub mod memory;
 pub mod model;
+/// Tracking numbers in mail, for the reader and each account's Summary.
+pub mod parcels;
+pub mod receipts;
 pub mod search;
 pub mod status;
 pub mod store;

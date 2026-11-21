@@ -228,3 +228,61 @@ fn the_models_list_shows_progress_and_deleting_asks_which_features_stop(cx: &mut
     });
     assert!(!local_ai::OTP.is_installed(&store));
 }
+
+/// Turning on Find tracking numbers installs the tracking number model from
+/// its training directory (it isn't published yet), and the reader then
+/// takes a tracking number given without a shipping word beside it.
+#[gpui::test]
+fn finding_tracking_numbers_installs_the_unpublished_model_from_its_training_directory(
+    cx: &mut TestAppContext,
+) {
+    let (store, account) = mailbox();
+    let parcel = |n: u32, body: &str| Mail {
+        id: format!("{account}:INBOX:1:{n}"),
+        account: account.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: n,
+        from: "orders@shop.test".into(),
+        sender: "Shop".into(),
+        subject: "A note from Shop".into(),
+        snippet: body.into(),
+        body: Some(body.into()),
+        date: chrono::Utc::now().timestamp(),
+        ..Mail::default()
+    };
+    // A bare 12-digit number: the rule without the model doesn't take it.
+    let m = parcel(
+        3,
+        "Hi Sam, use 986578788855 to follow your parcel on the FedEx website.",
+    );
+    store.save_messages(std::slice::from_ref(&m)).unwrap();
+    // The file the trained model is installed from must be the expected one.
+    local_ai::test_model("parcel-v1.bin");
+    let (view, cx) = open(store.clone(), cx);
+    view.read_with(cx, |this, _| assert!(this.found_parcels(&m).is_empty()));
+    act(&view, Action::SetLocalAi(true), cx);
+    act(&view, Action::SetFindParcels(true), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.parcel_error.is_none(), "{:?}", this.parcel_error);
+        assert!(this.find_parcels && this.parcel_model.is_some());
+        let found: Vec<String> = this
+            .found_parcels(&m)
+            .iter()
+            .map(|p| p.tracking_number.clone())
+            .collect();
+        assert_eq!(found, ["986578788855"]);
+    });
+    assert!(local_ai::PARCEL.is_installed(&store));
+    assert_eq!(
+        store.preference(local_ai::PARCEL_PREFERENCE).as_deref(),
+        Some("true")
+    );
+    // Off again: the model is deleted and the rule is back.
+    act(&view, Action::SetFindParcels(false), cx);
+    view.read_with(cx, |this, _| {
+        assert!(this.parcel_model.is_none());
+        assert!(this.found_parcels(&m).is_empty());
+    });
+    assert!(!local_ai::PARCEL.is_installed(&store));
+}

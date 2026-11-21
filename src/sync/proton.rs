@@ -836,7 +836,15 @@ impl Session {
     /// keys, attachments included. A part that won't decrypt is replaced by
     /// a note saying so, as Bridge does.
     pub fn literal(&self, id: &str) -> Result<Vec<u8>> {
-        block_on(async {
+        block_on(self.literal_async(id))
+    }
+    /// Several messages as `literal` gives each, asked for at once rather
+    /// than one after another: each its own result, in order.
+    pub fn literals(&self, ids: &[String]) -> Vec<Result<Vec<u8>>> {
+        block_on(futures::future::join_all(ids.iter().map(|id| self.literal_async(id))))
+    }
+    async fn literal_async(&self, id: &str) -> Result<Vec<u8>> {
+        {
             let client = &self.ctx.client;
             let msg = client.get_message(id).await.map_err(|e| {
                 if protected_email_bridge::api::mail::is_unprocessable(&e) {
@@ -853,7 +861,7 @@ impl Session {
                 packets.push(client.get_attachment(&a.id).await.explained()?);
             }
             Ok(literal::decrypt_and_build(&msg, &ring, packets, &self.ctx.art).0)
-        })
+        }
     }
     /// A message too large to download whole: its text alone, as MIME, and
     /// its attachments (id, name, size, type), each downloaded by itself
