@@ -206,7 +206,24 @@ def parity(model):
     return out
 
 
+def coreml_ready():
+    """Stops before training when --coreml can't write the Core ML file:
+    coremltools must be installed, and it ships builds only for Python
+    3.13 and older (a newer Python installs it without the parts it needs).
+    See the README's Training section."""
+    if "--coreml" not in sys.argv:
+        return
+    if sys.version_info >= (3, 14):
+        sys.exit(f"--coreml needs Python 3.13 or older (coremltools has no build for "
+                 f"{sys.version_info.major}.{sys.version_info.minor}): see README.md, Training.")
+    try:
+        import coremltools  # noqa: F401
+    except ImportError:
+        sys.exit("--coreml needs coremltools: see README.md, Training.")
+
+
 def main():
+    coreml_ready()
     rng = random.Random(20261120)
     # Labels, sentences and subjects held out of training.
     train_msgs = data.messages(rng, data.parts(held_out=False), 20000)

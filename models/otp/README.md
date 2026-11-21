@@ -72,8 +72,22 @@ and scripts) is checked by `cargo test matches_the_training_code`.
 
 ```sh
 python3 train.py            # numpy: otp-v1.bin, parity.json
-python3 train.py --coreml   # also otp-v1.mlmodel (pip install coremltools)
+python3 train.py --coreml   # also otp-v1.mlmodel (needs coremltools)
 ```
+
+`--coreml` needs [coremltools](https://pypi.org/project/coremltools/),
+which has builds only for Python 3.13 and older: on a newer Python it
+installs without its compiled parts and can't write the file, so
+`train.py` stops before training. Use a Python 3.13 environment, on any
+system (Linux works too: only *running* the model needs a Mac):
+
+```sh
+uv venv --python 3.13 .venv && uv pip install --python .venv numpy coremltools
+.venv/bin/python train.py --coreml
+```
+
+Lines saying `Failed to load ... libcoremlpython` are expected outside
+macOS: those parts run models, and writing one doesn't need them.
 
 The files it writes here are ignored by git. Tests use them when they are
 the published ones; otherwise they download the published files once into
