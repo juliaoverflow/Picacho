@@ -1,3 +1,14 @@
+---
+license: mit
+library_name: picacho
+tags:
+- packages
+- tracking
+- coreml
+- multilingual
+---
+
+
 # Vast Parcel: the tracking number model
 
 Confirms tracking numbers found in mail (`src/manage/parcels.rs`). The app
