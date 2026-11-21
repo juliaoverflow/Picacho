@@ -13,6 +13,74 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Events have a time zone: times are written in it, and Picacho says what
+  time that is for you. Events elsewhere show both times.
+- Guests' answers and the times they propose come back to the organizer:
+  note the answer, move the event, or keep the time. Guests can propose
+  another time, and updated invitations offer to update your calendar.
+- Every repeating rule other apps make is expanded (such as "the last
+  weekday of the month"), and extra dates (RDATE) are shown.
+- Checking a found key: its fingerprint and QR code, and a field to paste
+  the fingerprint its owner gave you, which Picacho compares. Your own key
+  shows yours, for others to check.
+- Repeating events show once for each time they happen, and one repeat
+  can be changed or deleted on its own. Events can be made to repeat
+  daily, weekly, monthly or yearly.
+- Events can have guests: they're sent an invitation from your account
+  when the event is saved, and a cancellation when it's deleted.
+- With Local AI → Understand dates, event times can be written as
+  "tomorrow at 10" or "every monday at 9"; an empty end is an hour later.
+- Keys Picacho finds for people are marked "not checked" until you
+  compare the fingerprint and mark them checked, and sending says when
+  one wasn't checked.
+- Encrypting the subject also hides the thread it's part of (In-Reply-To,
+  References), Reply-To and Keywords.
+- S/MIME drafts sync with the server's Drafts, sealed to your certificate.
+- Reduce motion's Automatic follows Android's and iOS's settings, and
+  notices changes whenever Picacho's window comes to the front.
+- Windows builds include OpenSSL, and the Android build script finds
+  Android Studio's SDK and NDK by itself.
+- Invitations in mail show what, when, where and who above the message,
+  with Accept, Maybe and Decline; the organizer is told (iMIP), from the
+  address that was invited.
+- Settings → Calendar: calendars on a CalDAV server (Fastmail, iCloud,
+  Nextcloud, Radicale…). Accepted invitations go in, declined and cancelled
+  ones come out, and events can be added, edited and deleted.
+- Settings → Contacts: contacts can be added, edited and deleted, on the
+  CardDAV server when there is one; what other apps keep on a card stays.
+- OpenPGP keys are found automatically: on the address's domain (WKD), on
+  keys.openpgp.org, and in Autocrypt headers; signed mail sends yours the
+  same way. Settings → Encryption → Find Key looks one up.
+- Encrypt the subject too: with OpenPGP, the composer can hide the subject
+  inside the encryption (others see "...").
+- Drafts to be sent encrypted sync with the server's Drafts, sealed to your
+  own OpenPGP key, instead of staying on one device.
+- S/MIME: import your certificate (.p12/.pfx), read and check S/MIME mail,
+  keep senders' certificates, and sign and encrypt with S/MIME instead of
+  OpenPGP.
+- Accessibility: menus are menus to screen readers and take the keyboard
+  when they open; contacts, events, invitations, keys and certificates are
+  named. Settings → General → Reduce motion follows the system's setting
+  (or yours): nothing slides or fades, and spinners stand still.
+- Settings → Encryption: OpenPGP for every account. Import your key and
+  others' public keys (armored `.asc` files from GnuPG, Thunderbird,
+  Proton…); they're kept in the system keychain. Mail encrypted to you
+  (PGP/MIME) opens when read and stays encrypted on disk; signatures are
+  checked, and the message's details say who signed it, or that it was
+  changed. The composer's Sign and Encrypt buttons sign with your key and
+  encrypt to each recipient's and yours. Drafts to be sent encrypted aren't
+  uploaded to the server.
+- Settings → Contacts: address books read from a CardDAV server (Fastmail,
+  iCloud, Nextcloud, Radicale…), and vCard files imported and exported.
+  The composer suggests these people first, then people from your mail.
+- A mailbox's menu has Export as Mbox… (all its messages in one mbox file,
+  for other mail apps or a backup) and Import Messages… (`.mbox` files and
+  `.eml` messages, added to it on the server).
+- Screen readers: buttons, links, switches, choices, settings pages,
+  folders (with unread counts) and messages (unread, sender, subject, date,
+  preview) say what they are and whether they're on or selected, and the
+  sidebar, message list, reader and composer are named regions. Tab and
+  Shift-Tab move between controls, with a visible focus ring.
 - The Summary's Receipts page shows what each receipt lists, under
   Details: its items, subtotal, shipping, fees, tip, taxes and discounts,
   and its total. They're read from the email's text or the sender's
@@ -88,6 +156,11 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Sign-in in the browser no longer fails when a stray connection reaches
+  Picacho's sign-in page before the browser does.
+- A message encrypted with OpenPGP in an account other than Pinal Mail no
+  longer asks to unlock Pinal Mail: it opens with your own key (Settings →
+  Encryption), or says it is encrypted.
 - Proton (Direct): a refused sign-in no longer says Proton ended the
   session; it says which step was refused and what Proton answered.
 - JMAP: Require encryption in transit was ignored; messages now go only

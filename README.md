@@ -103,13 +103,18 @@ debug key unless `PICACHO_KEYSTORE` and its passwords are set (see the
 script). `PICACHO_ABIS=arm64-v8a` builds one ABI. Credentials are kept in
 the app's SharedPreferences, encrypted with an Android Keystore key. The
 launcher icon's layers are `android/icon/*.svg`
-(`sh scripts/android-icons.sh` renders them). Not yet on Android:
+(`sh scripts/android-icons.sh` renders them).
 
-- System notifications.
-- Attachments from the file picker (gpui-mobile's Java helper classes are
-  not in the APK).
-- Proton: security keys and phone passkeys (sign-in uses the authenticator
-  app's code instead), and human verification (CAPTCHA).
+The Android app has what the desktop has, including:
+
+- New-mail notifications, and checking for mail after Picacho is closed: a
+  foreground service (`MailService`, with an ongoing notification) keeps
+  checking, and starts again at boot. Settings → General turns it off.
+- Attachments and account pictures from the system file picker
+  (`GpuiPathPicker`).
+- Proton: second factors with a security key (USB or NFC) or a passkey
+  (Android 14 and later, through Credential Manager), and Proton's human
+  verification (CAPTCHA) in a WebView (`VerifyActivity`).
 
 ### iOS (experimental)
 
@@ -164,6 +169,85 @@ Without a Fastmail client, Fastmail asks for an API token. Other JMAP servers si
 Proton Mail without Bridge (Direct) identifies the app to Proton's API as `<platform>-<token>@<version>` (`x-pm-appversion`), from `PICACHO_PROTON_APP_TOKEN` and `PICACHO_PROTON_APP_VERSION`. Direct is offered only when at least one of them is set; the other then defaults to `picacho` or Picacho's own version. `<platform>` is the system Picacho was built for (`linux`, `macos` or `windows`); `PICACHO_PROTON_APP_PLATFORM_OVERRIDE` names another, such as `linux` on a Windows build. It doesn't make Direct available by itself. Without either of the first two, Proton Mail connects through Proton Mail Bridge alone. Unlike the variables above, these are only read at build time.
 
 A Proton Direct account can also receive Proton's push notifications as Proton's Android app does (its **Push notifications** setting). Picacho keeps one connection open to Firebase Cloud Messaging, and Proton sends each notification down it, encrypted to a device key only this installation holds; nothing is polled. One registration serves every such account: its token, the device key and the pushes already shown are kept in the system keychain, so restarting Picacho (or Android's mail service) reuses them. The Firebase project comes from `PICACHO_PROTON_FCM_API_KEY`, `PICACHO_PROTON_FCM_APP_ID` and `PICACHO_PROTON_FCM_PROJECT_ID` (all three needed for the setting to be offered), and for projects restricted to an Android app, `PICACHO_PROTON_FCM_PACKAGE` and `PICACHO_PROTON_FCM_CERT_SHA1` (the signing certificate's SHA-1, with or without colons); `PICACHO_PROTON_FCM_SENDER_ID` defaults to the project number in the app id, and `PICACHO_PROTON_FCM_VAPID_KEY` is optional. These are read at build time, and the same variables at run time override them. Registering the device with Proton (`POST /core/v4/devices`) can identify the app differently from every other request: `PICACHO_PROTON_PUSH_APP_TOKEN`, `PICACHO_PROTON_PUSH_APP_VERSION` and `PICACHO_PROTON_PUSH_APP_PLATFORM` (read at build time) replace the token, version and platform for that request alone, each one unset being the general one. Proton registers devices only for sessions that identify as its Android app (`PICACHO_PROTON_APP_PLATFORM_OVERRIDE=android`, `PICACHO_PROTON_APP_TOKEN=mail`). Failures (a registration Proton refused, a push that couldn't be opened) are logged to standard error, or Android's log; what a push says never is.
+
+## Features
+
+Beyond reading, writing and organizing mail, Picacho has:
+
+- **Mail that keeps going while it's closed.** Once the last window closes,
+  Picacho can keep running in the background (Settings → General, on by
+  default) as a small process with a tray icon. It checks for new mail,
+  sends Send Later messages at their time and brings snoozed mail back.
+  Where the server can hold a message (SMTP FUTURERELEASE, JMAP HOLDUNTIL),
+  Settings → account → Sending → **Let the server send scheduled messages**
+  sends it even when the computer is off.
+- **Inline images.** Pictures the HTML shows from the message itself
+  (`cid:` parts, such as logos and signatures) are displayed, even with
+  remote content blocked.
+- **Calendar invitations** (Settings → Calendar). An invitation in mail
+  (iCalendar, from Google, Outlook, Apple and others) shows what, when, where
+  and who above the message, with **Accept**, **Maybe** and **Decline**.
+  The answer goes to the organizer as a standard iMIP reply, from the
+  address that was invited. Cancellations and published events show too.
+- **Calendars over CalDAV** (Settings → Calendar). Connect Fastmail, iCloud,
+  Nextcloud, Radicale or another CalDAV server. Accepted invitations go in
+  your calendar, and declined ones come out. Settings → Calendar lists
+  what's coming up, each repeat of a repeating event included, and adds,
+  edits and deletes events, one repeat or all of them. With Local AI's
+  Understand dates, you can write times as "tomorrow at 10" or "every
+  monday at 9", in the event's own time zone (Picacho says what time that
+  is for you). Guests you add get an invitation from your account, and a
+  cancellation if the event is deleted. Their answers, and times they
+  propose instead, show on their mail: move the event or keep the time.
+  As a guest, you can propose another time too, and an invitation that
+  changed after you answered offers to update your calendar. Repeating
+  rules from other apps, such as "the last weekday of the month", show
+  every time they happen. Changes go to the server, and are refused when
+  the event was changed elsewhere meanwhile.
+- **Encrypted mail with OpenPGP or S/MIME** (Settings → Encryption).
+  - *OpenPGP:* import your key and others' keys (`.asc`). Picacho also finds
+    people's keys by itself: on their domain (WKD), on keys.openpgp.org, and
+    in the Autocrypt headers their mail apps send. A key you imported never
+    gets replaced. Your signed mail carries your key the same way.
+  - *S/MIME:* import your certificate (`.p12`/`.pfx`). Others'
+    certificates are kept from the signed mail they send you, or imported
+    (`.pem`, `.crt`, `.cer`). Signatures are checked against your system's
+    trusted authorities.
+  - Mail encrypted to you opens when read and stays encrypted on disk. The
+    message details say who signed it, or that it was changed.
+  - The composer's **Sign** and **Encrypt** buttons sign with your key and
+    encrypt to each recipient and yourself. Picacho looks up missing keys
+    before sending, and says when one it found hasn't been checked. To
+    check one, **Check…** shows its fingerprint and QR code; paste the
+    fingerprint its owner gave you and Picacho compares them. **Encrypt the
+    subject too** hides the subject and the thread it's part of outside
+    the encryption (others see "..."). Encrypted drafts, OpenPGP or
+    S/MIME, sync with the server's Drafts sealed to your own key or
+    certificate, so other devices with it can open them.
+  - Pinal Mail's zero-access encryption works without any of this.
+- **Contacts** (Settings → Contacts). Picacho reads your address books from
+  a CardDAV server (Fastmail, iCloud, Nextcloud, Radicale and others; RFC
+  6352), and adds, edits and deletes contacts there. It keeps what other
+  apps store on a card, such as photos and birthdays, as it was. Without a
+  server, contacts stay on this computer. vCard files (`.vcf`) can be
+  imported and exported. The composer suggests these people first, then
+  people from your mail.
+- **Export and import.** A mailbox's menu (right-click it in the sidebar)
+  has **Export as Mbox…**, which saves its messages as one mboxrd file for
+  Thunderbird, Apple Mail, mutt or a backup. **Import Messages…** adds
+  `.mbox` files and single `.eml` messages to it on the server (IMAP
+  APPEND, JMAP Email/import, Proton's import), or on this computer for POP3.
+- **Screen readers, the keyboard, and reduced motion.** Buttons, links,
+  switches, segmented choices, menus, settings pages, folders, messages,
+  contacts and events tell assistive technology what they are, what they're
+  called, and whether they're on or selected. This works with VoiceOver,
+  Narrator and Orca, through AccessKit. Each message row reads as "Unread,
+  sender, subject, date, preview". Tab and Shift-Tab move between controls
+  with a visible focus ring, and Return or Space presses them. A menu takes
+  the keyboard when it opens. Settings → General → **Reduce motion**
+  follows the system's setting (desktops and phones, checked again
+  whenever the window comes to the front), or your own: panes, menus and messages then
+  appear without moving, and spinners stand still.
 
 ## Connect email
 
