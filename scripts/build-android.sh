@@ -12,6 +12,22 @@
 set -eu
 cd "$(dirname "$0")/.."
 abis="${PICACHO_ABIS:-arm64-v8a,x86_64}"
+# Where Android Studio puts the SDK and NDK, when they aren't set.
+if [ -z "${ANDROID_HOME:-}" ]; then
+    for sdk in "$HOME/Android/Sdk" "$HOME/Library/Android/sdk"; do
+        if [ -d "$sdk" ]; then
+            export ANDROID_HOME="$sdk"
+            break
+        fi
+    done
+fi
+if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
+    # The newest NDK installed.
+    ndk=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -n 1)
+    if [ -n "$ndk" ]; then
+        export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ndk"
+    fi
+fi
 if [ -f .env ]; then
     set -a
     . ./.env
