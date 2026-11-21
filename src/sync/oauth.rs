@@ -418,8 +418,12 @@ impl Browser {
             };
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    // A browser that hung up at once: wait for the next one.
+                    if stream.set_nonblocking(false).is_err()
+                        || stream.set_read_timeout(Some(Duration::from_secs(2))).is_err()
+                    {
+                        continue;
+                    }
                     let mut request = [0u8; 8192];
                     let n = stream.read(&mut request).unwrap_or(0);
                     let request = String::from_utf8_lossy(&request[..n]);
@@ -428,7 +432,9 @@ impl Browser {
                         .next()
                         .and_then(|s| s.split_whitespace().nth(1))
                         .unwrap_or("/");
-                    let callback = url::Url::parse(&format!("http://localhost{target}"))?;
+                    let Ok(callback) = url::Url::parse(&format!("http://localhost{target}")) else {
+                        continue;
+                    };
                     let answer = self.answer(&callback);
                     let (kind, body) = callback_page(matches!(answer, Some(Ok(_))));
                     let response = format!(
@@ -442,6 +448,19 @@ impl Browser {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(100))
+                }
+                // A connection that went away before it was taken, or a
+                // signal: neither ends the sign-in (both happen on busy
+                // systems, and to tests run side by side).
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20))
                 }
                 Err(e) => return Err(e.into()),
             }
