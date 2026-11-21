@@ -245,7 +245,8 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
 }
 /// What happened to a message the server accepted.
 pub(crate) struct Delivered {
-    pub(crate) message: Message,
+    /// The message as sent: signed or encrypted with OpenPGP if asked.
+    pub(crate) raw: Vec<u8>,
     /// Delivery receipts were asked for, but this server can't send them.
     pub(crate) receipts_unsupported: bool,
 }
@@ -653,9 +654,10 @@ pub(crate) fn deliver(
     secret: &str,
     tls: &native_tls::TlsConnector,
     hold_until: Option<i64>,
+    keys: &Keys,
 ) -> Result<Delivered> {
     let message = build(a, d, false)?;
-    let bytes = message.formatted();
+    let bytes = protected(&message, d, keys)?;
     let failed =
         "SMTP delivery failed. Your draft has been kept; check the server and account settings.";
     let (mut session, limits) = open(endpoint, secret, tls).context(failed)?;
@@ -777,9 +779,59 @@ pub(crate) fn deliver(
     // Accepted; a failed goodbye doesn't matter.
     let _ = session.command("QUIT");
     Ok(Delivered {
-        message,
+        raw: bytes,
         receipts_unsupported: a.delivery_receipts && !limits.dsn,
     })
+}
+/// The message's bytes as they go: signed and encrypted with OpenPGP where
+/// the draft asks. Bcc recipients are among those encrypted to; the
+/// envelope's recipients are exactly who receives it.
+/// Your OpenPGP keys and S/MIME certificates, for signing and encrypting.
+pub(crate) struct Keys<'a> {
+    pub ring: &'a crate::manage::openpgp::Keyring,
+    pub certs: &'a crate::manage::smime::Certificates,
+}
+
+pub(crate) fn protected(message: &Message, d: &Draft, keys: &Keys) -> Result<Vec<u8>> {
+    let ring = keys.ring;
+    let mut raw = message.formatted();
+    // With only an S/MIME certificate, S/MIME is how it's protected.
+    let smime = d.smime || (ring.secret.is_empty() && (d.sign || d.encrypt));
+    if smime && (d.sign || d.encrypt) {
+        let envelope = message.envelope();
+        let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
+        let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
+        return crate::manage::smime::protect_with(keys.certs, &raw, &from, &to, d.sign, d.encrypt);
+    }
+    // Signed mail tells recipients' apps the sender's key (Autocrypt).
+    if d.sign {
+        let envelope = message.envelope();
+        let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
+        if let Some(public) = ring.own_public_bytes(&from) {
+            let header = format!(
+                "Autocrypt: {}\r\n",
+                crate::sync::keys::autocrypt_header(&from, &public)
+            );
+            raw = [header.as_bytes(), &raw].concat();
+        }
+    }
+    if !d.sign && !d.encrypt {
+        return Ok(raw);
+    }
+    let envelope = message.envelope();
+    let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
+    let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
+    crate::manage::openpgp::protect(
+        &raw,
+        &from,
+        &to,
+        crate::manage::openpgp::Protect {
+            sign: d.sign,
+            encrypt: d.encrypt,
+            subject: d.encrypt_subject,
+        },
+        ring,
+    )
 }
 /// Sends a message made elsewhere (a read receipt) from `from` to `to`,
 /// as it is. No delivery receipts are asked for.

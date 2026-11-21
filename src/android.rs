@@ -274,6 +274,20 @@ pub fn clipboard_from_system(cx: &mut gpui::App) {
     }
 }
 
+/// Whether the system asks apps to reduce motion (Remove animations).
+pub fn reduce_motion() -> bool {
+    call_java("Clipboard.reduceMotion", |env, java| {
+        env.call_static_method(
+            &java.clipboard,
+            jni_str!("reduceMotion"),
+            jni_sig!("(Landroid/content/Context;)Z"),
+            &[JValue::Object(java.context.as_obj())],
+        )?
+        .z()
+    })
+    .unwrap_or(false)
+}
+
 /// The system clipboard's HTML, for pasting with formatting.
 pub fn clipboard_html() -> Option<String> {
     let mut html = None;

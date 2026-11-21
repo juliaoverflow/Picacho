@@ -1,7 +1,12 @@
 //! Sync: provider discovery, authentication, and incoming/outgoing protocols.
 //! Protocol helpers never depend on Display and never mutate the message database.
 pub mod auth;
+pub mod caldav;
+pub mod carddav;
+pub mod dav;
 pub mod discover;
+pub mod ical;
+pub mod keys;
 pub(crate) mod fido;
 pub mod forwarding;
 mod imap;

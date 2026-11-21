@@ -410,7 +410,7 @@ impl MailApp {
 }
 
 /// A QR code, black on white, `size` wide.
-fn qr_code(text: &str, size: f32) -> AnyElement {
+pub(super) fn qr_code(text: &str, size: f32) -> AnyElement {
     let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
         return div()
             .child("The QR code couldn't be made.")

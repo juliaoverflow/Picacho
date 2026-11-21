@@ -37,6 +37,12 @@ fontique = { version = "0.12", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 bytemuck = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# Time zones named in calendar invitations (sync/ical.rs).
+chrono-tz = "0.10"
+# This computer's time zone by name, on every system (new events keep it).
+iana-time-zone = "0.1"
+# Repeating events, the whole of RFC 5545's RRULE (sync/ical.rs).
+rrule = "0.14"
 cursor-icon = "1"
 directories = "6"
 # IMAP COMPRESS=DEFLATE (RFC 4978): raw deflate over the TLS stream.
@@ -84,6 +90,9 @@ native-tls = "0.2"
 notify-rust = "4"
 open = "5"
 pgp = "0.21"
+# S/MIME (manage/smime.rs): PKCS#7 and PKCS#12, from the OpenSSL already
+# linked for native-tls and Proton's push encryption.
+openssl = "0.10"
 # Proton Mail without Bridge: Proton's API (SRP sign-in, keys, sync, send),
 # used directly by sync/proton.rs. Its IMAP/SMTP listeners are not started.
 protected_email_bridge = { git = "https://github.com/pinaltech/Protected-Email-Bridge" }
@@ -91,6 +100,10 @@ webauthn-rs-proto = "=0.6.2"
 # The QR code a phone scans to sign in with its passkey.
 qrcode = { version = "0.14", default-features = false }
 rand = "0.10"
+# The rand pgp takes, for signing and encrypting outgoing mail (manage/openpgp.rs).
+rand08 = { package = "rand", version = "0.8" }
+# CardDAV answers (WebDAV XML), for the address book.
+roxmltree = "0.21"
 # Finds candidate sign-in codes for the local model (Local AI).
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
@@ -112,7 +125,6 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [dev-dependencies]
-rand08 = { package = "rand", version = "0.8" }
 gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
 
 [features]
@@ -292,6 +304,9 @@ objc2-core-ml = { version = "0.3", default-features = false, features = ["std", 
 [target.'cfg(windows)'.dependencies]
 # Windows Hello: the system's own passkeys and security keys.
 webauthn-authenticator-rs = { version = "0.6.2", features = ["win10"] }
+# Windows has no system OpenSSL (S/MIME and Proton's push encryption use
+# it): build it into the app, as on Android.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The tray (menu bar) icon while Picacho runs in the background (display/tray.rs).

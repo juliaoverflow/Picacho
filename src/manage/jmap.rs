@@ -445,7 +445,7 @@ impl Backend {
         self.open_jmap(a, secret)?.reload_mailboxes()?;
         Ok(())
     }
-    fn jmap_places(&self, a: &Account, s: &Session, reload: bool) -> Result<Vec<Place>> {
+    pub(super) fn jmap_places(&self, a: &Account, s: &Session, reload: bool) -> Result<Vec<Place>> {
         let mailboxes = if reload {
             s.reload_mailboxes()?
         } else {
@@ -1108,7 +1108,10 @@ impl Backend {
                 if d.remote.is_some() && d.uploaded == fingerprint {
                     continue;
                 }
-                let raw = crate::sync::smtp::build(a, d, true)?.formatted();
+                // Mail to be encrypted goes up encrypted, or not at all.
+                let Some(raw) = self.draft_upload(a, d)? else {
+                    continue;
+                };
                 let id = s.import(&raw, &[&drafts], &["$draft", "$seen"])?;
                 if let Some(old) = d.remote.as_ref().and_then(jmap_draft)
                     && old != id

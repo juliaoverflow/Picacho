@@ -1264,6 +1264,18 @@ pub struct Draft {
     /// It forwards `original`, rather than replying to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarding: bool,
+    /// Sign it with your OpenPGP key (PGP/MIME).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign: bool,
+    /// Encrypt it to every recipient's OpenPGP key (PGP/MIME).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encrypt: bool,
+    /// When encrypting, hide the subject too (protected headers).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encrypt_subject: bool,
+    /// Sign and encrypt it with S/MIME instead of OpenPGP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub smime: bool,
 }
 /// Where a draft is in the server's Drafts folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1305,6 +1317,16 @@ impl Draft {
         if !self.identity.is_empty() {
             h.update(b"identity\0");
             h.update(self.identity.as_bytes());
+        }
+        // Added later, likewise: how it is protected changes what's uploaded.
+        if self.encrypt || self.sign || self.smime || self.encrypt_subject {
+            h.update(b"protect\0");
+            h.update([
+                u8::from(self.sign),
+                u8::from(self.encrypt),
+                u8::from(self.smime),
+                u8::from(self.encrypt_subject),
+            ]);
         }
         for path in &self.attachments {
             h.update(path.to_string_lossy().as_bytes());

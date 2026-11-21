@@ -33,6 +33,12 @@ pub use remote_search::ServerResults;
 mod large;
 #[path = "extras.rs"]
 mod extras;
+#[path = "archive.rs"]
+pub mod archive;
+#[path = "contacts.rs"]
+pub mod contacts;
+#[path = "calendar.rs"]
+pub mod calendar;
 #[path = "proton.rs"]
 mod proton;
 #[path = "proton_push.rs"]
@@ -228,6 +234,15 @@ pub struct Backend {
     /// Decrypted Pinal messages by id. Memory only: the cache on disk keeps
     /// them encrypted, so reloads from it get their bodies back from here.
     readable: Mutex<HashMap<String, Mail>>,
+    /// Your OpenPGP keyring (`openpgp.rs`), read from the keychain once.
+    keyring: Mutex<Option<Arc<crate::manage::openpgp::Keyring>>>,
+    /// What OpenPGP found in messages read with it, by id: decrypted, and
+    /// whose signature. Memory only.
+    verdicts: Mutex<HashMap<String, crate::manage::openpgp::Verdict>>,
+    /// Your S/MIME certificates (`smime.rs`), read from the keychain once.
+    certificates: Mutex<Option<Arc<crate::manage::smime::Certificates>>>,
+    /// What S/MIME found in messages read with it, by id. Memory only.
+    smime_verdicts: Mutex<HashMap<String, crate::manage::smime::Verdict>>,
     /// Signed-in IMAP connections by account; see `connection.rs`.
     connections: Mutex<HashMap<String, Connection>>,
     limits: Mutex<Limits>,
@@ -305,6 +320,10 @@ impl Backend {
             credentials: Mutex::new(HashMap::new()),
             mail_keys: Mutex::new(HashMap::new()),
             readable: Mutex::new(HashMap::new()),
+            keyring: Mutex::new(None),
+            verdicts: Mutex::new(HashMap::new()),
+            certificates: Mutex::new(None),
+            smime_verdicts: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
             layouts: Mutex::new(HashMap::new()),
@@ -365,6 +384,10 @@ impl Backend {
                 .build()?);
         }
         Ok(native_tls::TlsConnector::new()?)
+    }
+    /// The TLS settings network lookups outside an account use.
+    pub fn tls_connector_pub(&self) -> Result<native_tls::TlsConnector> {
+        self.tls_connector()
     }
     fn imap_login(&self, a: &Account, s: &Secret) -> Result<ImapSession> {
         imap_login(a, s, &self.tls_connector()?)
@@ -943,14 +966,178 @@ impl Backend {
             Ok((crate::manage::crypto::Protection::Pinal, _))
         )
     }
+    /// Your OpenPGP keyring, read from the keychain the first time.
+    pub fn keyring(&self) -> Arc<crate::manage::openpgp::Keyring> {
+        let mut kept = self.keyring.lock().unwrap();
+        if let Some(ring) = &*kept {
+            return ring.clone();
+        }
+        #[cfg(test)]
+        let ring = crate::manage::openpgp::Keyring::default();
+        #[cfg(not(test))]
+        let ring = crate::manage::openpgp::Keyring::load().unwrap_or_default();
+        let ring = Arc::new(ring);
+        *kept = Some(ring.clone());
+        ring
+    }
+    /// Replaces the keyring, in the keychain and here. Messages read with
+    /// the old one are read again with this one when next opened.
+    pub fn set_keyring(&self, ring: crate::manage::openpgp::Keyring) -> Result<()> {
+        #[cfg(not(test))]
+        ring.save()?;
+        *self.keyring.lock().unwrap() = Some(Arc::new(ring));
+        self.verdicts.lock().unwrap().clear();
+        Ok(())
+    }
+    /// Looks up keys for those of `emails` that have none here (WKD, then
+    /// keys.openpgp.org), keeping those found. Returns the addresses a
+    /// key was found for. Lookups that fail are skipped.
+    pub fn find_keys(&self, emails: &[String]) -> Vec<String> {
+        let ring = self.keyring();
+        let missing: Vec<&String> = emails.iter().filter(|e| ring.key_for(e).is_none()).collect();
+        if missing.is_empty() || cfg!(test) {
+            return Vec::new();
+        }
+        let mut next = crate::manage::openpgp::Keyring::clone(&ring);
+        let mut found = Vec::new();
+        for email in missing {
+            let Ok(tls) = self.tls_connector() else { break };
+            if let Ok(Some((data, _))) = crate::sync::keys::lookup(email, tls)
+                && next.add_found(email, &data).unwrap_or(false)
+            {
+                found.push(email.clone());
+            }
+        }
+        if !found.is_empty() {
+            let _ = self.set_keyring(next);
+        }
+        found
+    }
+    /// Keeps the key an Autocrypt header in a received message gives for
+    /// its sender, if no key for them was imported by hand.
+    fn learn_autocrypt(&self, raw: &[u8]) {
+        let Some((email, key)) = crate::sync::keys::autocrypt(raw) else {
+            return;
+        };
+        let ring = self.keyring();
+        if ring.key_for(&email).is_some_and(|k| {
+            use pgp::ser::Serialize as _;
+            k.to_bytes().is_ok_and(|b| b == key)
+        }) {
+            return;
+        }
+        let mut next = crate::manage::openpgp::Keyring::clone(&ring);
+        if next.add_found(&email, &key).unwrap_or(false) {
+            let _ = self.set_keyring(next);
+        }
+    }
+    /// What OpenPGP found when the message was last read, if it had any.
+    pub fn verdict(&self, id: &str) -> Option<crate::manage::openpgp::Verdict> {
+        self.verdicts.lock().unwrap().get(id).cloned()
+    }
+    /// Your S/MIME certificates, read from the keychain the first time.
+    pub fn certificates(&self) -> Arc<crate::manage::smime::Certificates> {
+        let mut kept = self.certificates.lock().unwrap();
+        if let Some(c) = &*kept {
+            return c.clone();
+        }
+        #[cfg(test)]
+        let certs = crate::manage::smime::Certificates::default();
+        #[cfg(not(test))]
+        let certs = crate::manage::smime::Certificates::load().unwrap_or_default();
+        let certs = Arc::new(certs);
+        *kept = Some(certs.clone());
+        certs
+    }
+    pub fn set_certificates(&self, certs: crate::manage::smime::Certificates) -> Result<()> {
+        #[cfg(not(test))]
+        certs.save()?;
+        *self.certificates.lock().unwrap() = Some(Arc::new(certs));
+        self.smime_verdicts.lock().unwrap().clear();
+        Ok(())
+    }
+    /// What S/MIME found when the message was last read, if it had any.
+    pub fn smime_verdict(&self, id: &str) -> Option<crate::manage::smime::Verdict> {
+        self.smime_verdicts.lock().unwrap().get(id).cloned()
+    }
+    /// Opens an S/MIME message with your certificates, keeping the
+    /// signer's certificate for writing back encrypted.
+    fn open_smime(
+        &self,
+        id: Option<&str>,
+        raw: &[u8],
+    ) -> Option<(crate::manage::crypto::Protection, Vec<u8>)> {
+        let certs = self.certificates();
+        let (readable, verdict, signer) = crate::manage::smime::open(raw, &certs)?;
+        if let Some(signer) = &signer {
+            let mut next = crate::manage::smime::Certificates::clone(&certs);
+            if crate::manage::smime::learn(&mut next, signer, &verdict.signature).unwrap_or(false) {
+                let _ = self.set_certificates(next);
+            }
+        }
+        let protection = if verdict.decrypted {
+            crate::manage::crypto::Protection::Pinal
+        } else {
+            crate::manage::crypto::Protection::None
+        };
+        if let Some(id) = id {
+            self.smime_verdicts.lock().unwrap().insert(id.to_owned(), verdict);
+        }
+        Some((protection, readable))
+    }
+    /// Opens a message with your own OpenPGP keys, where it has OpenPGP
+    /// protection. Decrypted ones are kept from the disk cache as Pinal's are.
+    fn open_openpgp(
+        &self,
+        id: Option<&str>,
+        raw: &[u8],
+    ) -> Option<(crate::manage::crypto::Protection, Vec<u8>)> {
+        let ring = self.keyring();
+        if ring.secret.is_empty() && ring.public.is_empty() {
+            return None;
+        }
+        let (readable, verdict) = crate::manage::openpgp::open(raw, &ring)?;
+        let protection = if verdict.decrypted {
+            crate::manage::crypto::Protection::Pinal
+        } else {
+            crate::manage::crypto::Protection::None
+        };
+        if let Some(id) = id {
+            self.verdicts.lock().unwrap().insert(id.to_owned(), verdict);
+        }
+        Some((protection, readable))
+    }
     /// The readable message: decrypted here when Pinal stored it encrypted.
     fn plaintext(
         &self,
         a: &Account,
         raw: &[u8],
     ) -> Result<(crate::manage::crypto::Protection, Vec<u8>)> {
+        self.plaintext_of(a, None, raw)
+    }
+    /// `plaintext`, noting what OpenPGP found for message `id`.
+    fn plaintext_of(
+        &self,
+        a: &Account,
+        id: Option<&str>,
+        raw: &[u8],
+    ) -> Result<(crate::manage::crypto::Protection, Vec<u8>)> {
         if crate::manage::crypto::encrypted_part(raw).is_none() {
+            // Signed mail is shown with its signature checked.
+            if let Some(opened) = self.open_openpgp(id, raw) {
+                return Ok(opened);
+            }
+            if let Some(opened) = self.open_smime(id, raw) {
+                return Ok(opened);
+            }
             return crate::manage::crypto::open_message(raw, &[]);
+        }
+        // Not a Pinal account's: your own keys may open it.
+        if a.service != Service::Pinal {
+            if let Some(opened) = self.open_openpgp(id, raw) {
+                return Ok(opened);
+            }
+            return Ok((crate::manage::crypto::Protection::Foreign, raw.to_vec()));
         }
         let Some(keys) = self.keys(a)? else {
             // Accounts added before encryption existed have no key bundle.
@@ -2317,7 +2504,8 @@ impl Backend {
     /// keeps. Zero-access mail keeps only what the server could already
     /// see; its body stays in memory and is decrypted again later.
     fn parse_read(&self, a: &Account, m: &Mail, raw: &[u8]) -> Result<(Mail, Mail)> {
-        let (protection, plain) = self.plaintext(a, raw)?;
+        self.learn_autocrypt(raw);
+        let (protection, plain) = self.plaintext_of(a, Some(&m.id), raw)?;
         let mut next = parse_message(&plain, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         next.unread = m.unread;
         next.starred = m.starred;
@@ -3234,6 +3422,21 @@ impl Backend {
         crate::manage::forwarding::verify_alias(&self.store, d)?;
         let routed = crate::manage::forwarding::route(&self.store, d)?;
         let d = &routed;
+        // Encrypting: look up keys not yet known for its recipients first,
+        // and note those whose key nobody checked.
+        let mut unchecked = Vec::new();
+        if d.encrypt && !d.smime {
+            let mut to = Vec::new();
+            for list in [&d.to, &d.cc, &d.bcc] {
+                to.extend(
+                    crate::sync::smtp::recipients(list)?
+                        .into_iter()
+                        .map(|(_, email)| email),
+                );
+            }
+            self.find_keys(&to);
+            unchecked = self.keyring().unverified(&to);
+        }
         // Requiring encryption all the way: say which recipients' domains
         // publish nothing (MTA-STS or DANE) a server could insist on it by,
         // since mail to them will bounce. Looked up before the account is
@@ -3271,6 +3474,12 @@ impl Backend {
             // signs, and files the message in Sent itself. A JMAP server
             // submits it and files it in Sent.
             let message = crate::sync::smtp::build(a, d, false)?;
+            let (ring, certs) = (self.keyring(), self.certificates());
+            let raw = crate::sync::smtp::protected(
+                &message,
+                d,
+                &crate::sync::smtp::Keys { ring: &ring, certs: &certs },
+            )?;
             let envelope = message.envelope();
             let from = envelope
                 .from()
@@ -3292,22 +3501,33 @@ impl Backend {
                         return Err(crate::sync::smtp::NoServerHold.into());
                     }
                 }
-                self.send_jmap(a, &from, &to, &message.formatted(), &options)?
+                self.send_jmap(a, &from, &to, &raw, &options)?
                     .receipts
             } else {
-                self.send_proton(a, &from, &to, &message.formatted())?;
+                self.send_proton(a, &from, &to, &raw)?;
                 false
             };
             crate::sync::smtp::Delivered {
-                message,
+                raw,
                 receipts_unsupported: a.delivery_receipts && !receipts,
             }
         } else {
             let tls = self.tls_connector()?;
-            crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls, hold_until)?
+            let (ring, certs) = (self.keyring(), self.certificates());
+            let keys = crate::sync::smtp::Keys { ring: &ring, certs: &certs };
+            crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls, hold_until, &keys)?
         };
-        let message = delivered.message;
+        let sent_raw = delivered.raw;
         let mut notes = Vec::new();
+        if !unchecked.is_empty() {
+            notes.push(format!(
+                "It was encrypted to {} found automatically for {}. Compare {} fingerprint with {} in Settings → Encryption.",
+                if unchecked.len() == 1 { "a key" } else { "keys" },
+                unchecked.join(", "),
+                if unchecked.len() == 1 { "its" } else { "each" },
+                if unchecked.len() == 1 { "its owner" } else { "their owners" },
+            ));
+        }
         if !unprotected.is_empty() {
             notes.push(format!(
                 "It may bounce at {}: encryption all the way was required, and {} no MTA-STS policy or DANE records for servers to insist on it by.",
@@ -3334,7 +3554,7 @@ impl Backend {
             || proton_copy
             || jmap_copy
         {
-            let raw = message.formatted();
+            let raw = sent_raw.clone();
             let saved = if proton_copy {
                 self.file_sent_copy_proton(a, &raw)
             } else if jmap_copy {
@@ -3359,7 +3579,7 @@ impl Backend {
         // SMTP acceptance is the delivery boundary. Do not report a send failure
         // after this point, which could encourage a duplicate transmission.
         if a.provider == Provider::Pop3 {
-            let raw = message.formatted();
+            let raw = sent_raw;
             let id = format!("{}:sent:{}", a.id, d.id);
             if let Ok(mut sent) = parse_message(&raw, a, &id, Folder::Sent, "Sent", 0) {
                 sent.unread = false;
@@ -3499,6 +3719,40 @@ impl Backend {
         }
         self.store.delete_draft(id)
     }
+    /// The copy of a draft kept in the server's Drafts folder. A draft to
+    /// be encrypted with OpenPGP is encrypted to your own key first, so the
+    /// server never has it readable; other devices with your key open it.
+    /// One to be encrypted with S/MIME, or without a key of yours to seal
+    /// it with, isn't uploaded (`None`): it stays on this device.
+    pub(super) fn draft_upload(&self, a: &Account, d: &Draft) -> Result<Option<Vec<u8>>> {
+        let raw = crate::sync::smtp::build(a, d, true)?.formatted();
+        if !d.encrypt {
+            return Ok(Some(raw));
+        }
+        let ring = self.keyring();
+        let me = crate::sync::smtp::build(a, d, true)?
+            .envelope()
+            .from()
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+        if d.smime || ring.secret.is_empty() {
+            // Sealed to your own certificate, as S/MIME drafts are.
+            let certs = self.certificates();
+            if !certs.has_own(&me) {
+                return Ok(None);
+            }
+            return Ok(Some(crate::manage::smime::protect_with(&certs, &raw, &me, &[], false, true)?));
+        }
+        if ring.own_key(&me).is_none() {
+            return Ok(None);
+        }
+        let how = crate::manage::openpgp::Protect {
+            sign: false,
+            encrypt: true,
+            subject: d.encrypt_subject,
+        };
+        Ok(Some(crate::manage::openpgp::protect(&raw, &me, &[], how, &ring)?))
+    }
     fn draft_removals(&self, account: &str) -> Vec<RemoteDraft> {
         self.store
             .preference(&format!("draft_removals:{account}"))
@@ -3630,7 +3884,10 @@ impl Backend {
                 if d.remote.is_some() && d.uploaded == fingerprint {
                     continue;
                 }
-                let raw = crate::sync::smtp::build(a, d, true)?.formatted();
+                // Mail to be encrypted goes up encrypted, or not at all.
+                let Some(raw) = self.draft_upload(a, d)? else {
+                    continue;
+                };
                 if limit.is_some_and(|l| raw.len() as u64 > l) {
                     // Too large for the server; it stays here.
                     continue;
@@ -3681,6 +3938,33 @@ impl Backend {
     }
     /// A draft from a message in the server's Drafts folder.
     fn draft_from(&self, a: &Account, id: &str, raw: &[u8]) -> Result<Draft> {
+        // A draft sealed with your OpenPGP key (`draft_upload`).
+        // Sealed with your S/MIME certificate.
+        if crate::manage::crypto::sender_encrypted(raw)
+            && crate::manage::crypto::encrypted_part(raw).is_none()
+        {
+            let (plain, verdict, _) = crate::manage::smime::open(raw, &self.certificates())
+                .context("A draft on the server is encrypted to a certificate this device doesn't have.")?;
+            ensure!(verdict.decrypted, "A draft on the server couldn't be decrypted.");
+            let mut d = self.draft_from(a, id, &plain)?;
+            d.encrypt = true;
+            d.smime = true;
+            return Ok(d);
+        }
+        let sealed = crate::manage::crypto::encrypted_part(raw).is_some();
+        if sealed {
+            let ring = self.keyring();
+            let (plain, verdict) = crate::manage::openpgp::open(raw, &ring)
+                .context("A draft on the server is encrypted to a key this device doesn't have.")?;
+            ensure!(verdict.decrypted, "A draft on the server couldn't be decrypted.");
+            let mut d = self.draft_from(a, id, &plain)?;
+            d.encrypt = true;
+            d.encrypt_subject = mailparse::parse_headers(raw).is_ok_and(|(h, _)| {
+                use mailparse::MailHeaderMap;
+                h.get_first_value("Subject").as_deref() == Some(crate::manage::openpgp::HIDDEN_SUBJECT)
+            });
+            return Ok(d);
+        }
         use mailparse::MailHeaderMap;
         let parsed = mailparse::parse_mail(raw)?;
         let header = |name: &str| parsed.headers.get_first_value(name).unwrap_or_default();

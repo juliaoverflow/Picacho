@@ -992,6 +992,11 @@ impl Backend {
                 if d.remote.is_some() && d.uploaded == fingerprint {
                     continue;
                 }
+                // Proton keeps drafts encrypted itself; drafts to be
+                // encrypted without a key of yours stay here.
+                if d.encrypt && self.draft_upload(a, d)?.is_none() {
+                    continue;
+                }
                 let raw = crate::sync::smtp::build(a, d, true)?.formatted();
                 let id = s.save_draft(&raw)?;
                 if let Some(old) = d.remote.as_ref().and_then(proton_draft) {

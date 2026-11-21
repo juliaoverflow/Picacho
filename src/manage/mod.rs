@@ -15,6 +15,8 @@ pub mod mail_kinds;
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub mod memory;
 pub mod model;
+pub mod openpgp;
+pub mod smime;
 /// Tracking numbers in mail, for the reader and each account's Summary.
 pub mod parcels;
 pub mod receipts;

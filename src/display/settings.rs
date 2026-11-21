@@ -30,6 +30,7 @@ impl MailApp {
         let phone = self.mobile.on;
         let track = div()
             .id(SharedString::from(format!("{id}-track")))
+            .role(Role::RadioGroup)
             .w_full()
             .min_w_0()
             .p(px(3.))
@@ -52,6 +53,14 @@ impl MailApp {
                         div()
                             .id(SharedString::from(selector.clone()))
                             .debug_selector(move || selector)
+                            .role(Role::RadioButton)
+                            .aria_label(label.clone())
+                            .aria_selected(active)
+                            .aria_toggled(if active { Toggled::True } else { Toggled::False })
+                            .aria_position_in_set(i + 1)
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
                             .flex_1()
                             .when(!phone, |d| d.min_w(px(76.)).h(px(28.)).text_size(px(12.)))
                             // Each choice keeps its whole label; they share
@@ -93,6 +102,11 @@ impl MailApp {
         let c = self.colors();
         div()
             .id(SharedString::from(id))
+            .role(Role::Switch)
+            .aria_toggled(if on { Toggled::True } else { Toggled::False })
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
             .w(px(38.))
             .h(px(22.))
             .flex_shrink_0()
@@ -178,6 +192,8 @@ impl MailApp {
             .child({
                 let selector = id.clone();
                 self.switch(id, on, action, cx)
+                    .aria_label(title.to_owned())
+                    .aria_description(caption.to_owned())
                     .debug_selector(move || selector)
             })
     }
@@ -264,6 +280,12 @@ impl MailApp {
         div()
             .id(SharedString::from(id))
             .debug_selector(move || selector)
+            .role(Role::Tab)
+            .aria_label(label.clone())
+            .aria_selected(active)
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
             .max_w(px(180.))
             .h(px(32.))
             .flex_shrink_0()
@@ -290,6 +312,8 @@ impl MailApp {
         let narrow = window::content_size(window).width < px(700.);
         let mut nav = div()
             .id("settings-nav")
+            .role(Role::TabList)
+            .aria_label("Settings")
             .debug_selector(|| "settings-nav".into())
             .w(px(210.))
             .flex_shrink_0()
@@ -341,6 +365,27 @@ impl MailApp {
                 "Forwarding".into(),
                 icon_el("alias", 15., c.muted).into_any_element(),
                 Page::Forwarding,
+                cx,
+            ))
+            .child(self.settings_nav(
+                "settings-contacts".into(),
+                "Contacts".into(),
+                icon_el("contact", 15., c.muted).into_any_element(),
+                Page::Contacts,
+                cx,
+            ))
+            .child(self.settings_nav(
+                "settings-calendar".into(),
+                "Calendar".into(),
+                icon_el("clock", 15., c.muted).into_any_element(),
+                Page::Calendar,
+                cx,
+            ))
+            .child(self.settings_nav(
+                "settings-encryption".into(),
+                "Encryption".into(),
+                icon_el("lock", 15., c.muted).into_any_element(),
+                Page::Encryption,
                 cx,
             ))
             .child(self.settings_nav(
@@ -499,6 +544,19 @@ impl MailApp {
                     self.accent.label()
                 ),
                 swatches,
+            ))
+            .child(self.setting(
+                "Reduce motion",
+                "Panes, menus and messages appear without sliding or fading, and spinners stand still. Automatic follows your system's accessibility setting.",
+                self.segmented(
+                    "reduce-motion",
+                    [super::motion::Motion::System, super::motion::Motion::Reduced, super::motion::Motion::Full]
+                        .into_iter()
+                        .map(|m| (m.label().to_owned(), Action::SetMotion(m), self.motion == m))
+                        .collect(),
+                    cx,
+                )
+                .max_w(px(320.)),
             ))
             .child(self.section("Mailboxes"))
             .child(self.toggle_row(
@@ -2104,6 +2162,9 @@ impl MailApp {
             Page::Reading => self.reading_page(cx),
             Page::Composing => self.composing_page(cx),
             Page::Forwarding => self.forwarding_page(cx),
+            Page::Contacts => self.contacts_page(cx),
+            Page::Calendar => self.calendar_page(cx),
+            Page::Encryption => self.encryption_page(cx),
             Page::LocalAi => self.local_ai_page(cx),
             Page::About if self.mobile.on => self.mobile_about_page(cx),
             Page::About => self.general_page(cx),

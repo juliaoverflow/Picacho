@@ -218,6 +218,8 @@ fn control(id: &'static str, icon: &str, label: &'static str, c: Colors) -> Stat
         div()
             .id(id)
             .debug_selector(move || id.into())
+            .role(Role::Button)
+            .aria_label(label)
             .flex_shrink_0()
             .flex()
             .items_center()

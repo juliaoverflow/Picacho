@@ -409,6 +409,14 @@ impl Composer {
         }
     }
 
+    /// Whether you have a key or certificate to sign or encrypt with.
+    fn can_protect(&self) -> bool {
+        !self.backend.keyring().secret.is_empty() || !self.backend.certificates().own.is_empty()
+    }
+    /// Whether you have both an OpenPGP key and an S/MIME certificate.
+    fn has_both_kinds(&self) -> bool {
+        !self.backend.keyring().secret.is_empty() && !self.backend.certificates().own.is_empty()
+    }
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.saved = false;
         self.error = None;
@@ -1235,6 +1243,13 @@ impl Composer {
         div()
             .id(id)
             .debug_selector(move || format!("compose-{id}"))
+            .role(Role::Button)
+            .aria_label(super::spoken(tip))
+            .when_some(super::spoken_keys(tip), |d, k| d.aria_keyshortcuts(k))
+            .when(on, |d| d.aria_toggled(Toggled::True))
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
             // A fingertip needs a bigger target than a pointer.
             .size(px(if self.mobile { super::mobile::TOUCH } else { 28. }))
             .flex_shrink_0()
@@ -2337,6 +2352,84 @@ impl Composer {
                     },
                 )
             })
+            // Signing and encrypting, once there's a key or certificate of
+            // yours (Settings → Encryption).
+            .when(self.can_protect(), |d| {
+                let smime = self.draft.smime;
+                d.child(self.icon_button(
+                    "sign",
+                    "shield-check",
+                    match (self.draft.sign, smime) {
+                        (true, false) => "Signed with your OpenPGP key",
+                        (false, false) => "Sign with your OpenPGP key",
+                        (true, true) => "Signed with your S/MIME certificate",
+                        (false, true) => "Sign with your S/MIME certificate",
+                    },
+                    self.draft.sign,
+                    cx,
+                    |t, _, cx| {
+                        t.draft.sign = !t.draft.sign;
+                        t.changed(cx);
+                        cx.notify();
+                    },
+                ))
+                .child(self.icon_button(
+                    "encrypt",
+                    "lock",
+                    match (self.draft.encrypt, smime) {
+                        (true, false) => "Encrypted to each recipient's OpenPGP key",
+                        (false, false) => "Encrypt with OpenPGP (Picacho looks up recipients' keys)",
+                        (true, true) => "Encrypted to each recipient's S/MIME certificate",
+                        (false, true) => "Encrypt with S/MIME (recipients must have sent you signed mail)",
+                    },
+                    self.draft.encrypt,
+                    cx,
+                    |t, _, cx| {
+                        t.draft.encrypt = !t.draft.encrypt;
+                        t.changed(cx);
+                        cx.notify();
+                    },
+                ))
+                .when(self.draft.encrypt && !smime, |d| {
+                    d.child(self.icon_button(
+                        "encrypt-subject",
+                        "eye-off",
+                        if self.draft.encrypt_subject {
+                            "The subject is encrypted too (others see “...”)"
+                        } else {
+                            "Encrypt the subject too"
+                        },
+                        self.draft.encrypt_subject,
+                        cx,
+                        |t, _, cx| {
+                            t.draft.encrypt_subject = !t.draft.encrypt_subject;
+                            t.changed(cx);
+                            cx.notify();
+                        },
+                    ))
+                })
+                .when(self.has_both_kinds() && (self.draft.sign || self.draft.encrypt), |d| {
+                    d.child(self.icon_button(
+                        "protect-kind",
+                        "key-round",
+                        if smime {
+                            "Using S/MIME: switch to OpenPGP"
+                        } else {
+                            "Using OpenPGP: switch to S/MIME"
+                        },
+                        smime,
+                        cx,
+                        |t, _, cx| {
+                            t.draft.smime = !t.draft.smime;
+                            if t.draft.smime {
+                                t.draft.encrypt_subject = false;
+                            }
+                            t.changed(cx);
+                            cx.notify();
+                        },
+                    ))
+                })
+            })
             .child(
                 div()
                     .flex_1()
@@ -2362,6 +2455,8 @@ impl Render for Composer {
         let inline = self.placement == Placement::Inline;
         let mut root = div()
             .id("composer")
+            .role(Role::Form)
+            .aria_label("New message")
             .key_context("Composer")
             .track_focus(&self.focus)
             .debug_selector(|| "composer".into())

@@ -670,7 +670,18 @@ impl MailApp {
         {
             return contacts.clone();
         }
-        let contacts = Rc::new(gather_contacts(&self.messages, &own));
+        // The address book first, then people seen in mail.
+        let mut people =
+            crate::manage::backend::contacts::people(&self.backend.contacts());
+        let mut seen: HashSet<String> = people.iter().map(|(_, e)| e.to_lowercase()).collect();
+        seen.extend(own.iter().cloned());
+        people.retain(|(_, e)| !own.contains(&e.to_lowercase()));
+        people.extend(
+            gather_contacts(&self.messages, &own)
+                .into_iter()
+                .filter(|(_, e)| seen.insert(e.to_lowercase())),
+        );
+        let contacts = Rc::new(people);
         *self.contacts_cache.borrow_mut() = Some((self.list_revision, own, contacts.clone()));
         contacts
     }

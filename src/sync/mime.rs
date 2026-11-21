@@ -613,7 +613,11 @@ pub struct Details {
     pub return_path: Option<String>,
     /// Whether `auth::check` has run: the checks look the sender's records
     /// up in DNS, so they wait until asked for.
-    pub checked: bool,
+    pub checked: bool,    /// What the sender's OpenPGP signature says, when the message has one
+    /// (checked against your keyring when it was read).
+    pub signature: Option<String>,
+    /// Whether that signature checked out.
+    pub signature_good: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

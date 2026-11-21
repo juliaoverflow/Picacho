@@ -630,6 +630,45 @@ fn drafts_sync_with_the_drafts_folder() -> Result<()> {
     assert_eq!(copies.len(), 1);
     assert!(copies[0].contains("Second version"));
     assert_eq!(racer_uid(&drafts), Some(raced), "another app's draft stays");
+    // Marked Encrypt: the server's copy is replaced by one sealed to your
+    // OpenPGP key, its subject hidden too; it reads back on another device.
+    let me = crate::manage::openpgp::test_key("QA <qa@example.com>", "");
+    let mut ring = crate::manage::openpgp::Keyring::default();
+    ring.import(&me.to_armored_string(Default::default())?, "")?;
+    b.set_keyring(ring)?;
+    let mut sealed = b.store.draft("draft-here")?.unwrap();
+    sealed.encrypt = true;
+    sealed.encrypt_subject = true;
+    sealed.body = "Secret plans".into();
+    b.store.save_draft(&sealed)?;
+    b.sync_drafts(&a)?;
+    let copies = uploaded(&drafts);
+    assert_eq!(copies.len(), 1, "the readable copy is replaced");
+    assert!(copies[0].contains("multipart/encrypted") && copies[0].contains("Subject: ..."));
+    assert!(!copies[0].contains("Secret plans") && !copies[0].contains("Written here"));
+    let sealed_uid = b.store.draft("draft-here")?.unwrap().remote.unwrap().uid;
+    // Another device (here: this one, without its copy) opens it.
+    b.store.delete_draft("draft-here")?;
+    b.sync_drafts(&a)?;
+    let back = b.store.drafts(&a.id)?.into_iter().find(|d| d.subject == "Written here").expect("the sealed draft opens");
+    assert!(back.body.contains("Secret plans") && back.encrypt && back.encrypt_subject, "{back:?}");
+    assert_eq!(back.remote.as_ref().unwrap().uid, sealed_uid);
+    // With S/MIME instead: sealed to your certificate, and read back.
+    let mut certs = crate::manage::smime::Certificates::default();
+    certs.import_identity(&crate::manage::smime::test_identity("qa@example.com", ""), "")?;
+    b.set_certificates(certs)?;
+    let mut smime = back.clone();
+    smime.smime = true;
+    smime.body = "Certificate secret".into();
+    b.store.save_draft(&smime)?;
+    b.sync_drafts(&a)?;
+    let copies = uploaded(&drafts);
+    assert_eq!(copies.len(), 1);
+    assert!(copies[0].contains("enveloped-data") && !copies[0].contains("Certificate secret"));
+    b.store.delete_draft(&back.id)?;
+    b.sync_drafts(&a)?;
+    let back = b.store.drafts(&a.id)?.into_iter().find(|d| d.subject == "Written here").expect("the S/MIME draft opens");
+    assert!(back.smime && back.encrypt && back.body.contains("Certificate secret"), "{back:?}");
     // Deleted here: gone from the server.
     b.discard_draft(&phone.id)?;
     let saved_elsewhere = b

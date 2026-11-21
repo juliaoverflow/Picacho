@@ -69,6 +69,9 @@ impl MailApp {
             Page::Reading => "Reading".into(),
             Page::Composing => "Composing".into(),
             Page::Forwarding => "Forwarding".into(),
+            Page::Contacts => "Contacts".into(),
+            Page::Calendar => "Calendar".into(),
+            Page::Encryption => "Encryption".into(),
             Page::LocalAi => "Local AI".into(),
             Page::About => "About Picacho".into(),
             Page::Account(id) => self
@@ -164,6 +167,9 @@ impl MailApp {
                 row("mobile-settings-reading", "mail", Page::Reading),
                 row("mobile-settings-composing", "compose", Page::Composing),
                 row("mobile-settings-forwarding", "alias", Page::Forwarding),
+                row("mobile-settings-contacts", "contact", Page::Contacts),
+                row("mobile-settings-calendar", "clock", Page::Calendar),
+                row("mobile-settings-encryption", "lock", Page::Encryption),
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
             ]))
             .child(self.group_label("Mailboxes"))

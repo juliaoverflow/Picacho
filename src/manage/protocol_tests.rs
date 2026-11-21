@@ -405,6 +405,111 @@ fn smtp_starttls_auth_delivery_and_attachment() -> Result<()> {
     Ok(())
 }
 
+/// An SMTP server over TLS that takes one message and hands it back.
+fn smtp_sink() -> Result<(Vec<u8>, u16, std::thread::JoinHandle<Vec<u8>>)> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"220 localhost ESMTP\r\n").unwrap();
+        let mut delivered = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let response = if line.starts_with("EHLO") {
+                "250-localhost\r\n250 AUTH PLAIN\r\n"
+            } else if line.starts_with("AUTH") {
+                "235 OK\r\n"
+            } else if line.starts_with("MAIL") || line.starts_with("RCPT") || line == "NOOP\r\n" {
+                "250 OK\r\n"
+            } else if line == "DATA\r\n" {
+                r.get_mut().write_all(b"354 Go\r\n").unwrap();
+                loop {
+                    let mut data = Vec::new();
+                    r.read_until(b'\n', &mut data).unwrap();
+                    if data == b".\r\n" {
+                        break;
+                    }
+                    if data.starts_with(b"..") {
+                        data.remove(0);
+                    }
+                    delivered.extend(data);
+                }
+                "250 Queued\r\n"
+            } else if line == "QUIT\r\n" {
+                r.get_mut().write_all(b"221 Bye\r\n").unwrap();
+                break;
+            } else {
+                panic!("Unexpected SMTP command: {line}")
+            };
+            r.get_mut().write_all(response.as_bytes()).unwrap();
+        }
+        delivered
+    });
+    Ok((cert, port, server))
+}
+
+/// OpenPGP end to end: a draft asking to be signed and encrypted goes out
+/// as PGP/MIME, and its copy in Sent opens again with the sender's key.
+#[test]
+fn openpgp_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
+    use crate::manage::openpgp::{Keyring, test_key};
+    use pgp::composed::SignedPublicKey;
+    let (cert, port, server) = smtp_sink()?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.smtp_tls = Some(true);
+    let me = test_key("QA <qa@example.com>", "");
+    let them = test_key("Rae <rae@example.com>", "");
+    let mut ring = Keyring::default();
+    ring.import(&me.to_armored_string(Default::default())?, "")?;
+    ring.import(&SignedPublicKey::from(them.clone()).to_armored_string(Default::default())?, "")?;
+    b.set_keyring(ring)?;
+    let d = Draft {
+        id: "pgp-test".into(),
+        account: a.id.clone(),
+        to: "Rae <rae@example.com>".into(),
+        subject: "Sealed".into(),
+        body: "Only Rae reads this.".into(),
+        sign: true,
+        encrypt: true,
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let result = b.send(&a, &d);
+    let raw = server.join().unwrap();
+    result?;
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("Subject: Sealed") && text.contains("multipart/encrypted"));
+    assert!(!text.contains("Only Rae reads this"));
+    // Rae's keys open it, and find it signed by QA.
+    let mut raes = Keyring::default();
+    raes.import(&them.to_armored_string(Default::default())?, "")?;
+    raes.import(&SignedPublicKey::from(me).to_armored_string(Default::default())?, "")?;
+    let (opened, verdict) = crate::manage::openpgp::open(&raw, &raes).unwrap();
+    assert!(verdict.decrypted);
+    assert_eq!(verdict.signature, crate::manage::openpgp::Signature::Good("QA <qa@example.com>".into()));
+    assert!(String::from_utf8_lossy(&opened).contains("Only Rae reads this."));
+    // The copy in Sent stays encrypted on disk and opens in the reader.
+    let sent = b.store.messages(&a.id, Folder::Sent, 10)?;
+    assert_eq!(sent.len(), 1);
+    assert!(!String::from_utf8_lossy(&b.store.raw(&sent[0].id)?.unwrap()).contains("Only Rae"));
+    let read = b.read(&a, &sent[0])?;
+    assert!(read.body.unwrap_or_default().contains("Only Rae reads this."));
+    assert!(b.store.message(&sent[0].id)?.unwrap().body.is_none(), "kept out of the cache");
+    assert!(b.verdict(&sent[0].id).unwrap().decrypted);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 /// An outgoing server taking TLS from the first byte on a port other than
 /// 465, chosen in its settings, and offering no sign-in (a relay that knows
 /// its senders by their network): the message goes without AUTH.
@@ -1324,6 +1429,58 @@ fn the_background_monitor_waits_before_waking_snoozes_again() -> Result<()> {
     assert!(said.is_empty(), "{said:?}");
     // Still snoozed, for the next try.
     assert_eq!(b.snoozed(&a.id).len(), 1);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// S/MIME end to end: a signed, encrypted message goes out as
+/// application/pkcs7-mime, opens for its recipient, and its copy in Sent
+/// opens again here.
+#[test]
+fn smime_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
+    use crate::manage::smime::{Certificates, test_identity};
+    let (cert, port, server) = smtp_sink()?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    a.smtp_tls = Some(true);
+    let mut mine = Certificates::default();
+    mine.import_identity(&test_identity("qa@example.com", ""), "")?;
+    let mut theirs = Certificates::default();
+    theirs.import_identity(&test_identity("rae@example.com", ""), "")?;
+    // Rae's certificate, as one of Rae's signed messages would give it.
+    let signed = crate::manage::smime::protect_with(&theirs, b"From: rae@example.com\r\nSubject: hi\r\nContent-Type: text/plain\r\n\r\nhi\r\n", "rae@example.com", &[], true, false)?;
+    b.set_certificates(mine.clone())?;
+    let rae_signed = parse_message(&signed, &a, "rae-1", Folder::Inbox, "INBOX", 1)?;
+    b.store.save_download(&rae_signed, &signed)?;
+    b.read(&a, &rae_signed)?;
+    assert!(b.certificates().has_cert("rae@example.com"), "the signer's certificate is kept");
+    assert!(!b.smime_verdict("rae-1").unwrap().decrypted);
+    let d = Draft {
+        id: "smime-test".into(),
+        account: a.id.clone(),
+        to: "Rae <rae@example.com>".into(),
+        subject: "Sealed".into(),
+        body: "Only Rae reads this.".into(),
+        sign: true,
+        encrypt: true,
+        smime: true,
+        ..Default::default()
+    };
+    b.store.save_draft(&d)?;
+    let result = b.send(&a, &d);
+    let raw = server.join().unwrap();
+    result?;
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("smime-type=enveloped-data") && !text.contains("Only Rae"));
+    let (opened, verdict, _) = crate::manage::smime::open(&raw, &theirs).unwrap();
+    assert!(verdict.decrypted && verdict.signature != crate::manage::smime::Signature::Bad);
+    assert!(String::from_utf8_lossy(&opened).contains("Only Rae reads this."));
+    let sent = b.store.messages(&a.id, Folder::Sent, 10)?;
+    let read = b.read(&a, &sent[0])?;
+    assert!(read.body.unwrap_or_default().contains("Only Rae reads this."));
+    assert!(b.store.message(&sent[0].id)?.unwrap().body.is_none(), "kept out of the cache");
     drop(b);
     std::fs::remove_dir_all(path)?;
     Ok(())

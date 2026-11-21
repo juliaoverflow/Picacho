@@ -10,6 +10,14 @@ use proton_login::ProtonStage;
 mod catalog;
 #[path = "compose.rs"]
 mod compose;
+#[path = "contacts.rs"]
+mod contacts;
+#[path = "encryption.rs"]
+mod encryption;
+#[path = "calendar.rs"]
+mod calendar;
+#[path = "motion.rs"]
+mod motion;
 #[cfg(test)]
 #[path = "compose_tests.rs"]
 mod compose_tests;
@@ -407,6 +415,16 @@ fn address_entries(name: Option<&str>, email: &str, from: Option<&str>) -> Vec<E
     }
     entries
 }
+/// A label for screen readers: a tooltip's text without its keyboard
+/// shortcut ("Reply · ⌘R" is read "Reply"; the shortcut is given apart).
+pub(super) fn spoken(text: &str) -> String {
+    let text = text.trim_start_matches('@');
+    text.split(" · ").next().unwrap_or(text).trim().to_owned()
+}
+/// The keyboard shortcut in a tooltip's text, as a screen reader says it.
+pub(super) fn spoken_keys(text: &str) -> Option<String> {
+    text.split_once(" · ").map(|(_, k)| keys(k.trim()))
+}
 fn keys(text: &str) -> String {
     if cfg!(target_os = "macos") {
         return text.into();
@@ -568,6 +586,9 @@ enum Page {
     Reading,
     Composing,
     Forwarding,
+    Contacts,
+    Calendar,
+    Encryption,
     LocalAi,
     Account(String),
     /// About Picacho: a page of Settings on a phone, a dialog elsewhere.
@@ -615,6 +636,76 @@ enum Action {
     ReplyTo(String, u8),
     DeleteDraft(String),
     MarkAllRead(String, Mailbox),
+    /// Saves every message of a mailbox to one mbox file: (account, mailbox).
+    ExportMailbox(String, Mailbox),
+    /// Adds mbox or .eml files to a mailbox on its server: (account, mailbox).
+    ImportMail(String, Mailbox),
+    /// Contacts settings: sign in to the CardDAV server in the form.
+    ConnectContacts,
+    /// Reads the address book from its server again.
+    SyncContacts,
+    DisconnectContacts,
+    ImportContacts,
+    ExportContacts,
+    ClearImportedContacts,
+    NewContact,
+    /// Opens the contact with this UID for editing.
+    EditContact(String),
+    SaveContact,
+    CancelContactEdit,
+    RemoveContact(String),
+    /// Encryption settings: import OpenPGP key files.
+    ImportKeys,
+    /// Forgets the OpenPGP key with this fingerprint.
+    RemoveKey(String),
+    /// Marks a found OpenPGP key as compared with its owner.
+    VerifyKey(String),
+    /// Opens (or closes) the fingerprint check for this key.
+    CheckKey(String),
+    /// Compares the fingerprint in the field with this key's.
+    MatchFingerprint(String),
+    ExportPublicKeys,
+    /// Settings → General → Reduce motion.
+    SetMotion(motion::Motion),
+    /// Looks up the OpenPGP key for the address in the field.
+    FindKey,
+    ImportCertificates,
+    /// Forgets the S/MIME certificate with this fingerprint.
+    RemoveCertificate(String),
+    /// Answers the invitation in this message.
+    AnswerInvitation(String, crate::sync::ical::PartStat),
+    /// Takes the cancelled event in this message out of the calendar.
+    RemoveCancelled(String),
+    /// Adds the event in this message to the calendar.
+    AddEventFromMail(String),
+    /// Opens the form for proposing another time for this invitation.
+    ProposeTime(String),
+    CancelProposal,
+    /// Sends the time proposed in the form for this invitation.
+    SendProposal(String),
+    /// Notes a guest's answer in this message on the calendar's event.
+    ApplyReply(String),
+    /// Moves the event to the time a guest proposed in this message.
+    AcceptCounter(String),
+    /// Tells the guest who proposed a time in this message it stays.
+    DeclineCounter(String),
+    /// Puts this updated invitation's version in the calendar.
+    TakeInvitationUpdate(String),
+    /// Calendar settings: sign in to the CalDAV server in the form.
+    ConnectCalendar,
+    SyncCalendar,
+    DisconnectCalendar,
+    /// The calendar new events go to.
+    DefaultCalendar(String),
+    NewEvent,
+    /// Opens an event for editing: (UID, which repeat of a repeating one).
+    EditEvent(String, Option<i64>),
+    /// Edits only this repeat (false) or every repeat (true).
+    EventScope(bool),
+    EventRepeat(calendar::Repeat),
+    SaveEvent,
+    CancelEventEdit,
+    DeleteEvent(String),
     RefreshAccount(String),
     ToggleAccount(String),
     ToggleSubfolders(String),
@@ -1039,6 +1130,12 @@ pub struct MailApp {
     unfillable: HashSet<u32>,
     search: Entity<InputState>,
     focus: FocusHandle,
+    /// Settings → General → Reduce motion.
+    motion: motion::Motion,
+    /// The open popup menu's, so the keyboard lands in it.
+    menu_focus: FocusHandle,
+    /// The menu just opened: focus it once it's drawn.
+    menu_focus_pending: bool,
     modal: Option<Modal>,
     dark: bool,
     appearance: Appearance,
@@ -1438,6 +1535,59 @@ pub struct MailApp {
     fwd_search: Entity<InputState>,
     fwd_busy: HashSet<String>,
     fwd_error: Option<String>,
+    /// Contacts settings' CardDAV form, and whether its work is running.
+    contacts_url: Entity<InputState>,
+    contacts_user: Entity<InputState>,
+    contacts_password: Entity<InputState>,
+    contacts_busy: bool,
+    contacts_error: Option<String>,
+    /// Contacts settings: the contact being added or edited (its UID; empty
+    /// for a new one), its form, and the list's filter.
+    contact_editing: Option<String>,
+    contact_name: Entity<InputState>,
+    contact_emails: Entity<InputState>,
+    contact_phones: Entity<InputState>,
+    contact_org: Entity<InputState>,
+    contact_note: Entity<InputState>,
+    contact_filter: Entity<InputState>,
+    /// Encryption settings: the passphrase of a key being imported.
+    key_passphrase: Entity<InputState>,
+    key_error: Option<String>,
+    /// Encryption settings: the address to look a key up for.
+    key_lookup: Entity<InputState>,
+    key_busy: bool,
+    /// The key whose fingerprint check is open, and the fingerprint given.
+    key_checking: Option<String>,
+    key_check_input: Entity<InputState>,
+    /// Invitations found in messages, by message id (None: none found, or
+    /// still looking).
+    invitations: HashMap<String, Option<calendar::Invitation>>,
+    /// The message whose invitation is being answered.
+    invitation_busy: Option<String>,
+    /// The invitation (its message) whose propose-a-time form is open.
+    proposing: Option<String>,
+    /// Calendar settings: the CalDAV form, the event editor (the UID being
+    /// edited; empty for a new event), and its work.
+    calendar_url: Entity<InputState>,
+    calendar_user: Entity<InputState>,
+    calendar_password: Entity<InputState>,
+    calendar_busy: bool,
+    calendar_error: Option<String>,
+    event_editing: Option<String>,
+    /// The repeat of a repeating event opened for editing (its original
+    /// start), whether a change is for every repeat, and how it repeats.
+    event_occurrence: Option<i64>,
+    event_all_repeats: bool,
+    event_repeat: calendar::Repeat,
+    event_title: Entity<InputState>,
+    event_start: Entity<InputState>,
+    event_end: Entity<InputState>,
+    event_location: Entity<InputState>,
+    event_notes: Entity<InputState>,
+    event_guests: Entity<InputState>,
+    event_zone: Entity<InputState>,
+    /// The zone the editor's times were read in, while saving.
+    event_zone_chosen: Option<chrono_tz::Tz>,
     /// An alias waiting for its delete to be confirmed.
     fwd_confirm: Option<String>,
     /// The service whose new alias form is open.
@@ -1530,6 +1680,7 @@ impl MailApp {
     /// window on a desktop running in the background (see `shell`).
     pub fn with_backend(backend: Arc<Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = backend.store.clone();
+        let motion = motion::Motion::from_key(&store.preference(motion::Motion::PREFERENCE).unwrap_or_default());
         let accounts = store.accounts().unwrap_or_default();
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
@@ -1666,6 +1817,48 @@ impl MailApp {
         );
         let encrypted = HashSet::new();
         let fwd_key = input("API key", true, window, cx);
+        let calendar_url = input("https://caldav.example.com", false, window, cx);
+        let calendar_user = input("User name", false, window, cx);
+        let calendar_password = input("Password or app password", true, window, cx);
+        subscriptions.push(cx.subscribe_in(&calendar_password, window, |this, _, event, w, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.handle(Action::ConnectCalendar, w, cx);
+            }
+        }));
+        let event_title = input("Title", false, window, cx);
+        let event_start = input("2026-11-24 10:00", false, window, cx);
+        let event_end = input("2026-11-24 11:00", false, window, cx);
+        let event_location = input("Where (optional)", false, window, cx);
+        let event_notes = input("Notes (optional)", false, window, cx);
+        let event_zone = input("Europe/Berlin", false, window, cx);
+        subscriptions.push(cx.subscribe(&event_zone, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
+        let event_guests = input("ana@example.com, bo@example.com (optional)", false, window, cx);
+        let key_check_input = input("Their fingerprint", false, window, cx);
+        let key_lookup = input("name@example.com", false, window, cx);
+        let key_passphrase = input("Passphrase (only for a protected secret key)", true, window, cx);
+        let contact_name = input("Name", false, window, cx);
+        let contact_emails = input("name@example.com", false, window, cx);
+        let contact_phones = input("Phone numbers (optional)", false, window, cx);
+        let contact_org = input("Organization (optional)", false, window, cx);
+        let contact_note = input("Note (optional)", false, window, cx);
+        let contact_filter = input("Find a contact", false, window, cx);
+        subscriptions.push(cx.subscribe(&contact_filter, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
+        let contacts_url = input("https://carddav.example.com", false, window, cx);
+        let contacts_user = input("User name", false, window, cx);
+        let contacts_password = input("Password or app password", true, window, cx);
+        subscriptions.push(cx.subscribe_in(&contacts_password, window, |this, _, event, w, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.handle(Action::ConnectContacts, w, cx);
+            }
+        }));
         let fwd_server = input("Server (optional, for self-hosted)", false,
             window,
             cx,
@@ -1745,8 +1938,10 @@ impl MailApp {
             if !this.active {
                 cx.defer(crate::android::clipboard_to_system);
             }
-            #[cfg(not(target_os = "android"))]
-            let _ = cx;
+            // The system's Reduce motion may have changed meanwhile.
+            if this.active && this.motion == motion::Motion::System {
+                this.refresh_system_motion(cx);
+            }
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.persist_draft(cx);
@@ -2058,6 +2253,9 @@ impl MailApp {
             unfillable: HashSet::new(),
             search,
             focus: cx.focus_handle(),
+            motion,
+            menu_focus: cx.focus_handle(),
+            menu_focus_pending: false,
             modal: None,
             dark,
             appearance,
@@ -2269,6 +2467,44 @@ impl MailApp {
             fwd_search,
             fwd_busy: HashSet::new(),
             fwd_error: None,
+            contacts_url,
+            contacts_user,
+            contacts_password,
+            contacts_busy: false,
+            contacts_error: None,
+            contact_editing: None,
+            contact_name,
+            contact_emails,
+            contact_phones,
+            contact_org,
+            contact_note,
+            contact_filter,
+            key_passphrase,
+            key_error: None,
+            key_lookup,
+            key_busy: false,
+            key_checking: None,
+            key_check_input,
+            invitations: HashMap::new(),
+            invitation_busy: None,
+            proposing: None,
+            calendar_url,
+            calendar_user,
+            calendar_password,
+            calendar_busy: false,
+            calendar_error: None,
+            event_editing: None,
+            event_occurrence: None,
+            event_all_repeats: false,
+            event_repeat: calendar::Repeat::Never,
+            event_title,
+            event_start,
+            event_end,
+            event_location,
+            event_notes,
+            event_guests,
+            event_zone,
+            event_zone_chosen: None,
             fwd_confirm: None,
             fwd_creating: None,
             fwd_prefix,
@@ -2313,6 +2549,9 @@ impl MailApp {
         #[cfg(all(debug_assertions, target_os = "macos"))]
         devdriver::start(window, cx);
         this.watch_inboxes();
+        this.sync_contacts_at_start(cx);
+        this.sync_calendar_at_start(cx);
+        this.apply_motion(cx);
         this.listen_push_failures(cx);
         if this.account.is_some() {
             cx.defer_in(window, |this, w, cx| {
@@ -2386,6 +2625,36 @@ impl MailApp {
         #[cfg(target_os = "android")]
         crate::android::set_background(on);
         cx.notify();
+    }
+    /// Reads the system's Reduce motion again (off the UI thread: on
+    /// desktops it asks a system tool), and applies it if it changed.
+    fn refresh_system_motion(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let reduced = cx
+                .background_executor()
+                .spawn(async { motion::system_reduces_motion() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.motion == motion::Motion::System {
+                    Self::set_motion(reduced, cx);
+                }
+            });
+        })
+        .detach();
+    }
+    fn set_motion(reduced: bool, cx: &mut Context<Self>) {
+        STILL.with(|s| s.set(reduced));
+        cx.set_reduce_motion(reduced);
+        cx.notify();
+    }
+    /// Tells GPUI, and the spinners, whether to reduce motion.
+    fn apply_motion(&mut self, cx: &mut Context<Self>) {
+        if self.motion == motion::Motion::System {
+            // Read without holding up the window.
+            self.refresh_system_motion(cx);
+            return;
+        }
+        Self::set_motion(self.motion.reduced(), cx);
     }
     fn set_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
         use crate::manage::background::TRAY_PREFERENCE;
@@ -2891,6 +3160,9 @@ impl MailApp {
             opened: std::time::Instant::now(),
             window: None,
         });
+        // Keyboard and screen reader users land in the menu; Tab moves
+        // through its items and Escape closes it.
+        self.menu_focus_pending = true;
         cx.notify();
     }
     /// Opens a menu at the pointer in the window it was asked from: the
@@ -2967,6 +3239,21 @@ impl MailApp {
                 "mail-open",
                 Action::MarkAllRead(id.into(), mailbox.clone()),
             ));
+        }
+        if self.accounts.iter().any(|a| a.id == id) {
+            entries.push(Entry::Separator);
+            entries.push(entry(
+                "Export as Mbox…",
+                "download",
+                Action::ExportMailbox(id.into(), mailbox.clone()),
+            ));
+            if !mailbox.folder().is_virtual() && mailbox.folder() != Folder::Drafts {
+                entries.push(entry(
+                    "Import Messages…",
+                    "upload",
+                    Action::ImportMail(id.into(), mailbox.clone()),
+                ));
+            }
         }
         if let Mailbox::Standard(folder @ (Folder::Trash | Folder::Junk)) = mailbox
             && self.accounts.iter().any(|a| a.id == id)
@@ -4779,6 +5066,82 @@ impl MailApp {
             },
         );
     }
+    /// Saves a mailbox to an mbox file the person chooses.
+    fn export_mailbox(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let title = match &mailbox {
+            Mailbox::Standard(folder) => folder.label().to_owned(),
+            Mailbox::Remote(name) => name.rsplit(['/', '.']).next().unwrap_or(name).to_owned(),
+        };
+        let stem: String = format!("{} {title}", a.email)
+            .chars()
+            .map(|c| if c.is_alphanumeric() || " -_.@".contains(c) { c } else { '_' })
+            .take(80)
+            .collect();
+        let name = format!("{}.mbox", stem.trim());
+        let start = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .filter(|home| home.is_dir())
+            .unwrap_or_else(|| self.backend.store.path.clone());
+        let picker = cx.prompt_for_new_path(&start, Some(&name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = picker.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.notice("Exporting…", false, cx);
+                let stop = Arc::new(AtomicBool::new(false));
+                this.task(
+                    cx,
+                    move |b| b.export_mailbox(&a, &mailbox, &path, &stop),
+                    |this, result, cx| match result {
+                        Ok(moved) => this.notice(moved.notice("Exported"), false, cx),
+                        Err(e) => this.notice(e.to_string(), true, cx),
+                    },
+                );
+            });
+        })
+        .detach();
+    }
+    /// Adds mbox and .eml files the person chooses to a mailbox.
+    fn import_mail(&mut self, id: String, mailbox: Mailbox, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picker.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.notice("Importing…", false, cx);
+                let stop = Arc::new(AtomicBool::new(false));
+                let shown = mailbox.clone();
+                this.task(
+                    cx,
+                    move |b| b.import_messages(&a, &mailbox, &paths, &stop),
+                    move |this, result, cx| match result {
+                        Ok(moved) => {
+                            this.notice(moved.notice("Imported"), false, cx);
+                            if this.account.as_ref() == Some(&id) && this.mailbox() == shown {
+                                this.refresh(cx);
+                            }
+                        }
+                        Err(e) => this.notice(e.to_string(), true, cx),
+                    },
+                );
+            });
+        })
+        .detach();
+    }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         // A phone goes back one screen at a time (Android's Back, Escape).
         if self.mobile.on && self.mobile_back(w, cx) {
@@ -5252,7 +5615,28 @@ impl MailApp {
                 // The sender is checked only when asked (Check sender): the
                 // lookups reach the sender's DNS and can tell it when the
                 // message was opened.
-                let details = crate::sync::mime::details(&raw, b.decrypts(&account, &raw));
+                let mut details = crate::sync::mime::details(&raw, b.decrypts(&account, &raw));
+                if b.verdict(&m.id).is_none() && b.smime_verdict(&m.id).is_none() {
+                    // Read before this launch: check it again now.
+                    let _ = b.read(&account, &m);
+                }
+                if let Some(verdict) = b.verdict(&m.id) {
+                    use crate::manage::openpgp::Signature;
+                    if verdict.signature != Signature::None {
+                        details.signature_good = matches!(verdict.signature, Signature::Good(_));
+                        details.signature = Some(verdict.signature.label());
+                    }
+                }
+                if let Some(verdict) = b.smime_verdict(&m.id) {
+                    use crate::manage::smime::Signature;
+                    if verdict.decrypted {
+                        details.security = crate::sync::mime::Security::EndToEnd;
+                    }
+                    if verdict.signature != Signature::None {
+                        details.signature_good = verdict.signature.good();
+                        details.signature = Some(verdict.signature.label());
+                    }
+                }
                 Ok(Original::new(details, &raw))
             },
             move |this, result, cx| {
@@ -5528,6 +5912,51 @@ impl MailApp {
                 }
             }
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
+            Action::ExportMailbox(id, mailbox) => self.export_mailbox(id, mailbox, cx),
+            Action::ImportMail(id, mailbox) => self.import_mail(id, mailbox, cx),
+            action @ (Action::ConnectContacts
+            | Action::SyncContacts
+            | Action::DisconnectContacts
+            | Action::ImportContacts
+            | Action::ExportContacts
+            | Action::ClearImportedContacts
+            | Action::NewContact
+            | Action::EditContact(_)
+            | Action::SaveContact
+            | Action::CancelContactEdit
+            | Action::RemoveContact(_)) => self.contacts_action(action, w, cx),
+            action @ (Action::ImportKeys
+            | Action::RemoveKey(_)
+            | Action::VerifyKey(_)
+            | Action::CheckKey(_)
+            | Action::MatchFingerprint(_)
+            | Action::ExportPublicKeys
+            | Action::FindKey
+            | Action::ImportCertificates
+            | Action::RemoveCertificate(_)) => {
+                self.encryption_action(action, w, cx)
+            }
+            action @ (Action::AnswerInvitation(..)
+            | Action::RemoveCancelled(_)
+            | Action::AddEventFromMail(_)
+            | Action::ProposeTime(_)
+            | Action::CancelProposal
+            | Action::SendProposal(_)
+            | Action::ApplyReply(_)
+            | Action::AcceptCounter(_)
+            | Action::DeclineCounter(_)
+            | Action::TakeInvitationUpdate(_)
+            | Action::ConnectCalendar
+            | Action::SyncCalendar
+            | Action::DisconnectCalendar
+            | Action::DefaultCalendar(_)
+            | Action::NewEvent
+            | Action::EditEvent(..)
+            | Action::EventScope(_)
+            | Action::EventRepeat(_)
+            | Action::SaveEvent
+            | Action::CancelEventEdit
+            | Action::DeleteEvent(_)) => self.calendar_action(action, w, cx),
             Action::RefreshAccount(id) if fwd::is_view(&id) => {
                 if self.account.as_ref() == Some(&id) && self.showing_list() {
                     self.refresh(cx);
@@ -6070,6 +6499,11 @@ impl MailApp {
             }
             Action::SetBackground(on) => self.set_background(on, cx),
             Action::SetTrayIcon(on) => self.set_tray_icon(on, cx),
+            Action::SetMotion(m) => {
+                self.motion = m;
+                self.backend.store.set_preference_soon(motion::Motion::PREFERENCE, m.key());
+                self.apply_motion(cx);
+            }
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
                 if on {
@@ -6893,12 +7327,20 @@ impl MailApp {
             c.muted
         };
         let tooltip = keys(label.trim_start_matches('@'));
+        let shortcut = spoken_keys(label);
+        let name = spoken(label);
         let label = label.to_string();
         let id = id.into();
         let selector = id.to_string();
         let el = div()
             .id(id)
             .debug_selector(move || selector)
+            .role(Role::Button)
+            .aria_label(name)
+            .when_some(shortcut, |d, k| d.aria_keyshortcuts(k))
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -7042,6 +7484,7 @@ impl MailApp {
                 .filter(|(a, e, _)| a == account && e == edit)
                 .map(|(_, _, name)| name.clone())
         });
+        let label_text = label.clone();
         let label_el = if editing {
             self.rename_field()
         } else {
@@ -7066,9 +7509,20 @@ impl MailApp {
             }
             _ => None,
         };
+        let spoken_nav = match count {
+            0 => label_text.clone(),
+            1 => format!("{label_text}, 1 unread"),
+            n => format!("{label_text}, {n} unread"),
+        };
         div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(|| selector)
+            .role(Role::TreeItem)
+            .aria_label(spoken_nav)
+            .aria_selected(active)
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
             .h(px(30.))
             .pl(px(if self.sidebar_collapsed { 10. } else { 30. } + indent))
             .pr_2()
@@ -7429,6 +7883,8 @@ impl MailApp {
             .flex()
             .flex_col()
             .id("message-list")
+            .role(Role::List)
+            .aria_label("Messages")
             .debug_selector(|| "message-list".into())
             .flex_1()
             .min_w(px(if single { 0. } else { LIST_MIN }))
@@ -8089,6 +8545,11 @@ impl MailApp {
         let lead = div()
             .id(SharedString::from(format!("lead-{id}")))
             .debug_selector(|| format!("lead-{id}"))
+            .when(!drafts, |d| {
+                d.role(Role::CheckBox)
+                    .aria_label("Select")
+                    .aria_toggled(if checked { Toggled::True } else { Toggled::False })
+            })
             .group(lead_group.clone())
             .relative()
             .size(px(36.))
@@ -8138,9 +8599,34 @@ impl MailApp {
             && !m.from.is_empty()
             && !m.from.eq_ignore_ascii_case(&m.sender))
         .then(|| m.from.clone());
+        // What a screen reader says for the row, as a person scans it.
+        let spoken_row = {
+            let mut parts = Vec::new();
+            if m.unread {
+                parts.push("Unread".to_owned());
+            }
+            if star {
+                parts.push("Starred".to_owned());
+            }
+            parts.push(sender.clone());
+            parts.push(m.subject.clone());
+            parts.push(date_short(m.date).to_string());
+            if m.has_attachments {
+                parts.push("Has attachments".to_owned());
+            }
+            if !m.snippet.is_empty() {
+                parts.push(m.snippet.chars().take(140).collect());
+            }
+            parts.join(", ")
+        };
         div()
             .id(SharedString::from(format!("row-{id}")))
             .debug_selector(|| format!("row-{id}"))
+            .role(Role::ListItem)
+            .aria_label(spoken_row)
+            .aria_selected(selected)
+            .aria_position_in_set(index + 1)
+            .aria_size_of_set(self.messages.len())
             .group(row_group.clone())
             .relative()
             .h(px(ROW_HEIGHT))
@@ -8253,6 +8739,9 @@ impl MailApp {
                                 d.child(
                                     div()
                                         .id(SharedString::from(format!("star-{}", m.id)))
+                                        .role(Role::CheckBox)
+                                        .aria_label("Star")
+                                        .aria_toggled(if star { Toggled::True } else { Toggled::False })
                                         .size(px(20.))
                                         .flex_shrink_0()
                                         .flex()
@@ -8386,6 +8875,11 @@ impl MailApp {
         div()
             .id(SharedString::from(id.to_owned()))
             .debug_selector(move || selector)
+            .role(Role::Link)
+            .aria_label(label.to_owned())
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(move |s| s.border_2().border_color(rgb(c.accent)))
             .text_size(px(12.))
             .text_color(rgb(c.accent))
             .cursor_pointer()
@@ -9202,9 +9696,13 @@ impl MailApp {
         let (height, row) = menu_size(&menu.entries, f32::from(frame));
         let width = menu_width(&menu.entries, window);
         let origin = menu_origin(menu.position, size(px(width), px(height)), viewport, insets);
+        let items = menu.entries.iter().filter(|e| matches!(e, Entry::Item { .. })).count();
+        let mut position = 0;
         let mut panel = div()
             .id("menu-panel")
             .debug_selector(|| "menu-panel".into())
+            .role(Role::Menu)
+            .track_focus(&self.menu_focus)
             // Long addresses end in an ellipsis rather than widen the menu.
             .w(px(width))
             .max_h(px(height))
@@ -9249,10 +9747,22 @@ impl MailApp {
                 } => {
                     let action = action.clone();
                     let color = if *danger { c.danger } else { c.text };
+                    position += 1;
+                    let checkable = icon.is_empty() && any_checks;
                     panel = panel.child(
                         div()
                             .id(("menu-item", i))
                             .debug_selector(|| format!("menu-item-{i}"))
+                            .role(if checkable { Role::MenuItemCheckBox } else { Role::MenuItem })
+                            .aria_label(label.clone())
+                            .when(checkable, |d| {
+                                d.aria_toggled(if *checked { Toggled::True } else { Toggled::False })
+                            })
+                            .aria_position_in_set(position)
+                            .aria_size_of_set(items)
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(move |s| s.bg(rgb(c.soft)))
                             .flex_shrink_0()
                             .h(px(row))
                             .px_2()
@@ -9794,6 +10304,9 @@ impl Render for MailApp {
         self.apply_pending_new_alias(window, cx);
         self.apply_pending_listed(cx);
         self.sync_nickname_input(window, cx);
+        if std::mem::take(&mut self.menu_focus_pending) && self.menu.is_some() {
+            window.focus(&self.menu_focus, cx);
+        }
         SPINNING.with(|s| s.set(false));
         let root = if self.mobile.on {
             self.mobile_root(window, cx)
@@ -10212,6 +10725,9 @@ fn back_out(t: f32) -> f32 {
 thread_local! {
     /// Set while a render draws a spinner, so the app keeps ticking it.
     static SPINNING: Cell<bool> = const { Cell::new(false) };
+    /// Motion is reduced (Settings → General, or the system): spinners
+    /// stand still.
+    static STILL: Cell<bool> = const { Cell::new(false) };
     static SPIN_EPOCH: std::time::Instant = std::time::Instant::now();
 }
 /// What the search's code mail and package updates were worked out for
@@ -10276,8 +10792,15 @@ fn matching_rows(messages: &[Mail], parallel: bool, keep: impl Fn(&Mail) -> bool
     found.unwrap_or_else(serial)
 }
 fn spinner(size: f32, color: u32) -> impl IntoElement {
-    SPINNING.with(|s| s.set(true));
-    let step = SPIN_EPOCH.with(|e| e.elapsed().as_millis() / SPIN_STEP.as_millis()) % SPIN_STEPS;
+    let still = STILL.with(|s| s.get());
+    if !still {
+        SPINNING.with(|s| s.set(true));
+    }
+    let step = if still {
+        0
+    } else {
+        SPIN_EPOCH.with(|e| e.elapsed().as_millis() / SPIN_STEP.as_millis()) % SPIN_STEPS
+    };
     svg()
         .path("icons/loader-circle.svg")
         .size(px(size))
@@ -10586,6 +11109,14 @@ fn date_short(ts: i64) -> String {
     } else {
         local.format("%b %-d, %Y").to_string()
     }
+}
+#[cfg(test)]
+#[::core::prelude::v1::test]
+fn tooltips_are_spoken_without_their_shortcuts() {
+    assert_eq!(spoken("@Hide sidebar · ⌃⌘S"), "Hide sidebar");
+    assert_eq!(spoken("Archive"), "Archive");
+    assert_eq!(spoken_keys("Archive"), None);
+    assert!(spoken_keys("Save draft · ⌘S").is_some_and(|k| k.contains('S')));
 }
 #[cfg(test)]
 #[::core::prelude::v1::test]

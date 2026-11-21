@@ -46,6 +46,8 @@ impl MailApp {
         };
         div()
             .id("reader-pane")
+            .role(Role::Main)
+            .aria_label("Message")
             .debug_selector(|| "reader-pane".into())
             .relative()
             .flex_1()
@@ -248,6 +250,8 @@ impl MailApp {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             return div()
                 .id("reader-pane")
+            .role(Role::Main)
+            .aria_label("Message")
                 .debug_selector(|| "reader-pane".into())
                 .relative()
                 .flex_1()
@@ -280,6 +284,8 @@ impl MailApp {
         let single = width < px(900.);
         let toolbar = div()
             .id("reader-toolbar")
+            .role(Role::Toolbar)
+            .aria_label("Message actions")
             .debug_selector(|| "reader-toolbar".into())
             .h(px(57.))
             .flex_shrink_0()
@@ -376,6 +382,8 @@ impl MailApp {
             ));
         div()
             .id("reader-pane")
+            .role(Role::Main)
+            .aria_label("Message")
             .debug_selector(|| "reader-pane".into())
             .flex_1()
             .min_w_0()
@@ -550,7 +558,15 @@ impl MailApp {
             })
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6())
             .children((!locked).then(|| self.codes_banner(m, cx)).flatten())
-            .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) });
+            .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) })
+            .children((!locked).then(|| self.invitation_card(m, cx)).flatten());
+        if !locked && !self.invitations.contains_key(&m.id) {
+            let m = m.clone();
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |this, cx| this.check_invitation(&m, cx));
+            });
+        }
         if locked {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
@@ -982,6 +998,8 @@ impl MailApp {
         };
         let mut panel = div()
             .id("message-details")
+            .role(Role::Group)
+            .aria_label("Message details")
             .debug_selector(|| "message-details".into())
             .mb_5()
             .p_4()
@@ -1102,6 +1120,27 @@ impl MailApp {
                     )
                     .into_any_element(),
                 );
+                if let Some(signature) = &d.signature {
+                    let (icon, color) = if d.signature_good {
+                        ("lock", 0x1e8e3e)
+                    } else {
+                        ("warning", c.danger)
+                    };
+                    panel_rows.push(
+                        row(
+                            "signature:",
+                            div()
+                                .id("openpgp-signature")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon_el(icon, 13., color))
+                                .child(div().text_color(rgb(c.text)).child(signature.clone()))
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    );
+                }
                 let checks: Vec<(&str, &Option<String>)> =
                     vec![("SPF", &d.spf), ("DKIM", &d.dkim), ("DMARC", &d.dmarc)];
                 if !d.checked {
@@ -1659,6 +1698,8 @@ impl MailApp {
         Some(
             div()
                 .id("smart-replies")
+                .role(Role::Group)
+                .aria_label("Suggested replies")
                 .debug_selector(|| "smart-replies".into())
                 .mt_3()
                 .flex()

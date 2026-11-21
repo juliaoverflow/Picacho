@@ -40,6 +40,22 @@ final class Clipboard {
         }
     }
 
+    /**
+     * Whether the system asks apps to reduce motion: Settings → Accessibility
+     * → Remove animations (which sets the animator duration scale to 0).
+     */
+    public static boolean reduceMotion(Context context) {
+        try {
+            float scale = android.provider.Settings.Global.getFloat(
+                    context.getContentResolver(),
+                    android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,
+                    1f);
+            return scale == 0f;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     public static void write(Context context, String text) {
         ClipboardManager manager = context.getSystemService(ClipboardManager.class);
         if (manager != null) {

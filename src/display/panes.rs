@@ -98,6 +98,8 @@ impl MailApp {
         let rail = || layer(self.sidebar_rail(cx).into_any_element(), SIDEBAR_RAIL, true);
         let sidebar = div()
             .id("sidebar")
+            .role(Role::Navigation)
+            .aria_label("Mailboxes")
             .debug_selector(|| "sidebar".into())
             .relative()
             .flex_shrink_0()
