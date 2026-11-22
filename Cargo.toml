@@ -24,10 +24,19 @@ argon2 = "0.6"
 base64 = "0.23"
 # Embed Blitz without its standalone window/event loop or unrestricted network client.
 # `floats`: gpui-pre turns on taffy's float layout, which stylo_taffy must fill in.
-blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff", "floats"] }
+# `complex-scripts`: word and line breaks for Chinese, Japanese, Thai, Khmer,
+# Lao and Burmese (ICU4X's dictionaries and models), without which a long
+# press selected whole lines of Japanese and Thai text didn't wrap.
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts", "svg", "woff", "floats", "complex-scripts"] }
 blitz-html = { version = "=0.3.0-beta.4", default-features = false }
 blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = "=0.3.0-beta.4"
+# Computed styles of the email's elements (positions, overflow, backgrounds).
+style = { package = "stylo", version = "=0.22.0" }
+percent-encoding = "2"
+# Words of Chinese, Japanese, Thai and other scripts written without spaces,
+# for the reader's word selection (the same dictionaries Blitz's text uses).
+icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
 anyrender = "0.14"
 anyrender_vello_cpu = { version = "0.18", default-features = false }
 peniko = "0.6"
@@ -347,10 +356,13 @@ libc = "0.2"
 # An email's unresolvable image or link address no longer panics; text in
 # padded inline blocks and centered cells is hit (selected, clicked) where shown;
 # blocks directly in a table (columns restacked for phones) are laid out.
-# TEMPORARY: the local fix/blitz-table-block-children branch until it is merged;
+# TEMPORARY: the local fix/blitz-table-block-children branch (with its email
+# legacy attributes and media device pixel ratio patches) until it is merged;
 # then back to the git dependency and `cargo update -p blitz-dom -p blitz-paint`.
+# The HTML reader needs blitz-dom's `set_media_device_pixel_ratio` (0007).
 blitz-dom = { path = "../Picacho-Patches/blitz-dom/crate" }
-# Inline boxes paint gradient backgrounds (emails' dark styles).
+# Inline boxes paint gradient backgrounds (emails' dark styles); SVG images
+# are drawn in layers the dark recoloring recognizes (`is_image_layer`).
 blitz-paint = { path = "../Picacho-Patches/blitz-paint/crate" }
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }

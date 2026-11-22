@@ -8,15 +8,27 @@ use blitz_traits::{
 use std::{
     io::Read,
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
 };
 
+/// The most one resource may be.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_REQUESTS: usize = 64;
+/// The most an email may fetch: requests (a long newsletter has a hundred
+/// images or more), and bytes in all.
+const MAX_REQUESTS: usize = 400;
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Resources fetched at once, as browsers fetch about six from a server:
+/// one at a time, a newsletter's images came in one by one, each slow
+/// server holding up all the rest.
+const FETCHERS: usize = 6;
+/// What the fetches say they are and accept. A generic name: the app, not
+/// the person reading.
+const USER_AGENT: &str = concat!("Mozilla/5.0 (compatible; Picacho/", env!("CARGO_PKG_VERSION"), ")");
+const ACCEPT: &str = "image/webp,image/png,image/jpeg,image/gif,image/svg+xml,text/css,font/woff2,font/woff,*/*;q=0.5";
 type Fetch = (Request, Box<dyn NetHandler>);
 
 pub struct Resources {
@@ -27,11 +39,17 @@ pub struct Resources {
     changed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     count: AtomicUsize,
-    /// The fetcher thread, started by the email's first remote request.
-    /// Most emails make none (remote content is blocked by default), and
-    /// starting it costs a thread and an HTTP client (some 6 ms, and a
-    /// runtime thread of the client's own) for every email opened.
+    /// The fetcher threads' queue, started by the email's first remote
+    /// request. Most emails make none (remote content is blocked by
+    /// default), and starting them costs threads and an HTTP client (some
+    /// 6 ms, and a runtime thread of the client's own) for every email opened.
     fetcher: OnceLock<mpsc::Sender<Fetch>>,
+    /// Bytes fetched so far (see `MAX_TOTAL_BYTES`).
+    fetched: Arc<AtomicU64>,
+    /// Hashes of the local (`data:`, `cid:`) addresses served, so that one
+    /// asking for a relayout (see `local_served`) does so once: a broken one,
+    /// never cached, is asked for again by every layout.
+    served: Mutex<std::collections::HashSet<u64>>,
 }
 impl Resources {
     pub fn new(
@@ -47,23 +65,47 @@ impl Resources {
             cancelled,
             count: AtomicUsize::new(0),
             fetcher: OnceLock::new(),
+            fetched: Arc::default(),
+            served: Mutex::default(),
         }
     }
-    /// The fetcher, started now if it isn't yet. One per document: bounded
-    /// concurrency, no work on the UI thread.
+    /// Notes that a local resource was handed over. Requested during layout
+    /// (a CSS background), it arrives as a message that only the next layout
+    /// takes in: ask for one, the first time.
+    fn local_served(&self, url: &str) {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(url);
+        if self.served.lock().unwrap_or_else(|e| e.into_inner()).insert(hash) {
+            self.changed.store(true, Ordering::Release);
+        }
+    }
+    /// The fetchers' queue, started now if it isn't yet: `FETCHERS` threads
+    /// per document sharing one HTTP client, bounded concurrency, no work on
+    /// the UI thread.
     fn fetcher(&self) -> &mpsc::Sender<Fetch> {
         self.fetcher.get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Fetch>();
-            let (stopped, changed) = (self.cancelled.clone(), self.changed.clone());
-            std::thread::spawn(move || fetch_all(rx, &stopped, &changed));
+            let rx = Arc::new(Mutex::new(rx));
+            let client = client();
+            for _ in 0..FETCHERS {
+                let (rx, client) = (rx.clone(), client.clone());
+                let (stopped, changed, fetched) =
+                    (self.cancelled.clone(), self.changed.clone(), self.fetched.clone());
+                let _ = std::thread::Builder::new()
+                    .name("picacho-fetch".into())
+                    .spawn(move || fetch_all(&rx, client.as_ref(), &stopped, &changed, &fetched));
+            }
             tx
         })
     }
 }
-/// Fetches what the document asks for until it is dropped or cancelled.
-fn fetch_all(rx: mpsc::Receiver<Fetch>, stopped: &AtomicBool, changed: &AtomicBool) {
-    let client = reqwest::blocking::Client::builder()
+fn client() -> Option<reqwest::blocking::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static(ACCEPT));
+    reqwest::blocking::Client::builder()
         .referer(false)
+        .user_agent(USER_AGENT)
+        .default_headers(headers)
         .timeout(Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 || !remote_url(attempt.url()) {
@@ -72,29 +114,47 @@ fn fetch_all(rx: mpsc::Receiver<Fetch>, stopped: &AtomicBool, changed: &AtomicBo
                 attempt.follow()
             }
         }))
-        .build();
-    while let Ok((request, handler)) = rx.recv() {
+        .build()
+        .ok()
+}
+/// Fetches what the document asks for until it is dropped or cancelled.
+fn fetch_all(
+    rx: &Mutex<mpsc::Receiver<Fetch>>,
+    client: Option<&reqwest::blocking::Client>,
+    stopped: &AtomicBool,
+    changed: &AtomicBool,
+    fetched: &AtomicU64,
+) {
+    loop {
+        // One waits on the queue at a time; the others are fetching.
+        let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+        let Ok((request, handler)) = next else {
+            break;
+        };
         if stopped.load(Ordering::Relaxed) {
             break;
         }
-        let result = client.as_ref().ok().and_then(|client| {
+        let result = client.and_then(|client| {
+            let left = MAX_TOTAL_BYTES.saturating_sub(fetched.load(Ordering::Relaxed));
+            let limit = MAX_BYTES.min(left);
             let mut response = client
                 .get(request.url.clone())
                 .send()
                 .ok()?
                 .error_for_status()
                 .ok()?;
-            if response.content_length().is_some_and(|n| n > MAX_BYTES) {
+            if response.content_length().is_some_and(|n| n > limit) {
                 return None;
             }
             let resolved = response.url().to_string();
             let mut bytes = Vec::new();
             response
                 .by_ref()
-                .take(MAX_BYTES + 1)
+                .take(limit + 1)
                 .read_to_end(&mut bytes)
                 .ok()?;
-            (bytes.len() as u64 <= MAX_BYTES).then_some((resolved, bytes))
+            fetched.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            (bytes.len() as u64 <= limit).then_some((resolved, bytes))
         });
         if stopped.load(Ordering::Relaxed) {
             break;
@@ -121,9 +181,11 @@ impl NetProvider for Resources {
                 .and_then(|data| data.decode_to_vec().ok())
                 .map(|(bytes, _)| bytes)
                 .unwrap_or_default();
+            self.local_served(&url);
             handler.bytes(url, Bytes::from(bytes));
         } else if request.url.scheme() == "cid" {
             let bytes = self.inline.get(&url).map(|b| b.to_vec()).unwrap_or_default();
+            self.local_served(&url);
             handler.bytes(url, Bytes::from(bytes));
         } else if !self.blocked
             && remote_url(&request.url)

@@ -20,6 +20,7 @@ pub(super) struct MessageWindow {
     /// The link under the pointer, shown at the bottom left.
     hovered: Option<String>,
     _links: Subscription,
+    _reveals: Subscription,
 }
 
 impl MessageWindow {
@@ -53,6 +54,11 @@ impl MessageWindow {
                 }
             }
         });
+        // A `#` link's target, or what Tab focused.
+        let reveals = cx.subscribe(&html, |this, _, reveal: &HtmlReveal, cx| {
+            crate::display::html::scroll_to_reveal(&this.scroll, reveal);
+            cx.notify();
+        });
         Self {
             mail,
             app,
@@ -68,6 +74,7 @@ impl MessageWindow {
             focus: cx.focus_handle(),
             hovered: None,
             _links: links,
+            _reveals: reveals,
         }
     }
 

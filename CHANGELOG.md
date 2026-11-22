@@ -163,6 +163,24 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- HTML email: a newsletter inside a form shows instead of nothing; content
+  that fades in at first shows; wide emails are scaled to fit rather than cut
+  off; absolutely positioned content and fixed bars are shown once, in place;
+  sliced images in table cells meet without gaps; old attributes (centered
+  tables, images aligned left or right, cell background images, `<font>`
+  colors and sizes, named `bgcolor`s) apply; a body background reaches the
+  edges; short words in narrow cells no longer break letter by letter.
+- HTML email: blocked images show their alt text, and tracking pixels sized
+  in CSS stay invisible. Images load several at a time, and long newsletters
+  load all of theirs.
+- HTML email in dark colors: an email whose dark styles only swap a logo is
+  no longer shown as light text on a white page; dark text on a pastel
+  color stays dark; black borders and rules turn light; links are readable;
+  SVG images keep their colors.
+- HTML email: `#` links and Tab scroll to their target; the email's own
+  scrolling boxes scroll; double- and triple-click, shift-click and Ctrl/⌘A
+  select text; Chinese, Japanese and Thai words are selected and wrapped as
+  words.
 - Sign-in in the browser no longer fails when a stray connection reaches
   Picacho's sign-in page before the browser does.
 - A message encrypted with OpenPGP in an account other than Pinal Mail no

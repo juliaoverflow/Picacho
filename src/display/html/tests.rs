@@ -397,7 +397,7 @@ fn images_sent_with_the_message_show_by_content_id_even_with_remote_content_bloc
 }
 
 /// A development aid, not a check: renders the HTML file `SNAP_HTML` at
-/// `SNAP_WIDTH` (700) pixels to `SNAP_DIR/usps-{light,dark}-{width}.png`,
+/// `SNAP_WIDTH` (700) pixels to `SNAP_DIR/usps-{light,dark,inverted}-{width}.png`,
 /// with a stand-in picture for each image sent with the message (`cid:`).
 /// `cargo test render_to_png -- --ignored`.
 #[test]
@@ -418,7 +418,7 @@ fn render_to_png() {
         inline.insert(&id, png.into_inner());
     }
     let inline = std::sync::Arc::new(inline);
-    for (tone, name) in [(Tone::Light, "light"), (Tone::NativeDark, "dark")] {
+    for (tone, name) in [(Tone::Light, "light"), (Tone::NativeDark, "dark"), (Tone::InvertedDark, "inverted")] {
         let mut email = EmailDocument::with_parts(&html, inline.clone(), true, tone);
         email.layout(width);
         // The images arrive on the document's thread.

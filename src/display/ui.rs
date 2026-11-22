@@ -92,7 +92,7 @@ mod window;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[path = "shell.rs"]
 mod shell;
-use super::html::{HtmlContextMenu, HtmlLink, HtmlView};
+use super::html::{HtmlContextMenu, HtmlLink, HtmlReveal, HtmlView};
 use crate::manage::composing::{ComposeOpen, ComposeOptions, ReplyPlacement};
 use crate::manage::reading::{EmailTheme, ReadingOptions, message_key};
 use crate::manage::subscriptions::Subscription as MailSubscription;
@@ -2130,6 +2130,11 @@ impl MailApp {
                 HtmlLink::Opened(url) => this.open_email_link(url.clone(), cx),
             }),
         );
+        // A `#` link's target, or what Tab focused, in the reader.
+        subscriptions.push(cx.subscribe(&html_view, |this, _, reveal: &HtmlReveal, cx| {
+            super::html::scroll_to_reveal(&this.reader_scroll, reveal);
+            cx.notify();
+        }));
         // Android's Back, from its back callback (see `platform_back`).
         #[cfg(target_os = "android")]
         {

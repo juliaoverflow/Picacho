@@ -123,12 +123,16 @@ default color. Messages without an HTML part retain the selectable plain
 reader, on a page of the email's color when it differs from the app's.
 
 Blocked remote images keep their size as a dashed outline, so the sender's
-layout holds; images without a size get a small one, and tracking pixels stay
+layout holds; one with alt text shows the text in that box, images without a
+size get a small one, and tracking pixels (sized by attributes or CSS) stay
 invisible. Dark email colors use the email's own `prefers-color-scheme: dark`
-styles when it has them. Otherwise the painted scene is recolored before
-rasterizing (OKLab lightness, hue and chroma kept): grey and pale surfaces
-darken, dark text lightens, saturated brand surfaces and the light text on
-them are kept slightly dimmed, and images are untouched.
+styles when they set backgrounds, unless the email's first screens still come
+out mostly light (only a logo swapped): such an email, like one without dark
+styles, has its painted scene recolored before rasterizing (OKLab lightness,
+hue and chroma kept): grey and pale surfaces darken, dark text lightens,
+borders and rules lighten, saturated brand surfaces and the light text on
+them are kept slightly dimmed, text on a surface that stays light keeps its
+dark color, and images, SVG images included, are untouched.
 
 The "to …" line under the sender opens the message's details: addresses,
 mailed-by (the SPF envelope domain), signed-by (DKIM domains), transport

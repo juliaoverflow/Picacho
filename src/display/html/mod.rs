@@ -3,6 +3,8 @@
 mod document;
 mod resources;
 #[cfg(test)]
+mod rendering_tests;
+#[cfg(test)]
 mod tests;
 mod view;
 mod worker;
@@ -10,7 +12,7 @@ mod worker;
 // Called at startup, not in tests.
 #[cfg_attr(test, allow(unused_imports))]
 pub use document::warm_up;
-pub use view::{HtmlContextMenu, HtmlLink, HtmlView, thumbnail};
+pub use view::{HtmlContextMenu, HtmlLink, HtmlReveal, HtmlView, scroll_to_reveal, thumbnail};
 
 /// An address from an email that may be handed to the system to open: a web
 /// page, or an email link. Anything else (`file:`, `smb:`, UNC paths, an

@@ -1,6 +1,6 @@
 //! GPUI input, clipping and strip caching for an HTML document whose work
 //! happens on its own thread (see `worker.rs`).
-use super::document::{Tone, page_color};
+use super::document::{Scroller, Tone, page_color};
 use super::worker::{self, Command, Output, Update, band_height};
 use crate::manage::model::InlineParts;
 use blitz_traits::events::*;
@@ -37,6 +37,33 @@ pub enum HtmlLink {
     Opened(String),
 }
 
+/// Part of the email to bring into view, in window coordinates: a `#` link's
+/// target (`start`: scroll it to the top) or the element Tab focused (just
+/// into view). The view's owner scrolls (see `scroll_to_reveal`).
+#[derive(Clone, Copy, Debug)]
+pub struct HtmlReveal {
+    pub top: Pixels,
+    pub bottom: Pixels,
+    pub start: bool,
+}
+
+/// Scrolls `handle`'s content to show `reveal`.
+pub fn scroll_to_reveal(handle: &ScrollHandle, reveal: &HtmlReveal) {
+    let view = handle.bounds();
+    let offset = handle.offset();
+    let max = handle.max_offset().y;
+    let margin = px(16.);
+    let by = if reveal.start || reveal.top < view.top() + margin {
+        reveal.top - view.top() - margin
+    } else if reveal.bottom > view.bottom() - margin {
+        (reveal.bottom - view.bottom() + margin).min(reveal.top - view.top() - margin)
+    } else {
+        return;
+    };
+    let y = (offset.y - by).clamp(-max, px(0.));
+    handle.set_offset(point(offset.x, y));
+}
+
 /// The whole email, scaled down, for the collapsed reader.
 struct Thumbnail {
     revision: u64,
@@ -69,9 +96,14 @@ pub struct HtmlView {
     revision: u64,
     laid_out: bool,
     height: f32,
-    /// The width last sent for layout, and the one the latest state used.
+    /// The layout last asked for (width, window height, scale bits), and the
+    /// width the latest state used.
     width: u32,
+    screen: (u32, u32),
     laid_width: u32,
+    /// The email's page color (0xRRGGBB), and its scrollable boxes.
+    page: u32,
+    scrollers: Vec<Scroller>,
     bounds: Bounds<Pixels>,
     focus: FocusHandle,
     cursor: CursorStyle,
@@ -88,6 +120,7 @@ pub struct HtmlView {
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
 impl EventEmitter<HtmlLink> for HtmlView {}
+impl EventEmitter<HtmlReveal> for HtmlView {}
 
 impl HtmlView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -129,7 +162,10 @@ impl HtmlView {
             laid_out: false,
             height: 1.,
             width: 0,
+            screen: (0, 0),
             laid_width: 0,
+            page: page_color(Tone::Light),
+            scrollers: Vec::new(),
             bounds: Bounds::default(),
             focus: cx.focus_handle(),
             cursor: CursorStyle::Arrow,
@@ -174,7 +210,9 @@ impl HtmlView {
         self.thumbnail_requested = None;
         self.requested.clear();
         self.width = 0;
+        self.screen = (0, 0);
         self.laid_width = 0;
+        self.scrollers.clear();
         self.laid_out = false;
         self.selection = None;
         self.cursor = CursorStyle::Arrow;
@@ -217,6 +255,7 @@ impl HtmlView {
         self.blocked = blocked;
         self.clean_links = clean_links;
         self.tone = tone;
+        self.page = page_color(tone);
         self.height = 1.;
         let shown = if clean_links {
             crate::manage::tracking::clean_html_links(html)
@@ -259,6 +298,8 @@ impl HtmlView {
                 height,
                 cursor,
                 selection,
+                page,
+                scrollers,
             } => {
                 self.revision = revision;
                 self.laid_width = width;
@@ -266,7 +307,16 @@ impl HtmlView {
                 self.height = height;
                 self.cursor = cursor;
                 self.selection = selection;
+                self.page = page;
+                self.scrollers = scrollers;
                 cx.notify();
+            }
+            Output::Reveal { top, bottom, start } => {
+                cx.emit(HtmlReveal {
+                    top: self.bounds.top() + px(top),
+                    bottom: self.bounds.top() + px(bottom),
+                    start,
+                });
             }
             Output::Tile {
                 band,
@@ -296,14 +346,12 @@ impl HtmlView {
                 revision,
                 size: (pw, ph),
                 content: (cw, ch),
+                scale,
                 pixels,
             } => {
                 let Some(buffer) = image::RgbaImage::from_raw(pw, ph, pixels) else {
                     return;
                 };
-                let scale = self
-                    .thumbnail_requested
-                    .map_or(1., |(_, _, _, scale)| f32::from_bits(scale));
                 let thumbnail = Thumbnail {
                     revision,
                     image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
@@ -341,7 +389,13 @@ impl HtmlView {
             f32::from(position.y - self.bounds.origin.y),
         )
     }
-    fn pointer(&mut self, position: gpui::Point<Pixels>, kind: u8, pressed: bool) {
+    fn pointer(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        kind: u8,
+        pressed: bool,
+        modifiers: Modifiers,
+    ) {
         if self.worker.is_none() || !self.laid_out {
             return;
         }
@@ -363,7 +417,7 @@ impl HtmlView {
             } else {
                 MouseEventButtons::None
             },
-            mods: Default::default(),
+            mods: blitz_modifiers(modifiers),
             details: Default::default(),
             element: Default::default(),
             active_pointers: Default::default(),
@@ -436,9 +490,18 @@ impl HtmlView {
             return Vec::new();
         }
         let width = f32::from(bounds.size.width).ceil().max(1.) as u32;
-        if self.width != width {
+        let screen = (
+            f32::from(window.viewport_size().height).ceil().max(1.) as u32,
+            window.scale_factor().to_bits(),
+        );
+        if self.width != width || self.screen != screen {
             self.width = width;
-            self.send(Command::Layout(width));
+            self.screen = screen;
+            self.send(Command::Layout {
+                width,
+                height: screen.0,
+                scale: window.scale_factor(),
+            });
         }
         if !self.laid_out {
             return Vec::new();
@@ -498,7 +561,23 @@ impl HtmlView {
 impl HtmlView {
     /// The email's page color, for whatever frames it.
     pub fn page_color(&self) -> u32 {
-        page_color(self.tone)
+        self.page
+    }
+    /// Whether a scroll wheel at `position` scrolls one of the email's own
+    /// boxes, which can still scroll that way, rather than the reader.
+    fn scrolls_inside(&self, position: gpui::Point<Pixels>, delta: gpui::Point<Pixels>) -> bool {
+        let (x, y) = self.local(position);
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+        self.scrollers.iter().rev().any(|s| {
+            x >= s.x
+                && x < s.x + s.width
+                && y >= s.y
+                && y < s.y + s.height
+                && ((dy > 0. && s.up)
+                    || (dy < 0. && s.down)
+                    || (dx > 0. && s.left)
+                    || (dx < 0. && s.right))
+        })
     }
     /// The whole email scaled to the width of `bounds`, cropped to its height.
     fn prepare_thumbnail(
@@ -542,6 +621,16 @@ impl HtmlView {
     }
 }
 
+/// GPUI's modifier keys as Blitz's.
+fn blitz_modifiers(m: Modifiers) -> keyboard_types::Modifiers {
+    let mut out = keyboard_types::Modifiers::empty();
+    out.set(keyboard_types::Modifiers::SHIFT, m.shift);
+    out.set(keyboard_types::Modifiers::CONTROL, m.control);
+    out.set(keyboard_types::Modifiers::ALT, m.alt);
+    out.set(keyboard_types::Modifiers::META, m.platform);
+    out
+}
+
 /// Paints `view`'s email scaled down to fit this element's width.
 pub fn thumbnail(view: Entity<HtmlView>) -> impl IntoElement {
     canvas(
@@ -578,19 +667,21 @@ impl Render for HtmlView {
             .w_full()
             .h(px(if self.laid_out { self.height } else { 160. }))
             .flex_shrink_0()
-            .bg(rgb(page_color(self.tone)))
+            .bg(rgb(self.page))
             .cursor(self.cursor)
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, w, cx| {
                     this.focus.focus(w, cx);
-                    this.pointer(e.position, 1, true);
+                    this.pointer(e.position, 1, true, e.modifiers);
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, e: &MouseUpEvent, _, _| this.pointer(e.position, 2, false)),
+                cx.listener(|this, e: &MouseUpEvent, _, _| {
+                    this.pointer(e.position, 2, false, e.modifiers)
+                }),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -604,24 +695,45 @@ impl Render for HtmlView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
-                this.pointer(e.position, 0, e.pressed_button == Some(MouseButton::Left))
+                this.pointer(
+                    e.position,
+                    0,
+                    e.pressed_button == Some(MouseButton::Left),
+                    e.modifiers,
+                )
+            }))
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, w, cx| {
+                let delta = e.delta.pixel_delta(w.line_height());
+                if this.worker.is_some() && this.laid_out && this.scrolls_inside(e.position, delta) {
+                    let (x, y) = this.local(e.position);
+                    this.send(Command::Wheel {
+                        x,
+                        y,
+                        dx: f32::from(delta.x),
+                        dy: f32::from(delta.y),
+                    });
+                    cx.stop_propagation();
+                }
             }))
             .on_hover(cx.listener(|this, hovered, w, cx| {
                 if !hovered {
-                    this.pointer(w.mouse_position(), 3, false);
+                    this.pointer(w.mouse_position(), 3, false, Modifiers::default());
                     this.hover(None, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                if (if cfg!(target_os = "macos") {
+                let command = if cfg!(target_os = "macos") {
                     e.keystroke.modifiers.platform
                 } else {
                     e.keystroke.modifiers.control
-                }) && e.keystroke.key == "c"
-                {
+                };
+                if command && e.keystroke.key == "c" {
                     if let Some(text) = this.selection.clone() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
+                    cx.stop_propagation();
+                } else if command && e.keystroke.key == "a" {
+                    this.send(Command::SelectAll);
                     cx.stop_propagation();
                 } else if matches!(e.keystroke.key.as_str(), "tab" | "enter" | "space") {
                     let key = match e.keystroke.key.as_str() {
