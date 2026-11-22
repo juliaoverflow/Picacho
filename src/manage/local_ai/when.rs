@@ -473,6 +473,7 @@ impl Parser {
             options: Options::from_locale(),
         }
     }
+    #[cfg(test)]
     pub fn with_options(mut self, options: Options) -> Self {
         self.options = options;
         self

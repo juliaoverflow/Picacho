@@ -1024,7 +1024,6 @@ impl Session {
             notices,
         })
     }
-    /// Every message of a mailbox, newest first, up to `most`.
     /// The ids of a label's unread messages, a page at a time: only the
     /// ids are kept, not every message's listing, which for a large folder
     /// was tens of megabytes at once.
@@ -1040,6 +1039,7 @@ impl Session {
         }
         Ok(out)
     }
+    /// Every message of a mailbox, newest first, up to `most`.
     pub fn list_all(&self, label_id: &str, most: usize) -> Result<Vec<MessageMetadata>> {
         let mut out = Vec::new();
         for page in 0.. {

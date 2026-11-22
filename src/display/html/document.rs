@@ -1173,7 +1173,7 @@ pub(super) fn dark_color([r, g, b, alpha]: [f32; 4], role: Role) -> [f32; 4] {
 fn to_straight_bgra(pixels: &mut [u8]) {
     let (head, words, tail) = bytemuck::pod_align_to_mut::<u8, u32>(pixels);
     if !head.is_empty() || !tail.is_empty() {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             unpremultiply(pixel);
         }
         return;

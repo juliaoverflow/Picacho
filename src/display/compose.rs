@@ -1364,6 +1364,44 @@ pub(super) fn identity_addressed<'a>(
         .find(|i| addressed.contains(&i.email.to_lowercase()))
 }
 
+/// Everyone in `messages`, newest first, up to 2,000, but those in `own`
+/// (lowercase). Recipient lists already read are skipped: mail from lists
+/// is sent to the same few addresses over and over, and parsing every
+/// list of tens of thousands of messages took most of the time.
+pub(super) fn gather_contacts(messages: &[Mail], own: &[String]) -> Vec<(String, String)> {
+    let own: HashSet<&str> = own.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut lists_read: HashSet<&str> = HashSet::new();
+    let mut out = vec![];
+    let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
+    by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
+    for m in by_date {
+        let mut people = vec![(m.sender.clone(), m.from.clone())];
+        for list in [m.to.as_str(), m.cc()] {
+            if !lists_read.insert(list) {
+                continue;
+            }
+            if let Ok(parsed) = crate::sync::smtp::recipients(list) {
+                people.extend(
+                    parsed
+                        .into_iter()
+                        .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
+                );
+            }
+        }
+        for (name, email) in people {
+            let key = email.to_lowercase();
+            if email.contains('@') && !own.contains(key.as_str()) && seen.insert(key) {
+                out.push((name, email));
+            }
+        }
+        if out.len() >= 2000 {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1475,42 +1513,4 @@ mod tests {
         );
         assert!(alias_addressed(&Mail::default(), &aliases).is_none());
     }
-}
-
-/// Everyone in `messages`, newest first, up to 2,000, but those in `own`
-/// (lowercase). Recipient lists already read are skipped: mail from lists
-/// is sent to the same few addresses over and over, and parsing every
-/// list of tens of thousands of messages took most of the time.
-pub(super) fn gather_contacts(messages: &[Mail], own: &[String]) -> Vec<(String, String)> {
-    let own: HashSet<&str> = own.iter().map(String::as_str).collect();
-    let mut seen = HashSet::new();
-    let mut lists_read: HashSet<&str> = HashSet::new();
-    let mut out = vec![];
-    let mut by_date: Vec<&Mail> = messages.iter().filter(|m| !m.pending).collect();
-    by_date.sort_by_key(|m| std::cmp::Reverse(m.date));
-    for m in by_date {
-        let mut people = vec![(m.sender.clone(), m.from.clone())];
-        for list in [m.to.as_str(), m.cc()] {
-            if !lists_read.insert(list) {
-                continue;
-            }
-            if let Ok(parsed) = crate::sync::smtp::recipients(list) {
-                people.extend(
-                    parsed
-                        .into_iter()
-                        .map(|(name, email)| (name.unwrap_or_else(|| email.clone()), email)),
-                );
-            }
-        }
-        for (name, email) in people {
-            let key = email.to_lowercase();
-            if email.contains('@') && !own.contains(key.as_str()) && seen.insert(key) {
-                out.push((name, email));
-            }
-        }
-        if out.len() >= 2000 {
-            break;
-        }
-    }
-    out
 }

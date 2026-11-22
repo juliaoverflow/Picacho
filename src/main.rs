@@ -55,6 +55,11 @@ fn main() -> anyhow::Result<()> {
     // background): show that one rather than open the cache twice.
     let listener = match display::instance::claim(&path) {
         Some(display::instance::Claim::Forwarded) => return Ok(()),
+        // Running already but not answering: opening the cache too would
+        // have two processes check the same accounts.
+        Some(display::instance::Claim::Busy) => {
+            anyhow::bail!("Picacho is already running but isn't responding. Quit it, then open Picacho again.")
+        }
         Some(display::instance::Claim::Primary(listener)) => Some(listener),
         None => None,
     };

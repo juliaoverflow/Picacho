@@ -455,7 +455,7 @@ impl Composer {
                         this.saved = true;
                         cx.emit(ComposerEvent::Saved);
                     }
-                    Err(e) => this.error = Some(e.to_string()),
+                    Err(e) => this.error = Some(format!("{e:#}")),
                 }
                 cx.notify();
             });
@@ -1023,7 +1023,6 @@ impl Composer {
         )
     }
 
-    /// Send Later's menu: quick choices, and a calendar and time of day.
     /// A phone's formatting switch: says what it is and whether it is on,
     /// where the desktop has an icon with a tooltip.
     fn rich_text_toggle(&self, cx: &Context<Self>) -> Stateful<Div> {
@@ -1129,6 +1128,7 @@ impl Composer {
             )
     }
 
+    /// Send Later's menu: quick choices, and a calendar and time of day.
     fn later_menu(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
         div()
@@ -1187,6 +1187,10 @@ impl Composer {
 
     pub(super) fn add_files(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         for p in paths {
+            // The picker's copies in the app's cache are pruned after a
+            // week; the draft keeps its own.
+            #[cfg(target_os = "android")]
+            let p = self.backend.adopt_picked(&self.draft.id, p);
             if p.is_file() && !self.draft.attachments.contains(&p) {
                 self.draft.attachments.push(p);
             }
@@ -2515,14 +2519,6 @@ impl Render for Composer {
             .child(self.footer(cx))
             // A phone shows Send Later as a page over the message.
             .when(self.mobile && self.later_open, |d| d.child(self.later_page(cx)))
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    match bytes {
-        0..1024 => format!("{bytes} B"),
-        1024..1_048_576 => format!("{} KB", bytes / 1024),
-        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
     }
 }
 

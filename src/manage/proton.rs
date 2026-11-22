@@ -928,23 +928,27 @@ impl Backend {
             {
                 return Err(e);
             }
-            if !pending.is_empty() {
-                self.save_draft_removals(&a.id, &[])?;
-            }
-            let on_server: Vec<String> = s
-                .list_all(label_id::DRAFTS, 1000)?
+            self.clear_draft_removals(&a.id, &pending)?;
+            // Only a complete listing shows that a draft missing from it is
+            // gone: `list_all` stops at its limit, so one more is asked for.
+            const MOST: usize = 20_000;
+            let mut on_server: Vec<String> = s
+                .list_all(label_id::DRAFTS, MOST + 1)?
                 .into_iter()
                 .map(|m| m.id)
                 .collect();
+            let complete = on_server.len() <= MOST;
+            on_server.truncate(MOST);
+            let listed: std::collections::HashSet<&str> = on_server.iter().map(String::as_str).collect();
             let mut changed = 0;
             let mut locals = self.store.drafts(&a.id)?;
             // Copies gone from Proton (sent or deleted elsewhere): unchanged
             // drafts go here too; changed ones upload again.
             for d in &mut locals {
-                let Some(id) = d.remote.as_ref().and_then(proton_draft).map(str::to_owned) else {
+                let Some(id) = d.remote.as_ref().and_then(proton_draft) else {
                     continue;
                 };
-                if on_server.contains(&id) {
+                if !complete || listed.contains(id) {
                     continue;
                 }
                 if d.uploaded == d.fingerprint() {
@@ -958,11 +962,12 @@ impl Backend {
             }
             locals.retain(|d| !d.id.is_empty());
             // Drafts written elsewhere.
+            let claimed: std::collections::HashSet<String> = locals
+                .iter()
+                .filter_map(|d| d.remote.as_ref().and_then(proton_draft).map(str::to_owned))
+                .collect();
             for id in &on_server {
-                if locals
-                    .iter()
-                    .any(|d| d.remote.as_ref().and_then(proton_draft) == Some(id.as_str()))
-                {
+                if claimed.contains(id) {
                     continue;
                 }
                 let raw = s.literal(id)?;
@@ -985,7 +990,16 @@ impl Backend {
                 }
                 // Proton keeps drafts encrypted itself; drafts to be
                 // encrypted without a key of yours stay here.
-                if d.encrypt && self.draft_upload(a, d)?.is_none() {
+                if d.encrypt && self.draft_seal(a, d)?.is_none() {
+                    // Its earlier copy is no longer it.
+                    if let Some(old) = d.remote.as_ref().and_then(proton_draft) {
+                        if let Err(e) = s.delete(&[old.to_owned()])
+                            && crate::sync::retry::later(&e)
+                        {
+                            return Err(e);
+                        }
+                        self.keep_draft_here(d)?;
+                    }
                     continue;
                 }
                 let raw = crate::sync::smtp::build(a, d, true)?.formatted();
@@ -993,12 +1007,12 @@ impl Backend {
                 if let Some(old) = d.remote.as_ref().and_then(proton_draft) {
                     let _ = s.delete(&[old.to_owned()]);
                 }
-                // A composer may have saved a newer version meanwhile; it
-                // keeps its words, and uploads again next time.
-                let mut current = self.store.draft(&d.id)?.unwrap_or_else(|| d.clone());
-                current.remote = Some(proton_remote(&id));
-                current.uploaded = fingerprint;
-                self.store.save_draft(&current)?;
+                if !self.finish_draft_upload(d, proton_remote(&id), fingerprint)?
+                    && s.delete(std::slice::from_ref(&id)).is_err()
+                {
+                    // Discarded while uploading: its new copy goes too.
+                    self.queue_draft_removal(&a.id, proton_remote(&id))?;
+                }
             }
             Ok(changed)
         })

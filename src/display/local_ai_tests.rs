@@ -218,6 +218,15 @@ fn the_models_list_shows_progress_and_deleting_asks_which_features_stop(cx: &mut
         assert!(this.model_confirm.is_none() && this.modal == Some(Modal::Settings))
     });
     assert!(local_ai::OTP.is_installed(&store));
+    // Like the app's other dialogs, its header has a close button.
+    act(&view, Action::AskDeleteModel("otp".into()), cx);
+    frame(cx);
+    let close = cx.debug_bounds("delete-model-sheet-close").expect("a close button");
+    cx.simulate_click(close.center(), Modifiers::none());
+    view.read_with(cx, |this, _| {
+        assert!(this.model_confirm.is_none() && this.modal == Some(Modal::Settings))
+    });
+    assert!(local_ai::OTP.is_installed(&store));
 
     act(&view, Action::AskDeleteModel("otp".into()), cx);
     act(&view, Action::DeleteModel("otp".into()), cx);

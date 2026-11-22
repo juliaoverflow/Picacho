@@ -35,6 +35,14 @@ public final class GpuiPathPicker extends Activity {
     private static final int PICK = 1;
     /** Copies older than this are deleted when picking again. */
     private static final long KEEP_MS = 7L * 24 * 60 * 60 * 1000;
+    /**
+     * The most one pick copies, per file and in all: as much as a message
+     * may attach (smtp.rs), so a large selection can't fill the device.
+     */
+    private static final long MAX_FILE = 100L * 1024 * 1024;
+    private static final long MAX_TOTAL = 100L * 1024 * 1024;
+    /** Space left free on the device after copying. */
+    private static final long KEEP_FREE = 200L * 1024 * 1024;
 
     /** One prompt at a time. */
     private static final Object prompts = new Object();
@@ -117,6 +125,7 @@ public final class GpuiPathPicker extends Activity {
         prune(picked);
         List<String> paths = new ArrayList<>();
         ContentResolver resolver = getContentResolver();
+        long total = 0;
         for (Uri uri : uris) {
             File dir = new File(picked, UUID.randomUUID().toString());
             if (!dir.mkdirs()) {
@@ -129,10 +138,17 @@ public final class GpuiPathPicker extends Activity {
                     continue;
                 }
                 byte[] buffer = new byte[64 * 1024];
+                long size = 0;
                 int n;
                 while ((n = in.read(buffer)) > 0) {
+                    size += n;
+                    if (size > MAX_FILE || total + size > MAX_TOTAL
+                            || picked.getUsableSpace() < KEEP_FREE + n) {
+                        throw new IOException("picked files are too large to attach");
+                    }
                     out.write(buffer, 0, n);
                 }
+                total += size;
                 paths.add(file.getAbsolutePath());
             } catch (IOException | SecurityException e) {
                 Log.w(TAG, "could not copy a picked file", e);
@@ -163,7 +179,10 @@ public final class GpuiPathPicker extends Activity {
         return name.isEmpty() ? "file" : name;
     }
 
-    /** Deletes earlier copies past KEEP_MS (drafts may still use newer ones). */
+    /**
+     * Deletes earlier copies past KEEP_MS. Drafts don't refer to these: the
+     * composer moves each file it attaches into the draft's own files.
+     */
     private static void prune(File picked) {
         File[] dirs = picked.listFiles();
         if (dirs == null) {

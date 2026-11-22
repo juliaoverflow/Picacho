@@ -909,7 +909,7 @@ impl Store {
                     continue;
                 }
                 scanned += 1;
-                let from = row.from_line();
+                let from = row.sender_line();
                 if !row.content
                     && row.date >= download_since
                     && receipts::worth_downloading(&row.subject, &from)
@@ -1448,14 +1448,31 @@ impl Store {
     /// a few at a time (see `compact_on_quit` for one that can't yet).
     /// Returns how many sources were moved.
     pub fn pack_saved_sources(&self) -> Result<usize> {
-        let ids: Vec<String> = {
+        // Batches of at most 50 sources and about 16 MiB of them, so a few
+        // large attachments don't make one batch hundreds of MiB.
+        const BATCH_BYTES: u64 = 16 * 1024 * 1024;
+        let ids: Vec<(String, u64)> = {
             let db = self.read();
-            let mut q = db.prepare("SELECT id FROM messages WHERE raw IS NOT NULL")?;
-            q.query_map([], |r| r.get(0))?
+            let mut q = db.prepare("SELECT id, length(raw) FROM messages WHERE raw IS NOT NULL")?;
+            q.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64)))?
                 .collect::<rusqlite::Result<_>>()?
         };
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut bytes = 0;
+        for (id, len) in ids {
+            match batches.last_mut() {
+                Some(batch) if batch.len() < 50 && bytes + len <= BATCH_BYTES => {
+                    bytes += len;
+                    batch.push(id);
+                }
+                _ => {
+                    bytes = len;
+                    batches.push(vec![id]);
+                }
+            }
+        }
         let mut packed = 0;
-        for chunk in ids.chunks(50) {
+        for chunk in &batches {
             let rows: Vec<(String, Vec<u8>)> = {
                 let db = self.read();
                 let mut q = db.prepare("SELECT raw FROM messages WHERE id=?1 AND raw IS NOT NULL")?;
@@ -1921,6 +1938,15 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Saves a draft only if it is still here (not discarded meanwhile).
+    /// Returns whether it was.
+    pub fn update_draft(&self, d: &Draft) -> Result<bool> {
+        let changed = self.write().execute(
+            "UPDATE drafts SET account=?2, data=?3 WHERE id=?1",
+            params![d.id, d.account, serde_json::to_string(d)?],
+        )?;
+        Ok(changed > 0)
+    }
     pub fn drafts(&self, account: &str) -> Result<Vec<Draft>> {
         let db = self.read();
         let mut q = db.prepare("SELECT data FROM drafts WHERE account=?1 ORDER BY rowid DESC")?;
@@ -1943,6 +1969,19 @@ impl Store {
         let data: Option<String> = self
             .read()
             .query_row("SELECT data FROM drafts WHERE id=?1", [id], |r| r.get(0))
+            .optional()?;
+        Ok(match data {
+            Some(data) => Some(serde_json::from_str(&data)?),
+            None => None,
+        })
+    }
+    /// Deletes a draft, returning it as it was when deleted: a sync saving
+    /// it at the same moment either finds it gone or is returned here.
+    pub fn take_draft(&self, id: &str) -> Result<Option<Draft>> {
+        use rusqlite::OptionalExtension;
+        let data: Option<String> = self
+            .write()
+            .query_row("DELETE FROM drafts WHERE id=?1 RETURNING data", [id], |r| r.get(0))
             .optional()?;
         Ok(match data {
             Some(data) => Some(serde_json::from_str(&data)?),
@@ -2140,7 +2179,7 @@ struct ScanRow {
 
 impl ScanRow {
     /// Its sender as "Name <address>".
-    fn from_line(&self) -> String {
+    fn sender_line(&self) -> String {
         format!("{} <{}>", self.sender, self.from)
     }
     fn folder(&self) -> Folder {
@@ -2624,7 +2663,6 @@ mod tests {
     }
 }
 
-/// Inputs validated before a mailbox snapshot is committed.
 /// A cached message's state as the server reports it now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlagUpdate {
@@ -2649,6 +2687,7 @@ pub struct MailboxState {
     /// The account's sync window (days) these results used.
     pub days: u32,
 }
+/// Inputs validated before a mailbox snapshot is committed.
 pub struct MailboxSnapshot<'a> {
     pub account: &'a str,
     pub mailbox: &'a Mailbox,

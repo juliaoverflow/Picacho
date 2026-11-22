@@ -147,6 +147,8 @@ jobs:
           # "beta" makes the app Picacho Beta, its version "Beta Build".
           PICACHO_CHANNEL: ${{ needs.prepare.outputs.channel == 'beta' && 'beta' || '' }}
           PICACHO_BUILD_NUMBER: ${{ needs.prepare.outputs.version }}
+          # Optional pin: the release certificate's SHA-256 digest (hex).
+          PICACHO_CERT_SHA256: ${{ vars.PICACHO_CERT_SHA256 }}
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           # Pull requests build with the debug key; releases need the release key.
@@ -156,6 +158,26 @@ jobs:
           elif [ "$PUBLISH" = true ]; then
             echo "::error::The PICACHO_KEYSTORE_BASE64 secret is not set"
             exit 1
+          fi
+          # The release certificate's digest, from the keystore (and the pin,
+          # when set), to compare each APK's signer against.
+          expected=
+          if [ "$PUBLISH" = true ]; then
+            # Step by step: without pipefail, a failed export would give the
+            # digest of nothing.
+            if ! keytool -exportcert -alias "$PICACHO_KEY_ALIAS" -keystore "$PICACHO_KEYSTORE" \
+                -storepass:env PICACHO_KEYSTORE_PASSWORD -file "$RUNNER_TEMP/release.der" \
+              || [ ! -s "$RUNNER_TEMP/release.der" ]; then
+              echo "::error::Could not read the release certificate"
+              exit 1
+            fi
+            expected=$(sha256sum "$RUNNER_TEMP/release.der" | cut -d' ' -f1)
+            rm -f "$RUNNER_TEMP/release.der"
+            pin=$(printf '%s' "$PICACHO_CERT_SHA256" | tr -d ': ' | tr 'A-F' 'a-f')
+            if [ -n "$pin" ] && [ "$pin" != "$expected" ]; then
+              echo "::error::The release keystore's certificate is not the pinned one"
+              exit 1
+            fi
           fi
           sh scripts/build-android.sh
           rm -f "$RUNNER_TEMP/picacho-release.jks"
@@ -168,7 +190,15 @@ jobs:
           apksigner=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)/apksigner
           for apk in out/*.apk; do
             "$apksigner" verify --print-certs "$apk" > signer.txt
-            if [ "$PUBLISH" = true ]; then grep -q "CN=Picacho, O=Pinal Tech" signer.txt; fi
+            if [ "$PUBLISH" = true ]; then
+              # Exactly one signer, whose certificate is the release key's.
+              digests=$(grep 'certificate SHA-256 digest:' signer.txt | awk '{print $NF}' | tr 'A-F' 'a-f')
+              if [ "$(printf '%s\n' "$digests" | grep -c .)" != 1 ] || [ "$digests" != "$expected" ]; then
+                echo "::error::$apk is not signed with the release key"
+                cat signer.txt
+                exit 1
+              fi
+            fi
           done
       - uses: actions/upload-artifact@v4
         with:

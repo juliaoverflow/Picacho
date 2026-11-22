@@ -902,7 +902,7 @@ impl MailApp {
     /// sidebar, and leaves a view that is no longer listed.
     pub(super) fn views_changed(&mut self, cx: &mut Context<Self>) {
         if let Err(e) = fwd::save(&self.backend.store, &self.forwarding) {
-            self.notice(e.to_string(), true, cx);
+            self.notice(format!("{e:#}"), true, cx);
         }
         self.sync_tree();
         let gone = match self.account.as_deref() {
@@ -1843,7 +1843,7 @@ mod tests {
                 address: format!("ra+secret{i}@simplelogin.co"),
                 blocked: i == 3,
                 last_sent: (i % 2 == 0).then_some(1_700_000_000 + i as i64),
-                stats: (i % 3 == 0).then(|| fwd::ContactStats {
+                stats: (i % 3 == 0).then_some(fwd::ContactStats {
                     received_recent: 1,
                     received: i as u64,
                     sent_recent: 0,

@@ -210,26 +210,33 @@ fn fetch_all(
             break;
         }
         let result = client.filter(|_| proxies.admits(&request.url)).and_then(|client| {
-            let left = MAX_TOTAL_BYTES.saturating_sub(fetched.load(Ordering::Relaxed));
-            let limit = MAX_BYTES.min(left);
-            let mut response = client
-                .get(request.url.clone())
-                .send()
-                .ok()?
-                .error_for_status()
-                .ok()?;
-            if response.content_length().is_some_and(|n| n > limit) {
-                return None;
-            }
-            let resolved = response.url().to_string();
-            let mut bytes = Vec::new();
-            response
-                .by_ref()
-                .take(limit + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            fetched.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            (bytes.len() as u64 <= limit && admit(&bytes, pixels)).then_some((resolved, bytes))
+            // This fetch's share of the email's budget, taken before it
+            // starts so fetches at once can't spend the same bytes; what it
+            // doesn't use is given back.
+            let limit = reserve(fetched)?;
+            let mut used = 0;
+            let result = (|| {
+                let mut response = client
+                    .get(request.url.clone())
+                    .send()
+                    .ok()?
+                    .error_for_status()
+                    .ok()?;
+                if response.content_length().is_some_and(|n| n > limit) {
+                    return None;
+                }
+                let resolved = response.url().to_string();
+                let mut bytes = Vec::new();
+                response
+                    .by_ref()
+                    .take(limit + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                used = (bytes.len() as u64).min(limit);
+                (bytes.len() as u64 <= limit && admit(&bytes, pixels)).then_some((resolved, bytes))
+            })();
+            fetched.fetch_sub(limit - used, Ordering::AcqRel);
+            result
         });
         if stopped.load(Ordering::Relaxed) {
             break;
@@ -241,6 +248,18 @@ fn fetch_all(
         // sees the change.
         pending.fetch_sub(1, Ordering::AcqRel);
     }
+}
+/// Takes up to `MAX_BYTES` of what is left of `MAX_TOTAL_BYTES`; `None`
+/// when nothing is.
+fn reserve(fetched: &AtomicU64) -> Option<u64> {
+    let mut limit = 0;
+    fetched
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+            limit = MAX_BYTES.min(MAX_TOTAL_BYTES.saturating_sub(spent));
+            (limit > 0).then_some(spent + limit)
+        })
+        .ok()?;
+    Some(limit)
 }
 pub fn remote_url(url: &url::Url) -> bool {
     matches!(url.scheme(), "http" | "https")
@@ -443,13 +462,27 @@ mod tests {
     use blitz_traits::net::{NetHandler, Request};
     use std::prelude::v1::test;
 
+    /// Fetches at once take their shares of an email's byte budget before
+    /// they start, so together they can't spend more than it.
+    #[test]
+    fn fetches_reserve_the_byte_budget() {
+        let fetched = AtomicU64::new(0);
+        let mut reserved = 0;
+        while let Some(limit) = reserve(&fetched) {
+            assert!(limit <= MAX_BYTES);
+            reserved += limit;
+        }
+        assert_eq!(reserved, MAX_TOTAL_BYTES);
+        // What a fetch doesn't use is given back.
+        fetched.fetch_sub(1000, Ordering::AcqRel);
+        assert_eq!(reserve(&fetched), Some(1000));
+    }
+
     struct Ignore;
     impl NetHandler for Ignore {
         fn bytes(self: Box<Self>, _: String, _: Bytes) {}
     }
 
-    /// An email whose remote content is blocked never starts the fetcher
-    /// (its thread and HTTP client); one that isn't, on its first request.
     /// An image that decodes to too many pixels isn't handed over, nor are
     /// more pixels than an email may have in all; anything else is.
     #[test]
@@ -523,6 +556,8 @@ mod tests {
         }
     }
 
+    /// An email whose remote content is blocked never starts the fetcher
+    /// (its thread and HTTP client); one that isn't, on its first request.
     #[test]
     fn the_fetcher_starts_only_for_remote_content() {
         let make = |blocked| Resources::new(blocked, Default::default(), Arc::default(), Arc::default(), Arc::default());

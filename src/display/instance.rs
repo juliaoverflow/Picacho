@@ -12,7 +12,7 @@
 //! dies): two launches at once can't both replace the socket and run on the
 //! same mail cache.
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -29,7 +29,16 @@ pub enum Claim {
     Primary(Listener),
     /// Another Picacho is running and was asked to show its window.
     Forwarded,
+    /// Another Picacho holds the lock but didn't answer: this one must not
+    /// open the same mail cache.
+    Busy,
 }
+
+/// The most a launch's message may be: a key and a word. Anything longer
+/// is read no further.
+const MAX_LINE: u64 = 128;
+/// How long a launch has to say it, in all.
+const SAY_WITHIN: Duration = Duration::from_secs(2);
 
 /// Listens for later launches; see [`Listener::serve`].
 pub struct Listener {
@@ -99,7 +108,7 @@ pub fn claim(dir: &Path) -> Option<Claim> {
                     return Some(Claim::Forwarded);
                 }
             }
-            None
+            Some(Claim::Busy)
         }
         // No locking here: as before, the socket alone.
         Err(_) => listen(path, None).ok().map(Claim::Primary),
@@ -195,13 +204,12 @@ impl Listener {
                     let Ok(stream) = stream else {
                         continue;
                     };
-                    // A launch that connects and says nothing can't hold
-                    // the next one up for long.
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut line = String::new();
-                    if BufReader::new(stream).read_line(&mut line).is_err() {
+                    // A launch that connects and says nothing, or a great
+                    // deal slowly, can't hold the next one up for long: a
+                    // few bytes, within a deadline for them all.
+                    let Some(line) = read_message(stream) else {
                         continue;
-                    }
+                    };
                     #[cfg(windows)]
                     let line = match line.trim().split_once(' ') {
                         Some((key, rest)) if key == self.key => rest.to_owned(),
@@ -217,6 +225,50 @@ impl Listener {
             eprintln!("Picacho: later launches can't reach this one");
         }
         path
+    }
+}
+
+/// The line a launch sends, read within `SAY_WITHIN` and `MAX_LINE`.
+fn read_message<S: Read + Timed>(stream: S) -> Option<String> {
+    let deadline = std::time::Instant::now() + SAY_WITHIN;
+    let mut reader = BufReader::new(stream.take(MAX_LINE));
+    let mut line = Vec::new();
+    loop {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        if left.is_zero() {
+            return None;
+        }
+        reader.get_ref().get_ref().timeout(left).ok()?;
+        let buffer = reader.fill_buf().ok()?;
+        if buffer.is_empty() {
+            // Closed, or `MAX_LINE` reached.
+            break;
+        }
+        if let Some(end) = buffer.iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&buffer[..end]);
+            break;
+        }
+        let n = buffer.len();
+        line.extend_from_slice(buffer);
+        reader.consume(n);
+    }
+    String::from_utf8(line).ok()
+}
+
+/// A stream whose reads can be given a timeout.
+trait Timed {
+    fn timeout(&self, left: Duration) -> std::io::Result<()>;
+}
+#[cfg(unix)]
+impl Timed for std::os::unix::net::UnixStream {
+    fn timeout(&self, left: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(left))
+    }
+}
+#[cfg(windows)]
+impl Timed for std::net::TcpStream {
+    fn timeout(&self, left: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(left))
     }
 }
 
@@ -236,6 +288,24 @@ pub fn release(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch's message is read to its line's end, and no further than
+    /// a few bytes however much is sent.
+    #[cfg(unix)]
+    #[test]
+    fn messages_are_short() {
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.write_all(b"show\nmore").unwrap();
+        assert_eq!(read_message(b).as_deref(), Some("show"));
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.write_all(&[b'x'; 4096]).unwrap();
+        assert_eq!(read_message(b).map(|l| l.len()), Some(MAX_LINE as usize));
+        // Saying nothing: given up on after the deadline.
+        let (_a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(read_message(b), None);
+        assert!(start.elapsed() < SAY_WITHIN + Duration::from_secs(1));
+    }
 
     #[test]
     fn one_process_holds_the_lock() {

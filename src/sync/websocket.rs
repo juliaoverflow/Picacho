@@ -240,7 +240,7 @@ impl<S: Read + Write> Socket<S> {
                     let _ = self.send_frame(0x8, &payload);
                     return Ok(Incoming::Closed);
                 }
-                0x0 | 0x1 | 0x2 => {
+                0x0..=0x2 => {
                     message.extend_from_slice(&payload);
                     if fin {
                         if opcode == 0x2 {

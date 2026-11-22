@@ -971,115 +971,77 @@ impl MailApp {
             return div().into_any_element();
         };
         let features: Vec<&str> = model.features.to_vec();
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(rgba(0x101c2c55))
+        let content = div()
             .flex()
-            .items_center()
-            .justify_center()
-            .p_4()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .flex_col()
+            .gap_2()
             .child(
                 div()
-                    .id("delete-model-sheet")
-                    .debug_selector(|| "delete-model-sheet".into())
-                    .w(px(400.))
-                    .max_w_full()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format!(
+                        "Delete the {} ({})?",
+                        model.label.to_lowercase(),
+                        mb(model.installed_size(&self.backend.store))
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if features.len() == 1 {
+                        "Deleting it turns off this feature:"
+                    } else {
+                        "Deleting it turns off these features:"
+                    }),
+            )
+            .children(features.into_iter().map(|f| {
+                div()
                     .flex()
-                    .flex_col()
-                    .rounded(px(14.))
-                    .border_1()
-                    .border_color(rgb(c.border))
-                    .bg(rgb(c.surface))
-                    .shadow_2xl()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .px_5()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(rgb(c.border))
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Delete Model"),
-                    )
-                    .child(
-                        div()
-                            .p_5()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(format!(
-                                        "Delete the {} ({})?",
-                                        model.label.to_lowercase(),
-                                        mb(model.installed_size(&self.backend.store))
-                                    )),
-                            )
-                            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(
-                                if features.len() == 1 {
-                                    "Deleting it turns off this feature:"
-                                } else {
-                                    "Deleting it turns off these features:"
-                                },
-                            ))
-                            .children(features.into_iter().map(|f| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_size(px(13.))
-                                    .child(icon_el("close", 12., c.danger))
-                                    .child(f)
-                            }))
-                            .child(
-                                div().text_size(px(12.)).text_color(rgb(c.muted)).child(
-                                    "Turning the feature on again downloads the model again.",
-                                ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .px_5()
-                            .py_3()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .border_t_1()
-                            .border_color(rgb(c.border))
-                            .child(div().flex_1())
-                            .child(self.button(
-                                "delete-model-cancel",
-                                "Cancel",
-                                "",
-                                Action::CloseModelSheet,
-                                false,
-                                cx,
-                            ))
-                            .child(
-                                self.button(
-                                    "delete-model-confirm",
-                                    "Delete",
-                                    "",
-                                    Action::DeleteModel(model.id.into()),
-                                    true,
-                                    cx,
-                                )
-                                .bg(rgb(c.danger)),
-                            ),
-                    ),
-            )
-            .with_animation(
-                ("delete-model-sheet", self.menu_anim),
-                Animation::new(Duration::from_millis(140)).with_easing(|t| 1. - (1. - t).powi(3)),
-                |d, t| d.opacity(t),
-            )
-            .into_any_element()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(13.))
+                    .child(icon_el("close", 12., c.danger))
+                    .child(f)
+            }))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child("Turning the feature on again downloads the model again."),
+            );
+        let footer = div()
+            .child(div().flex_1())
+            .child(self.button(
+                "delete-model-cancel",
+                "Cancel",
+                "",
+                Action::CloseModelSheet,
+                false,
+                cx,
+            ))
+            .child(
+                self.button(
+                    "delete-model-confirm",
+                    "Delete",
+                    "",
+                    Action::DeleteModel(model.id.into()),
+                    true,
+                    cx,
+                )
+                .bg(rgb(c.danger)),
+            );
+        self.sheet_over_settings(
+            super::settings::Sheet {
+                id: "delete-model-sheet",
+                title: "Delete Model",
+                width: 400.,
+                close: Action::CloseModelSheet,
+            },
+            content,
+            Some(footer),
+            cx,
+        )
     }
 }
 

@@ -263,9 +263,6 @@ fn http() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-/// The Google account's profile picture, if it has one. The sign-in's
-/// `profile` scope covers the OpenID userinfo endpoint; the image itself is
-/// only fetched from Google's own content host.
 /// The Gravatar picture for an address, or `None` when it has none. Only
 /// the SHA-256 hash of the address leaves this computer.
 pub fn gravatar(email: &str) -> Result<Option<Vec<u8>>> {
@@ -293,6 +290,9 @@ pub fn gravatar(email: &str) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// The Google account's profile picture, if it has one. The sign-in's
+/// `profile` scope covers the OpenID userinfo endpoint; the image itself is
+/// only fetched from Google's own content host.
 pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
     let client = reqwest::blocking::Client::builder()

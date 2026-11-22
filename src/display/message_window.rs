@@ -253,7 +253,7 @@ impl Render for MessageWindow {
                 .border_color(rgb(c.border))
                 .text_size(px(12.))
                 .child(icon_el("paperclip", 14., c.muted))
-                .child(format!("{}  ·  {} KB", a.name, a.size / 1024))
+                .child(format!("{}  ·  {}", a.name, human_size(a.size as u64)))
         });
         let toolbar = super::window::detached_bar("message-titlebar", c)
             .child(icon_el("mail", 15., c.muted))

@@ -331,7 +331,7 @@ impl MailApp {
                     let result = std::fs::write(&path, text);
                     let _ = this.update(cx, |this, cx| match result {
                         Ok(()) => this.notice("Public key saved", false, cx),
-                        Err(e) => this.notice(e.to_string(), true, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
                     });
                 })
                 .detach();
