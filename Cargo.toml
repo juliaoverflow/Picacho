@@ -345,10 +345,13 @@ libc = "0.2"
 # https://github.com/pinaltech/Picacho-Patches
 # After changing that repository, run `cargo update -p gpui` to use it here.
 # An email's unresolvable image or link address no longer panics; text in
-# padded inline blocks and centered cells is hit (selected, clicked) where shown.
-blitz-dom = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# padded inline blocks and centered cells is hit (selected, clicked) where shown;
+# blocks directly in a table (columns restacked for phones) are laid out.
+# TEMPORARY: the local fix/blitz-table-block-children branch until it is merged;
+# then back to the git dependency and `cargo update -p blitz-dom -p blitz-paint`.
+blitz-dom = { path = "../Picacho-Patches/blitz-dom/crate" }
 # Inline boxes paint gradient backgrounds (emails' dark styles).
-blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+blitz-paint = { path = "../Picacho-Patches/blitz-paint/crate" }
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,

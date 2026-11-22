@@ -478,6 +478,41 @@ fn tables_restacked_for_narrow_screens_keep_their_rows() {
 }
 
 #[test]
+fn columns_restacked_as_blocks_in_a_div_table_stack_for_narrow_screens() {
+    // Klaviyo's templates lay columns out as `display: table-cell` divs in a
+    // `display: table` div, and below 480 pixels make them `display: block`.
+    // Blocks directly in a table each get an anonymous row and cell in CSS;
+    // they vanished, and the email showed only what was outside them.
+    let html = "<style>@media only screen and (max-width: 480px) {\
+         div.row div.col { display: block !important; width: 100% !important } }</style>\
+         <body style='margin:0'>\
+         <div class='row' style='display:table;table-layout:fixed;width:100%'>\
+         <div class='col' id='a' style='display:table-cell;width:50%;background:#ff0000'>\
+         <div style='height:60px'>One</div></div>\
+         <div class='col' id='b' style='display:table-cell;width:50%;background:#0000ff'>\
+         <div style='height:60px'>Two</div></div>\
+         </div><div id='after' style='height:20px'>After</div></body>";
+    let mut email = EmailDocument::new(html, true);
+    // Wide: side by side.
+    email.layout(600);
+    let (ax, ay, _, _) = element_box(&email, "a");
+    let (bx, by, _, _) = element_box(&email, "b");
+    assert!(bx > ax && (by - ay).abs() < 1., "side by side: a {ax},{ay} b {bx},{by}");
+    // Narrow: stacked, full width, and the content after them below both.
+    email.layout(380);
+    let (_, ay, aw, ah) = element_box(&email, "a");
+    let (bx, by, bw, bh) = element_box(&email, "b");
+    let (_, after, _, _) = element_box(&email, "after");
+    assert!(aw > 370. && bw > 370., "full width: {aw} and {bw}");
+    assert!(ah >= 60. && bh >= 60., "laid out: {ah} and {bh}");
+    assert!(by >= ay + ah - 1., "stacked: a at {ay}+{ah}, b at {by}");
+    assert!(after >= by + bh - 1., "after both: {after}");
+    // Each paints its own background (not a row's, on the other).
+    assert_eq!(color_at(&mut email, 10., ay + ah / 2.), [255, 0, 0]);
+    assert_eq!(color_at(&mut email, bx + 10., by + bh / 2.), [0, 0, 255]);
+}
+
+#[test]
 fn cellspacing_and_cellpadding_attributes_apply() {
     let mut email = EmailDocument::new(
         "<body style='margin:0;background:#ffffff'>\
