@@ -1,8 +1,10 @@
 // Picacho's Windows resources: the icon (ID 1, which GPUI loads for its
 // windows, and Explorer, the taskbar and the installer show) and version
 // information. GPUI embeds the application manifest itself. Compiled by
-// build.rs, which defines PICACHO_VERSION and PICACHO_VERSION_COMMAS.
+// build.rs, which writes PICACHO_VERSION and PICACHO_VERSION_COMMAS to
+// picacho_version.h in OUT_DIR.
 #include <winver.h>
+#include "picacho_version.h"
 
 1 ICON "picacho.ico"
 

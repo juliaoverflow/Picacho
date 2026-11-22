@@ -24,7 +24,9 @@ fn main() {
 
 /// The icon (resource 1, which GPUI gives its windows) and version
 /// information, from packaging/windows/picacho.rc: windres for the GNU
-/// target, RC.EXE for MSVC.
+/// target, RC.EXE for MSVC. The version is written to a header in
+/// OUT_DIR, which both compilers search: a quoted string defined on the
+/// command line needs escaping that RC.EXE and windres read differently.
 fn resources() {
     println!("cargo:rerun-if-changed=packaging/windows/picacho.rc");
     println!("cargo:rerun-if-changed=packaging/windows/picacho.ico");
@@ -35,14 +37,17 @@ fn resources() {
         .map(|p| p.parse::<u16>().unwrap_or(0).to_string())
         .collect();
     parts.resize(4, "0".into());
-    let defines = [
-        format!("PICACHO_VERSION=\\\"{version}\\\""),
-        format!("PICACHO_VERSION_COMMAS={}", parts.join(",")),
-    ];
+    let out = std::env::var("OUT_DIR").unwrap();
+    let header = format!(
+        "#define PICACHO_VERSION \"{version}\"\n#define PICACHO_VERSION_COMMAS {}\n",
+        parts.join(",")
+    );
+    std::fs::write(Path::new(&out).join("picacho_version.h"), header)
+        .expect("couldn't write the version header");
     embed_resource::compile_for(
         "packaging/windows/picacho.rc",
         ["picacho"],
-        embed_resource::ParamsMacros(defines.iter()),
+        embed_resource::NONE,
     )
     .manifest_optional()
     .unwrap();
