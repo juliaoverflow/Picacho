@@ -7,6 +7,10 @@ on:
     branches: [dev]
   pull_request:
 
+# Tests need nothing but to read the code.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test

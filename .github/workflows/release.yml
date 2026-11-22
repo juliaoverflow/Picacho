@@ -136,9 +136,12 @@ jobs:
           tool: cargo-ndk
       - name: Build APKs
         env:
-          PICACHO_KEYSTORE_BASE64: ${{ secrets.PICACHO_KEYSTORE_BASE64 }}
-          PICACHO_KEYSTORE_PASSWORD: ${{ secrets.PICACHO_KEYSTORE_PASSWORD }}
-          PICACHO_KEY_PASSWORD: ${{ secrets.PICACHO_KEYSTORE_PASSWORD }}
+          # Only builds that publish get the release key: a pull request's
+          # build runs the pull request's code (build scripts, Gradle), which
+          # must never see it.
+          PICACHO_KEYSTORE_BASE64: ${{ needs.prepare.outputs.publish == 'true' && secrets.PICACHO_KEYSTORE_BASE64 || '' }}
+          PICACHO_KEYSTORE_PASSWORD: ${{ needs.prepare.outputs.publish == 'true' && secrets.PICACHO_KEYSTORE_PASSWORD || '' }}
+          PICACHO_KEY_PASSWORD: ${{ needs.prepare.outputs.publish == 'true' && secrets.PICACHO_KEYSTORE_PASSWORD || '' }}
           PICACHO_KEY_ALIAS: picacho
           PUBLISH: ${{ needs.prepare.outputs.publish }}
           # "beta" makes the app Picacho Beta, its version "Beta Build".
