@@ -173,6 +173,7 @@ pub(crate) fn pop_login(
 ) -> Result<PopSession<native_tls::TlsStream<Wire>>> {
     let tcp = tcp(&a.incoming_host, a.incoming_port)?;
     let stream = tls.connect(&a.incoming_host, tcp)?;
+    let binding = super::sasl::binding(&stream);
     let mut s = PopSession::new(stream)?;
     let rejected = |error: anyhow::Error| {
         if error.is::<Rejected>() || error.chain().any(|c| c.is::<Rejected>()) {
@@ -192,13 +193,15 @@ pub(crate) fn pop_login(
         secret: password.to_owned(),
         host: a.incoming_host.clone(),
         port: a.incoming_port,
+        binding: binding.clone(),
     };
     // SCRAM where offered; else USER/PASS (unless the server lists
     // capabilities without USER), else another SASL mechanism.
     let user_pass = caps.is_empty() || caps.iter().any(|c| c == "USER");
-    let mechanism = Mechanism::choose(
-        &[Mechanism::ScramSha256, Mechanism::ScramSha1],
+    let mechanism = Mechanism::choose_bound(
+        &sasl::SCRAM_ORDER,
         offered.iter().copied(),
+        !binding.is_empty(),
     )
     .or_else(|| {
         (!user_pass)

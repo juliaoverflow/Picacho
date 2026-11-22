@@ -438,6 +438,7 @@ fn open(
     let stream = tls
         .connect(&endpoint.host, plain.reader.into_inner())
         .map_err(|e| anyhow::anyhow!("TLS with {}'s filter server failed: {e}", endpoint.host))?;
+    let binding = sasl::binding(&stream);
     let mut session = Session {
         reader: BufReader::new(stream),
     };
@@ -454,7 +455,8 @@ fn open(
     } else {
         &sasl::PASSWORD_ORDER
     };
-    let mechanism = sasl::Mechanism::choose(order, caps.sasl.iter().map(String::as_str))
+    let mechanism =
+        sasl::Mechanism::choose_bound(order, caps.sasl.iter().map(String::as_str), !binding.is_empty())
         .context("The filter server offers no sign-in method Picacho supports.")?;
     let mut exchange = sasl::Exchange::new(
         mechanism,
@@ -463,6 +465,7 @@ fn open(
             secret: secret.to_owned(),
             host: endpoint.host.clone(),
             port: endpoint.port,
+            binding,
         },
     );
     let mut line = format!("AUTHENTICATE \"{}\"", mechanism.name());

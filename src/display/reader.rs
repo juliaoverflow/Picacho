@@ -564,7 +564,10 @@ impl MailApp {
             let m = m.clone();
             let view = cx.entity().downgrade();
             cx.defer(move |cx| {
-                let _ = view.update(cx, |this, cx| this.check_invitation(&m, cx));
+                let _ = view.update(cx, |this, cx| {
+                    this.check_invitation(&m, cx);
+                    this.complete_jmap_thread(&m, cx);
+                });
             });
         }
         if locked {
@@ -643,7 +646,11 @@ impl MailApp {
             if has_quotes {
                 content = content.child(div().flex().child(self.quotes_toggle(cx)));
             }
+            let previews = self.attached_previews.clone();
             for (i, a) in m.attachments().iter().enumerate() {
+                let is_message = a.mime.eq_ignore_ascii_case("message/rfc822")
+                    || a.name.to_ascii_lowercase().ends_with(".eml");
+                let preview = previews.get(&(m.id.clone(), i)).cloned();
                 content = content.child(
                     div()
                         .mt_3()
@@ -661,8 +668,18 @@ impl MailApp {
                                 .min_w_0()
                                 .text_size(px(12.))
                                 .truncate()
-                                .child(format!("{}  ·  {} KB", a.name, a.size / 1024)),
+                                .child(format!("{}  ·  {}", a.name, human_size(a.size as u64))),
                         )
+                        .when(is_message && preview.is_none(), |d| {
+                            d.child(self.button(
+                                format!("attachment-preview-{i}"),
+                                "Preview",
+                                "preview",
+                                Action::PreviewAttachment(i),
+                                false,
+                                cx,
+                            ))
+                        })
                         .child(self.button(
                             format!("attachment-{i}"),
                             "Save",
@@ -672,7 +689,21 @@ impl MailApp {
                             cx,
                         )),
                 );
+                if let Some(text) = preview {
+                    content = content.child(
+                        div()
+                            .id(SharedString::from(format!("attachment-preview-text-{i}")))
+                            .mt_1()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(c.raised))
+                            .text_size(px(12.))
+                            .whitespace_normal()
+                            .children(text.lines().map(|l| div().child(l.to_owned())).collect::<Vec<_>>()),
+                    );
+                }
             }
+            content = content.children(self.delivery_line(m, cx));
             let later = self.thread_cards(m, false, cx);
             if !later.is_empty() {
                 content = content.child(div().mt_8().children(later));

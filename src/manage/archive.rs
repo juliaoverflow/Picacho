@@ -162,14 +162,30 @@ impl Backend {
         // so the whole mailbox's text is never held at once.
         let mut messages = self.store.summaries(&a.id, mailbox.clone())?;
         messages.sort_by_key(|m| m.date);
-        // Written whole, then named, so a half-written file never stands in for one.
-        let partial = path.with_extension("mbox.partial");
-        let mut out = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+        // Written whole, then named, so a half-written file never stands in
+        // for one. The partial file is new (never an existing file, or one a
+        // link points to), readable by you alone, and removed however the
+        // export ends short of naming it.
+        let partial = path.with_extension(format!("{}.partial", uuid::Uuid::new_v4().simple()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(&partial)?;
+        struct Partial<'a>(&'a Path, bool);
+        impl Drop for Partial<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    let _ = std::fs::remove_file(self.0);
+                }
+            }
+        }
+        let mut cleanup = Partial(&partial, false);
+        let mut out = std::io::BufWriter::new(file);
         let mut moved = Moved::default();
         for m in &messages {
             if cancel.load(Ordering::Relaxed) {
                 drop(out);
-                let _ = std::fs::remove_file(&partial);
                 bail!("The export was stopped.");
             }
             let raw = (|| -> Result<Vec<u8>> {
@@ -186,9 +202,9 @@ impl Backend {
                 Err(_) => moved.skipped += 1,
             }
         }
-        out.flush()?;
-        drop(out);
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         std::fs::rename(&partial, path)?;
+        cleanup.1 = true;
         Ok(moved)
     }
 
@@ -206,12 +222,46 @@ impl Backend {
             "Mail can't be imported into this mailbox. Choose the inbox, Archive or one of your folders."
         );
         let mut moved = Moved::default();
+        // IMAP servers with MULTIAPPEND take messages in batches, in one
+        // command each, rather than one round trip per message.
+        let batching = matches!(a.provider, Provider::Imap | Provider::Gmail | Provider::Outlook)
+            && self
+                .with_imap(a, |c| Ok(c.extensions()?.multiappend))
+                .unwrap_or(false);
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let flush = |batch: &mut Vec<Vec<u8>>, moved: &mut Moved| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let taken = std::mem::take(batch);
+            if taken.len() > 1 && self.import_batch(a, mailbox, &taken).is_ok() {
+                moved.done += taken.len();
+                return Ok(());
+            }
+            // One at a time, so one the server refuses doesn't stop the rest.
+            for raw in &taken {
+                match self.import_one(a, mailbox, raw) {
+                    Ok(()) => moved.done += 1,
+                    Err(e) if moved.done == 0 && moved.skipped == 0 => return Err(e),
+                    Err(_) => moved.skipped += 1,
+                }
+            }
+            Ok(())
+        };
         let mut add = |raw: Vec<u8>| -> Result<()> {
             if cancel.load(Ordering::Relaxed) {
                 bail!("The import was stopped.");
             }
             if raw.len() > MAX_IMPORT || mailparse::parse_headers(&raw).is_err() {
                 moved.skipped += 1;
+                return Ok(());
+            }
+            if batching {
+                batch.push(raw);
+                let bytes: usize = batch.iter().map(Vec::len).sum();
+                if batch.len() >= BATCH_MESSAGES || bytes >= BATCH_BYTES {
+                    flush(&mut batch, &mut moved)?;
+                }
                 return Ok(());
             }
             match self.import_one(a, mailbox, &raw) {
@@ -236,6 +286,8 @@ impl Backend {
                 add(crlf(&raw))?;
             }
         }
+        drop(add);
+        flush(&mut batch, &mut moved)?;
         moved.skipped += too_large;
         Ok(moved)
     }
@@ -269,7 +321,42 @@ impl Backend {
             }),
         }
     }
+
+    /// Adds several messages to `mailbox` on an IMAP server in one command
+    /// where it can (MULTIAPPEND): all are added, or none.
+    fn import_batch(&self, a: &Account, mailbox: &Mailbox, raws: &[Vec<u8>]) -> Result<()> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            let remote = remote_name(c.names(false)?, a, mailbox)?;
+            let wire = c.wire(&remote);
+            let refs: Vec<&[u8]> = raws.iter().map(Vec::as_slice).collect();
+            let heard = c.append_many(&wire, &refs, &[imap::types::Flag::Seen])?;
+            // Where they went (APPENDUID with a UID each): listed at once.
+            if let [heard] = heard.as_slice()
+                && let Some((validity, uids)) = crate::sync::transport::append_uids(heard)
+                && uids.len() == raws.len()
+            {
+                let rows: Vec<Mail> = raws
+                    .iter()
+                    .zip(uids)
+                    .filter_map(|(raw, uid)| {
+                        let id = format!("{}:{remote}:{validity}:{uid}", a.id);
+                        let mut m = parse_message(raw, a, &id, mailbox.folder(), &remote, uid).ok()?;
+                        m.unread = false;
+                        Some(m)
+                    })
+                    .collect();
+                self.store.save_messages(&rows)?;
+            }
+            Ok(())
+        })
+    }
 }
+
+/// At most this many messages, or bytes, go in one MULTIAPPEND.
+const BATCH_MESSAGES: usize = 50;
+const BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// `raw` with every bare LF made CRLF.
 fn crlf(raw: &[u8]) -> Vec<u8> {
@@ -360,6 +447,37 @@ mod tests {
             b.import_messages(&a, &Mailbox::Standard(Folder::Starred), &[], &stop)
                 .is_err()
         );
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    /// An export writes a new file of its own beside the target (never one
+    /// already there) and leaves none behind when it stops.
+    #[test]
+    fn exports_leave_no_partial_files() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-export-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(crate::manage::store::Store::open(&path)?));
+        let a = Account::new(Provider::Pop3);
+        let dir = path.join("out");
+        std::fs::create_dir_all(&dir)?;
+        // The name earlier versions wrote to, here someone else's file.
+        let bystander = dir.join("mail.mbox.partial");
+        std::fs::write(&bystander, b"keep me")?;
+        let inbox = Mailbox::Standard(Folder::Inbox);
+        b.export_mailbox(&a, &inbox, &dir.join("mail.mbox"), &AtomicBool::new(false))?;
+        assert_eq!(std::fs::read(&bystander)?, b"keep me");
+        let names = |dir: &Path| -> Result<Vec<String>> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)?
+                .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<_>>()?;
+            names.sort();
+            Ok(names)
+        };
+        assert_eq!(names(&dir)?, ["mail.mbox", "mail.mbox.partial"]);
+        // Into a directory that isn't there: it fails, leaving nothing.
+        assert!(b.export_mailbox(&a, &inbox, &dir.join("gone/x.mbox"), &AtomicBool::new(false)).is_err());
+        assert_eq!(names(&dir)?, ["mail.mbox", "mail.mbox.partial"]);
         drop(b);
         std::fs::remove_dir_all(path)?;
         Ok(())

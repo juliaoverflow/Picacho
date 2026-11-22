@@ -34,6 +34,16 @@ pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
 pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 /// Pushed changes over a WebSocket (RFC 8887).
 pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
+/// Read receipts (RFC 9007).
+pub const MDN: &str = "urn:ietf:params:jmap:mdn";
+/// Blob management: copying and reading parts of blobs (RFC 9404).
+pub const BLOB: &str = "urn:ietf:params:jmap:blob";
+/// Address books and contact cards (RFC 9610), as JSContact (RFC 9553).
+pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+/// Calendars and events (JMAP for Calendars), as JSCalendar (RFC 8984).
+pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+/// Who an account belongs to and shares with (JMAP Sharing, RFC 9670).
+pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
 
 /// What a listing asks of each message: what the message list shows, and
 /// the headers Picacho keeps from a source it hasn't downloaded.
@@ -218,6 +228,8 @@ pub struct Page {
     pub total: Option<usize>,
     /// The Email state these were read in.
     pub state: String,
+    /// The query's state, to ask later what changed in its results.
+    pub query_state: String,
 }
 
 /// What changed since an Email state (`Email/changes`).
@@ -241,6 +253,11 @@ pub struct Identity {
     pub id: String,
     #[serde(default)]
     pub email: String,
+    #[serde(default)]
+    pub name: String,
+    /// Whether this account may remove it (`mayDelete`).
+    #[serde(default, rename = "mayDelete")]
+    pub may_delete: bool,
 }
 impl Identity {
     /// Whether it sends as `address`: the same address, or a whole domain
@@ -315,6 +332,16 @@ pub struct Session {
     /// it): (id, name). The one used is `account_id`.
     other_accounts: Vec<(String, String)>,
     mailboxes: Mutex<Vec<Mailbox>>,
+    /// The capabilities the server and the mail account have (session and
+    /// account capability URIs), for the extensions used when there.
+    capabilities: std::collections::HashSet<String>,
+    /// The sign-in's own accounts for contacts and calendars
+    /// (`primaryAccounts`), where the server has them.
+    contacts_account: Option<String>,
+    primary_mail: String,
+    calendars_account: Option<String>,
+    /// The Mailbox state `mailboxes` was read in, for Mailbox/changes.
+    mailbox_state: Mutex<String>,
     /// The account's name for itself (the session's `username`).
     username: String,
     /// The Sieve extensions of the account's filters, where it has JMAP
@@ -364,8 +391,18 @@ fn transport(e: reqwest::Error, what: &str) -> anyhow::Error {
     }
 }
 
-/// A server's refusal of a whole request (RFC 7807 problem details).
+/// A server's refusal of a whole request (RFC 7807 problem details). A
+/// server that is limiting requests (429) or busy (503) is reported as
+/// `[THROTTLED]`, so the account's background work pauses as it does for
+/// IMAP servers that say so (`imap::throttled`).
 fn problem(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return anyhow::anyhow!(
+            "[THROTTLED] The JMAP server is limiting requests ({status}); background sync waits a while."
+        );
+    }
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let detail = v["detail"]
         .as_str()
@@ -625,6 +662,20 @@ impl Session {
             }),
             account_id,
             mailboxes: Mutex::new(Vec::new()),
+            capabilities: caps
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, _)| k.clone())
+                .filter(|k| {
+                    // Mail-account extensions the account itself must have.
+                    ![MDN, BLOB].contains(&k.as_str()) || account.get(k).is_some() || account.is_null()
+                })
+                .collect(),
+            contacts_account: v["primaryAccounts"][CONTACTS].as_str().map(str::to_owned),
+            primary_mail: v["primaryAccounts"][MAIL].as_str().unwrap_or_default().to_owned(),
+            calendars_account: v["primaryAccounts"][CALENDARS].as_str().map(str::to_owned),
+            mailbox_state: Mutex::new(String::new()),
         })
     }
 
@@ -718,6 +769,31 @@ impl Session {
         if calls.iter().any(|(n, _)| n.starts_with("VacationResponse/")) {
             using.push(VACATION);
         }
+        if calls.iter().any(|(n, _)| n.starts_with("MDN/")) {
+            using.push(MDN);
+        }
+        if calls
+            .iter()
+            .any(|(n, _)| n.starts_with("Blob/") && *n != "Blob/copy")
+        {
+            using.push(BLOB);
+        }
+        if calls
+            .iter()
+            .any(|(n, _)| n.starts_with("AddressBook/") || n.starts_with("ContactCard/"))
+        {
+            using.push(CONTACTS);
+        }
+        if calls.iter().any(|(n, _)| {
+            n.starts_with("Calendar/")
+                || n.starts_with("CalendarEvent/")
+                || n.starts_with("ParticipantIdentity/")
+        }) {
+            using.push(CALENDARS);
+        }
+        if calls.iter().any(|(n, _)| n.starts_with("Principal/")) {
+            using.push(PRINCIPALS);
+        }
         let method_calls: Vec<Value> = calls
             .iter()
             .enumerate()
@@ -787,20 +863,95 @@ impl Session {
 
     // Mailboxes.
 
-    /// Reads the account's mailboxes again.
+    /// Reads the account's mailboxes again: once read, only those changed
+    /// since (Mailbox/changes, then Mailbox/get of those in one request),
+    /// else all of them.
     pub fn reload_mailboxes(&self) -> Result<Vec<Mailbox>> {
+        const PROPERTIES: [&str; 7] =
+            ["id", "name", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails"];
+        let since = self.mailbox_state.lock().unwrap().clone();
+        let known = self.mailboxes.lock().unwrap().clone();
+        if !since.is_empty() && !known.is_empty() {
+            match self.mailbox_changes(&since, &PROPERTIES, known) {
+                Ok(Some(list)) => return Ok(list),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let v = self.one(
             "Mailbox/get",
-            json!({
-                "accountId": self.account_id,
-                "ids": null,
-                "properties": ["id", "name", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails"],
-            }),
+            json!({ "accountId": self.account_id, "ids": null, "properties": PROPERTIES }),
         )?;
         let list: Vec<Mailbox> = serde_json::from_value(v["list"].clone())
             .context("The JMAP server's mailboxes aren't in a form Picacho can read.")?;
         *self.mailboxes.lock().unwrap() = list.clone();
+        *self.mailbox_state.lock().unwrap() = v["state"].as_str().unwrap_or_default().to_owned();
         Ok(list)
+    }
+    /// `known` brought up to date by Mailbox/changes since `since`, or
+    /// `None` when the server can't say (or there are too many changes).
+    fn mailbox_changes(
+        &self,
+        since: &str,
+        properties: &[&str],
+        known: Vec<Mailbox>,
+    ) -> Result<Option<Vec<Mailbox>>> {
+        // Two calls, so servers that take few at a time still answer in one
+        // request (back-references can't cross requests).
+        let changes = match self.one(
+            "Mailbox/changes",
+            json!({ "accountId": self.account_id, "sinceState": since, "maxChanges": 500 }),
+        ) {
+            Ok(v) => v,
+            // Too old a state, or a server without it: read them all.
+            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let ids: Vec<&str> = ["created", "updated"]
+            .iter()
+            .flat_map(|k| changes[*k].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .collect();
+        let mut responses = vec![("Mailbox/changes".to_owned(), changes.clone())];
+        for chunk in ids.chunks(self.max_get) {
+            responses.push((
+                "Mailbox/get".to_owned(),
+                self.one(
+                    "Mailbox/get",
+                    json!({ "accountId": self.account_id, "ids": chunk, "properties": properties }),
+                )?,
+            ));
+        }
+        let Some((_, changes)) = responses.iter().find(|(n, _)| n == "Mailbox/changes") else {
+            return Ok(None);
+        };
+        if changes["hasMoreChanges"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let destroyed: Vec<&str> = changes["destroyed"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let mut fresh: Vec<Mailbox> = Vec::new();
+        for (name, v) in &responses {
+            if name == "Mailbox/get" {
+                fresh.extend(
+                    serde_json::from_value::<Vec<Mailbox>>(v["list"].clone()).context(
+                        "The JMAP server's mailboxes aren't in a form Picacho can read.",
+                    )?,
+                );
+            }
+        }
+        let mut list: Vec<Mailbox> = known
+            .into_iter()
+            .filter(|m| !destroyed.contains(&m.id.as_str()))
+            .filter(|m| !fresh.iter().any(|f| f.id == m.id))
+            .collect();
+        list.extend(fresh);
+        *self.mailboxes.lock().unwrap() = list.clone();
+        *self.mailbox_state.lock().unwrap() =
+            changes["newState"].as_str().unwrap_or_default().to_owned();
+        Ok(Some(list))
     }
     /// The mailboxes, as last read (reading them the first time).
     pub fn mailboxes(&self) -> Result<Vec<Mailbox>> {
@@ -925,6 +1076,7 @@ impl Session {
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok()),
             state: get["state"].as_str().unwrap_or_default().to_owned(),
+            query_state: query["queryState"].as_str().unwrap_or_default().to_owned(),
         })
     }
     /// Just the ids of the messages matching `filter`, from `position`.
@@ -1061,6 +1213,25 @@ impl Session {
             .context("Message no longer exists on the server")?;
         self.download(&blob, "message.eml", "message/rfc822", limit)
     }
+    /// The header block of a message's source, without downloading the
+    /// rest, where the server has the Blob extension (RFC 9404): what the
+    /// sender check and details read from a message too large to keep.
+    pub fn header_block(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let blob = self
+            .blob_ids(&[id.to_owned()])?
+            .remove(id)
+            .context("Message no longer exists on the server")?;
+        // Headers rarely run past 64 KiB, even with long Received chains.
+        let Some(start) = self.blob_range(&blob, 0, 64 * 1024)? else {
+            return Ok(None);
+        };
+        let end = start
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(start.len());
+        Ok(Some(start[..end].to_vec()))
+    }
     /// Downloads a blob, refusing one larger than `limit`.
     pub fn download(&self, blob: &str, name: &str, kind: &str, limit: usize) -> Result<Vec<u8>> {
         let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
@@ -1137,6 +1308,14 @@ impl Session {
     }
     /// Adds a message to mailboxes from its source, with keywords
     /// (`$seen`, `$draft`). Returns its id.
+    /// Adds a message already uploaded (a blob) to `mailboxes`.
+    pub fn import_blob(&self, blob: &str, mailboxes: &[&str], keywords: &[&str]) -> Result<String> {
+        let v = self.one(
+            "Email/import",
+            json!({ "accountId": self.account_id, "emails": { "m": import_args(blob, mailboxes, keywords) } }),
+        )?;
+        imported(&v, "m")
+    }
     pub fn import(&self, raw: &[u8], mailboxes: &[&str], keywords: &[&str]) -> Result<String> {
         let blob = self.upload(raw, "message/rfc822")?;
         let v = self.one(
@@ -1321,10 +1500,477 @@ impl Session {
             let _ = self.destroy(&[id]);
             bail!("The server didn't send the message: {}", set_error(e));
         }
-        submission["created"]
+        let created = submission["created"]
             .get("s")
             .context("The server didn't say whether it sent the message.")?;
-        Ok(Submitted { receipts })
+        Ok(Submitted {
+            receipts,
+            id: created["id"].as_str().unwrap_or_default().to_owned(),
+        })
+    }
+    /// One method call's response arguments, for callers outside this
+    /// module (calendars and contacts: `jscal`).
+    pub fn call_one(&self, name: &str, args: Value) -> Result<Value> {
+        self.one(name, args)
+    }
+    /// Several method calls in one request (back-references allowed).
+    pub fn call_many(&self, calls: &[(&str, Value)]) -> Result<Vec<(String, Value)>> {
+        self.call(calls)
+    }
+    /// The sign-in's calendar account, where the server has calendars.
+    pub fn calendars_account(&self) -> Option<&str> {
+        self.calendars_account
+            .as_deref()
+            .filter(|_| self.has(CALENDARS))
+    }
+    /// The sign-in's contacts account, where the server has contacts.
+    pub fn contacts_account(&self) -> Option<&str> {
+        self.contacts_account.as_deref().filter(|_| self.has(CONTACTS))
+    }
+    /// The mail account this session reads.
+    pub fn account(&self) -> &str {
+        &self.account_id
+    }
+    /// The sign-in's own mail account (`primaryAccounts`).
+    pub fn primary_mail_account(&self) -> &str {
+        &self.primary_mail
+    }
+    /// Whether the server and account have the capability `uri`.
+    pub fn has(&self, uri: &str) -> bool {
+        self.capabilities.contains(uri)
+    }
+    /// What became of a submission, and whether it can still be cancelled
+    /// (`undoStatus`). `None` once the server no longer has it.
+    pub fn submission_status(&self, id: &str) -> Result<Option<SubmissionStatus>> {
+        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        let v = self.one(
+            "EmailSubmission/get",
+            json!({
+                "accountId": self.account_id,
+                "ids": [id],
+                "properties": ["id", "undoStatus", "deliveryStatus"],
+            }),
+        )?;
+        let Some(s) = v["list"].as_array().and_then(|l| l.first()) else {
+            return Ok(None);
+        };
+        let mut delivery: Vec<(String, String, String)> = s["deliveryStatus"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(to, d)| {
+                (
+                    to.clone(),
+                    d["delivered"].as_str().unwrap_or("unknown").to_owned(),
+                    d["smtpReply"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        delivery.sort();
+        Ok(Some(SubmissionStatus {
+            undo: s["undoStatus"].as_str().unwrap_or("final").to_owned(),
+            delivery,
+        }))
+    }
+    /// The submissions changed since `since` (ids), and the new state, for
+    /// following what was sent; `None` where the server can't say.
+    pub fn submission_changes(&self, since: &str) -> Result<Option<(Vec<String>, String)>> {
+        let v = match self.one(
+            "EmailSubmission/changes",
+            json!({ "accountId": self.account_id, "sinceState": since, "maxChanges": 200 }),
+        ) {
+            Ok(v) => v,
+            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let ids = ["created", "updated"]
+            .iter()
+            .flat_map(|k| v[*k].as_array().into_iter().flatten())
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect();
+        Ok(Some((ids, v["newState"].as_str().unwrap_or_default().to_owned())))
+    }
+    /// The submissions not yet final (held for later, or still being
+    /// tried), newest first: EmailSubmission/query on `undoStatus`.
+    pub fn pending_submissions(&self) -> Result<Vec<String>> {
+        let v = self.one(
+            "EmailSubmission/query",
+            json!({
+                "accountId": self.account_id,
+                "filter": { "undoStatus": "pending" },
+                "sort": [{ "property": "sendAt", "isAscending": false }],
+                "limit": 100,
+            }),
+        )?;
+        Ok(v["ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect())
+    }
+    /// Takes back a submission the server still holds (`undoStatus`
+    /// `pending`: held for later with HOLDUNTIL, or in the server's own
+    /// undo window), and moves its message back to `drafts` as a draft.
+    /// False if it had already gone.
+    pub fn cancel_submission(&self, id: &str, drafts: Option<&str>) -> Result<bool> {
+        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        let v = self.one(
+            "EmailSubmission/set",
+            json!({
+                "accountId": self.account_id,
+                "update": { id: { "undoStatus": "canceled" } },
+            }),
+        )?;
+        if let Some(e) = v["notUpdated"].get(id) {
+            if e["type"] == "cannotUnsend" || e["type"] == "notFound" {
+                return Ok(false);
+            }
+            bail!("The server couldn't take the message back: {}", set_error(e));
+        }
+        // Its message, back as a draft where it was moved to Sent.
+        let got = self.one(
+            "EmailSubmission/get",
+            json!({ "accountId": self.account_id, "ids": [id], "properties": ["emailId"] }),
+        )?;
+        if let (Some(email), Some(drafts)) = (
+            got["list"][0]["emailId"].as_str(),
+            drafts,
+        ) {
+            let mut patch = Map::new();
+            patch.insert("keywords/$draft".into(), Value::Bool(true));
+            patch.insert("mailboxIds".into(), json!({ drafts: true }));
+            let mut update = Map::new();
+            update.insert(email.to_owned(), Value::Object(patch));
+            let _ = self.update(update);
+        }
+        Ok(true)
+    }
+    /// Changes a sending identity: its name, Reply-To and signatures.
+    pub fn update_identity(&self, id: &str, change: &IdentityChange) -> Result<()> {
+        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        let mut patch = Map::new();
+        if let Some(name) = &change.name {
+            patch.insert("name".into(), json!(name));
+        }
+        if let Some(reply_to) = &change.reply_to {
+            let list: Vec<Value> = reply_to
+                .iter()
+                .map(|(name, email)| json!({ "name": name, "email": email }))
+                .collect();
+            patch.insert(
+                "replyTo".into(),
+                if list.is_empty() { Value::Null } else { Value::Array(list) },
+            );
+        }
+        if let Some(text) = &change.text_signature {
+            patch.insert("textSignature".into(), json!(text));
+        }
+        if let Some(html) = &change.html_signature {
+            patch.insert("htmlSignature".into(), json!(html));
+        }
+        let v = self.one(
+            "Identity/set",
+            json!({ "accountId": self.account_id, "update": { id: patch } }),
+        )?;
+        if let Some(e) = v["notUpdated"].get(id) {
+            bail!("The server didn't change the sending address: {}", set_error(e));
+        }
+        Ok(())
+    }
+    /// Adds a sending identity for `email` (which the server must allow
+    /// this account to send as), returning its id.
+    pub fn create_identity(&self, email: &str, name: &str) -> Result<String> {
+        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        let v = self.one(
+            "Identity/set",
+            json!({
+                "accountId": self.account_id,
+                "create": { "i": { "email": email, "name": name } },
+            }),
+        )?;
+        if let Some(e) = v["notCreated"].get("i") {
+            if e["type"] == "forbiddenFrom" {
+                bail!("The server doesn't let this account send as {email}.");
+            }
+            bail!("The server didn't add the sending address: {}", set_error(e));
+        }
+        Ok(v["created"]["i"]["id"]
+            .as_str()
+            .context("The server didn't say which sending address it added.")?
+            .to_owned())
+    }
+    /// Removes a sending identity.
+    pub fn destroy_identity(&self, id: &str) -> Result<()> {
+        let v = self.one(
+            "Identity/set",
+            json!({ "accountId": self.account_id, "destroy": [id] }),
+        )?;
+        if let Some(e) = v["notDestroyed"].get(id)
+            && e["type"] != "notFound"
+        {
+            bail!("The server didn't remove the sending address: {}", set_error(e));
+        }
+        Ok(())
+    }
+    /// The messages of conversations, by thread id: each thread's message
+    /// ids, oldest first (Thread/get).
+    pub fn threads(&self, ids: &[String]) -> Result<HashMap<String, Vec<String>>> {
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(self.max_get) {
+            let v = self.one(
+                "Thread/get",
+                json!({ "accountId": self.account_id, "ids": chunk }),
+            )?;
+            for t in v["list"].as_array().into_iter().flatten() {
+                let Some(id) = t["id"].as_str() else { continue };
+                let emails = t["emailIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.as_str().map(str::to_owned))
+                    .collect();
+                out.insert(id.to_owned(), emails);
+            }
+        }
+        Ok(out)
+    }
+    /// Which conversations changed since `since` (Thread/changes): their
+    /// ids, and the new state; `None` where the server can't say.
+    pub fn thread_changes(&self, since: &str) -> Result<Option<ThreadChanges>> {
+        let v = match self.one(
+            "Thread/changes",
+            json!({ "accountId": self.account_id, "sinceState": since, "maxChanges": 500 }),
+        ) {
+            Ok(v) => v,
+            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if v["hasMoreChanges"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let ids = |key: &str| -> Vec<String> {
+            v[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| i.as_str().map(str::to_owned))
+                .collect()
+        };
+        let mut changed = ids("created");
+        changed.extend(ids("updated"));
+        Ok(Some((changed, ids("destroyed"), v["newState"].as_str().unwrap_or_default().to_owned())))
+    }
+    /// What changed in a query's results since `since_query_state`
+    /// (Email/queryChanges): ids removed, and ids added with where. `None`
+    /// where the server can't say; the query is then read again.
+    pub fn query_changes(
+        &self,
+        filter: &Value,
+        since_query_state: &str,
+        up_to: Option<&str>,
+    ) -> Result<Option<QueryChanges>> {
+        let mut args = json!({
+            "accountId": self.account_id,
+            "filter": filter,
+            "sort": [{ "property": "receivedAt", "isAscending": false }],
+            "sinceQueryState": since_query_state,
+            "maxChanges": 500,
+            "calculateTotal": true,
+        });
+        if let Some(id) = up_to {
+            args["upToId"] = json!(id);
+        }
+        let v = match self.one("Email/queryChanges", args) {
+            Ok(v) => v,
+            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let removed = v["removed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect();
+        let added = v["added"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| {
+                Some((a["id"].as_str()?.to_owned(), a["index"].as_u64()? as usize))
+            })
+            .collect();
+        Ok(Some(QueryChanges {
+            removed,
+            added,
+            total: v["total"].as_u64().map(|n| n as usize),
+            new_state: v["newQueryState"].as_str().unwrap_or_default().to_owned(),
+        }))
+    }
+    /// Copies messages from another account this sign-in reaches (shared
+    /// with it) into this one, in `mailbox` (Email/copy, RFC 8621 §4.7).
+    /// The originals stay. Returns the new ids, by original id.
+    pub fn copy_from(
+        &self,
+        from_account: &str,
+        ids: &[String],
+        mailbox: &str,
+        keywords: &[&str],
+    ) -> Result<HashMap<String, String>> {
+        let kw: Map<String, Value> = keywords.iter().map(|k| ((*k).to_owned(), json!(true))).collect();
+        let create: Map<String, Value> = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    json!({ "id": id, "mailboxIds": { mailbox: true }, "keywords": kw }),
+                )
+            })
+            .collect();
+        let v = self.one(
+            "Email/copy",
+            json!({
+                "fromAccountId": from_account,
+                "accountId": self.account_id,
+                "create": create,
+            }),
+        )?;
+        if let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next()) {
+            bail!("The server didn't copy message {id}: {}", set_error(e));
+        }
+        Ok(v["created"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, c)| Some((k.clone(), c["id"].as_str()?.to_owned())))
+            .collect())
+    }
+    /// Reads a message kept as a blob (an attached `.eml`) without adding
+    /// it to the mailbox (Email/parse, RFC 8621 §4.9): its headers, text
+    /// and attachments as for any message.
+    pub fn parse_blob(&self, blob: &str) -> Result<Option<Email>> {
+        let v = self.one(
+            "Email/parse",
+            json!({
+                "accountId": self.account_id,
+                "blobIds": [blob],
+                "properties": LIST_PROPERTIES.iter().filter(|p| !["id", "blobId", "threadId", "mailboxIds", "keywords", "receivedAt", "size"].contains(p)).collect::<Vec<_>>(),
+            }),
+        )?;
+        let Some(parsed) = v["parsed"].get(blob) else {
+            return Ok(None);
+        };
+        let mut parsed = parsed.clone();
+        // What Email/get always gives, which a parsed blob has not.
+        for (k, d) in [
+            ("id", json!(blob)),
+            ("blobId", json!(blob)),
+            ("threadId", json!("")),
+            ("mailboxIds", json!({})),
+            ("keywords", json!({})),
+        ] {
+            if parsed.get(k).is_none_or(Value::is_null) {
+                parsed[k] = d;
+            }
+        }
+        Ok(Some(serde_json::from_value(parsed).context(
+            "The JMAP server's reading of the message isn't in a form Picacho can read.",
+        )?))
+    }
+    /// Copies blobs from another account this sign-in reaches (Blob/copy,
+    /// RFC 8620 §6.3), returning the new ids by old id.
+    pub fn copy_blobs(&self, from_account: &str, blobs: &[String]) -> Result<HashMap<String, String>> {
+        let v = self.one(
+            "Blob/copy",
+            json!({ "fromAccountId": from_account, "accountId": self.account_id, "blobIds": blobs }),
+        )?;
+        Ok(v["copied"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, n)| Some((k.clone(), n.as_str()?.to_owned())))
+            .collect())
+    }
+    /// Uploads small data in the API request itself, where the server has
+    /// the Blob extension (Blob/upload, RFC 9404), rather than a separate
+    /// upload; otherwise as `upload` does. Returns its blob id.
+    pub fn upload_inline(&self, bytes: &[u8], kind: &str) -> Result<String> {
+        use base64::Engine as _;
+        if !self.has(BLOB) || bytes.len() > 256 * 1024 {
+            return self.upload(bytes, kind);
+        }
+        let v = self.one(
+            "Blob/upload",
+            json!({
+                "accountId": self.account_id,
+                "create": { "b": {
+                    "data": [{ "data:asBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }],
+                    "type": kind,
+                } },
+            }),
+        )?;
+        if let Some(e) = v["notCreated"].get("b") {
+            bail!("The server didn't take the data: {}", set_error(e));
+        }
+        Ok(v["created"]["b"]["id"]
+            .as_str()
+            .context("The server didn't say where it kept the data.")?
+            .to_owned())
+    }
+    /// Part of a blob, where the server has the Blob extension (Blob/get
+    /// with `offset` and `length`, RFC 9404): the start of a large message
+    /// without downloading it all.
+    pub fn blob_range(&self, blob: &str, offset: usize, length: usize) -> Result<Option<Vec<u8>>> {
+        use base64::Engine as _;
+        if !self.has(BLOB) {
+            return Ok(None);
+        }
+        let v = self.one(
+            "Blob/get",
+            json!({
+                "accountId": self.account_id,
+                "ids": [blob],
+                "properties": ["data:asBase64"],
+                "offset": offset,
+                "length": length,
+            }),
+        )?;
+        let Some(data) = v["list"][0]["data:asBase64"].as_str() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .context("The server's data isn't base64.")?,
+        ))
+    }
+    /// Sends a read receipt for message `id` (MDN/send, RFC 9007), from
+    /// `identity`; the server marks the message `$mdnsent`.
+    pub fn send_receipt(&self, id: &str, identity: &str, subject: &str, text: &str) -> Result<()> {
+        ensure!(self.has(MDN), "This JMAP server can't send read receipts.");
+        let v = self.one(
+            "MDN/send",
+            json!({
+                "accountId": self.account_id,
+                "identityId": identity,
+                "send": { "r": {
+                    "forEmailId": id,
+                    "subject": subject,
+                    "textBody": text,
+                    "includeOriginalMessage": false,
+                    "disposition": {
+                        "actionMode": "manual-action",
+                        "sendingMode": "mdn-sent-manually",
+                        "type": "displayed",
+                    },
+                } },
+                "onSuccessUpdateEmail": { "#r": { "keywords/$mdnsent": true } },
+            }),
+        )?;
+        if let Some(e) = v["notSent"].get("r") {
+            bail!("The server didn't send the read receipt: {}", set_error(e));
+        }
+        Ok(())
     }
     /// The automatic reply while away (RFC 8621 §8), where the account has
     /// it.
@@ -1336,11 +1982,11 @@ impl Session {
             "VacationResponse/get",
             json!({ "accountId": self.account_id, "ids": ["singleton"] }),
         )?;
-        Ok(v["list"]
+        v["list"]
             .get(0)
             .map(|r| serde_json::from_value(r.clone()))
             .transpose()
-            .context("The JMAP server's away reply isn't in a form Picacho can read.")?)
+            .context("The JMAP server's away reply isn't in a form Picacho can read.")
     }
     /// Sets the automatic reply while away.
     pub fn set_vacation(&self, reply: &VacationResponse) -> Result<()> {
@@ -1528,7 +2174,7 @@ impl Session {
     /// Checks a script the server would run, without saving it.
     pub fn sieve_validate(&self, text: &str) -> Result<()> {
         self.require_sieve()?;
-        let blob = self.upload(text.as_bytes(), "application/sieve")?;
+        let blob = self.upload_inline(text.as_bytes(), "application/sieve")?;
         let v = self.one(
             "SieveScript/validate",
             json!({ "accountId": self.account_id, "blobId": blob }),
@@ -1545,7 +2191,7 @@ impl Session {
     /// if it is there) and makes it the active one.
     pub fn sieve_put(&self, name: &str, text: &str, existing: Option<&str>) -> Result<()> {
         self.require_sieve()?;
-        let blob = self.upload(text.as_bytes(), "application/sieve")?;
+        let blob = self.upload_inline(text.as_bytes(), "application/sieve")?;
         let (args, key, activate) = match existing {
             Some(id) => (
                 json!({ "update": { id: { "blobId": blob } } }),
@@ -1679,6 +2325,42 @@ pub struct SendOptions {
 pub struct Submitted {
     /// Delivery reports were asked for.
     pub receipts: bool,
+    /// The submission's id, to follow it (`submission_status`) or, while
+    /// the server still holds it, cancel it (`cancel_submission`).
+    pub id: String,
+}
+
+/// Where a submission is (RFC 8621 §7): whether it can still be taken
+/// back, and what became of each recipient.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubmissionStatus {
+    /// `pending` (held, and can be cancelled), `final` or `canceled`.
+    pub undo: String,
+    /// Each recipient's delivery: (address, `queued`/`yes`/`no`/`unknown`,
+    /// the server's last SMTP reply).
+    pub delivery: Vec<(String, String, String)>,
+}
+
+/// A sending identity (RFC 8621 §6) as it can be changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdentityChange {
+    pub name: Option<String>,
+    pub reply_to: Option<Vec<(String, String)>>,
+    pub text_signature: Option<String>,
+    pub html_signature: Option<String>,
+}
+
+/// Conversations changed and gone since a state, and the new state.
+pub type ThreadChanges = (Vec<String>, Vec<String>, String);
+
+/// What changed in a query's results (Email/queryChanges).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryChanges {
+    pub removed: Vec<String>,
+    /// Added (or moved) ids, with their place in the results.
+    pub added: Vec<(String, usize)>,
+    pub total: Option<usize>,
+    pub new_state: String,
 }
 
 /// The automatic reply while away (RFC 8621 §8.1).
@@ -1824,6 +2506,7 @@ mod tests {
         let one = Identity {
             id: "1".into(),
             email: "Ana@Example.com".into(),
+            ..Default::default()
         };
         assert!(one.covers("ana@example.com"));
         assert!(!one.covers("bo@example.com"));

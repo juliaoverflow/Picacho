@@ -208,8 +208,6 @@ pub(super) fn location(e: &Email, places: &[Place]) -> (Folder, String) {
     (Folder::Archive, "Archive".into())
 }
 
-/// A JMAP draft, as a `RemoteDraft` (which IMAP fills with its mailbox,
-/// UIDVALIDITY and UID): the message's id, after `jmap:`.
 /// The away reply as the filter settings show it, from JMAP's automatic
 /// reply (whose dates are UTC date-times; the settings keep days).
 fn vacation_state(reply: &jmap::VacationResponse) -> sieve::State {
@@ -258,6 +256,8 @@ fn jmap_remote(id: &str) -> RemoteDraft {
         uid: 0,
     }
 }
+/// A JMAP draft, as a `RemoteDraft` (which IMAP fills with its mailbox,
+/// UIDVALIDITY and UID): the message's id, after `jmap:`.
 fn jmap_draft(r: &RemoteDraft) -> Option<&str> {
     r.mailbox.strip_prefix("jmap:")
 }
@@ -284,6 +284,10 @@ fn bracketed(id: &str) -> String {
 struct Synced {
     state: String,
     days: u32,
+    /// The mailbox query's state then (Email/queryChanges), where the
+    /// server keeps one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    query_state: String,
 }
 
 /// The patch that makes a change to one message.
@@ -383,10 +387,12 @@ impl Backend {
     ) -> Result<T> {
         let session = self.jmap_session(a)?;
         let result = work(&session);
-        if let Err(e) = &result
-            && e.downcast_ref::<AccessFailure>().is_some()
-        {
-            self.jmap.lock().unwrap().remove(&a.id);
+        if let Err(e) = &result {
+            if e.downcast_ref::<AccessFailure>().is_some() {
+                self.jmap.lock().unwrap().remove(&a.id);
+            }
+            // 429 or 503: background work pauses, as for IMAP.
+            self.note_limit(a, e);
         }
         result
     }
@@ -587,14 +593,70 @@ impl Backend {
                 a.sync.days,
                 chrono::Utc::now().timestamp(),
             )?;
+            // What changed in this mailbox's listing since (Email/
+            // queryChanges): those added are read and those removed asked
+            // about, rather than the newest listed again.
+            if let Some(saved) = saved.as_ref().filter(|s| !s.query_state.is_empty())
+                && let Some(changes) = s.query_changes(&filter, &saved.query_state, None)?
+                && changes.added.len() + changes.removed.len() <= PAGE
+            {
+                let added: Vec<String> = changes.added.iter().map(|(id, _)| id.clone()).collect();
+                let mut rows = Vec::new();
+                for e in &s.emails(&added)? {
+                    rows.push(self.jmap_mail(a, &places, e)?);
+                }
+                // Removed from this mailbox's results: moved elsewhere
+                // (asked again, to update the row) or gone.
+                if !changes.removed.is_empty() {
+                    let current = s.emails(&changes.removed)?;
+                    let still: HashSet<String> = current.iter().map(|e| row_id(a, &e.id)).collect();
+                    for e in &current {
+                        rows.push(self.jmap_mail(a, &places, e)?);
+                    }
+                    let gone: Vec<String> = changes
+                        .removed
+                        .iter()
+                        .map(|id| row_id(a, id))
+                        .filter(|id| !still.contains(id))
+                        .collect();
+                    if !gone.is_empty() {
+                        self.store.delete_ids(&a.id, &gone)?;
+                    }
+                }
+                // Flags of what stayed: Email/changes said which changed.
+                if let Some(c) = s.changes(&saved.state)?.filter(|c| !c.has_more) {
+                    let listed: HashSet<String> = rows.iter().map(|m| m.id.clone()).collect();
+                    let updated: Vec<String> = c
+                        .updated
+                        .into_iter()
+                        .filter(|id| !listed.contains(&row_id(a, id)))
+                        .filter(|id| self.store.message(&row_id(a, id)).ok().flatten().is_some())
+                        .collect();
+                    for e in &s.emails(&updated)? {
+                        rows.push(self.jmap_mail(a, &places, e)?);
+                    }
+                    self.store.save_messages(&rows)?;
+                    self.store.set_preference(
+                        &key,
+                        &serde_json::to_string(&Synced {
+                            state: c.new_state,
+                            days: a.sync.days,
+                            query_state: changes.new_state,
+                        })?,
+                    )?;
+                    return self.store.newest(&a.id, mailbox.clone(), limit);
+                }
+            }
             let mut listed: Vec<Email> = Vec::new();
             let mut state = String::new();
+            let mut query_state = String::new();
             let mut complete = false;
             while listed.len() < limit {
                 let want = (limit - listed.len()).min(PAGE);
                 let page = s.query(&filter, listed.len(), want, false)?;
                 if state.is_empty() {
                     state = page.state.clone();
+                    query_state = page.query_state.clone();
                 }
                 let short = page.emails.len() < want;
                 listed.extend(page.emails);
@@ -653,6 +715,7 @@ impl Backend {
                     &serde_json::to_string(&Synced {
                         state,
                         days: a.sync.days,
+                        query_state,
                     })?,
                 )?;
             }
@@ -762,6 +825,17 @@ impl Backend {
         next.has_attachments = !next.attachments().is_empty();
         next.partial = true;
         Ok(next)
+    }
+    /// A JMAP message's header block alone, for one too large to keep
+    /// (where the server reads parts of blobs).
+    pub fn jmap_header_block(&self, a: &Account, m: &Mail) -> Result<Option<Vec<u8>>> {
+        if a.provider != Provider::Jmap {
+            return Ok(None);
+        }
+        let id = jmap_id(a, m).context("This message isn't from this JMAP account.")?;
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| s.header_block(id))
     }
     /// One attachment of a message too large to download whole.
     pub(super) fn jmap_attachment(&self, a: &Account, attachment: &Attachment) -> Result<Vec<u8>> {
@@ -977,6 +1051,343 @@ impl Backend {
         })
     }
 
+    /// Messages the JMAP server holds to send later (handed over with
+    /// HOLDUNTIL) or is still trying: (submission id, subject, when).
+    pub fn held_submissions(&self, a: &Account) -> Result<Vec<HeldSubmission>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers hold messages this way.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| {
+            let ids = s.pending_submissions()?;
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let v = s.call(&[(
+                "EmailSubmission/get",
+                json!({ "accountId": s.account(), "ids": ids, "properties": ["id", "emailId", "sendAt"] }),
+            )])?;
+            let list = v
+                .first()
+                .map(|(_, v)| v["list"].as_array().cloned().unwrap_or_default())
+                .unwrap_or_default();
+            let emails: Vec<String> = list
+                .iter()
+                .filter_map(|e| e["emailId"].as_str().map(str::to_owned))
+                .collect();
+            let subjects: std::collections::HashMap<String, String> = s
+                .emails(&emails)?
+                .into_iter()
+                .map(|e| (e.id.clone(), e.subject.clone().unwrap_or_default()))
+                .collect();
+            Ok(list
+                .iter()
+                .filter_map(|e| {
+                    Some(HeldSubmission {
+                        id: e["id"].as_str()?.to_owned(),
+                        subject: e["emailId"]
+                            .as_str()
+                            .and_then(|i| subjects.get(i).cloned())
+                            .unwrap_or_default(),
+                        send_at: e["sendAt"]
+                            .as_str()
+                            .and_then(crate::sync::jmap::timestamp)
+                            .unwrap_or(0),
+                    })
+                })
+                .collect())
+        })
+    }
+    /// Takes back a message the JMAP server holds to send later: it isn't
+    /// sent, and goes back to Drafts. False if it had already gone.
+    pub fn cancel_held(&self, a: &Account, submission: &str) -> Result<bool> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers hold messages this way.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let taken = self.with_jmap(a, |s| {
+            let places = self.jmap_places(a, s, false)?;
+            let drafts = mailbox_id(&places, &Mailbox::Standard(Folder::Drafts)).ok();
+            s.cancel_submission(submission, drafts.as_deref())
+        })?;
+        drop(_operation);
+        if taken {
+            let _ = self.sync_drafts(a);
+        }
+        Ok(taken)
+    }
+    /// Remembers which submission sent the message with `message_id`.
+    pub(super) fn note_submission(&self, a: &Account, message_id: &str, submission: &str) {
+        if message_id.is_empty() || submission.is_empty() {
+            return;
+        }
+        let key = format!("jmap_submissions:{}", a.id);
+        let mut all: Vec<(String, String)> = self
+            .store
+            .preference(&key)
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        all.push((message_id.to_owned(), submission.to_owned()));
+        // The last few hundred: servers forget submissions after a while too.
+        let excess = all.len().saturating_sub(500);
+        all.drain(..excess);
+        if let Ok(json) = serde_json::to_string(&all) {
+            let _ = self.store.set_preference(&key, &json);
+        }
+    }
+    /// Which conversations changed on a JMAP server since `since`
+    /// (Thread/changes): ids changed and gone, and the new state; `None`
+    /// where the server can't say. With an empty `since`, the current
+    /// state alone.
+    pub fn jmap_thread_changes(
+        &self,
+        a: &Account,
+        since: &str,
+    ) -> Result<Option<crate::sync::jmap::ThreadChanges>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep threads.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| {
+            if since.is_empty() {
+                let v = s.call_one("Thread/get", json!({ "accountId": s.account(), "ids": [] }))?;
+                return Ok(Some((Vec::new(), Vec::new(), v["state"].as_str().unwrap_or_default().to_owned())));
+            }
+            s.thread_changes(since)
+        })
+    }
+    /// The ids of messages sent from here whose delivery changed since
+    /// `since` (EmailSubmission/changes), mapped to their Message-IDs, and
+    /// the new state.
+    pub fn jmap_delivery_changes(&self, a: &Account, since: &str) -> Result<Option<(Vec<String>, String)>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers report this.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        // Without a state yet: the current one, to ask from.
+        if since.is_empty() {
+            let state = self.with_jmap(a, |s| {
+                let v = s.call_one(
+                    "EmailSubmission/get",
+                    json!({ "accountId": s.account(), "ids": [] }),
+                )?;
+                Ok(v["state"].as_str().unwrap_or_default().to_owned())
+            })?;
+            return Ok(Some((Vec::new(), state)));
+        }
+        let Some((changed, state)) = self.with_jmap(a, |s| s.submission_changes(since))? else {
+            return Ok(None);
+        };
+        let all: Vec<(String, String)> = self
+            .store
+            .preference(&format!("jmap_submissions:{}", a.id))
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        let ids = all
+            .into_iter()
+            .filter(|(_, sub)| changed.contains(sub))
+            .map(|(id, _)| id)
+            .collect();
+        Ok(Some((ids, state)))
+    }
+    /// What became of a sent message, by its Message-ID, where it went over
+    /// JMAP from here.
+    pub fn delivery_of(&self, a: &Account, m: &Mail) -> Result<Option<crate::sync::jmap::SubmissionStatus>> {
+        if a.provider != Provider::Jmap || m.message_id.is_empty() {
+            return Ok(None);
+        }
+        let all: Vec<(String, String)> = self
+            .store
+            .preference(&format!("jmap_submissions:{}", a.id))
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        let bare = |id: &str| id.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase();
+        let wanted = bare(&m.message_id);
+        let Some((_, submission)) = all.iter().rev().find(|(id, _)| bare(id) == wanted) else {
+            return Ok(None);
+        };
+        self.submission_status(a, submission)
+    }
+    /// What became of a message sent over JMAP: each recipient's delivery
+    /// as the server knows it.
+    pub fn submission_status(
+        &self,
+        a: &Account,
+        submission: &str,
+    ) -> Result<Option<crate::sync::jmap::SubmissionStatus>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers report this.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| s.submission_status(submission))
+    }
+    /// The account's sending identities on the JMAP server.
+    pub fn jmap_identities(&self, a: &Account) -> Result<Vec<crate::sync::jmap::Identity>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| s.identities())
+    }
+    /// Changes a sending identity on the JMAP server (name, Reply-To,
+    /// signatures).
+    pub fn update_jmap_identity(
+        &self,
+        a: &Account,
+        id: &str,
+        change: &crate::sync::jmap::IdentityChange,
+    ) -> Result<()> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| s.update_identity(id, change))
+    }
+    /// Adds a sending identity on the JMAP server.
+    pub fn create_jmap_identity(&self, a: &Account, email: &str, name: &str) -> Result<String> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| s.create_identity(email, name))
+    }
+    /// Removes a sending identity from the JMAP server.
+    pub fn destroy_jmap_identity(&self, a: &Account, id: &str) -> Result<()> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| s.destroy_identity(id))
+    }
+    /// The whole conversation `m` belongs to on a JMAP server (Thread/get),
+    /// across mailboxes: messages not listed here yet are fetched (listing
+    /// only) and kept, and all of them returned oldest first.
+    pub fn jmap_conversation(&self, a: &Account, m: &Mail) -> Result<Vec<Mail>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep threads.");
+        let thread = m
+            .thread_id()
+            .strip_prefix("jmap:")
+            .context("This message has no conversation on the server.")?
+            .to_owned();
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| {
+            let ids = s.threads(std::slice::from_ref(&thread))?.remove(&thread).unwrap_or_default();
+            let mut out = Vec::new();
+            let mut missing = Vec::new();
+            for id in &ids {
+                match self.store.message(&row_id(a, id))? {
+                    Some(m) => out.push(m),
+                    None => missing.push(id.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                let places = self.jmap_places(a, s, false)?;
+                let rows: Vec<Mail> = s
+                    .emails(&missing)?
+                    .iter()
+                    .map(|e| self.jmap_mail(a, &places, e))
+                    .collect::<Result<_>>()?;
+                self.store.save_messages(&rows)?;
+                out.extend(rows);
+            }
+            out.sort_by_key(|m| m.date);
+            Ok(out)
+        })
+    }
+    /// Copies messages from another JMAP account this sign-in reaches
+    /// (shared with it, and added here as `from`) into `a`'s `mailbox`, on
+    /// the server (Email/copy): nothing is downloaded and uploaded again.
+    pub fn copy_between_jmap(
+        &self,
+        from: &Account,
+        mails: &[Mail],
+        a: &Account,
+        mailbox: &Mailbox,
+    ) -> Result<usize> {
+        ensure!(
+            from.provider == Provider::Jmap && a.provider == Provider::Jmap,
+            "Only JMAP accounts copy between themselves on the server."
+        );
+        let same_sign_in = |x: &Account| if x.credentials_of.is_empty() { x.id.clone() } else { x.credentials_of.clone() };
+        ensure!(
+            same_sign_in(from) == same_sign_in(a),
+            "These accounts don't share a sign-in, so the server can't copy between them."
+        );
+        let ids: Vec<String> = mails
+            .iter()
+            .filter_map(|m| jmap_id(from, m).map(str::to_owned))
+            .collect();
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let from_account = from.jmap_account.clone();
+        // Where the sources' contents are, in case the copy goes by blob.
+        let from_blobs: HashMap<String, String> = {
+            let ids = ids.clone();
+            let flock = self.account_lock(&from.id);
+            let _from = flock.lock().unwrap();
+            self.with_jmap(from, |s| s.blob_ids(&ids)).unwrap_or_default()
+        };
+        ensure!(!from_account.is_empty() || from.credentials_of.is_empty(), "The account to copy from isn't known.");
+        let copied = self.with_jmap(a, |s| {
+            let from_account = if from_account.is_empty() {
+                // The sign-in's own account.
+                s.primary_mail_account().to_owned()
+            } else {
+                from_account.clone()
+            };
+            let places = self.jmap_places(a, s, false)?;
+            let target = mailbox_id(&places, mailbox)?;
+            match s.copy_from(&from_account, &ids, &target, &["$seen"]) {
+                Ok(copied) => Ok(copied),
+                // A server without Email/copy: the sources' blobs copied
+                // across (Blob/copy), then imported as messages.
+                Err(e) if e.downcast_ref::<crate::sync::jmap::MethodError>().is_some() => {
+                    let blobs: Vec<String> = from_blobs.values().cloned().collect();
+                    let copied = s.copy_blobs(&from_account, &blobs)?;
+                    let mut out = HashMap::new();
+                    for (id, blob) in &from_blobs {
+                        let Some(new_blob) = copied.get(blob) else { continue };
+                        let new = s.import_blob(new_blob, &[&target], &["$seen"])?;
+                        out.insert(id.clone(), new);
+                    }
+                    Ok(out)
+                }
+                Err(e) => Err(e),
+            }
+        })?;
+        Ok(copied.len())
+    }
+    /// A short summary of an attached message (`message/rfc822` or
+    /// `.eml`): who wrote it, to whom, when, its subject and the start of
+    /// its text. On a JMAP server with the message not downloaded, the
+    /// server reads it (Email/parse); otherwise it is read here.
+    pub fn preview_attached(&self, a: &Account, m: &Mail, part: usize) -> Result<String> {
+        let attachment = m
+            .attachments()
+            .iter()
+            .find(|x| x.part == part)
+            .cloned()
+            .context("Attachment not found")?;
+        if a.provider == Provider::Jmap
+            && !attachment.section.is_empty()
+            && self.store.raw(&m.id)?.is_none()
+        {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            if let Some(e) = self.with_jmap(a, |s| s.parse_blob(&attachment.section))? {
+                return Ok(format!(
+                    "From: {}\nTo: {}\nDate: {}\nSubject: {}\n\n{}",
+                    crate::sync::jmap::addresses(&e.from),
+                    crate::sync::jmap::addresses(&e.to),
+                    e.sent_at.clone().unwrap_or_default(),
+                    e.subject.clone().unwrap_or_default(),
+                    e.preview.clone().unwrap_or_default()
+                ));
+            }
+        }
+        let bytes = self.attachment(a, m, part)?;
+        let parsed = parse_message(&bytes, a, "preview", Folder::Other, "", 0)?;
+        Ok(format!(
+            "From: {}\nTo: {}\nSubject: {}\n\n{}",
+            parsed.from,
+            parsed.to,
+            parsed.subject,
+            parsed.body.unwrap_or_default().chars().take(600).collect::<String>()
+        ))
+    }
+
     /// Saves a copy of a message sent through another server in Sent (an
     /// identity with its own outgoing server), unless one is there already.
     pub(super) fn file_sent_copy_jmap(&self, a: &Account, raw: &[u8]) -> Result<()> {
@@ -1057,19 +1468,32 @@ impl Backend {
             {
                 return Err(e);
             }
-            if !pending.is_empty() {
-                self.save_draft_removals(&a.id, &[])?;
-            }
-            let on_server = s.query_ids(&json!({ "inMailbox": drafts }), 0, 1000)?;
+            self.clear_draft_removals(&a.id, &pending)?;
+            // Every draft on the server, a page at a time. Only a complete
+            // listing shows that a draft missing from it is gone.
+            const PAGE: usize = 500;
+            const MOST: usize = 20_000;
+            let mut on_server: Vec<String> = Vec::new();
+            let complete = loop {
+                let page = s.query_ids(&json!({ "inMailbox": drafts }), on_server.len(), PAGE)?;
+                if page.is_empty() {
+                    break true;
+                }
+                on_server.extend(page);
+                if on_server.len() >= MOST {
+                    break false;
+                }
+            };
+            let listed: std::collections::HashSet<&str> = on_server.iter().map(String::as_str).collect();
             let mut changed = 0;
             let mut locals = self.store.drafts(&a.id)?;
             // Copies gone from the server (sent or deleted elsewhere):
             // unchanged drafts go here too; changed ones upload again.
             for d in &mut locals {
-                let Some(id) = d.remote.as_ref().and_then(jmap_draft).map(str::to_owned) else {
+                let Some(id) = d.remote.as_ref().and_then(jmap_draft) else {
                     continue;
                 };
-                if on_server.contains(&id) {
+                if !complete || listed.contains(id) {
                     continue;
                 }
                 if d.uploaded == d.fingerprint() {
@@ -1083,11 +1507,12 @@ impl Backend {
             }
             locals.retain(|d| !d.id.is_empty());
             // Drafts written elsewhere.
+            let claimed: std::collections::HashSet<String> = locals
+                .iter()
+                .filter_map(|d| d.remote.as_ref().and_then(jmap_draft).map(str::to_owned))
+                .collect();
             for id in &on_server {
-                if locals
-                    .iter()
-                    .any(|d| d.remote.as_ref().and_then(jmap_draft) == Some(id.as_str()))
-                {
+                if claimed.contains(id) {
                     continue;
                 }
                 let raw = s.source(id, MAX_MESSAGE)?;
@@ -1106,6 +1531,15 @@ impl Backend {
                 }
                 // Mail to be encrypted goes up encrypted, or not at all.
                 let Some(raw) = self.draft_upload(a, d)? else {
+                    // Its earlier copy (perhaps readable) is no longer it.
+                    if let Some(old) = d.remote.as_ref().and_then(jmap_draft) {
+                        if let Err(e) = s.destroy(&[old.to_owned()])
+                            && crate::sync::retry::later(&e)
+                        {
+                            return Err(e);
+                        }
+                        self.keep_draft_here(d)?;
+                    }
                     continue;
                 };
                 let id = s.import(&raw, &[&drafts], &["$draft", "$seen"])?;
@@ -1114,12 +1548,12 @@ impl Backend {
                 {
                     let _ = s.destroy(&[old.to_owned()]);
                 }
-                // A composer may have saved a newer version meanwhile; it
-                // keeps its words, and uploads again next time.
-                let mut current = self.store.draft(&d.id)?.unwrap_or_else(|| d.clone());
-                current.remote = Some(jmap_remote(&id));
-                current.uploaded = fingerprint;
-                self.store.save_draft(&current)?;
+                if !self.finish_draft_upload(d, jmap_remote(&id), fingerprint)?
+                    && s.destroy(std::slice::from_ref(&id)).is_err()
+                {
+                    // Discarded while uploading: its new copy goes too.
+                    self.queue_draft_removal(&a.id, jmap_remote(&id))?;
+                }
             }
             Ok(changed)
         })
@@ -1446,4 +1880,13 @@ mod tests {
         };
         assert_eq!(jmap_draft(&imap), None);
     }
+}
+
+/// A message the JMAP server holds to send later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldSubmission {
+    pub id: String,
+    pub subject: String,
+    /// When it goes (Unix seconds).
+    pub send_at: i64,
 }

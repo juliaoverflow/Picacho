@@ -133,6 +133,20 @@ fn esearch_uids(data: &[u8]) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// UID SEARCH that also keeps its result on the server as `$` (SEARCHRES,
+/// RFC 5182), for the next commands to act on exactly those messages; it
+/// needs ESEARCH's form of reply. Returns the UIDs.
+pub(crate) fn uid_search_saved(session: &mut ImapSession, criteria: &str) -> Result<Vec<u32>> {
+    let charset = search_charset(criteria, false);
+    let data = session.run_command_and_read_response(format!(
+        "UID SEARCH RETURN (SAVE ALL) {charset}{criteria}"
+    ))?;
+    let mut uids = esearch_uids(&data)?;
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(uids)
+}
+
 /// UID SEARCH as the imap crate's `uid_search`, answered with ESEARCH
 /// where the server has it (and must, speaking IMAP4rev2, whose SEARCH
 /// replies are ESEARCH, which the imap crate doesn't read). Refusals come

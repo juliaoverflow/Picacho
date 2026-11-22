@@ -659,6 +659,7 @@ impl MailApp {
                 let server = crate::sync::caldav::Server {
                     url: self.calendar_url.read(cx).value().trim().to_owned(),
                     user: self.calendar_user.read(cx).value().trim().to_owned(),
+                    ..Default::default()
                 };
                 let password = self.calendar_password.read(cx).value().to_string();
                 self.calendar_password
@@ -670,6 +671,7 @@ impl MailApp {
             }
             Action::SyncCalendar => {
                 self.calendar_run(cx, |b| {
+                    let _ = b.sync_tasks();
                     b.sync_calendar().map(|n| format!("Read {n} events"))
                 });
             }
@@ -685,7 +687,10 @@ impl MailApp {
             }
             Action::EventScope(all) => self.event_all_repeats = all,
             Action::EventRepeat(r) => self.event_repeat = r,
+            Action::EventAlarm(a) => self.event_alarm = a,
             Action::NewEvent => {
+                self.event_alarm = None;
+                self.free_busy = None;
                 self.event_occurrence = None;
                 self.event_repeat = Repeat::Never;
                 let here = crate::manage::backend::calendar::local_zone().unwrap_or_default();
@@ -718,6 +723,8 @@ impl MailApp {
                     return;
                 };
                 self.event_repeat = Repeat::of(&s.event.recurrence);
+                self.event_alarm = s.event.alarms.first().copied();
+                self.free_busy = None;
                 // One repeat: as it is now (changed on its own, or as the series has it).
                 let e = match occurrence {
                     Some(at) => ical::occurrences(&s.event, &s.overrides, at, at + 1)
@@ -879,6 +886,12 @@ impl MailApp {
                 }
                 event.location = location;
                 event.description = description;
+                // The first reminder is the one chosen; others stay.
+                match (self.event_alarm, event.alarms.is_empty()) {
+                    (Some(a), true) => event.alarms.push(a),
+                    (Some(a), false) => event.alarms[0] = a,
+                    (None, _) => event.alarms.clear(),
+                }
                 event.recurrence = self.event_repeat.rule();
                 if event.recurrence.is_empty() {
                     event.exdates.clear();
@@ -973,9 +986,157 @@ impl MailApp {
                     })
                 });
             }
+            Action::ConnectJmapCalendar(id) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                self.calendar_run(cx, move |b| {
+                    let n = b.connect_jmap_calendar(&a)?;
+                    Ok(format!("Read {n} events from {}", a.email))
+                });
+            }
+            Action::CreateCalendar => {
+                let name = self.collection_name.read(cx).value().trim().to_owned();
+                self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
+                self.calendar_run(cx, move |b| {
+                    let made = b.create_calendar(&name, "")?;
+                    Ok(format!("Made the calendar {}", made.name))
+                });
+            }
+            Action::AddTask => {
+                let name = self.collection_name.read(cx).value().trim().to_owned();
+                // Due as written in the start field, else at the end of today.
+                let due = self
+                    .read_when(self.event_start.read(cx).value().trim())
+                    .map(|(t, ..)| t)
+                    .unwrap_or_else(|| {
+                        let today = chrono::Local::now().date_naive().and_hms_opt(17, 0, 0).unwrap_or_default();
+                        today.and_local_timezone(chrono::Local).earliest().map_or(0, |t| t.timestamp())
+                    });
+                self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
+                self.calendar_run(cx, move |b| {
+                    let t = b.add_task(&name, due)?;
+                    Ok(format!("Added the task {}", t.event.summary))
+                });
+            }
+            Action::CompleteTask(uid) => {
+                self.calendar_run(cx, move |b| b.complete_task(&uid, true).map(|()| "Task done".into()));
+            }
+            Action::CheckFreeBusy => {
+                let guests: Vec<String> = self
+                    .event_guests
+                    .read(cx)
+                    .value()
+                    .split([',', ';'])
+                    .map(|g| g.trim().to_owned())
+                    .filter(|g| g.contains('@'))
+                    .collect();
+                let around = self
+                    .read_when(self.event_start.read(cx).value().trim())
+                    .map(|(t, ..)| t)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp());
+                let Some(organizer) = self.accounts.first().map(|a| a.email.clone()) else {
+                    return;
+                };
+                self.free_busy = Some("Looking…".into());
+                self.task(
+                    cx,
+                    move |b| {
+                        let from = around - around.rem_euclid(86_400);
+                        b.free_busy(&organizer, &guests, from, from + 86_400)
+                    },
+                    |this, result, cx| {
+                        this.free_busy = Some(match result {
+                            Ok(found) if found.iter().all(|f| f.busy.is_empty()) => {
+                                "Everyone is free that day.".into()
+                            }
+                            Ok(found) => found
+                                .iter()
+                                .map(|f| {
+                                    let times: Vec<String> = f
+                                        .busy
+                                        .iter()
+                                        .map(|(s, e)| {
+                                            let at = |t: i64| {
+                                                chrono::DateTime::from_timestamp(t, 0)
+                                                    .unwrap_or_default()
+                                                    .with_timezone(&chrono::Local)
+                                                    .format("%H:%M")
+                                                    .to_string()
+                                            };
+                                            format!("{}–{}", at(*s), at(*e))
+                                        })
+                                        .collect();
+                                    if times.is_empty() {
+                                        format!("{} is free", f.attendee)
+                                    } else {
+                                        format!("{} is busy {}", f.attendee, times.join(", "))
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(". "),
+                            Err(e) => format!("{e:#}"),
+                        });
+                        cx.notify();
+                    },
+                );
+            }
+            Action::ListHeld(id) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                self.task(
+                    cx,
+                    move |b| b.held_submissions(&a),
+                    move |this, result, cx| {
+                        match result {
+                            Ok(held) => this.held = Some((id.clone(), held)),
+                            Err(e) => this.notice(format!("{e:#}"), true, cx),
+                        }
+                        cx.notify();
+                    },
+                );
+            }
+            Action::CancelHeld(id, submission) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                if let Some((_, held)) = self.held.as_mut() {
+                    held.retain(|h| h.id != submission);
+                }
+                self.calendar_run(cx, move |b| {
+                    Ok(if b.cancel_held(&a, &submission)? {
+                        "Taken back; it's in Drafts".into()
+                    } else {
+                        "It had already been sent".into()
+                    })
+                });
+            }
             _ => {}
         }
         cx.notify();
+    }
+
+    /// Shows reminders that are due, as notifications. Called with the
+    /// mail checks' timer.
+    pub(super) fn show_due_reminders(&mut self, cx: &mut Context<Self>) {
+        if self.backend.calendar_server().is_none() {
+            return;
+        }
+        self.task(
+            cx,
+            |b| Ok(b.due_reminders(chrono::Utc::now().timestamp())),
+            |_, result: anyhow::Result<Vec<(Event, i64)>>, _| {
+                for (e, _) in result.unwrap_or_default() {
+                    let body = if e.location.is_empty() {
+                        event_when(&e)
+                    } else {
+                        format!("{} · {}", event_when(&e), e.location)
+                    };
+                    crate::display::notify::reminder(&e.uid, &e.summary, &body);
+                }
+            },
+        );
     }
 
     /// The account an event you organize is sent from: the one whose
@@ -1059,7 +1220,16 @@ impl MailApp {
     /// Reads the calendar from its server once at startup, quietly.
     pub(super) fn sync_calendar_at_start(&mut self, cx: &mut Context<Self>) {
         if self.backend.calendar_server().is_some() {
-            self.task(cx, |b| b.sync_calendar(), |_, _, cx| cx.notify());
+            self.task(
+                cx,
+                |b| {
+                    let n = b.sync_calendar()?;
+                    // Tasks aren't worth failing the calendar for.
+                    let _ = b.sync_tasks();
+                    Ok(n)
+                },
+                |_, _, cx| cx.notify(),
+            );
         }
     }
 
@@ -1167,6 +1337,49 @@ impl MailApp {
             .into_any_element()
     }
 
+    /// Buttons to use the calendars or contacts of each JMAP account whose
+    /// server keeps them, instead of signing in to another server.
+    pub(super) fn jmap_sources(
+        &self,
+        id: &'static str,
+        action: fn(String) -> Action,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let c = self.colors();
+        let accounts: Vec<&Account> = self
+            .accounts
+            .iter()
+            .filter(|a| a.provider == crate::manage::model::Provider::Jmap)
+            .collect();
+        if accounts.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Or use those kept with your mail, signed in as the account already is:"),
+                )
+                .child(div().flex().flex_wrap().gap_2().children(accounts.into_iter().map(|a| {
+                    self.button(
+                        SharedString::from(format!("{id}-{}", a.id)),
+                        &a.email,
+                        "plus",
+                        action(a.id.clone()),
+                        false,
+                        cx,
+                    )
+                })))
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn calendar_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let busy = self.calendar_busy;
@@ -1212,6 +1425,7 @@ impl MailApp {
                                 .text_color(rgb(c.muted))
                                 .child("Fastmail, iCloud, Nextcloud, Radicale, mailbox.org or another CalDAV server. iCloud and Fastmail need an app password."),
                         )
+                        .children(self.jmap_sources("calendar-jmap", Action::ConnectJmapCalendar, cx))
                         .child(labelled("Server", "calendar-url", &self.calendar_url))
                         .child(labelled("User name", "calendar-user", &self.calendar_user))
                         .child(labelled("Password", "calendar-password", &self.calendar_password))
@@ -1242,11 +1456,19 @@ impl MailApp {
                     .to_string()
             })
             .unwrap_or_else(|| "never".into());
-        page = page.child(self.section("Calendar server (CalDAV)")).child(
+        let over_jmap = !server.jmap_account.is_empty();
+        page = page
+            .child(self.section(if over_jmap {
+                "Calendar server (JMAP)"
+            } else {
+                "Calendar server (CalDAV)"
+            }))
+            .child(
             self.setting(
                 &server.url,
                 &format!(
-                    "Signed in as {}. Read {synced}; read again each time Picacho starts.",
+                    "{} {}. Read {synced}; read again each time Picacho starts.",
+                    if over_jmap { "The calendars of" } else { "Signed in as" },
                     server.user
                 ),
                 div()
@@ -1310,6 +1532,125 @@ impl MailApp {
                 .text_color(rgb(c.danger))
                 .child(e)
         }));
+        // A new calendar, or a task, named in one field.
+        page = page.child(
+            self.setting(
+                "New calendar or task",
+                "A calendar is made on the server. A task is added to the calendar new events go to, due as written in an event's Starts field, else this evening.",
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("collection-name")
+                            .w(px(200.))
+                            .child(field(Input::new(&self.collection_name), c, busy)),
+                    )
+                    .child(self.button("calendar-create", "Make Calendar", "plus", Action::CreateCalendar, false, cx))
+                    .child(self.button("task-add", "Add Task", "check", Action::AddTask, false, cx)),
+            ),
+        );
+        // Open tasks.
+        let tasks = self.backend.calendar_tasks();
+        if !tasks.is_empty() {
+            let count = tasks.len();
+            page = page.child(self.section("Tasks")).child(
+                div()
+                    .id("calendar-tasks")
+                    .role(Role::List)
+                    .aria_label("Tasks")
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.raised))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .children(tasks.into_iter().take(50).enumerate().map(|(i, t)| {
+                        let due = chrono::DateTime::from_timestamp(t.event.start, 0)
+                            .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
+                            .unwrap_or_default();
+                        div()
+                            .id(SharedString::from(format!("task-{i}")))
+                            .role(Role::ListItem)
+                            .aria_label(format!("{}, due {due}", t.event.summary))
+                            .aria_position_in_set(i + 1)
+                            .aria_size_of_set(count)
+                            .px_4()
+                            .py(px(10.))
+                            .border_b_1()
+                            .border_color(rgb(c.border))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().text_size(px(13.)).truncate().child(t.event.summary.clone()))
+                                    .child(div().text_size(px(11.5)).text_color(rgb(c.muted)).child(format!("Due {due}"))),
+                            )
+                            .child(self.button(
+                                SharedString::from(format!("task-done-{i}")),
+                                "Done",
+                                "check",
+                                Action::CompleteTask(t.event.uid.clone()),
+                                false,
+                                cx,
+                            ))
+                    })),
+            );
+        }
+        // Messages JMAP servers hold to send later.
+        let jmap_accounts: Vec<&Account> = self
+            .accounts
+            .iter()
+            .filter(|a| a.provider == crate::manage::model::Provider::Jmap)
+            .collect();
+        if !jmap_accounts.is_empty() {
+            page = page.child(self.section("Held to send later"));
+            for a in jmap_accounts {
+                let listed = self.held.as_ref().filter(|(id, _)| *id == a.id);
+                let detail = match listed {
+                    None => "Messages handed to the server to send later can be taken back until they go.".to_owned(),
+                    Some((_, held)) if held.is_empty() => "Nothing is waiting.".to_owned(),
+                    Some((_, held)) => format!("{} waiting.", held.len()),
+                };
+                page = page.child(self.setting(
+                    &a.email,
+                    &detail,
+                    self.button(
+                        SharedString::from(format!("held-{}", a.id)),
+                        "Show",
+                        "refresh",
+                        Action::ListHeld(a.id.clone()),
+                        false,
+                        cx,
+                    ),
+                ));
+                for h in listed.map(|(_, h)| h.as_slice()).unwrap_or_default() {
+                    let when = chrono::DateTime::from_timestamp(h.send_at, 0)
+                        .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
+                        .unwrap_or_default();
+                    page = page.child(self.setting(
+                        if h.subject.is_empty() { "(No subject)" } else { &h.subject },
+                        &format!("Goes {when}"),
+                        self.button(
+                            SharedString::from(format!("held-cancel-{}", h.id)),
+                            "Take Back",
+                            "undo",
+                            Action::CancelHeld(a.id.clone(), h.id.clone()),
+                            false,
+                            cx,
+                        ),
+                    ));
+                }
+            }
+        }
         // The event being added or edited.
         if let Some(uid) = &self.event_editing {
             page = page.child(
@@ -1352,6 +1693,48 @@ impl MailApp {
                     .child(labelled("Where", "event-location", &self.event_location))
                     .child(labelled("Notes", "event-notes", &self.event_notes))
                     .child(labelled("Guests (invited by mail; separated by commas)", "event-guests", &self.event_guests))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.button(
+                                "event-free-busy",
+                                "When Are They Free?",
+                                "calendar",
+                                Action::CheckFreeBusy,
+                                false,
+                                cx,
+                            ))
+                            .children(self.free_busy.clone().map(|text| {
+                                div()
+                                    .id("event-free-busy-result")
+                                    .flex_1()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(c.muted))
+                                    .child(text)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child("Remind me"))
+                            .child(self.segmented(
+                                "event-alarm",
+                                [
+                                    ("Never", None),
+                                    ("10 minutes before", Some(600)),
+                                    ("An hour before", Some(3600)),
+                                    ("A day before", Some(86_400)),
+                                ]
+                                .into_iter()
+                                .map(|(label, a)| (label.to_owned(), Action::EventAlarm(a), self.event_alarm == a))
+                                .collect(),
+                                cx,
+                            )),
+                    )
                     .when(self.event_occurrence.is_some() && self.event_repeat != Repeat::Never, |d| {
                         d.child(
                             div()

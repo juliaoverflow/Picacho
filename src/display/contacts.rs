@@ -79,6 +79,28 @@ impl MailApp {
                         )),
                 ),
             )
+            .child(self.setting(
+                "New address book",
+                "Made on the server; new contacts then go to it.",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("address-book-name")
+                            .w(px(200.))
+                            .child(field(Input::new(&self.collection_name), c, busy)),
+                    )
+                    .child(self.button(
+                        "address-book-create",
+                        "Make Address Book",
+                        "plus",
+                        Action::CreateAddressBook,
+                        false,
+                        cx,
+                    )),
+            ))
         } else {
             page.child(
                 div()
@@ -90,8 +112,9 @@ impl MailApp {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child("Read your address books from Fastmail, iCloud, Nextcloud, Radicale or another CardDAV server. They are only read; edit contacts where they're kept. iCloud and Fastmail need an app password."),
+                            .child("Read and edit your address books on Fastmail, iCloud, Nextcloud, Radicale or another CardDAV server. iCloud and Fastmail need an app password."),
                     )
+                    .children(self.jmap_sources("contacts-jmap", Action::ConnectJmapContacts, cx))
                     .child(
                         div()
                             .flex()
@@ -209,7 +232,7 @@ impl MailApp {
                 let server = crate::sync::carddav::Server {
                     url: self.contacts_url.read(cx).value().trim().to_owned(),
                     user: self.contacts_user.read(cx).value().trim().to_owned(),
-                    book: String::new(),
+                    ..Default::default()
                 };
                 let password = self.contacts_password.read(cx).value().to_string();
                 // Not kept on screen; the keychain has it once it works.
@@ -271,6 +294,23 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::ConnectJmapContacts(id) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                self.contacts_run(cx, move |b| {
+                    let n = b.connect_jmap_contacts(&a)?;
+                    Ok(format!("Read {n} contacts from {}", a.email))
+                });
+            }
+            Action::CreateAddressBook => {
+                let name = self.collection_name.read(cx).value().trim().to_owned();
+                self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
+                self.contacts_run(cx, move |b| {
+                    b.create_address_book(&name)?;
+                    Ok(format!("Made the address book {name}"))
+                });
+            }
             Action::NewContact => self.edit_contact(None, w, cx),
             Action::EditContact(uid) => {
                 let card = self.backend.contacts().into_iter().find(|c| c.uid == uid);
@@ -300,6 +340,26 @@ impl MailApp {
                 card.phones = list(value(&self.contact_phones, cx));
                 card.org = value(&self.contact_org, cx).trim().to_owned();
                 card.note = value(&self.contact_note, cx).trim().to_owned();
+                card.addresses = value(&self.contact_addresses, cx)
+                    .split(['\n', ';'])
+                    .map(|a| a.trim().to_owned())
+                    .filter(|a| !a.is_empty())
+                    .collect();
+                card.birthday = value(&self.contact_birthday, cx).trim().to_owned();
+                // A group's members, by address: the UIDs of those people.
+                let members = list(value(&self.contact_members, cx));
+                if !members.is_empty() || card.group {
+                    let all = self.backend.contacts();
+                    card.group = !members.is_empty();
+                    card.members = members
+                        .iter()
+                        .filter_map(|m| {
+                            all.iter()
+                                .find(|c| c.emails.iter().any(|e| e.eq_ignore_ascii_case(m)) || c.name.eq_ignore_ascii_case(m))
+                                .map(|c| c.uid.clone())
+                        })
+                        .collect();
+                }
                 self.contact_editing = None;
                 self.contacts_run(cx, move |b| {
                     b.save_contact(card).map(|c| format!("Saved {}", c.name))
@@ -365,6 +425,19 @@ impl MailApp {
             (&self.contact_phones, card.phones.join(", ")),
             (&self.contact_org, card.org.clone()),
             (&self.contact_note, card.note.clone()),
+            (&self.contact_addresses, card.addresses.join("\n")),
+            (&self.contact_birthday, card.birthday.clone()),
+            (&self.contact_members, {
+                let all = self.backend.contacts();
+                card.members
+                    .iter()
+                    .filter_map(|uid| {
+                        let c = all.iter().find(|c| &c.uid == uid)?;
+                        c.emails.first().cloned().or_else(|| Some(c.name.clone()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }),
         ] {
             input.update(cx, |i, cx| i.set_text(text, w, cx));
         }
@@ -452,6 +525,13 @@ impl MailApp {
                 ))
                 .child(labelled("Organization", "contact-org", &self.contact_org))
                 .child(labelled("Note", "contact-note", &self.contact_note))
+                .child(labelled("Postal addresses", "contact-addresses", &self.contact_addresses))
+                .child(labelled("Birthday", "contact-birthday", &self.contact_birthday))
+                .child(labelled(
+                    "Members (makes it a group)",
+                    "contact-members",
+                    &self.contact_members,
+                ))
                 .child(div().text_size(px(11.)).text_color(rgb(c.muted)).child(
                     if self.backend.contacts_server().is_some() {
                         "Saved to your contacts server."
@@ -547,7 +627,14 @@ impl MailApp {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(icon_el("contact", 16., c.muted))
+                    .child(match card.photo_bytes().and_then(|b| photo_image(&b)) {
+                        Some(image) => img(image)
+                            .size(px(24.))
+                            .rounded_full()
+                            .into_any_element(),
+                        None => icon_el(if card.group { "user" } else { "contact" }, 16., c.muted)
+                            .into_any_element(),
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -614,4 +701,15 @@ impl MailApp {
             })
             .into_any_element()
     }
+}
+
+/// A contact's embedded photo as an image to draw, where it decodes.
+fn photo_image(bytes: &[u8]) -> Option<std::sync::Arc<gpui::Image>> {
+    let format = match bytes {
+        [0x89, b'P', b'N', b'G', ..] => gpui::ImageFormat::Png,
+        [0xFF, 0xD8, ..] => gpui::ImageFormat::Jpeg,
+        [b'G', b'I', b'F', ..] => gpui::ImageFormat::Gif,
+        _ => return None,
+    };
+    Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes.to_vec())))
 }

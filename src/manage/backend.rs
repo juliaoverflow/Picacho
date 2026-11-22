@@ -49,6 +49,7 @@ mod proton_push;
 pub use proton_push::ProtonPushed;
 #[path = "jmap.rs"]
 mod jmap;
+pub use jmap::HeldSubmission;
 pub use crate::sync::fido::{Method as KeyMethod, NeedsPin, Prompt as KeyPrompt};
 pub use proton::ProtonNext;
 pub use extras::ServerNotes;
@@ -2602,7 +2603,6 @@ impl Backend {
         }
         Ok(next)
     }
-    /// Applies one change to several messages, with one IMAP command per mailbox.
     /// Whether the account's folders live on a server that can create,
     /// rename and delete them: any IMAP server (CREATE, RENAME and DELETE
     /// are part of IMAP4rev1), but not POP3, which has only the inbox.
@@ -2895,11 +2895,17 @@ impl Backend {
         }
         self.with_imap(a, |c| {
             if !c.extensions()?.quota {
-                return Ok(None);
+                // Space used without a limit, where the server can say. Not
+                // worth failing the account's settings over.
+                return Ok(c.total_size_kib().ok().flatten().map(|used_kib| Quota {
+                    used_kib,
+                    limit_kib: 0,
+                }));
             }
             quota(&mut c.session)
         })
     }
+    /// Applies one change to several messages, with one IMAP command per mailbox.
     pub fn change_many(&self, a: &Account, mails: &[Mail], change: Change) -> Result<()> {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -2974,7 +2980,7 @@ impl Backend {
         commit: bool,
     ) -> Result<()> {
         let target = match change {
-            Change::Move(folder) => Some(resolve_in(c.names(false)?, a.provider, folder)?),
+            Change::Move(folder) => Some(c.standard_folder(a.provider, folder)?),
             Change::MoveTo(ref name) => {
                 // Listed afresh: the folder may have gone since the last sync.
                 let names = c.names(true)?;
@@ -3529,6 +3535,8 @@ impl Backend {
                 )
             }
         };
+        // Set where the message went to Sent before it was sent (BURL).
+        let mut filed_already = false;
         let delivered = if a.provider.api_sending() && own_server.is_none() {
             // Through Proton's API: it encrypts for the recipients it can,
             // signs, and files the message in Sent itself. A JMAP server
@@ -3561,8 +3569,11 @@ impl Backend {
                         return Err(crate::sync::smtp::NoServerHold.into());
                     }
                 }
-                self.send_jmap(a, &from, &to, &raw, &options)?
-                    .receipts
+                let submitted = self.send_jmap(a, &from, &to, &raw, &options)?;
+                // Kept by Message-ID, so a sent message can show what became
+                // of it (each recipient's delivery, as the server knows it).
+                self.note_submission(a, &message_id_of(&raw), &submitted.id);
+                submitted.receipts
             } else {
                 self.send_proton(a, &from, &to, &raw)?;
                 false
@@ -3575,7 +3586,13 @@ impl Backend {
             let tls = self.tls_connector()?;
             let (ring, certs) = (self.keyring(), self.certificates());
             let keys = crate::sync::smtp::Keys { ring: &ring, certs: &certs };
-            crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls, hold_until, &keys)?
+            match self.send_by_reference(a, d, &endpoint, &secret, &tls, hold_until, &keys) {
+                Some(delivered) => {
+                    filed_already = true;
+                    delivered?
+                }
+                None => crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls, hold_until, &keys)?,
+            }
         };
         let sent_raw = delivered.raw;
         let mut notes = Vec::new();
@@ -3609,10 +3626,11 @@ impl Backend {
         // app's copy.
         let proton_copy = a.provider == Provider::Proton && own_server.is_some();
         let jmap_copy = a.provider == Provider::Jmap && own_server.is_some();
-        if a.provider == Provider::Imap
-            || (a.provider.imap() && own_server.is_some())
-            || proton_copy
-            || jmap_copy
+        if !filed_already
+            && (a.provider == Provider::Imap
+                || (a.provider.imap() && own_server.is_some())
+                || proton_copy
+                || jmap_copy)
         {
             let raw = sent_raw.clone();
             let saved = if proton_copy {
@@ -3663,7 +3681,7 @@ impl Backend {
         {
             return Err(TooLargeForSent(limit).into());
         }
-        let sent = resolve_in(c.names(false)?, a.provider, Folder::Sent)?;
+        let sent = c.standard_folder(a.provider, Folder::Sent)?;
         let id = message_id_of(raw);
         if !id.is_empty() {
             c.select(&sent)?;
@@ -3689,6 +3707,147 @@ impl Backend {
             }
         }
         Ok(())
+    }
+    /// Sends through the account's own IMAP server's copy (BURL, RFC 4468),
+    /// for messages whose attachments add up to `BURL_FROM` or more:
+    /// the message is filed in Sent first, and the outgoing server fetches
+    /// it from there with an URL the IMAP server authorized (URLAUTH), so a
+    /// large message crosses the network once rather than twice. For an
+    /// IMAP account sending through its own outgoing server, when both
+    /// servers can. `None` where they can't (nothing was done: send as
+    /// usual). If the send fails the copy in Sent is removed again.
+    #[allow(clippy::too_many_arguments)]
+    fn send_by_reference(
+        &self,
+        a: &Account,
+        d: &Draft,
+        endpoint: &crate::sync::smtp::Endpoint,
+        secret: &str,
+        tls: &native_tls::TlsConnector,
+        hold_until: Option<i64>,
+        keys: &crate::sync::smtp::Keys,
+    ) -> Option<Result<crate::sync::smtp::Delivered>> {
+        // Only where it saves something: a message with attachments.
+        let large = d
+            .attachments
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum::<u64>()
+            >= BURL_FROM;
+        if a.provider != Provider::Imap || endpoint.host != a.smtp_host || !large {
+            return None;
+        }
+        let ready = self.with_imap(a, |c| {
+            let ext = c.extensions()?;
+            Ok(ext.urlauth && ext.uidplus)
+        });
+        if !matches!(ready, Ok(true)) {
+            return None;
+        }
+        if !crate::sync::smtp::takes_burl(endpoint, secret, tls).unwrap_or(false) {
+            return None;
+        }
+        let built = crate::sync::smtp::build(a, d, false)
+            .and_then(|message| Ok((crate::sync::smtp::protected(&message, d, keys)?, message)));
+        let (raw, message) = match built {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        // A forward with the original attached whole, the original on this
+        // server: the server puts it in itself (CATENATE), so it isn't sent
+        // up again. Only where the attachment is the original as it is.
+        let original = self.catenated_original(a, d, &raw);
+        // Filed and authorized; nothing has been sent yet.
+        let filed = self.with_imap(a, |c| {
+            if let Some(limit) = c.extensions()?.append_limit
+                && raw.len() as u64 > limit
+            {
+                bail!(TooLargeForSent(limit));
+            }
+            let sent = c.standard_folder(a.provider, Folder::Sent)?;
+            let wire = c.wire(&sent);
+            let flags = [imap::types::Flag::Seen];
+            let catenated = match &original {
+                Some((m, at)) => c
+                    .catenate(
+                        &wire,
+                        &flags,
+                        &raw[..*at],
+                        (&c.wire(&m.remote_folder), validity_of(m), m.uid),
+                        &raw[at + original_len(m, self)..],
+                    )
+                    .unwrap_or(None),
+                None => None,
+            };
+            let heard = match catenated {
+                Some(heard) => heard,
+                None => c.append_heard(&wire, &raw, &flags)?,
+            };
+            let (validity, uid) = crate::sync::transport::append_uid(&heard)
+                .context("The server didn't say where it filed the message.")?;
+            let url = c.submit_url(&a.incoming_host, a.login(), &wire, validity, uid);
+            Ok((sent, validity, uid, url))
+        });
+        let Ok((sent, validity, uid, url)) = filed else {
+            return None;
+        };
+        let remove = || {
+            let _ = self.with_imap(a, |c| {
+                c.select(&sent)?;
+                c.erase(&[uid])
+            });
+        };
+        let Ok(url) = url else {
+            remove();
+            return None;
+        };
+        let delivered = crate::sync::smtp::deliver_bytes(
+            a,
+            d,
+            &message,
+            raw.clone(),
+            endpoint,
+            secret,
+            tls,
+            hold_until,
+            Some(crate::sync::smtp::Burl { url: &url }),
+        );
+        match &delivered {
+            Ok(_) => {
+                let id = format!("{}:{sent}:{validity}:{uid}", a.id);
+                if let Ok(mut m) = parse_message(&raw, a, &id, Folder::Sent, &sent, uid) {
+                    m.unread = false;
+                    let _ = self.store.save_messages(&[m]);
+                }
+            }
+            // Not sent: it isn't in Sent either.
+            Err(_) => remove(),
+        }
+        Some(delivered)
+    }
+    /// For a forward with its original attached whole (`d.forwarding`, an
+    /// `.eml` whose bytes are the original's as kept here): the original,
+    /// on this account's server, and where its bytes start in `raw`.
+    fn catenated_original(&self, a: &Account, d: &Draft, raw: &[u8]) -> Option<(Mail, usize)> {
+        if !d.forwarding || d.original.is_empty() || d.encrypt || d.sign {
+            return None;
+        }
+        let m = self.store.message(&d.original).ok()??;
+        if m.account != a.id || m.uid == 0 || validity_of(&m) == 0 {
+            return None;
+        }
+        let source = self.store.raw(&m.id).ok()??;
+        // The draft attaches exactly that source.
+        let attached = d.attachments.iter().any(|p| {
+            p.extension().is_some_and(|e| e.eq_ignore_ascii_case("eml"))
+                && std::fs::read(p).is_ok_and(|bytes| bytes == source)
+        });
+        if !attached || source.len() < 64 {
+            return None;
+        }
+        let at = raw.windows(source.len()).position(|w| w == source.as_slice())?;
+        Some((m, at))
     }
     /// Where copies for Sent that couldn't be saved yet wait, per account.
     fn sent_queue(&self, account: &str) -> std::path::PathBuf {
@@ -3766,18 +3925,49 @@ impl Backend {
     /// Deletes a draft here, and its copy on the server at the next draft
     /// sync (it may have been uploaded since a composer last saved it).
     pub fn discard_draft(&self, id: &str) -> Result<()> {
-        if let Some(d) = self.store.draft(id)? {
+        // Taken in one step: a sync uploading it now either sees it gone
+        // (and removes its new copy, `finish_draft_upload`) or its new copy
+        // is the one queued here.
+        if let Some(d) = self.store.take_draft(id)? {
             if let Some(remote) = d.remote {
-                let mut pending = self.draft_removals(&d.account);
-                if !pending.contains(&remote) {
-                    pending.push(remote);
-                }
-                self.save_draft_removals(&d.account, &pending)?;
+                self.queue_draft_removal(&d.account, remote)?;
             }
             // Files taken from a server draft were kept for it alone.
             let _ = std::fs::remove_dir_all(self.draft_files(id));
         }
-        self.store.delete_draft(id)
+        Ok(())
+    }
+    /// Notes a draft's server copy to be removed at the next draft sync.
+    pub(super) fn queue_draft_removal(&self, account: &str, remote: RemoteDraft) -> Result<()> {
+        let _guard = DRAFT_REMOVALS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.draft_removals(account);
+        if !pending.contains(&remote) {
+            pending.push(remote);
+        }
+        self.save_draft_removals(account, &pending)
+    }
+    /// Forgets the removals `done`, keeping any queued since they were read.
+    pub(super) fn clear_draft_removals(&self, account: &str, done: &[RemoteDraft]) -> Result<()> {
+        if done.is_empty() {
+            return Ok(());
+        }
+        let _guard = DRAFT_REMOVALS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.draft_removals(account);
+        pending.retain(|r| !done.contains(r));
+        self.save_draft_removals(account, &pending)
+    }
+    /// Records a draft's new server copy after an upload. Returns false when
+    /// the draft was discarded meanwhile: the caller removes that copy (or,
+    /// failing that, queues it), so it doesn't come back as a draft.
+    /// A composer may have saved a newer version meanwhile; it keeps its
+    /// words, and uploads again next time.
+    pub(super) fn finish_draft_upload(&self, d: &Draft, remote: RemoteDraft, fingerprint: String) -> Result<bool> {
+        let Some(mut current) = self.store.draft(&d.id)? else {
+            return Ok(false);
+        };
+        current.remote = Some(remote);
+        current.uploaded = fingerprint;
+        self.store.update_draft(&current)
     }
     /// The copy of a draft kept in the server's Drafts folder. A draft to
     /// be encrypted with OpenPGP is encrypted to your own key first, so the
@@ -3785,33 +3975,102 @@ impl Backend {
     /// One to be encrypted with S/MIME, or without a key of yours to seal
     /// it with, isn't uploaded (`None`): it stays on this device.
     pub(super) fn draft_upload(&self, a: &Account, d: &Draft) -> Result<Option<Vec<u8>>> {
-        let raw = crate::sync::smtp::build(a, d, true)?.formatted();
         if !d.encrypt {
-            return Ok(Some(raw));
+            return Ok(Some(crate::sync::smtp::build(a, d, true)?.formatted()));
         }
-        let ring = self.keyring();
-        let me = crate::sync::smtp::build(a, d, true)?
-            .envelope()
-            .from()
-            .map(|f| f.to_string())
-            .unwrap_or_default();
-        if d.smime || ring.secret.is_empty() {
+        // Whether it can be sealed is known before the message (with every
+        // attachment read from disk) is built, once.
+        let Some((me, smime)) = self.draft_seal(a, d)? else {
+            return Ok(None);
+        };
+        let raw = crate::sync::smtp::build(a, d, true)?.formatted();
+        if smime {
             // Sealed to your own certificate, as S/MIME drafts are.
             let certs = self.certificates();
-            if !certs.has_own(&me) {
-                return Ok(None);
-            }
             return Ok(Some(crate::manage::smime::protect_with(&certs, &raw, &me, &[], false, true)?));
         }
-        if ring.own_key(&me).is_none() {
-            return Ok(None);
-        }
+        let ring = self.keyring();
         let how = crate::manage::openpgp::Protect {
             sign: false,
             encrypt: true,
             subject: d.encrypt_subject,
         };
         Ok(Some(crate::manage::openpgp::protect(&raw, &me, &[], how, &ring)?))
+    }
+    /// For a draft to be encrypted: the address it is sealed to and whether
+    /// with S/MIME, or `None` when this device has no key of yours for it.
+    /// The sender comes from the message without its attachments, which
+    /// aren't read for it.
+    pub(super) fn draft_seal(&self, a: &Account, d: &Draft) -> Result<Option<(String, bool)>> {
+        let bare = Draft {
+            attachments: Vec::new(),
+            ..d.clone()
+        };
+        let me = crate::sync::smtp::build(a, &bare, true)?
+            .envelope()
+            .from()
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+        let ring = self.keyring();
+        if d.smime || ring.secret.is_empty() {
+            return Ok(self.certificates().has_own(&me).then_some((me, true)));
+        }
+        Ok(ring.own_key(&me).is_some().then_some((me, false)))
+    }
+    /// After a draft to be encrypted couldn't be sealed: its earlier copy on
+    /// the server (perhaps readable) is no longer it, so the draft stays on
+    /// this device alone. The caller removes that copy first.
+    pub(super) fn keep_draft_here(&self, d: &Draft) -> Result<()> {
+        if let Some(mut current) = self.store.draft(&d.id)? {
+            current.remote = None;
+            current.uploaded.clear();
+            self.store.update_draft(&current)?;
+        }
+        Ok(())
+    }
+    /// An id for a draft found on the server: the one its header names,
+    /// unless that is taken by a draft here (perhaps another account's; a
+    /// server chooses the header), or not usable.
+    pub(super) fn draft_id_for(&self, named: Option<&str>) -> Result<String> {
+        if let Some(id) = named
+            && !id.is_empty()
+            && id.len() <= 200
+            && self.store.draft(id)?.is_none()
+        {
+            return Ok(id.to_owned());
+        }
+        Ok(uuid::Uuid::new_v4().to_string())
+    }
+    /// A file the Android picker copied into the app's cache (`picked/<one
+    /// pick>/<name>`, pruned after a week) moved among draft `id`'s own
+    /// files, which last as long as the draft. Other paths are left as they are.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn adopt_picked(&self, id: &str, path: std::path::PathBuf) -> std::path::PathBuf {
+        let picked = path
+            .parent()
+            .and_then(|p| p.parent())
+            .is_some_and(|p| p.file_name().is_some_and(|n| n == "picked"));
+        let Some(name) = path.file_name().filter(|_| picked && path.is_file()) else {
+            return path;
+        };
+        let dir = self.draft_files(id);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return path;
+        }
+        let mut used: HashSet<String> = std::fs::read_dir(&dir)
+            .map(|e| e.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect())
+            .unwrap_or_default();
+        let target = dir.join(distinct_name(&name.to_string_lossy(), &mut used));
+        let moved = std::fs::rename(&path, &target).or_else(|_| std::fs::copy(&path, &target).map(|_| ()));
+        match moved {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::remove_dir_all(parent);
+                }
+                target
+            }
+            Err(_) => path,
+        }
     }
     fn draft_removals(&self, account: &str) -> Vec<RemoteDraft> {
         self.store
@@ -3864,19 +4123,22 @@ impl Backend {
             let pending = self.draft_removals(&a.id);
             let gone: Vec<u32> = pending.iter().filter(|r| here(r)).map(|r| r.uid).collect();
             c.erase(&gone)?;
-            if !pending.is_empty() {
-                self.save_draft_removals(&a.id, &[])?;
-            }
+            self.clear_draft_removals(&a.id, &pending)?;
             // What the server has, and which of Picacho's drafts each is.
             let mut on_server: Vec<u32> = c.uid_search("ALL")?.into_iter().collect();
             on_server.sort_unstable();
+            let present: HashSet<u32> = on_server.iter().copied().collect();
             let mut tagged: HashMap<u32, String> = HashMap::new();
+            let mut sizes: HashMap<u32, u32> = HashMap::new();
             if !on_server.is_empty() {
                 let items = format!(
-                    "(UID BODY.PEEK[HEADER.FIELDS ({})])",
+                    "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS ({})])",
                     crate::sync::smtp::DRAFT_HEADER
                 );
                 for row in uid_fetch_rows(&mut c.session, &uid_ranges(&on_server), &items)? {
+                    if let Some(size) = row.size {
+                        sizes.insert(row.uid, size);
+                    }
                     let id = row.header.as_deref().and_then(|h| {
                         mailparse::parse_headers(h).ok().and_then(|(headers, _)| {
                             use mailparse::MailHeaderMap;
@@ -3896,7 +4158,7 @@ impl Backend {
                 let Some(remote) = d.remote.clone() else {
                     continue;
                 };
-                if here(&remote) && on_server.contains(&remote.uid) {
+                if here(&remote) && present.contains(&remote.uid) {
                     continue;
                 }
                 if here(&remote) && d.uploaded == d.fingerprint() {
@@ -3909,21 +4171,33 @@ impl Backend {
                 }
             }
             locals.retain(|d| !d.id.is_empty());
-            // Drafts written elsewhere.
+            // Drafts written elsewhere. Which server copies and ids drafts
+            // here already have, looked up rather than searched for each.
+            let claimed_uids: HashSet<u32> = locals
+                .iter()
+                .filter_map(|d| d.remote.as_ref().filter(|r| here(r)).map(|r| r.uid))
+                .collect();
+            let local_ids: HashSet<&str> = locals.iter().map(|d| d.id.as_str()).collect();
+            let mut found = Vec::new();
             for &uid in &on_server {
-                let claimed = locals.iter().any(|d| {
-                    d.remote.as_ref().is_some_and(|r| here(r) && r.uid == uid)
-                        || tagged.get(&uid) == Some(&d.id)
-                });
-                if claimed {
+                if claimed_uids.contains(&uid) || tagged.get(&uid).is_some_and(|id| local_ids.contains(id.as_str())) {
+                    continue;
+                }
+                // Too large to open: skipped before it is downloaded, without
+                // holding up the drafts after it.
+                if sizes.get(&uid).is_some_and(|&n| n as usize > MAX_MESSAGE) {
                     continue;
                 }
                 let rows = uid_fetch_rows(&mut c.session, &uid.to_string(), "(UID RFC822.SIZE BODY.PEEK[])")?;
                 let Some(raw) = rows.into_iter().find(|r| r.uid == uid).and_then(|r| r.header) else {
                     continue;
                 };
-                ensure!(raw.len() <= MAX_MESSAGE, "A draft on the server is too large to open here.");
-                let id = tagged.get(&uid).cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                if raw.len() > MAX_MESSAGE {
+                    continue;
+                }
+                // The id the copy names (a server sets it) is taken only when
+                // no draft here, of any account, has it already.
+                let id = self.draft_id_for(tagged.get(&uid).map(String::as_str))?;
                 let mut d = self.draft_from(a, &id, &raw)?;
                 d.remote = Some(RemoteDraft {
                     mailbox: mailbox.clone(),
@@ -3932,9 +4206,10 @@ impl Backend {
                 });
                 d.uploaded = d.fingerprint();
                 self.store.save_draft(&d)?;
-                locals.push(d);
+                found.push(d);
                 changed += 1;
             }
+            locals.extend(found);
             // Drafts written or changed here.
             let limit = c.extensions()?.append_limit;
             // UIDs only grow: anything uploaded from here on is above this.
@@ -3946,6 +4221,11 @@ impl Backend {
                 }
                 // Mail to be encrypted goes up encrypted, or not at all.
                 let Some(raw) = self.draft_upload(a, d)? else {
+                    // Its earlier copy (perhaps readable) is no longer it.
+                    if let Some(old) = d.remote.as_ref().filter(|r| here(r)) {
+                        c.erase(&[old.uid])?;
+                        self.keep_draft_here(d)?;
+                    }
                     continue;
                 };
                 if limit.is_some_and(|l| raw.len() as u64 > l) {
@@ -3953,16 +4233,28 @@ impl Backend {
                     continue;
                 }
                 let wire = c.wire(&mailbox);
-                c.session.append_with_flags(
-                    &wire,
-                    &raw,
-                    &[imap::types::Flag::Seen, imap::types::Flag::Draft],
-                )?;
+                let flags = [imap::types::Flag::Seen, imap::types::Flag::Draft];
+                // Its copy here replaced in one step (REPLACE, RFC 8508), so
+                // no moment has two copies or none; else append, then remove.
+                let previous = d.remote.as_ref().filter(|r| here(r)).map(|r| r.uid);
+                let replaced = match previous {
+                    Some(old) => c.replace(old, &wire, &raw, &flags).unwrap_or(None),
+                    None => None,
+                };
+                let given = replaced
+                    .as_deref()
+                    .and_then(crate::sync::transport::append_uid)
+                    .filter(|(v, _)| *v == selected.validity)
+                    .map(|(_, uid)| uid);
+                if replaced.is_none() {
+                    c.session.append_with_flags(&wire, &raw, &flags)?;
+                }
                 // The new copy is the newest message carrying this draft's
                 // id: mail another app added meanwhile can't be taken for it.
                 let esearch = c.extensions()?.esearch;
                 let copies = draft_copies(&mut c.session, esearch, &d.id, floor)?;
-                let Some(uid) = copies.iter().copied().filter(|u| *u > floor).max() else {
+                let Some(uid) = given.or_else(|| copies.iter().copied().filter(|u| *u > floor).max())
+                else {
                     bail!("The server didn't keep the uploaded draft.");
                 };
                 floor = floor.max(uid);
@@ -3978,20 +4270,21 @@ impl Backend {
                     )
                     .chain(d.remote.as_ref().filter(|r| here(r)).map(|r| r.uid))
                     .filter(|u| *u != uid)
+                    // Replaced (REPLACE): already gone from the server.
+                    .filter(|u| replaced.is_none() || Some(*u) != previous)
                     .collect();
                 old.sort_unstable();
                 old.dedup();
                 c.erase(&old)?;
-                // A composer may have saved a newer version meanwhile; it
-                // keeps its words, and uploads again next time.
-                let mut current = self.store.draft(&d.id)?.unwrap_or_else(|| d.clone());
-                current.remote = Some(RemoteDraft {
+                let remote = RemoteDraft {
                     mailbox: mailbox.clone(),
                     validity: selected.validity,
                     uid,
-                });
-                current.uploaded = fingerprint;
-                self.store.save_draft(&current)?;
+                };
+                if !self.finish_draft_upload(d, remote.clone(), fingerprint)? && c.erase(&[uid]).is_err() {
+                    // Discarded while uploading: its new copy goes too.
+                    self.queue_draft_removal(&a.id, remote)?;
+                }
             }
             Ok(changed)
         })
@@ -4119,10 +4412,19 @@ fn distinct_name(name: &str, used: &mut std::collections::HashSet<String>) -> St
     }
     candidate
 }
-/// The UIDs of the selected Drafts folder's copies of draft `id`, by its
-/// `X-Picacho-Draft` header. The server is asked to search for the header;
-/// one that finds nothing (some don't search arbitrary headers) has the
-/// messages above `floor` read instead, keeping those that carry the id.
+/// A cached message's UIDVALIDITY, from its id (`account:mailbox:validity:uid`).
+fn validity_of(m: &Mail) -> u32 {
+    m.id.rsplit(':').nth(1).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// The length of the original as kept here.
+fn original_len(m: &Mail, b: &Backend) -> usize {
+    b.store.raw(&m.id).ok().flatten().map_or(0, |r| r.len())
+}
+
+/// Attachments adding up to this make a message worth sending by
+/// reference (BURL), so it crosses the network once.
+const BURL_FROM: u64 = 1024 * 1024;
 /// A sent message larger than the server keeps (APPENDLIMIT).
 #[derive(Debug)]
 struct TooLargeForSent(u64);
@@ -4147,6 +4449,13 @@ fn message_id_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// Held while a pending list of draft removals is read and written back.
+static DRAFT_REMOVALS: Mutex<()> = Mutex::new(());
+
+/// The UIDs of the selected Drafts folder's copies of draft `id`, by its
+/// `X-Picacho-Draft` header. The server is asked to search for the header;
+/// one that finds nothing (some don't search arbitrary headers) has the
+/// messages above `floor` read instead, keeping those that carry the id.
 fn draft_copies(session: &mut ImapSession, esearch: bool, id: &str, floor: u32) -> Result<Vec<u32>> {
     let header = crate::sync::smtp::DRAFT_HEADER;
     let found = match uid_search_any(session, esearch, &format!("HEADER {header} {}", quote(id)?)) {
@@ -4305,6 +4614,44 @@ mod layout_tests {
         let next = b.layout(&a.id, &inbox).unwrap();
         assert_eq!(*next.uids, [2, 3, 4]);
         assert_ne!(b.list_revision(&a.id), revision);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A server's draft naming the id of a draft here (another account's)
+    /// gets an id of its own rather than replacing it; a draft discarded
+    /// while it uploads isn't saved back; removals queued meanwhile stay.
+    #[test]
+    fn server_drafts_never_replace_or_revive_drafts_here() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-draft-ids-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(Store::open(&path)?));
+        let other = Draft {
+            id: "shared-id".into(),
+            account: "other".into(),
+            body: "Mine".into(),
+            ..Draft::default()
+        };
+        b.store.save_draft(&other)?;
+        let id = b.draft_id_for(Some("shared-id"))?;
+        assert_ne!(id, "shared-id");
+        assert_eq!(b.draft_id_for(Some("fresh"))?, "fresh");
+        assert_eq!(b.store.draft("shared-id")?.unwrap().body, "Mine");
+        // Discarded while uploading: the upload's result isn't saved.
+        let remote = |uid| RemoteDraft {
+            mailbox: "Drafts".into(),
+            validity: 1,
+            uid,
+        };
+        b.discard_draft("shared-id")?;
+        assert!(!b.finish_draft_upload(&other, remote(7), "x".into())?);
+        assert!(b.store.draft("shared-id")?.is_none());
+        // A removal queued while a sync works through earlier ones stays.
+        b.queue_draft_removal("other", remote(1))?;
+        let seen = b.draft_removals("other");
+        b.queue_draft_removal("other", remote(2))?;
+        b.clear_draft_removals("other", &seen)?;
+        assert_eq!(b.draft_removals("other"), vec![remote(2)]);
+        drop(b);
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

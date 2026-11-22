@@ -4,7 +4,10 @@
 //! POP3's `+` and SMTP's `334` lines); this module only makes them.
 //!
 //! - SCRAM-SHA-256 and SCRAM-SHA-1 (RFC 5802, 7677): the password never
-//!   crosses the wire, and the server proves it knows it too.
+//!   crosses the wire, and the server proves it knows it too. Their -PLUS
+//!   forms also bind the exchange to the TLS connection (RFC 5929's
+//!   tls-server-end-point: a hash of the server's certificate), so a
+//!   machine in the middle with a certificate of its own can't relay it.
 //! - PLAIN (RFC 4616) and LOGIN: the password, inside TLS.
 //! - CRAM-MD5 (RFC 2195): a keyed hash of a challenge; only where nothing
 //!   better is offered, since it needs the server to keep the password.
@@ -19,6 +22,8 @@ const MAX_ITERATIONS: u32 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mechanism {
+    ScramSha256Plus,
+    ScramSha1Plus,
     ScramSha256,
     ScramSha1,
     Plain,
@@ -30,12 +35,21 @@ pub(crate) enum Mechanism {
 
 /// For a password, best first: SCRAM proves both sides without sending the
 /// password; PLAIN and LOGIN send it inside TLS; CRAM-MD5 last.
-pub(crate) const PASSWORD_ORDER: [Mechanism; 5] = [
+pub(crate) const PASSWORD_ORDER: [Mechanism; 7] = [
+    Mechanism::ScramSha256Plus,
+    Mechanism::ScramSha1Plus,
     Mechanism::ScramSha256,
     Mechanism::ScramSha1,
     Mechanism::Plain,
     Mechanism::Login,
     Mechanism::CramMd5,
+];
+/// SCRAM alone, best first (IMAP and POP3 prefer it to plain LOGIN/USER).
+pub(crate) const SCRAM_ORDER: [Mechanism; 4] = [
+    Mechanism::ScramSha256Plus,
+    Mechanism::ScramSha1Plus,
+    Mechanism::ScramSha256,
+    Mechanism::ScramSha1,
 ];
 /// For an access token: the standard mechanism, then the older one.
 pub(crate) const TOKEN_ORDER: [Mechanism; 2] = [Mechanism::OAuthBearer, Mechanism::XOAuth2];
@@ -43,6 +57,8 @@ pub(crate) const TOKEN_ORDER: [Mechanism; 2] = [Mechanism::OAuthBearer, Mechanis
 impl Mechanism {
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
+            Self::ScramSha1Plus => "SCRAM-SHA-1-PLUS",
             Self::ScramSha256 => "SCRAM-SHA-256",
             Self::ScramSha1 => "SCRAM-SHA-1",
             Self::Plain => "PLAIN",
@@ -53,16 +69,37 @@ impl Mechanism {
         }
     }
     /// The best of `order` among the mechanisms a server offers (names in
-    /// any case).
+    /// any case), leaving out the -PLUS ones (no channel binding to give).
     pub(crate) fn choose<'a>(
         order: &[Mechanism],
         offered: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Mechanism> {
+        Self::choose_bound(order, offered, false)
+    }
+    /// As `choose`, with the -PLUS ones where `bound` (the connection's
+    /// channel binding is known).
+    pub(crate) fn choose_bound<'a>(
+        order: &[Mechanism],
+        offered: impl IntoIterator<Item = &'a str>,
+        bound: bool,
     ) -> Option<Mechanism> {
         let offered: Vec<String> = offered.into_iter().map(str::to_ascii_uppercase).collect();
         order
             .iter()
             .copied()
+            .filter(|m| bound || !m.plus())
             .find(|m| offered.iter().any(|o| o == m.name()))
+    }
+    /// SCRAM with channel binding.
+    pub(crate) fn plus(self) -> bool {
+        matches!(self, Self::ScramSha256Plus | Self::ScramSha1Plus)
+    }
+    fn scram(self) -> Option<Hash> {
+        match self {
+            Self::ScramSha256 | Self::ScramSha256Plus => Some(Hash::Sha256),
+            Self::ScramSha1 | Self::ScramSha1Plus => Some(Hash::Sha1),
+            _ => None,
+        }
     }
     /// Whether the client speaks first (and so can send its first message
     /// with the command, where the protocol allows).
@@ -79,6 +116,16 @@ pub(crate) struct Credentials {
     pub(crate) secret: String,
     pub(crate) host: String,
     pub(crate) port: u16,
+    /// The TLS connection's tls-server-end-point binding (RFC 5929), for
+    /// SCRAM-PLUS; empty where unknown.
+    pub(crate) binding: Vec<u8>,
+}
+
+/// The tls-server-end-point binding of a TLS stream, or empty.
+pub(crate) fn binding<S: std::io::Read + std::io::Write>(
+    tls: &native_tls::TlsStream<S>,
+) -> Vec<u8> {
+    tls.tls_server_end_point().ok().flatten().unwrap_or_default()
 }
 
 enum State {
@@ -89,6 +136,8 @@ enum State {
     ScramFirst {
         bare: String,
         nonce: String,
+        /// The GS2 header sent ("n,," or "p=tls-server-end-point,,").
+        header: String,
     },
     /// SCRAM: the proof was sent; the server's signature is expected.
     ScramFinal {
@@ -135,6 +184,7 @@ impl Exchange {
             secret,
             host,
             port,
+            binding: _,
         } = &self.credentials;
         let state = std::mem::replace(&mut self.state, State::Done);
         let (answer, next) = match (self.mechanism, state) {
@@ -171,27 +221,39 @@ impl Exchange {
                 };
                 (answer, State::Refused(reason))
             }
-            (Mechanism::ScramSha256 | Mechanism::ScramSha1, State::Start) => {
+            (m, State::Start) if m.scram().is_some() => {
                 let nonce = self
                     .nonce
                     .clone()
                     .unwrap_or_else(|| STANDARD.encode(rand::random::<[u8; 18]>()));
                 let bare = format!("n={},r={nonce}", saslname(user));
+                let header = if m.plus() {
+                    ensure!(
+                        !self.credentials.binding.is_empty(),
+                        "The connection's channel binding isn't known."
+                    );
+                    "p=tls-server-end-point,,".to_owned()
+                } else {
+                    // Not "y,,": servers behind a TLS-ending proxy offer no
+                    // -PLUS and would refuse a client that says it could.
+                    "n,,".to_owned()
+                };
                 (
-                    format!("n,,{bare}").into_bytes(),
-                    State::ScramFirst { bare, nonce },
+                    format!("{header}{bare}").into_bytes(),
+                    State::ScramFirst { bare, nonce, header },
                 )
             }
-            (Mechanism::ScramSha256 | Mechanism::ScramSha1, State::ScramFirst { bare, nonce }) => {
-                let hash = if self.mechanism == Mechanism::ScramSha256 {
-                    Hash::Sha256
-                } else {
-                    Hash::Sha1
-                };
-                let (answer, signature) = scram_proof(hash, secret, &bare, &nonce, challenge)?;
+            (m, State::ScramFirst { bare, nonce, header }) if m.scram().is_some() => {
+                let hash = m.scram().expect("a SCRAM mechanism");
+                let mut binding = header.into_bytes();
+                if m.plus() {
+                    binding.extend_from_slice(&self.credentials.binding);
+                }
+                let (answer, signature) =
+                    scram_proof(hash, secret, &bare, &nonce, challenge, &binding)?;
                 (answer.into_bytes(), State::ScramFinal { signature })
             }
-            (Mechanism::ScramSha256 | Mechanism::ScramSha1, State::ScramFinal { signature }) => {
+            (m, State::ScramFinal { signature }) if m.scram().is_some() => {
                 let text = std::str::from_utf8(challenge)
                     .context("The server's SCRAM reply isn't text.")?;
                 let fields = scram_fields(text);
@@ -327,6 +389,7 @@ fn scram_proof(
     client_first_bare: &str,
     nonce: &str,
     server_first: &[u8],
+    binding: &[u8],
 ) -> Result<(String, Vec<u8>)> {
     let server_first =
         std::str::from_utf8(server_first).context("The server's SCRAM challenge isn't text.")?;
@@ -361,8 +424,8 @@ fn scram_proof(
     let salted = hash.hi(password.as_bytes(), &salt, iterations);
     let client_key = hash.hmac(&salted, b"Client Key");
     let stored_key = hash.digest(&client_key);
-    // "biws" is base64 of "n,,": no channel binding.
-    let without_proof = format!("c=biws,r={combined}");
+    // The GS2 header and, for -PLUS, the binding data ("biws" is "n,,").
+    let without_proof = format!("c={},r={combined}", STANDARD.encode(binding));
     let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
     let signature = hash.hmac(&stored_key, auth_message.as_bytes());
     let proof: Vec<u8> = client_key
@@ -412,6 +475,7 @@ mod tests {
             secret: secret.into(),
             host: "mail.example.com".into(),
             port: 993,
+            binding: Vec::new(),
         }
     }
 
@@ -488,6 +552,39 @@ mod tests {
         x.nonce = Some("abc".into());
         x.initial();
         assert!(x.step(b"r=xyz123,s=QSXCR+Q6sek8bf92,i=4096").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn channel_binding_is_used_only_when_known() -> Result<()> {
+        let offered = ["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS", "PLAIN"];
+        assert_eq!(
+            Mechanism::choose(&PASSWORD_ORDER, offered),
+            Some(Mechanism::ScramSha256)
+        );
+        assert_eq!(
+            Mechanism::choose_bound(&PASSWORD_ORDER, offered, true),
+            Some(Mechanism::ScramSha256Plus)
+        );
+        // The same exchange as RFC 7677's, bound to a certificate hash: the
+        // header names the binding, and c= carries header and hash.
+        let mut c = credentials("user", "pencil");
+        c.binding = vec![0xAB; 32];
+        let mut x = Exchange::new(Mechanism::ScramSha256Plus, c);
+        x.nonce = Some("rOprNGfwEbeRWgbNEkqO".into());
+        assert_eq!(
+            x.initial().unwrap(),
+            b"p=tls-server-end-point,,n=user,r=rOprNGfwEbeRWgbNEkqO"
+        );
+        let answer = String::from_utf8(x.step(
+            b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+        )?)?;
+        let mut expected = b"p=tls-server-end-point,,".to_vec();
+        expected.extend([0xAB; 32]);
+        assert!(answer.starts_with(&format!("c={},r=", STANDARD.encode(&expected))));
+        // Without a binding, -PLUS can't start.
+        let mut x = Exchange::new(Mechanism::ScramSha1Plus, credentials("user", "pencil"));
+        assert!(x.initial().is_none());
         Ok(())
     }
 

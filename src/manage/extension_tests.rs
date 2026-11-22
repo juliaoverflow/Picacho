@@ -1688,3 +1688,197 @@ fn scheduled_mail_is_handed_to_a_server_that_holds_it() -> Result<()> {
     assert!(!seen.commands.iter().any(|c| c.starts_with("MAIL")), "{:?}", seen.commands);
     Ok(())
 }
+
+/// The server's answers, written and read whole: commands with any number
+/// of literals (`{n}` at a line's end), each given a go-ahead.
+fn command_with_literals(p: &mut Peer) -> Option<(String, String, Vec<Vec<u8>>)> {
+    let first = p.line()?;
+    let (tag, rest) = first.trim_end().split_once(' ')?;
+    let tag = tag.to_owned();
+    let mut command = String::new();
+    let mut literals = Vec::new();
+    let mut line = rest.to_owned();
+    loop {
+        let size = line
+            .rfind('{')
+            .filter(|_| line.ends_with('}'))
+            .and_then(|open| Some((open, line[open + 1..line.len() - 1].parse::<usize>().ok()?)));
+        let Some((open, n)) = size else {
+            command.push_str(&line);
+            return Some((tag, command, literals));
+        };
+        command.push_str(&line[..open]);
+        command.push_str("{}");
+        p.send("+ go ahead\r\n");
+        literals.push(p.bytes(n));
+        line = p.line()?.trim_end().to_owned();
+    }
+}
+
+/// A server with SASL-IR, REPLACE, MULTIAPPEND, CREATE-SPECIAL-USE and
+/// STATUS=SIZE: sign-in takes one round trip, a new draft version replaces
+/// the old in one command, imported mail goes in one APPEND, a missing
+/// Sent folder is made marked as Sent, and storage used is added up.
+#[test]
+fn newer_extensions_save_round_trips() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let drafts: FixtureFolder = Arc::default();
+    let (log, folder) = (seen.clone(), drafts.clone());
+    let server = std::thread::spawn(move || {
+        let mut next = 10;
+        let mut sent_made = false;
+        let mut imported = 0;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literals)) = command_with_literals(&mut p) {
+                let upper = command.to_ascii_uppercase();
+                log.lock().unwrap().push(command.clone());
+                let mut drafts = folder.lock().unwrap();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN LOGINDISABLED UIDPLUS REPLACE MULTIAPPEND CREATE-SPECIAL-USE STATUS=SIZE SPECIAL-USE\r\n");
+                } else if let Some(initial) = command.strip_prefix("AUTHENTICATE PLAIN ") {
+                    // The credentials came with the command: no go-ahead.
+                    assert_eq!(
+                        crate::sync::sasl::decode(initial).unwrap(),
+                        b"\0qa@example.com\0fixture-password"
+                    );
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Drafts) \"/\" Drafts\r\n* LIST () \"/\" Work\r\n");
+                    if sent_made {
+                        p.send("* LIST (\\Sent) \"/\" Sent\r\n");
+                    }
+                } else if upper == "CREATE \"SENT\" (USE (\\SENT))" {
+                    sent_made = true;
+                } else if upper.starts_with("SUBSCRIBE") {
+                } else if upper.starts_with("STATUS") {
+                    let size = if upper.contains("WORK") { 2048 } else { 1024 };
+                    let name = command.split('"').nth(1).unwrap_or("INBOX").to_owned();
+                    p.send(&format!("* STATUS \"{name}\" (SIZE {size})\r\n"));
+                } else if upper.starts_with("SELECT") {
+                    p.send(&format!(
+                        "* {} EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n",
+                        drafts.len()
+                    ));
+                } else if upper.starts_with("UID SEARCH HEADER X-PICACHO-DRAFT ") {
+                    let uids: String = drafts.iter().map(|(u, _)| format!(" {u}")).collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if upper.starts_with("UID SEARCH") {
+                    let uids: String = drafts.iter().map(|(u, _)| format!(" {u}")).collect();
+                    p.send(&format!("* SEARCH{uids}\r\n"));
+                } else if upper.starts_with("UID FETCH") {
+                    let set = command.split(' ').nth(2).unwrap();
+                    let wanted = super::protocol_tests::expand(set);
+                    for (uid, raw) in drafts.iter().filter(|(u, _)| wanted.contains(u)) {
+                        let text = String::from_utf8_lossy(raw);
+                        let header: String = text
+                            .lines()
+                            .filter(|l| l.starts_with("X-Picacho-Draft"))
+                            .map(|l| format!("{l}\r\n"))
+                            .collect();
+                        let data = format!("{header}\r\n");
+                        p.send(&format!(
+                            "* {uid} FETCH (UID {uid} RFC822.SIZE {} BODY[HEADER.FIELDS (X-PICACHO-DRAFT)] {{{}}}\r\n{data})\r\n",
+                            raw.len(),
+                            data.len()
+                        ));
+                    }
+                } else if let Some(rest) = upper.strip_prefix("UID REPLACE ") {
+                    let old: u32 = rest.split(' ').next().unwrap().parse().unwrap();
+                    assert!(command.contains("\\Draft"), "{command}");
+                    drafts.retain(|(u, _)| *u != old);
+                    drafts.push((next, literals[0].clone()));
+                    p.send(&format!("{tag} OK [APPENDUID 42 {next}] Replaced\r\n"));
+                    next += 1;
+                    continue;
+                } else if upper.starts_with("APPEND \"DRAFTS\"") {
+                    drafts.push((next, literals[0].clone()));
+                    p.send(&format!("{tag} OK [APPENDUID 42 {next}] Saved\r\n"));
+                    next += 1;
+                    continue;
+                } else if upper.starts_with("APPEND \"WORK\"") {
+                    // Every message in the one command.
+                    imported += literals.len();
+                    let first = 100 + imported - literals.len();
+                    p.send(&format!(
+                        "{tag} OK [APPENDUID 9 {first}:{}] Saved\r\n",
+                        100 + imported - 1
+                    ));
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        imported
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    // Drafts: uploaded, then replaced in one step.
+    let mut d = Draft {
+        id: "replaced-draft".into(),
+        account: a.id.clone(),
+        to: "ana@example.com".into(),
+        subject: "Plans".into(),
+        body: "First".into(),
+        ..Draft::default()
+    };
+    b.store.save_draft(&d)?;
+    b.sync_drafts(&a)?;
+    let first = b.store.draft(&d.id)?.unwrap().remote.unwrap().uid;
+    d = b.store.draft(&d.id)?.unwrap();
+    d.body = "Second".into();
+    b.store.save_draft(&d)?;
+    b.sync_drafts(&a)?;
+    let second = b.store.draft(&d.id)?.unwrap().remote.unwrap().uid;
+    assert_ne!(first, second);
+    {
+        let drafts = drafts.lock().unwrap();
+        assert_eq!(drafts.len(), 1, "replaced, not added");
+        assert!(String::from_utf8_lossy(&drafts[0].1).contains("Second"));
+    }
+    // Import: three messages, one APPEND, listed at once.
+    let dir = std::env::temp_dir().join(format!("picacho-import-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let mbox = dir.join("mail.mbox");
+    let one = |n: u32| {
+        format!("From qa@example.com Sat Nov 21 10:00:00 2026\nFrom: Ana <ana@example.com>\nSubject: Note {n}\nMessage-ID: <n{n}@example.com>\n\nBody {n}\n\n")
+    };
+    std::fs::write(&mbox, format!("{}{}{}", one(1), one(2), one(3)))?;
+    let moved = b.import_messages(
+        &a,
+        &Mailbox::Remote("Work".into()),
+        &[mbox],
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    assert_eq!((moved.done, moved.skipped), (3, 0));
+    // No QUOTA: the space every mailbox takes, without a limit, where the
+    // IMAP parser reads STATUS=SIZE (Picacho-Patches imap-proto 0007).
+    // Before it, nothing is shown, and nothing else fails.
+    match b.quota(&a)? {
+        Some(q) => assert_eq!((q.used_kib, q.limit_kib), (4, 0), "1 + 1 + 2 KiB"),
+        None => assert!(!crate::sync::transport::reads_status_size()),
+    }
+    // No Sent folder: one is made, marked for its use.
+    let made = b.with_imap(&a, |c| c.standard_folder(a.provider, Folder::Sent))?;
+    assert_eq!(made, "Sent");
+    b.disconnect(&a.id);
+    let imported = server.join().unwrap();
+    assert_eq!(imported, 3);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.iter().filter(|c| c.starts_with("APPEND \"Work\"")).count(), 1, "{seen:?}");
+    assert!(seen.iter().any(|c| c.starts_with("UID REPLACE")), "{seen:?}");
+    assert!(!seen.iter().any(|c| c.starts_with("UID EXPUNGE")), "nothing to remove: {seen:?}");
+    assert!(!seen.iter().any(|c| c == "AUTHENTICATE PLAIN"), "SASL-IR: {seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+

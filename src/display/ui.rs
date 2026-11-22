@@ -16,6 +16,8 @@ mod contacts;
 mod encryption;
 #[path = "calendar.rs"]
 mod calendar;
+#[path = "jmap_extras.rs"]
+mod jmap_extras;
 #[path = "motion.rs"]
 mod motion;
 #[cfg(test)]
@@ -355,7 +357,6 @@ fn system_dark(w: &Window) -> bool {
         WindowAppearance::Dark | WindowAppearance::VibrantDark
     )
 }
-/// Shortcut text for this platform: macOS symbols, or Ctrl/Alt/Shift words.
 /// A search for `value` in `field`, quoted when it has spaces.
 fn search_term(field: &str, value: &str) -> String {
     let value = value.replace('"', "");
@@ -425,6 +426,7 @@ pub(super) fn spoken(text: &str) -> String {
 pub(super) fn spoken_keys(text: &str) -> Option<String> {
     text.split_once(" · ").map(|(_, k)| keys(k.trim()))
 }
+/// Shortcut text for this platform: macOS symbols, or Ctrl/Alt/Shift words.
 fn keys(text: &str) -> String {
     if cfg!(target_os = "macos") {
         return text.into();
@@ -714,6 +716,31 @@ enum Action {
     SaveEvent,
     CancelEventEdit,
     DeleteEvent(String),
+    /// The event editor's reminder (seconds before; none).
+    EventAlarm(Option<i64>),
+    /// Calendar settings: use this JMAP account's calendars (its id).
+    ConnectJmapCalendar(String),
+    /// Makes a calendar named as in the form on the server.
+    CreateCalendar,
+    /// Adds the task in the form; marks a task (its UID) done.
+    AddTask,
+    CompleteTask(String),
+    /// Looks up when the event's guests are busy around its time.
+    CheckFreeBusy,
+    /// Messages a JMAP server holds to send later: lists them (account
+    /// id), or takes one back: (account id, submission id).
+    ListHeld(String),
+    CancelHeld(String, String),
+    /// A JMAP account's identities on its server: loads them (account),
+    /// names one as in the field, removes one, or adds the address typed.
+    LoadServerIdentities(String),
+    RenameServerIdentity(String, String),
+    RemoveServerIdentity(String, String),
+    AddServerIdentity(String),
+    /// Contacts settings: use this JMAP account's contacts (its id).
+    ConnectJmapContacts(String),
+    /// Makes an address book named as in the form on the server.
+    CreateAddressBook,
     RefreshAccount(String),
     ToggleAccount(String),
     ToggleSubfolders(String),
@@ -965,6 +992,13 @@ enum Action {
     SubmitAccount,
     Remove(String),
     SaveAttachment(usize),
+    /// Shows who an attached message is from, its subject and start.
+    PreviewAttachment(usize),
+    /// Copies the open message into another JMAP account that shares its
+    /// sign-in (its id), on the server.
+    CopyToJmapAccount(String),
+    /// Asks the JMAP server what became of the open (sent) message.
+    CheckDelivery,
     UnlockMail,
     BackToList,
     LockMail(String),
@@ -1240,8 +1274,8 @@ pub struct MailApp {
     /// Storage use by account, once asked (None: no quota).
     quotas: HashMap<String, Option<crate::sync::transport::Quota>>,
     nickname_for: Option<String>,
-    /// The preset picker was opened from Settings, which it returns to.
-    /// The account whose preset pictures are shown over Settings.
+    /// The account whose preset pictures are shown over Settings: the
+    /// picker was opened from Settings, which it returns to.
     presets_for: Option<String>,
     settings_place: SettingsPlace,
     /// Settings' own window while it is popped out.
@@ -1561,6 +1595,11 @@ pub struct MailApp {
     contact_phones: Entity<InputState>,
     contact_org: Entity<InputState>,
     contact_note: Entity<InputState>,
+    /// The contact's postal addresses (one a line), birthday and members
+    /// (a group's, by name or address).
+    contact_addresses: Entity<InputState>,
+    contact_birthday: Entity<InputState>,
+    contact_members: Entity<InputState>,
     contact_filter: Entity<InputState>,
     /// Encryption settings: the passphrase of a key being imported.
     key_passphrase: Entity<InputState>,
@@ -1597,6 +1636,29 @@ pub struct MailApp {
     event_location: Entity<InputState>,
     event_notes: Entity<InputState>,
     event_guests: Entity<InputState>,
+    /// Calendar and Contacts settings: a name for a new calendar, address
+    /// book or task, what the free/busy lookup found, and messages a JMAP
+    /// server holds to send later (account id, and what it holds).
+    collection_name: Entity<InputState>,
+    /// The event editor's reminder: seconds before the start, if any.
+    event_alarm: Option<i64>,
+    free_busy: Option<String>,
+    held: Option<(String, Vec<crate::manage::backend::HeldSubmission>)>,
+    /// A JMAP account's identities on its server, as last loaded.
+    server_identities: Option<jmap_extras::ServerIdentities>,
+    /// JMAP conversations already completed from the server (thread ids).
+    threads_completed: std::collections::HashSet<String>,
+    /// Messages brought in only to complete a conversation (other
+    /// mailboxes'): shown in the conversation, not in the list.
+    thread_extras: HashSet<String>,
+    /// JMAP accounts' Thread and EmailSubmission states, to ask what
+    /// changed since (account id → state; empty while being read).
+    thread_states: HashMap<String, String>,
+    delivery_states: HashMap<String, String>,
+    /// Attached messages previewed: (message id, attachment index) → text.
+    attached_previews: Rc<HashMap<(String, usize), String>>,
+    /// What the JMAP server said became of a sent message: id → text.
+    deliveries: HashMap<String, String>,
     event_zone: Entity<InputState>,
     /// The zone the editor's times were read in, while saving.
     event_zone_chosen: Option<chrono_tz::Tz>,
@@ -2051,11 +2113,11 @@ impl MailApp {
         }));
         let nickname_input = input("Nickname", false, window, cx);
         subscriptions.push(cx.subscribe(&nickname_input, |this, input, e, cx| {
-            if matches!(e, InputEvent::Change) {
-                if let Some(id) = this.nickname_for.clone() {
-                    let nickname = input.read(cx).value().to_string();
-                    this.set_nickname(&id, &nickname, cx);
-                }
+            if matches!(e, InputEvent::Change)
+                && let Some(id) = this.nickname_for.clone()
+            {
+                let nickname = input.read(cx).value().to_string();
+                this.set_nickname(&id, &nickname, cx);
             }
         }));
         let login_input = input("Same as the email address", false, window, cx);
@@ -2496,6 +2558,9 @@ impl MailApp {
             contact_phones,
             contact_org,
             contact_note,
+            contact_addresses: input("Street, city (one a line; optional)", false, window, cx),
+            contact_birthday: input("1990-01-31, or --01-31 without a year (optional)", false, window, cx),
+            contact_members: input("For a group: its people, by address (optional)", false, window, cx),
             contact_filter,
             key_passphrase,
             key_error: None,
@@ -2521,6 +2586,17 @@ impl MailApp {
             event_location,
             event_notes,
             event_guests,
+            collection_name: input("Name", false, window, cx),
+            event_alarm: None,
+            free_busy: None,
+            held: None,
+            server_identities: None,
+            threads_completed: Default::default(),
+            thread_extras: Default::default(),
+            thread_states: Default::default(),
+            delivery_states: Default::default(),
+            attached_previews: Default::default(),
+            deliveries: Default::default(),
             event_zone,
             event_zone_chosen: None,
             fwd_confirm: None,
@@ -2603,6 +2679,8 @@ impl MailApp {
                     this.send_due(cx);
                     this.wake_snoozed(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
+                    this.show_due_reminders(cx);
+                    this.refresh_jmap_threads(cx);
                     true
                 });
                 if !checked.unwrap_or(false) {
@@ -2832,7 +2910,11 @@ impl MailApp {
         let filter = self.filter_by;
         let open = self.selected.clone();
         let (subs_open, scope) = (self.subs_open, &self.scope);
+        let extras = &self.thread_extras;
         let keep = |m: &Mail| {
+            if extras.contains(&m.id) {
+                return false;
+            }
             // Placeholders have nothing to match yet; they show only in the
             // whole, unsearched list, where they hold their messages' places.
             (!m.pending || (filter == Filter::All && query.is_empty()))
@@ -3152,7 +3234,7 @@ impl MailApp {
                 .await;
             if let Err(e) = saved {
                 let _ = this.update(cx, |this, cx| {
-                    this.notice(e.to_string(), true, cx);
+                    this.notice(format!("{e:#}"), true, cx);
                     undo(this, cx);
                     cx.notify();
                 });
@@ -4411,7 +4493,7 @@ impl MailApp {
                             .collect();
                         this.filter(cx);
                     }
-                    Err(e) => this.notice(e.to_string(), true, cx),
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }
             },
         );
@@ -5234,7 +5316,7 @@ impl MailApp {
                     move |b| b.export_mailbox(&a, &mailbox, &path, &stop),
                     |this, result, cx| match result {
                         Ok(moved) => this.notice(moved.notice("Exported"), false, cx),
-                        Err(e) => this.notice(e.to_string(), true, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
             });
@@ -5270,7 +5352,7 @@ impl MailApp {
                                 this.refresh(cx);
                             }
                         }
-                        Err(e) => this.notice(e.to_string(), true, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
             });
@@ -5746,7 +5828,12 @@ impl MailApp {
         self.task(
             cx,
             move |b| {
-                let raw = b.original(&account, &m)?;
+                // A message too large to keep: its headers alone, where the
+                // JMAP server reads parts of blobs.
+                let raw = match b.original(&account, &m) {
+                    Ok(raw) => raw,
+                    Err(e) => b.jmap_header_block(&account, &m).ok().flatten().ok_or(e)?,
+                };
                 // The sender is checked only when asked (Check sender): the
                 // lookups reach the sender's DNS and can tell it when the
                 // message was opened.
@@ -5778,7 +5865,7 @@ impl MailApp {
                 if this.details.as_ref().is_some_and(|d| d.id == id) {
                     this.details = Some(MessageInfo {
                         id,
-                        result: Some(result.map(Rc::new).map_err(|e| e.to_string())),
+                        result: Some(result.map(Rc::new).map_err(|e| format!("{e:#}"))),
                     });
                 }
                 cx.notify();
@@ -5854,7 +5941,7 @@ impl MailApp {
                 let _ = this.update(cx, |this, cx| match result {
                     Ok(true) => this.notice("Raw message saved", false, cx),
                     Ok(false) => {}
-                    Err(e) => this.notice(e.to_string(), true, cx),
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
                 });
             })
             .detach();
@@ -5867,7 +5954,7 @@ impl MailApp {
                 let result = std::fs::write(&path, &original.raw);
                 let _ = this.update(cx, |this, cx| match result {
                     Ok(()) => this.notice("Raw message saved", false, cx),
-                    Err(e) => this.notice(e.to_string(), true, cx),
+                    Err(e) => this.notice(format!("{e:#}"), true, cx),
                 });
             }
         })
@@ -5929,6 +6016,10 @@ impl MailApp {
             entries.push(entry("Copy Message Text", "copy", Action::CopyText(body)));
         }
         entries.push(entry("Show Raw", "code", Action::ShowOriginal));
+        // Accounts shared through the same JMAP sign-in copy on the server.
+        for (id, label) in self.jmap_copy_targets() {
+            entries.push(entry(format!("Copy to {label}"), "copy", Action::CopyToJmapAccount(id)));
+        }
         self.open_menu(menu.position, entries, cx);
     }
     fn save_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -5959,7 +6050,7 @@ impl MailApp {
                         },
                         |this, result, cx| match result {
                             Ok(()) => this.notice("Attachment saved", false, cx),
-                            Err(e) => this.notice(e.to_string(), true, cx),
+                            Err(e) => this.notice(format!("{e:#}"), true, cx),
                         },
                     )
                 });
@@ -6078,7 +6169,13 @@ impl MailApp {
             | Action::EditContact(_)
             | Action::SaveContact
             | Action::CancelContactEdit
-            | Action::RemoveContact(_)) => self.contacts_action(action, w, cx),
+            | Action::RemoveContact(_)
+            | Action::ConnectJmapContacts(_)
+            | Action::CreateAddressBook) => self.contacts_action(action, w, cx),
+            action @ (Action::LoadServerIdentities(_)
+            | Action::RenameServerIdentity(..)
+            | Action::RemoveServerIdentity(..)
+            | Action::AddServerIdentity(_)) => self.server_identity_action(action, w, cx),
             action @ (Action::ImportKeys
             | Action::RemoveKey(_)
             | Action::VerifyKey(_)
@@ -6110,7 +6207,15 @@ impl MailApp {
             | Action::EventRepeat(_)
             | Action::SaveEvent
             | Action::CancelEventEdit
-            | Action::DeleteEvent(_)) => self.calendar_action(action, w, cx),
+            | Action::DeleteEvent(_)
+            | Action::EventAlarm(_)
+            | Action::ConnectJmapCalendar(_)
+            | Action::CreateCalendar
+            | Action::AddTask
+            | Action::CompleteTask(_)
+            | Action::CheckFreeBusy
+            | Action::ListHeld(_)
+            | Action::CancelHeld(..)) => self.calendar_action(action, w, cx),
             Action::RefreshAccount(id) if fwd::is_view(&id) => {
                 if self.account.as_ref() == Some(&id) && self.showing_list() {
                     self.refresh(cx);
@@ -6534,7 +6639,7 @@ impl MailApp {
                     move |b| b.lock_mail(&a),
                     |this, result, cx| match result {
                         Ok(()) => this.notice("This computer forgot your mail key", false, cx),
-                        Err(e) => this.notice(e.to_string(), true, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
             }
@@ -6941,12 +7046,15 @@ impl MailApp {
                                 }
                                 this.refresh_counts(cx);
                             }
-                            Err(e) => this.notice(e.to_string(), true, cx),
+                            Err(e) => this.notice(format!("{e:#}"), true, cx),
                         }
                     },
                 );
             }
             Action::SaveAttachment(i) => self.save_attachment(i, cx),
+            Action::PreviewAttachment(i) => self.preview_attachment(i, cx),
+            Action::CheckDelivery => self.check_delivery(cx),
+            Action::CopyToJmapAccount(id) => self.copy_to_jmap_account(id, cx),
 
             Action::OpenDraft(id) => {
                 if let Some(d) = self.drafts.iter().find(|d| d.id == id).cloned() {
@@ -7121,7 +7229,7 @@ impl MailApp {
         let subscribed = a.sync.subscribed_only != sync.subscribed_only;
         a.sync = sync;
         if let Err(e) = self.backend.store.save_account(a) {
-            self.notice(e.to_string(), true, cx);
+            self.notice(format!("{e:#}"), true, cx);
             return;
         }
         let offline = a.sync.offline_days;
@@ -7320,7 +7428,7 @@ impl MailApp {
                 Ok(a) => {
                     this.identity_edit = None;
                     this.account_saved(a, cx);
-                    this.notice("Address saved.", false, cx);
+                    this.notice("Address saved", false, cx);
                 }
                 Err(e) => this.identity_failed(format!("{e:#}"), cx),
             },
@@ -7372,7 +7480,7 @@ impl MailApp {
         };
         edit(a);
         if let Err(e) = self.backend.store.save_account(a) {
-            self.notice(e.to_string(), true, cx);
+            self.notice(format!("{e:#}"), true, cx);
         }
         cx.notify();
     }
@@ -7406,12 +7514,10 @@ impl MailApp {
         }
         a.nickname = nickname.to_owned();
         if let Err(e) = self.backend.store.save_account(a) {
-            self.notice(e.to_string(), true, cx);
+            self.notice(format!("{e:#}"), true, cx);
         }
         cx.notify();
     }
-    /// Shows the open account page's nickname in its field, also after it
-    /// was changed elsewhere, unless the field is being typed in.
     /// Applies a sign-in name being typed (see `login_pending`): saves it
     /// and signs the account's connections out, so the next sign in with it.
     fn apply_login(&mut self, cx: &mut Context<Self>) {
@@ -7423,6 +7529,8 @@ impl MailApp {
             self.backend.reconnect_later(&id);
         }
     }
+    /// Shows the open account page's nickname in its field, also after it
+    /// was changed elsewhere, unless the field is being typed in.
     pub(super) fn sync_nickname_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let shown = match &self.page {
             Page::Account(id) => self.accounts.iter().find(|a| &a.id == id),
@@ -9690,7 +9798,7 @@ impl MailApp {
                 None
             }
             Step::Credentials if self.sign_in_retry => Some(
-                self.button("setup-retry", "Retry", "", Action::RetrySignIn, true, cx)
+                self.button("setup-retry", "Try Again", "", Action::RetrySignIn, true, cx)
                     .min_w(px(120.))
                     .into_any_element(),
             ),
@@ -10370,7 +10478,7 @@ impl MailApp {
             if self.sign_in_retry && !self.connecting {
                 footer = footer.child(self.button(
                     "reconnect-retry",
-                    "Retry",
+                    "Try Again",
                     "",
                     Action::RetrySignIn,
                     false,
@@ -10858,8 +10966,15 @@ impl MailApp {
 fn swallow_press(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
     cx.stop_propagation()
 }
-/// Overshooting ease-out. GPUI requires easing output within 0..=1, so apply
-/// this inside an animator rather than with `with_easing`.
+/// A file's size as attachments show it: B, KB, or MB with a decimal.
+pub(super) fn human_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{} KB", bytes / 1024),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
+    }
+}
+/// A count with thousands separators: 12,345.
 fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
@@ -10907,6 +11022,8 @@ fn ring(progress: f32, track: u32, fill: u32) -> Canvas<()> {
         },
     )
 }
+/// Overshooting ease-out. GPUI requires easing output within 0..=1, so apply
+/// this inside an animator rather than with `with_easing`.
 fn back_out(t: f32) -> f32 {
     let (c1, t) = (1.70158, t - 1.);
     1. + (c1 + 1.) * t.powi(3) + c1 * t.powi(2)
@@ -12093,10 +12210,9 @@ mod tests {
         let (view, cx) = open(store.clone(), cx);
         (view, cx, store)
     }
-    /// Test windows draw before dispatching input, so a no-op mouse move
-    /// brings the rendered frame up to date.
     /// Draws a fresh frame. The app no longer redraws on its own while idle,
-    /// so ask for one before moving the pointer.
+    /// so ask for one, then dispatch a no-op mouse move: test windows draw
+    /// before dispatching input.
     pub(super) fn frame(cx: &mut VisualTestContext) {
         cx.update(|w, _| w.refresh());
         cx.simulate_event(MouseMoveEvent {

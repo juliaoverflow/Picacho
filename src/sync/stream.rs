@@ -53,8 +53,12 @@ impl Deflate {
 /// Keeps a copy of what the server sends while it is on, so a session can
 /// see the lines the imap crate reads and drops (those IDLE wakes on).
 #[derive(Clone, Default)]
-pub(crate) struct Tap(Arc<Mutex<Option<Vec<u8>>>>);
+pub(crate) struct Tap(Arc<Mutex<Option<Vec<u8>>>>, Literals);
 impl Tap {
+    /// The session's commands with literals; see [`Literals`].
+    pub(crate) fn literals(&self) -> Literals {
+        self.1.clone()
+    }
     /// More than this is never kept: the copy is only read for what kind
     /// of lines it holds, and a long one is taken to report a change.
     pub(crate) const LIMIT: usize = 64 * 1024;
@@ -81,15 +85,116 @@ pub(crate) struct ImapStream {
     /// Set once the server accepted COMPRESS; compression starts with the
     /// next byte in either direction.
     compressing: Arc<AtomicBool>,
+    /// Literals for the next command (`literals`): each is sent once the
+    /// server has answered the line before it with `+`.
+    literals: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// A line read while sending literals that wasn't a go-ahead: the
+    /// imap crate reads it next.
+    unread: Vec<u8>,
+}
+
+/// Commands with literals of any bytes, through the imap crate's text
+/// commands: the command's line ends where its first literal is announced
+/// (`{n}`); the rest waits here and is sent, piece by piece, as the server
+/// asks for it (RFC 3501 §7.5). Used for APPEND with several messages
+/// (MULTIAPPEND), REPLACE and CATENATE.
+#[derive(Clone, Default)]
+pub(crate) struct Literals(Arc<Mutex<Vec<Vec<u8>>>>);
+impl Literals {
+    /// The command `parts` make: text and literals alternating, text first.
+    /// Returns the first line, to run; the rest is sent from here.
+    pub(crate) fn command(&self, parts: &[Part<'_>]) -> String {
+        let mut line = String::new();
+        let mut queued: Vec<Vec<u8>> = Vec::new();
+        let mut current: Vec<u8> = Vec::new();
+        let mut first = true;
+        for part in parts {
+            match part {
+                Part::Text(t) => {
+                    if first {
+                        line.push_str(t)
+                    } else {
+                        current.extend_from_slice(t.as_bytes())
+                    }
+                }
+                Part::Literal(bytes) => {
+                    let size = format!("{{{}}}", bytes.len());
+                    if first {
+                        line.push_str(&size);
+                        first = false;
+                    } else {
+                        current.extend_from_slice(size.as_bytes());
+                        current.extend_from_slice(b"\r\n");
+                        queued.push(std::mem::take(&mut current));
+                    }
+                    current.extend_from_slice(bytes);
+                }
+            }
+        }
+        // What follows the last literal, ended as the imap crate ends lines.
+        current.extend_from_slice(b"\r\n");
+        queued.push(current);
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = queued;
+        line
+    }
+    fn take(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// A piece of a command with literals.
+pub(crate) enum Part<'a> {
+    Text(&'a str),
+    Literal(&'a [u8]),
 }
 impl ImapStream {
     pub(crate) fn new(tls: native_tls::TlsStream<Wire>) -> Self {
+        let literals: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         Self {
             tls,
             deflate: None,
-            tap: Tap::default(),
+            tap: Tap(Arc::default(), Literals(literals.clone())),
             compressing: Arc::new(AtomicBool::new(false)),
+            literals,
+            unread: Vec::new(),
         }
+    }
+    /// Reads one line from below the imap crate's buffer, which is empty
+    /// between a command and its reply.
+    fn line_below(&mut self) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        let mut byte = [0u8];
+        while !line.ends_with(b"\n") {
+            if line.len() > 64 * 1024 || self.read(&mut byte)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "The server closed the connection during a command.",
+                ));
+            }
+            line.push(byte[0]);
+        }
+        Ok(line)
+    }
+    /// Sends the queued literals once the command's line has gone: each
+    /// after the server's go-ahead (`+`). A refusal (a tagged NO or BAD
+    /// instead) is left for the imap crate to read; nothing more is sent.
+    fn send_literals(&mut self) -> io::Result<()> {
+        let queued = Literals(self.literals.clone()).take();
+        for piece in queued {
+            let line = self.line_below()?;
+            if !line.starts_with(b"+") {
+                // Give the answer back to the imap crate's reader.
+                self.unread = line;
+                return Ok(());
+            }
+            self.write_plain(&piece)?;
+            self.tls.flush()?;
+        }
+        Ok(())
+    }
+    /// The TLS channel binding, for SCRAM-PLUS.
+    pub(crate) fn binding(&self) -> Vec<u8> {
+        super::sasl::binding(&self.tls)
     }
     /// A handle on the copy of what the server sends; see [`Tap`].
     pub(crate) fn tap(&self) -> Tap {
@@ -125,6 +230,12 @@ pub(crate) fn closed_without_goodbye(e: &io::Error) -> bool {
 }
 impl Read for ImapStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.unread.is_empty() {
+            let n = buf.len().min(self.unread.len());
+            buf[..n].copy_from_slice(&self.unread[..n]);
+            self.unread.drain(..n);
+            return Ok(n);
+        }
         let read = match self.read_plain(buf) {
             Err(e) if closed_without_goodbye(&e) => 0,
             other => other?,
@@ -193,6 +304,20 @@ impl ImapStream {
 }
 impl Write for ImapStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_plain(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.tls.flush()?;
+        // A command's line went: its literals follow as the server asks.
+        if !self.literals.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            self.send_literals()?;
+        }
+        Ok(())
+    }
+}
+impl ImapStream {
+    /// Writes to the server, compressed where COMPRESS is on.
+    fn write_plain(&mut self, buf: &[u8]) -> io::Result<usize> {
         let Some(d) = self.deflate() else {
             return self.tls.write(buf);
         };
@@ -218,9 +343,6 @@ impl Write for ImapStream {
         }
         self.tls.write_all(&out)?;
         Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.tls.flush()
     }
 }
 impl imap::extensions::idle::SetReadTimeout for ImapStream {

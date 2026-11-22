@@ -397,6 +397,42 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
 /// A service's SRV records (RFC 2782), such as `_jmap._tcp.<domain>`:
 /// (target, port), the most preferred first. Empty when there are none or
 /// the record says the service isn't offered (a target of ".").
+/// The strings of a name's TXT records, each record's pieces joined.
+pub(crate) fn txt(name: &str) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context as _;
+    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
+    let checker = checker().context("DNS isn't available")?;
+    checker.runtime.block_on(async {
+        tokio::time::timeout(TIMEOUT, async {
+            let found = match checker
+                .authenticator
+                .resolver()
+                .lookup(name, RecordType::TXT)
+                .await
+            {
+                Ok(found) => found,
+                Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(vec![]),
+                Err(e) => anyhow::bail!("{e}"),
+            };
+            Ok(found
+                .answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::TXT(t) => Some(
+                        t.txt_data
+                            .iter()
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+    })
+}
+
 pub(crate) fn srv(name: &str) -> anyhow::Result<Vec<(String, u16)>> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};

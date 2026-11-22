@@ -574,13 +574,20 @@ impl Backend {
     /// still there.
     fn wake(&self, c: &mut Connection, account: &str, s: &Snoozed) -> Result<bool> {
         let selected = c.select(&s.folder)?;
-        let uids: Vec<u32> = c.uid_search(&format!("HEADER Message-ID {}", quote(&s.message_id)?))?
-            .into_iter()
-            .collect();
+        let criteria = format!("HEADER Message-ID {}", quote(&s.message_id)?);
+        let ext = c.extensions()?;
+        // With SEARCHRES the server keeps what it found as `$`: the STORE
+        // and MOVE act on exactly those, not on whatever matches by then.
+        let saved = ext.searchres && ext.esearch;
+        let uids: Vec<u32> = if saved {
+            crate::sync::transport::uid_search_saved(&mut c.session, &criteria)?
+        } else {
+            c.uid_search(&criteria)?.into_iter().collect()
+        };
         if uids.is_empty() {
             return Ok(false);
         }
-        let set = uid_ranges(&uids);
+        let set = if saved && ext.moves { "$".to_owned() } else { uid_ranges(&uids) };
         c.session.uid_store(&set, "-FLAGS.SILENT (\\Seen)")?;
         let inbox = c.mailbox("INBOX")?;
         if c.extensions()?.moves {

@@ -206,6 +206,9 @@ impl MailApp {
     /// Replaces the listed messages, keeping the open message's body and the
     /// list's scroll position on the same message, wherever it moved.
     pub(super) fn set_messages(&mut self, messages: Vec<Mail>, cx: &App) {
+        // Conversations are completed again for the new list.
+        self.thread_extras.clear();
+        self.threads_completed.clear();
         let kept = self.list_place();
         self.install_messages(messages, kept, cx);
     }

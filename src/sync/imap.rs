@@ -76,8 +76,18 @@ pub(crate) fn append_uid(heard: &[u8]) -> Option<(u32, u32)> {
     let mut words = text[start..end].split_ascii_whitespace();
     let validity = words.next()?.parse().ok()?;
     let uid = words.next()?;
-    // One message appended: one UID (MULTIAPPEND isn't used).
+    // One message appended: one UID (`append_uids` reads several).
     uid.parse().ok().map(|uid| (validity, uid))
+}
+/// The UIDs a server gave messages appended together (MULTIAPPEND's
+/// `[APPENDUID validity 4:6]`), in order.
+pub(crate) fn append_uids(heard: &[u8]) -> Option<(u32, Vec<u32>)> {
+    let text = String::from_utf8_lossy(heard);
+    let start = text.rfind("[APPENDUID ")? + "[APPENDUID ".len();
+    let end = start + text[start..].find(']')?;
+    let mut words = text[start..end].split_ascii_whitespace();
+    let validity = words.next()?.parse().ok()?;
+    Some((validity, uid_set_list(words.next()?)?))
 }
 /// A UID set ("4,7:9") in order, as COPYUID pairs them: a range counts
 /// from its first number to its second, either way.
@@ -126,23 +136,31 @@ pub(crate) fn imap_login_interruptible(
     // takes the stream (it has no CAPABILITY before login). IMAP sends no
     // second greeting after STARTTLS.
     let caps = pre_auth_capabilities(&mut stream, !a.incoming_starttls)?;
+    let binding = stream.binding();
     let mut client = imap::Client::new(stream);
     client.greeting_read = true;
     let offered = auth_mechanisms(&caps);
+    // RFC 4959: the first message goes with AUTHENTICATE, saving a round trip.
+    let initial_response = caps.iter().any(|c| c == "SASL-IR");
     let credentials = |user: &str, secret: &str| sasl::Credentials {
         user: user.to_owned(),
         secret: secret.to_owned(),
         host: a.incoming_host.clone(),
         port: a.incoming_port,
+        binding: binding.clone(),
+    };
+    let authenticate = |client, mechanism, credentials| {
+        authenticate(client, mechanism, credentials, initial_response)
     };
     let session = if a.oauth {
         // XOAUTH2 when the server lists neither: Gmail and Outlook take it.
         let mechanism = Mechanism::choose(&sasl::TOKEN_ORDER, offered.iter().map(String::as_str))
             .unwrap_or(Mechanism::XOAuth2);
         authenticate(client, mechanism, credentials(&a.email, &s.access_token))
-    } else if let Some(mechanism) = Mechanism::choose(
-        &[Mechanism::ScramSha256, Mechanism::ScramSha1],
+    } else if let Some(mechanism) = Mechanism::choose_bound(
+        &sasl::SCRAM_ORDER,
         offered.iter().map(String::as_str),
+        !binding.is_empty(),
     ) {
         authenticate(client, mechanism, credentials(a.login(), &s.password))
     } else if !caps.iter().any(|c| c == "LOGINDISABLED") {
@@ -230,12 +248,23 @@ fn authenticate(
     client: imap::Client<ImapStream>,
     mechanism: Mechanism,
     credentials: sasl::Credentials,
+    initial_response: bool,
 ) -> Result<ImapSession> {
     let auth = Sasl {
         exchange: std::cell::RefCell::new(sasl::Exchange::new(mechanism, credentials)),
         failed: std::cell::RefCell::new(None),
     };
-    let result = client.authenticate(mechanism.name(), &auth);
+    // With SASL-IR the client's first message follows the mechanism's name
+    // ("=" when empty); the imap crate sends the command as given.
+    let command = match initial_response
+        .then(|| auth.exchange.borrow_mut().initial())
+        .flatten()
+    {
+        Some(first) if first.is_empty() => format!("{} =", mechanism.name()),
+        Some(first) => format!("{} {}", mechanism.name(), sasl::encode(&first)),
+        None => mechanism.name().to_owned(),
+    };
+    let result = client.authenticate(command, &auth);
     if let Some(e) = auth.failed.borrow_mut().take() {
         return Err(e.context(crate::manage::status::AccessFailure::Authentication));
     }
@@ -332,7 +361,7 @@ pub(crate) struct Name {
 impl Name {
     /// Whether the server gave this mailbox `attribute`. Attributes are
     /// case-insensitive (\\Noselect, \\NoSelect…).
-    fn has(&self, attribute: &str) -> bool {
+    pub(crate) fn has(&self, attribute: &str) -> bool {
         let attribute = attribute.to_ascii_lowercase();
         self.attributes
             .iter()
@@ -1060,6 +1089,41 @@ pub(crate) struct Extensions {
     pub(crate) partial: bool,
     /// RFC 9586: messages named by UID alone, once enabled (UIDONLY).
     pub(crate) uidonly: bool,
+    /// RFC 3691: leaving a mailbox without expunging it (UNSELECT).
+    pub(crate) unselect: bool,
+    /// RFC 8508: a message replaced by a new version in one step (REPLACE).
+    pub(crate) replace: bool,
+    /// RFC 3502: several messages in one APPEND (MULTIAPPEND).
+    pub(crate) multiappend: bool,
+    /// RFC 4469: a message put together from parts of others (CATENATE).
+    pub(crate) catenate: bool,
+    /// RFC 4467: URLs that let another server read a message (URLAUTH).
+    pub(crate) urlauth: bool,
+    /// RFC 6154: making a folder for a role (CREATE … (USE (\\Sent))).
+    pub(crate) create_special_use: bool,
+    /// RFC 8438: mailbox sizes in STATUS (STATUS=SIZE).
+    pub(crate) status_size: bool,
+    /// RFC 5182: a search's result kept for the next command ($).
+    pub(crate) searchres: bool,
+    /// RFC 7889's APPENDLIMIT and others aside: Gmail's own search language
+    /// (X-GM-RAW), from X-GM-EXT-1.
+    pub(crate) gmail_raw: bool,
+}
+/// Whether the IMAP parser reads STATUS=SIZE replies (Picacho-Patches'
+/// imap-proto 0007). Without it, such a reply ends the session in a way
+/// the imap crate can't recover from, so the size isn't asked.
+pub(crate) fn reads_status_size() -> bool {
+    matches!(
+        imap_proto::parse_response(b"* STATUS INBOX (SIZE 1)\r\n"),
+        Ok((_, imap_proto::Response::MailboxData(_)))
+    )
+}
+/// Whether the IMAP parser keeps GENURLAUTH replies (imap-proto 0007).
+pub(crate) fn reads_urlauth() -> bool {
+    matches!(
+        imap_proto::parse_response(b"* GENURLAUTH \"imap://a@b/c;urlauth=submit+a:internal:0\"\r\n"),
+        Ok((_, imap_proto::Response::Other(_)))
+    )
 }
 pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
     let caps = session.capabilities()?;
@@ -1108,6 +1172,15 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         literal_plus: rev2 || caps.has_str("LITERAL+") || caps.has_str("LITERAL-"),
         rev2,
         list_status: rev2 || caps.has_str("LIST-STATUS"),
+        unselect: rev2 || caps.has_str("UNSELECT"),
+        replace: caps.has_str("REPLACE"),
+        multiappend: caps.has_str("MULTIAPPEND"),
+        catenate: caps.has_str("CATENATE"),
+        urlauth: caps.has_str("URLAUTH"),
+        create_special_use: caps.has_str("CREATE-SPECIAL-USE"),
+        status_size: rev2 || caps.has_str("STATUS=SIZE"),
+        searchres: rev2 || caps.has_str("SEARCHRES"),
+        gmail_raw: caps.has_str("X-GM-EXT-1"),
         partial: caps.has_str("PARTIAL"),
         uidonly: caps.has_str("UIDONLY"),
     })

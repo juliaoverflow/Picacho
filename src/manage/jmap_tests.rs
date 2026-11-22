@@ -49,6 +49,15 @@ struct Server {
     session_state: String,
     /// How many times the session resource was read.
     session_reads: usize,
+    /// Email/query states and Email/queryChanges: each query's results by
+    /// the state it was answered in.
+    query_changes: bool,
+    queries: HashMap<String, Vec<String>>,
+    /// Calendar events and contact cards (JSON objects by id), and
+    /// submissions' undo states.
+    events: Vec<Value>,
+    cards: Vec<Value>,
+    undo: HashMap<String, String>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -82,12 +91,18 @@ impl Server {
                 "urn:ietf:params:jmap:mail": {},
                 "urn:ietf:params:jmap:submission": {},
                 "urn:ietf:params:jmap:vacationresponse": {},
+                "urn:ietf:params:jmap:calendars": {},
+                "urn:ietf:params:jmap:contacts": {},
             },
             "accounts": {
                 "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
                 "u2": { "name": "Team", "isPersonal": false, "accountCapabilities": account },
             },
-            "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
+            "primaryAccounts": {
+                "urn:ietf:params:jmap:mail": "u1",
+                "urn:ietf:params:jmap:calendars": "u1",
+                "urn:ietf:params:jmap:contacts": "u1",
+            },
             "username": "qa@example.com",
             "apiUrl": format!("{base}/api"),
             "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
@@ -192,9 +207,25 @@ impl Server {
         };
         let state = self.state.to_string();
         match name {
-            "Mailbox/get" => vec![(
+            "Mailbox/get" => {
+                let all = Self::mailboxes();
+                let list = match ids_of(args) {
+                    Some(ids) => all
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|m| ids.iter().any(|i| m["id"] == i.as_str()))
+                        .cloned()
+                        .collect(),
+                    None => all,
+                };
+                vec![(name.into(), json!({ "list": list, "state": "m1" }))]
+            }
+            // The mailboxes don't change here.
+            "Mailbox/changes" if args["sinceState"] == "m1" => vec![(
                 name.into(),
-                json!({ "list": Self::mailboxes(), "state": "m1" }),
+                json!({ "oldState": "m1", "newState": "m1", "hasMoreChanges": false,
+                        "created": [], "updated": [], "destroyed": [] }),
             )],
             "Email/query" => {
                 let mut found: Vec<&Message> = self
@@ -212,9 +243,40 @@ impl Server {
                     .take(limit)
                     .map(|m| m.id.as_str())
                     .collect();
+                let mut answer = json!({ "ids": ids, "total": total, "position": position });
+                if self.query_changes {
+                    let all: Vec<String> = found.iter().map(|m| m.id.clone()).collect();
+                    let q = format!("q{}", self.state);
+                    self.queries.insert(q.clone(), all);
+                    answer["queryState"] = json!(q);
+                }
+                vec![(name.into(), answer)]
+            }
+            "Email/queryChanges" if self.query_changes => {
+                let since = args["sinceQueryState"].as_str().unwrap_or_default();
+                let Some(before) = self.queries.get(since).cloned() else {
+                    return vec![("error".into(), json!({ "type": "cannotCalculateChanges" }))];
+                };
+                let mut now: Vec<&Message> = self
+                    .emails
+                    .iter()
+                    .filter(|m| Self::matches(m, &args["filter"]))
+                    .collect();
+                now.sort_by(|a, b| b.received.cmp(&a.received));
+                let now: Vec<String> = now.iter().map(|m| m.id.clone()).collect();
+                let removed: Vec<&String> = before.iter().filter(|id| !now.contains(id)).collect();
+                let added: Vec<Value> = now
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| !before.contains(id))
+                    .map(|(i, id)| json!({ "id": id, "index": i }))
+                    .collect();
+                let q = format!("q{}", self.state);
+                self.queries.insert(q.clone(), now.clone());
                 vec![(
                     name.into(),
-                    json!({ "ids": ids, "total": total, "position": position }),
+                    json!({ "oldQueryState": since, "newQueryState": q, "total": now.len(),
+                            "removed": removed, "added": added }),
                 )]
             }
             "Email/get" => {
@@ -329,6 +391,117 @@ impl Server {
                 name.into(),
                 json!({ "list": [{ "id": "id1", "name": "QA", "email": "qa@example.com" }] }),
             )],
+            "Calendar/get" => vec![(
+                name.into(),
+                json!({ "list": [
+                    { "id": "c1", "name": "Personal", "color": "#3366ff", "myRights": { "mayWriteAll": true } },
+                ], "state": "c" }),
+            )],
+            "CalendarEvent/query" => {
+                let ids: Vec<&str> = self.events.iter().filter_map(|e| e["id"].as_str()).collect();
+                vec![(name.into(), json!({ "ids": ids }))]
+            }
+            "CalendarEvent/get" => {
+                let wanted = ids_of(args).unwrap_or_default();
+                let list: Vec<&Value> = self
+                    .events
+                    .iter()
+                    .filter(|e| wanted.iter().any(|w| e["id"] == w.as_str()))
+                    .collect();
+                vec![(name.into(), json!({ "list": list, "state": "e" }))]
+            }
+            "CalendarEvent/set" => {
+                assert_eq!(args["sendSchedulingMessages"], false, "Picacho invites by mail");
+                let mut out = json!({});
+                if let Some(create) = args["create"].as_object() {
+                    for (key, props) in create {
+                        let id = format!("E{}", self.events.len() + 1);
+                        let mut e = props.clone();
+                        e["id"] = json!(id);
+                        self.events.push(e);
+                        out["created"][key] = json!({ "id": id });
+                    }
+                }
+                if let Some(update) = args["update"].as_object() {
+                    for (id, patch) in update {
+                        let e = self.events.iter_mut().find(|e| e["id"] == id.as_str()).unwrap();
+                        for (k, v) in patch.as_object().unwrap() {
+                            e[k] = v.clone();
+                        }
+                    }
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    self.events.retain(|e| e["id"] != *id);
+                }
+                vec![(name.into(), out)]
+            }
+            "AddressBook/get" => vec![(
+                name.into(),
+                json!({ "list": [{ "id": "b1", "name": "Contacts", "myRights": { "mayWrite": true } }], "state": "b" }),
+            )],
+            "ContactCard/get" => {
+                let wanted = ids_of(args);
+                let list: Vec<&Value> = self
+                    .cards
+                    .iter()
+                    .filter(|c| wanted.as_ref().is_none_or(|w| w.iter().any(|i| c["id"] == i.as_str())))
+                    .collect();
+                vec![(name.into(), json!({ "list": list, "state": "k" }))]
+            }
+            "ContactCard/set" => {
+                let mut out = json!({});
+                if let Some(create) = args["create"].as_object() {
+                    for (key, props) in create {
+                        let id = format!("K{}", self.cards.len() + 1);
+                        let mut c = props.clone();
+                        c["id"] = json!(id);
+                        self.cards.push(c);
+                        out["created"][key] = json!({ "id": id });
+                    }
+                }
+                if let Some(update) = args["update"].as_object() {
+                    for (id, patch) in update {
+                        let c = self.cards.iter_mut().find(|c| c["id"] == id.as_str()).unwrap();
+                        for (k, v) in patch.as_object().unwrap() {
+                            c[k] = v.clone();
+                        }
+                    }
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    self.cards.retain(|c| c["id"] != *id);
+                }
+                vec![(name.into(), out)]
+            }
+            "EmailSubmission/query" => {
+                let ids: Vec<&String> = self.undo.iter().filter(|(_, u)| *u == "pending").map(|(k, _)| k).collect();
+                vec![(name.into(), json!({ "ids": ids }))]
+            }
+            "EmailSubmission/get" => {
+                let wanted = ids_of(args).unwrap_or_default();
+                let list: Vec<Value> = wanted
+                    .iter()
+                    .filter_map(|id| {
+                        let undo = self.undo.get(id)?;
+                        Some(json!({ "id": id, "emailId": "M1", "undoStatus": undo,
+                                     "sendAt": "2026-12-01T09:00:00Z",
+                                     "deliveryStatus": { "bo@example.se": { "delivered": "queued", "smtpReply": "250 OK" } } }))
+                    })
+                    .collect();
+                vec![(name.into(), json!({ "list": list, "state": "sub" }))]
+            }
+            "EmailSubmission/set" if args.get("update").is_some() => {
+                let mut out = json!({ "updated": {} });
+                for (id, patch) in args["update"].as_object().unwrap() {
+                    match self.undo.get_mut(id) {
+                        Some(u) if u == "pending" => {
+                            *u = patch["undoStatus"].as_str().unwrap().to_owned();
+                            out["updated"][id] = Value::Null;
+                        }
+                        _ => out["notUpdated"][id] = json!({ "type": "cannotUnsend" }),
+                    }
+                }
+                vec![(name.into(), out)]
+            }
             "EmailSubmission/set" => {
                 let s = &args["create"]["s"];
                 let email_id = s["emailId"].as_str().unwrap();
@@ -745,6 +918,11 @@ fn jmap_sync_read_change_send_and_folders() -> Result<()> {
         let before = server.lock().unwrap().calls.len();
         b.sync(&a, Folder::Starred, 50)?;
         assert_eq!(server.lock().unwrap().calls[before..], ["Email/changes"]);
+        // Reading the folders again asks only what changed.
+        let before = server.lock().unwrap().calls.len();
+        b.with_jmap(&a, |s| s.reload_mailboxes())?;
+        assert_eq!(server.lock().unwrap().calls[before..], ["Mailbox/changes"]);
+        assert_eq!(b.with_jmap(&a, |s| s.mailboxes())?.len(), 5);
 
         // Moving keeps the row, in its new place.
         b.change_many(&a, std::slice::from_ref(m), Change::Move(Folder::Trash))?;
@@ -837,9 +1015,9 @@ fn jmap_refused_sign_in_is_an_access_failure() -> Result<()> {
     Ok(())
 }
 
-/// Starts the fixture server; returns its port and a handle that stops it.
 /// The fixture's certificate, its port, its state and its running thread.
 type Started = (Vec<u8>, u16, Arc<Mutex<Server>>, Running);
+/// Starts the fixture server.
 fn start(server: Server) -> Result<Started> {
     let (cert, tls) = tls_fixture()?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -1270,4 +1448,155 @@ fn jmap_shipping_mail_downloads_in_batches_for_the_summary() -> Result<()> {
     stop.store(true, Ordering::Relaxed);
     thread.join().unwrap();
     result
+}
+
+/// A mailbox's listing that changed is brought up to date from what
+/// changed in it (Email/queryChanges): new mail read, removed mail asked
+/// about, without listing the mailbox again.
+#[test]
+fn jmap_listing_changes_come_from_query_changes() -> Result<()> {
+    let mut fixture = Server {
+        query_changes: true,
+        state: 1,
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    let message = |id: &str, mailbox: &str, received: &str| Message {
+        id: id.into(),
+        blob: "B0".into(),
+        mailboxes: vec![mailbox.into()],
+        keywords: vec![],
+        subject: format!("Message {id}"),
+        received: received.into(),
+    };
+    fixture.emails.push(message("e1", "i", "2026-10-24T10:00:00Z"));
+    fixture.emails.push(message("e2", "i", "2026-10-25T10:00:00Z"));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    assert_eq!(b.sync(&a, Folder::Inbox, 50)?.len(), 2);
+    // A new message arrives; another moves to Trash.
+    {
+        let mut s = server.lock().unwrap();
+        s.emails.push(message("e3", "i", "2026-10-26T10:00:00Z"));
+        s.touch("e3", false);
+        s.emails.iter_mut().find(|m| m.id == "e1").unwrap().mailboxes = vec!["t".into()];
+        s.touch("e1", false);
+    }
+    let before = server.lock().unwrap().calls.len();
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    let calls = server.lock().unwrap().calls[before..].to_vec();
+    assert!(calls.contains(&"Email/queryChanges".to_owned()), "{calls:?}");
+    assert!(!calls.contains(&"Email/query".to_owned()), "not listed again: {calls:?}");
+    let ids: Vec<String> = inbox.iter().map(|m| m.id.rsplit(':').next().unwrap().to_owned()).collect();
+    assert_eq!(ids, ["e3", "e2"]);
+    // The moved message's row is in Trash now.
+    let moved = b.store.message(&format!("{}:jmap:e1", a.id))?.unwrap();
+    assert_eq!(moved.folder, Folder::Trash);
+    Ok(())
+}
+
+/// Calendars and contacts kept by a JMAP server: read, added to, changed
+/// and removed there, with the server told not to send invitations; and a
+/// message held to send later is taken back.
+#[test]
+fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    fixture.events.push(json!({
+        "@type": "Event", "id": "E0", "uid": "dentist@x", "title": "Dentist",
+        "start": "2099-11-24T10:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+        "calendarIds": { "c1": true },
+    }));
+    fixture.cards.push(json!({
+        "@type": "Card", "id": "K0", "uid": "bo", "name": { "full": "Bo Lindqvist" },
+        "emails": { "work": { "@type": "EmailAddress", "address": "bo@example.se", "contexts": { "work": true } } },
+    }));
+    fixture.undo.insert("held1".into(), "pending".into());
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["s".into()],
+        keywords: vec!["$seen".into()],
+        subject: "Held".into(),
+        received: "2026-11-20T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    // Calendars.
+    b.connect_jmap_calendar(&a)?;
+    let cals = b.calendars();
+    assert_eq!(cals.len(), 1);
+    assert_eq!((cals[0].href.as_str(), cals[0].color.as_str()), ("jmap:c1", "#3366ff"));
+    let events = b.calendar_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.summary, "Dentist");
+    assert_eq!(events[0].href, "jmap:E0");
+    let mut lunch = crate::sync::ical::Event {
+        summary: "Lunch".into(),
+        start: 4_100_000_000,
+        end: 4_100_003_600,
+        utc: true,
+        alarms: vec![600],
+        ..Default::default()
+    };
+    lunch.attendees.push(crate::sync::ical::Attendee {
+        email: "bo@example.se".into(),
+        ..Default::default()
+    });
+    let saved = b.save_event(lunch, None)?;
+    assert!(saved.href.starts_with("jmap:E"));
+    {
+        let s = server.lock().unwrap();
+        let made = s.events.iter().find(|e| e["title"] == "Lunch").unwrap();
+        assert_eq!(made["calendarIds"]["c1"], true);
+        assert_eq!(made["participants"]["p0"]["scheduleAgent"], "client");
+    }
+    b.delete_event(&saved.event.uid)?;
+    assert!(!server.lock().unwrap().events.iter().any(|e| e["title"] == "Lunch"));
+    // Contacts.
+    assert_eq!(b.connect_jmap_contacts(&a)?, 1);
+    let mut bo = b.contacts().into_iter().find(|c| c.name == "Bo Lindqvist").unwrap();
+    bo.phones.push("+46 8 123".into());
+    b.save_contact(bo)?;
+    {
+        let s = server.lock().unwrap();
+        let card = s.cards.iter().find(|c| c["id"] == "K0").unwrap();
+        assert_eq!(card["emails"]["work"]["contexts"]["work"], true, "the label stays");
+        assert_eq!(card["phones"]["phones1"]["number"], "+46 8 123");
+    }
+    let cy = b.save_contact(crate::sync::carddav::Card {
+        name: "Cy".into(),
+        emails: vec!["cy@example.net".into()],
+        ..Default::default()
+    })?;
+    assert_eq!(cy.href, "jmap:K2");
+    b.delete_contact(&cy.uid)?;
+    assert_eq!(server.lock().unwrap().cards.len(), 1);
+    // Held to send later: listed, and taken back once.
+    let held = b.held_submissions(&a)?;
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].id, "held1");
+    assert!(b.cancel_held(&a, "held1")?);
+    {
+        // Back in Drafts, as a draft.
+        let s = server.lock().unwrap();
+        let m = s.emails.iter().find(|m| m.id == "M1").unwrap();
+        assert_eq!(m.mailboxes, ["d"]);
+        assert!(m.keywords.contains(&"$draft".to_owned()));
+    }
+    assert!(!b.cancel_held(&a, "held1")?, "already taken back");
+    let status = b.submission_status(&a, "held1")?.unwrap();
+    assert_eq!(status.undo, "canceled");
+    assert_eq!(status.delivery[0].1, "queued");
+    Ok(())
 }

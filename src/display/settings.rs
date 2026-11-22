@@ -1173,6 +1173,7 @@ impl MailApp {
                 ))
             })
             .child(self.identities_setting(a, cx))
+            .children(self.server_identities_setting(a, cx))
             .when(a.provider != Provider::Pop3, |page| {
                 page.child(self.section("Storage"))
                     .child(self.storage(a))
@@ -1941,10 +1942,23 @@ impl MailApp {
                 cx,
             ))
     }
-    /// Preset pictures drawn over Settings, so choosing one never closes
-    /// Settings or loses its place.
-    pub(super) fn presets_sheet(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+    /// A dialog drawn over Settings, which stays open where it was: the
+    /// main dialogs' panel, header and close button, its content scrolling
+    /// between them, then `footer` if it has buttons.
+    pub(super) fn sheet_over_settings(
+        &self,
+        sheet: Sheet,
+        content: impl IntoElement,
+        footer: Option<Div>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let c = self.colors();
+        let Sheet {
+            id,
+            title,
+            width,
+            close,
+        } = sheet;
         div()
             .absolute()
             .inset_0()
@@ -1954,17 +1968,17 @@ impl MailApp {
             .items_center()
             .justify_center()
             .p_4()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Left, swallow_press)
             .child(
                 div()
-                    .id("presets-sheet")
-                    .debug_selector(|| "presets-sheet".into())
-                    .w(px(540.))
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .w(px(width))
                     .max_w_full()
                     .max_h_full()
                     .flex()
                     .flex_col()
-                    .rounded(px(14.))
+                    .rounded(px(18.))
                     .border_1()
                     .border_color(rgb(c.border))
                     .bg(rgb(c.surface))
@@ -1984,34 +1998,69 @@ impl MailApp {
                                     .flex_1()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Choose a Picture"),
+                                    .child(title),
                             )
                             .child(self.button(
-                                "presets-close",
-                                "@Close",
+                                format!("{id}-close"),
+                                "@Close dialog",
                                 "close",
-                                Action::ClosePresets,
+                                close,
                                 false,
                                 cx,
                             )),
                     )
                     .child(
                         div()
-                            .id("presets-sheet-content")
+                            .id(SharedString::from(format!("{id}-content")))
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
                             .p_5()
-                            .child(self.presets_modal(id, cx)),
-                    ),
+                            .child(content),
+                    )
+                    .children(footer.map(|footer| {
+                        footer
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .px_5()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(rgb(c.border))
+                    })),
             )
             .with_animation(
-                ("presets-sheet", self.menu_anim),
+                (id, self.menu_anim),
                 Animation::new(Duration::from_millis(140)).with_easing(|t| 1. - (1. - t).powi(3)),
                 |d, t| d.opacity(t),
             )
             .into_any_element()
     }
+    /// Preset pictures drawn over Settings, so choosing one never closes
+    /// Settings or loses its place.
+    pub(super) fn presets_sheet(&self, id: &str, cx: &Context<Self>) -> AnyElement {
+        self.sheet_over_settings(
+            Sheet {
+                id: "presets-sheet",
+                title: "Choose a Picture",
+                width: 540.,
+                close: Action::ClosePresets,
+            },
+            self.presets_modal(id, cx),
+            None,
+            cx,
+        )
+    }
+}
+
+/// A dialog over Settings: its id, title, width and what closes it.
+pub(super) struct Sheet {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub width: f32,
+    pub close: Action,
 }
 
 /// Settings popped out into a window of its own. It draws the app's

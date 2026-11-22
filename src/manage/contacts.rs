@@ -58,27 +58,105 @@ impl Backend {
     /// Signs in to a CardDAV server and reads its address books; the server
     /// and password are kept only once that works.
     pub fn connect_contacts(&self, mut server: carddav::Server, password: &str) -> Result<usize> {
-        let (cards, book) = carddav::fetch(&server, password, self.tls_connector()?)?;
-        server.book = book;
+        let fetched = carddav::fetch_changes(&server, password, self.tls_connector()?, &[])?;
+        let cards = fetched.cards;
+        server.book = fetched.book;
+        server.states = fetched.states;
         #[cfg(not(test))]
         store::write_secret_text(PASSWORD, password)?;
         self.store
             .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         self.replace_server_cards(cards)
     }
+    /// Uses the address books of a JMAP account's server (JMAP for
+    /// Contacts) instead of a CardDAV server: its sign-in is the account's.
+    pub fn connect_jmap_contacts(&self, a: &Account) -> Result<usize> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP accounts keep contacts this way.");
+        self.with_jmap_contacts(a, crate::sync::jscal::ensure_contacts)?;
+        let server = carddav::Server {
+            url: a.incoming_host.clone(),
+            user: a.email.clone(),
+            jmap_account: a.id.clone(),
+            ..Default::default()
+        };
+        self.store
+            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.sync_contacts()
+    }
+    fn with_jmap_contacts<T>(
+        &self,
+        a: &Account,
+        work: impl FnOnce(&crate::sync::jmap::Session) -> Result<T>,
+    ) -> Result<T> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, work)
+    }
+    /// The JMAP account contacts come from, if they come from one.
+    fn contacts_jmap(&self, server: &carddav::Server) -> Result<Option<Account>> {
+        if server.jmap_account.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.store
+                .accounts()?
+                .into_iter()
+                .find(|a| a.id == server.jmap_account)
+                .context("The account your contacts come from was removed. Set up contacts again.")?,
+        ))
+    }
+    /// Makes a new address book on the server (MKCOL, or AddressBook/set),
+    /// which new contacts then go to.
+    pub fn create_address_book(&self, name: &str) -> Result<()> {
+        ensure!(!name.trim().is_empty(), "Give the address book a name.");
+        let mut server = self
+            .contacts_server()
+            .context("Set up a contacts server in Settings → Contacts first.")?;
+        server.book = match self.contacts_jmap(&server)? {
+            Some(a) => format!(
+                "jmap:{}",
+                self.with_jmap_contacts(&a, |s| crate::sync::jscal::create_address_book(s, name.trim()))?
+            ),
+            None => carddav::create_book(
+                &server,
+                &self.contacts_password()?,
+                self.tls_connector()?,
+                name.trim(),
+            )?,
+        };
+        self.store
+            .set_preference(SERVER, &serde_json::to_string(&server)?)
+    }
     /// Reads the address books again from the server set up before.
     pub fn sync_contacts(&self) -> Result<usize> {
         let mut server = self
             .contacts_server()
             .context("No contacts server is set up.")?;
-        let (cards, book) =
-            carddav::fetch(&server, &self.contacts_password()?, self.tls_connector()?)?;
-        if server.book != book {
-            server.book = book;
+        if let Some(a) = self.contacts_jmap(&server)? {
+            let (cards, book) = self.with_jmap_contacts(&a, crate::sync::jscal::cards)?;
+            if server.book.is_empty() || !server.book.starts_with("jmap:") {
+                server.book = book;
+                self.store
+                    .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+            }
+            return self.replace_server_cards(cards);
+        }
+        // Only what changed since the last sync is downloaded, where the
+        // server can say (sync token or ctag).
+        let known: Vec<Card> = self.contacts().into_iter().filter(from_server).collect();
+        let fetched = carddav::fetch_changes(
+            &server,
+            &self.contacts_password()?,
+            self.tls_connector()?,
+            &known,
+        )?;
+        if server.book != fetched.book || server.states != fetched.states {
+            server.book = fetched.book;
+            server.states = fetched.states;
             self.store
                 .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         }
-        self.replace_server_cards(cards)
+        self.replace_server_cards(fetched.cards)
     }
     fn replace_server_cards(&self, cards: Vec<Card>) -> Result<usize> {
         let count = cards.len();
@@ -140,12 +218,19 @@ impl Backend {
             card.uid = uuid::Uuid::new_v4().to_string();
         }
         let saved = match self.contacts_server() {
-            Some(server) if from_server(&card) || !server.book.is_empty() => carddav::save(
-                &server,
-                &self.contacts_password()?,
-                self.tls_connector()?,
-                &card,
-            )?,
+            Some(server) if from_server(&card) || !server.book.is_empty() => {
+                match self.contacts_jmap(&server)? {
+                    Some(a) => self.with_jmap_contacts(&a, |s| {
+                        crate::sync::jscal::save_card(s, &card, &server.book)
+                    })?,
+                    None => carddav::save(
+                        &server,
+                        &self.contacts_password()?,
+                        self.tls_connector()?,
+                        &card,
+                    )?,
+                }
+            }
             _ => card,
         };
         let mut all = self.contacts();
@@ -163,12 +248,15 @@ impl Backend {
         if from_server(&card)
             && let Some(server) = self.contacts_server()
         {
-            carddav::delete(
-                &server,
-                &self.contacts_password()?,
-                self.tls_connector()?,
-                &card,
-            )?;
+            match self.contacts_jmap(&server)? {
+                Some(a) => self.with_jmap_contacts(&a, |s| crate::sync::jscal::delete_card(s, &card))?,
+                None => carddav::delete(
+                    &server,
+                    &self.contacts_password()?,
+                    self.tls_connector()?,
+                    &card,
+                )?,
+            }
         }
         all.retain(|c| c.uid != uid);
         self.save_contacts(&all)

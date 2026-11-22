@@ -194,6 +194,18 @@ pub(crate) struct ServerLimits {
     pub(crate) starttls: bool,
     /// SASL mechanisms it takes (AUTH), uppercase.
     pub(crate) auth: Vec<String>,
+    /// ENHANCEDSTATUSCODES (RFC 2034): replies start with a class.subject.detail
+    /// code such as 5.1.1.
+    pub(crate) enhanced: bool,
+    /// LIMITS RCPTMAX (RFC 9422): how many recipients one message may have.
+    pub(crate) rcpt_max: Option<usize>,
+    /// LIMITS MAILMAX: how many messages one connection may send.
+    pub(crate) mail_max: Option<usize>,
+    /// BURL (RFC 4468): the message may be named by an IMAP URL rather than
+    /// sent again; `imap` when the server fetches from IMAP servers.
+    pub(crate) burl_imap: bool,
+    /// BINARYMIME (RFC 3030): 8-bit lines of any length and NULs, with BDAT.
+    pub(crate) binary_mime: bool,
     /// FUTURERELEASE (RFC 4865): how far ahead it holds a message for
     /// release, in seconds (0 where it doesn't).
     pub(crate) future_release: u64,
@@ -227,6 +239,27 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
             Some("STARTTLS") => limits.starttls = true,
             Some("FUTURERELEASE") => {
                 limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0)
+            }
+            Some("ENHANCEDSTATUSCODES") => limits.enhanced = true,
+            Some("BINARYMIME") => limits.binary_mime = true,
+            // "BURL imap" (or a bare BURL, which fetches from URLs it is given).
+            Some("BURL") => {
+                let schemes: Vec<String> = words.map(str::to_ascii_lowercase).collect();
+                limits.burl_imap = schemes.is_empty() || schemes.iter().any(|s| s == "imap");
+            }
+            // "LIMITS RCPTMAX=100 MAILMAX=1000 RCPTDOMAINMAX=10"
+            Some("LIMITS") => {
+                for word in words {
+                    let Some((name, value)) = word.split_once('=') else {
+                        continue;
+                    };
+                    let value = value.parse::<usize>().ok().filter(|n| *n > 0);
+                    match name.to_ascii_uppercase().as_str() {
+                        "RCPTMAX" => limits.rcpt_max = value,
+                        "MAILMAX" => limits.mail_max = value,
+                        _ => {}
+                    }
+                }
             }
             // Some servers still write "AUTH=PLAIN LOGIN".
             Some(word) if word == "AUTH" || word.starts_with("AUTH=") => {
@@ -310,6 +343,66 @@ impl Reply {
     fn text(&self) -> String {
         self.lines.join(" ")
     }
+    /// The enhanced status code (RFC 3463) the reply starts with, if any.
+    fn enhanced(&self) -> Option<(u8, u16, u16)> {
+        enhanced_code(self.lines.first()?)
+    }
+    /// "Too many recipients" (RFC 5321 §4.5.3.1.10): 452, or 4.5.3. The
+    /// recipients refused for it go in another transaction.
+    fn too_many_recipients(&self) -> bool {
+        self.code == 452 && self.enhanced().is_none_or(|e| e == (4, 5, 3))
+            || self.enhanced() == Some((4, 5, 3))
+    }
+    /// The server's text, with what its enhanced code means in front when
+    /// the text alone is unclear.
+    fn explained(&self) -> String {
+        match self.enhanced().and_then(|(c, s, d)| meaning(c, s, d)) {
+            Some(meaning) => format!("{meaning} ({} {})", self.code, self.text()),
+            None => format!("{} {}", self.code, self.text()),
+        }
+    }
+}
+
+/// An enhanced status code at the start of a reply line: `5.1.1 …`.
+fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
+    let code = line.split_whitespace().next()?;
+    let mut parts = code.split('.');
+    let class: u8 = parts.next()?.parse().ok()?;
+    let subject: u16 = parts.next()?.parse().ok()?;
+    let detail: u16 = parts.next()?.parse().ok()?;
+    (parts.next().is_none() && matches!(class, 2 | 4 | 5)).then_some((class, subject, detail))
+}
+
+/// What an enhanced status code (RFC 3463, and the IANA registry) means,
+/// for the codes people most often meet.
+fn meaning(class: u8, subject: u16, detail: u16) -> Option<&'static str> {
+    if class == 2 {
+        return None;
+    }
+    Some(match (subject, detail) {
+        (1, 1) => "That mailbox doesn't exist",
+        (1, 2) => "That domain doesn't exist or takes no mail",
+        (1, 3) => "That address isn't valid",
+        (1, 6) => "That person has moved and no longer gets mail there",
+        (1, 7) | (1, 8) => "The server won't send from this address",
+        (1, 10) => "That domain takes no mail (null MX)",
+        (2, 1) => "That mailbox isn't taking mail now",
+        (2, 2) => "That mailbox is full",
+        (2, 3) | (3, 4) => "The message is too large",
+        (3, 1) => "The server's storage is full",
+        (4, 1) | (4, 2) | (4, 7) => "The recipient's server couldn't be reached",
+        (4, 4) => "The recipient's domain couldn't be routed to",
+        (5, 3) => "Too many recipients for one message",
+        (6, _) => "The server can't take this message's format",
+        (7, 0) | (7, 1) => "The server refused this by its policy",
+        (7, 8) | (7, 9) => "The sign-in wasn't accepted",
+        (7, 13) => "This account is disabled",
+        (7, 23) => "SPF says this server may not send for this address",
+        (7, 25) | (7, 26) | (7, 27) => "The message failed the receiving server's sender checks",
+        (7, 30) => "The server can't keep the message encrypted all the way",
+        (_, _) if class == 4 => "The server can't take this now; it may later",
+        _ => return None,
+    })
 }
 /// A server's refusal, with what it said.
 #[derive(Debug)]
@@ -324,6 +417,10 @@ impl std::error::Error for Refused {}
 /// A stream whose reads may be told to wait longer than usual.
 trait Patience {
     fn wait_for(&mut self, wait: Option<Duration>);
+    /// The TLS channel binding (SCRAM-PLUS), where the stream is TLS.
+    fn binding(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 impl Patience for Wire {
     fn wait_for(&mut self, wait: Option<Duration>) {
@@ -333,6 +430,9 @@ impl Patience for Wire {
 impl Patience for native_tls::TlsStream<Wire> {
     fn wait_for(&mut self, wait: Option<Duration>) {
         self.get_mut().wait_for(wait)
+    }
+    fn binding(&self) -> Vec<u8> {
+        sasl::binding(self)
     }
 }
 
@@ -399,7 +499,20 @@ impl<S: Read + Write + Patience> Session<S> {
     fn ehlo(&mut self) -> Result<ServerLimits> {
         // An address literal, as Thunderbird says hello: the computer's own
         // name would be written into every message's Received header.
-        let reply = self.expect("EHLO [127.0.0.1]", "The outgoing server refused EHLO")?;
+        let reply = self.command("EHLO [127.0.0.1]")?;
+        if !reply.positive() {
+            // A server from before ESMTP (RFC 5321 §4.1.4): HELO, and no
+            // extensions. Without STARTTLS it is only used over TLS.
+            if matches!(reply.code, 500 | 502) {
+                self.expect("HELO [127.0.0.1]", "The outgoing server refused HELO")?;
+                return Ok(ServerLimits::default());
+            }
+            return Err(Refused(format!(
+                "The outgoing server refused EHLO: {}",
+                reply.explained()
+            ))
+            .into());
+        }
         Ok(server_limits(
             reply.lines.iter().skip(1).map(String::as_str),
         ))
@@ -416,7 +529,8 @@ impl<S: Read + Write + Patience> Session<S> {
         } else {
             &sasl::PASSWORD_ORDER
         };
-        let mechanism = sasl::Mechanism::choose(order, limits.auth.iter().map(String::as_str))
+        let bound = !self.reader.get_ref().binding().is_empty();
+        let mechanism = sasl::Mechanism::choose_bound(order, limits.auth.iter().map(String::as_str), bound)
             .with_context(|| {
                 format!(
                     "{} offers no sign-in method Picacho supports{}.",
@@ -435,6 +549,7 @@ impl<S: Read + Write + Patience> Session<S> {
                 secret: secret.to_owned(),
                 host: endpoint.host.clone(),
                 port: endpoint.port,
+                binding: self.reader.get_ref().binding(),
             },
         );
         // RFC 4954: the first message may go with the command.
@@ -544,6 +659,21 @@ impl<S: Read + Write + Patience> Session<S> {
         }
         reply.context("No reply to the message")
     }
+    /// The message named by an IMAP URL, which the server fetches (BURL,
+    /// RFC 4468), as the whole of the message.
+    fn burl(&mut self, url: &str) -> Result<Reply> {
+        self.send(&format!("BURL {url} LAST"))?;
+        self.flush()?;
+        let reply = self.final_reply()?;
+        if !reply.positive() {
+            return Err(Refused(format!(
+                "The server couldn't fetch the message to send: {}",
+                reply.explained()
+            ))
+            .into());
+        }
+        Ok(reply)
+    }
     /// The reply to the end of a message: servers may check it first, so
     /// it is waited for longer (RFC 5321 suggests ten minutes).
     fn final_reply(&mut self) -> Result<Reply> {
@@ -649,6 +779,41 @@ pub(crate) fn deliver(
 ) -> Result<Delivered> {
     let message = build(a, d, false)?;
     let bytes = protected(&message, d, keys)?;
+    deliver_bytes(a, d, &message, bytes, endpoint, secret, tls, hold_until, None)
+}
+
+/// What the server can be told to fetch instead of being sent the
+/// message: an URLAUTH-authorized IMAP URL (RFC 4467) for BURL (RFC 4468).
+pub(crate) struct Burl<'a> {
+    pub(crate) url: &'a str,
+}
+
+/// Whether a server can take the message as a BURL reference.
+pub(crate) fn takes_burl(
+    endpoint: &Endpoint,
+    secret: &str,
+    tls: &native_tls::TlsConnector,
+) -> Result<bool> {
+    let (mut session, limits) = open(endpoint, secret, tls)?;
+    let _ = session.command("QUIT");
+    Ok(limits.burl_imap)
+}
+
+/// Delivers `bytes`, the message built from `d` (`message`, for its
+/// envelope). With `burl`, a server offering BURL fetches the message from
+/// there rather than being sent it; others are sent `bytes`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_bytes(
+    a: &Account,
+    d: &Draft,
+    message: &Message,
+    bytes: Vec<u8>,
+    endpoint: &Endpoint,
+    secret: &str,
+    tls: &native_tls::TlsConnector,
+    hold_until: Option<i64>,
+    burl: Option<Burl<'_>>,
+) -> Result<Delivered> {
     let failed =
         "SMTP delivery failed. Your draft has been kept; check the server and account settings.";
     let (mut session, limits) = open(endpoint, secret, tls).context(failed)?;
@@ -700,7 +865,13 @@ pub(crate) fn deliver(
         );
         mail.push_str(" SMTPUTF8");
     }
-    if !bytes.is_ascii() && limits.eight_bit {
+    let burl = burl.filter(|_| limits.burl_imap);
+    // Binary content (NULs, bare CR, very long lines) goes as BINARYMIME,
+    // which only BDAT can carry; otherwise 8BITMIME for 8-bit text.
+    let binary = needs_binary(&bytes) && limits.binary_mime && limits.chunking && burl.is_none();
+    if binary {
+        mail.push_str(" BODY=BINARYMIME");
+    } else if !bytes.is_ascii() && limits.eight_bit {
         mail.push_str(" BODY=8BITMIME");
     }
     let receipts = a.delivery_receipts && limits.dsn;
@@ -718,61 +889,130 @@ pub(crate) fn deliver(
         let mut line = format!("RCPT TO:<{to}>");
         if receipts {
             line.push_str(" NOTIFY=SUCCESS,FAILURE,DELAY");
+            // The address as written, so a report names it (RFC 3461 §4.2).
+            // Non-ASCII ones would need RFC 6533's utf-8-addr form; left out.
+            let to: &str = to.as_ref();
+            if to.is_ascii() {
+                line.push_str(&format!(" ORCPT=rfc822;{}", xtext(to)));
+            }
         }
         line
     };
-    // With PIPELINING the sender and every recipient go at once, and their
-    // replies are read after; the message itself waits for them.
-    let recipients = envelope.to();
-    let replies: Vec<Reply> = if limits.pipelining {
-        session.send(&mail)?;
-        for to in recipients {
-            session.send(&rcpt(to))?;
+    // Recipients go in as many transactions as the server needs: at most
+    // RCPTMAX each (RFC 9422), and those refused with "too many recipients"
+    // (452, 4.5.3) in the next one (RFC 5321 §4.5.3.1.10). A server that
+    // took no recipient in a transaction ends the send.
+    let mut pending: Vec<&lettre::Address> = envelope.to().iter().collect();
+    let batch = limits.rcpt_max.unwrap_or(usize::MAX).max(1);
+    let mut sent = 0;
+    while !pending.is_empty() {
+        if limits.mail_max.is_some_and(|max| sent >= max) {
+            let _ = session.command("QUIT");
+            bail!(
+                "{} sent this to some recipients but limits how many messages one connection sends; {} recipients didn't get it. Send it to them again.",
+                endpoint.host,
+                pending.len()
+            );
         }
-        session.flush()?;
-        (0..=recipients.len())
-            .map(|_| session.reply())
-            .collect::<Result<_>>()?
-    } else {
-        let mut replies = vec![session.command(&mail)?];
-        if replies[0].positive() {
-            for to in recipients {
-                replies.push(session.command(&rcpt(to))?);
+        if sent > 0 {
+            let reset = session.command("RSET")?;
+            ensure!(
+                reset.positive(),
+                "{} refused to start another message: {}",
+                endpoint.host,
+                reset.explained()
+            );
+        }
+        let these: Vec<&lettre::Address> =
+            pending.drain(..batch.min(pending.len())).collect();
+        let replies = transaction(&mut session, &mail, &these, &rcpt, limits.pipelining)?;
+        let sender = &replies[0];
+        if !sender.positive() {
+            let _ = session.command("QUIT");
+            let error = Err(Refused(format!(
+                "The server refused to send from {from}: {}",
+                sender.explained()
+            )));
+            return if sent == 0 {
+                error.context(failed)
+            } else {
+                error.context("The message went to some recipients only.")
+            };
+        }
+        let mut later = Vec::new();
+        for (to, reply) in these.iter().zip(&replies[1..]) {
+            if reply.positive() {
+                continue;
             }
+            if reply.too_many_recipients() {
+                later.push(*to);
+                continue;
+            }
+            let _ = session.command("QUIT");
+            let error = Err(Refused(reply.explained()));
+            return if sent == 0 {
+                error.with_context(|| format!("The server refused the recipient {to}."))
+            } else {
+                error.with_context(|| {
+                    format!("The message went to some recipients, but the server refused {to}.")
+                })
+            };
         }
-        replies
-    };
-    let sender = &replies[0];
-    if !sender.positive() {
-        let _ = session.command("QUIT");
-        return Err(Refused(format!(
-            "The server refused to send from {from}: {} {}",
-            sender.code,
-            sender.text()
-        )))
-        .context(failed);
+        if later.len() == these.len() {
+            let _ = session.command("QUIT");
+            bail!("{} took none of this message's recipients (too many).", endpoint.host);
+        }
+        // Those refused for their number go first next time.
+        later.append(&mut pending);
+        pending = later;
+        let accepted = if let Some(burl) = &burl {
+            session.burl(burl.url)
+        } else if limits.chunking {
+            session.bdat(&bytes, limits.pipelining)
+        } else {
+            session.data(&bytes)
+        };
+        if sent == 0 {
+            accepted.context(failed)?;
+        } else {
+            accepted.context("The message went to some recipients only.")?;
+        }
+        sent += 1;
     }
-    if let Some((to, reply)) = recipients
-        .iter()
-        .zip(&replies[1..])
-        .find(|(_, r)| !r.positive())
-    {
-        let _ = session.command("QUIT");
-        return Err(Refused(format!("{} {}", reply.code, reply.text())))
-            .with_context(|| format!("The server refused the recipient {to}."));
-    }
-    let accepted = if limits.chunking {
-        session.bdat(&bytes, limits.pipelining)
-    } else {
-        session.data(&bytes)
-    };
-    accepted.context(failed)?;
     // Accepted; a failed goodbye doesn't matter.
     let _ = session.command("QUIT");
     Ok(Delivered {
         raw: bytes,
         receipts_unsupported: a.delivery_receipts && !limits.dsn,
     })
+}
+
+/// MAIL FROM and the RCPT TO of `to`: with PIPELINING all at once and their
+/// replies read after; otherwise one by one, stopping if the sender is
+/// refused. The first reply is MAIL FROM's.
+fn transaction<S: Read + Write + Patience>(
+    session: &mut Session<S>,
+    mail: &str,
+    to: &[&lettre::Address],
+    rcpt: &dyn Fn(&lettre::Address) -> String,
+    pipelining: bool,
+) -> Result<Vec<Reply>> {
+    if pipelining {
+        session.send(mail)?;
+        for t in to {
+            session.send(&rcpt(t))?;
+        }
+        session.flush()?;
+        (0..=to.len()).map(|_| session.reply()).collect()
+    } else {
+        let mut replies = vec![session.command(mail)?];
+        if replies[0].positive() {
+            for t in to {
+                replies.push(session.command(&rcpt(t))?);
+            }
+        }
+        Ok(replies)
+    }
 }
 /// The message's bytes as they go: signed and encrypted with OpenPGP where
 /// the draft asks. Bcc recipients are among those encrypted to; the
@@ -859,10 +1099,14 @@ pub(crate) fn deliver_raw(
         mail.push_str(" REQUIRETLS");
     }
     let reply = session.command(&mail)?;
-    ensure!(reply.positive(), "The server refused to send from {from}: {}", reply.text());
+    ensure!(reply.positive(), "The server refused to send from {from}: {}", reply.explained());
     for address in to {
         let reply = session.command(&format!("RCPT TO:<{address}>"))?;
-        ensure!(reply.positive(), "The server refused the recipient {address}: {}", reply.text());
+        ensure!(
+            reply.positive(),
+            "The server refused the recipient {address}: {}",
+            reply.explained()
+        );
     }
     session.data(bytes)?;
     let _ = session.command("QUIT");
@@ -968,6 +1212,27 @@ pub(crate) fn receipt(a: &Account, m: &crate::manage::model::Mail, to: &str) -> 
     out.push_str("Disposition: manual-action/MDN-sent-manually; displayed\r\n");
     out.push_str(&format!("--{boundary}--\r\n"));
     out.into_bytes()
+}
+/// Whether a message can't go as 7- or 8-bit text (RFC 6152): it has a
+/// NUL, a bare CR or LF, or a line over 998 octets.
+fn needs_binary(bytes: &[u8]) -> bool {
+    let mut line = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            0 => return true,
+            b'\r' if bytes.get(i + 1) != Some(&b'\n') => return true,
+            b'\n' if i == 0 || bytes[i - 1] != b'\r' => return true,
+            b'\n' => line = 0,
+            b'\r' => {}
+            _ => {
+                line += 1;
+                if line > 998 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 /// A value as RFC 3461's xtext: printable ASCII but + and =, else +XX.
 fn xtext(value: &str) -> String {
@@ -1216,6 +1481,11 @@ mod tests {
         );
         assert!(modern.chunking && modern.require_tls && modern.starttls);
         assert_eq!(modern.auth, ["LOGIN", "SCRAM-SHA-256", "PLAIN"]);
+        let limited = server_limits(
+            ["ENHANCEDSTATUSCODES", "LIMITS RCPTMAX=50 MAILMAX=0 RCPTDOMAINMAX=5"].into_iter(),
+        );
+        assert!(limited.enhanced && !modern.enhanced);
+        assert_eq!((limited.rcpt_max, limited.mail_max), (Some(50), None));
         let ty = |name: &str| format!("{:?}", content_type(std::path::Path::new(name)));
         assert!(
             ty("photo.JPG").contains("image/jpeg"),
@@ -1225,6 +1495,70 @@ mod tests {
         assert!(ty("report.pdf").contains("application/pdf"));
         assert!(ty("notes").contains("application/octet-stream"));
         assert_eq!(xtext("a+b=c d"), "a+2Bb+3Dc+20d");
+    }
+
+    #[test]
+    fn enhanced_codes_explain_refusals() {
+        let reply = |code, line: &str| Reply {
+            code,
+            lines: vec![line.to_owned()],
+        };
+        let gone = reply(550, "5.1.1 <x@example.com>: Recipient address rejected");
+        assert_eq!(gone.enhanced(), Some((5, 1, 1)));
+        assert!(gone.explained().starts_with("That mailbox doesn't exist (550 5.1.1"));
+        let plain = reply(550, "No such user here");
+        assert_eq!(plain.enhanced(), None);
+        assert_eq!(plain.explained(), "550 No such user here");
+        assert!(reply(452, "4.5.3 Too many recipients").too_many_recipients());
+        assert!(reply(452, "Too many recipients").too_many_recipients());
+        assert!(!reply(452, "4.2.2 Mailbox full").too_many_recipients());
+        assert!(!reply(550, "5.7.1 Relaying denied").too_many_recipients());
+        assert_eq!(enhanced_code("2.0.0 OK"), Some((2, 0, 0)));
+        assert_eq!(enhanced_code("1.2.3 no"), None);
+    }
+
+    #[test]
+    fn recipients_go_in_as_many_transactions_as_the_server_needs() {
+        use std::io::Cursor;
+        // A stream whose replies are scripted and whose writes are kept.
+        struct Scripted {
+            replies: Cursor<Vec<u8>>,
+            written: Vec<u8>,
+        }
+        impl Read for Scripted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.replies.read(buf)
+            }
+        }
+        impl Write for Scripted {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Patience for Scripted {
+            fn wait_for(&mut self, _: Option<Duration>) {}
+        }
+        let a: lettre::Address = "a@x.org".parse().unwrap();
+        let b: lettre::Address = "b@x.org".parse().unwrap();
+        let script = "250 2.1.0 OK\r\n250 2.1.5 OK\r\n452 4.5.3 Too many recipients\r\n";
+        let mut session = Session::new(Scripted {
+            replies: Cursor::new(script.as_bytes().to_vec()),
+            written: Vec::new(),
+        });
+        let rcpt = |t: &lettre::Address| format!("RCPT TO:<{t}> ORCPT=rfc822;{}", xtext(AsRef::<str>::as_ref(t)));
+        let replies =
+            transaction(&mut session, "MAIL FROM:<me@x.org>", &[&a, &b], &rcpt, true).unwrap();
+        assert_eq!(replies.len(), 3);
+        assert!(replies[1].positive() && replies[2].too_many_recipients());
+        let written = String::from_utf8(session.reader.into_inner().written).unwrap();
+        assert_eq!(
+            written,
+            "MAIL FROM:<me@x.org>\r\nRCPT TO:<a@x.org> ORCPT=rfc822;a@x.org\r\nRCPT TO:<b@x.org> ORCPT=rfc822;b@x.org\r\n"
+        );
     }
 
     #[test]

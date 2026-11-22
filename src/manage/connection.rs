@@ -93,6 +93,184 @@ impl Connection {
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
     }
+    /// Runs a command with literals (`Part`s, text first), returning what
+    /// the server sent for it. Needs the tap, which carries the literals.
+    fn with_literals(
+        &mut self,
+        parts: &[crate::sync::stream::Part<'_>],
+    ) -> Result<Vec<u8>> {
+        let tap = self
+            .tap
+            .clone()
+            .context("This connection can't send messages that way.")?;
+        let line = tap.literals().command(parts);
+        tap.start();
+        let result = self.session.run_command_and_read_response(&line);
+        let copy = tap.take().unwrap_or_default();
+        result?;
+        Ok(copy)
+    }
+    /// Appends several messages to `mailbox` (a wire name) in one command
+    /// (MULTIAPPEND, RFC 3502), each with `flags`; one APPEND each where
+    /// the server doesn't have it. Either all are added or, with
+    /// MULTIAPPEND, none. Returns what the server sent for each command.
+    pub(super) fn append_many(
+        &mut self,
+        mailbox: &str,
+        messages: &[&[u8]],
+        flags: &[imap::types::Flag<'_>],
+    ) -> Result<Vec<Vec<u8>>> {
+        use crate::sync::stream::Part;
+        if messages.len() < 2 || !self.extensions()?.multiappend || self.tap.is_none() {
+            return messages
+                .iter()
+                .map(|raw| Ok(self.append_heard(mailbox, raw, flags)?))
+                .collect();
+        }
+        let flags = flag_list(flags);
+        let head = format!("APPEND {}", crate::sync::transport::quote(mailbox)?);
+        let each = format!(" ({flags}) ");
+        let mut parts = vec![Part::Text(&head)];
+        for raw in messages {
+            parts.push(Part::Text(&each));
+            parts.push(Part::Literal(raw));
+        }
+        Ok(vec![self.with_literals(&parts)?])
+    }
+    /// Replaces the message `uid` in the selected mailbox with `raw` in one
+    /// step (REPLACE, RFC 8508), into `mailbox` (a wire name; the same one
+    /// for a draft). Returns what the server sent, with APPENDUID. `None`
+    /// where the server can't, so the caller appends and removes instead.
+    pub(super) fn replace(
+        &mut self,
+        uid: u32,
+        mailbox: &str,
+        raw: &[u8],
+        flags: &[imap::types::Flag<'_>],
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::sync::stream::Part;
+        if !self.extensions()?.replace || self.tap.is_none() {
+            return Ok(None);
+        }
+        let head = format!(
+            "UID REPLACE {uid} {} ({}) ",
+            crate::sync::transport::quote(mailbox)?,
+            flag_list(flags)
+        );
+        Ok(Some(self.with_literals(&[Part::Text(&head), Part::Literal(raw)])?))
+    }
+    /// Appends a message made of `before`, then the body of the message
+    /// `uid` in `source` (a wire name) as it is on the server, then
+    /// `after` (CATENATE, RFC 4469): a forward that includes the original
+    /// whole, without downloading and uploading it again. `None` where the
+    /// server can't.
+    pub(super) fn catenate(
+        &mut self,
+        mailbox: &str,
+        flags: &[imap::types::Flag<'_>],
+        before: &[u8],
+        source: (&str, u32, u32),
+        after: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::sync::stream::Part;
+        if !self.extensions()?.catenate || self.tap.is_none() {
+            return Ok(None);
+        }
+        let (folder, validity, uid) = source;
+        let head = format!(
+            "APPEND {} ({}) CATENATE (TEXT ",
+            crate::sync::transport::quote(mailbox)?,
+            flag_list(flags)
+        );
+        let url = format!(
+            " URL \"/{};UIDVALIDITY={validity}/;UID={uid}\" TEXT ",
+            url_mailbox(folder)
+        );
+        Ok(Some(self.with_literals(&[
+            Part::Text(&head),
+            Part::Literal(before),
+            Part::Text(&url),
+            Part::Literal(after),
+            Part::Text(")"),
+        ])?))
+    }
+    /// An URL another server (the account's SMTP server, for BURL) may
+    /// read the message `uid` of `mailbox` (a wire name) by, authorized for
+    /// the account's own submission (URLAUTH, RFC 4467: GENURLAUTH with the
+    /// `submit+` access).
+    pub(super) fn submit_url(
+        &mut self,
+        host: &str,
+        user: &str,
+        mailbox: &str,
+        validity: u32,
+        uid: u32,
+    ) -> Result<String> {
+        ensure!(self.extensions()?.urlauth, "The server can't authorize URLs (no URLAUTH).");
+        ensure!(
+            crate::sync::transport::reads_urlauth(),
+            "This build can't read the server's URL authorizations."
+        );
+        let url = format!(
+            "imap://{}@{host}/{};UIDVALIDITY={validity}/;UID={uid};urlauth=submit+{}",
+            url_mailbox(user),
+            url_mailbox(mailbox),
+            url_mailbox(user)
+        );
+        let heard = self.heard(&format!(
+            "GENURLAUTH {} INTERNAL",
+            crate::sync::transport::quote(&url)?
+        ))?;
+        authorized_url(&heard).context("The server didn't authorize the URL.")
+    }
+    /// The server's folder for `folder` (Sent, Archive, Trash, Junk,
+    /// Drafts), making it where there is none and the server can mark it
+    /// for that use (CREATE-SPECIAL-USE, RFC 6154), so other apps find it
+    /// too. Elsewhere a missing folder stays an error.
+    pub(super) fn standard_folder(&mut self, provider: Provider, folder: Folder) -> Result<String> {
+        let found = crate::sync::transport::resolve_in(self.names(false)?, provider, folder);
+        if found.is_ok() || !self.extensions()?.create_special_use {
+            return found;
+        }
+        let (name, special) = match folder {
+            Folder::Sent => ("Sent", "\\Sent"),
+            Folder::Archive => ("Archive", "\\Archive"),
+            Folder::Trash => ("Trash", "\\Trash"),
+            Folder::Junk => ("Junk", "\\Junk"),
+            Folder::Drafts => ("Drafts", "\\Drafts"),
+            _ => return found,
+        };
+        // In the personal namespace (`INBOX.` on servers that want it).
+        let name = format!("{}{name}", self.namespace()?.unwrap_or_default());
+        let wire = self.mailbox(&name)?;
+        self.session
+            .run_command_and_check_ok(format!("CREATE {wire} (USE ({special}))"))
+            .with_context(|| format!("The server has no {} folder and didn't make one.", folder.label()))?;
+        let _ = self
+            .session
+            .run_command_and_check_ok(format!("SUBSCRIBE {wire}"));
+        crate::sync::transport::resolve_in(self.names(true)?, provider, folder)
+    }
+    /// The space every mailbox takes, from STATUS=SIZE (RFC 8438), in KiB:
+    /// storage used where the server has no QUOTA to say.
+    pub(super) fn total_size_kib(&mut self) -> Result<Option<u64>> {
+        if !self.extensions()?.status_size || !crate::sync::transport::reads_status_size() {
+            return Ok(None);
+        }
+        let names: Vec<String> = self
+            .names(false)?
+            .iter()
+            .filter(|n| !n.has("Noselect") && !n.has("NonExistent"))
+            .map(|n| n.name.clone())
+            .collect();
+        let mut total: u64 = 0;
+        for name in names {
+            let wire = self.mailbox(&name)?;
+            let heard = self.heard(&format!("STATUS {wire} (SIZE)"))?;
+            total += status_size(&heard).unwrap_or(0);
+        }
+        Ok(Some(total.div_ceil(1024)))
+    }
     /// A new session, with QRESYNC, UTF8=ACCEPT and UIDONLY turned on
     /// where the server has them (ENABLE comes before any SELECT).
     pub(super) fn open(session: ImapSession) -> Result<Self> {
@@ -281,7 +459,13 @@ impl Connection {
     pub(super) fn leave(&mut self, name: &str) -> Result<()> {
         if self.selected.as_ref().is_some_and(|s| s.name == name) {
             self.selected = None;
-            self.session.close()?;
+            // UNSELECT leaves without expunging; CLOSE would remove messages
+            // another app marked \Deleted but meant to keep for now.
+            if self.extensions()?.unselect {
+                self.session.run_command_and_check_ok("UNSELECT")?;
+            } else {
+                self.session.close()?;
+            }
         }
         Ok(())
     }
@@ -380,7 +564,7 @@ impl Backend {
             let _ = c.session.logout();
         }
     }
-    fn note_limit(&self, a: &Account, error: &anyhow::Error) {
+    pub(super) fn note_limit(&self, a: &Account, error: &anyhow::Error) {
         if !crate::sync::transport::throttled(error) {
             return;
         }
@@ -465,5 +649,73 @@ impl Backend {
             .entry(a.id.clone())
             .or_insert_with(|| self.saved_traffic(&a.id, day));
         entry.0 != day || entry.1 < GMAIL_DAILY_BUDGET
+    }
+}
+
+/// Flags as APPEND writes them, without \\Recent (servers set it).
+fn flag_list(flags: &[imap::types::Flag<'_>]) -> String {
+    flags
+        .iter()
+        .filter(|f| **f != imap::types::Flag::Recent)
+        .map(|f| f.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A mailbox name in an IMAP URL (RFC 5092): percent-encoded where it
+/// isn't plain.
+fn url_mailbox(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,=:@".contains(&b) || b == b'/' {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// SIZE in a STATUS reply: `* STATUS "Sent" (SIZE 123456)`.
+fn status_size(heard: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(heard).to_ascii_uppercase();
+    let at = text.find("(SIZE ").or_else(|| text.find(" SIZE "))?;
+    let rest = &text[at + 6..];
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The URL in a GENURLAUTH reply: `* GENURLAUTH "imap://…:internal:…"`.
+fn authorized_url(heard: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(heard);
+    let line = text
+        .lines()
+        .find(|l| l.to_ascii_uppercase().starts_with("* GENURLAUTH "))?;
+    let rest = line["* GENURLAUTH ".len()..].trim();
+    let url = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(rest);
+    url.starts_with("imap://").then(|| url.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn imap_urls_and_their_authorization() {
+        assert_eq!(url_mailbox("Sent Items"), "Sent%20Items");
+        assert_eq!(url_mailbox("INBOX/Work"), "INBOX/Work");
+        assert_eq!(url_mailbox("ana@example.com"), "ana@example.com");
+        let heard = b"* GENURLAUTH \"imap://ana@mail.example/Sent;UIDVALIDITY=7/;UID=3;urlauth=submit+ana:internal:91354a473744909de610943775f92038\"\r\na5 OK done\r\n";
+        assert_eq!(
+            authorized_url(heard).as_deref(),
+            Some("imap://ana@mail.example/Sent;UIDVALIDITY=7/;UID=3;urlauth=submit+ana:internal:91354a473744909de610943775f92038")
+        );
+        assert_eq!(authorized_url(b"a5 NO no\r\n"), None);
+        assert_eq!(status_size(b"* STATUS \"Sent Items\" (SIZE 44827)\r\na3 OK\r\n"), Some(44827));
+        assert_eq!(status_size(b"* STATUS INBOX (MESSAGES 3 SIZE 9)\r\n"), Some(9));
+        assert_eq!(status_size(b"a3 OK\r\n"), None);
+        assert_eq!(flag_list(&[imap::types::Flag::Seen, imap::types::Flag::Recent]), "\\Seen");
     }
 }

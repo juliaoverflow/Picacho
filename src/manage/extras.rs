@@ -94,7 +94,30 @@ impl Backend {
         } else if a.provider == Provider::Jmap {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
-            self.send_jmap(a, &a.email, &[to], &raw, &Default::default())?;
+            // The server's own read receipts (MDN/send, RFC 9007) where it
+            // has them: it writes the report and marks the message.
+            let by_server = self.with_jmap(a, |s| {
+                let Some(id) = super::jmap::jmap_id(a, m) else {
+                    return Ok(false);
+                };
+                if !s.has(crate::sync::jmap::MDN) {
+                    return Ok(false);
+                }
+                let identity = s.identities()?.into_iter().find(|i| i.covers(&a.email));
+                let Some(identity) = identity else {
+                    return Ok(false);
+                };
+                s.send_receipt(
+                    id,
+                    &identity.id,
+                    &format!("Read: {}", m.subject),
+                    &format!("Your message “{}” was displayed.", m.subject),
+                )?;
+                Ok(true)
+            })?;
+            if !by_server {
+                self.send_jmap(a, &a.email, &[to], &raw, &Default::default())?;
+            }
         } else {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();

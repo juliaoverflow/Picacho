@@ -177,6 +177,17 @@ pub fn account_notice(account: &str, account_id: &str, title: &str, body: &str) 
     );
 }
 
+/// A calendar reminder: the event's title, and when and where.
+pub fn reminder(uid: &str, title: &str, body: &str) {
+    show(
+        format!("reminder:{uid}"),
+        title.to_owned(),
+        "Calendar".to_owned(),
+        body.to_owned(),
+        None,
+    );
+}
+
 /// `key` names the notification where the system can replace one;
 /// `target` is where tapping it goes.
 fn show(key: String, title: String, account: String, body: String, target: Option<Target>) {

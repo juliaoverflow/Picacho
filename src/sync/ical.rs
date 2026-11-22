@@ -25,7 +25,7 @@ impl PartStat {
             Self::NeedsAction => "NEEDS-ACTION",
         }
     }
-    fn parse(text: &str) -> Self {
+    pub fn parse(text: &str) -> Self {
         match text.to_ascii_uppercase().as_str() {
             "ACCEPTED" => Self::Accepted,
             "TENTATIVE" => Self::Tentative,
@@ -91,6 +91,83 @@ pub struct Event {
     /// replaces (RECURRENCE-ID), as its original start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurrence_id: Option<i64>,
+    /// Reminders (VALARM), as seconds before the start (negative: after).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alarms: Vec<i64>,
+    /// A task (VTODO) rather than an event: `start` is when it is due
+    /// (`end` the same), and `completed` whether it is done.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub completed: bool,
+}
+
+/// When someone is busy (a VFREEBUSY reply, RFC 5545 §3.6.4): their
+/// address and busy periods (start, end), in Unix seconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreeBusy {
+    pub attendee: String,
+    pub busy: Vec<(i64, i64)>,
+}
+
+/// The busy periods in VFREEBUSY components (FREEBUSY lines, other than
+/// FBTYPE=FREE), each with its ATTENDEE.
+pub fn parse_free_busy(text: &str) -> Vec<FreeBusy> {
+    let mut out = Vec::new();
+    let mut current: Option<FreeBusy> = None;
+    for line in unfold(text) {
+        let Some((name, params, value)) = split_line(&line) else {
+            continue;
+        };
+        match name.as_str() {
+            "BEGIN" if value.eq_ignore_ascii_case("VFREEBUSY") => current = Some(FreeBusy::default()),
+            "END" if value.eq_ignore_ascii_case("VFREEBUSY") => out.extend(current.take()),
+            "ATTENDEE" => {
+                if let Some(fb) = current.as_mut() {
+                    fb.attendee = value.trim().trim_start_matches("mailto:").trim_start_matches("MAILTO:").to_owned();
+                }
+            }
+            "FREEBUSY" => {
+                let Some(fb) = current.as_mut() else { continue };
+                if param(&params, "FBTYPE").is_some_and(|t| t.eq_ignore_ascii_case("FREE")) {
+                    continue;
+                }
+                for period in value.split(',') {
+                    let Some((from, to)) = period.split_once('/') else { continue };
+                    let Some((start, _)) = parse_time(from, &[]) else { continue };
+                    let end = parse_time(to, &[])
+                        .map(|(t, _)| t)
+                        .or_else(|| parse_duration(to).map(|d| start + d));
+                    if let Some(end) = end {
+                        fb.busy.push((start, end));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A VFREEBUSY request (RFC 4791 §7.10, iTIP's REQUEST) for `attendees`
+/// from `organizer` over `from`..`to`, for a scheduling outbox.
+pub fn free_busy_request(organizer: &str, attendees: &[String], from: i64, to: i64) -> String {
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_owned(),
+        "VERSION:2.0".to_owned(),
+        concat!("PRODID:-//Pinal Technologies//Picacho ", env!("CARGO_PKG_VERSION"), "//EN").to_owned(),
+        "METHOD:REQUEST".to_owned(),
+        "BEGIN:VFREEBUSY".to_owned(),
+        format!("UID:{}", uuid::Uuid::new_v4()),
+        format!("DTSTAMP:{}", stamp(Utc::now().timestamp())),
+        format!("DTSTART:{}", stamp(from)),
+        format!("DTEND:{}", stamp(to)),
+        format!("ORGANIZER:mailto:{organizer}"),
+    ];
+    lines.extend(attendees.iter().map(|a| format!("ATTENDEE:mailto:{a}")));
+    lines.push("END:VFREEBUSY".to_owned());
+    lines.push("END:VCALENDAR".to_owned());
+    lines.iter().map(|l| fold(l)).collect()
 }
 
 /// An iCalendar object: its METHOD and events.
@@ -118,11 +195,11 @@ fn unfold(text: &str) -> Vec<String> {
     lines
 }
 
-/// A content line's name, parameters and value. Colons inside quoted
-/// parameter values don't end the name.
 /// A content line: its name, parameters and value.
 type Line = (String, Vec<(String, String)>, String);
 
+/// Splits a content line into its name, parameters and value. Colons
+/// inside quoted parameter values don't end the name.
 fn split_line(line: &str) -> Option<Line> {
     let mut quoted = false;
     let mut colon = None;
@@ -280,6 +357,8 @@ pub fn parse(text: &str) -> Calendar {
     let mut event: Option<Event> = None;
     let mut source: Vec<String> = Vec::new();
     let mut end_duration: Option<i64> = None;
+    // Inside a VALARM: its trigger (seconds before the start) once read.
+    let mut alarm: Option<Option<i64>> = None;
     for line in &lines {
         let Some((name, params, value)) = split_line(line) else {
             continue;
@@ -287,21 +366,41 @@ pub fn parse(text: &str) -> Calendar {
         match name.as_str() {
             "BEGIN" => {
                 let kind = value.to_ascii_uppercase();
-                if kind == "VEVENT" && depth.last().is_some_and(|d| d == "VCALENDAR") {
-                    event = Some(Event::default());
+                if (kind == "VEVENT" || kind == "VTODO")
+                    && depth.last().is_some_and(|d| d == "VCALENDAR")
+                {
+                    event = Some(Event {
+                        task: kind == "VTODO",
+                        ..Default::default()
+                    });
                     source.clear();
                     end_duration = None;
+                }
+                // A reminder: when, relative to the start.
+                if kind == "VALARM" {
+                    alarm = Some(None);
                 }
                 depth.push(kind);
             }
             "END" => {
                 let kind = value.to_ascii_uppercase();
-                if kind == "VEVENT"
+                if kind == "VALARM"
+                    && let Some(Some(before)) = alarm.take()
+                    && let Some(e) = event.as_mut()
+                    && !e.alarms.contains(&before)
+                {
+                    e.alarms.push(before);
+                }
+                if (kind == "VEVENT" || kind == "VTODO")
                     && depth.len() == 2
                     && let Some(mut e) = event.take()
                 {
                     source.push(line.clone());
                     e.source = source.join("\r\n") + "\r\n";
+                    // A task without a due date is due when it starts.
+                    if e.task && e.start == 0 {
+                        e.start = e.end;
+                    }
                     if e.end == 0 {
                         e.end = match end_duration {
                             Some(d) => e.start + d,
@@ -318,10 +417,29 @@ pub fn parse(text: &str) -> Calendar {
             "METHOD" if depth.len() == 1 => cal.method = value.trim().to_ascii_uppercase(),
             _ => {}
         }
-        // Properties of the event itself, not of an alarm inside it.
-        if depth.last().is_some_and(|d| d == "VEVENT") && depth.len() == 2 {
-            let Some(e) = event.as_mut() else { continue };
+        // Everything inside the event goes in its source, alarms included,
+        // so it is written back whole (the END:VEVENT line is added above).
+        if event.is_some() && depth.len() >= 2 && (depth[1] == "VEVENT" || depth[1] == "VTODO") {
             source.push(line.clone());
+        }
+        if name == "TRIGGER"
+            && depth.last().is_some_and(|d| d == "VALARM")
+            && let Some(slot) = alarm.as_mut()
+        {
+            let from_end = param(&params, "RELATED").is_some_and(|r| r.eq_ignore_ascii_case("END"));
+            // An absolute trigger (VALUE=DATE-TIME) is kept as relative.
+            *slot = if param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
+                parse_time(&value, &[]).and_then(|(t, _)| event.as_ref().map(|e| e.start - t))
+            } else {
+                parse_duration(&value).map(|d| {
+                    let length = event.as_ref().map_or(0, |e| (e.end - e.start).max(0));
+                    if from_end { -(d + length) } else { -d }
+                })
+            };
+        }
+        // Properties of the event itself, not of an alarm inside it.
+        if depth.last().is_some_and(|d| d == "VEVENT" || d == "VTODO") && depth.len() == 2 {
+            let Some(e) = event.as_mut() else { continue };
             match name.as_str() {
                 "UID" => e.uid = value.trim().to_owned(),
                 "SUMMARY" => e.summary = unescape(&value),
@@ -365,7 +483,11 @@ pub fn parse(text: &str) -> Calendar {
                 "ATTENDEE" => e.attendees.push(attendee(&value, &params)),
                 "SEQUENCE" => e.sequence = value.trim().parse().unwrap_or(0),
                 "RRULE" => e.recurrence = value.trim().to_owned(),
-                "STATUS" => e.cancelled |= value.trim().eq_ignore_ascii_case("CANCELLED"),
+                "STATUS" => {
+                    e.cancelled |= value.trim().eq_ignore_ascii_case("CANCELLED");
+                    e.completed |= value.trim().eq_ignore_ascii_case("COMPLETED");
+                }
+                "COMPLETED" => e.completed = true,
                 _ => {}
             }
         }
@@ -427,6 +549,8 @@ pub fn from_message(raw: &[u8]) -> Option<Calendar> {
         if mime == "text/calendar" || mime == "application/ics" || named_ics {
             let text = leaf.get_body().ok()?;
             let mut cal = parse(&text);
+            // Invitations are to events; a task sent by mail isn't one.
+            cal.events.retain(|e| !e.task);
             if cal.method.is_empty()
                 && let Some(method) = leaf.ctype.params.get("method")
             {
@@ -1112,10 +1236,39 @@ pub fn to_store(event: &Event) -> String {
     out
 }
 
+/// A calendar object for a CalDAV server that Picacho does the inviting
+/// for: every ORGANIZER and ATTENDEE gets `SCHEDULE-AGENT=CLIENT` (RFC 6638
+/// §7.1), so a server that schedules (iCloud, Fastmail, Nextcloud, Google)
+/// doesn't send its own invitations, answers and cancellations on top of
+/// the ones Picacho emails. One that already names an agent is left alone.
+pub fn scheduled_by_client(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in unfold(text) {
+        let name_end = line.find([';', ':']).unwrap_or(line.len());
+        let name = line[..name_end].to_ascii_uppercase();
+        let params = split_line(&line).map(|(_, p, _)| p).unwrap_or_default();
+        let named = params
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("SCHEDULE-AGENT"));
+        if (name == "ORGANIZER" || name == "ATTENDEE") && !named {
+            let line = format!(
+                "{};SCHEDULE-AGENT=CLIENT{}",
+                &line[..name_end],
+                &line[name_end..]
+            );
+            out.push_str(&fold(&line));
+        } else {
+            out.push_str(&fold(&line));
+        }
+    }
+    out
+}
+
 /// A VEVENT written from its fields, for events made or edited here.
 pub fn write_event(e: &Event) -> String {
+    let kind = if e.task { "VTODO" } else { "VEVENT" };
     let mut lines = vec![
-        "BEGIN:VEVENT".to_owned(),
+        format!("BEGIN:{kind}"),
         format!("UID:{}", e.uid),
         format!("DTSTAMP:{}", stamp(Utc::now().timestamp())),
         format!("SEQUENCE:{}", e.sequence),
@@ -1136,15 +1289,26 @@ pub fn write_event(e: &Event) -> String {
     if let Some(id) = e.recurrence_id.filter(|_| e.recurrence.is_empty()) {
         lines.push(at("RECURRENCE-ID", id));
     }
-    lines.push(at("DTSTART", e.start));
-    lines.push(at(
-        "DTEND",
-        if e.all_day {
-            e.end.max(e.start + 86_400)
+    if e.task {
+        // A task is due then; done or not.
+        lines.push(at("DUE", e.start));
+        if e.completed {
+            lines.push("STATUS:COMPLETED".to_owned());
+            lines.push(format!("COMPLETED:{}", stamp(Utc::now().timestamp())));
         } else {
-            e.end.max(e.start)
-        },
-    ));
+            lines.push("STATUS:NEEDS-ACTION".to_owned());
+        }
+    } else {
+        lines.push(at("DTSTART", e.start));
+        lines.push(at(
+            "DTEND",
+            if e.all_day {
+                e.end.max(e.start + 86_400)
+            } else {
+                e.end.max(e.start)
+            },
+        ));
+    }
     for x in &e.exdates {
         lines.push(at("EXDATE", *x));
     }
@@ -1182,8 +1346,27 @@ pub fn write_event(e: &Event) -> String {
             at.email
         ));
     }
-    lines.push("END:VEVENT".to_owned());
+    for before in &e.alarms {
+        lines.push("BEGIN:VALARM".to_owned());
+        lines.push("ACTION:DISPLAY".to_owned());
+        lines.push(format!("DESCRIPTION:{}", escape(&e.summary)));
+        lines.push(format!("TRIGGER:{}", trigger(*before)));
+        lines.push("END:VALARM".to_owned());
+    }
+    lines.push(format!("END:{kind}"));
     lines.iter().map(|l| fold(l)).collect()
+}
+
+/// A reminder's TRIGGER: seconds before the start as `-PT15M`, `-P1D`.
+fn trigger(before: i64) -> String {
+    let (sign, s) = if before >= 0 { ("-", before) } else { ("", -before) };
+    if s % 86_400 == 0 && s > 0 {
+        format!("{sign}P{}D", s / 86_400)
+    } else if s % 3600 == 0 && s > 0 {
+        format!("{sign}PT{}H", s / 3600)
+    } else {
+        format!("{sign}PT{}M", s / 60)
+    }
 }
 
 #[cfg(test)]
@@ -1207,7 +1390,10 @@ mod tests {
         assert_eq!(e.organizer.as_ref().unwrap().name, "Ana López");
         assert_eq!(e.attendees[0].email, "qa@example.com");
         assert_eq!(e.attendees[0].status, Some(PartStat::NeedsAction));
-        assert!(!e.source.contains("VALARM") || e.source.contains("END:VEVENT"));
+        // Kept whole: the alarm's lines, and each BEGIN with its END.
+        assert!(e.source.contains("BEGIN:VALARM\r\nTRIGGER:-P0DT0H10M0S\r\n"));
+        assert_eq!(e.source.matches("BEGIN:").count(), e.source.matches("END:").count());
+        assert!(e.source.ends_with("END:VALARM\r\nEND:VEVENT\r\n"));
     }
 
     #[test]
@@ -1430,6 +1616,64 @@ mod tests {
         assert_eq!(no.method, "DECLINECOUNTER");
         assert_eq!(no.events.len(), 0, "no start: not an event to show");
         assert!(decline_counter(&e, "qa@example.com").contains("ATTENDEE:mailto:qa@example.com"));
+    }
+
+    #[test]
+    fn reminders_tasks_and_free_busy() {
+        let cal = parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20261124T090000Z\r\nDTEND:20261124T100000Z\r\nSUMMARY:Dentist\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=END:PT0M\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VTODO\r\nUID:t\r\nSUMMARY:Taxes\r\nDUE;VALUE=DATE:20261130\r\nEND:VTODO\r\nEND:VCALENDAR\r\n");
+        assert_eq!(cal.events.len(), 2);
+        let e = &cal.events[0];
+        assert_eq!(e.alarms, [900, -3600]);
+        assert!(!e.task);
+        let t = &cal.events[1];
+        assert!(t.task && !t.completed);
+        assert_eq!(t.summary, "Taxes");
+        assert!(t.start > 0);
+        // Written again, they read the same.
+        let back = parse(&to_store(&Event { source: String::new(), ..e.clone() })).events.remove(0);
+        assert_eq!(back.alarms, [900, -3600]);
+        let mut done = t.clone();
+        done.completed = true;
+        done.source.clear();
+        let back = parse(&to_store(&done)).events.remove(0);
+        assert!(back.task && back.completed);
+        assert_eq!(trigger(86_400), "-P1D");
+        assert_eq!(trigger(900), "-PT15M");
+        // A task in a message isn't an invitation.
+        let mail = "Content-Type: text/calendar\r\n\r\nBEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VTODO\r\nUID:t\r\nDUE:20261130T090000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert!(from_message(mail.as_bytes()).is_none_or(|c| c.events.is_empty()));
+        let fb = parse_free_busy("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nBEGIN:VFREEBUSY\r\nATTENDEE:mailto:bo@example.se\r\nFREEBUSY;FBTYPE=BUSY:20261124T090000Z/20261124T100000Z,20261124T130000Z/PT30M\r\nFREEBUSY;FBTYPE=FREE:20261124T100000Z/20261124T130000Z\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n");
+        assert_eq!(fb.len(), 1);
+        assert_eq!(fb[0].attendee, "bo@example.se");
+        assert_eq!(fb[0].busy.len(), 2);
+        assert_eq!(fb[0].busy[1].1 - fb[0].busy[1].0, 1800);
+        let req = free_busy_request("ana@example.org", &["bo@example.se".into()], 0, 3600);
+        assert!(req.contains("BEGIN:VFREEBUSY") && req.contains("ATTENDEE:mailto:bo@example.se"));
+    }
+
+    #[test]
+    fn stored_guests_are_scheduled_by_picacho() {
+        let e = parse(INVITE).events.remove(0);
+        let text = scheduled_by_client(&to_store(&e));
+        let lines = unfold(&text);
+        let people: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("ORGANIZER") || l.starts_with("ATTENDEE"))
+            .collect();
+        assert_eq!(people.len(), 2);
+        assert!(
+            people
+                .iter()
+                .all(|l| l.matches("SCHEDULE-AGENT=CLIENT").count() == 1)
+        );
+        // The people and their answers read the same, and doing it again
+        // changes nothing.
+        let back = parse(&text).events.remove(0);
+        assert_eq!(back.attendees, e.attendees);
+        assert_eq!(back.organizer, e.organizer);
+        assert_eq!(scheduled_by_client(&text), text);
+        let server = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nATTENDEE;SCHEDULE-AGENT=SERVER:mailto:a@b.c\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(scheduled_by_client(server), server);
     }
 
     #[test]

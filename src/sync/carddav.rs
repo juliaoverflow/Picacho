@@ -2,9 +2,11 @@
 //! keep) and CardDAV (RFC 6352), read and written through `dav`.
 //!
 //! Picacho shows and edits a card's name, email addresses, phone numbers,
-//! organization and note. A card read from a server keeps its original
-//! text, and an edit replaces only those properties in it, so photos,
-//! addresses, birthdays and the like that other apps keep stay as they were.
+//! postal addresses, birthday, photo, organization and note, and groups
+//! (vCard 4's `KIND:group` with `MEMBER`s, and Apple's
+//! `X-ADDRESSBOOKSERVER-KIND`/`-MEMBER`). A card read from a server keeps
+//! its original text, and an edit replaces only those properties in it,
+//! so what other apps keep stays as it was.
 use crate::sync::dav;
 use anyhow::{Result, ensure};
 
@@ -31,6 +33,63 @@ pub struct Card {
     /// doesn't show.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vcard: String,
+    /// Postal addresses, one line each, as people write them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    /// The birthday: `YYYY-MM-DD`, or `--MM-DD` without a year.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub birthday: String,
+    /// The photo: a `data:` URI (embedded) or an address.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub photo: String,
+    /// A group rather than a person: its members, by UID.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub group: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+impl Card {
+    /// The photo's bytes, where it is embedded.
+    pub fn photo_bytes(&self) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let data = self.photo.strip_prefix("data:")?;
+        let (_, b64) = data.split_once(";base64,")?;
+        base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()
+    }
+}
+
+/// An ADR value (`;;street;city;region;code;country`) as one line.
+fn address_line(value: &str) -> String {
+    value
+        .split(';')
+        .map(|p| unescape(p).replace('\n', ", ").trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A one-line address as ADR's parts: the street, then the rest as the
+/// city (`street, city`), since that's how people write them.
+fn address_value(line: &str) -> String {
+    let mut parts = line.splitn(2, ',').map(str::trim);
+    let street = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default();
+    format!(";;{};{};;;", escape(street), escape(rest))
+}
+
+/// A BDAY value (`19900101`, `1990-01-01`, `--0101`, `--01-01`) as
+/// `YYYY-MM-DD` or `--MM-DD`.
+fn birthday_value(value: &str) -> String {
+    let v = value.trim().split('T').next().unwrap_or_default();
+    let digits: String = v.chars().filter(char::is_ascii_digit).collect();
+    if v.starts_with("--") && digits.len() == 4 {
+        return format!("--{}-{}", &digits[..2], &digits[2..]);
+    }
+    if digits.len() == 8 {
+        return format!("{}-{}-{}", &digits[..4], &digits[4..6], &digits[6..]);
+    }
+    v.to_owned()
 }
 
 /// Lines of a vCard file unfolded (continuation lines start with a space or
@@ -97,7 +156,7 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                     if card.uid.is_empty() {
                         card.uid = card.emails.join(",").to_lowercase();
                     }
-                    if !card.emails.is_empty() || !card.name.is_empty() {
+                    if !card.emails.is_empty() || !card.name.is_empty() || card.group {
                         cards.push(card);
                     }
                 }
@@ -146,6 +205,40 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                     }
                     "NOTE" => card.note = unescape(value).trim().to_owned(),
                     "UID" => card.uid = unescape(value).trim().to_owned(),
+                    "ADR" => {
+                        let a = address_line(value);
+                        if !a.is_empty() {
+                            card.addresses.push(a);
+                        }
+                    }
+                    "BDAY" => card.birthday = birthday_value(value),
+                    "PHOTO" => {
+                        // vCard 4: a URI. vCard 3: base64 with ENCODING=b.
+                        let upper = head.to_ascii_uppercase();
+                        card.photo = if upper.contains("ENCODING=B") || upper.contains("ENCODING=BASE64") {
+                            let kind = upper
+                                .split(';')
+                                .find_map(|p| p.strip_prefix("TYPE="))
+                                .map(|t| t.to_ascii_lowercase())
+                                .unwrap_or_else(|| "jpeg".into());
+                            format!("data:image/{kind};base64,{}", value.trim())
+                        } else {
+                            value.trim().to_owned()
+                        };
+                    }
+                    "KIND" | "X-ADDRESSBOOKSERVER-KIND" => {
+                        card.group = value.trim().eq_ignore_ascii_case("group")
+                    }
+                    "MEMBER" | "X-ADDRESSBOOKSERVER-MEMBER" => {
+                        let m = value
+                            .trim()
+                            .trim_start_matches("urn:uuid:")
+                            .trim_start_matches("mailto:")
+                            .to_owned();
+                        if !m.is_empty() {
+                            card.members.push(m);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -202,37 +295,205 @@ fn own_lines(card: &Card) -> Vec<String> {
     if !card.note.is_empty() {
         lines.push(format!("NOTE:{}", escape(&card.note)));
     }
+    lines.extend(card.addresses.iter().map(|a| format!("ADR:{}", address_value(a))));
+    if !card.birthday.is_empty() {
+        // 1990-01-01 → 19900101; --01-01 (no year) → --0101.
+        let b = &card.birthday;
+        let written = match b.strip_prefix("--") {
+            Some(md) => format!("--{}", md.replace('-', "")),
+            None => b.replace('-', ""),
+        };
+        lines.push(format!("BDAY:{written}"));
+    }
+    if !card.photo.is_empty() {
+        // vCard 3's form, which every address book reads.
+        match card.photo.strip_prefix("data:").and_then(|d| d.split_once(";base64,")) {
+            Some((kind, data)) => lines.push(format!(
+                "PHOTO;ENCODING=b;TYPE={}:{data}",
+                kind.trim_start_matches("image/").to_ascii_uppercase()
+            )),
+            None => lines.push(format!("PHOTO;VALUE=uri:{}", card.photo)),
+        }
+    }
+    if card.group {
+        // Apple's form, which vCard 3 servers (iCloud too) keep.
+        lines.push("X-ADDRESSBOOKSERVER-KIND:group".into());
+        lines.extend(
+            card.members
+                .iter()
+                .map(|m| format!("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:{m}")),
+        );
+    }
     lines
 }
 
+/// A line's group (`item1` in `item1.EMAIL;…`), uppercase, if it has one.
+fn group(head: &str) -> Option<String> {
+    let name = head.split(';').next().unwrap_or("");
+    name.rsplit_once('.').map(|(g, _)| g.to_ascii_uppercase())
+}
+
+/// An EMAIL line's address, as `parse_vcards` reads it.
+fn email_value(value: &str) -> String {
+    unescape(value)
+        .trim()
+        .trim_start_matches("mailto:")
+        .to_owned()
+}
+
+/// A TEL line's number, as `parse_vcards` reads it.
+fn phone_value(value: &str) -> String {
+    unescape(value).trim().trim_start_matches("tel:").to_owned()
+}
+
 /// One card as vCard text. A card read from a server keeps every property
-/// Picacho doesn't edit; those it does are written from the card's fields.
+/// Picacho doesn't edit, and the lines of those it does edit whose value
+/// didn't change, with their labels (`TYPE=work`, `pref`, Apple's
+/// `item1.X-ABLabel`) and structure (`N`'s prefixes, middle names and
+/// suffixes, `ORG`'s units). Only changed values are written anew.
 pub fn write_vcard(card: &Card) -> String {
-    const EDITED: [&str; 7] = ["FN", "N", "EMAIL", "TEL", "ORG", "NOTE", "UID"];
-    let mut out = String::new();
-    let kept: Vec<String> = unfold(&card.vcard)
-        .into_iter()
-        .filter(|l| !l.is_empty())
-        .filter(|l| {
-            let head = l.split(':').next().unwrap_or("");
-            let p = property(head);
-            !EDITED.contains(&p.as_str()) && p != "BEGIN" && p != "END" && p != "VERSION"
-        })
-        .collect();
-    let version = unfold(&card.vcard)
-        .into_iter()
-        .find(|l| property(l.split(':').next().unwrap_or("")) == "VERSION")
-        .unwrap_or_else(|| "VERSION:3.0".into());
-    out.push_str("BEGIN:VCARD\r\n");
-    out.push_str(&fold(&version));
+    let original = unfold(&card.vcard);
+    let before = parse_vcards(&card.vcard).into_iter().next();
+    let Some(before) = before else {
+        // Made here: nothing to keep.
+        let mut out = String::from("BEGIN:VCARD\r\nVERSION:3.0\r\n");
+        for line in own_lines(card) {
+            out.push_str(&fold(&line));
+        }
+        if !card.uid.is_empty() {
+            out.push_str(&fold(&format!("UID:{}", escape(&card.uid))));
+        }
+        out.push_str("END:VCARD\r\n");
+        return out;
+    };
+    let name_same = before.name == card.name;
+    let mut addresses_left: Vec<&String> = card.addresses.iter().collect();
+    let mut members_left: Vec<&String> = card.members.iter().collect();
+    let mut emails_left: Vec<&String> = card.emails.iter().collect();
+    let mut phones_left: Vec<&String> = card.phones.iter().collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped_groups: Vec<String> = Vec::new();
+    let mut version = "VERSION:3.0".to_owned();
+    let has = |p: &str, kept: &Vec<String>| {
+        kept.iter()
+            .any(|l| property(l.split(':').next().unwrap_or("")) == p)
+    };
+    for line in original.iter().filter(|l| !l.is_empty()) {
+        let Some((head, value)) = line.split_once(':') else {
+            continue;
+        };
+        let p = property(head);
+        let keep = match p.as_str() {
+            "BEGIN" | "END" => false,
+            "VERSION" => {
+                version = line.clone();
+                false
+            }
+            "FN" | "N" => name_same,
+            "ORG" => before.org == card.org,
+            "NOTE" => before.note == card.note,
+            "UID" => before.uid == card.uid,
+            "EMAIL" => {
+                let v = email_value(value);
+                match emails_left.iter().position(|e| e.eq_ignore_ascii_case(&v)) {
+                    Some(i) => {
+                        emails_left.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            "TEL" => {
+                let v = phone_value(value);
+                match phones_left.iter().position(|t| **t == v) {
+                    Some(i) => {
+                        phones_left.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            "ADR" => {
+                let v = address_line(value);
+                match addresses_left.iter().position(|a| **a == v) {
+                    Some(i) => {
+                        addresses_left.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            "BDAY" => birthday_value(value) == card.birthday,
+            "PHOTO" => before.photo == card.photo,
+            "KIND" | "X-ADDRESSBOOKSERVER-KIND" => before.group == card.group,
+            "MEMBER" | "X-ADDRESSBOOKSERVER-MEMBER" => {
+                let v = value.trim().trim_start_matches("urn:uuid:").trim_start_matches("mailto:");
+                match members_left.iter().position(|m| m.as_str() == v) {
+                    Some(i) => {
+                        members_left.remove(i);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => true,
+        };
+        if keep {
+            kept.push(line.clone());
+        } else if let Some(g) = group(head) {
+            dropped_groups.push(g);
+        }
+    }
+    // A label (`item1.X-ABLabel`) whose address or number went goes too.
+    kept.retain(|l| {
+        let head = l.split(':').next().unwrap_or("");
+        match group(head) {
+            Some(g) if dropped_groups.contains(&g) => !property(head).starts_with("X-AB"),
+            _ => true,
+        }
+    });
+    // What changed, or wasn't there, written from the card's fields.
+    let mut added: Vec<String> = Vec::new();
     for line in own_lines(card) {
-        out.push_str(&fold(&line));
+        let p = property(line.split(':').next().unwrap_or(""));
+        let wanted = match p.as_str() {
+            "FN" | "N" => !has(&p, &kept),
+            "ORG" => !has("ORG", &kept),
+            "NOTE" => !has("NOTE", &kept),
+            "EMAIL" => {
+                let v = email_value(line.split_once(':').map_or("", |(_, v)| v));
+                emails_left.iter().any(|e| e.eq_ignore_ascii_case(&v))
+            }
+            "TEL" => {
+                let v = phone_value(line.split_once(':').map_or("", |(_, v)| v));
+                phones_left.iter().any(|t| **t == v)
+            }
+            "ADR" => {
+                let v = address_line(line.split_once(':').map_or("", |(_, v)| v));
+                addresses_left.iter().any(|a| **a == v)
+            }
+            "BDAY" => !has("BDAY", &kept),
+            "PHOTO" => !has("PHOTO", &kept),
+            "X-ADDRESSBOOKSERVER-KIND" => {
+                !has("X-ADDRESSBOOKSERVER-KIND", &kept) && !has("KIND", &kept)
+            }
+            "X-ADDRESSBOOKSERVER-MEMBER" => {
+                let v = line.split_once(':').map_or("", |(_, v)| v).trim_start_matches("urn:uuid:");
+                members_left.iter().any(|m| m.as_str() == v)
+            }
+            _ => true,
+        };
+        if wanted {
+            added.push(line);
+        }
     }
-    if !card.uid.is_empty() {
-        out.push_str(&fold(&format!("UID:{}", escape(&card.uid))));
+    if !card.uid.is_empty() && !has("UID", &kept) {
+        added.push(format!("UID:{}", escape(&card.uid)));
     }
-    for line in kept {
-        out.push_str(&fold(&line));
+    let mut out = String::from("BEGIN:VCARD\r\n");
+    out.push_str(&fold(&version));
+    for line in kept.iter().chain(&added) {
+        out.push_str(&fold(line));
     }
     out.push_str("END:VCARD\r\n");
     out
@@ -252,18 +513,51 @@ pub struct Server {
     /// The address book new contacts go to, once found.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub book: String,
+    /// Contacts kept by one of the mail accounts' JMAP servers (JMAP for
+    /// Contacts) instead of a CardDAV server: that account's id here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jmap_account: String,
+    /// Each address book's state when last read: its sync token (RFC 6578)
+    /// or ctag, so an unchanged book costs no download and a changed one
+    /// only what changed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub states: std::collections::BTreeMap<String, dav::State>,
 }
 
 const QUERY: &str = "<?xml version=\"1.0\"?><c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag/><c:address-data/></d:prop></c:addressbook-query>";
 
-/// Reads every address book the account can see. Returns the cards, each
-/// with its href and ETag, and the address book new cards go to (the first
-/// one the account may write to).
+/// Reads every address book the account can see, whole. Returns the
+/// cards, each with its href and ETag, and the address book new cards go to
+/// (the first one the account may write to).
+#[cfg(test)]
 pub fn fetch(
     server: &Server,
     password: &str,
     tls: native_tls::TlsConnector,
 ) -> Result<(Vec<Card>, String)> {
+    let fetched = fetch_changes(server, password, tls, &[])?;
+    Ok((fetched.cards, fetched.book))
+}
+
+/// What `fetch_changes` found.
+pub struct Fetched {
+    /// Every card on the server.
+    pub cards: Vec<Card>,
+    /// The address book new cards go to.
+    pub book: String,
+    /// Each address book's state now, for the next sync.
+    pub states: std::collections::BTreeMap<String, dav::State>,
+}
+
+/// Reads the address books, downloading only what changed since `known`
+/// (the cards read last time) where the server can say: by sync token
+/// (RFC 6578), else not at all for a book whose ctag is the same.
+pub fn fetch_changes(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    known: &[Card],
+) -> Result<Fetched> {
     let client = dav::Client::new(&server.user, password, tls)?;
     let books = dav::discover(
         &client,
@@ -274,21 +568,70 @@ pub fn fetch(
         dav::CARDDAV,
     )?;
     let mut cards = Vec::new();
+    let mut states = std::collections::BTreeMap::new();
     for book in &books {
-        for resource in client.list(&book.href, QUERY, "address-data")? {
+        let key = book.href.to_string();
+        let before: Vec<&Card> = known
+            .iter()
+            .filter(|c| dav::in_collection(&c.href, &book.href))
+            .collect();
+        let previous = server.states.get(&key).filter(|_| !known.is_empty());
+        let read = dav::read_collection(
+            &client,
+            book,
+            previous,
+            &before
+                .iter()
+                .map(|c| (c.href.clone(), c.etag.clone()))
+                .collect::<Vec<_>>(),
+            |c| c.list(&book.href, QUERY, "address-data"),
+            |c, hrefs| {
+                c.multiget(
+                    &book.href,
+                    "addressbook-multiget",
+                    dav::CARDDAV,
+                    "address-data",
+                    hrefs,
+                )
+            },
+        )?;
+        // Cards kept as they were, then those read anew.
+        cards.extend(
+            before
+                .into_iter()
+                .filter(|c| read.kept.contains(&c.href))
+                .cloned(),
+        );
+        for resource in read.fetched {
             for mut card in parse_vcards(&resource.data) {
                 card.href = resource.href.to_string();
                 card.etag = resource.etag.clone();
                 cards.push(card);
             }
         }
+        states.insert(key, read.state);
     }
-    let home = books
+    let book = books
         .iter()
         .find(|b| b.writable)
         .map(|b| b.href.to_string())
         .unwrap_or_default();
-    Ok((cards, home))
+    Ok(Fetched {
+        cards,
+        book,
+        states,
+    })
+}
+
+/// Makes an address book named `name` in the account's address book home.
+/// Returns its address.
+pub fn create_book(server: &Server, password: &str, tls: native_tls::TlsConnector, name: &str) -> Result<String> {
+    let client = dav::Client::new(&server.user, password, tls)?;
+    let home = client.home(&server.url, "carddav", "addressbook-home-set", dav::CARDDAV)?;
+    let href = dav::new_href(&home, &uuid::Uuid::new_v4().to_string(), "x")?;
+    let href = url::Url::parse(&format!("{}/", href.as_str().trim_end_matches(".x")))?;
+    client.make_collection(&href, false, name, "")?;
+    Ok(href.to_string())
 }
 
 /// Saves a card on the server: a new one in `book`, or a change to the
@@ -375,6 +718,77 @@ mod tests {
     }
 
     #[test]
+    fn addresses_birthdays_photos_and_groups() {
+        let text = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bo\r\nEMAIL:bo@example.se\r\nADR;TYPE=home:;;Storgatan 1;Stockholm;;111 22;Sweden\r\nBDAY:1990-01-31\r\nPHOTO;ENCODING=b;TYPE=PNG:aGVsbG8=\r\nUID:bo\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:3.0\r\nFN:Friends\r\nX-ADDRESSBOOKSERVER-KIND:group\r\nX-ADDRESSBOOKSERVER-MEMBER:urn:uuid:bo\r\nUID:g1\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:4.0\r\nFN:Cy\r\nBDAY:--0704\r\nKIND:individual\r\nEND:VCARD\r\n";
+        let cards = parse_vcards(text);
+        assert_eq!(cards.len(), 3);
+        let bo = &cards[0];
+        assert_eq!(bo.addresses, ["Storgatan 1, Stockholm, 111 22, Sweden"]);
+        assert_eq!(bo.birthday, "1990-01-31");
+        assert_eq!(bo.photo_bytes().as_deref(), Some(&b"hello"[..]));
+        assert!(cards[1].group && cards[1].members == ["bo"]);
+        assert_eq!(cards[2].birthday, "--07-04");
+        assert!(!cards[2].group);
+        // Unchanged, they're kept as they were; changed, written anew.
+        let same = write_vcard(bo);
+        assert!(same.contains("ADR;TYPE=home:;;Storgatan 1;Stockholm;;111 22;Sweden\r\n"));
+        assert!(same.contains("PHOTO;ENCODING=b;TYPE=PNG:aGVsbG8=\r\n"));
+        let mut moved = bo.clone();
+        moved.addresses = vec!["Kungsgatan 5, Göteborg".into()];
+        moved.birthday = "--01-31".into();
+        let written = write_vcard(&moved);
+        assert!(!written.contains("Storgatan"));
+        assert!(written.contains("ADR:;;Kungsgatan 5;Göteborg;;;\r\n"));
+        assert!(written.contains("BDAY:--0131\r\n") && !written.contains("1990"));
+        let back = parse_vcards(&written).remove(0);
+        assert_eq!(back.addresses, ["Kungsgatan 5, Göteborg"]);
+        assert_eq!(back.birthday, "--01-31");
+        let mut group = cards[1].clone();
+        group.members.push("cy".into());
+        let written = write_vcard(&group);
+        assert_eq!(written.matches("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:").count(), 2);
+        let new_group = Card {
+            uid: "g2".into(),
+            name: "Team".into(),
+            group: true,
+            members: vec!["a".into()],
+            ..Default::default()
+        };
+        assert!(write_vcard(&new_group).contains("X-ADDRESSBOOKSERVER-KIND:group"));
+    }
+
+    #[test]
+    fn edits_keep_labels_names_and_organizations() {
+        let original = "BEGIN:VCARD\r\nVERSION:3.0\r\nN:García López;María;José;Dr.;PhD\r\nFN:Dr. María José García López\r\nitem1.EMAIL;TYPE=INTERNET,pref:maria@example.es\r\nitem1.X-ABLabel:_$!<Work>!$_\r\nitem2.EMAIL;TYPE=INTERNET:old@example.es\r\nitem2.X-ABLabel:School\r\nTEL;TYPE=CELL:+34 600 000 000\r\nORG:Acme;Research\r\nUID:m\r\nEND:VCARD\r\n";
+        let mut card = parse_vcards(original).remove(0);
+        card.emails.retain(|e| e != "old@example.es");
+        card.emails.push("new@example.es".into());
+        card.note = "Met in Madrid".into();
+        let written = write_vcard(&card);
+        // What wasn't edited is as it was, labels and all.
+        assert!(written.contains("N:García López;María;José;Dr.;PhD\r\n"));
+        assert!(written.contains("item1.EMAIL;TYPE=INTERNET,pref:maria@example.es\r\n"));
+        assert!(written.contains("item1.X-ABLabel:_$!<Work>!$_\r\n"));
+        assert!(written.contains("TEL;TYPE=CELL:+34 600 000 000\r\n"));
+        assert!(written.contains("ORG:Acme;Research\r\n"));
+        // The removed address goes with its label; the new one is added.
+        assert!(!written.contains("old@example.es") && !written.contains("School"));
+        assert!(written.contains("EMAIL:new@example.es\r\n"));
+        assert!(written.contains("NOTE:Met in Madrid\r\n"));
+        assert_eq!(written.matches("UID:").count(), 1);
+        assert_eq!(written.matches("FN:").count(), 1);
+        let back = parse_vcards(&written).remove(0);
+        assert_eq!(back.emails, ["maria@example.es", "new@example.es"]);
+        assert_eq!(back.org, "Acme, Research");
+        // A changed name is written anew, once.
+        let mut renamed = back.clone();
+        renamed.name = "María García".into();
+        let written = write_vcard(&renamed);
+        assert!(written.contains("FN:María García\r\n") && written.contains("N:García;María;;;"));
+        assert_eq!(written.matches("\r\nN:").count(), 1);
+    }
+
+    #[test]
     fn cards_are_found_read_saved_and_removed() -> Result<()> {
         let (port, server) = dav::test_server(8, |method, path, _| {
             match (method, path) {
@@ -391,7 +805,7 @@ mod tests {
         let mut srv = Server {
             url: format!("http://127.0.0.1:{port}"),
             user: "ana".into(),
-            book: String::new(),
+            ..Default::default()
         };
         let (cards, book) = fetch(&srv, "secret", tls())?;
         assert_eq!(cards.len(), 1);
