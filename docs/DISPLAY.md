@@ -85,11 +85,31 @@ an older strip stays up until its replacement arrives, and strips far from the
 viewport are released. A spinner shows until the first layout and paint.
 Leaving a message, turning HTML off or blocking remote content ends the thread
 and cancels queued resource work. Clicks, hover (including author `:hover`
-styles and CSS cursors), drag selection/copy, Tab and Enter/Space are bridged
-to the document; a secondary click offers Copy, link and image actions, Copy
-Message Text and Show Raw. On a touch screen a long press selects the
-word under the finger (`select_word_at`), moving the finger before lifting
-it extends the selection, and lifting it opens that menu. Scripts, forms and embedded frames are disabled.
+styles and CSS cursors), drag selection/copy, double-click (word) and
+triple-click (block) selection, shift-click to extend, Ctrl/⌘A, Tab and
+Enter/Space are bridged to the document, with modifier keys; a secondary click
+offers Copy, link and image actions, Copy Message Text and Show Raw. On a
+touch screen a long press selects the word under the finger
+(`select_word_at`; words of Chinese, Japanese, Thai and similar scripts come
+from ICU's dictionaries), moving the finger before lifting it extends the
+selection, and lifting it opens that menu. A `#` link, and Tab reaching an
+element out of view, scroll the reader to it (`HtmlReveal`); a wheel over one
+of the email's own scrollable boxes scrolls that box while it can. Scripts,
+form controls and embedded frames are disabled (a form's other content shows).
+
+The document is laid out in CSS pixels at the reader's width, with the
+window's height and scale for `vh` units and media queries (resolution
+queries see the real scale). Content wider than the reader (a fixed 700-pixel
+table on a phone) is laid out at its width, up to three times the reader's,
+and shown scaled down to fit. The height counts absolutely positioned
+content. Fixed and sticky boxes are placed as absolute and relative ones, as
+the email is one long page. Animations and transitions are settled at their
+end rather than played. An email without a standards DOCTYPE gets browsers'
+quirk for lines holding only images (no gaps under sliced images in table
+cells), and legacy attributes (`align`, `background`, `bgcolor` names,
+`<font>`) apply through blitz-dom's patches. The email's `body` background
+fills the page and frames it. Remote resources are fetched six at a time, at
+most 400 and 64 MB per email.
 Development builds optimize the rendering crates (see `Cargo.toml`), since
 unoptimized they are roughly 50 times slower.
 

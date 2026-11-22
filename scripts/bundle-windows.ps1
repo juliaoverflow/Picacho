@@ -57,17 +57,30 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
 & dotnet tool restore
 if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore (WiX) failed" }
 
+# WiX runs from the package `dotnet tool restore` put in NuGet's cache,
+# not through `dotnet tool run`, whose own parsing took WiX's -d (as its
+# --diagnostics) or passed `--` on to WiX, which refuses it.
+$wixVersion = (Get-Content .config\dotnet-tools.json -Raw | ConvertFrom-Json).tools.wix.version
+$nuget = if ($env:NUGET_PACKAGES) { $env:NUGET_PACKAGES } else { Join-Path $env:USERPROFILE ".nuget\packages" }
+$wix = Get-ChildItem (Join-Path $nuget "wix\$wixVersion\tools") -Recurse -Filter wix.dll |
+    Select-Object -First 1
+if (-not $wix) { throw "WiX $wixVersion isn't in $nuget after dotnet tool restore" }
+
 New-Item -ItemType Directory -Force dist | Out-Null
 $msi = "dist\Picacho-$version-x64.msi"
 # MSVC links WebView2's loader statically: no DLL beside the app.
-# `--`: what follows is WiX's. Without it `dotnet tool run` takes the
-# first -d as its own --diagnostics, and WiX reads the next defines' values
-# as input files. -define, as -d is ambiguous.
-& dotnet tool run wix -- build -arch x64 `
-    -define "Version=$msiVersion" `
-    -define "ExeDir=$exeDir" `
-    -define "WebView2Loader=no" `
-    -out $msi packaging\windows\picacho.wxs
-if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+$wixArgs = @(
+    $wix.FullName, "build", "-arch", "x64",
+    "-define", "Version=$msiVersion",
+    "-define", "ExeDir=$exeDir",
+    "-define", "WebView2Loader=no",
+    "-out", $msi,
+    "packaging\windows\picacho.wxs"
+)
+Write-Host "dotnet $($wixArgs -join ' ')"
+# WiX 5 targets .NET 6; roll forward to whichever newer runtime is here.
+$env:DOTNET_ROLL_FORWARD = "Major"
+& dotnet @wixArgs
+if ($LASTEXITCODE -ne 0) { throw "wix build failed (exit $LASTEXITCODE): see WiX's errors above" }
 Sign $msi
 Write-Host "Built $msi"
