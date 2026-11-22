@@ -236,6 +236,12 @@ opt-level = 3
 [profile.dev.package.app_units]
 opt-level = 3
 
+# build.rs: Windows' icon and version resource (windres or RC.EXE). The
+# version GPUI uses for its manifest. Build dependencies follow the host,
+# so this is built for every target and used only for Windows.
+[build-dependencies]
+embed-resource = "3.0.12"
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Unlike gpui 0.2, the platforms leave text and Linux windowing to features:
 # without `font-kit` macOS draws no text, and without `wayland` or `x11`
@@ -307,6 +313,18 @@ webauthn-authenticator-rs = { version = "0.6.2", features = ["win10"] }
 # Windows has no system OpenSSL (S/MIME and Proton's push encryption use
 # it): build it into the app, as on Android.
 openssl = { version = "0.10", features = ["vendored"] }
+# display/windows.rs: the AppUserModelID, the delay-loaded DLLs' checks,
+# the animations setting and the data directory's access list. The
+# versions GPUI and keyring already use.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-registry = "0.6"
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The tray (menu bar) icon while Picacho runs in the background (display/tray.rs).

@@ -19,5 +19,8 @@ mod tray;
 /// Proton's human verification window (a process of its own).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod verify;
+/// What Windows needs of Picacho itself, and its delay-loaded DLLs.
+#[cfg(windows)]
+pub mod windows;
 
 mod html;

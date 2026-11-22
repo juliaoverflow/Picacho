@@ -13,6 +13,13 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Windows: an installer for the current user (`scripts\bundle-windows.ps1`,
+  unsigned for now), with Picacho's icon, version information and a Start
+  menu shortcut. No console window opens. Notifications are Picacho's and
+  open the message when clicked. The data folder is limited to your
+  account. Picacho starts without WebView2 or Windows Hello: it says when
+  Proton's check needs WebView2, and offers security keys and phone
+  passkeys itself where Windows Hello isn't available.
 - Events have a time zone: times are written in it, and Picacho says what
   time that is for you. Events elsewhere show both times.
 - Guests' answers and the times they propose come back to the organizer:

@@ -159,8 +159,17 @@ fn forward(path: &Path, message: &str) -> std::io::Result<()> {
     writeln!(stream, "{key} {message}")
 }
 
+/// Windows has no Unix sockets for every version Picacho runs on: a port on
+/// the loopback address, and a key only this user can read (the file is in
+/// the data directory, limited to this user first), so other accounts on
+/// the computer can't open Picacho's window.
 #[cfg(windows)]
 fn listen(path: PathBuf, lock: Option<std::fs::File>) -> std::io::Result<Listener> {
+    // Best effort, as in `Store::open`: FAT and some network drives keep no
+    // access lists, and Picacho still runs there.
+    if let Some(dir) = path.parent() {
+        let _ = super::windows::restrict_to_user(dir);
+    }
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let key = uuid::Uuid::new_v4().simple().to_string();

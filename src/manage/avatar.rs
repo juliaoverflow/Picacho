@@ -122,6 +122,8 @@ mod tests {
         assert!(backend.set_avatar("a", b"not an image", "custom").is_err());
         backend.remove_avatar("a")?;
         assert_eq!(backend.avatar("a"), None);
+        // Closes the database first: Windows can't delete an open file.
+        drop(backend);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }

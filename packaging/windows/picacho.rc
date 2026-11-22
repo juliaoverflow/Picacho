@@ -1,0 +1,36 @@
+// Picacho's Windows resources: the icon (ID 1, which GPUI loads for its
+// windows, and Explorer, the taskbar and the installer show) and version
+// information. GPUI embeds the application manifest itself. Compiled by
+// build.rs, which defines PICACHO_VERSION and PICACHO_VERSION_COMMAS.
+#include <winver.h>
+
+1 ICON "picacho.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION PICACHO_VERSION_COMMAS
+PRODUCTVERSION PICACHO_VERSION_COMMAS
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Pinal Tech"
+            VALUE "FileDescription", "Picacho"
+            VALUE "FileVersion", PICACHO_VERSION
+            VALUE "InternalName", "picacho"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "picacho.exe"
+            VALUE "ProductName", "Picacho"
+            VALUE "ProductVersion", PICACHO_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -9118,6 +9118,7 @@ dependencies = [
  "cursor-icon",
  "data-url",
  "directories",
+ "embed-resource",
  "flate2",
  "fontique",
  "futures",
@@ -9184,6 +9185,8 @@ dependencies = [
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "windows-registry 0.6.1",
+ "windows-sys 0.61.2",
  "wry",
  "zeroize",
 ]

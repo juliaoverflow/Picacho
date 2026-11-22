@@ -204,6 +204,10 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
         // The icon installed with the desktop entry; see `desktop`.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         note.icon(super::desktop::APP_ID);
+        // Shown as Picacho's (its name and icon), not PowerShell's, the
+        // default for apps without one; see `windows::set_app_identity`.
+        #[cfg(windows)]
+        note.app_id(super::windows::APP_ID);
         // Clicking the notification is its default action.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if !target.is_empty() {
@@ -226,7 +230,19 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
                 }
             });
         }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        // A click on the toast's body is its default response; the toast
+        // calls back while it is shown, and while this process runs.
+        #[cfg(windows)]
+        if let Ok(handle) = shown
+            && !target.is_empty()
+        {
+            let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
+                if matches!(response, notify_rust::NotificationResponse::Default) {
+                    clicked(&target);
+                }
+            });
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
         let _ = (shown, target);
     });
 }

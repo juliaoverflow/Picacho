@@ -50,7 +50,7 @@ impl Motion {
 }
 
 /// Runs a command, giving its output when it succeeds.
-#[cfg(not(any(target_os = "android", target_os = "ios", test)))]
+#[cfg(not(any(target_os = "android", target_os = "ios", windows, test)))]
 fn output(program: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(program)
         .args(args)
@@ -73,19 +73,12 @@ pub fn system_reduces_motion() -> bool {
         )
         .is_some_and(|v| v == "1")
     }
+    // "Show animations in Windows" (Settings → Accessibility → Visual
+    // effects), asked of the system: no `reg` process (and console) each
+    // time the window comes to the front.
     #[cfg(windows)]
     {
-        // "Show animations in Windows" (Settings → Accessibility → Visual effects).
-        output(
-            "reg",
-            &[
-                "query",
-                r"HKCU\Control Panel\Desktop\WindowMetrics",
-                "/v",
-                "MinAnimate",
-            ],
-        )
-        .is_some_and(|v| v.split_whitespace().last() == Some("0"))
+        crate::display::windows::animations_off()
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

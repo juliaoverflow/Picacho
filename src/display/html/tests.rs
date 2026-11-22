@@ -707,12 +707,18 @@ fn selection_follows_the_pointer_in_inline_blocks_and_centered_cells() {
 #[test]
 fn a_long_press_selects_the_word_and_dragging_extends_it_both_ways() {
     let mut email = EmailDocument::new(
-        "<body style='margin:0'><p id='p' style='margin:0; font: 20px/30px monospace'>alpha beta gamma</p></body>",
+        "<body style='margin:0'><p id='p' style='margin:0; font: 20px/30px monospace'>\
+         <span id='s' style='display:inline-block'>alpha beta gamma</span></p></body>",
         true,
     );
     email.layout(600);
     let (_, y, _, _) = element_box(&email, "p");
-    let char_width = 12.;
+    // The system's monospace font decides the advance (12px for 20px
+    // DejaVu Sans Mono or Menlo; others differ): measured, from the
+    // 16 characters' width.
+    let (_, _, text_width, _) = element_box(&email, "s");
+    let char_width = text_width / 16.;
+    assert!(char_width > 5., "the text is laid out: {text_width}");
     // Just inside the character's leading or trailing half.
     let at = |i: f32| i * char_width + char_width / 2.;
     let after = |i: f32| i * char_width + char_width * 0.8;

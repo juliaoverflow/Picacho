@@ -65,6 +65,18 @@ swift scripts/icon.swift /tmp/Picacho.iconset
 iconutil -c icns /tmp/Picacho.iconset -o assets/AppIcon.icns
 ```
 
+### Windows
+
+On Windows, with Rust's MSVC toolchain, Visual Studio's C++ build tools and a Windows SDK (GPUI's release builds compile their shaders with its `fxc.exe`), Perl for OpenSSL's build (Strawberry Perl, or Git for Windows'), and [WiX Toolset 3](https://wixtoolset.org/docs/wix3/):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bundle-windows.ps1
+```
+
+This builds `dist\Picacho-<version>-x64.msi`, which installs for the current user without administrator rights (in `%LOCALAPPDATA%\Programs\Picacho`, with a Start menu shortcut). It reads `.env` like `bundle.sh`. The MSI and `picacho.exe` aren't signed unless `PICACHO_SIGNTOOL_CERT` (a `.pfx`) and `PICACHO_SIGNTOOL_PASSWORD` are set, so SmartScreen warns about them until they are. Proton's human verification needs the Microsoft Edge WebView2 runtime, which Windows 11 includes; Windows Hello needs Windows 10 1903 or later. Picacho starts without either and says so when it needs one, and on older Windows versions it offers security keys and phone passkeys itself.
+
+From Linux, `sh scripts/bundle-windows.sh` cross-builds a debug `picacho.exe` (the `x86_64-pc-windows-gnu` target, with MinGW-w64 and lld) and, with msitools' `wixl`, an MSI for trying it under Wine. Debug builds compile GPUI's shaders when they start, from this computer's Cargo registry, so they run only where they were built. Release builds have to be made on Windows.
+
 Ad-hoc signing and `cargo run` builds can change their Keychain identity whenever
 the executable changes. macOS may ask for access again after recompilation,
 even if an earlier build was allowed. To keep a stable identity, use the same

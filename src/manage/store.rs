@@ -127,6 +127,13 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
         }
+        // The same on Windows: the folder's access list names only this
+        // user. Best effort, as some file systems (FAT, network shares)
+        // keep no access lists.
+        #[cfg(windows)]
+        if let Err(e) = crate::display::windows::restrict_to_user(path) {
+            eprintln!("Picacho: couldn't limit the data directory to this user: {e}");
+        }
         let file = path.join("mail.sqlite3");
         let mut db = connect(&file)?;
         // Free pages go back to the system on `incremental_vacuum` (see

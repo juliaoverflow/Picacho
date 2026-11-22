@@ -1,3 +1,7 @@
+// A Windows app rather than a console one: launching it opens no console
+// window. Debug builds keep the console for their output.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod display;
 mod manage;
 mod sync;
@@ -5,6 +9,9 @@ mod sync;
 fn main() -> anyhow::Result<()> {
     // Before any other thread starts.
     manage::memory::configure();
+    // Before any window, tray icon or notification.
+    #[cfg(windows)]
+    display::windows::set_app_identity();
     // Started by a Proton sign-in to show its human verification page.
     let mut args = std::env::args_os().skip(1);
     let first = args.next();

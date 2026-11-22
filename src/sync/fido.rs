@@ -48,11 +48,15 @@ pub enum Method {
     Windows,
 }
 impl Method {
-    /// The ways this platform offers, in order.
+    /// The ways this platform offers, in order. On Windows, Windows Hello
+    /// handles keys and phones itself (and asks Windows 10 1903 and later
+    /// to let it); without it (webauthn.dll), Picacho talks to them as on
+    /// other systems.
     pub fn offered() -> &'static [Self] {
         #[cfg(windows)]
-        return &[Self::Windows];
-        #[cfg(not(windows))]
+        if crate::display::windows::has_windows_hello() {
+            return &[Self::Windows];
+        }
         &[Self::SecurityKey, Self::Phone]
     }
     pub fn label(self) -> &'static str {
@@ -279,6 +283,13 @@ pub async fn assert(
             security_key(&answers, options, client_data_hash, cancel).await
         }
         Method::Phone => phone(&answers, options, client_data_hash, cancel).await,
+        // Offered only with webauthn.dll, which is delay-loaded: checked
+        // again, as calling it without one would end the process.
+        #[cfg(windows)]
+        Method::Windows if !crate::display::windows::has_windows_hello() => Err(anyhow!(
+            "Windows Hello isn't available on this version of Windows."
+        )
+        .into()),
         #[cfg(windows)]
         Method::Windows => windows(options),
     };

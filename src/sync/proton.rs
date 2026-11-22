@@ -356,6 +356,15 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<HumanVerification> {
     use std::io::Read;
+    // The window is WebView2's, whose loader is delay-loaded and whose
+    // runtime Windows 10 may lack: asked here, as the check's process would
+    // otherwise end without a word.
+    #[cfg(windows)]
+    if !crate::display::windows::has_webview2() {
+        bail!(
+            "Proton wants to check that it's you, which needs Microsoft Edge WebView2. Install it from go.microsoft.com/fwlink/p/?LinkId=2124703 and sign in again."
+        );
+    }
     let exe = std::env::current_exe().context("Couldn't find Picacho to show Proton's check")?;
     let mut child = std::process::Command::new(exe)
         .arg(VERIFY_FLAG)
