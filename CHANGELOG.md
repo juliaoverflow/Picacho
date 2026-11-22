@@ -13,6 +13,47 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Calendars and address books read only what changed since the last sync
+  (WebDAV sync-collection, RFC 6578; else the collection's ctag), rather
+  than everything each time. Calendars for tasks only are left out, and
+  calendars keep their colour.
+- CalDAV and CardDAV servers are found from a domain's `_caldavs._tcp` and
+  `_carddavs._tcp` records (RFC 6764), where the server is in the domain.
+- Calendars and contacts from Fastmail and other JMAP servers, signed in as
+  the mail account already is (Settings → Calendar / Contacts).
+- Tasks (open VTODOs) in Settings → Calendar, added and marked done there;
+  reminders on events, shown as notifications; and "When Are They Free?"
+  for an event's guests, where the calendar server schedules (RFC 6638).
+- New calendars and address books can be made on the server.
+- Contacts keep and edit postal addresses, birthdays and photos, and
+  groups with their members.
+- JMAP: messages handed to the server to send later are listed and can be
+  taken back (Settings → Calendar → Held to send later). Sent messages say
+  what became of each recipient's copy (Delivery). The server's own sending
+  addresses are shown and can be renamed, added or removed. Conversations
+  include messages in other mailboxes, and messages can be copied to
+  another account the same sign-in reaches. Attached messages can be
+  previewed without downloading them, and read receipts are sent by the
+  server where it can (RFC 9007).
+- JMAP mailboxes that changed are brought up to date from what changed in
+  their listing (Email/queryChanges), rather than listed again.
+- IMAP: drafts are replaced in one step (REPLACE), imported mail goes in
+  batches (MULTIAPPEND), sign-in takes one round trip (SASL-IR), a missing
+  Sent or Archive folder is made where the server can mark it
+  (CREATE-SPECIAL-USE), storage used is shown on servers without QUOTA
+  (STATUS=SIZE), and a snoozed message is woken by the server's own search
+  result (SEARCHRES).
+- Large messages on IMAP servers with BURL and URLAUTH are filed in Sent
+  first and sent from there, crossing the network once; a forward with the
+  original attached has the server put the original in itself (CATENATE).
+- SCRAM-SHA-256-PLUS and SCRAM-SHA-1-PLUS: sign-in is tied to the TLS
+  connection (tls-server-end-point), for IMAP, SMTP, POP3 and ManageSieve.
+- SMTP: BINARYMIME for messages with binary content, and HELO for servers
+  from before ESMTP.
+- Sending to more recipients than the server takes at once (RCPTMAX, or a
+  452 "too many recipients") sends to the rest in another round. Refusals
+  say what the server's code means ("That mailbox doesn't exist").
+  Delivery reports name each recipient as written (ORCPT).
 - Windows: an installer for the current user (`scripts\bundle-windows.ps1`,
   unsigned for now), with Picacho's icon, version information and a Start
   menu shortcut. No console window opens. Notifications are Picacho's and
@@ -163,6 +204,18 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Saving an event with guests to iCloud, Fastmail, Nextcloud or Google no
+  longer has the server email them a second invitation: Picacho sends
+  invitations itself, and now tells the server so (SCHEDULE-AGENT=CLIENT).
+- Editing a contact keeps its email and phone labels (work, home, Apple's
+  custom labels), full name parts (prefixes, middle names, suffixes) and
+  organization units, unless those were what changed.
+- Saving an invitation with a reminder to a calendar no longer writes it
+  without the reminder's start, which some servers refused.
+- Leaving an IMAP folder (to delete it) uses UNSELECT where offered, so
+  messages another app marked deleted aren't removed.
+- JMAP servers that are limiting requests (429, 503) pause background sync,
+  as IMAP servers that say so do.
 - HTML email: a newsletter inside a form shows instead of nothing; content
   that fades in at first shows; wide emails are scaled to fit rather than cut
   off; absolutely positioned content and fixed bars are shown once, in place;

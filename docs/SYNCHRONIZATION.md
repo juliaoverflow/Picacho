@@ -226,6 +226,12 @@ SMTP is Picacho's own client (`sync/smtp.rs`); lettre only builds the MIME messa
 - `REQUIRETLS`: added to `MAIL FROM` when the account requires encryption in transit. Without it, nothing is sent.
 - `AUTH`: the best mechanism Picacho speaks (`sync/sasl.rs`). For passwords: SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, LOGIN, then CRAM-MD5. For tokens: OAUTHBEARER, then XOAUTH2. The first message goes with the command (RFC 4954). SCRAM checks the server's signature, so a server that can't prove it knows the password fails the sign-in.
 
+- `ENHANCEDSTATUSCODES`: refusals say what the code means (5.1.1: the mailbox doesn't exist) before the server's text.
+- `LIMITS` (RFC 9422): at most `RCPTMAX` recipients per transaction. Recipients refused with 452 or 4.5.3 (too many) go in the next one, after `RSET`. Once a transaction has been accepted, a later refusal says the message reached only some recipients. `MAILMAX` caps the transactions.
+- With delivery receipts, each `RCPT TO` carries `ORCPT=rfc822;<address>` (ASCII addresses only).
+
+A server that refuses EHLO with 500 or 502 gets HELO and no extensions; over STARTTLS that means it is refused, since STARTTLS is an extension.
+
 The reply to the end of the message is waited for up to ten minutes (RFC 5321).
 
 IMAP asks for `CAPABILITY` before signing in, or reads it from the greeting. It does this directly on the stream, since the imap crate can't before login. SCRAM is used where offered, otherwise `LOGIN` unless `LOGINDISABLED` is listed, then `AUTHENTICATE` with PLAIN, LOGIN or CRAM-MD5. POP3 asks `CAPA` (servers without it get `USER`/`PASS`) and uses `AUTH` (RFC 5034) for SCRAM, or for another mechanism where `USER` isn't listed.
@@ -277,6 +283,8 @@ next try signs in again.
   Mail sent as an address with its own SMTP server gets a copy imported into
   Sent, as for IMAP. Copies that couldn't be filed are queued the same way.
 - Drafts sync with the Drafts mailbox, as Proton's do (`jmap:` remote ids).
+- Mailboxes: once read, `Mailbox/changes` and a `Mailbox/get` of the changed ones bring the list up to date. A server that can't say (or doesn't have the method) has them all read again.
+- Limits: a 429 or 503 pauses the account's background work, as IMAP's `[THROTTLED]` does.
 - Push: the event source (`types=Email,Mailbox`, a ping every 30 seconds)
   stands in for IDLE. When it reports a change, `Email/changes` says which
   mailboxes to check. Servers without an event source are asked for changes
@@ -316,6 +324,49 @@ next try signs in again.
 
 Fastmail is offered over JMAP. Fastmail accounts added over IMAP before
 this keep using IMAP.
+
+## Contacts and calendars (CardDAV, CalDAV)
+
+`sync/dav.rs` is the WebDAV client both use. Passwords go only over HTTPS and only to the host entered (same-host redirects).
+
+- Discovery: an address that is just a domain uses its `_caldavs._tcp` or `_carddavs._tcp` SRV record and TXT `path=` (RFC 6764), but only if the target is in the domain. DNS isn't authenticated, so this keeps the password with a host that has the domain's certificate. Otherwise discovery uses `/.well-known/caldav` or `/.well-known/carddav`, the principal, and its home set.
+- Each collection's `sync-token` and `getctag` are read with its name, privileges, `supported-calendar-component-set` and `calendar-color`. Calendars without VEVENT (task lists) are left out.
+- Sync: an unchanged token or ctag costs one PROPFIND. With a token, `sync-collection` lists changed and removed hrefs with ETags. Only resources whose ETag differs from the one kept are fetched, by `calendar-multiget` or `addressbook-multiget` (100 per request). A token the server no longer knows (403 `valid-sync-token`) reads the collection whole. Address books keep their states in the server's settings, and calendars keep theirs on each calendar.
+- Calendars read whole cover a month back to a year ahead plus 30 days. Change-only syncs continue until that end is reached, then the window is read whole again.
+- Writes use `If-Match`, and new resources use `If-None-Match: *`. 412 is "changed elsewhere", 429 and 503 are `Busy` with the Retry-After time, and 507 is out of storage.
+- Events saved to the server mark every ORGANIZER and ATTENDEE `SCHEDULE-AGENT=CLIENT` (RFC 6638). Picacho sends invitations, answers and cancellations by email (iMIP), so a scheduling server must not send its own. An agent already named is kept.
+- Cards: editing replaces only the lines whose value changed. The lines of unchanged addresses, numbers, names, organization and note keep their parameters and groups. An address removed takes its `itemN.X-AB*` label with it.
+
+## Newer extensions
+
+IMAP:
+
+- `SASL-IR` (RFC 4959): AUTHENTICATE carries the first message.
+- SCRAM's `-PLUS` forms (RFC 5802, 5929) are preferred where offered, with the tls-server-end-point binding (the certificate's hash). The same goes for SMTP, POP3 and ManageSieve. A server that doesn't offer `-PLUS` gets `n,,`, not `y,,`, since TLS-ending proxies would otherwise refuse the sign-in.
+- Commands with literals of any bytes go through `stream::Literals`. The command's line ends at its first `{n}`, and each later piece is sent when the server answers `+`. A refusal is left for the imap crate to read.
+- `REPLACE` (RFC 8508): a draft's new version replaces its copy (`UID REPLACE`). The `APPENDUID` gives the new UID, and the old copy is not expunged separately.
+- `MULTIAPPEND` (RFC 3502): imports go 50 messages or 4 MB per APPEND, and are listed at once from `APPENDUID`'s set. A refused batch is retried one message at a time.
+- `CREATE-SPECIAL-USE` (RFC 6154): a Sent, Archive, Trash, Junk or Drafts folder the server lacks is made with `CREATE … (USE (\Sent))` in the personal namespace (`Connection::standard_folder`).
+- `STATUS=SIZE` (RFC 8438): without QUOTA, Settings shows the space all mailboxes use, with no limit. This needs Picacho-Patches' imap-proto 0007. Without it, the size isn't asked (`reads_status_size`), since the unpatched parser can't read the reply and the session would fail.
+- `UNSELECT` (RFC 3691) leaves a mailbox without expunging it.
+- `SEARCHRES` (RFC 5182): waking a snoozed message searches with `RETURN (SAVE ALL)`, then STOREs and MOVEs `$`, exactly the messages found.
+- `CATENATE` (RFC 4469), `URLAUTH` (RFC 4467) and SMTP's `BURL` (RFC 4468): sending through an IMAP account's own outgoing server with attachments of 1 MB or more works as follows. When both servers can, the message is first filed in Sent (APPEND, or CATENATE with the original's IMAP URL where a forward attaches it whole). Then `GENURLAUTH` authorizes a `submit+` URL, and the outgoing server is given `BURL <url> LAST`. If the send fails, the filed copy is removed again. This also needs imap-proto 0007 (`reads_urlauth`).
+
+SMTP: `BINARYMIME` (RFC 3030) for messages with NULs, bare CR or LF, or lines over 998 octets (BDAT only). A server refusing EHLO with 500 or 502 gets HELO and no extensions.
+
+JMAP:
+
+- `Email/queryChanges`: each mailbox keeps its query's `queryState`. With it, a check reads the messages added to the listing and asks about those removed (moved: their row is updated; gone: removed). It then takes flags from `Email/changes`. A server that can't say (or with more than a page of changes) has the mailbox listed again.
+- `Thread/get` brings an open conversation's messages from other mailboxes. They are kept out of the list (`thread_extras`), and `Thread/changes` (with each mail check) marks changed conversations to be completed again.
+- Submissions: `EmailSubmission/get` gives `undoStatus` and each recipient's `deliveryStatus` (Delivery, in a sent message). `EmailSubmission/query` lists those still `pending` (held with HOLDUNTIL), and `EmailSubmission/set` with `undoStatus: canceled` takes one back, its message returned to Drafts as `$draft`. Submission ids are kept by Message-ID (the last 500). `EmailSubmission/changes` marks delivery lines to be read again.
+- `Identity/set` renames, adds and removes the server's sending addresses.
+- `Email/copy` copies between accounts the same sign-in reaches. Without it, `Blob/copy` and `Email/import` do the same.
+- `Email/parse` previews an attached message of one too large to download.
+- The Blob extension (RFC 9404): small uploads (Sieve scripts) go inline with `Blob/upload`, and the header block of a message too large to keep is read with `Blob/get`'s offset and length, for Check sender.
+- `MDN/send` (RFC 9007) sends read receipts where the account has it, marking `$mdnsent`.
+- JMAP for Calendars and Contacts (`sync/jscal.rs`): JSCalendar events and JSContact cards become the same events and cards CalDAV and CardDAV give. Events are created with `sendSchedulingMessages: false`, and participants are given `scheduleAgent: client`. A card edit patches only what changed, keeping each unchanged address's and number's entry (and labels). The calendar or contacts "server" is then the account (`jmap_account`), and hrefs are `jmap:<id>`.
+
+CalDAV and CardDAV also make calendars (MKCALENDAR) and address books (extended MKCOL) in the user's home set. They read open tasks with a VTODO query (`COMPLETED` not defined), keep VALARM reminders (shown as notifications once, up to a day late), and ask free/busy of the scheduling outbox (a VFREEBUSY POST, RFC 6638 §5). Cards keep ADR, BDAY, PHOTO and groups (vCard 4's KIND/MEMBER, written as Apple's X-ADDRESSBOOKSERVER-KIND/-MEMBER, which vCard 3 servers keep).
 
 ## Reference implementation review
 
