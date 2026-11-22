@@ -178,9 +178,8 @@ const PARCEL_NATIVE: Model = Model {
 };
 
 /// Echo Replies, the reply suggestion model (see `models/replies/train.py`):
-/// the same file on every platform, run by Picacho's own runtime. Until it
-/// is on Hugging Face, it is installed from the file `train.py` writes in
-/// `models/replies` (see `local_dir`).
+/// the same file on every platform, run by Picacho's own runtime, published
+/// as `pinaltech/echo-replies`.
 pub const REPLIES: Model = Model {
     id: "replies",
     label: "Reply suggestion model",
@@ -188,7 +187,7 @@ pub const REPLIES: Model = Model {
     repo: "echo-replies",
     kind: Kind::Tagger,
     file: "replies-v1.bin",
-    local: true,
+    local: false,
     installed: "replies-v1.bin",
     sha256: "2e70213172b99b6537baf5a4b1c4594a5db1c6a2642c3e215ab0ffc144b27d2b",
     size: 1_187_716,
@@ -471,6 +470,7 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
         &WHEN,
         &PARCEL_NATIVE,
         &PARCEL_COREML,
+        &REPLIES,
     ]
     .into_iter()
     .find(|m| m.file == file)
@@ -510,25 +510,6 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
     std::fs::write(&partial, &bytes).unwrap();
     std::fs::rename(&partial, &cached).unwrap();
     cached
-}
-
-/// The reply model `models/replies/train.py` wrote, while it isn't
-/// published: None (and tests needing it skip, saying why) unless it is
-/// there and is the one the app expects.
-#[cfg(test)]
-pub(crate) fn trained_replies() -> Option<PathBuf> {
-    let path = local_dir(&REPLIES).join(REPLIES.file);
-    match std::fs::read(&path) {
-        Ok(bytes) if hex(&Sha256::digest(&bytes)) == REPLIES.sha256 => Some(path),
-        _ => {
-            eprintln!(
-                "skipping: {} isn't the reply model the app expects (run models/replies/train.py \
-                 and update REPLIES' size and digest)",
-                path.display()
-            );
-            None
-        }
-    }
 }
 
 #[cfg(test)]

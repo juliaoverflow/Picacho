@@ -289,9 +289,8 @@ fn finding_tracking_numbers_installs_the_unpublished_model_from_its_training_dir
 
 #[gpui::test]
 fn suggested_replies_are_worded_in_the_message_language_and_learn(cx: &mut TestAppContext) {
-    if local_ai::trained_replies().is_none() {
-        return;
-    }
+    // The file the model is installed from must be the published one.
+    local_ai::test_model("replies-v1.bin");
     let store = store();
     let mut a = Account::new(Provider::Imap);
     a.name = "Work".into();

@@ -26,11 +26,12 @@ opens.
 | --- | --- | --- |
 | `replies-v1.bin` | every platform | Picacho's own (`NativeTagger` in `src/manage/local_ai/runtime.rs`) |
 
-Like the other models, it isn't kept in git. Until it is published on
-Hugging Face (as `pinaltech/echo-replies`), the app installs it from the file
-`train.py` writes here (`local: true` in `src/manage/local_ai/mod.rs`), so
-builds made elsewhere need to run `train.py` first; the tests that need the
-model skip, saying so, until it is there.
+Like the other models, it isn't kept in git: it is published on Hugging Face
+as [pinaltech/echo-replies](https://huggingface.co/pinaltech/echo-replies),
+and Picacho downloads it from there when the feature is turned on, checking
+its size and SHA-256 (`REPLIES` in `src/manage/local_ai/mod.rs`). A model
+trained again here with `train.py` needs a new file name, size and digest
+there, and publishing.
 
 ## Languages
 

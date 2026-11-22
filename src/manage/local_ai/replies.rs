@@ -539,10 +539,12 @@ impl Suggester {
 mod tests {
     use super::*;
 
-    /// The trained model, if it is there (see `trained_replies`).
-    pub(crate) fn trained() -> Option<Suggester> {
-        let path = super::super::trained_replies()?;
-        Some(Suggester::new(NativeTagger::load(&path).ok()?).expect("model and classes agree"))
+    /// The published model (the trained file when it is that one,
+    /// otherwise downloaded once; see `test_model`).
+    pub(crate) fn trained() -> Suggester {
+        let path = super::super::test_model(super::super::REPLIES.file);
+        Suggester::new(NativeTagger::load(&path).expect("the published model loads"))
+            .expect("model and classes agree")
     }
 
     #[test]
@@ -807,16 +809,14 @@ mod tests {
                 assert_eq!(i, j);
                 assert!((v - u).abs() < 1e-5, "{v} vs {u}");
             }
-            if let Some(model) = &model {
-                let p = model.probabilities(subject, body);
-                for t in case["top"].as_array().unwrap() {
-                    let k = CLASSES
-                        .iter()
-                        .position(|c| c == t[0].as_str().unwrap())
-                        .unwrap();
-                    let want = t[1].as_f64().unwrap() as f32;
-                    assert!((p[k] - want).abs() < 1e-4, "{}: {} vs {want}", t[0], p[k]);
-                }
+            let p = model.probabilities(subject, body);
+            for t in case["top"].as_array().unwrap() {
+                let k = CLASSES
+                    .iter()
+                    .position(|c| c == t[0].as_str().unwrap())
+                    .unwrap();
+                let want = t[1].as_f64().unwrap() as f32;
+                assert!((p[k] - want).abs() < 1e-4, "{}: {} vs {want}", t[0], p[k]);
             }
         }
     }
@@ -853,7 +853,6 @@ mod tests {
             if told != Some(lang) && std::env::var_os("PICACHO_SHOW_MISSES").is_some() {
                 eprintln!("{lang} told as {told:?}: {subject:?} {body:?}");
             }
-            let Some(model) = &model else { continue };
             let s = model.suggest(subject, body, &History::default(), "en", MAX_SUGGESTIONS);
             if case["none"].as_bool().unwrap() {
                 automated[1] += 1;
@@ -892,15 +891,13 @@ mod tests {
             );
         }
         assert!(share(told[0], told[1]) > 0.9, "languages told {told:?}");
-        if model.is_some() {
-            eprintln!(
-                "best reply fits {:.3}; automated mail left alone {:.3}; replied-to mail left without suggestions {quiet_wrongly}",
-                share(fits[0], fits[1]),
-                share(automated[0], automated[1])
-            );
-            assert!(share(fits[0], fits[1]) > 0.85);
-            assert!(share(automated[0], automated[1]) > 0.8);
-            assert!(quiet_wrongly * 50 < fits[1]);
-        }
+        eprintln!(
+            "best reply fits {:.3}; automated mail left alone {:.3}; replied-to mail left without suggestions {quiet_wrongly}",
+            share(fits[0], fits[1]),
+            share(automated[0], automated[1])
+        );
+        assert!(share(fits[0], fits[1]) > 0.85);
+        assert!(share(automated[0], automated[1]) > 0.8);
+        assert!(quiet_wrongly * 50 < fits[1]);
     }
 }
