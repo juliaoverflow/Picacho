@@ -6,8 +6,13 @@
 #   sh scripts/bundle-windows.sh
 #
 # Needs rustup's x86_64-pc-windows-gnu target, MinGW-w64 (its gcc and
-# windres), lld (build.rs links with it, to delay-load webauthn.dll and
-# WebView2Loader.dll) and, for the MSI, msitools' wixl.
+# windres) and lld (build.rs links with it, to delay-load webauthn.dll
+# and WebView2Loader.dll). The MSI, made with the WiX Toolset as on
+# Windows, needs Wine with the Windows .NET runtime: set PICACHO_WIX to a
+# command that runs WiX's wix.dll there, such as
+#   PICACHO_WIX="wine /path/to/dotnet.exe Z:/path/to/wix.dll"
+# (wix.dll from the `wix` 5.0.2 NuGet package's tools/net6.0/any). WiX's
+# native Linux build misreads paths.
 #
 # Debug builds only: GPUI compiles its shaders with the Windows SDK's
 # fxc.exe in release builds, which runs only on Windows, while debug builds
@@ -36,13 +41,15 @@ cp "$loader" "$out/WebView2Loader.dll"
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 mkdir -p dist
 msi="dist/Picacho-$version-x64-debug.msi"
-if ! command -v wixl >/dev/null 2>&1; then
-    echo "Built $out/picacho.exe (install msitools for the MSI)"
+if [ -z "${PICACHO_WIX:-}" ]; then
+    echo "Built $out/picacho.exe (set PICACHO_WIX for the MSI)"
     exit 0
 fi
-wixl --arch x64 \
-    -D Version="${version%%[-+]*}" \
-    -D ExeDir="$out" \
-    -D WebView2Loader=yes \
-    -o "$msi" packaging/windows/picacho.wxs
+# Wine's Z: drive is this computer's root; WiX takes Windows paths.
+win() { printf 'Z:%s' "$(realpath -m "$1")" | tr / '\\'; }
+$PICACHO_WIX build -arch x64 \
+    -d Version="${version%%[-+]*}" \
+    -d ExeDir="$(win "$out")" \
+    -d WebView2Loader=yes \
+    -o "$(win "$msi")" "$(win packaging/windows/picacho.wxs)"
 echo "Built $msi"

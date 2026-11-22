@@ -9,8 +9,10 @@
 #     (Release builds can't be made on Linux for that reason.)
 #   - Perl for OpenSSL's vendored build: Strawberry Perl, or Git for
 #     Windows' perl.exe on PATH.
-#   - WiX Toolset 3 (candle.exe and light.exe on PATH, or WIX set by its
-#     installer), for the MSI.
+#   - The .NET SDK (8 or later), for the WiX Toolset that builds the MSI:
+#     `dotnet tool restore` installs the version pinned in
+#     .config/dotnet-tools.json (5.0.2, under the MS-RL license; WiX 6 and
+#     later add the Open Source Maintenance Fee EULA). This script runs it.
 #
 # Optional built-in sign-in registrations are read from .env, as by
 # scripts/bundle.sh (see README, "Connect email"). The MSI isn't signed:
@@ -49,20 +51,17 @@ function Sign($path) {
 }
 Sign "$exeDir\picacho.exe"
 
-$wixBin = if ($env:WIX) { Join-Path $env:WIX "bin" } else { "" }
-$candle = if ($wixBin) { Join-Path $wixBin "candle.exe" } else { "candle.exe" }
-$light = if ($wixBin) { Join-Path $wixBin "light.exe" } else { "light.exe" }
+if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+    throw "The .NET SDK is needed for the WiX Toolset: winget install Microsoft.DotNet.SDK.8"
+}
+& dotnet tool restore
+if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore (WiX) failed" }
 
 New-Item -ItemType Directory -Force dist | Out-Null
-$obj = "target\$target\$Profile\picacho.wixobj"
 $msi = "dist\Picacho-$version-x64.msi"
 # MSVC links WebView2's loader statically: no DLL beside the app.
-& $candle -nologo -arch x64 "-dVersion=$msiVersion" "-dExeDir=$exeDir" `
-    "-dWebView2Loader=no" -out $obj packaging\windows\picacho.wxs
-if ($LASTEXITCODE -ne 0) { throw "candle failed" }
-# ICE validation needs Windows Installer's service; per-user installs trip
-# ICE38/ICE64/ICE91 by design.
-& $light -nologo -sice:ICE38 -sice:ICE64 -sice:ICE91 -out $msi $obj
-if ($LASTEXITCODE -ne 0) { throw "light failed" }
+& dotnet tool run wix build -arch x64 -d "Version=$msiVersion" -d "ExeDir=$exeDir" `
+    -d "WebView2Loader=no" -o $msi packaging\windows\picacho.wxs
+if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 Sign $msi
 Write-Host "Built $msi"
