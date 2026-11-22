@@ -1251,6 +1251,120 @@ fn imap_mail_moves_into_server_folders() -> Result<()> {
     Ok(())
 }
 
+/// The commands an undo server heard, for a fixture that lists INBOX,
+/// Archive (or Gmail's All Mail) and Trash, and finds `<moved@example.com>`
+/// at UID 31 in whichever mailbox is selected.
+fn undo_server(
+    listener: std::net::TcpListener,
+    acceptor: native_tls::TlsAcceptor,
+    gmail: bool,
+) -> std::thread::JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        let mut heard = Vec::new();
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+        loop {
+            let mut line = String::new();
+            if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            let upper = command.to_ascii_uppercase();
+            let mut out = String::new();
+            if upper.starts_with("LOGIN") {
+            } else if upper == "CAPABILITY" {
+                out.push_str(if gmail {
+                    "* CAPABILITY IMAP4rev1 MOVE X-GM-EXT-1\r\n"
+                } else {
+                    "* CAPABILITY IMAP4rev1 MOVE\r\n"
+                });
+            } else if upper.starts_with("LIST") {
+                out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                out.push_str(if gmail {
+                    "* LIST (\\All) \"/\" \"[Gmail]/All Mail\"\r\n"
+                } else {
+                    "* LIST (\\Archive) \"/\" \"Archive\"\r\n"
+                });
+                out.push_str("* LIST (\\Trash) \"/\" \"Trash\"\r\n");
+            } else if upper.starts_with("SELECT") {
+                heard.push(command.to_owned());
+                out.push_str("* 1 EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n");
+            } else if upper.starts_with("UID SEARCH") {
+                assert!(upper.contains("MOVED@EXAMPLE.COM"), "{command}");
+                out.push_str("* SEARCH 31\r\n");
+            } else if upper.starts_with("UID MOVE") || upper.starts_with("UID COPY") {
+                heard.push(command.to_owned());
+            } else if upper.starts_with("LOGOUT") {
+                r.get_mut()
+                    .write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes())
+                    .unwrap();
+                break;
+            } else {
+                panic!("Unexpected IMAP command: {line}");
+            }
+            out.push_str(&format!("{tag} OK done\r\n"));
+            r.get_mut().write_all(out.as_bytes()).unwrap();
+        }
+        heard
+    })
+}
+
+/// Undo after an archive finds the message in Archive by its Message-ID
+/// (its UID there is new) and moves it back to the inbox; at Gmail it is
+/// copied back (the Inbox label again), never moved out of All Mail.
+#[test]
+fn undoing_a_move_puts_mail_back_where_it_was() -> Result<()> {
+    for gmail in [false, true] {
+        let (cert, acceptor) = tls_fixture()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = undo_server(listener, acceptor, gmail);
+        let (b, mut a, path) = backend(&cert)?;
+        a.incoming_port = port;
+        let before = Mail {
+            id: format!("{}:INBOX:42:7", a.id),
+            account: a.id.clone(),
+            folder: Folder::Inbox,
+            remote_folder: "INBOX".into(),
+            uid: 7,
+            message_id: "<moved@example.com>".into(),
+            ..Mail::default()
+        };
+        // No Message-ID: nothing to find it by, so it is left alone.
+        let anonymous = Mail {
+            id: format!("{}:INBOX:42:8", a.id),
+            uid: 8,
+            message_id: String::new(),
+            ..before.clone()
+        };
+        let moved = [before, anonymous]
+            .map(|before| Moved { before, change: Change::Move(Folder::Archive) });
+        assert_eq!(b.undo_move(&a, &moved)?, 1);
+        b.disconnect(&a.id);
+        let heard = server.join().unwrap();
+        let archive = if gmail { "\"[Gmail]/All Mail\"" } else { "\"Archive\"" };
+        assert_eq!(
+            heard,
+            [
+                format!("SELECT {archive}"),
+                if gmail {
+                    "UID COPY 31 \"INBOX\"".to_string()
+                } else {
+                    "UID MOVE 31 \"INBOX\"".to_string()
+                },
+            ],
+            "gmail: {gmail}"
+        );
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 /// Labels and Gmail ids come from the server's listing, not the message's
 /// source: opening a downloaded message keeps them, in what is shown and in
 /// the cache.

@@ -104,6 +104,8 @@ impl MailApp {
             let count = mails.len();
             let account_id = a.id.clone();
             let when = when.clone();
+            let message_ids: Vec<String> =
+                mails.iter().map(|m| m.message_id.trim().to_owned()).collect();
             self.task(
                 cx,
                 move |b| {
@@ -115,13 +117,13 @@ impl MailApp {
                     match result {
                         Ok(list) => {
                             this.snoozed.insert(account_id.clone(), list);
-                            this.notice(
+                            this.notice_undo(
                                 if count == 1 {
                                     format!("Snoozed until {when}")
                                 } else {
                                     format!("Snoozed {count} messages until {when}")
                                 },
-                                false,
+                                Undo::Snooze(account_id.clone(), message_ids),
                                 cx,
                             );
                             if let Some(a) = this.accounts.iter().find(|a| a.id == account_id) {
@@ -180,7 +182,7 @@ impl MailApp {
         }
     }
     /// Wakes an account's due snoozes, and `now` (by Message-ID) at once.
-    fn wake_account(&mut self, a: Account, now: Vec<String>, cx: &mut Context<Self>) {
+    pub(super) fn wake_account(&mut self, a: Account, now: Vec<String>, cx: &mut Context<Self>) {
         if !self.waking.insert(a.id.clone()) {
             return;
         }

@@ -326,16 +326,82 @@ pub fn clipboard_to_system(cx: &mut gpui::App) {
     }
     *synced = Some(text.clone());
     drop(synced);
-    with_java("Clipboard.write", |env, java| {
-        let text = env.new_string(&text)?;
+    write_system_clipboard(&text);
+}
+
+/// Copies `text` to Android's clipboard now, for a Copy button: GPUI's
+/// clipboard is only the app's own, and otherwise reaches Android only as
+/// Picacho goes to the background. False when Android refused it (too
+/// large to hand between apps).
+pub fn copy_to_system(text: &str) -> bool {
+    let copied = write_system_clipboard(text);
+    if copied {
+        *CLIPBOARD_SYNCED.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_owned());
+    }
+    copied
+}
+
+fn write_system_clipboard(text: &str) -> bool {
+    call_java("Clipboard.write", |env, java| {
+        let text = env.new_string(text)?;
         env.call_static_method(
             &java.clipboard,
             jni_str!("write"),
-            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)V"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Z"),
             &[JValue::Object(java.context.as_obj()), JValue::Object(&text)],
-        )
-        .map(drop)
+        )?
+        .z()
+    }) == Some(true)
+}
+
+/// Asks where to save `bytes` as `name` with the system's document picker
+/// (`SaveFile`) and saves them there: GPUI has no save dialog on Android.
+/// `Ok(false)` when the person cancelled. Blocks until they answer: call it
+/// off the UI thread.
+pub fn save_as(bytes: &[u8], name: &str, mime: &str) -> anyhow::Result<bool> {
+    if JAVA.get().is_none() {
+        anyhow::bail!("Saving isn't available yet");
+    }
+    // Written whole to the cache first; Java copies it where it was asked.
+    let dir = std::env::temp_dir().join("picacho-save");
+    std::fs::create_dir_all(&dir)?;
+    let source = dir.join(format!("{:016x}", rand_suffix()));
+    std::fs::write(&source, bytes)?;
+    let source_path = source.to_string_lossy().into_owned();
+    let outcome = call_java("SaveFile.save", |env, java| {
+        let source = env.new_string(&source_path)?;
+        let name = env.new_string(name)?;
+        let mime = env.new_string(mime)?;
+        env.call_static_method(
+            &java.save_file,
+            jni_str!("save"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I"),
+            &[
+                JValue::Object(java.context.as_obj()),
+                JValue::Object(&source),
+                JValue::Object(&name),
+                JValue::Object(&mime),
+            ],
+        )?
+        .i()
     });
+    let _ = std::fs::remove_file(&source);
+    match outcome {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!("Couldn't save the file"),
+    }
+}
+
+fn rand_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
 }
 
 /// A step of Android's Back (`PicachoActivity`'s back callback).
@@ -603,6 +669,8 @@ struct Java {
     passkeys: Global<JClass<'static>>,
     /// Opens links in the browser (or mail app).
     browser: Global<JClass<'static>>,
+    /// "Save as", with the system's document picker.
+    save_file: Global<JClass<'static>>,
     /// The app's package name (`tech.pinal.picacho`, or the beta's).
     package: String,
 }
@@ -693,6 +761,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
         let keys = env.find_class(jni_str!("tech/pinal/picacho/SecurityKeys"))?;
         let passkeys = env.find_class(jni_str!("tech/pinal/picacho/Passkeys"))?;
         let browser = env.find_class(jni_str!("tech/pinal/picacho/Browser"))?;
+        let save_file = env.find_class(jni_str!("tech/pinal/picacho/SaveFile"))?;
         let package = env
             .call_method(
                 &context,
@@ -714,6 +783,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
             keys: env.new_global_ref(&keys)?,
             passkeys: env.new_global_ref(&passkeys)?,
             browser: env.new_global_ref(&browser)?,
+            save_file: env.new_global_ref(&save_file)?,
             package,
         };
         let _ = JAVA.set(java);

@@ -26,6 +26,9 @@ mod offline;
 #[path = "snooze.rs"]
 mod snooze;
 pub use snooze::Snoozed;
+#[path = "undo.rs"]
+mod undo;
+pub use undo::Moved;
 #[path = "remote_search.rs"]
 mod remote_search;
 pub use remote_search::ServerResults;

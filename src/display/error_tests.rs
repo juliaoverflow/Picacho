@@ -235,3 +235,69 @@ fn push_registration_failures_are_critical_but_dont_need_signing_in(cx: &mut Tes
         assert!(this.account_issues[&id].is_empty());
     });
 }
+
+/// The desktop's corner notice for a move has Undo, apart from its close
+/// button; Undo and Cmd/Ctrl+Z put the mail back.
+#[gpui::test]
+fn the_corner_notice_offers_undo(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    cx.update(|_, cx| {
+        let bindings = app_bindings(cx);
+        cx.bind_keys(bindings);
+    });
+    let (id, account) = view.update(cx, |this, _| {
+        let m = this.visible.first().map(|&i| this.messages[i].clone()).expect("mail");
+        // A local POP3 account: the move and its undo need no server.
+        let a = this.accounts.iter_mut().find(|a| a.id == m.account).unwrap();
+        a.provider = Provider::Pop3;
+        (m.id, a.id.clone())
+    });
+    let moved = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        act(view, Action::Apply(vec![id.clone()], Change::Move(Folder::Trash)), cx);
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert!(!this.messages.iter().any(|m| m.id == id), "moved out of the inbox");
+        });
+    };
+    let back = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        cx.run_until_parked();
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            let m = this.messages.iter().find(|m| m.id == id).expect("back in the list");
+            assert_eq!(m.folder, Folder::Inbox);
+            assert!(this.undo.is_none());
+            let cached = this.backend.store.message(&id).unwrap();
+            assert_eq!(cached.map(|m| m.folder), Some(Folder::Inbox), "{account}");
+        });
+    };
+    moved(&view, cx);
+    let undo = cx.debug_bounds("toast-undo").expect("the notice has Undo");
+    let dismiss = cx.debug_bounds("dismiss").expect("the notice has a close button");
+    assert!(dismiss.left() - undo.right() >= px(12.), "{undo:?} {dismiss:?}");
+    cx.simulate_click(undo.center(), Modifiers::none());
+    back(&view, cx);
+    // Cmd/Ctrl+Z, away from any text field.
+    moved(&view, cx);
+    view.update_in(cx, |this, w, cx| this.focus.focus(w, cx));
+    cx.simulate_keystrokes("secondary-z");
+    back(&view, cx);
+    // In a text field, Cmd/Ctrl+Z undoes the typing, not the move.
+    moved(&view, cx);
+    act(&view, Action::OpenSearch, cx);
+    frame(cx);
+    cx.simulate_input("abc");
+    frame(cx);
+    view.read_with(cx, |this, cx| assert_eq!(this.search.read(cx).value(), "abc", "typed"));
+    cx.simulate_keystrokes("secondary-z");
+    frame(cx);
+    view.read_with(cx, |this, cx| {
+        assert!(this.undo.is_some(), "the field took the undo");
+        assert!(!this.messages.iter().any(|m| m.id == id));
+        assert_ne!(this.search.read(cx).value(), "abc", "the field undid its typing");
+    });
+    // Notices with nothing to put back have no Undo.
+    view.update(cx, |this, cx| this.notice("Link copied", false, cx));
+    frame(cx);
+    assert!(cx.debug_bounds("toast-undo").is_none());
+    assert!(cx.debug_bounds("dismiss").is_some());
+}

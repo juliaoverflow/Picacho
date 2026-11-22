@@ -87,7 +87,7 @@ Leaving a message, turning HTML off or blocking remote content ends the thread
 and cancels queued resource work. Clicks, hover (including author `:hover`
 styles and CSS cursors), drag selection/copy, Tab and Enter/Space are bridged
 to the document; a secondary click offers Copy, link and image actions, Copy
-Message Text and Show Original. On a touch screen a long press selects the
+Message Text and Show Raw. On a touch screen a long press selects the
 word under the finger (`select_word_at`), moving the finger before lifting
 it extends the selection, and lifting it opens that menu. Scripts, forms and embedded frames are disabled.
 Development builds optimize the rendering crates (see `Cargo.toml`), since
@@ -113,7 +113,7 @@ them are kept slightly dimmed, and images are untouched.
 The "to …" line under the sender opens the message's details: addresses,
 mailed-by (the SPF envelope domain), signed-by (DKIM domains), transport
 security (TLS on the last hop, or end-to-end encryption) and SPF/DKIM/DMARC
-verdicts from the receiving server's Authentication-Results. Show Original
+verdicts from the receiving server's Authentication-Results. Show Raw
 opens the raw source with those facts, Copy and Download (.eml).
 
 ## Frame budget

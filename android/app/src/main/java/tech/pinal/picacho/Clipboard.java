@@ -56,10 +56,21 @@ final class Clipboard {
         }
     }
 
-    public static void write(Context context, String text) {
-        ClipboardManager manager = context.getSystemService(ClipboardManager.class);
-        if (manager != null) {
+    /**
+     * Puts {@code text} on the clipboard. False when Android refused it:
+     * text past about a megabyte (a whole message with its attachments)
+     * is more than it hands between apps.
+     */
+    public static boolean write(Context context, String text) {
+        try {
+            ClipboardManager manager = context.getSystemService(ClipboardManager.class);
+            if (manager == null) {
+                return false;
+            }
             manager.setPrimaryClip(ClipData.newPlainText("Picacho", text));
+            return true;
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 }

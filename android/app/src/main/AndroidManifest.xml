@@ -93,6 +93,14 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale" />
 
+        <!-- "Save as": the system's document picker, for Rust (SaveFile.java). -->
+        <activity
+            android:name=".SaveFile"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale" />
+
         <!-- Restarts the app's process when a new activity can't start in it
              (see PicachoActivity). -->
         <activity

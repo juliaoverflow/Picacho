@@ -99,7 +99,7 @@ use crate::manage::subscriptions::Subscription as MailSubscription;
 use crate::manage::status::{AccountIssue, DownloadStatus as Download, IssueSource, SignInStep};
 use crate::{
     manage::{
-        backend::{Backend, Change},
+        backend::{Backend, Change, Moved},
         forwarding::{self as fwd, ALL_MAIL, AliasDisplay, ForwardingAccount, ForwardingService},
         model::*,
         store::Store,
@@ -492,7 +492,7 @@ impl SourceView {
         match self {
             Self::Headers => "Headers",
             Self::Html => "HTML",
-            Self::Original => "Original",
+            Self::Original => "Raw",
         }
     }
 }
@@ -609,6 +609,14 @@ enum MoveTarget {
 pub(super) enum ParcelField {
     Name,
     Sender,
+}
+/// What a notice's Undo puts back.
+#[derive(Clone)]
+pub(super) enum Undo {
+    /// Messages an account's move took out of their mailboxes.
+    Moves(String, Vec<Moved>),
+    /// Messages just snoozed, by Message-ID: back to the inbox now.
+    Snooze(String, Vec<String>),
 }
 #[derive(Clone)]
 enum Action {
@@ -1037,6 +1045,8 @@ enum Action {
     PlaceSettings(SettingsPlace),
     ClosePresets,
     Dismiss,
+    /// Puts back what the notice says was just done (`MailApp::undo`).
+    Undo,
     /// Asks when to bring messages back: these, or the selection (empty).
     SnoozeMenu(Vec<String>),
     /// Brings a snoozed message back now: (account, Message-ID).
@@ -1167,6 +1177,8 @@ pub struct MailApp {
     cache_loading: bool,
     status: String,
     error: bool,
+    /// What the notice's Undo puts back (on phones, beside the notice).
+    undo: Option<Undo>,
     form: Vec<Entity<InputState>>,
     service: Service,
     provider: Provider,
@@ -2275,6 +2287,7 @@ impl MailApp {
             syncing: false,
             cache_loading: false,
             status: String::new(),
+            undo: None,
             error: false,
             form,
             service: Service::Other,
@@ -3820,16 +3833,33 @@ impl MailApp {
         entries
     }
     fn notice(&mut self, text: impl Into<String>, error: bool, cx: &mut Context<Self>) {
+        self.notice_with(text, error, None, cx);
+    }
+    /// A notice whose Undo puts back what was just done.
+    pub(super) fn notice_undo(&mut self, text: impl Into<String>, undo: Undo, cx: &mut Context<Self>) {
+        self.notice_with(text, false, Some(undo), cx);
+    }
+    fn notice_with(
+        &mut self,
+        text: impl Into<String>,
+        error: bool,
+        undo: Option<Undo>,
+        cx: &mut Context<Self>,
+    ) {
         self.status = text.into();
         self.error = error;
+        // A notice offering Undo stays long enough to reach for it.
+        let shown = if undo.is_some() { 8 } else { 4 };
+        self.undo = undo;
         self.notice_generation += 1;
         if !error {
             let generation = self.notice_generation;
             cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_secs(4)).await;
+                cx.background_executor().timer(Duration::from_secs(shown)).await;
                 let _ = this.update(cx, |this, cx| {
                     if this.notice_generation == generation && !this.connecting {
                         this.status.clear();
+                        this.undo = None;
                         cx.notify();
                     }
                 });
@@ -4664,6 +4694,7 @@ impl MailApp {
             let account_id = a.id.clone();
             let change = change.clone();
             let sending = change.clone();
+            let undoable = before.clone();
             self.task(
                 cx,
                 move |b| b.change_many(&a, &sent, sending),
@@ -4677,13 +4708,17 @@ impl MailApp {
                                 this.reload_cached(cx);
                             }
                             if let Some(to) = this.destination_label(&account_id, &change) {
-                                this.notice(
+                                let moved = undoable
+                                    .into_iter()
+                                    .map(|before| Moved { before, change: change.clone() })
+                                    .collect();
+                                this.notice_undo(
                                     if count == 1 {
                                         format!("Moved to {to}")
                                     } else {
                                         format!("Moved {count} messages to {to}")
                                     },
-                                    false,
+                                    Undo::Moves(account_id.clone(), moved),
                                     cx,
                                 );
                             }
@@ -4705,6 +4740,60 @@ impl MailApp {
                 },
             );
         }
+    }
+    /// The notice's Undo: puts back what it says was just done.
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        self.status.clear();
+        match undo {
+            Undo::Snooze(account, message_ids) => {
+                if let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() {
+                    self.wake_account(a, message_ids, cx);
+                }
+            }
+            Undo::Moves(account, moved) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
+                    return;
+                };
+                // Back in the list at once; the server catches up.
+                let mailbox = self.mailbox();
+                for m in &moved {
+                    if (self.folder == Folder::All || m.before.mailbox() == mailbox)
+                        && !self.messages.iter().any(|x| x.id == m.before.id)
+                    {
+                        self.messages.push(m.before.clone());
+                    }
+                }
+                self.messages.sort_by(Mail::newest_first);
+                self.filter(cx);
+                let count = moved.len();
+                let account_id = a.id.clone();
+                self.task(
+                    cx,
+                    move |b| b.undo_move(&a, &moved),
+                    move |this, result, cx| {
+                        this.account_result(&account_id, IssueSource::Change, &result);
+                        match result {
+                            Ok(_) => this.notice(
+                                if count == 1 {
+                                    "Moved back".to_string()
+                                } else {
+                                    format!("Moved {count} messages back")
+                                },
+                                false,
+                                cx,
+                            ),
+                            Err(e) => this.notice(format!("Couldn't undo: {e:#}"), true, cx),
+                        }
+                        this.reload_cached(cx);
+                        this.refresh_counts(cx);
+                    },
+                );
+            }
+        }
+        cx.notify();
     }
     /// Where a move puts an account's mail, as the sidebar names it.
     pub(super) fn destination_label(&self, account: &str, change: &Change) -> Option<String> {
@@ -5707,12 +5796,31 @@ impl MailApp {
             .take(60)
             .collect();
         let name = format!("{}.eml", stem.trim().trim_matches('_').if_empty("message"));
+        // GPUI has no save dialog on Android: the system's document picker.
+        #[cfg(target_os = "android")]
+        {
+            let raw = original.raw.clone();
+            let saved = cx.background_executor().spawn(async move {
+                crate::android::save_as(&raw, &name, "message/rfc822")
+            });
+            cx.spawn(async move |this, cx| {
+                let result = saved.await;
+                let _ = this.update(cx, |this, cx| match result {
+                    Ok(true) => this.notice("Raw message saved", false, cx),
+                    Ok(false) => {}
+                    Err(e) => this.notice(e.to_string(), true, cx),
+                });
+            })
+            .detach();
+            return;
+        }
+        #[allow(unreachable_code)]
         let picker = cx.prompt_for_new_path(&self.backend.store.path, Some(&name));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = picker.await {
                 let result = std::fs::write(&path, &original.raw);
                 let _ = this.update(cx, |this, cx| match result {
-                    Ok(()) => this.notice("Original message saved", false, cx),
+                    Ok(()) => this.notice("Raw message saved", false, cx),
                     Err(e) => this.notice(e.to_string(), true, cx),
                 });
             }
@@ -5774,7 +5882,7 @@ impl MailApp {
         if let Some(body) = self.selected_mail().and_then(|m| m.body) {
             entries.push(entry("Copy Message Text", "copy", Action::CopyText(body)));
         }
-        entries.push(entry("Show Original", "code", Action::ShowOriginal));
+        entries.push(entry("Show Raw", "code", Action::ShowOriginal));
         self.open_menu(menu.position, entries, cx);
     }
     fn save_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -6632,8 +6740,18 @@ impl MailApp {
                     let what = match view {
                         SourceView::Headers => "Headers",
                         SourceView::Html => "HTML",
-                        SourceView::Original => "Original message",
+                        SourceView::Original => "Raw message",
                     };
+                    // Android's clipboard, now: GPUI's is only the app's own.
+                    #[cfg(target_os = "android")]
+                    if !crate::android::copy_to_system(&text) {
+                        self.notice(
+                            format!("{what} is too large for Android's clipboard. Download it instead."),
+                            true,
+                            cx,
+                        );
+                        return;
+                    }
                     self.notice(format!("{what} copied"), false, cx);
                 }
             }
@@ -6911,7 +7029,11 @@ impl MailApp {
             }
             Action::PlaceSettings(place) => self.place_settings(place, w, cx),
             Action::ClosePresets => self.presets_for = None,
-            Action::Dismiss => self.status.clear(),
+            Action::Dismiss => {
+                self.status.clear();
+                self.undo = None;
+            }
+            Action::Undo => self.undo(cx),
             Action::SnoozeMenu(ids) => self.snooze_menu(ids, w, cx),
             Action::Unsnooze(account, message_id) => self.unsnooze(account, message_id, cx),
             Action::SearchServer => self.search_server(cx),
@@ -9959,7 +10081,7 @@ impl MailApp {
             Modal::Original => match self.source_view {
                 SourceView::Headers => "Message Headers",
                 SourceView::Html => "Message HTML",
-                SourceView::Original => "Original Message",
+                SourceView::Original => "Raw Message",
             },
             Modal::AvatarPresets(_) => "Choose a Picture",
             Modal::AliasGone(..) => "Alias No Longer Exists",
@@ -10414,6 +10536,14 @@ impl MailApp {
                     this.next(-1, cx)
                 }
             }))
+            // Undo (the Edit menu, Cmd/Ctrl+Z) outside a text field: puts
+            // back the last move or snooze while its notice offers that.
+            // A focused field handles it first, undoing its own typing.
+            .on_action(cx.listener(|this, _: &gpui_component::input::Undo, _, cx| {
+                if this.modal.is_none() && this.undo.is_some() {
+                    this.undo(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Archive, w, cx| {
                 if this.modal.is_none() {
                     this.handle(Action::Move(Folder::Archive), w, cx)
@@ -10649,7 +10779,20 @@ impl MailApp {
                         .shadow_lg()
                         .text_size(px(12.))
                         .text_color(rgb(if self.error { c.danger } else { c.text }))
-                        .child(self.status.clone())
+                        .child(div().flex_1().min_w_0().child(self.status.clone()))
+                        // Undo, then a gap and a rule before the close button.
+                        .when(self.undo.is_some() && !self.error, |d| {
+                            d.child(
+                                self.button("toast-undo", "Undo", "", Action::Undo, false, cx)
+                                    .h(px(28.))
+                                    .text_color(rgb(c.accent))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .tooltip(|w, cx| {
+                                        Tooltip::new(keys("Undo (⌘Z)")).build(w, cx)
+                                    }),
+                            )
+                            .child(div().w(px(1.)).h(px(20.)).flex_shrink_0().bg(rgb(c.border)))
+                        })
                         .child(self.button(
                             "dismiss",
                             "@Dismiss notification",
@@ -11196,6 +11339,7 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
             Some("Mail"),
         ),
         key(cx, "secondary-a", SelectAllMail, Some("Mail")),
+        key(cx, "secondary-z", gpui_component::input::Undo, Some("Mail")),
         key(cx, "secondary-1", GoInbox, Some("Mail")),
         key(cx, "secondary-2", GoStarred, Some("Mail")),
         key(cx, "secondary-3", GoSent, Some("Mail")),

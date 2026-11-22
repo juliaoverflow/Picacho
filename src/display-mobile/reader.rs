@@ -163,7 +163,7 @@ impl MailApp {
                             Action::Read(more_id.clone()),
                         ));
                         entries.push(entry("Message Details", "info", Action::ToggleDetails));
-                        entries.push(entry("View Original", "code", Action::ShowOriginal));
+                        entries.push(entry("View Raw", "code", Action::ShowOriginal));
                         this.open_menu_here(entries, w, cx)
                     },
                 ),

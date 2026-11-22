@@ -509,6 +509,59 @@ fn snoozing_fits_a_phone(cx: &mut TestAppContext) {
     assert!(confirm.right() <= px(PHONE.0) && confirm.size.height >= px(TOUCH - 0.5));
 }
 
+/// A notice for something that can be put back has Undo, well apart from
+/// the close button, and Undo puts it back.
+#[gpui::test]
+fn notices_offer_undo_away_from_dismiss(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let id = first_message(&view, cx);
+    let before = view.read_with(cx, |this, _| {
+        this.messages.iter().find(|m| m.id == id).unwrap().clone()
+    });
+    // A local POP3 account: the move and its undo need no server.
+    let account = view.update(cx, |this, _| {
+        let a = this.accounts.iter_mut().find(|a| a.id == before.account).unwrap();
+        a.provider = Provider::Pop3;
+        a.id.clone()
+    });
+    act(&view, Action::Apply(vec![id.clone()], Change::Move(Folder::Trash)), cx);
+    settle(cx);
+    view.read_with(cx, |this, _| {
+        assert!(!this.messages.iter().any(|m| m.id == id), "moved out of the inbox");
+        assert!(this.undo.is_some(), "the notice offers undo: {}", this.status);
+    });
+    // Read at once: `bounds` lets time pass, and the notice goes after a while.
+    let undo = cx.debug_bounds("toast-undo").expect("the notice has Undo");
+    let dismiss = cx.debug_bounds("toast-dismiss").expect("the notice has a close button");
+    for b in [undo, dismiss] {
+        assert!(b.size.height >= px(TOUCH - 0.5) && b.size.width >= px(TOUCH - 0.5), "{b:?}");
+    }
+    assert!(
+        dismiss.left() - undo.right() >= px(16.),
+        "Undo ends at {:?}, the close button starts at {:?}",
+        undo.right(),
+        dismiss.left()
+    );
+    // Notices without anything to put back have no Undo.
+    let pending = view.update(cx, |this, cx| {
+        let pending = this.undo.clone();
+        this.notice("Link copied", false, cx);
+        pending
+    });
+    assert!(!shown(cx, "toast-undo"));
+    // Undo brings it back to the inbox.
+    view.update(cx, |this, _| this.undo = pending);
+    act(&view, Action::Undo, cx);
+    settle(cx);
+    view.read_with(cx, |this, _| {
+        let back = this.messages.iter().find(|m| m.id == id).expect("back in the list");
+        assert_eq!(back.folder, Folder::Inbox);
+        assert!(this.undo.is_none());
+    });
+    let cached = view.read_with(cx, |this, _| this.backend.store.message(&id).unwrap());
+    assert_eq!(cached.map(|m| m.folder), Some(Folder::Inbox), "{account}");
+}
+
 /// A message with long headers and lines, opened with its original
 /// source loaded, as the development driver does.
 const LONG_EML: &str = "Return-Path: <bounce-1234567890abcdef@mail.newsletter-service.example.com>\r
@@ -565,7 +618,7 @@ fn the_original_message_fits_a_phone(cx: &mut TestAppContext) {
             "original-source",
             "source-tab-headers",
             "source-tab-html",
-            "source-tab-original",
+            "source-tab-raw",
             "copy-original",
             "save-original",
         ] {

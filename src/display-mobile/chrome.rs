@@ -485,6 +485,22 @@ impl MailApp {
                 .text_size(px(15.))
                 .text_color(rgb(if self.error { c.danger } else { c.text }))
                 .child(div().flex_1().min_w_0().py_2().child(self.status.clone()))
+                // Undo, then a clear gap and a rule before the close button,
+                // so a thumb reaching for one doesn't land on the other.
+                .when(self.undo.is_some() && !self.error, |d| {
+                    d.child(
+                        self.touch_text("toast-undo", "Undo", true, act(Action::Undo), cx)
+                            .px_3(),
+                    )
+                    .child(div().w(px(16.)).flex_shrink_0())
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h(px(24.))
+                            .flex_shrink_0()
+                            .bg(rgb(c.border)),
+                    )
+                })
                 .child(self.touch_icon(
                     "toast-dismiss",
                     "close",

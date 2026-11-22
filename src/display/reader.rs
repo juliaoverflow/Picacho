@@ -1232,7 +1232,7 @@ impl MailApp {
                     .child(
                         self.button(
                             "show-original",
-                            "Show original",
+                            "Show raw",
                             "code",
                             Action::ShowOriginal,
                             false,
@@ -1448,7 +1448,7 @@ impl MailApp {
             let label = match view {
                 SourceView::Headers => "View headers",
                 SourceView::Html => "View HTML",
-                SourceView::Original => "View original",
+                SourceView::Original => "View raw",
             };
             row = row.child(self.link(
                 &format!("view-source-{}", view.label().to_lowercase()),
@@ -1601,7 +1601,7 @@ impl MailApp {
                                     .child(
                                         self.button(
                                             "save-original",
-                                            "Download original",
+                                            "Download raw",
                                             "download",
                                             Action::SaveOriginal,
                                             false,
