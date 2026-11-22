@@ -391,7 +391,7 @@ impl Backend {
         let ids: Vec<String> = if s.ids.is_empty() {
             // Snoozed before ids were kept: found by Message-ID.
             self.store
-                .messages(&a.id, Mailbox::Remote(s.folder.clone()), usize::MAX >> 1)?
+                .summaries(&a.id, Mailbox::Remote(s.folder.clone()))?
                 .iter()
                 .filter(|m| m.message_id.trim() == s.message_id)
                 .filter_map(|m| super::proton::proton_id(a, m).map(str::to_owned))

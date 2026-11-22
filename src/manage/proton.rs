@@ -537,9 +537,11 @@ impl Backend {
                 .unwrap_or(i64::MIN);
             let listed_ids: std::collections::HashSet<&str> =
                 rows.iter().map(|m| m.id.as_str()).collect();
+            // Only their ids are needed: without bodies, every sync no
+            // longer reads (and parses) the whole cached mailbox's text.
             let unlisted: Vec<Mail> = self
                 .store
-                .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?
+                .summaries(&a.id, mailbox.clone())?
                 .into_iter()
                 .filter(|m| proton_id(a, m).is_some() && !listed_ids.contains(m.id.as_str()))
                 .filter(|m| complete || m.date >= oldest)
@@ -582,7 +584,7 @@ impl Backend {
             let folders = s.folders();
             let label = label_for(&folders, mailbox)?;
             let total = s.count(&label)?;
-            let cached = self.store.summaries(&a.id, mailbox.clone())?.len();
+            let cached = self.store.count_messages(&a.id, mailbox.clone())?;
             if cached >= total {
                 return Ok(Catalog {
                     cataloged: total,
@@ -813,7 +815,8 @@ impl Backend {
             }
             Ok(count)
         })?;
-        let cached = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
+        // Deleted by id: their bodies needn't be read.
+        let cached = self.store.summaries(&a.id, mailbox)?;
         self.store.commit_changes(&cached, true)?;
         Ok(count)
     }
@@ -854,25 +857,13 @@ impl Backend {
     pub(super) fn mark_all_read_proton(&self, a: &Account, mailbox: &Mailbox) -> Result<()> {
         self.with_proton(a, |s| {
             let label = label_for(&s.folders(), mailbox)?;
-            let unread: Vec<String> = s
-                .list_all(&label, usize::MAX >> 1)?
-                .into_iter()
-                .filter(|m| m.unread)
-                .map(|m| m.id)
-                .collect();
+            let unread = s.unread_ids(&label)?;
             if !unread.is_empty() {
                 s.mark_read(&unread, true)?;
             }
             Ok(())
         })?;
-        let mut cached = self
-            .store
-            .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?;
-        cached.retain(|m| m.unread);
-        for m in &mut cached {
-            m.unread = false;
-        }
-        self.store.save_messages(&cached)
+        self.store.mark_mailbox_read(&a.id, mailbox.clone())
     }
 
     /// Saves a copy of a message sent through another server in Sent at
@@ -1088,13 +1079,7 @@ impl Backend {
         })?;
         // Rows keep their ids; only the folder they show in is renamed.
         for (old, new) in &change.moved {
-            let mut rows =
-                self.store
-                    .messages(&a.id, Mailbox::Remote(old.clone()), usize::MAX >> 1)?;
-            for m in &mut rows {
-                m.remote_folder = new.clone();
-            }
-            self.store.save_messages(&rows)?;
+            self.store.rename_remote(&a.id, old, new)?;
         }
         Ok(change)
     }
@@ -1114,7 +1099,7 @@ impl Backend {
         // Proton moves what was in it to the inbox; the next check finds it there.
         let rows = self
             .store
-            .messages(&a.id, Mailbox::Remote(name.to_owned()), usize::MAX >> 1)?;
+            .summaries(&a.id, Mailbox::Remote(name.to_owned()))?;
         self.store.commit_changes(&rows, true)?;
         Ok(folders)
     }

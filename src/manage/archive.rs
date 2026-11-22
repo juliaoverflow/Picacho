@@ -95,7 +95,13 @@ pub fn read_mbox(input: impl Read, mut each: impl FnMut(Vec<u8>) -> Result<()>) 
     };
     loop {
         line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        // A line is read up to the import limit: a file without line breaks
+        // (not mail) isn't held in memory whole.
+        if (&mut reader)
+            .take(MAX_IMPORT as u64 + 1)
+            .read_until(b'\n', &mut line)?
+            == 0
+        {
             break;
         }
         let text = line
@@ -152,9 +158,9 @@ impl Backend {
         path: &Path,
         cancel: &AtomicBool,
     ) -> Result<Moved> {
-        let mut messages = self
-            .store
-            .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?;
+        // Without bodies: each message's source is read on its own below,
+        // so the whole mailbox's text is never held at once.
+        let mut messages = self.store.summaries(&a.id, mailbox.clone())?;
         messages.sort_by_key(|m| m.date);
         // Written whole, then named, so a half-written file never stands in for one.
         let partial = path.with_extension("mbox.partial");
@@ -215,15 +221,22 @@ impl Backend {
             }
             Ok(())
         };
+        let mut too_large = 0;
         for path in paths {
             if is_mbox(path)? {
                 read_mbox(std::fs::File::open(path)?, &mut add)?;
             } else {
+                // Not read at all when it is larger than an import may be.
+                if std::fs::metadata(path)?.len() > MAX_IMPORT as u64 {
+                    too_large += 1;
+                    continue;
+                }
                 let raw = std::fs::read(path)?;
                 // Mail travels with CRLF; files saved elsewhere may use LF.
                 add(crlf(&raw))?;
             }
         }
+        moved.skipped += too_large;
         Ok(moved)
     }
 

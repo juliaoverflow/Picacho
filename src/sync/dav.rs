@@ -90,6 +90,9 @@ impl Client {
                     }
                 }))
                 .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
+                // Hrefs and redirects from the server can name any address:
+                // the password is never sent over plain http.
+                .https_only(!cfg!(test))
                 .build()?,
             user: user.to_owned(),
             password: password.to_owned(),

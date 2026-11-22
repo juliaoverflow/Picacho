@@ -617,9 +617,11 @@ impl Backend {
                 .min()
                 .unwrap_or(i64::MIN);
             let listed_ids: HashSet<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+            // Only their ids are needed: without bodies, every sync no
+            // longer reads (and parses) the whole cached mailbox's text.
             let unlisted: Vec<Mail> = self
                 .store
-                .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?
+                .summaries(&a.id, mailbox.clone())?
                 .into_iter()
                 .filter(|m| jmap_id(a, m).is_some() && !listed_ids.contains(m.id.as_str()))
                 .filter(|m| complete || m.date >= oldest)
@@ -674,7 +676,7 @@ impl Backend {
                 a.sync.days,
                 chrono::Utc::now().timestamp(),
             )?;
-            let cached = self.store.summaries(&a.id, mailbox.clone())?.len();
+            let cached = self.store.count_messages(&a.id, mailbox.clone())?;
             let mut position = cached;
             let mut added = Vec::new();
             let mut total = None;
@@ -859,7 +861,8 @@ impl Backend {
             }
             Ok(count)
         })?;
-        let cached = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
+        // Deleted by id: their bodies needn't be read.
+        let cached = self.store.summaries(&a.id, mailbox)?;
         self.store.commit_changes(&cached, true)?;
         Ok(count)
     }
@@ -927,14 +930,7 @@ impl Backend {
             }
             Ok(())
         })?;
-        let mut cached = self
-            .store
-            .messages(&a.id, mailbox.clone(), usize::MAX >> 1)?;
-        cached.retain(|m| m.unread);
-        for m in &mut cached {
-            m.unread = false;
-        }
-        self.store.save_messages(&cached)
+        self.store.mark_mailbox_read(&a.id, mailbox.clone())
     }
 
     pub(super) fn quota_jmap(&self, a: &Account) -> Result<Option<Quota>> {
@@ -1187,13 +1183,7 @@ impl Backend {
         })?;
         // Rows keep their ids; only the folder they show in is renamed.
         for (old, new) in &change.moved {
-            let mut rows =
-                self.store
-                    .messages(&a.id, Mailbox::Remote(old.clone()), usize::MAX >> 1)?;
-            for m in &mut rows {
-                m.remote_folder = new.clone();
-            }
-            self.store.save_messages(&rows)?;
+            self.store.rename_remote(&a.id, old, new)?;
         }
         Ok(change)
     }

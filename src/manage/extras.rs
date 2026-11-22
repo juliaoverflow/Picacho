@@ -78,6 +78,13 @@ impl Backend {
     pub fn send_receipt(&self, a: &Account, m: &Mail) -> Result<()> {
         let to = m.receipt_to().trim().to_owned();
         ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
+        // The address is the sender's to write: checked for every provider,
+        // not only for SMTP's envelope (`deliver_raw`).
+        ensure!(
+            !to.contains(|c: char| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
+                && to.contains('@'),
+            "The read receipt's address “{to}” isn't valid."
+        );
         ensure!(m.account == a.id, "Message belongs to another account");
         let raw = crate::sync::smtp::receipt(a, m, &to);
         if a.provider == Provider::Proton {

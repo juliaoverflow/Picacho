@@ -109,7 +109,15 @@ quirk for lines holding only images (no gaps under sliced images in table
 cells), and legacy attributes (`align`, `background`, `bgcolor` names,
 `<font>`) apply through blitz-dom's patches. The email's `body` background
 fills the page and frames it. Remote resources are fetched six at a time, at
-most 400 and 64 MB per email.
+most 400 and 64 MB per email, never from this computer or its local network
+(addresses and names that lead there are refused). A proxy set for the system
+(`HTTPS_PROXY` and the like, or the macOS and Windows settings) is used, even
+one on the local network; a name it is asked for that leads only inside the
+network is refused before the proxy is asked. Images, inline ones too,
+are decoded only up to 40 million pixels each and 160 million per email, so a
+small, very compressible file can't stand for gigabytes of memory. While no
+resource is on its way, the document's thread sleeps until the view asks it
+for something.
 Development builds optimize the rendering crates (see `Cargo.toml`), since
 unoptimized they are roughly 50 times slower.
 

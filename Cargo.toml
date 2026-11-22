@@ -115,7 +115,12 @@ rand08 = { package = "rand", version = "0.8" }
 roxmltree = "0.21"
 # Finds candidate sign-in codes for the local model (Local AI).
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "native-tls", "system-proxy"] }
+# The proxy settings reqwest follows (`system-proxy`), read the same way, so
+# email images can tell a corporate proxy from a local address
+# (display/html/resources.rs).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+http = "1"
 # fallible_uint: sizes and counts bind as integers, failing rather than wrapping when too large.
 rusqlite = { version = "0.42", features = ["bundled", "fallible_uint", "functions"] }
 serde = { version = "1", features = ["derive"] }

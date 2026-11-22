@@ -27,6 +27,7 @@ impl MailApp {
         } else {
             ids
         };
+        let ids: HashSet<String> = ids.into_iter().collect();
         let snoozable: Vec<String> = self
             .messages
             .iter()
@@ -347,7 +348,7 @@ impl MailApp {
                     Ok(found) => {
                         search.total = found.total;
                         search.ids = found.mails.iter().map(|m| m.id.clone()).collect();
-                        let found = this.backend.with_readable(found.mails);
+                        let found = this.backend.with_readable_previews(found.mails);
                         for m in found {
                             if !this.messages.iter().any(|x| x.id == m.id) {
                                 this.messages.push(m);

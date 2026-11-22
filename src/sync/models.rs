@@ -11,6 +11,7 @@ use std::time::Duration;
 /// HTTPS only.
 pub fn download(url: &str, max: u64, received: &AtomicU64) -> Result<Vec<u8>> {
     let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(120))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(5))

@@ -631,7 +631,8 @@ impl MailApp {
     /// blurred swatch of the message's own colors.
     pub(super) fn ribbon(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors();
-        let mail = self.selected_mail();
+        // Not a copy: drawn every frame, and the open message has its body.
+        let mail = self.selected_ref();
         let action = |id: &'static str, tip: &str, icon: &str, action: Action| {
             let b = self.button(id, tip, icon, action, false, cx).size(px(36.));
             if mail.is_some() { b } else { b.opacity(0.35) }
@@ -649,7 +650,7 @@ impl MailApp {
             .pt_3()
             .child(self.reader_toggle(true, cx).size(px(36.)).rounded(px(10.)))
             .child(div().h(px(1.)).w(px(28.)).my_1().bg(rgb(c.border)));
-        if let Some(m) = &mail {
+        if let Some(m) = mail {
             column = column
                 .child(action(
                     "ribbon-reply",
@@ -701,7 +702,7 @@ impl MailApp {
                     Action::Move(Folder::Trash),
                 ));
         }
-        column.child(self.preview(mail.as_ref(), cx))
+        column.child(self.preview(mail, cx))
     }
     /// The open message in miniature, filling the collapsed reader below its
     /// actions: the HTML email itself scaled to the ribbon's width, or a

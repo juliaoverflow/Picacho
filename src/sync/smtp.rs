@@ -109,11 +109,14 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
         ));
     }
     if !d.reply_id.is_empty() {
-        builder = builder.in_reply_to(d.reply_id.clone());
+        // Both come from the message replied to, written by its sender:
+        // kept to one line so they can't add headers of their own.
+        let one_line = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+        builder = builder.in_reply_to(one_line(&d.reply_id));
         let references = if d.references.trim().is_empty() {
-            d.reply_id.clone()
+            one_line(&d.reply_id)
         } else {
-            d.references.clone()
+            one_line(&d.references)
         };
         builder = builder.references(references);
     }
@@ -496,19 +499,7 @@ impl<S: Read + Write + Patience> Session<S> {
             ))
             .into());
         }
-        let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 64 + 5);
-        let mut line_start = true;
-        for &b in bytes {
-            if line_start && b == b'.' {
-                out.push(b'.');
-            }
-            out.push(b);
-            line_start = b == b'\n';
-        }
-        if !out.ends_with(b"\r\n") {
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(b".\r\n");
+        let out = dot_stuffed(bytes);
         self.reader.get_mut().write_all(&out)?;
         self.flush()?;
         self.final_reply()
@@ -877,6 +868,39 @@ pub(crate) fn deliver_raw(
     let _ = session.command("QUIT");
     Ok(())
 }
+/// A message as DATA sends it (RFC 5321 §4.5.2): every line ended by CRLF,
+/// a dot doubled at the start of a line, and the ending `.` line. A bare CR
+/// or LF (from a forwarded original, or a file) becomes CRLF, so no
+/// sequence in the message can be taken by a server for the end of the data
+/// and the rest sent on as a message of its own (SMTP smuggling).
+fn dot_stuffed(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 64 + 5);
+    let mut line_start = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\r' || b == b'\n' {
+            // CRLF, a bare CR or a bare LF: one line ending.
+            if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                i += 1;
+            }
+            out.extend_from_slice(b"\r\n");
+            line_start = true;
+        } else {
+            if line_start && b == b'.' {
+                out.push(b'.');
+            }
+            out.push(b);
+            line_start = false;
+        }
+        i += 1;
+    }
+    if !line_start {
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b".\r\n");
+    out
+}
 /// A read receipt (MDN, RFC 8098) saying `m` was shown to `a`'s owner:
 /// a multipart/report with a human-readable part and the machine-readable
 /// disposition.
@@ -897,7 +921,17 @@ pub(crate) fn receipt(a: &Account, m: &crate::manage::model::Mail, to: &str) -> 
     let now = chrono::Local::now();
     let name = encoded(&a.name);
     let subject = encoded(&format!("Read: {}", m.subject));
-    let original = m.message_id.trim();
+    // The sender's Message-ID is theirs to write (and decoded, so CR/LF can
+    // hide in an encoded word): kept to one line so it can't add headers.
+    let original: String = m
+        .message_id
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let original = original.trim();
+    // The same for the address, which comes from the sender's
+    // Disposition-Notification-To.
+    let to: String = to.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>')).collect();
     let mut out = String::new();
     out.push_str(&format!("From: {name} <{}>\r\n", a.email));
     out.push_str(&format!("To: <{to}>\r\n"));
@@ -1031,6 +1065,42 @@ mod tests {
         assert!(html.contains("<em>there</em><br />"));
         assert!(html.contains("<li>one</li>"));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn data_ends_only_where_it_should() {
+        assert_eq!(dot_stuffed(b"a\r\n.b\r\n"), b"a\r\n..b\r\n.\r\n");
+        assert_eq!(dot_stuffed(b"a"), b"a\r\n.\r\n");
+        assert_eq!(dot_stuffed(b""), b".\r\n");
+        // Bare line endings, as smuggling uses them, become CRLF.
+        assert_eq!(dot_stuffed(b"a\n.\nb\r.\r\nc"), b"a\r\n..\r\nb\r\n..\r\nc\r\n.\r\n");
+    }
+
+    /// A sender's Message-ID or receipt address with CR/LF in it (an
+    /// encoded word decodes to anything) can't add headers to a receipt
+    /// or reply.
+    #[test]
+    fn sender_values_cannot_inject_headers() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let m = crate::manage::model::Mail {
+            message_id: "<x@y>\r\nBcc: victim@example.com".into(),
+            subject: "Hi".into(),
+            ..Default::default()
+        };
+        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com>\r\nX-Evil: 1"))?;
+        let headers = raw.split("\r\n\r\n").next().unwrap_or_default();
+        assert!(!headers.contains("\r\nBcc:"), "{headers}");
+        assert!(!headers.contains("\r\nX-Evil:"), "{headers}");
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Re: Hi".into(),
+            reply_id: "<x@y>\r\nBcc: victim@example.com".into(),
+            ..Draft::default()
+        };
+        let sent = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
+        assert!(!sent.contains("\r\nBcc:"), "{sent}");
+        Ok(())
     }
 
     /// Mail sent as an alias asks for read receipts at the alias and

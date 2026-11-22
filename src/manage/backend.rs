@@ -237,6 +237,9 @@ pub struct Backend {
     /// Decrypted Pinal messages by id. Memory only: the cache on disk keeps
     /// them encrypted, so reloads from it get their bodies back from here.
     readable: Mutex<HashMap<String, Mail>>,
+    /// The messages of `readable` that keep their decrypted text, the most
+    /// recently read last (see `READABLE_BODIES`).
+    readable_order: Mutex<std::collections::VecDeque<String>>,
     /// Your OpenPGP keyring (`openpgp.rs`), read from the keychain once.
     keyring: Mutex<Option<Arc<crate::manage::openpgp::Keyring>>>,
     /// What OpenPGP found in messages read with it, by id: decrypted, and
@@ -323,6 +326,7 @@ impl Backend {
             credentials: Mutex::new(HashMap::new()),
             mail_keys: Mutex::new(HashMap::new()),
             readable: Mutex::new(HashMap::new()),
+            readable_order: Mutex::default(),
             keyring: Mutex::new(None),
             verdicts: Mutex::new(HashMap::new()),
             certificates: Mutex::new(None),
@@ -386,7 +390,19 @@ impl Backend {
                 .add_root_certificate(native_tls::Certificate::from_pem(cert)?)
                 .build()?);
         }
-        Ok(native_tls::TlsConnector::new()?)
+        // Built once: each build loads the system's root certificates again
+        // (milliseconds of CPU, for every connection and retry). TLS 1.2 at
+        // least: native-tls would otherwise accept 1.0 and 1.1, which no
+        // mail server needs and RFC 8996 retired.
+        static CONNECTOR: std::sync::OnceLock<native_tls::TlsConnector> =
+            std::sync::OnceLock::new();
+        if let Some(connector) = CONNECTOR.get() {
+            return Ok(connector.clone());
+        }
+        let connector = native_tls::TlsConnector::builder()
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()?;
+        Ok(CONNECTOR.get_or_init(|| connector).clone())
     }
     /// The TLS settings network lookups outside an account use.
     pub fn tls_connector_pub(&self) -> Result<native_tls::TlsConnector> {
@@ -930,6 +946,21 @@ impl Backend {
         s.mail_key.clear();
         self.save_credentials(&a.id, &s)
     }
+    /// Puts what lists show of decrypted messages (previews, attachments)
+    /// back on messages reloaded from the disk cache, but not their text:
+    /// a list holds messages without bodies (see `with_readable` for the
+    /// one opened).
+    pub fn with_readable_previews(&self, mut messages: Vec<Mail>) -> Vec<Mail> {
+        let readable = self.readable.lock().unwrap();
+        for m in messages.iter_mut().filter(|m| m.body.is_none()) {
+            if let Some(r) = readable.get(&m.id) {
+                m.snippet = r.snippet.clone();
+                m.set_attachments(r.attachments().to_vec());
+                m.has_attachments = r.has_attachments;
+            }
+        }
+        messages
+    }
     /// Puts decrypted bodies back on messages reloaded from the disk cache.
     pub fn with_readable(&self, mut messages: Vec<Mail>) -> Vec<Mail> {
         let readable = self.readable.lock().unwrap();
@@ -1074,7 +1105,19 @@ impl Backend {
         let (readable, verdict, signer) = crate::manage::smime::open(raw, &certs)?;
         if let Some(signer) = &signer {
             let mut next = crate::manage::smime::Certificates::clone(&certs);
-            if crate::manage::smime::learn(&mut next, signer, &verdict.signature).unwrap_or(false) {
+            // The address the message says it is from: a certificate is
+            // kept only for it.
+            let from = mailparse::parse_headers(raw)
+                .ok()
+                .and_then(|(h, _)| {
+                    use mailparse::MailHeaderMap as _;
+                    h.get_first_value("From")
+                })
+                .map(|v| crate::sync::mime::receipt_address(&v))
+                .unwrap_or_default();
+            if crate::manage::smime::learn(&mut next, signer, &verdict.signature, &from)
+                .unwrap_or(false)
+            {
                 let _ = self.set_certificates(next);
             }
         }
@@ -1846,10 +1889,11 @@ impl Backend {
             let current: std::collections::HashSet<u32> = search(c, a, starred_only)?
                 .into_iter()
                 .collect();
+            let fetched: std::collections::HashSet<u32> = result.iter().map(|m| m.uid).collect();
             ensure!(
                 newest
                     .iter()
-                    .all(|uid| !current.contains(uid) || result.iter().any(|m| m.uid == *uid)),
+                    .all(|uid| !current.contains(uid) || fetched.contains(uid)),
                 "The server omitted requested headers; cached mail has been kept. Refresh to retry."
             );
             all_ids.retain(|id| {
@@ -2524,13 +2568,30 @@ impl Backend {
             kept.html = None;
             kept.snippet.clear();
             kept.set_attachments(Vec::new());
-            self.readable
-                .lock()
-                .unwrap()
-                .insert(next.id.clone(), next.clone());
+            self.keep_readable(next.clone());
             Ok((next, kept))
         } else {
             Ok((next.clone(), next))
+        }
+    }
+    /// Keeps a decrypted message in memory (the disk cache has it only
+    /// encrypted). Only the latest `READABLE_BODIES` keep their text, HTML
+    /// and inline images; the rest keep what lists show, and are decrypted
+    /// again from the cached source when opened. Reading through an
+    /// encrypted mailbox no longer keeps every message read in memory.
+    fn keep_readable(&self, mail: Mail) {
+        const READABLE_BODIES: usize = 32;
+        let mut readable = self.readable.lock().unwrap();
+        let mut order = self.readable_order.lock().unwrap();
+        order.retain(|id| id != &mail.id);
+        order.push_back(mail.id.clone());
+        readable.insert(mail.id.clone(), mail);
+        while order.len() > READABLE_BODIES {
+            if let Some(old) = order.pop_front().and_then(|id| readable.get_mut(&id)) {
+                old.body = None;
+                old.html = None;
+                old.inline = crate::manage::model::InlineParts::none();
+            }
         }
     }
     pub fn change(&self, a: &Account, m: &Mail, change: Change) -> Result<Mail> {
@@ -2783,7 +2844,8 @@ impl Backend {
             "Only Trash and Spam can be emptied."
         );
         if a.provider == Provider::Pop3 {
-            let mails = self.store.messages(&a.id, folder, usize::MAX >> 1)?;
+            // Deleted by id: their text needn't be read.
+            let mails = self.store.summaries(&a.id, folder)?;
             self.delete_forever(a, &mails)?;
             return Ok(mails.len());
         }
@@ -3173,12 +3235,7 @@ impl Backend {
                 Ok(())
             })?;
         }
-        let mut cached = self.store.messages(&a.id, mailbox, usize::MAX >> 1)?;
-        cached.retain(|m| m.unread);
-        for m in &mut cached {
-            m.unread = false;
-        }
-        self.store.save_messages(&cached)
+        self.store.mark_mailbox_read(&a.id, mailbox.clone())
     }
     /// Downloads the full content of up to `max` messages that are only known
     /// by their headers. Returns how many were stored.
@@ -4198,6 +4255,34 @@ fn sort_arrival(messages: &mut [Mail], prefix: &str) {
 mod layout_tests {
     use super::*;
     use std::prelude::v1::test;
+
+    /// Only the latest decrypted messages keep their text in memory; the
+    /// rest keep their previews, and lists get previews only.
+    #[test]
+    fn decrypted_messages_keep_few_bodies() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-readable-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(Store::open(&path)?));
+        for i in 0..40 {
+            b.keep_readable(Mail {
+                id: format!("m{i}"),
+                body: Some("Secret text".into()),
+                html: Some("<p>Secret text</p>".into()),
+                snippet: "Secret".into(),
+                ..Mail::default()
+            });
+        }
+        let bare = |id: &str| Mail { id: id.into(), ..Mail::default() };
+        let old = b.with_readable(vec![bare("m0")]).remove(0);
+        assert!(old.body.is_none() && old.html.is_none());
+        assert_eq!(old.snippet, "Secret");
+        let latest = b.with_readable(vec![bare("m39")]).remove(0);
+        assert_eq!(latest.body.as_deref(), Some("Secret text"));
+        let listed = b.with_readable_previews(vec![bare("m39")]).remove(0);
+        assert!(listed.body.is_none() && listed.html.is_none());
+        assert_eq!(listed.snippet, "Secret");
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
 
     /// A mailbox laid out again the same way, or checked with nothing new
     /// or gone, keeps its layout (by identity) and the list revision, so

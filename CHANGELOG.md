@@ -225,6 +225,55 @@ same version in `Cargo.toml`.
   press selects a word, moving the finger before lifting it selects more,
   and lifting it offers Copy, with the link or image pressed.
 
+### Security
+
+- A received message's Message-ID, read-receipt address or invitation
+  organizer can no longer add headers to the read receipts, replies and
+  calendar answers Picacho sends.
+- CardDAV and CalDAV never send your password over plain http, even when
+  the server points elsewhere.
+- An S/MIME certificate is kept only for the address its message is from,
+  and a self-signed one never replaces one already kept, so a stranger
+  can't have mail you encrypt go to their certificate.
+- Email images are never loaded from your computer or local network, and
+  an email's images can't run Picacho out of memory. A proxy set for the
+  system (also one on the local network) is used to load them.
+- Connections use TLS 1.2 or later.
+- Copied sign-in codes are marked sensitive on Android, so they don't show
+  in the clipboard preview.
+- Key lookups (WKD) only go to plain domain names, and read at most 1 MB.
+- Mail sent over SMTP has every line ending made CRLF before it is sent,
+  so nothing in a forwarded message can end the data early (SMTP
+  smuggling).
+- An email whose start looks almost like a DOCTYPE no longer fails to
+  render.
+- Importing a file larger than an import may be, or one without line
+  breaks, no longer reads it all into memory.
+- Release builds' signing key is only given to builds that publish, never
+  to a pull request's.
+
+### Performance
+
+- An open email's thread, and Proton and JMAP accounts' watches, sleep
+  instead of waking several times a second.
+- Syncing Proton and JMAP accounts, marking a mailbox read and emptying a
+  folder no longer read every cached message's text; All Mail and Starred
+  read only the messages they show.
+- Deleting or labelling thousands of chosen messages no longer stalls the
+  window.
+- Exporting a mailbox and renaming a Proton or JMAP folder no longer read
+  every message's text at once; listing more of a large IMAP mailbox looks
+  up only its own messages.
+- Less memory: the message list keeps only the open message's text, not
+  every message read since the mailbox was opened; only the latest 32
+  decrypted messages keep their text in memory; previews are at most 400
+  characters; a message's raw source isn't kept once another opens; and on
+  Linux memory an email or a long list used goes back to the system.
+- Counting subscriptions and code mail, and finding parcels and receipts,
+  no longer hold every message of an account at once.
+- Marking a Proton folder read keeps only the unread messages' ids, not
+  the whole folder's listing.
+
 ## [0.1.0] - 2026-11-16
 
 ### Added

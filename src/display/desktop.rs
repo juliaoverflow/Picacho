@@ -43,6 +43,11 @@ fn install() -> std::io::Result<()> {
     };
     let data = base.data_dir();
     let exe = std::env::current_exe()?;
+    // A line break in the path would end the Exec key and start keys of
+    // its own; such a path gets no entry.
+    if exe.to_string_lossy().contains(['\n', '\r']) {
+        return Ok(());
+    }
     let desktop = format!(
         "[Desktop Entry]\n\
          Type=Application\n\

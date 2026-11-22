@@ -64,6 +64,7 @@ impl Client {
             server: server_url(service, server)?,
             key: key.to_owned(),
             http: reqwest::blocking::Client::builder()
+                .min_tls_version(reqwest::tls::Version::TLS_1_2)
                 .timeout(Duration::from_secs(20))
                 .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))

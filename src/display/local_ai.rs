@@ -132,7 +132,13 @@ impl MailApp {
         let Some(code) = self.found_codes(&m).first().cloned() else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(otp::copyable(&code)));
+        let copied = otp::copyable(&code);
+        cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+        // Marked sensitive on Android's own clipboard (see the function).
+        #[cfg(target_os = "android")]
+        crate::android::copy_sensitive_to_system(&copied);
+        #[cfg(not(target_os = "android"))]
+        drop(copied);
         self.notice("Code copied", false, cx);
     }
     pub(super) fn show_codes(&mut self, id: String, show: bool, cx: &mut Context<Self>) {

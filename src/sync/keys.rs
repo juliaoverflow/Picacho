@@ -29,10 +29,12 @@ fn zbase32(bytes: &[u8]) -> String {
 /// The two WKD addresses for `email`: advanced (openpgpkey.<domain>) first.
 pub fn wkd_urls(email: &str) -> Option<[String; 2]> {
     let (local, domain) = email.trim().rsplit_once('@')?;
-    if local.is_empty() || domain.is_empty() || domain.contains(['/', '?', '#']) {
+    let domain = domain.to_ascii_lowercase();
+    // Only a plain DNS name: no ports, user info, IP addresses or path
+    // characters, so an address can't point the lookup anywhere else.
+    if local.is_empty() || !super::mta_sts::is_domain(&domain) {
         return None;
     }
-    let domain = domain.to_ascii_lowercase();
     let hash = zbase32(&Sha1::digest(local.to_lowercase().as_bytes()));
     let local: String = url::form_urlencoded::byte_serialize(local.as_bytes()).collect();
     Some([
@@ -49,6 +51,19 @@ fn http(tls: native_tls::TlsConnector) -> Result<reqwest::blocking::Client> {
         .https_only(true)
         .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
         .build()?)
+}
+
+/// The most a key lookup reads: keys are a few kilobytes, and a server
+/// could otherwise send without end.
+const MAX_KEY_BYTES: u64 = 1 << 20;
+
+/// A response's body, refused past `MAX_KEY_BYTES`.
+fn limited(response: reqwest::blocking::Response) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    response.take(MAX_KEY_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX_KEY_BYTES, "The key found is too large.");
+    Ok(bytes)
 }
 
 /// Where a key was found.
@@ -76,7 +91,7 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
             if let Ok(response) = client.get(&url).send()
                 && response.status().is_success()
             {
-                let bytes = response.bytes()?.to_vec();
+                let bytes = limited(response)?;
                 if !bytes.is_empty() {
                     return Ok(Some((bytes, Source::Wkd)));
                 }
@@ -92,7 +107,7 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
         .send()
         .context("keys.openpgp.org couldn't be reached.")?;
     match response.status().as_u16() {
-        200 => Ok(Some((response.bytes()?.to_vec(), Source::KeysOpenpgpOrg))),
+        200 => Ok(Some((limited(response)?, Source::KeysOpenpgpOrg))),
         404 => Ok(None),
         status => bail!("keys.openpgp.org answered {status}."),
     }

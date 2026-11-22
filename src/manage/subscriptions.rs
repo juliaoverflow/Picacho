@@ -67,21 +67,34 @@ pub fn key(account: &str, address: &str) -> String {
 /// Groups messages into subscriptions, most messages first. Copies of a
 /// message in several folders (or Gmail labels) count once.
 pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut by: HashMap<String, Subscription> = HashMap::new();
+    let mut grouping = Grouping::default();
     for m in mails {
-        let Some(sub) = Subscription::of(&m) else {
-            continue;
+        grouping.add(&m);
+    }
+    grouping.finish()
+}
+
+/// `group`, a message at a time: a mailbox's messages needn't all be held
+/// at once to count its subscriptions (see `Store::subscriptions`).
+#[derive(Default)]
+pub struct Grouping {
+    seen: HashSet<(String, String)>,
+    by: HashMap<String, Subscription>,
+}
+impl Grouping {
+    pub fn add(&mut self, m: &Mail) {
+        let Some(sub) = Subscription::of(m) else {
+            return;
         };
         let identity = if m.message_id.is_empty() {
             m.id.clone()
         } else {
             m.message_id.clone()
         };
-        if !seen.insert((m.account.clone(), identity)) {
-            continue;
+        if !self.seen.insert((m.account.clone(), identity)) {
+            return;
         }
-        match by.get_mut(&sub.key()) {
+        match self.by.get_mut(&sub.key()) {
             Some(existing) => {
                 existing.count += 1;
                 existing.unread += sub.unread;
@@ -93,18 +106,20 @@ pub fn group(mails: impl IntoIterator<Item = Mail>) -> Vec<Subscription> {
                 }
             }
             None => {
-                by.insert(sub.key(), sub);
+                self.by.insert(sub.key(), sub);
             }
         }
     }
-    let mut list: Vec<Subscription> = by.into_values().collect();
-    list.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
-            .then_with(|| b.latest.cmp(&a.latest))
-            .then_with(|| a.address.cmp(&b.address))
-    });
-    list
+    pub fn finish(self) -> Vec<Subscription> {
+        let mut list: Vec<Subscription> = self.by.into_values().collect();
+        list.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.latest.cmp(&a.latest))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        list
+    }
 }
 
 /// What makes copies of one message (in several folders, or Gmail labels)
@@ -317,6 +332,7 @@ pub fn unsubscribe(
                 bail!("The sender's request to unsubscribe couldn't be verified.");
             }
             let response = reqwest::blocking::Client::builder()
+                .min_tls_version(reqwest::tls::Version::TLS_1_2)
                 .timeout(std::time::Duration::from_secs(30))
                 .redirect(https_redirects())
                 .build()?

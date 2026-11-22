@@ -29,7 +29,38 @@ const FETCHERS: usize = 6;
 /// the person reading.
 const USER_AGENT: &str = concat!("Mozilla/5.0 (compatible; Picacho/", env!("CARGO_PKG_VERSION"), ")");
 const ACCEPT: &str = "image/webp,image/png,image/jpeg,image/gif,image/svg+xml,text/css,font/woff2,font/woff,*/*;q=0.5";
+/// The most pixels one image may have once decoded, and all of an email's
+/// together. Images are decoded whole (4 bytes a pixel) and kept while the
+/// email is open; a small, very compressible file (a PNG of one color) can
+/// stand for a gigabyte of them, so a sender, with inline images even while
+/// remote content is blocked, could otherwise run the app out of memory.
+const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+const MAX_TOTAL_PIXELS: u64 = 160_000_000;
 type Fetch = (Request, Box<dyn NetHandler>);
+
+/// Whether `bytes` may be handed over: anything not a raster image (CSS,
+/// fonts, SVG), or one within the limits above, its pixels then counted
+/// in `used`. Only the image's header is read.
+fn admit(bytes: &[u8], used: &AtomicU64) -> bool {
+    let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .filter(|r| r.format().is_some())
+        .and_then(|r| r.into_dimensions().ok())
+    else {
+        return true;
+    };
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_IMAGE_PIXELS {
+        return false;
+    }
+    let before = used.fetch_add(pixels, Ordering::AcqRel);
+    if before + pixels > MAX_TOTAL_PIXELS {
+        used.fetch_sub(pixels, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
 
 pub struct Resources {
     blocked: bool,
@@ -39,6 +70,10 @@ pub struct Resources {
     changed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     count: AtomicUsize,
+    /// Remote fetches asked for and not yet handed over. While none are,
+    /// nothing changes the document but its own thread, which can then
+    /// sleep until told to do something (see `worker::run`).
+    pending: Arc<AtomicUsize>,
     /// The fetcher threads' queue, started by the email's first remote
     /// request. Most emails make none (remote content is blocked by
     /// default), and starting them costs threads and an HTTP client (some
@@ -48,8 +83,12 @@ pub struct Resources {
     fetched: Arc<AtomicU64>,
     /// Hashes of the local (`data:`, `cid:`) addresses served, so that one
     /// asking for a relayout (see `local_served`) does so once: a broken one,
-    /// never cached, is asked for again by every layout.
-    served: Mutex<std::collections::HashSet<u64>>,
+    /// never cached, is asked for again by every layout. With whether it
+    /// was let through (see `admit`), so asking again neither counts its
+    /// pixels twice nor lets through one refused.
+    served: Mutex<std::collections::HashMap<u64, bool>>,
+    /// Decoded image pixels handed over so far (see `admit`).
+    pixels: Arc<AtomicU64>,
 }
 impl Resources {
     pub fn new(
@@ -57,6 +96,7 @@ impl Resources {
         inline: Arc<InlineParts>,
         changed: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
+        pending: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             blocked,
@@ -64,20 +104,31 @@ impl Resources {
             changed,
             cancelled,
             count: AtomicUsize::new(0),
+            pending,
             fetcher: OnceLock::new(),
             fetched: Arc::default(),
             served: Mutex::default(),
+            pixels: Arc::default(),
         }
     }
-    /// Notes that a local resource was handed over. Requested during layout
-    /// (a CSS background), it arrives as a message that only the next layout
-    /// takes in: ask for one, the first time.
-    fn local_served(&self, url: &str) {
+    /// A local resource's bytes as handed over: as they are, or none when
+    /// `admit` refuses them. Requested during layout (a CSS background), it
+    /// arrives as a message that only the next layout takes in: ask for
+    /// one, the first time.
+    fn local_served(&self, url: &str, bytes: &[u8]) -> Vec<u8> {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
         let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(url);
-        if self.served.lock().unwrap_or_else(|e| e.into_inner()).insert(hash) {
-            self.changed.store(true, Ordering::Release);
-        }
+        let mut served = self.served.lock().unwrap_or_else(|e| e.into_inner());
+        let admitted = match served.get(&hash) {
+            Some(&admitted) => admitted,
+            None => {
+                let admitted = admit(bytes, &self.pixels);
+                served.insert(hash, admitted);
+                self.changed.store(true, Ordering::Release);
+                admitted
+            }
+        };
+        if admitted { bytes.to_vec() } else { Vec::new() }
     }
     /// The fetchers' queue, started now if it isn't yet: `FETCHERS` threads
     /// per document sharing one HTTP client, bounded concurrency, no work on
@@ -86,29 +137,39 @@ impl Resources {
         self.fetcher.get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Fetch>();
             let rx = Arc::new(Mutex::new(rx));
-            let client = client();
+            let proxies = Arc::new(Proxies::system());
+            let client = client(&proxies);
             for _ in 0..FETCHERS {
-                let (rx, client) = (rx.clone(), client.clone());
-                let (stopped, changed, fetched) =
-                    (self.cancelled.clone(), self.changed.clone(), self.fetched.clone());
+                let (rx, client, proxies) = (rx.clone(), client.clone(), proxies.clone());
+                let shared = Shared {
+                    stopped: self.cancelled.clone(),
+                    changed: self.changed.clone(),
+                    fetched: self.fetched.clone(),
+                    pending: self.pending.clone(),
+                    pixels: self.pixels.clone(),
+                };
                 let _ = std::thread::Builder::new()
                     .name("picacho-fetch".into())
-                    .spawn(move || fetch_all(&rx, client.as_ref(), &stopped, &changed, &fetched));
+                    .spawn(move || fetch_all(&rx, client.as_ref(), &proxies, &shared));
             }
             tx
         })
     }
 }
-fn client() -> Option<reqwest::blocking::Client> {
+fn client(proxies: &Arc<Proxies>) -> Option<reqwest::blocking::Client> {
+    let redirects = proxies.clone();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static(ACCEPT));
     reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .referer(false)
         .user_agent(USER_AGENT)
         .default_headers(headers)
         .timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || !remote_url(attempt.url()) {
+        // Names that lead to this computer or its network aren't fetched.
+        .dns_resolver(Arc::new(PublicOnly(proxies.clone())))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 || !redirects.admits(attempt.url()) {
                 attempt.stop()
             } else {
                 attempt.follow()
@@ -117,14 +178,28 @@ fn client() -> Option<reqwest::blocking::Client> {
         .build()
         .ok()
 }
+/// What the fetcher threads share with their document.
+struct Shared {
+    stopped: Arc<AtomicBool>,
+    changed: Arc<AtomicBool>,
+    fetched: Arc<AtomicU64>,
+    pending: Arc<AtomicUsize>,
+    pixels: Arc<AtomicU64>,
+}
 /// Fetches what the document asks for until it is dropped or cancelled.
 fn fetch_all(
     rx: &Mutex<mpsc::Receiver<Fetch>>,
     client: Option<&reqwest::blocking::Client>,
-    stopped: &AtomicBool,
-    changed: &AtomicBool,
-    fetched: &AtomicU64,
+    proxies: &Proxies,
+    shared: &Shared,
 ) {
+    let Shared {
+        stopped,
+        changed,
+        fetched,
+        pending,
+        pixels,
+    } = shared;
     loop {
         // One waits on the queue at a time; the others are fetching.
         let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
@@ -134,7 +209,7 @@ fn fetch_all(
         if stopped.load(Ordering::Relaxed) {
             break;
         }
-        let result = client.and_then(|client| {
+        let result = client.filter(|_| proxies.admits(&request.url)).and_then(|client| {
             let left = MAX_TOTAL_BYTES.saturating_sub(fetched.load(Ordering::Relaxed));
             let limit = MAX_BYTES.min(left);
             let mut response = client
@@ -154,7 +229,7 @@ fn fetch_all(
                 .read_to_end(&mut bytes)
                 .ok()?;
             fetched.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            (bytes.len() as u64 <= limit).then_some((resolved, bytes))
+            (bytes.len() as u64 <= limit && admit(&bytes, pixels)).then_some((resolved, bytes))
         });
         if stopped.load(Ordering::Relaxed) {
             break;
@@ -162,12 +237,150 @@ fn fetch_all(
         let (url, bytes) = result.unwrap_or_else(|| (request.url.to_string(), Vec::new()));
         handler.bytes(url, Bytes::from(bytes));
         changed.store(true, Ordering::Release);
+        // After `changed`: a document thread that sees none pending also
+        // sees the change.
+        pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
 pub fn remote_url(url: &url::Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()
+}
+
+/// Whether an email may load `url`: a remote address that isn't an IP
+/// address of this computer or its local network. An email's images are
+/// requests the reader never chose; pointed at a router's or a local
+/// service's address, they could reach it (and change its settings by a
+/// GET) from inside the network. Names are checked as they are looked up
+/// (`PublicOnly`).
+fn fetchable(url: &url::Url) -> bool {
+    remote_url(url)
+        && match url.host() {
+            Some(url::Host::Ipv4(ip)) => allowed_ip(ip.into()),
+            Some(url::Host::Ipv6(ip)) => allowed_ip(ip.into()),
+            Some(url::Host::Domain(_)) => true,
+            None => false,
+        }
+}
+
+/// See `public_ip`; tests fetch from servers of their own on this computer.
+fn allowed_ip(ip: std::net::IpAddr) -> bool {
+    cfg!(test) || public_ip(ip)
+}
+
+/// Whether `ip` is on the internet: not this computer, a private or
+/// link-local network, carrier-grade NAT, or a reserved range.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                // 100.64.0.0/10, shared address space (carrier-grade NAT).
+                || (a == 100 && (64..128).contains(&b))
+                // 198.18.0.0/15, benchmarking; 240.0.0.0/4, reserved.
+                || (a == 198 && (18..20).contains(&b))
+                || a >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7, unique local; fe80::/10, link-local.
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// The proxies the fetches go through, as reqwest finds them (`HTTP_PROXY`
+/// and the like, or the system's settings on macOS and Windows).
+struct Proxies {
+    matcher: hyper_util::client::proxy::matcher::Matcher,
+    /// The proxies' own names: a corporate proxy is on the local network,
+    /// and is looked up there.
+    hosts: std::collections::HashSet<String>,
+}
+impl Proxies {
+    fn system() -> Self {
+        Self::with(hyper_util::client::proxy::matcher::Matcher::from_system())
+    }
+    fn with(matcher: hyper_util::client::proxy::matcher::Matcher) -> Self {
+        let hosts = ["http://example.com/", "https://example.com/"]
+            .into_iter()
+            .filter_map(|u| matcher.intercept(&http::Uri::from_static(u)))
+            .filter_map(|i| i.uri().host().map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase()))
+            .collect();
+        Self { matcher, hosts }
+    }
+    /// Whether `url` goes through a proxy rather than straight to its server.
+    fn routes(&self, url: &url::Url) -> bool {
+        url.as_str()
+            .parse::<http::Uri>()
+            .is_ok_and(|uri| self.matcher.intercept(&uri).is_some())
+    }
+    /// Whether an email may load `url` (see `fetchable`). Through a proxy,
+    /// which looks its name up itself, the name is also looked up here
+    /// first: one that leads only to this computer or its network is
+    /// refused, so the proxy isn't asked to reach inside. One that can't be
+    /// looked up here (only the proxy can) goes on.
+    fn admits(&self, url: &url::Url) -> bool {
+        if !fetchable(url) {
+            return false;
+        }
+        let Some(url::Host::Domain(name)) = url.host() else {
+            return true;
+        };
+        if !self.routes(url) {
+            // Straight there: `PublicOnly` checks the name as it connects.
+            return true;
+        }
+        use std::net::ToSocketAddrs as _;
+        match (name, 0).to_socket_addrs() {
+            Ok(found) => {
+                let found: Vec<_> = found.collect();
+                found.is_empty() || found.iter().any(|a| allowed_ip(a.ip()))
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+/// Looks names up as the system does, keeping only addresses on the
+/// internet (`allowed_ip`): a name of the sender's that leads to this
+/// computer or its network fails as if it didn't exist. The proxies' own
+/// names (`Proxies::hosts`) are looked up as they are.
+struct PublicOnly(Arc<Proxies>);
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let proxy = self.0.hosts.contains(&host.to_ascii_lowercase());
+        Box::pin(async move {
+            use std::net::ToSocketAddrs as _;
+            let found = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0).to_socket_addrs().map(Iterator::collect::<Vec<_>>)
+            })
+            .await??;
+            let public: Vec<std::net::SocketAddr> =
+                found.into_iter().filter(|a| proxy || allowed_ip(a.ip())).collect();
+            if public.is_empty() {
+                return Err("The address leads to a local network.".into());
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 impl NetProvider for Resources {
     fn fetch(&self, _: usize, request: Request, handler: Box<dyn NetHandler>) {
@@ -181,18 +394,21 @@ impl NetProvider for Resources {
                 .and_then(|data| data.decode_to_vec().ok())
                 .map(|(bytes, _)| bytes)
                 .unwrap_or_default();
-            self.local_served(&url);
+            let bytes = self.local_served(&url, &bytes);
             handler.bytes(url, Bytes::from(bytes));
         } else if request.url.scheme() == "cid" {
-            let bytes = self.inline.get(&url).map(|b| b.to_vec()).unwrap_or_default();
-            self.local_served(&url);
+            let part = self.inline.get(&url);
+            let bytes = self.local_served(&url, part.as_deref().map_or(&[][..], |b| &b[..]));
             handler.bytes(url, Bytes::from(bytes));
         } else if !self.blocked
-            && remote_url(&request.url)
+            && fetchable(&request.url)
             && request.method == blitz_traits::net::Method::GET
             && self.count.fetch_add(1, Ordering::Relaxed) < MAX_REQUESTS
         {
-            let _ = self.fetcher().send((request, handler));
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if self.fetcher().send((request, handler)).is_err() {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
         } else {
             // Complete refused resources, so Blitz never waits forever on a stylesheet.
             handler.bytes(url, Bytes::new());
@@ -234,9 +450,82 @@ mod tests {
 
     /// An email whose remote content is blocked never starts the fetcher
     /// (its thread and HTTP client); one that isn't, on its first request.
+    /// An image that decodes to too many pixels isn't handed over, nor are
+    /// more pixels than an email may have in all; anything else is.
+    #[test]
+    fn image_pixels_are_limited() {
+        let png = |w: u32, h: u32| {
+            let mut out = Vec::new();
+            image::RgbaImage::new(w, h)
+                .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        let used = AtomicU64::new(0);
+        assert!(admit(b"body { color: red }", &used));
+        assert!(admit(&png(600, 400), &used));
+        assert_eq!(used.load(Ordering::Relaxed), 240_000);
+        // 50 million pixels: 200 MB decoded, from a file of some kilobytes.
+        assert!(!admit(&png(10_000, 5_000), &used));
+        used.store(MAX_TOTAL_PIXELS - 100, Ordering::Relaxed);
+        assert!(!admit(&png(20, 20), &used));
+        assert_eq!(used.load(Ordering::Relaxed), MAX_TOTAL_PIXELS - 100);
+    }
+
+    /// Names are looked up through `PublicOnly`, from the client's runtime.
+    #[test]
+    fn names_resolve_through_the_filter() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            if let Ok((mut s, _)) = server.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        let proxies = Arc::new(Proxies::with(
+            hyper_util::client::proxy::matcher::Matcher::builder().build(),
+        ));
+        let response =
+            client(&proxies).unwrap().get(format!("http://localhost:{port}/")).send().unwrap();
+        assert_eq!(response.text().unwrap(), "ok");
+    }
+
+    /// A corporate proxy on the local network is used; names it is asked
+    /// for that lead inside the network are not.
+    #[test]
+    fn proxies_are_known_and_kept_from_the_inside() {
+        use hyper_util::client::proxy::matcher::Matcher;
+        let proxies = Proxies::with(
+            Matcher::builder().all("http://Proxy.Corp.Example:3128").no("direct.example").build(),
+        );
+        assert!(proxies.hosts.contains("proxy.corp.example"));
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        assert!(proxies.routes(&url("https://images.example/a.png")));
+        assert!(!proxies.routes(&url("https://direct.example/a.png")));
+        // `localhost` is this computer however it is reached.
+        assert!(!public_ip("127.0.0.1".parse().unwrap()));
+        assert!(Proxies::with(Matcher::builder().build()).hosts.is_empty());
+    }
+
+    #[test]
+    fn local_network_addresses_are_not_public() {
+        for ip in [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0",
+            "100.64.0.1", "255.255.255.255", "::1", "fd00::1", "fe80::1", "::ffff:192.168.1.1",
+        ] {
+            assert!(!public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["93.184.215.14", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(public_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
     #[test]
     fn the_fetcher_starts_only_for_remote_content() {
-        let make = |blocked| Resources::new(blocked, Default::default(), Arc::default(), Arc::default());
+        let make = |blocked| Resources::new(blocked, Default::default(), Arc::default(), Arc::default(), Arc::default());
         let get = |url: &str| Request::get(url::Url::parse(url).unwrap());
         let blocked = make(true);
         for url in ["https://example.com/a.png", "data:image/png;base64,AAAA", "cid:part@x"] {

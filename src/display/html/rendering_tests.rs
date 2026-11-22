@@ -360,6 +360,8 @@ fn the_body_background_fills_the_page() {
 #[test]
 fn doctypes_choose_the_mode_that_spaces_images() {
     assert_eq!(compat_mode("<html><body>"), Compat::Quirks);
+    // Not a DOCTYPE, with a character across its ninth byte.
+    assert_eq!(compat_mode("<!DOCTYé html>"), Compat::Quirks);
     assert_eq!(compat_mode("<!-- x --> <!DOCTYPE html>"), Compat::Standards);
     assert_eq!(
         compat_mode(
@@ -701,7 +703,7 @@ fn remote_resources_load_side_by_side_and_say_what_they_accept() {
         }
     });
     let resources =
-        super::resources::Resources::new(false, Default::default(), Arc::default(), Arc::default());
+        super::resources::Resources::new(false, Default::default(), Arc::default(), Arc::default(), Arc::default());
     struct Done(std::sync::mpsc::Sender<usize>);
     impl blitz_traits::net::NetHandler for Done {
         fn bytes(self: Box<Self>, _: String, bytes: blitz_traits::net::Bytes) {

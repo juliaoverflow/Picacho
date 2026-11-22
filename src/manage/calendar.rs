@@ -809,6 +809,13 @@ impl Backend {
     /// Sends a finished message from `from` to `to` through the account's
     /// own way of sending.
     pub(super) fn send_raw(&self, a: &Account, from: &str, to: &str, raw: &[u8]) -> Result<()> {
+        // `to` comes from an invitation (its organizer): checked for every
+        // provider, as `deliver_raw` checks SMTP's.
+        ensure!(
+            !to.contains(|c: char| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
+                && to.contains('@'),
+            "“{to}” isn't a valid address."
+        );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         match a.provider {
@@ -847,6 +854,12 @@ pub fn local_zone() -> Option<String> {
 }
 
 /// A header value, encoded when it isn't plain ASCII.
+/// `text` without control characters (CR, LF), so a value from someone
+/// else can't start a header of its own.
+fn one_line(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 fn header_text(text: &str) -> String {
     use base64::Engine as _;
     if text.is_ascii() && !text.contains(['\r', '\n']) {
@@ -919,7 +932,7 @@ fn imip(
     }
     let to_line = to
         .iter()
-        .map(|t| format!("<{t}>"))
+        .map(|t| format!("<{}>", one_line(t).replace(['<', '>'], "")))
         .collect::<Vec<_>>()
         .join(", ");
     out.push_str(&format!("To: {to_line}\r\n"));
@@ -929,7 +942,9 @@ fn imip(
         "Message-ID: <{}@{domain}>\r\n",
         uuid::Uuid::new_v4()
     ));
-    let original = in_reply_to.trim();
+    // The invitation's Message-ID is the sender's to write: one line.
+    let original = one_line(in_reply_to);
+    let original = original.trim();
     if !original.is_empty() {
         out.push_str(&format!(
             "In-Reply-To: {original}\r\nReferences: {original}\r\n"

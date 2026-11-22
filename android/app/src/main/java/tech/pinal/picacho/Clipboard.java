@@ -62,12 +62,33 @@ final class Clipboard {
      * is more than it hands between apps.
      */
     public static boolean write(Context context, String text) {
+        return put(context, text, false);
+    }
+
+    /**
+     * Puts a secret (a sign-in code) on the clipboard, marked sensitive so
+     * Android 13 and later don't show it in the copied-text preview, and
+     * keyboards with clipboard history are asked not to keep it.
+     */
+    public static boolean writeSensitive(Context context, String text) {
+        return put(context, text, true);
+    }
+
+    private static boolean put(Context context, String text, boolean sensitive) {
         try {
             ClipboardManager manager = context.getSystemService(ClipboardManager.class);
             if (manager == null) {
                 return false;
             }
-            manager.setPrimaryClip(ClipData.newPlainText("Picacho", text));
+            ClipData clip = ClipData.newPlainText("Picacho", text);
+            if (sensitive) {
+                android.os.PersistableBundle extras = new android.os.PersistableBundle();
+                // ClipDescription.EXTRA_IS_SENSITIVE (API 33), by its value,
+                // which earlier versions' keyboards also read.
+                extras.putBoolean("android.content.extra.IS_SENSITIVE", true);
+                clip.getDescription().setExtras(extras);
+            }
+            manager.setPrimaryClip(clip);
             return true;
         } catch (RuntimeException e) {
             return false;

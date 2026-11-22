@@ -504,14 +504,52 @@ fn verify(p7: &Pkcs7, content: Option<&[u8]>) -> Option<(Vec<u8>, Signature, Opt
 
 /// Keeps the signer's certificate from a signed message, so you can write
 /// back to them encrypted. Returns whether it was new.
-pub fn learn(certs: &mut Certificates, signer: &X509, verdict: &Signature) -> Result<bool> {
+///
+/// Only a certificate for the address the message is from (`from`) is
+/// kept: anyone can sign with a certificate naming someone else's address,
+/// and mail encrypted to that person would then be readable only by them.
+/// One no trusted authority vouches for is kept only while there is no
+/// certificate yet for its addresses, so a stranger's can never replace
+/// one already kept; one an authority vouches for replaces what was kept.
+pub fn learn(certs: &mut Certificates, signer: &X509, verdict: &Signature, from: &str) -> Result<bool> {
     if matches!(verdict, Signature::Bad | Signature::None) {
         return Ok(false);
     }
-    if emails(signer).is_empty() {
+    let addresses = emails(signer);
+    if addresses.is_empty() {
         bail!("The signer's certificate names no address.");
     }
-    certs.add_other(signer)
+    let from = from.trim().to_lowercase();
+    if from.is_empty() || !addresses.contains(&from) {
+        return Ok(false);
+    }
+    match verdict {
+        Signature::Good(_) => {
+            let fp = fingerprint(signer);
+            if certs.others().iter().any(|c| fingerprint(c) == fp) {
+                return Ok(false);
+            }
+            // Vouched for: it takes the place of any kept for its addresses.
+            certs.others.retain(|pem| {
+                X509::from_pem(pem.as_bytes())
+                    .map_or(true, |c| !emails(&c).iter().any(|e| addresses.contains(e)))
+            });
+            certs.others.push(String::from_utf8(signer.to_pem()?)?);
+            Ok(true)
+        }
+        _ => {
+            let known = certs
+                .identities()
+                .into_iter()
+                .map(|(c, _, _)| c)
+                .chain(certs.others())
+                .any(|c| emails(&c).iter().any(|e| addresses.contains(e)));
+            if known {
+                return Ok(false);
+            }
+            certs.add_other(signer)
+        }
+    }
 }
 
 /// A self-signed certificate and key for `email`, as a PKCS#12 file. For tests.
@@ -590,8 +628,19 @@ mod tests {
         );
         assert!(!verdict.decrypted);
         assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
-        assert!(learn(&mut bo, &signer.unwrap(), &verdict.signature).unwrap());
+        let signer = signer.unwrap();
+        // Not for an address the message isn't from.
+        assert!(!learn(&mut bo, &signer, &verdict.signature, "eve@example.net").unwrap());
+        assert!(learn(&mut bo, &signer, &verdict.signature, "ana@example.org").unwrap());
         assert!(bo.has_cert("ana@example.org"));
+        // A stranger's self-signed certificate for the same address doesn't
+        // take the place of the one kept.
+        let mut eve = Certificates::default();
+        eve.import_identity(&test_identity("ana@example.org", ""), "").unwrap();
+        let spoofed = protect_with(&eve, MESSAGE, "ana@example.org", &[], true, false).unwrap();
+        let (_, spoofed_verdict, spoofed_signer) = open(&spoofed, &bo).unwrap();
+        assert!(!learn(&mut bo, &spoofed_signer.unwrap(), &spoofed_verdict.signature, "ana@example.org").unwrap());
+        assert_eq!(bo.cert_for("ana@example.org").map(|c| fingerprint(&c)), Some(fingerprint(&signer)));
         let forged = text.replace("Meet at noon.", "Meet at nine.");
         assert_eq!(
             open(forged.as_bytes(), &bo).unwrap().1.signature,

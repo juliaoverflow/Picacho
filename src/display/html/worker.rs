@@ -245,6 +245,8 @@ pub fn spawn(
                     output: Output::Failed,
                 });
             }
+            // The document (its DOM, styles, decoded images) is gone now.
+            crate::manage::memory::release_unused_soon();
         });
     tx
 }
@@ -273,10 +275,20 @@ fn run(
     let mut hovered: Option<String> = None;
     let mut clicks: Option<Clicks> = None;
     loop {
-        let first = match rx.recv_timeout(Duration::from_millis(40)) {
-            Ok(command) => Some(command),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        // While resources are arriving, look every 40 ms for them; once
+        // none are, sleep until a command comes rather than waking 25 times
+        // a second for nothing (every open email and thumbnail has a thread).
+        let first = if doc.settled() {
+            match rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         };
         // Coalesce everything queued: a burst of pointer moves resolves once.
         let commands: Vec<Command> = first.into_iter().chain(rx.try_iter()).collect();

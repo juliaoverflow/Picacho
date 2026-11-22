@@ -137,6 +137,7 @@ fn jmap_srv(domain: &str) -> Option<Settings> {
 /// sends `fastmail.com` on to `api.fastmail.com`).
 fn jmap_well_known(domain: &str) -> Option<Settings> {
     let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -250,6 +251,7 @@ fn base_domains(host: &str) -> Vec<String> {
 
 fn fetch_config(url: &str, domain: &str) -> Option<Settings> {
     let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()
@@ -364,8 +366,14 @@ fn substitute(host: &str, domain: &str) -> String {
 /// Uses the system resolver through `dig`, which ships with macOS, so no
 /// third-party DNS service learns the address being configured.
 fn mx_host(domain: &str) -> Option<String> {
+    // A plain DNS name only (international ones in their ASCII form): one
+    // starting with `-` would be read as one of dig's options.
+    let domain = match url::Host::parse(domain).ok()? {
+        url::Host::Domain(d) if super::mta_sts::is_domain(&d) => d,
+        _ => return None,
+    };
     let output = std::process::Command::new("/usr/bin/dig")
-        .args(["+short", "+time=3", "+tries=1", "MX", domain])
+        .args(["+short", "+time=3", "+tries=1", "MX", &domain])
         .output()
         .ok()?;
     parse_mx(&String::from_utf8_lossy(&output.stdout))

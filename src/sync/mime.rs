@@ -293,8 +293,16 @@ pub(crate) fn snippet(body: &str) -> String {
         .chars()
         .filter(|c| !invisible(*c))
         .collect();
-    text.split_whitespace().take(45).collect::<Vec<_>>().join(" ")
+    let words = text.split_whitespace().take(45).collect::<Vec<_>>().join(" ");
+    // At most a few lines' worth: a "word" can be a whole encoded blob, and
+    // every listed message keeps its preview in memory.
+    match words.char_indices().nth(SNIPPET_CHARS) {
+        Some((end, _)) => words[..end].to_owned(),
+        None => words,
+    }
 }
+/// The longest preview kept, in characters.
+const SNIPPET_CHARS: usize = 400;
 
 /// Decodes HTML character references: numeric ones, and the named ones
 /// mail uses. Unknown names are left as written.

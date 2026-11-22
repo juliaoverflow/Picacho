@@ -1025,6 +1025,21 @@ impl Session {
         })
     }
     /// Every message of a mailbox, newest first, up to `most`.
+    /// The ids of a label's unread messages, a page at a time: only the
+    /// ids are kept, not every message's listing, which for a large folder
+    /// was tens of megabytes at once.
+    pub fn unread_ids(&self, label_id: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for page in 0.. {
+            let batch = self.list(label_id, page, PAGE)?;
+            let last = batch.len() < PAGE;
+            out.extend(batch.into_iter().filter(|m| m.unread).map(|m| m.id));
+            if last {
+                break;
+            }
+        }
+        Ok(out)
+    }
     pub fn list_all(&self, label_id: &str, most: usize) -> Result<Vec<MessageMetadata>> {
         let mut out = Vec::new();
         for page in 0.. {

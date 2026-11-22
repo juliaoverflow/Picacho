@@ -1416,7 +1416,6 @@ impl Session {
         stop: &std::sync::atomic::AtomicBool,
         heard: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        use std::sync::atomic::Ordering;
         ensure!(self.pushes(), "This JMAP server doesn't push changes.");
         if self.event_source_url.is_empty() {
             return self.listen_websocket(stop, heard);
@@ -1443,36 +1442,57 @@ impl Session {
             status.is_success(),
             "The JMAP event stream answered {status}."
         );
-        let mut event = String::new();
-        let mut data = String::new();
-        for line in BufReader::new(response).lines() {
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            let Ok(line) = line else {
-                // The stream ended (a timeout, or the server closed it).
-                return Ok(());
-            };
-            if line.is_empty() {
-                if (event.is_empty() || event == "state")
-                    && state_change_for(&data, &self.account_id)
-                {
-                    heard()?;
-                }
-                event.clear();
-                data.clear();
-            } else if let Some(v) = line.strip_prefix("event:") {
-                event = v.trim().to_owned();
-            } else if let Some(v) = line.strip_prefix("data:") {
-                // A field's lines are one value, joined by line feeds.
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                // One space after the colon is the field's, not the value's.
-                data.push_str(v.strip_prefix(' ').unwrap_or(v));
-            }
+        read_events(BufReader::new(response), stop, &self.account_id, heard)
+    }
+}
+
+/// Reads an event stream (`text/event-stream`) until `stop` or its end,
+/// calling `heard` for each state change of `account`.
+fn read_events(
+    mut reader: impl BufRead,
+    stop: &std::sync::atomic::AtomicBool,
+    account: &str,
+    heard: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    use std::io::Read as _;
+    use std::sync::atomic::Ordering;
+    let mut event = String::new();
+    let mut data = String::new();
+    // A state change is a few hundred bytes: a stream that sends more
+    // than this without ending an event (or a line) is cut off rather
+    // than held in memory as it grows.
+    const MOST: u64 = 1 << 20;
+    let mut line = String::new();
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
         }
-        Ok(())
+        line.clear();
+        match (&mut reader).take(MOST).read_line(&mut line) {
+            // The stream ended (a timeout, or the server closed it).
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(_) => {}
+        }
+        if !line.ends_with('\n') || data.len() as u64 > MOST {
+            bail!("The JMAP event stream sent more than an event can be.");
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            if (event.is_empty() || event == "state") && state_change_for(&data, account) {
+                heard()?;
+            }
+            event.clear();
+            data.clear();
+        } else if let Some(v) = line.strip_prefix("event:") {
+            event = v.trim().to_owned();
+        } else if let Some(v) = line.strip_prefix("data:") {
+            // A field's lines are one value, joined by line feeds.
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            // One space after the colon is the field's, not the value's.
+            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
     }
 }
 
@@ -1766,6 +1786,26 @@ impl std::error::Error for MethodError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Events are read as they come; a stream that never ends one is cut
+    /// off instead of growing in memory.
+    #[test]
+    fn event_streams_are_read_and_bounded() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let change = r#"{"@type":"StateChange","changed":{"A1":{"Email":"s2"}}}"#;
+        let stream = format!(": ping\r\n\r\nevent: state\r\ndata: {change}\r\n\r\ndata: {change}\n\n");
+        let mut heard = 0;
+        read_events(stream.as_bytes(), &stop, "A1", &mut || {
+            heard += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(heard, 2);
+        let endless = "data: x\n".repeat(600_000);
+        assert!(read_events(endless.as_bytes(), &stop, "A1", &mut || Ok(())).is_err());
+        let long_line = format!("data: {}", "x".repeat(2 << 20));
+        assert!(read_events(long_line.as_bytes(), &stop, "A1", &mut || Ok(())).is_err());
+    }
 
     #[test]
     fn session_urls() {

@@ -225,7 +225,7 @@ impl MailApp {
     /// Shows `messages`, keeping what `kept` (taken from the list before)
     /// holds: see `set_messages`.
     pub(super) fn install_messages(&mut self, messages: Vec<Mail>, kept: ListPlace, cx: &App) {
-        let mut messages = self.backend.with_readable(messages);
+        let mut messages = self.backend.with_readable_previews(messages);
         if let Some(open) = kept.open
             && let Some(m) = messages
                 .iter_mut()
@@ -239,7 +239,13 @@ impl MailApp {
                 ..open
             };
         }
-        self.messages = messages;
+        let replaced = std::mem::replace(&mut self.messages, messages);
+        // A long list let go of (another mailbox opened): its memory goes
+        // back to the system rather than staying with the window.
+        if replaced.len() > 1000 {
+            drop(replaced);
+            crate::manage::memory::release_unused_soon();
+        }
         self.apply_filter(cx);
         if let Some(anchor) = kept.anchor {
             self.restore_scroll(anchor);

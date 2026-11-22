@@ -40,3 +40,32 @@ pub fn release_unused() {
         libc::malloc_trim(0);
     }
 }
+
+/// Hands freed memory back to the system before long, off the calling
+/// thread, at most every `EVERY`: for the window's process, after it lets go
+/// of a lot (an email's document, a mailbox's list). Without it glibc kept
+/// what an email or a long list had used, and the window stayed as large as
+/// its largest moment. Throttled so that opening one message after another
+/// costs no more than a trim every few seconds.
+pub fn release_unused_soon() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        const EVERY: Duration = Duration::from_secs(10);
+        static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        // Milliseconds after `START` of the last trim, plus one (0: none yet).
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = START.elapsed().as_millis() as u64 + 1;
+        let last = LAST.load(Ordering::Relaxed);
+        if last != 0 && now - last < EVERY.as_millis() as u64 {
+            return;
+        }
+        if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("picacho-trim".into())
+            .spawn(release_unused);
+    }
+}

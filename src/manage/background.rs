@@ -214,12 +214,11 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
         .unwrap_or_default()
         .into_iter()
         .map(|a| {
+            // By id from the index: the inbox's messages aren't read.
             let unread = store
-                .summaries(&a.id, Folder::Inbox)
+                .unread_ids(&a.id, Folder::Inbox)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|m| m.unread)
-                .map(|m| m.id)
                 .collect();
             (a.id, unread)
         })

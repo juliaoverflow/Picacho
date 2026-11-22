@@ -150,6 +150,7 @@ pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
         return Ok(m.clone());
     }
     let http = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -257,6 +258,7 @@ fn random_url_token() -> String {
 }
 fn http() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(30))
         .build()?)
 }
@@ -272,6 +274,7 @@ pub fn gravatar(email: &str) -> Result<Option<Vec<u8>>> {
     let hash = sha2::Sha256::digest(email.trim().to_lowercase().as_bytes());
     let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -293,6 +296,7 @@ pub fn gravatar(email: &str) -> Result<Option<Vec<u8>>> {
 pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
     let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -331,10 +335,16 @@ pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
 /// `picacho://` URLs macOS handed the app, waiting for a sign-in to claim them.
 static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub fn opened(urls: Vec<String>) {
-    OPENED
-        .lock()
-        .unwrap()
-        .extend(urls.into_iter().filter(|u| u.starts_with("picacho:")));
+    // Any web page can ask for `picacho://` addresses: only the latest few,
+    // of a callback's size, are kept for a sign-in to claim.
+    const KEPT: usize = 16;
+    let mut opened = OPENED.lock().unwrap();
+    opened.extend(
+        urls.into_iter()
+            .filter(|u| u.starts_with("picacho:") && u.len() <= 8192),
+    );
+    let extra = opened.len().saturating_sub(KEPT);
+    opened.drain(..extra);
 }
 /// Running from Picacho.app, where macOS routes `picacho://` to this process.
 fn bundled() -> bool {

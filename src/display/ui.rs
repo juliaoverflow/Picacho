@@ -4517,6 +4517,13 @@ impl MailApp {
             return;
         }
         self.html_view.update(cx, |view, cx| view.clear(cx));
+        self.forget_bodies(&id);
+        // The previous message's source, as Show Raw read it (the source
+        // whole, its headers and HTML, laid out in lines): only shown for
+        // the open message, so not kept past it.
+        if self.details.as_ref().is_some_and(|d| d.id != id) {
+            self.details = None;
+        }
         // A subscription's mail list gives way to the message; keep its place.
         if self.subs_open && self.selected.is_none() {
             self.subs_return
@@ -4591,6 +4598,11 @@ impl MailApp {
                             if let Some(old) = this.messages.iter_mut().find(|m| m.id == id2) {
                                 *old = mail.clone();
                             }
+                            // Another message opened meanwhile: this one's
+                            // body isn't kept in the list (see `forget_bodies`).
+                            if this.selected.as_ref() != Some(&id2) {
+                                this.forget_bodies(this.selected.clone().as_deref().unwrap_or(""));
+                            }
                             this.filter(cx);
                             if unread {
                                 this.mark_read(mark, mail, cx);
@@ -4614,6 +4626,27 @@ impl MailApp {
             );
         }
         cx.notify();
+    }
+    /// Lets go of the bodies the list holds of messages other than `keep`
+    /// (the one being opened). The list holds messages without bodies; each
+    /// opened one got its text, HTML and inline images, and kept them until
+    /// the list was next loaded whole, so reading through a mailbox grew the
+    /// app by every message read. Opened again, a message's body is read
+    /// from the cache (as the first time), not downloaded. Drafts, and
+    /// messages of no account (the demo), have nowhere to read it back from.
+    fn forget_bodies(&mut self, keep: &str) {
+        let accounts: HashSet<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
+        for m in &mut self.messages {
+            if (m.body.is_some() || m.html.is_some())
+                && m.id != keep
+                && m.folder != Folder::Drafts
+                && accounts.contains(m.account.as_str())
+            {
+                m.body = None;
+                m.html = None;
+                m.inline = crate::manage::model::InlineParts::none();
+            }
+        }
     }
     /// Marks an opened message read at the server and in the cache. It is
     /// shown read already; a refusal shows the cache as it is.
@@ -4816,6 +4849,7 @@ impl MailApp {
         let (account, mails): (String, Vec<&Mail>) = match target {
             MoveTarget::Subscription(sub) => (sub.account.clone(), vec![]),
             MoveTarget::Mail(ids) => {
+                let ids: HashSet<&String> = ids.iter().collect();
                 let mails: Vec<&Mail> =
                     self.messages.iter().filter(|m| ids.contains(&m.id)).collect();
                 (mails.first()?.account.clone(), mails)
@@ -4863,7 +4897,8 @@ impl MailApp {
     /// The IMAP account whose labels `target`'s messages can have: the one
     /// they are all from.
     fn label_account(&self, target: &MoveTarget) -> Option<&Account> {
-        let ids = self.target_ids(target);
+        // A set: looked up for every listed message, as menus draw.
+        let ids: HashSet<String> = self.target_ids(target).into_iter().collect();
         let mut mails = self.messages.iter().filter(|m| ids.contains(&m.id));
         let first = mails.next()?;
         if mails.any(|m| m.account != first.account) {
@@ -4886,7 +4921,8 @@ impl MailApp {
             return vec![];
         };
         let ids = self.target_ids(target);
-        let mails: Vec<&Mail> = self.messages.iter().filter(|m| ids.contains(&m.id)).collect();
+        let chosen: HashSet<&String> = ids.iter().collect();
+        let mails: Vec<&Mail> = self.messages.iter().filter(|m| chosen.contains(&m.id)).collect();
         let gmail = a.provider == Provider::Gmail;
         let mut known = self.backend.store.labels(&a.id).unwrap_or_default();
         if gmail {
@@ -4938,6 +4974,9 @@ impl MailApp {
         self.modal = None;
         match erase {
             Erase::Mail(ids) => {
+                // Looked up for every listed message: a set, not the list
+                // (thousands chosen in a long mailbox took seconds).
+                let ids: HashSet<String> = ids.into_iter().collect();
                 let gone: Vec<Mail> = self
                     .messages
                     .iter()
@@ -5031,10 +5070,12 @@ impl MailApp {
         let c = self.colors();
         let (question, pop) = match erase {
             Erase::Mail(ids) => {
+                // Drawn every frame the dialog is up: a set, not the list.
+                let chosen: HashSet<&String> = ids.iter().collect();
                 let pop = self
                     .messages
                     .iter()
-                    .filter(|m| ids.contains(&m.id))
+                    .filter(|m| chosen.contains(&m.id))
                     .any(|m| self.account_of(m).is_some_and(|a| a.provider == Provider::Pop3));
                 (
                     if ids.len() == 1 {
@@ -12243,6 +12284,29 @@ mod tests {
         assert!(!has(&labels(Mailbox::Remote("INBOX/Receipts".into()), cx), "Rename…"));
         act(&view, Action::NewRemoteFolder(id.clone(), None), cx);
         view.read_with(cx, |this, _| assert!(this.folder_edit.is_none()));
+    }
+
+    /// The list keeps the body of the open message only: one read before
+    /// gives its text back, to be read from the cache when opened again.
+    #[gpui::test]
+    fn the_list_keeps_only_the_open_message_body(cx: &mut TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        let work = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        let read = |id: &str, account: &str| Mail {
+            id: id.into(),
+            account: account.into(),
+            body: Some("Read before".into()),
+            html: Some("<p>Read before</p>".into()),
+            ..Mail::default()
+        };
+        view.update(cx, |this, _| {
+            this.messages = vec![read("w1", &work), read("w2", &work), read("demo", "nobody")];
+            this.forget_bodies("w2");
+            let bodies: Vec<bool> = this.messages.iter().map(|m| m.body.is_some()).collect();
+            // w1 can be read again; w2 is open; "demo" has no account to read it from.
+            assert_eq!(bodies, [false, true, true]);
+            assert!(this.messages[0].html.is_none());
+        });
     }
 
     #[gpui::test]

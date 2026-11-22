@@ -355,12 +355,14 @@ impl Store {
         prefix: &str,
     ) -> Result<std::collections::HashSet<String>> {
         let db = self.read();
-        let mut q =
-            db.prepare("SELECT id FROM messages WHERE account=?1 AND substr(id,1,?2)=?3")?;
+        // A range of the primary key (ids sort bytewise): only the matching
+        // rows are visited, not every message of the account.
+        let mut q = db.prepare_cached(
+            "SELECT id FROM messages WHERE id >= ?2 AND id < ?3 AND account=?1",
+        )?;
+        let end = format!("{prefix}\u{10FFFF}");
         let ids = q
-            .query_map(params![account, prefix.chars().count(), prefix], |r| {
-                r.get(0)
-            })?
+            .query_map(params![account, prefix, end], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(ids)
     }
@@ -418,6 +420,13 @@ impl Store {
                     continue;
                 }
                 result.push(mail);
+                // Rows come newest first: the rest would only be cut off.
+                // (Virtual mailboxes ask SQLite for every row, as some are
+                // left out above; reading and parsing them all for All Mail
+                // cost as much as the account's whole cache.)
+                if result.len() >= limit {
+                    break;
+                }
             }
         }
         result.truncate(limit);
@@ -428,6 +437,77 @@ impl Store {
         let tx = db.transaction()?;
         write_messages(&tx, messages)?;
         tx.commit()?;
+        Ok(())
+    }
+    /// Marks every cached message in `mailbox` read, in the database itself:
+    /// reading each whole (bodies included) only to flip one flag cost as
+    /// much memory as the mailbox's text.
+    pub fn mark_mailbox_read(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<()> {
+        let mailbox = mailbox.into();
+        if mailbox.folder().is_virtual() {
+            // Starred and All Mail gather rows of other mailboxes.
+            let mut cached = self.messages(account, mailbox, usize::MAX >> 1)?;
+            cached.retain(|m| m.unread);
+            for m in &mut cached {
+                m.unread = false;
+            }
+            return self.save_messages(&cached);
+        }
+        // The same condition as the `unread` index, so it finds the rows.
+        self.write().execute(
+            "UPDATE messages SET data=json_set(data,'$.unread',json('false')) WHERE account=?1 AND folder=?2 AND json_extract(data,'$.unread')",
+            params![account, mailbox.key()],
+        )?;
+        Ok(())
+    }
+    /// How many messages `mailbox` has cached, counted by the database
+    /// rather than by reading them all.
+    pub fn count_messages(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<usize> {
+        let mailbox = mailbox.into();
+        if mailbox.folder().is_virtual() {
+            // Starred and All Mail count each message once, as they list it.
+            return Ok(self.summaries(account, mailbox)?.len());
+        }
+        let n: i64 = self.read().query_row(
+            "SELECT COUNT(*) FROM messages WHERE account=?1 AND folder=?2",
+            params![account, mailbox.key()],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+    /// The ids of `mailbox`'s unread cached messages, from the `unread`
+    /// index, without reading the messages.
+    pub fn unread_ids(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<Vec<String>> {
+        let mailbox = mailbox.into();
+        if mailbox.folder().is_virtual() {
+            return Ok(self
+                .summaries(account, mailbox)?
+                .into_iter()
+                .filter(|m| m.unread)
+                .map(|m| m.id)
+                .collect());
+        }
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT id FROM messages WHERE account=?1 AND folder=?2 AND json_extract(data,'$.unread')",
+        )?;
+        let ids = q
+            .query_map(params![account, mailbox.key()], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+    /// Moves the cached rows of server folder `old` to `new` (a rename),
+    /// in the database itself rather than reading each message whole.
+    pub fn rename_remote(&self, account: &str, old: &str, new: &str) -> Result<()> {
+        self.write().execute(
+            "UPDATE messages SET folder=?3, data=json_set(data,'$.remote_folder',?4) WHERE account=?1 AND folder=?2",
+            params![
+                account,
+                Mailbox::Remote(old.to_owned()).key(),
+                Mailbox::Remote(new.to_owned()).key(),
+                new
+            ],
+        )?;
         Ok(())
     }
     /// Saves what reading a message found, keeping its flags and place as
@@ -521,7 +601,7 @@ impl Store {
             };
             for id in old {
                 if !keep.contains(&id) {
-                    tx.execute("DELETE FROM messages WHERE id=?1", [id])?;
+                    tx.prepare_cached("DELETE FROM messages WHERE id=?1")?.execute([id])?;
                 }
             }
         }
@@ -538,15 +618,18 @@ impl Store {
         let mut q = db.prepare(
             "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND json_extract(data,'$.list_unsubscribe') IS NOT NULL",
         )?;
-        let mut mails = Vec::new();
+        // Counted as read: every message from a list was held at once
+        // before, tens of thousands in a large mailbox.
+        let mut grouping = crate::manage::subscriptions::Grouping::default();
         for account in accounts {
-            for row in q.query_map([account], |r| r.get::<_, String>(0))? {
-                if let Ok(mail) = serde_json::from_str::<Mail>(&row?) {
-                    mails.push(mail);
+            let mut rows = q.query([account])?;
+            while let Some(row) = rows.next()? {
+                if let Ok(mail) = serde_json::from_str::<Mail>(row.get_ref(0)?.as_str()?) {
+                    grouping.add(&mail);
                 }
             }
         }
-        Ok(crate::manage::subscriptions::group(mails))
+        Ok(grouping.finish())
     }
     /// The text of messages, lowercase, for searching the Summary's
     /// packages by what their emails say: by message id, as `parcels`
@@ -614,12 +697,17 @@ impl Store {
         let mut with_parcels = HashSet::new();
         for account in accounts {
             let listed = self.scan_rows(account)?;
-            let cached: HashMap<String, (bool, i64, String)> = {
+            // What was found before, without the text of the many messages
+            // where nothing was ("[]"): one string kept per message of the
+            // account added up.
+            let cached: HashMap<String, (bool, i64, Option<String>)> = {
                 let db = self.read();
                 let mut q =
                     db.prepare("SELECT id, state, version, data FROM parcel_scan WHERE account=?1")?;
                 q.query_map([account], |r| {
-                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)))
+                    let data: String = r.get(3)?;
+                    let data = (data != "[]").then_some(data);
+                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, data)))
                 })?
                 .collect::<rusqlite::Result<_>>()?
             };
@@ -634,7 +722,10 @@ impl Store {
                 scanned += 1;
                 match cached.get(&row.id) {
                     Some((state, v, data)) if *state == row.content && *v == version => {
-                        let list: Vec<Parcel> = serde_json::from_str(data).unwrap_or_default();
+                        let list: Vec<Parcel> = data
+                            .as_deref()
+                            .and_then(|d| serde_json::from_str(d).ok())
+                            .unwrap_or_default();
                         results.insert(row.id.clone(), list);
                     }
                     // Downloaded, but nothing in its subject, preview or
@@ -797,12 +888,15 @@ impl Store {
         let mut scanned = 0;
         for account in accounts {
             let listed = self.scan_rows(account)?;
-            let cached: HashMap<String, (bool, i64, String)> = {
+            // As `parcels`: none kept for messages that hold no receipt.
+            let cached: HashMap<String, (bool, i64, Option<String>)> = {
                 let db = self.read();
                 let mut q = db
                     .prepare("SELECT id, state, version, data FROM receipt_scan WHERE account=?1")?;
                 q.query_map([account], |r| {
-                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)))
+                    let data: String = r.get(3)?;
+                    let data = (data != "null").then_some(data);
+                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, data)))
                 })?
                 .collect::<rusqlite::Result<_>>()?
             };
@@ -824,7 +918,10 @@ impl Store {
                 }
                 match cached.get(&row.id) {
                     Some((state, v, data)) if *state == row.content && *v == RECEIPT_SCAN => {
-                        let r: Option<Receipt> = serde_json::from_str(data).unwrap_or_default();
+                        let r: Option<Receipt> = data
+                            .as_deref()
+                            .and_then(|d| serde_json::from_str(d).ok())
+                            .unwrap_or_default();
                         results.insert(row.id.clone(), r);
                     }
                     _ if !receipts::worth_reading(&row.subject, &from) => {
@@ -1006,32 +1103,41 @@ impl Store {
             ..Kinds::default()
         };
         for account in accounts {
-            let listed: Vec<(String, String, String, String)> = {
+            // Judged a row at a time as SQLite reads them: every message's
+            // subject and preview were held at once before.
+            let mut maybe: Vec<String> = Vec::new();
+            {
                 let db = self.read();
                 let mut q = db.prepare(
                     "SELECT id, coalesce(json_extract(data,'$.folder'),''), \
                      coalesce(json_extract(data,'$.subject'),''), coalesce(json_extract(data,'$.snippet'),'') \
                      FROM messages WHERE account=?1 AND coalesce(json_extract(data,'$.pending'),0)=0",
                 )?;
-                q.query_map([account], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            let mut maybe: Vec<String> = Vec::new();
-            for (id, folder, subject, snippet) in listed {
-                // Codes are received, not sent or drafted.
-                if matches!(folder.as_str(), "Sent" | "Drafts") {
-                    continue;
-                }
-                match previous.filter(|p| p.checked.contains(&id)) {
-                    Some(p) => {
-                        if p.codes.contains(&id) {
-                            kinds.codes.insert(id.clone());
-                        }
+                let mut rows = q.query([account])?;
+                while let Some(row) = rows.next()? {
+                    let folder = row.get_ref(1)?.as_str()?;
+                    // Codes are received, not sent or drafted.
+                    if matches!(folder, "Sent" | "Drafts") {
+                        continue;
                     }
-                    None if mail_kinds::might_be_code(&subject, &snippet) => maybe.push(id.clone()),
-                    None => {}
+                    let id: String = row.get(0)?;
+                    match previous.filter(|p| p.checked.contains(&id)) {
+                        Some(p) => {
+                            if p.codes.contains(&id) {
+                                kinds.codes.insert(id.clone());
+                            }
+                        }
+                        None if mail_kinds::might_be_code(
+                            row.get_ref(2)?.as_str()?,
+                            row.get_ref(3)?.as_str()?,
+                        ) =>
+                        {
+                            maybe.push(id.clone())
+                        }
+                        None => {}
+                    }
+                    kinds.checked.insert(id);
                 }
-                kinds.checked.insert(id);
             }
             // Each likely one read whole, then judged.
             for chunk in maybe.chunks(PARCEL_BATCH) {
@@ -1211,8 +1317,7 @@ impl Store {
             let tx = db.transaction()?;
             for (id, body, snippet) in &updates {
                 match body {
-                    Some(body) => tx.execute(
-                        "UPDATE messages SET data=json_set(data,'$.body',?2,'$.snippet',?3) WHERE id=?1",
+                    Some(body) => tx.prepare_cached("UPDATE messages SET data=json_set(data,'$.body',?2,'$.snippet',?3) WHERE id=?1")?.execute(
                         params![id, body, snippet],
                     )?,
                     None => tx.execute(
@@ -1295,8 +1400,7 @@ impl Store {
             let mut db = self.write();
             let tx = db.transaction()?;
             for (id, header, one_click) in &found {
-                tx.execute(
-                    "UPDATE messages SET data=json_set(data,'$.list_unsubscribe',?2,'$.one_click',json(?3)) WHERE id=?1",
+                tx.prepare_cached("UPDATE messages SET data=json_set(data,'$.list_unsubscribe',?2,'$.one_click',json(?3)) WHERE id=?1")?.execute(
                     params![id, header, if *one_click { "true" } else { "false" }],
                 )?;
             }
@@ -1332,7 +1436,7 @@ impl Store {
         let keep: std::collections::HashSet<_> = ids.iter().collect();
         for id in old {
             if !keep.contains(&id) {
-                tx.execute("DELETE FROM messages WHERE id=?1", [id])?;
+                tx.prepare_cached("DELETE FROM messages WHERE id=?1")?.execute([id])?;
             }
         }
         tx.commit()?;
@@ -1375,8 +1479,7 @@ impl Store {
             let tx = db.transaction()?;
             for (id, source) in &rows {
                 // Unless it was saved again meanwhile (into `source`, then).
-                packed += tx.execute(
-                    "UPDATE messages SET source=?2, raw=NULL WHERE id=?1 AND raw IS NOT NULL",
+                packed += tx.prepare_cached("UPDATE messages SET source=?2, raw=NULL WHERE id=?1 AND raw IS NOT NULL")?.execute(
                     params![id, source],
                 )?;
             }
@@ -1481,11 +1584,9 @@ impl Store {
         let mut db = self.write();
         let tx = db.transaction()?;
         if delete {
+            let mut q = tx.prepare_cached("DELETE FROM messages WHERE id=?1 AND account=?2")?;
             for mail in messages {
-                tx.execute(
-                    "DELETE FROM messages WHERE id=?1 AND account=?2",
-                    params![mail.id, mail.account],
-                )?;
+                q.execute(params![mail.id, mail.account])?;
             }
         } else {
             write_messages(&tx, messages)?;
@@ -2557,8 +2658,10 @@ pub struct MailboxSnapshot<'a> {
     pub starred_only: bool,
 }
 fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<()> {
+    // Compiled once per connection, not once per message.
+    let mut q = tx.prepare_cached("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data WHERE folder IS NOT excluded.folder OR date IS NOT excluded.date OR data IS NOT excluded.data")?;
     for m in messages {
-        tx.execute("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data WHERE folder IS NOT excluded.folder OR date IS NOT excluded.date OR data IS NOT excluded.data",params![m.id,m.account,m.mailbox().key(),m.date,serde_json::to_string(m)?])?;
+        q.execute(params![m.id,m.account,m.mailbox().key(),m.date,serde_json::to_string(m)?])?;
     }
     Ok(())
 }

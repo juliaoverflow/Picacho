@@ -33,13 +33,39 @@ pub(super) struct Watcher {
     mailbox: Mailbox,
     /// Its server agreed to NOTIFY: it hears about every mailbox.
     notifying: Arc<AtomicBool>,
+    /// Its thread, woken from `pause` when stopped.
+    thread: Option<std::thread::Thread>,
 }
 impl Watcher {
+    fn on(mut self, thread: &std::thread::Thread) -> Self {
+        self.thread = Some(thread.clone());
+        self
+    }
     fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(thread) = &self.thread {
+            thread.unpark();
+        }
         if let Some(socket) = self.socket.lock().unwrap().take() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+/// Waits `wait` on a watcher's own thread, or less once `stop` is set
+/// (`Watcher::stop` wakes it). Asleep meanwhile, rather than waking every
+/// moment to look. Returns whether it was stopped.
+fn pause(stop: &AtomicBool, wait: Duration) -> bool {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= until {
+            return false;
+        }
+        // Wakes early on `unpark` (or spuriously): the loop looks again.
+        std::thread::park_timeout(until - now);
     }
 }
 /// Why a watch ended.
@@ -145,6 +171,7 @@ impl Backend {
             socket: Arc::new(Mutex::new(None)),
             mailbox: Mailbox::Standard(Folder::Inbox),
             notifying: Arc::new(AtomicBool::new(true)),
+            thread: None,
         };
         let stop = watcher.stop.clone();
         let backend = self.clone();
@@ -174,17 +201,14 @@ impl Backend {
                         retry
                     };
                     retry = (retry * 2).min(LONGEST_RETRY);
-                    let until = std::time::Instant::now() + wait;
-                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
+                    pause(&stop, wait);
                     // Mail may have arrived while the watch was down.
                     if !stop.load(Ordering::Acquire) {
                         changed(Mailbox::Standard(Folder::Inbox));
                     }
                 }
             });
-        spawned.ok().map(|_| watcher)
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Follows Proton's events until `stop`, saying which mailboxes
     /// changed. Like IDLE, it only notices: the regular check syncs.
@@ -204,12 +228,8 @@ impl Backend {
             // the requests don't settle into lockstep with anything else.
             let every = Duration::from_secs(u64::from(a.sync.proton_events_seconds.max(1)));
             let wait = every + every.mul_f64(rand::random::<f64>() / 4.0);
-            let until = std::time::Instant::now() + wait;
-            while std::time::Instant::now() < until {
-                if stop.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(250));
+            if pause(stop, wait) {
+                return Ok(());
             }
             let (news, folders) =
                 self.with_proton(a, |s| Ok((s.events_since(&since)?, s.folders())))?;
@@ -285,6 +305,7 @@ impl Backend {
             socket: Arc::new(Mutex::new(None)),
             mailbox: Mailbox::Standard(Folder::Inbox),
             notifying: Arc::new(AtomicBool::new(true)),
+            thread: None,
         };
         let stop = watcher.stop.clone();
         let backend = self.clone();
@@ -314,17 +335,14 @@ impl Backend {
                         retry
                     };
                     retry = (retry * 2).min(LONGEST_RETRY);
-                    let until = std::time::Instant::now() + wait;
-                    while std::time::Instant::now() < until && !stop.load(Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
+                    pause(&stop, wait);
                     // Mail may have arrived while the watch was down.
                     if !stop.load(Ordering::Acquire) {
                         changed(Mailbox::Standard(Folder::Inbox));
                     }
                 }
             });
-        spawned.ok().map(|_| watcher)
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Follows a JMAP account's changes until `stop`, saying which
     /// mailboxes changed. Like IDLE, it only notices: the regular check
@@ -368,14 +386,8 @@ impl Backend {
             } else {
                 Duration::from_secs(60)
             };
-            {
-                let until = std::time::Instant::now() + wait;
-                while std::time::Instant::now() < until {
-                    if stop.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
+            if pause(stop, wait) {
+                return Ok(());
             }
             if stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -396,6 +408,7 @@ impl Backend {
             socket: Arc::new(Mutex::new(None)),
             mailbox: mailbox.clone(),
             notifying: Arc::new(AtomicBool::new(false)),
+            thread: None,
         };
         let (stop, socket, notifying) = (
             watcher.stop.clone(),
@@ -447,11 +460,7 @@ impl Backend {
                                 retry
                             };
                             retry = (retry * 2).min(LONGEST_RETRY);
-                            let until = std::time::Instant::now() + wait;
-                            while std::time::Instant::now() < until && !stop.load(Ordering::Acquire)
-                            {
-                                std::thread::sleep(Duration::from_millis(250));
-                            }
+                            pause(&stop, wait);
                             // Mail may have arrived while the watch was down.
                             if !stop.load(Ordering::Acquire) {
                                 changed(mailbox.clone());
@@ -461,7 +470,7 @@ impl Backend {
                 }
             });
         // Without a thread, polling checks this mailbox.
-        spawned.ok().map(|_| watcher)
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Ends the account's watches, if any; their connections close.
     pub fn stop_watching(&self, id: &str) {

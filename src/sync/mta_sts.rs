@@ -106,6 +106,7 @@ fn fetch(domain: &str) -> Result<Policy> {
         "{domain:?} isn't a domain name that can publish a policy"
     );
     let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(10))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -139,7 +140,7 @@ fn fetch(domain: &str) -> Result<Policy> {
 
 /// Whether `domain` is a plain DNS name (letters, digits and hyphens, in
 /// dot-separated labels); internationalized names in their ASCII form.
-fn is_domain(domain: &str) -> bool {
+pub(crate) fn is_domain(domain: &str) -> bool {
     domain.len() <= 253
         && domain.contains('.')
         && domain.split('.').all(|label| {

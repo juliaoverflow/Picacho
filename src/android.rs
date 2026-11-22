@@ -341,6 +341,26 @@ pub fn copy_to_system(text: &str) -> bool {
     copied
 }
 
+/// Copies a secret (a sign-in code) to Android's clipboard, marked
+/// sensitive so the system's preview and keyboards' histories leave it out.
+pub fn copy_sensitive_to_system(text: &str) -> bool {
+    let copied = call_java("Clipboard.writeSensitive", |env, java| {
+        let text = env.new_string(text)?;
+        env.call_static_method(
+            &java.clipboard,
+            jni_str!("writeSensitive"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Z"),
+            &[JValue::Object(java.context.as_obj()), JValue::Object(&text)],
+        )?
+        .z()
+    }) == Some(true);
+    if copied {
+        // Not copied again, unmarked, when the app's clipboard is synced.
+        *CLIPBOARD_SYNCED.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_owned());
+    }
+    copied
+}
+
 fn write_system_clipboard(text: &str) -> bool {
     call_java("Clipboard.write", |env, java| {
         let text = env.new_string(text)?;

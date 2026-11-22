@@ -200,6 +200,7 @@ fn unsafe_resource_schemes_and_credentials_are_refused() {
             Default::default(),
             Arc::new(AtomicBool::new(false)),
             cancelled.clone(),
+            Arc::default(),
         );
     struct Capture(std::sync::mpsc::Sender<blitz_traits::net::Bytes>);
     impl blitz_traits::net::NetHandler for Capture {

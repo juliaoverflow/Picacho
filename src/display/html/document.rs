@@ -190,7 +190,8 @@ pub(super) fn compat_mode(html: &str) -> Compat {
     while let Some(after) = rest.strip_prefix("<!--") {
         rest = after.find("-->").map_or("", |end| &after[end + 3..]).trim_start();
     }
-    if rest.len() < 9 || !rest[..9].eq_ignore_ascii_case("<!doctype") {
+    // `get`: the ninth byte may fall inside a character ("<!DOCTYé").
+    if !rest.get(..9).is_some_and(|start| start.eq_ignore_ascii_case("<!doctype")) {
         return Compat::Quirks;
     }
     let doctype = &rest[9..rest.find('>').unwrap_or(rest.len())];
@@ -260,6 +261,8 @@ pub(super) struct EmailDocument {
     tone: Tone,
     cancelled: Arc<AtomicBool>,
     pub(super) changed: Arc<AtomicBool>,
+    /// Remote fetches in flight (see `Resources::pending`).
+    pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Links clicked since last taken (see `take_clicked`).
     clicked: Arc<Mutex<Vec<String>>>,
     /// The animation clock (see `SETTLE`).
@@ -296,8 +299,14 @@ impl EmailDocument {
     ) -> Self {
         let cancelled = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(AtomicBool::new(false));
-        let resources =
-            resources::Resources::new(blocked, inline, changed.clone(), cancelled.clone());
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = resources::Resources::new(
+            blocked,
+            inline,
+            changed.clone(),
+            cancelled.clone(),
+            pending.clone(),
+        );
         let links = resources::Links::default();
         let clicked = links.clicked.clone();
         let doc = HtmlDocument::from_html(
@@ -329,6 +338,7 @@ impl EmailDocument {
             tone,
             cancelled,
             changed,
+            pending,
             clicked,
             clock: 0.,
             width: 0,
@@ -341,6 +351,12 @@ impl EmailDocument {
         }
         email.mark_image_lines(compat_mode(html));
         email
+    }
+    /// Whether nothing but a command can change the document now: no
+    /// fetch in flight, and no change waiting to be laid out.
+    pub(super) fn settled(&self) -> bool {
+        // `pending` first: a fetch that finished set `changed` before it.
+        self.pending.load(Ordering::Acquire) == 0 && !self.changed.load(Ordering::Acquire)
     }
     /// The elements in document order.
     fn elements(&self) -> Vec<NodeId> {
