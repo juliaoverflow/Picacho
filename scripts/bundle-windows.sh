@@ -47,7 +47,16 @@ if [ -z "${PICACHO_WIX:-}" ]; then
 fi
 # Wine's Z: drive is this computer's root; WiX takes Windows paths.
 win() { printf 'Z:%s' "$(realpath -m "$1")" | tr / '\\'; }
+# The installer's dialogs: WiX's UI extension, from NuGet.
+ui="target/wix/wixtoolset.ui.wixext.5.0.2"
+if [ ! -f "$ui/wixext5/WixToolset.UI.wixext.dll" ]; then
+    mkdir -p "$ui"
+    curl -sSfL -o "$ui/package.zip" \
+        https://api.nuget.org/v3-flatcontainer/wixtoolset.ui.wixext/5.0.2/wixtoolset.ui.wixext.5.0.2.nupkg
+    (cd "$ui" && unzip -oq package.zip)
+fi
 $PICACHO_WIX build -arch x64 \
+    -ext "$(win "$ui/wixext5/WixToolset.UI.wixext.dll")" \
     -d Version="${version%%[-+]*}" \
     -d ExeDir="$(win "$out")" \
     -d WebView2Loader=yes \

@@ -66,11 +66,25 @@ $wix = Get-ChildItem (Join-Path $nuget "wix\$wixVersion\tools") -Recurse -Filter
     Select-Object -First 1
 if (-not $wix) { throw "WiX $wixVersion isn't in $nuget after dotnet tool restore" }
 
+# The installer's dialogs (WixUI_Minimal) come from WiX's UI extension, a
+# NuGet package of the same version (MS-RL), unpacked under target\.
+$uiDir = "target\wix\wixtoolset.ui.wixext.$wixVersion"
+$uiExt = Join-Path $uiDir "wixext5\WixToolset.UI.wixext.dll"
+if (-not (Test-Path $uiExt)) {
+    New-Item -ItemType Directory -Force $uiDir | Out-Null
+    $nupkg = Join-Path $uiDir "package.zip"
+    Invoke-WebRequest -UseBasicParsing -OutFile $nupkg `
+        "https://api.nuget.org/v3-flatcontainer/wixtoolset.ui.wixext/$wixVersion/wixtoolset.ui.wixext.$wixVersion.nupkg"
+    Expand-Archive -Force $nupkg $uiDir
+    if (-not (Test-Path $uiExt)) { throw "WiX's UI extension wasn't found in its package" }
+}
+
 New-Item -ItemType Directory -Force dist | Out-Null
 $msi = "dist\Picacho-$version-x64.msi"
 # MSVC links WebView2's loader statically: no DLL beside the app.
 $wixArgs = @(
     $wix.FullName, "build", "-arch", "x64",
+    "-ext", $uiExt,
     "-define", "Version=$msiVersion",
     "-define", "ExeDir=$exeDir",
     "-define", "WebView2Loader=no",
