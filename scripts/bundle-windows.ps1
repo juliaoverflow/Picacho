@@ -60,8 +60,14 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet tool restore (WiX) failed" }
 New-Item -ItemType Directory -Force dist | Out-Null
 $msi = "dist\Picacho-$version-x64.msi"
 # MSVC links WebView2's loader statically: no DLL beside the app.
-& dotnet tool run wix build -arch x64 -d "Version=$msiVersion" -d "ExeDir=$exeDir" `
-    -d "WebView2Loader=no" -o $msi packaging\windows\picacho.wxs
+# `--`: what follows is WiX's. Without it `dotnet tool run` takes the
+# first -d as its own --diagnostics, and WiX reads the next defines' values
+# as input files. -define, as -d is ambiguous.
+& dotnet tool run wix -- build -arch x64 `
+    -define "Version=$msiVersion" `
+    -define "ExeDir=$exeDir" `
+    -define "WebView2Loader=no" `
+    -out $msi packaging\windows\picacho.wxs
 if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 Sign $msi
 Write-Host "Built $msi"
