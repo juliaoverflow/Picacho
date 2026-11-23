@@ -294,10 +294,7 @@ impl Connection {
         } else {
             format!("{host}:{port}")
         };
-        // Valid for a day (RFC 4467 §3: `;EXPIRE=`), long enough for the
-        // submission server to fetch it, not forever.
-        let expire = (chrono::Utc::now() + chrono::Duration::days(1))
-            .format("%Y-%m-%dT%H:%M:%SZ");
+        let expire = url_expiry(chrono::Utc::now());
         let url = format!(
             "imap://{}@{authority}/{};UIDVALIDITY={validity}/;UID={uid};EXPIRE={expire};urlauth=submit+{}",
             url_user(user),
@@ -922,6 +919,15 @@ fn flag_list(flags: &[imap::types::Flag<'_>]) -> String {
         .join(" ")
 }
 
+/// When a URL made for one delivery stops working (RFC 4467 §3:
+/// `;EXPIRE=`, checked by the server's clock): soon, as it is made just
+/// before the message is handed over and fetched at once, with a margin
+/// for a computer whose clock is off (this is the computer's time, not
+/// the server's).
+fn url_expiry(now: chrono::DateTime<chrono::Utc>) -> String {
+    (now + chrono::Duration::hours(4)).format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 /// A mailbox name in an IMAP URL (RFC 5092): percent-encoded where it
 /// isn't plain.
 fn url_mailbox(name: &str) -> String {
@@ -989,6 +995,9 @@ mod url_tests {
     #[test]
     fn imap_urls_and_their_authorization() {
         assert_eq!(url_mailbox("Sent Items"), "Sent%20Items");
+        // Four hours on, by this computer's clock.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-23T10:00:00Z").unwrap().to_utc();
+        assert_eq!(url_expiry(now), "2026-11-23T14:00:00Z");
         assert_eq!(url_mailbox("INBOX/Work"), "INBOX/Work");
         assert_eq!(url_mailbox("ana@example.com"), "ana@example.com");
         let heard = b"* GENURLAUTH \"imap://ana@mail.example/Sent;UIDVALIDITY=7/;UID=3;urlauth=submit+ana:internal:91354a473744909de610943775f92038\"\r\na5 OK done\r\n";
