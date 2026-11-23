@@ -212,11 +212,14 @@ pub(super) fn encode(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
 
 pub(super) const SEQUENCE: u8 = 0x30;
 pub(super) const SET: u8 = 0x31;
-const INTEGER: u8 = 0x02;
-const OCTET_STRING: u8 = 0x04;
-const OID: u8 = 0x06;
+pub(super) const INTEGER: u8 = 0x02;
+pub(super) const OCTET_STRING: u8 = 0x04;
+pub(super) const NULL: u8 = 0x05;
+pub(super) const OID: u8 = 0x06;
+pub(super) const UTC_TIME: u8 = 0x17;
+pub(super) const GENERALIZED_TIME: u8 = 0x18;
 /// `[0]` and `[1]`, constructed (EXPLICIT, or IMPLICIT SET OF).
-const CONTEXT_0: u8 = 0xa0;
+pub(super) const CONTEXT_0: u8 = 0xa0;
 const CONTEXT_1: u8 = 0xa1;
 /// `[0]` IMPLICIT, primitive: SignerIdentifier's subjectKeyIdentifier.
 const CONTEXT_0_PRIMITIVE: u8 = 0x80;
@@ -397,9 +400,44 @@ pub(super) fn compressed_content(input: &[u8]) -> Result<&[u8], Error> {
     Ok(content.value)
 }
 
+/// An OBJECT IDENTIFIER's DER, from its content octets.
+pub(super) fn oid(content: &[u8]) -> Vec<u8> {
+    encode(OID, &[content])
+}
+
+/// An INTEGER's DER from unsigned big-endian octets (X.690 §8.3: minimal,
+/// with a zero octet first where the high bit would make it negative).
+pub(super) fn unsigned_integer(octets: &[u8]) -> Vec<u8> {
+    let first = octets.iter().position(|&b| b != 0).unwrap_or(octets.len());
+    let trimmed = octets.get(first..).unwrap_or_default();
+    match trimmed.first() {
+        None => encode(INTEGER, &[&[0]]),
+        Some(&b) if b & 0x80 != 0 => encode(INTEGER, &[&[0], trimmed]),
+        Some(_) => encode(INTEGER, &[trimmed]),
+    }
+}
+
+/// A SET OF its `elements` (each a whole DER value), in DER order: X.690
+/// §11.6 sorts them as octet strings, the shorter padded with zeros at
+/// its end, which for distinct values is plain byte order.
+pub(super) fn set_of(elements: &[Vec<u8>]) -> Vec<u8> {
+    let mut sorted: Vec<&[u8]> = elements.iter().map(Vec::as_slice).collect();
+    sorted.sort();
+    encode(SET, &sorted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn der_writes_integers_and_sorted_sets() {
+        assert_eq!(unsigned_integer(&[0, 0, 5]), [0x02, 0x01, 0x05]);
+        assert_eq!(unsigned_integer(&[0x80]), [0x02, 0x02, 0x00, 0x80]);
+        assert_eq!(unsigned_integer(&[]), [0x02, 0x01, 0x00]);
+        let set = set_of(&[vec![0x31, 0x00], vec![0x04, 0x01, 0x07], vec![0x02, 0x01, 0x05]]);
+        assert_eq!(set, [0x31, 0x08, 0x02, 0x01, 0x05, 0x04, 0x01, 0x07, 0x31, 0x00]);
+    }
 
     #[test]
     fn der_encode_writes_minimal_lengths_the_reader_reads_back() {

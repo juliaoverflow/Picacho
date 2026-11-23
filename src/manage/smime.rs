@@ -412,6 +412,170 @@ fn as_part(smime: Vec<u8>) -> Vec<u8> {
         .collect()
 }
 
+/// OIDs' content octets for the signing writer.
+mod oids {
+    /// RFC 5652 §5.1, §11.1, §11.2, §11.3; RFC 8551 §2.5.2.
+    pub const DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+    pub const CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
+    pub const MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
+    pub const SIGNING_TIME: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x05];
+    pub const SMIME_CAPABILITIES: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0f];
+    /// RFC 5754 §2.2: id-sha256.
+    pub const SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    /// RFC 3370 §3.2: rsaEncryption, as today's PKCS#7 signatures name
+    /// PKCS#1 v1.5.
+    pub const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+    /// RFC 5084 §3.2 and RFC 3565 §4: AES-GCM and AES-CBC.
+    pub const AES256_GCM: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2e];
+    pub const AES128_GCM: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x06];
+    pub const AES256_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a];
+    pub const AES128_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x02];
+}
+
+/// RFC 8551 §2.5.2: the ciphers we can read, most preferred first. AES-GCM
+/// leads (RFC 8551 §2.7: MUST support AES-128 GCM and AES-256 GCM), as
+/// decryption of AuthEnvelopedData is proven by
+/// `aes_gcm_auth_enveloped_mail_decrypts_and_is_authenticated`. Each has no
+/// parameters, which §2.5.2 then requires be omitted. RC2 and DES are
+/// never listed, so no reply is encrypted with them.
+fn smime_capabilities() -> Vec<u8> {
+    let capabilities: Vec<Vec<u8>> = [oids::AES256_GCM, oids::AES128_GCM, oids::AES256_CBC, oids::AES128_CBC]
+        .iter()
+        .map(|cipher| der::encode(der::SEQUENCE, &[&der::oid(cipher)]))
+        .collect();
+    let refs: Vec<&[u8]> = capabilities.iter().map(Vec::as_slice).collect();
+    der::encode(der::SEQUENCE, &refs)
+}
+
+/// RFC 5652 §5.3 Attribute: its type and one value.
+fn attribute(kind: &[u8], value: &[u8]) -> Vec<u8> {
+    der::encode(der::SEQUENCE, &[&der::oid(kind), &der::encode(der::SET, &[value])])
+}
+
+/// RFC 5652 §11.3: UTCTime through 2049, GeneralizedTime after (RFC 5280
+/// §4.1.2.5's rule), in UTC to the second.
+fn signing_time(now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    use chrono::Datelike as _;
+    if now.year() < 2050 {
+        der::encode(der::UTC_TIME, &[now.format("%y%m%d%H%M%SZ").to_string().as_bytes()])
+    } else {
+        der::encode(der::GENERALIZED_TIME, &[now.format("%Y%m%d%H%M%SZ").to_string().as_bytes()])
+    }
+}
+
+/// A detached SignedData (RFC 5652 §5) over `content`, by an RSA `key`:
+/// SHA-256 and PKCS#1 v1.5, as `Pkcs7::sign` wrote it before. Written here
+/// rather than by OpenSSL so its SMIMECapabilities lists only what we read
+/// (OpenSSL's own lists triple DES, DES and RC2).
+fn sign_rsa(
+    cert: &X509,
+    chain: &[X509],
+    key: &PKey<Private>,
+    content: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<u8>> {
+    let sha256 = der::encode(der::SEQUENCE, &[&der::oid(oids::SHA256), &der::encode(der::NULL, &[])]);
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), content)?;
+    // RFC 5652 §5.3, §11: contentType, signingTime and messageDigest,
+    // and RFC 8551 §2.5.2's SMIMECapabilities.
+    let attributes = [
+        attribute(oids::CONTENT_TYPE, &der::oid(oids::DATA)),
+        attribute(oids::SIGNING_TIME, &signing_time(now)),
+        attribute(oids::MESSAGE_DIGEST, &der::encode(der::OCTET_STRING, &[&digest])),
+        attribute(oids::SMIME_CAPABILITIES, &smime_capabilities()),
+    ];
+    // RFC 5652 §5.4: the signature is over the attributes' DER as a SET
+    // OF (sorted, X.690 §11.6), which goes in the message as [0] IMPLICIT.
+    let signed_attributes = der::set_of(&attributes);
+    let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), key)?;
+    signer.set_rsa_padding(openssl::rsa::Padding::PKCS1)?;
+    signer.update(&signed_attributes)?;
+    let signature = signer.sign_to_vec()?;
+    let mut implicit = signed_attributes;
+    if let Some(tag) = implicit.first_mut() {
+        *tag = der::CONTEXT_0;
+    }
+    // RFC 5652 §5.3: version 1, with issuerAndSerialNumber.
+    let issuer = cert.issuer_name().to_der()?;
+    let serial = der::unsigned_integer(&cert.serial_number().to_bn()?.to_vec());
+    let rsa = der::encode(der::SEQUENCE, &[&der::oid(oids::RSA_ENCRYPTION), &der::encode(der::NULL, &[])]);
+    let version = der::unsigned_integer(&[1]);
+    let signer_info = der::encode(
+        der::SEQUENCE,
+        &[
+            &version,
+            &der::encode(der::SEQUENCE, &[&issuer, &serial]),
+            &sha256,
+            &implicit,
+            &rsa,
+            &der::encode(der::OCTET_STRING, &[&signature]),
+        ],
+    );
+    let certificates: Vec<Vec<u8>> = std::iter::once(cert)
+        .chain(chain)
+        .map(|c| c.to_der())
+        .collect::<Result<_, _>>()?;
+    let certificates: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
+    // RFC 5652 §5.1: version 1, detached (no eContent).
+    let signed_data = der::encode(
+        der::SEQUENCE,
+        &[
+            &version,
+            &der::encode(der::SET, &[&sha256]),
+            &der::encode(der::SEQUENCE, &[&der::oid(oids::DATA)]),
+            &der::encode(der::CONTEXT_0, &certificates),
+            &der::encode(der::SET, &[&signer_info]),
+        ],
+    );
+    Ok(der::encode(
+        der::SEQUENCE,
+        &[&der::oid(der::SIGNED_DATA), &der::encode(der::CONTEXT_0, &[&signed_data])],
+    ))
+}
+
+/// RFC 8551 §3.5.3: `content` and its detached signature as
+/// multipart/signed, the signature base64 in lines of 64.
+fn multipart_signed(content: &[u8], signature: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let boundary = format!("----{}", uuid::Uuid::new_v4().simple().to_string().to_uppercase());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(signature);
+    let mut out = format!(
+        "Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; micalg=sha-256; boundary=\"{boundary}\"\r\n\r\n\
+         This is an S/MIME signed message\r\n\r\n--{boundary}\r\n"
+    )
+    .into_bytes();
+    out.extend_from_slice(content);
+    out.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n\
+             Content-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"smime.p7s\"\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    for line in encoded.as_bytes().chunks(64) {
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    out
+}
+
+/// Signs `content` (a MIME part, CRLF line ends) as multipart/signed: RSA
+/// keys with `sign_rsa`, others (EC) with OpenSSL's CMS_sign.
+fn sign_part(cert: &X509, chain: &[X509], key: &PKey<Private>, content: &[u8]) -> Result<Vec<u8>> {
+    if key.rsa().is_ok() {
+        let signature = sign_rsa(cert, chain, key, content, chrono::Utc::now())?;
+        return Ok(multipart_signed(content, &signature));
+    }
+    let mut extra = Stack::new()?;
+    for c in chain {
+        extra.push(c.clone())?;
+    }
+    let flags = CMSOptions::DETACHED | CMSOptions::BINARY;
+    let signed = CmsContentInfo::sign(Some(cert), Some(key), Some(&extra), Some(content), flags)?;
+    Ok(multipart_signed(content, &signed.to_der()?))
+}
+
 /// Signs and/or encrypts a finished message with S/MIME. Encrypted mail is
 /// encrypted to each recipient's certificate and the sender's own.
 pub fn protect_with(
@@ -432,13 +596,7 @@ pub fn protect_with(
         let (cert, chain, key) = own.as_ref().with_context(|| {
             format!("There's no S/MIME certificate of yours for {from}. Import one in Settings → Encryption, or turn off Sign.")
         })?;
-        let mut extra = Stack::new()?;
-        for c in chain {
-            extra.push(c.clone())?;
-        }
-        let flags = Pkcs7Flags::DETACHED | Pkcs7Flags::BINARY;
-        let signed = Pkcs7::sign(cert, key, &extra, &content, flags)?;
-        content = as_part(signed.to_smime(&content, flags)?);
+        content = sign_part(cert, chain, key, &content)?;
     }
     if encrypt {
         let mut recipients = Stack::new()?;
@@ -1397,5 +1555,132 @@ mod tests {
             open_with(&fixture("pkcs7-encrypted.eml"), &fixture_identity("ana"), &test_authority()).unwrap();
         assert!(verdict.decrypted);
         assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+    }
+
+    /// Runs the `openssl` CLI (`smime` or `cms`) to verify `signed`
+    /// against the fixtures' authority, under a deadline.
+    fn openssl_cli_verifies(command: &str, signed: &[u8]) -> bool {
+        let dir = std::env::temp_dir().join(format!("picacho-smime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let message = dir.join("signed.eml");
+        std::fs::write(&message, signed).unwrap();
+        let ca = format!("{}/tests/fixtures/smime/ca.pem", env!("CARGO_MANIFEST_DIR"));
+        let status = std::process::Command::new("timeout")
+            .args(["30", "openssl", command, "-verify", "-CAfile", &ca, "-purpose", "smimesign", "-in"])
+            .arg(&message)
+            .args(["-out", "/dev/null"])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+        status.is_ok_and(|s| s.success())
+    }
+
+    /// Our RSA signature verifies with all four: OpenSSL's CMS and PKCS#7
+    /// APIs, and `openssl cms -verify` and `openssl smime -verify`.
+    #[test]
+    fn signed_mail_verifies_with_cms_pkcs7_and_both_openssl_commands() {
+        let ana = fixture_identity("ana");
+        let signed = protect_with(&ana, MESSAGE, "ana@example.org", &[], true, false).unwrap();
+        let (content, signature) = signed_parts(&signed).unwrap();
+        let store = test_authority();
+        let mut cms = CmsContentInfo::from_der(&signature).unwrap();
+        cms.verify(None, Some(&store), Some(&content), None, CMSOptions::BINARY).unwrap();
+        let p7 = Pkcs7::from_der(&signature).unwrap();
+        let none = Stack::new().unwrap();
+        p7.verify(&none, &store, Some(&content), None, Pkcs7Flags::BINARY).unwrap();
+        // The CLIs are part of the test: missing, the test fails.
+        assert!(openssl_cli_verifies("cms", &signed), "openssl cms -verify");
+        assert!(openssl_cli_verifies("smime", &signed), "openssl smime -verify");
+        // Changed after signing, it fails for all four.
+        let changed = String::from_utf8_lossy(&signed).replace("Meet at noon.", "Meet at nine.");
+        let (changed_content, _) = signed_parts(changed.as_bytes()).unwrap();
+        let mut cms = CmsContentInfo::from_der(&signature).unwrap();
+        assert!(cms.verify(None, Some(&store), Some(&changed_content), None, CMSOptions::BINARY).is_err());
+        assert!(p7.verify(&none, &store, Some(&changed_content), None, Pkcs7Flags::BINARY).is_err());
+        assert!(!openssl_cli_verifies("cms", changed.as_bytes()));
+        assert!(!openssl_cli_verifies("smime", changed.as_bytes()));
+        // And we read it back as good.
+        let (_, verdict, _) = open_with(&signed, &Certificates::default(), &store).unwrap();
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+    }
+
+    /// RFC 5652 §5.3, §5.4 and RFC 8551 §2.5.2: the signed attributes are
+    /// DER-sorted and include contentType, signingTime, messageDigest and
+    /// SMIMECapabilities, which lists AES and never RC2 or DES; the
+    /// signature is sha256 with rsaEncryption (PKCS#1 v1.5), as before.
+    #[test]
+    fn signed_attributes_are_sorted_and_advertise_only_aes() {
+        let ana = fixture_identity("ana");
+        let (cert, chain, key) = ana.identities().remove(0);
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-23T10:00:00Z").unwrap().to_utc();
+        let signature = sign_rsa(&cert, &chain, &key, b"content", at).unwrap();
+        let signed = der::SignedData::parse(&signature).unwrap();
+        let [signer_info] = signed.signer_infos.as_slice() else { panic!("one signer") };
+        let mut fields = signer_info.children().unwrap();
+        for _ in 0..3 {
+            fields.read().unwrap();
+        }
+        let attributes = fields.read_tag(der::CONTEXT_0).unwrap();
+        let algorithm = fields.read_tag(der::SEQUENCE).unwrap();
+        assert_eq!(
+            algorithm.raw,
+            der::encode(der::SEQUENCE, &[&der::oid(oids::RSA_ENCRYPTION), &der::encode(der::NULL, &[])])
+        );
+        let mut each = attributes.children().unwrap();
+        let mut raws = Vec::new();
+        let mut kinds = Vec::new();
+        while !each.is_empty() {
+            let attribute = each.read().unwrap();
+            raws.push(attribute.raw.to_vec());
+            kinds.push(attribute.children().unwrap().read().unwrap().value.to_vec());
+        }
+        let mut sorted = raws.clone();
+        sorted.sort();
+        assert_eq!(raws, sorted, "X.690 §11.6 order");
+        let mut kinds = kinds;
+        kinds.sort();
+        let mut expected = vec![
+            oids::CONTENT_TYPE.to_vec(),
+            oids::MESSAGE_DIGEST.to_vec(),
+            oids::SIGNING_TIME.to_vec(),
+            oids::SMIME_CAPABILITIES.to_vec(),
+        ];
+        expected.sort();
+        assert_eq!(kinds, expected);
+        let text = String::from_utf8(
+            std::process::Command::new("timeout")
+                .args(["30", "openssl", "cms", "-cmsout", "-print", "-inform", "DER"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write as _;
+                    child.stdin.take().unwrap().write_all(&signature)?;
+                    child.wait_with_output()
+                })
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(text.contains("aes-256-gcm") && text.contains("aes-128-cbc"), "{text}");
+        assert!(text.contains("UTCTIME:Nov 23 10:00:00 2026 GMT"), "signingTime: {text}");
+        for weak in ["rc2", "des"] {
+            assert!(!text.to_lowercase().contains(weak), "{weak}: {text}");
+        }
+        assert_eq!(signing_time(at), [&[0x17, 13][..], b"261123100000Z"].concat());
+        let later = chrono::DateTime::parse_from_rfc3339("2050-01-01T00:00:00Z").unwrap().to_utc();
+        assert_eq!(signing_time(later), [&[0x18, 15][..], b"20500101000000Z"].concat());
+    }
+
+    /// EC keys sign through OpenSSL's CMS_sign, and verify.
+    #[test]
+    fn ec_keys_sign_through_cms() {
+        let bo = fixture_identity("bo");
+        let message = b"From: bo@example.se\r\nTo: ana@example.org\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\nHi.\r\n";
+        let signed = protect_with(&bo, message, "bo@example.se", &[], true, false).unwrap();
+        assert!(openssl_cli_verifies("cms", &signed));
+        let (_, verdict, _) = open_with(&signed, &Certificates::default(), &test_authority()).unwrap();
+        assert_eq!(verdict.signature, Signature::Good("bo@example.se".into()));
     }
 }
