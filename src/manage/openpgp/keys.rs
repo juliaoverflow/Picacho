@@ -118,43 +118,68 @@ fn resigned_subpackets(
     Ok(config)
 }
 
+/// How long a key lasts, as RFC 9580 §5.2.3.13 writes it: seconds after
+/// its creation, at least one, and no more than 32 bits hold.
+fn validity(lasts: std::time::Duration) -> Result<Duration> {
+    let secs = u32::try_from(lasts.as_secs()).ok().filter(|s| *s > 0);
+    secs.map(Duration::from_secs)
+        .context("Choose a time between a second and 136 years after the key was made.")
+}
+
 /// `key` re-signed to expire `lasts` after it was made (RFC 9580
-/// §5.2.3.13), or never with `None`. The newest self-signature of each
-/// user id, and the newest direct-key signature where there is one (v6
-/// keys keep their preferences there, §5.2.3.10), gets a newer copy saying
-/// so (see `resigned_subpackets`); the old ones stay, as they are
-/// superseded by date. A user id whose newest self-signature revokes it
-/// stays revoked.
+/// §5.2.3.13), or never with `None`.
 ///
-/// Subkey binding signatures are left as they are: §5.2.3.13 puts the
-/// key's expiry on the primary key's self-signatures, and a subkey stops
-/// being usable when the primary key does (Picacho's `key_for` and
-/// `unrevoked` check the primary first, as other apps do). A subkey's own
-/// expiry, in its binding, is a separate, shorter limit, which this doesn't
-/// touch. The test checks that a peer encrypting to the key sees it.
+/// The newest self-signature of each user id, the newest direct-key
+/// signature where there is one (v6 keys keep their preferences there,
+/// §5.2.3.10), and the newest binding signature of each subkey get a newer
+/// copy saying so (see `resigned_subpackets`); the old ones stay, as they
+/// are superseded by date. A user id or subkey whose newest signature
+/// revokes it stays revoked.
+///
+/// Subkeys are re-signed as well: §5.2.3.13 puts a subkey's expiry in its
+/// binding signature, counted from the subkey's own creation, and apps
+/// differ on whether a subkey outlives an expired primary key's renewal
+/// or a binding's older, earlier end. Each subkey is set to end when the
+/// primary key does (never, with `None`). A signing subkey's binding keeps
+/// its embedded back-signature (§5.2.1.9), which covers the two keys, not
+/// the binding, and so stays valid.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_expiry(key: &SignedSecretKey, lasts: Option<std::time::Duration>) -> Result<SignedSecretKey> {
-    let lasts = match lasts {
-        None => None,
-        Some(d) => {
-            let secs = u32::try_from(d.as_secs()).ok().filter(|s| *s > 0);
-            ensure!(secs.is_some(), "Choose a time between a second and 136 years.");
-            secs.map(Duration::from_secs)
-        }
-    };
+    resign(key, lasts.map(validity).transpose()?, Supersede::Newer)
+}
+
+/// Whether `resign` adds newer signatures after the old ones or replaces
+/// them (for a key just made, which no one else has yet).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Supersede {
+    Newer,
+    Replace,
+}
+
+fn resign(key: &SignedSecretKey, lasts: Option<Duration>, how: Supersede) -> Result<SignedSecretKey> {
     let primary = &key.primary_key;
     let public = primary.public_key();
+    let made = primary.created_at().as_secs();
     let mut out = key.clone();
     let mut old: Vec<&pgp::packet::Signature> = key.details.direct_signatures.iter().collect();
     old.extend(key.details.users.iter().flat_map(|u| u.signatures.iter()));
-    let created = after(&old);
+    old.extend(key.secret_subkeys.iter().flat_map(|s| s.signatures.iter()));
+    let created = match how {
+        Supersede::Newer => after(&old),
+        Supersede::Replace => Timestamp::now(),
+    };
+    let add = |list: &mut Vec<pgp::packet::Signature>, signature| match how {
+        Supersede::Newer => list.push(signature),
+        Supersede::Replace => *list = vec![signature],
+    };
     let mut resigned = 0;
     if let Some(direct) = newest(&key.details.direct_signatures) {
         let config = resigned_subpackets(direct, created, lasts)?;
         let signature = config
             .sign_key(primary, &Password::empty(), public)
             .context("The key couldn't be re-signed.")?;
-        out.details.direct_signatures.push(signature);
+        add(&mut out.details.direct_signatures, signature);
         resigned += 1;
     }
     for user in &mut out.details.users {
@@ -166,31 +191,70 @@ pub fn set_expiry(key: &SignedSecretKey, lasts: Option<std::time::Duration>) -> 
         let signature = config
             .sign_certification(primary, public, &Password::empty(), user.id.tag(), &user.id)
             .context("The key couldn't be re-signed.")?;
-        user.signatures.push(signature);
+        add(&mut user.signatures, signature);
         resigned += 1;
     }
     ensure!(resigned > 0, "This key has no self-signature to set its expiry on.");
+    for sub in &mut out.secret_subkeys {
+        let Some(binding) = newest(&sub.signatures) else { continue };
+        if binding.typ() != Some(SignatureType::SubkeyBinding) {
+            continue;
+        }
+        // The primary key's end, counted from the subkey's creation; a
+        // subkey made after it ends a second after it was made.
+        let sub_lasts = lasts.map(|l| {
+            let end = i64::from(made) + i64::from(l.as_secs());
+            let from_sub = end - i64::from(sub.key.created_at().as_secs());
+            Duration::from_secs(u32::try_from(from_sub.max(1)).unwrap_or(u32::MAX))
+        });
+        let config = resigned_subpackets(binding, created, sub_lasts)?;
+        let signature = config
+            .sign_subkey_binding(primary, public, &Password::empty(), sub.key.public_key())
+            .context("The key couldn't be re-signed.")?;
+        add(&mut sub.signatures, signature);
+    }
     Ok(out)
 }
 
+/// When `key` expires (RFC 9580 §5.2.3.13), as seconds since 1970, by its
+/// newest self-signature; `None` when it never does.
+pub fn expires(key: &SignedPublicKey) -> Option<i64> {
+    let lasts = super::newest_self_signature(key)?.key_expiration_time()?.as_secs();
+    (lasts > 0).then(|| i64::from(key.primary_key.created_at().as_secs()) + i64::from(lasts))
+}
+
+/// `key`, just made, made to expire `lasts` after now: its self-signatures
+/// and bindings replaced by ones saying so (see `set_expiry`).
+pub(super) fn expiring(key: SignedSecretKey, lasts: Option<std::time::Duration>) -> Result<SignedSecretKey> {
+    let Some(lasts) = lasts else { return Ok(key) };
+    let age = Timestamp::now().as_secs().saturating_sub(key.primary_key.created_at().as_secs());
+    let lasts = validity(lasts + std::time::Duration::from_secs(age.into()))?;
+    resign(&key, Some(lasts), Supersede::Replace)
+}
+
 impl Keyring {
-    // Backend-only until the UI calls it:
-    /// Sets when your key with fingerprint `fp` expires (see `set_expiry`),
-    /// keeping it re-signed in place of the old copy. Others see the new
-    /// date once they have the key again (Autocrypt, WKD, or sent by hand).
+    /// Renews your key with fingerprint `fp`: it expires `from_now` after
+    /// now, or never with `None` (see `set_expiry`). An expired key is
+    /// renewed too, the main reason to (RFC 9580 §5.2.3.13: its expiry is
+    /// only what its newest self-signature says). The re-signed key takes
+    /// the old one's place; others see the new date once they have the
+    /// key again (sent by hand, or by Autocrypt or WKD).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_expiry(&mut self, fp: &str, lasts: Option<std::time::Duration>) -> Result<()> {
-        let at = self
+    pub fn renew(&mut self, fp: &str, from_now: Option<std::time::Duration>) -> Result<()> {
+        use pgp::composed::Deserializable as _;
+        let (at, key) = self
             .secret
             .iter()
-            .position(|k| {
-                use pgp::composed::Deserializable as _;
-                SignedSecretKey::from_string(k)
-                    .is_ok_and(|(k, _)| fingerprint(&SignedPublicKey::from(k)) == fp)
+            .enumerate()
+            .find_map(|(at, k)| {
+                let (k, _) = SignedSecretKey::from_string(k).ok()?;
+                (fingerprint(&SignedPublicKey::from(k.clone())) == fp).then_some((at, k))
             })
             .context("That isn't one of your keys.")?;
-        let key = self.secret_keys().into_iter().find(|k| fingerprint(&SignedPublicKey::from(k.clone())) == fp);
-        let key = key.context("That isn't one of your keys.")?;
+        let lasts = from_now.map(|d| {
+            let age = Timestamp::now().as_secs().saturating_sub(key.primary_key.created_at().as_secs());
+            d + std::time::Duration::from_secs(age.into())
+        });
         self.secret[at] = set_expiry(&key, lasts)?.to_armored_string(ArmorOptions::default())?;
         Ok(())
     }
@@ -323,28 +387,55 @@ mod tests {
         }
         let ids = |k: &SignedSecretKey| k.details.users.iter().map(|u| newest_of(u).created().unwrap().as_secs()).collect::<Vec<_>>();
         assert!(ids(&twice).iter().zip(ids(&once)).all(|(t, o)| *t > o));
-        // Subkey bindings are left as they were (see `set_expiry`).
+        // Each subkey's binding is re-signed to end with the primary key,
+        // counted from its own creation, keeping its flags and, for the
+        // signing subkey, its back-signature.
+        let made = twice.primary_key.created_at().as_secs();
         for (new, old) in twice.secret_subkeys.iter().zip(&ana.secret_subkeys) {
-            assert_eq!(new.signatures, old.signatures);
+            let binding = newest(&new.signatures).unwrap();
+            let before = newest(&old.signatures).unwrap();
+            assert_eq!(binding.typ(), Some(SignatureType::SubkeyBinding));
+            assert!(binding.created().unwrap().as_secs() > before.created().unwrap().as_secs());
+            let end = made + 2 * year.as_secs() as u32;
+            assert_eq!(binding.key_expiration_time(), Some(Duration::from_secs(end - new.key.created_at().as_secs())));
+            assert_eq!(binding.key_flags(), before.key_flags());
+            assert_eq!(binding.embedded_signature().is_some(), before.embedded_signature().is_some());
+            binding.verify_subkey_binding(&twice.primary_key.public_key(), new.key.public_key()).unwrap();
         }
-        // None: never expires again.
+        assert_eq!(expires(&SignedPublicKey::from(twice.clone())), Some(i64::from(made) + 2 * year.as_secs() as i64));
+        // None: never expires again, nor do the subkeys.
         let cleared = set_expiry(&twice, None).unwrap();
         for user in &cleared.details.users {
             assert_eq!(newest_of(user).key_expiration_time(), None);
         }
+        for sub in &cleared.secret_subkeys {
+            assert_eq!(newest(&sub.signatures).unwrap().key_expiration_time(), None);
+        }
+        assert_eq!(expires(&SignedPublicKey::from(cleared.clone())), None);
         assert!(!super::super::primary_expired(&SignedPublicKey::from(cleared)));
         assert!(set_expiry(&ana, Some(std::time::Duration::ZERO)).is_err());
     }
 
+    /// The key Bo has for Ana: the one she has now, imported over his copy.
+    fn send_to_bo(anas: &Keyring, bos: &mut Keyring) -> SignedPublicKey {
+        let key = SignedPublicKey::from(anas.own_key("ana@example.org").unwrap());
+        bos.import(&key.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+        key
+    }
+
     /// An expiry in the past: once others have the re-signed key (exported
-    /// and imported over the copy they had), they no longer encrypt to it
-    /// nor trust new signatures by it; cleared, they do again.
+    /// and imported over the copy they had, the newest self-signature
+    /// winning), they no longer encrypt to it, its encryption subkey
+    /// included, nor trust signatures by it. Renewed, even though expired,
+    /// it encrypts and verifies again; renewing with `None` clears it.
     #[test]
-    fn expired_keys_are_neither_encrypted_to_nor_trusted() {
+    fn expired_keys_are_neither_encrypted_to_nor_trusted_until_renewed() {
         let ana = key_made_days_ago("Ana <ana@example.org>", 10);
         let bo = super::super::test_key("Bo <bo@example.se>", "");
         let mut anas = Keyring::default();
-        anas.import(&ana.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+        // Ten days old, set to have lasted a day: expired.
+        let lapsed = set_expiry(&ana, Some(std::time::Duration::from_secs(86_400))).unwrap();
+        anas.import(&lapsed.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
         let mut bos = Keyring::default();
         bos.import(&bo.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
         bos.import(&SignedPublicKey::from(ana.clone()).to_armored_string(ArmorOptions::default()).unwrap(), "")
@@ -355,32 +446,79 @@ mod tests {
         let message = b"From: Bo <bo@example.se>\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\nHi\r\n";
         let from_ana = b"From: Ana <ana@example.org>\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\nHi\r\n";
         assert!(protect(message, "bo@example.se", &["ana@example.org".into()], encrypt, &bos).is_ok());
+        let signed = protect(from_ana, "ana@example.org", &[], sign, &anas).unwrap();
+        assert!(matches!(open(&signed, &bos).unwrap().1.signature, Signature::Good(_)));
 
-        // Ten days old, set to last a day: expired.
-        anas.set_expiry(&fp, Some(std::time::Duration::from_secs(86_400))).unwrap();
-        assert!(anas.set_expiry("00", None).is_err());
-        assert_eq!(anas.list().len(), 1, "re-signed in place");
-        let resigned = anas.own_key("ana@example.org").unwrap();
-        bos.import(&SignedPublicKey::from(resigned.clone()).to_armored_string(ArmorOptions::default()).unwrap(), "")
-            .unwrap();
+        let had = send_to_bo(&anas, &mut bos);
         assert_eq!(bos.list().len(), 2, "merged into the copy Bo had");
+        let day_after = bos.list().iter().find(|k| k.fingerprint == fp).unwrap().expires;
+        assert_eq!(day_after, Some(i64::from(ana.primary_key.created_at().as_secs()) + 86_400));
         assert!(bos.key_for("ana@example.org").is_none());
+        assert!(super::super::encryption_subkey(&had).is_none(), "the subkey has expired too");
         let error = protect(message, "bo@example.se", &["ana@example.org".into()], encrypt, &bos).unwrap_err();
         assert!(error.to_string().contains("ana@example.org"), "{error}");
-        let signed = protect(from_ana, "ana@example.org", &[], sign, &anas).unwrap();
         assert_eq!(open(&signed, &bos).unwrap().1.signature, Signature::UnknownKey);
 
-        // Cleared, and the newer copy imported again: the newest wins.
-        anas.set_expiry(&fp, None).unwrap();
-        let renewed = anas.own_key("ana@example.org").unwrap();
-        bos.import(&SignedPublicKey::from(renewed).to_armored_string(ArmorOptions::default()).unwrap(), "")
-            .unwrap();
+        // Renewed for a year from now, though expired.
+        let year = std::time::Duration::from_secs(365 * 86_400);
+        anas.renew(&fp, Some(year)).unwrap();
+        assert!(anas.renew("00", None).is_err());
+        assert_eq!(anas.list().len(), 1, "re-signed in place");
+        let expires = anas.list()[0].expires.unwrap();
+        let wanted = chrono::Utc::now().timestamp() + year.as_secs() as i64;
+        assert!((expires - wanted).abs() <= 2, "{expires} vs {wanted}");
+        let renewed = send_to_bo(&anas, &mut bos);
+        let sub = super::super::encryption_subkey(&renewed).expect("the encryption subkey is usable again");
+        let binding = newest(&sub.signatures).unwrap();
+        assert_eq!(
+            i64::from(sub.key.created_at().as_secs()) + i64::from(binding.key_expiration_time().unwrap().as_secs()),
+            expires
+        );
         assert!(bos.key_for("ana@example.org").is_some());
-        assert!(protect(message, "bo@example.se", &["ana@example.org".into()], encrypt, &bos).is_ok());
+        let sent = protect(message, "bo@example.se", &["ana@example.org".into()], encrypt, &bos).unwrap();
+        assert!(open(&sent, &anas).unwrap().1.decrypted);
         assert!(matches!(open(&signed, &bos).unwrap().1.signature, Signature::Good(_)));
-        // An older copy imported after doesn't undo it.
-        bos.import(&SignedPublicKey::from(resigned).to_armored_string(ArmorOptions::default()).unwrap(), "")
-            .unwrap();
+        // The lapsed copy imported after doesn't undo it: the newest wins.
+        bos.import(&had.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
         assert!(bos.key_for("ana@example.org").is_some());
+
+        // Renewed with None: never expires.
+        anas.renew(&fp, None).unwrap();
+        assert_eq!(anas.list()[0].expires, None);
+        send_to_bo(&anas, &mut bos);
+        assert_eq!(bos.list().iter().find(|k| k.fingerprint == fp).unwrap().expires, None);
+        assert!(bos.key_for("ana@example.org").is_some());
+    }
+
+    /// New keys don't expire unless asked; asked, they and their subkeys
+    /// end that long from now.
+    #[test]
+    fn new_keys_expire_only_when_asked() {
+        let mut ring = Keyring::default();
+        let fp = ring.create("Ana", "ana@example.org", None).unwrap();
+        assert_eq!(ring.list()[0].expires, None);
+        let key = ring.own_key("ana@example.org").unwrap();
+        assert!(key.secret_subkeys.iter().all(|s| newest(&s.signatures).unwrap().key_expiration_time().is_none()));
+        ring.remove(&fp);
+
+        let two_years = std::time::Duration::from_secs(2 * 365 * 86_400);
+        ring.create("Ana", "ana@example.org", Some(two_years)).unwrap();
+        let info = &ring.list()[0];
+        let wanted = chrono::Utc::now().timestamp() + two_years.as_secs() as i64;
+        assert!((info.expires.unwrap() - wanted).abs() <= 2);
+        let key = ring.own_key("ana@example.org").unwrap();
+        let public = SignedPublicKey::from(key.clone());
+        public.verify_bindings().unwrap();
+        // Signed once, not superseded: a new key has one of each.
+        assert!(key.details.users.iter().all(|u| u.signatures.len() == 1));
+        assert!(key.secret_subkeys.iter().all(|s| s.signatures.len() == 1));
+        for sub in &key.secret_subkeys {
+            let lasts = sub.signatures[0].key_expiration_time().unwrap().as_secs();
+            assert!((i64::from(sub.key.created_at().as_secs()) + i64::from(lasts) - wanted).abs() <= 2);
+        }
+        assert!(newest(&key.details.users[0].signatures).unwrap().preferred_symmetric_algs().contains(
+            &pgp::crypto::sym::SymmetricKeyAlgorithm::AES256
+        ));
+        assert!(ring.key_for("ana@example.org").is_some());
     }
 }

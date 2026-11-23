@@ -370,7 +370,7 @@ impl MailApp {
                             ring.own_key(&email).is_none(),
                             "You already have a key for {email}."
                         );
-                        let fp = ring.create(&name, &email)?;
+                        let fp = ring.create(&name, &email, None)?;
                         b.set_keyring(ring)?;
                         Ok(fp)
                     },

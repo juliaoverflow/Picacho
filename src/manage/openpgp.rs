@@ -57,6 +57,9 @@ pub struct KeyInfo {
     pub found: bool,
     /// A found key you compared and marked as checked.
     pub verified: bool,
+    /// When the key expires (or expired), as seconds since 1970; `None`
+    /// when it never does (see `keys::expires`).
+    pub expires: Option<i64>,
 }
 
 /// What a message's OpenPGP protection turned out to be when read.
@@ -170,6 +173,7 @@ impl Keyring {
                     secret: true,
                     found: false,
                     verified: true,
+                    expires: keys::expires(&public),
                 }
             })
             .collect();
@@ -180,6 +184,7 @@ impl Keyring {
         {
             let fp = fingerprint(&k);
             out.push(KeyInfo {
+                expires: keys::expires(&k),
                 found: self.found.contains(&fp),
                 verified: !self.found.contains(&fp) || self.verified.contains(&fp),
                 fingerprint: fp,
@@ -1243,9 +1248,9 @@ fn encryption_subkey(key: &SignedPublicKey) -> Option<&pgp::composed::SignedPubl
 
 /// A new key of yours for `name <email>`, as GnuPG makes them (Ed25519
 /// certifying primary, Ed25519 signing and Curve25519 encryption subkeys;
-/// version 4, which every OpenPGP app reads). It doesn't expire: the
-/// library makes keys without an end date.
-pub fn generate_key(name: &str, email: &str) -> Result<SignedSecretKey> {
+/// version 4, which every OpenPGP app reads). It expires `lasts` from now
+/// (RFC 9580 §5.2.3.13, see `keys::set_expiry`), or never with `None`.
+pub fn generate_key(name: &str, email: &str, lasts: Option<std::time::Duration>) -> Result<SignedSecretKey> {
     use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
     use pgp::crypto::ecc_curve::ECCCurve;
     ensure!(email.contains('@'), "Enter the address the key is for.");
@@ -1278,11 +1283,12 @@ pub fn generate_key(name: &str, email: &str) -> Result<SignedSecretKey> {
             sign.build().context("The key couldn't be made.")?,
             encrypt.build().context("The key couldn't be made.")?,
         ]);
-    params
+    let key = params
         .build()
         .context("The key couldn't be made.")?
         .generate(rand08::thread_rng())
-        .context("The key couldn't be made.")
+        .context("The key couldn't be made.")?;
+    keys::expiring(key, lasts)
 }
 /// The armored, password-encrypted key an Autocrypt Setup Message
 /// carries (Autocrypt 1.1 §4.4: a message with `Autocrypt-Setup-Message:
@@ -1336,10 +1342,10 @@ impl Keyring {
         }
         self.import(&text, "")
     }
-    /// Makes a new key of yours for `email` and keeps it (see
-    /// `generate_key`). Returns its fingerprint.
-    pub fn create(&mut self, name: &str, email: &str) -> Result<String> {
-        let key = generate_key(name, email)?;
+    /// Makes a new key of yours for `email`, expiring `lasts` from now or
+    /// never, and keeps it (see `generate_key`). Returns its fingerprint.
+    pub fn create(&mut self, name: &str, email: &str, lasts: Option<std::time::Duration>) -> Result<String> {
+        let key = generate_key(name, email, lasts)?;
         let fp = fingerprint(&SignedPublicKey::from(key.clone()));
         self.secret.push(key.to_armored_string(ArmorOptions::default())?);
         Ok(fp)
