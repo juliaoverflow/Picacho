@@ -1569,6 +1569,11 @@ impl Session {
     pub fn max_get(&self) -> usize {
         self.max_get.max(1)
     }
+    /// The most objects one /set may create, change or destroy
+    /// (`maxObjectsInSet`).
+    pub fn max_set(&self) -> usize {
+        self.max_set.max(1)
+    }
     /// Runs `work` on each item, as many at once as the server takes
     /// requests (RFC 8620 §2: `maxConcurrentRequests`), returning the
     /// results in the items' order.
@@ -1881,35 +1886,48 @@ impl Session {
         keywords: &[&str],
     ) -> Result<HashMap<String, String>> {
         let kw: Map<String, Value> = keywords.iter().map(|k| ((*k).to_owned(), json!(true))).collect();
-        let create: Map<String, Value> = ids
-            .iter()
-            .map(|id| {
-                // Without keywords, a copy keeps the original's (RFC 8621
-                // §4.7: read, starred and labels stay as they were).
-                let mut o = json!({ "id": id, "mailboxIds": { mailbox: true } });
-                if !kw.is_empty() {
-                    o["keywords"] = Value::Object(kw.clone());
-                }
-                (id.clone(), o)
-            })
-            .collect();
-        let v = self.one(
-            "Email/copy",
-            json!({
-                "fromAccountId": from_account,
-                "accountId": self.account_id,
-                "create": create,
-            }),
-        )?;
-        if let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next()) {
-            bail!("The server didn't copy message {id}: {}", set_error(e));
+        let mut copied = HashMap::new();
+        let mut refused = None;
+        // RFC 8620 §5.4: /copy creates as /set does, so at most
+        // `maxObjectsInSet` at a time.
+        for chunk in ids.chunks(self.max_set()) {
+            let create: Map<String, Value> = chunk
+                .iter()
+                .map(|id| {
+                    // Without keywords, a copy keeps the original's (RFC 8621
+                    // §4.7: read, starred and labels stay as they were).
+                    let mut o = json!({ "id": id, "mailboxIds": { mailbox: true } });
+                    if !kw.is_empty() {
+                        o["keywords"] = Value::Object(kw.clone());
+                    }
+                    (id.clone(), o)
+                })
+                .collect();
+            let v = self.one(
+                "Email/copy",
+                json!({
+                    "fromAccountId": from_account,
+                    "accountId": self.account_id,
+                    "create": create,
+                }),
+            )?;
+            if refused.is_none()
+                && let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next())
+            {
+                refused = Some(format!("The server didn't copy message {id}: {}", set_error(e)));
+            }
+            copied.extend(
+                v["created"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, c)| Some((k.clone(), c["id"].as_str()?.to_owned()))),
+            );
         }
-        Ok(v["created"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter_map(|(k, c)| Some((k.clone(), c["id"].as_str()?.to_owned())))
-            .collect())
+        if let Some(refused) = refused {
+            bail!(refused);
+        }
+        Ok(copied)
     }
     /// Reads a message kept as a blob (an attached `.eml`) without adding
     /// it to the mailbox (Email/parse, RFC 8621 §4.9): its headers, text
@@ -1946,16 +1964,23 @@ impl Session {
     /// Copies blobs from another account this sign-in reaches (Blob/copy,
     /// RFC 8620 §6.3), returning the new ids by old id.
     pub fn copy_blobs(&self, from_account: &str, blobs: &[String]) -> Result<HashMap<String, String>> {
-        let v = self.one(
-            "Blob/copy",
-            json!({ "fromAccountId": from_account, "accountId": self.account_id, "blobIds": blobs }),
-        )?;
-        Ok(v["copied"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter_map(|(k, n)| Some((k.clone(), n.as_str()?.to_owned())))
-            .collect())
+        let mut copied = HashMap::new();
+        // RFC 8620 §6.3: Blob/copy is bounded as a /set is
+        // (`maxObjectsInSet`).
+        for chunk in blobs.chunks(self.max_set()) {
+            let v = self.one(
+                "Blob/copy",
+                json!({ "fromAccountId": from_account, "accountId": self.account_id, "blobIds": chunk }),
+            )?;
+            copied.extend(
+                v["copied"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, n)| Some((k.clone(), n.as_str()?.to_owned()))),
+            );
+        }
+        Ok(copied)
     }
     /// Uploads small data in the API request itself, where the server has
     /// the Blob extension (Blob/upload, RFC 9404), rather than a separate

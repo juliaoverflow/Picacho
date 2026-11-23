@@ -1090,14 +1090,15 @@ impl Backend {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let v = s.call(&[(
-                "EmailSubmission/get",
-                json!({ "accountId": s.account(), "ids": ids, "properties": ["id", "emailId", "sendAt"] }),
-            )])?;
-            let list = match v.first() {
-                Some(answer) => answer.value()?["list"].as_array().cloned().unwrap_or_default(),
-                None => Vec::new(),
-            };
+            // RFC 8620 §5.1: at most `maxObjectsInGet` ids in one /get.
+            let mut list = Vec::new();
+            for chunk in ids.chunks(s.max_get()) {
+                let v = s.call_one(
+                    "EmailSubmission/get",
+                    json!({ "accountId": s.account(), "ids": chunk, "properties": ["id", "emailId", "sendAt"] }),
+                )?;
+                list.extend(v["list"].as_array().cloned().unwrap_or_default());
+            }
             let emails: Vec<String> = list
                 .iter()
                 .filter_map(|e| e["emailId"].as_str().map(str::to_owned))

@@ -68,6 +68,9 @@ struct Server {
     query_limit: usize,
     /// Blob ids downloaded, in order.
     downloads: Vec<String>,
+    /// The session's maxObjectsInGet and maxObjectsInSet, where set (0:
+    /// 100); calls naming more are refused with `requestTooLarge`.
+    max_objects: usize,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -95,7 +98,7 @@ impl Server {
         json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
-                    "maxObjectsInGet": 100, "maxObjectsInSet": 100,
+                    "maxObjectsInGet": self.object_limit(), "maxObjectsInSet": self.object_limit(),
                     "maxCallsInRequest": 2, "maxSizeRequest": 1_000_000,
                 },
                 "urn:ietf:params:jmap:mail": {},
@@ -119,6 +122,21 @@ impl Server {
             "uploadUrl": format!("{base}/upload/{{accountId}}/"),
             "state": self.state_name(),
         })
+    }
+    fn object_limit(&self) -> usize {
+        if self.max_objects == 0 { 100 } else { self.max_objects }
+    }
+    /// RFC 8620 §5.1, §5.3: a call naming more objects than the session
+    /// allows is refused.
+    fn too_many_objects(&self, args: &Value) -> bool {
+        let count = |v: &Value| match v {
+            Value::Array(a) => a.len(),
+            Value::Object(o) => o.len(),
+            _ => 0,
+        };
+        ["ids", "create", "update", "destroy", "blobIds", "emailIds"]
+            .iter()
+            .any(|k| count(&args[*k]) > self.object_limit())
     }
     fn touch(&mut self, id: &str, destroyed: bool) {
         self.state += 1;
@@ -198,6 +216,9 @@ impl Server {
                 "error".into(),
                 json!({ "type": "invalidArguments", "arguments": ["ids"] }),
             )];
+        }
+        if self.too_many_objects(args) {
+            return vec![("error".into(), json!({ "type": "requestTooLarge" }))];
         }
         let ids_of = |args: &Value| -> Option<Vec<String>> {
             if let Some(r) = args.get("#ids") {
@@ -572,6 +593,37 @@ impl Server {
                     out.extend(self.method("Email/set", &update, earlier));
                 }
                 out
+            }
+            "Email/copy" => {
+                let mut created = serde_json::Map::new();
+                for (key, c) in args["create"].as_object().into_iter().flatten() {
+                    let Some(original) = self.emails.iter().find(|m| m.id == c["id"]).cloned() else {
+                        continue;
+                    };
+                    self.next += 1;
+                    let id = format!("C{}", self.next);
+                    self.emails.push(Message {
+                        id: id.clone(),
+                        mailboxes: c["mailboxIds"].as_object().unwrap().keys().cloned().collect(),
+                        ..original
+                    });
+                    created.insert(key.clone(), json!({ "id": id }));
+                }
+                vec![(name.into(), json!({ "created": created }))]
+            }
+            "Blob/copy" => {
+                let copied: serde_json::Map<String, Value> = args["blobIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b.as_str())
+                    .map(|b| (b.to_owned(), json!(format!("copy-{b}"))))
+                    .collect();
+                vec![(name.into(), json!({ "copied": copied }))]
+            }
+            "CalendarEventNotification/set" => {
+                let destroyed = args["destroy"].clone();
+                vec![(name.into(), json!({ "destroyed": destroyed }))]
             }
             "SieveScript/get" => {
                 let list: Vec<Value> = self
@@ -1819,5 +1871,57 @@ fn jmap_contacts_without_changes_are_read_whole() -> Result<()> {
         .cards
         .push(json!({ "@type": "Card", "id": "K1", "uid": "cy", "name": { "full": "Cy" } }));
     assert_eq!(b.sync_contacts()?, 2);
+    Ok(())
+}
+
+/// Copies, blob copies, held submissions and dismissed notices go in
+/// pieces the server takes (RFC 8620 §5.1, §5.3: `maxObjectsInGet` and
+/// `maxObjectsInSet`), however many there are.
+#[test]
+fn jmap_batches_respect_the_object_limits() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        max_objects: 2,
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    for i in 0..5 {
+        fixture.emails.push(Message {
+            id: format!("M{i}"),
+            blob: "B0".into(),
+            mailboxes: vec!["i".into()],
+            keywords: vec![],
+            subject: format!("Message {i}"),
+            received: "2026-10-24T10:00:00Z".into(),
+        });
+        fixture.undo.insert(format!("held{i}"), "pending".into());
+    }
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let ids: Vec<String> = (0..5).map(|i| format!("M{i}")).collect();
+    let copied = b.with_jmap(&a, |s| s.copy_from("u2", &ids, "w", &[]))?;
+    assert_eq!(copied.len(), 5);
+    let blobs: Vec<String> = (0..5).map(|i| format!("B{i}")).collect();
+    let copied = b.with_jmap(&a, |s| s.copy_blobs("u2", &blobs))?;
+    assert_eq!(copied.len(), 5);
+    assert_eq!(b.held_submissions(&a)?.len(), 5);
+    let notices: Vec<crate::sync::jscal::Notice> = (0..5)
+        .map(|i| crate::sync::jscal::Notice {
+            id: format!("n{i}"),
+            kind: "CalendarEventNotification".into(),
+            text: String::new(),
+        })
+        .collect();
+    b.with_jmap(&a, |s| crate::sync::jscal::dismiss_notices(s, &notices))?;
+    let s = server.lock().unwrap();
+    let count = |m: &str| s.calls.iter().filter(|c| *c == m).count();
+    assert_eq!(count("Email/copy"), 3);
+    assert_eq!(count("Blob/copy"), 3);
+    assert_eq!(count("CalendarEventNotification/set"), 3);
+    assert!(count("EmailSubmission/get") >= 3, "{:?}", s.calls);
     Ok(())
 }

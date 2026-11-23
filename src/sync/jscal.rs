@@ -1572,8 +1572,10 @@ pub fn dismiss_notices(s: &Session, notices: &[Notice]) -> Result<()> {
             .filter(|n| n.kind == kind)
             .map(|n| n.id.as_str())
             .collect();
-        if let (Some(account), false) = (account, ids.is_empty()) {
-            s.call_one(&format!("{kind}/set"), json!({ "accountId": account, "destroy": ids }))?;
+        let Some(account) = account else { continue };
+        // RFC 8620 §5.3: at most `maxObjectsInSet` in one /set.
+        for chunk in ids.chunks(s.max_set()) {
+            s.call_one(&format!("{kind}/set"), json!({ "accountId": account, "destroy": chunk }))?;
         }
     }
     Ok(())
