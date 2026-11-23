@@ -646,6 +646,64 @@ impl HtmlView {
     }
 }
 
+/// The most links a screen reader is offered of one email: a newsletter's
+/// footer can hold hundreds, each a node in every frame's tree.
+const MAX_ACCESSIBLE_LINKS: usize = 200;
+
+/// The email's text for screen readers (see `EmailDocument::accessible_text`,
+/// a line a block) as its paragraphs: its non-blank lines.
+pub(super) fn accessible_paragraphs(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty())
+}
+
+/// The email's paragraphs for screen readers, one text node each, so a
+/// reader moves through the email a paragraph at a time. Drawn nowhere.
+fn accessible_text(text: SharedString) -> impl IntoElement {
+    div()
+        .id("html-email-text")
+        .absolute()
+        .size_0()
+        .overflow_hidden()
+        .role(gpui::accesskit::Role::Group)
+        .a11y_synthetic_children(move |builder| {
+            for (i, paragraph) in accessible_paragraphs(&text).enumerate() {
+                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Label);
+                node.set_value(paragraph);
+                builder.push_child(builder.synthetic_node_id(i), node);
+            }
+        })
+}
+
+/// The email's links for screen readers (text, address), which open when
+/// activated. Drawn nowhere.
+fn accessible_links(
+    links: Vec<(String, String)>,
+    opener: WeakEntity<HtmlView>,
+) -> impl IntoElement {
+    let links = links.into_iter().take(MAX_ACCESSIBLE_LINKS).enumerate();
+    div()
+        .id("html-email-links")
+        .absolute()
+        .size_0()
+        .overflow_hidden()
+        .role(gpui::accesskit::Role::List)
+        .aria_label("Links in this message")
+        .children(links.map(move |(i, (label, href))| {
+            let opener = opener.clone();
+            // AccessKit's Click, handled here: GPUI's own presses the middle
+            // of the node's bounds, which for this undrawn node is the
+            // email's top left, not the link.
+            div()
+                .id(("html-email-link", i))
+                .role(gpui::accesskit::Role::Link)
+                .aria_label(label)
+                .aria_description(href.clone())
+                .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                    let _ = opener.update(cx, |_, cx| cx.emit(HtmlLink::Opened(href.clone())));
+                })
+        }))
+}
+
 /// GPUI's modifier keys as Blitz's.
 fn blitz_modifiers(m: Modifiers) -> keyboard_types::Modifiers {
     let mut out = keyboard_types::Modifiers::empty();
@@ -795,30 +853,16 @@ impl Render for HtmlView {
                     cx.stop_propagation();
                 }
             }))
-            // For screen readers: the email as a document with its text,
-            // and its links as buttons that open them (WCAG 1.1.1, 2.1.1).
+            // For screen readers: the email as a document of its paragraphs,
+            // then its links, which open when activated (WCAG 1.1.1, 1.3.1,
+            // 2.1.1). Both are drawn nowhere: the painted strips are what
+            // sighted readers see.
             .role(gpui::accesskit::Role::Document)
             .aria_label("Message")
             .when_some(self.accessible.clone(), |d, (text, links)| {
-                d.aria_description(text).child(
-                    div()
-                        .id("html-email-links")
-                        .absolute()
-                        .size_0()
-                        .overflow_hidden()
-                        .role(gpui::accesskit::Role::List)
-                        .aria_label("Links in this message")
-                        .children(links.into_iter().take(200).enumerate().map(|(i, (label, href))| {
-                            div()
-                                .id(("html-email-link", i))
-                                .role(gpui::accesskit::Role::Link)
-                                .aria_label(label)
-                                .aria_description(href.clone())
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(HtmlLink::Opened(href.clone()))
-                                }))
-                        })),
-                )
+                let opener = cx.entity().downgrade();
+                d.child(accessible_text(text))
+                    .child(accessible_links(links, opener))
             })
             .child(
                 canvas(

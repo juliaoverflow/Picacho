@@ -142,6 +142,34 @@ borders and rules lighten, saturated brand surfaces and the light text on
 them are kept slightly dimmed, text on a surface that stays light keeps its
 dark color, and images, SVG images included, are untouched.
 
+Screen readers see the email as a Document named "Message" (`html/view.rs`).
+It holds a group with one text node per paragraph of the email, with images
+given by their alt text and hidden content left out
+(`EmailDocument::accessible_text`). After that comes a list, "Links in this
+message", with up to 200 links. Each is named by its text, or by its address
+when it has none, and is described by its address. Activating one
+(AccessKit's Click) opens it the same way a click on the painted link does,
+including the link warnings. None of these nodes are drawn. They are zero-size
+boxes at the email's top left, so a screen reader's highlight shows there.
+
+Testing with a screen reader needs a real one. For every reader below, open
+an HTML newsletter with several paragraphs and links, then move focus into
+the reader. Tab until the email itself has focus.
+- VoiceOver (macOS, ⌘F5): press VO-Shift-↓ on "Message, document" to enter
+  it. VO-→ should read the email one paragraph at a time, then the "Links in
+  this message" list. VO-Space on a link should open it in the browser, or
+  show the link warning. The Rotor (VO-U) → Links should list the same links.
+- NVDA (Windows): in browse mode, ↓ should read the paragraphs in order and
+  K should jump between the links. Enter on a link should open it. NVDA+F7
+  should list the links.
+- Orca (GNOME, Super-Alt-S): Flat Review (KP-7/8/9) or Tab into the email
+  should read the paragraphs. In Orca's Find or Where Am I, each link should
+  be announced as a link with its address. Enter or KP-/ (activate) should
+  open it.
+
+Accessibility Inspector (macOS), Accessibility Insights (Windows) or Accerciser
+(Linux) should show the Document → Group (static texts) and List (links) tree.
+
 The "to …" line under the sender opens the message's details: addresses,
 mailed-by (the SPF envelope domain), signed-by (DKIM domains), transport
 security (TLS on the last hop, or end-to-end encryption) and SPF/DKIM/DMARC

@@ -788,3 +788,41 @@ fn dark_reading_keeps_text_readable() {
     let white = [1., 1., 1., 1.];
     assert_eq!(readable_on(white, page), white);
 }
+
+#[test]
+fn screen_readers_get_the_emails_paragraphs_and_its_links() {
+    let mut email = EmailDocument::new(
+        "<style>.x{color:red}</style><body><h1>Order shipped</h1>\
+         <p>Your <b>parcel</b> is on its way. <img src='cid:a' alt='Truck'></p>\
+         <div style='display:none'>preheader text</div>\
+         <p aria-hidden='true'>spacer</p>\
+         <p><a href='https://example.com/track'>Track  it</a> or <a href='mailto:help@example.com'></a></p>",
+        true,
+    );
+    email.layout(600);
+    let (text, links) = email.accessible_text();
+    let paragraphs: Vec<&str> = super::view::accessible_paragraphs(&text).collect();
+    assert_eq!(
+        paragraphs,
+        [
+            "Order shipped",
+            "Your parcel is on its way. [Truck]",
+            "Track it or"
+        ],
+        "{text:?}"
+    );
+    assert_eq!(
+        links,
+        [
+            (
+                "Track it".to_owned(),
+                "https://example.com/track".to_owned()
+            ),
+            // A link with no text is named by its address.
+            (
+                "mailto:help@example.com".to_owned(),
+                "mailto:help@example.com".to_owned()
+            ),
+        ]
+    );
+}
