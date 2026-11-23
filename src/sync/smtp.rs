@@ -524,6 +524,9 @@ const HELLO: &str = "[127.0.0.1]";
 struct Reply {
     code: u16,
     lines: Vec<String>,
+    /// The server offered ENHANCEDSTATUSCODES: its replies start with one
+    /// (RFC 2034 §3). Elsewhere text like "5.1.1" is only text.
+    enhanced: bool,
 }
 impl Reply {
     /// A completion (2xx). Intermediate replies (3xx: 334, 354) are
@@ -531,12 +534,34 @@ impl Reply {
     fn positive(&self) -> bool {
         (200..300).contains(&self.code)
     }
+    /// The reply's text, its lines joined. RFC 2034 §4: each line of a
+    /// multi-line reply starts with the same enhanced code; it is kept on
+    /// the first line only.
     fn text(&self) -> String {
-        self.lines.join(" ")
+        let code = self.enhanced().map(|_| {
+            self.lines[0].split_whitespace().next().unwrap_or("").to_owned()
+        });
+        let mut out = String::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            let line = match &code {
+                Some(code) if i > 0 => line
+                    .strip_prefix(code.as_str())
+                    .map_or(line.as_str(), str::trim_start),
+                _ => line.as_str(),
+            };
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(line);
+        }
+        out
     }
     /// The enhanced status code (RFC 3463) the reply starts with, if any.
     /// Only one whose class agrees with the reply code's (RFC 2034 §4).
     fn enhanced(&self) -> Option<(u8, u16, u16)> {
+        if !self.enhanced {
+            return None;
+        }
         enhanced_code(self.lines.first()?).filter(|(class, ..)| u16::from(*class) == self.code / 100)
     }
     /// "Too many recipients" (RFC 5321 §4.5.3.1.10): 452, or 4.5.3. The
@@ -635,11 +660,14 @@ impl Patience for native_tls::TlsStream<Wire> {
 /// An SMTP session: commands out, replies in.
 struct Session<S: Read + Write> {
     reader: BufReader<S>,
+    /// The last EHLO listed ENHANCEDSTATUSCODES (RFC 2034).
+    enhanced: bool,
 }
 impl<S: Read + Write + Patience> Session<S> {
     fn new(stream: S) -> Self {
         Self {
             reader: BufReader::new(stream),
+            enhanced: false,
         }
     }
     fn reply(&mut self) -> Result<Reply> {
@@ -673,7 +701,11 @@ impl<S: Read + Write + Patience> Session<S> {
             );
             lines.push(rest.get(1..).unwrap_or("").to_owned());
             if !rest.starts_with('-') {
-                return Ok(Reply { code, lines });
+                return Ok(Reply {
+                    code,
+                    lines,
+                    enhanced: self.enhanced,
+                });
             }
         }
     }
@@ -698,7 +730,7 @@ impl<S: Read + Write + Patience> Session<S> {
     fn expect(&mut self, line: &str, what: &str) -> Result<Reply> {
         let reply = self.command(line)?;
         if !reply.positive() {
-            return Err(Refused(format!("{what}: {} {}", reply.code, reply.text())).into());
+            return Err(Refused(format!("{what}: {}", reply.explained())).into());
         }
         Ok(reply)
     }
@@ -713,6 +745,7 @@ impl<S: Read + Write + Patience> Session<S> {
                 // HELO takes a domain, not an address literal (RFC 5321
                 // §4.1.1.1).
                 self.expect("HELO localhost.localdomain", "The outgoing server refused HELO")?;
+                self.enhanced = false;
                 return Ok(ServerLimits::default());
             }
             return Err(Refused(format!(
@@ -721,9 +754,9 @@ impl<S: Read + Write + Patience> Session<S> {
             ))
             .into());
         }
-        Ok(server_limits(
-            reply.lines.iter().skip(1).map(String::as_str),
-        ))
+        let limits = server_limits(reply.lines.iter().skip(1).map(String::as_str));
+        self.enhanced = limits.enhanced;
+        Ok(limits)
     }
     /// Signs in with the best mechanism the server offers.
     fn authenticate(
@@ -796,7 +829,7 @@ impl<S: Read + Write + Patience> Session<S> {
                     let extra = reply
                         .lines
                         .first()
-                        .map(|t| match enhanced_code(t) {
+                        .map(|t| match reply.enhanced() {
                             Some(_) => t.split_once(' ').map_or("", |(_, rest)| rest.trim()),
                             None => t.trim(),
                         })
@@ -816,15 +849,16 @@ impl<S: Read + Write + Patience> Session<S> {
                     }
                 }
                 _ => {
+                    // RFC 4954 §6 and RFC 3463: 535 5.7.8 and the like say
+                    // why; the mechanism's own reason (SCRAM's e=) follows.
                     let why = match exchange.refusal() {
-                        Some(reason) => format!("{} ({reason})", reply.text()),
-                        None => reply.text(),
+                        Some(reason) => format!("{} ({reason})", reply.explained()),
+                        None => reply.explained(),
                     };
                     return Err(Refused(format!(
-                        "{} refused the sign-in with {}: {} {why}",
+                        "{} refused the sign-in with {}: {why}",
                         endpoint.host,
                         mechanism.name(),
-                        reply.code
                     ))
                     .into());
                 }
@@ -836,9 +870,8 @@ impl<S: Read + Write + Patience> Session<S> {
         let reply = self.command("DATA")?;
         if reply.code != 354 {
             return Err(Refused(format!(
-                "The server refused the message: {} {}",
-                reply.code,
-                reply.text()
+                "The server refused the message: {}",
+                reply.explained()
             ))
             .into());
         }
@@ -847,7 +880,16 @@ impl<S: Read + Write + Patience> Session<S> {
         // megabytes and more).
         dot_stuff_into(bytes, self.reader.get_mut())?;
         self.flush()?;
-        self.final_reply()
+        // RFC 5321 §4.1.1.4: only a 2xx after the final dot accepts it.
+        let reply = self.final_reply()?;
+        if !reply.positive() {
+            return Err(Refused(format!(
+                "The server refused the message: {}",
+                reply.explained()
+            ))
+            .into());
+        }
+        Ok(reply)
     }
     /// The message as is, in BDAT chunks (CHUNKING); with PIPELINING all
     /// chunks go before their replies are read.
@@ -884,9 +926,8 @@ impl<S: Read + Write + Patience> Session<S> {
                     pending -= 1;
                     if !r.positive() {
                         return Err(Refused(format!(
-                            "The server refused the message: {} {}",
-                            r.code,
-                            r.text()
+                            "The server refused the message: {}",
+                            r.explained()
                         ))
                         .into());
                     }
@@ -943,7 +984,7 @@ fn open(
             greeting.code == 220,
             "{} refused the connection: {}",
             endpoint.host,
-            greeting.text()
+            greeting.explained()
         );
         session
     } else {
@@ -953,7 +994,7 @@ fn open(
             greeting.code == 220,
             "{} refused the connection: {}",
             endpoint.host,
-            greeting.text()
+            greeting.explained()
         );
         let limits = plain.ehlo()?;
         // Never send credentials or mail unencrypted.
@@ -968,7 +1009,7 @@ fn open(
             reply.code == 220,
             "{} refused STARTTLS: {}",
             endpoint.host,
-            reply.text()
+            reply.explained()
         );
         // Anything sent before the handshake could be an attacker's.
         ensure!(
@@ -1155,10 +1196,17 @@ pub(crate) fn deliver_bytes(
         "SMTP delivery failed. Your draft has been kept; check the server and account settings.";
     let (mut session, limits) = open(endpoint, secret, tls).context(failed)?;
     let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
-    if bytes.len() > limit {
+    // As the server will count it (RFC 1870 §4): with DATA, every line
+    // ending a CRLF; with BDAT, the bytes as they are.
+    let size = if limits.chunking {
+        bytes.len()
+    } else {
+        data_size(&bytes)
+    };
+    if size > limit {
         bail!(
             "This message is {} with its attachments; {} accepts up to {}. Remove an attachment or share it by link.",
-            megabytes(bytes.len()),
+            megabytes(size),
             endpoint.host,
             megabytes(limit)
         );
@@ -1190,7 +1238,7 @@ pub(crate) fn deliver_bytes(
     let from = ascii_domain(&from);
     let mut mail = format!("MAIL FROM:<{from}>");
     if limits.size_offered {
-        mail.push_str(&format!(" SIZE={}", bytes.len()));
+        mail.push_str(&format!(" SIZE={size}"));
     }
     let non_ascii = envelope
         .from()
@@ -1502,10 +1550,16 @@ pub(crate) fn deliver_raw(
         );
     }
     let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
+    // RFC 1870 §4: as the server counts it (see `deliver_bytes`).
+    let size = if limits.chunking {
+        bytes.len()
+    } else {
+        data_size(bytes)
+    };
     ensure!(
-        bytes.len() <= limit,
+        size <= limit,
         "This message is {}; {} accepts up to {}.",
-        megabytes(bytes.len()),
+        megabytes(size),
         endpoint.host,
         megabytes(limit)
     );
@@ -1513,7 +1567,7 @@ pub(crate) fn deliver_raw(
     // receipts, which must never be answered (RFC 8098 §3).
     let mut mail = format!("MAIL FROM:<{from}>");
     if limits.size_offered {
-        mail.push_str(&format!(" SIZE={}", bytes.len()));
+        mail.push_str(&format!(" SIZE={size}"));
     }
     if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) {
         ensure!(limits.utf8, "{} can't send to this address (no SMTPUTF8).", endpoint.host);
@@ -1569,6 +1623,37 @@ fn dot_stuffed(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     dot_stuff_into(bytes, &mut out).expect("writing to memory");
     out
+}
+/// The size of `bytes` as DATA sends it, for SIZE (RFC 1870 §4): each
+/// line ending (CRLF, or a bare CR or LF, which `dot_stuff_into` makes
+/// CRLF) counts two octets, and an unended last line gains its CRLF. The
+/// dots stuffed in and the final `.` line aren't counted: RFC 1870 §4
+/// counts the message's own octets, which the server gets back after it
+/// removes them.
+fn data_size(bytes: &[u8]) -> usize {
+    let mut size = 0;
+    let mut i = 0;
+    let mut line_start = true;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' | b'\n' => {
+                if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+                size += 2;
+                line_start = true;
+            }
+            _ => {
+                size += 1;
+                line_start = false;
+            }
+        }
+        i += 1;
+    }
+    if !line_start {
+        size += 2;
+    }
+    size
 }
 /// `bytes` dot-stuffed (RFC 5321 §4.5.2) with CRLF line ends and the final
 /// `.` line, written to `out` in pieces of at most a few hundred kilobytes.
@@ -1803,9 +1888,9 @@ mod tests {
     fn enhanced_codes_and_completions_are_strict() {
         assert_eq!(enhanced_code("5.1.1 no such user"), Some((5, 1, 1)));
         assert_eq!(enhanced_code("5.1234.1 odd"), None);
-        let r = Reply { code: 354, lines: vec!["go ahead".into()] };
+        let r = Reply { code: 354, lines: vec!["go ahead".into()], enhanced: true };
         assert!(!r.positive());
-        let r = Reply { code: 250, lines: vec!["5.0.0 mismatched".into()] };
+        let r = Reply { code: 250, lines: vec!["5.0.0 mismatched".into()], enhanced: true };
         assert_eq!(r.enhanced(), None);
         let limits = server_limits(["SIZE", "BURL imap://imap.example.com", "LIMITS RCPTDOMAINMAX=2"].into_iter());
         assert!(limits.size_offered && limits.size.is_none() && limits.burl_imap);
@@ -1820,6 +1905,32 @@ mod tests {
         assert!(html.contains("<em>there</em><br />"));
         assert!(html.contains("<li>one</li>"));
         assert!(!html.contains("<script>"));
+    }
+
+    /// RFC 1870 §4: the size declared for DATA counts bare CR and LF as
+    /// the CRLF they're sent as, and the unended last line's CRLF; it
+    /// matches what the server gets once it undoes the dot-stuffing.
+    #[test]
+    fn data_size_counts_line_endings_as_sent() {
+        for message in [
+            &b"a\r\nb\r\n"[..],
+            b"a\nb\rc\r\n",
+            b"a\n.\n..b\r",
+            b"no ending",
+            b"",
+            b"\r\r\n\n",
+        ] {
+            let stuffed = dot_stuffed(message);
+            // What the server keeps: the stuffed text without the final
+            // line, its doubled dots undone.
+            let body = &stuffed[..stuffed.len() - 3];
+            let kept: usize = body
+                .split_inclusive(|b| *b == b'\n')
+                .map(|line| line.len() - usize::from(line.starts_with(b"..")))
+                .sum();
+            assert_eq!(data_size(message), kept, "{:?}", String::from_utf8_lossy(message));
+        }
+        assert_eq!(data_size(b"a\nb"), 6);
     }
 
     #[test]
@@ -1992,11 +2103,95 @@ mod tests {
         assert_eq!(xtext("a+b=c d"), "a+2Bb+3Dc+20d");
     }
 
+    /// A stream whose replies are scripted and whose writes are kept.
+    struct Scripted {
+        replies: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.replies.read(buf)
+        }
+    }
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Patience for Scripted {
+        fn wait_for(&mut self, _: Option<Duration>) {}
+    }
+    fn scripted(replies: &str) -> Session<Scripted> {
+        Session::new(Scripted {
+            replies: std::io::Cursor::new(replies.as_bytes().to_vec()),
+            written: Vec::new(),
+        })
+    }
+
+    /// RFC 2034 and RFC 3463: once EHLO offers ENHANCEDSTATUSCODES, every
+    /// refusal (a command, the sign-in, DATA and its end, BDAT) says what
+    /// its code means; a code repeated on each line shows once; and from a
+    /// server that didn't offer them, a code-like text is only text.
+    #[test]
+    fn enhanced_codes_are_read_everywhere_a_server_refuses() {
+        let ehlo = "250-fixture\r\n250 ENHANCEDSTATUSCODES\r\n";
+        let text = |e: anyhow::Error| format!("{e:#}");
+        // A plain command.
+        let mut s = scripted(&format!("{ehlo}550-5.7.1 Relaying\r\n550 5.7.1 denied\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.expect("RSET", "Refused").unwrap_err());
+        assert_eq!(e, "Refused: The server refused this by its policy (550 5.7.1 Relaying denied)");
+        // DATA refused before the message.
+        let mut s = scripted(&format!("{ehlo}554 5.3.4 Too big\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.data(b"x").unwrap_err());
+        assert!(e.contains("The message is too large (554 5.3.4 Too big)"), "{e}");
+        // DATA refused after it: no longer taken as accepted.
+        let mut s = scripted(&format!("{ehlo}354 go\r\n550 5.7.26 DMARC\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.data(b"x").unwrap_err());
+        assert!(e.contains("sender checks (550 5.7.26 DMARC)"), "{e}");
+        // BDAT.
+        let mut s = scripted(&format!("{ehlo}552 5.2.2 Mailbox full\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.bdat(b"x", false).unwrap_err());
+        assert!(e.contains("That mailbox is full (552 5.2.2"), "{e}");
+        // The sign-in.
+        let mut s = scripted(&format!("{ehlo}535 5.7.8 Bad credentials\r\n"));
+        let limits = ServerLimits {
+            auth: vec!["PLAIN".into()],
+            ..s.ehlo().unwrap()
+        };
+        let endpoint = Endpoint {
+            host: "mail.example".into(),
+            port: 587,
+            user: "me".into(),
+            oauth: false,
+            implicit_tls: false,
+            kerberos: false,
+        };
+        let e = text(s.authenticate(&endpoint, &limits, "pw").unwrap_err());
+        assert_eq!(
+            e,
+            "mail.example refused the sign-in with PLAIN: The sign-in wasn't accepted (535 5.7.8 Bad credentials)"
+        );
+        // Without ENHANCEDSTATUSCODES: the text as it is.
+        let mut s = scripted("250-fixture\r\n250 SIZE\r\n550 5.1.1 is just text\r\n");
+        s.ehlo().unwrap();
+        let e = text(s.expect("RSET", "Refused").unwrap_err());
+        assert_eq!(e, "Refused: 550 5.1.1 is just text");
+    }
+
     #[test]
     fn enhanced_codes_explain_refusals() {
         let reply = |code, line: &str| Reply {
             code,
             lines: vec![line.to_owned()],
+            enhanced: true,
         };
         let gone = reply(550, "5.1.1 <x@example.com>: Recipient address rejected");
         assert_eq!(gone.enhanced(), Some((5, 1, 1)));
@@ -2014,36 +2209,11 @@ mod tests {
 
     #[test]
     fn recipients_go_in_as_many_transactions_as_the_server_needs() {
-        use std::io::Cursor;
-        // A stream whose replies are scripted and whose writes are kept.
-        struct Scripted {
-            replies: Cursor<Vec<u8>>,
-            written: Vec<u8>,
-        }
-        impl Read for Scripted {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.replies.read(buf)
-            }
-        }
-        impl Write for Scripted {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.written.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl Patience for Scripted {
-            fn wait_for(&mut self, _: Option<Duration>) {}
-        }
         let a: lettre::Address = "a@x.org".parse().unwrap();
         let b: lettre::Address = "b@x.org".parse().unwrap();
         let script = "250 2.1.0 OK\r\n250 2.1.5 OK\r\n452 4.5.3 Too many recipients\r\n";
-        let mut session = Session::new(Scripted {
-            replies: Cursor::new(script.as_bytes().to_vec()),
-            written: Vec::new(),
-        });
+        let mut session = scripted(script);
+        session.enhanced = true;
         let rcpt = |t: &lettre::Address| format!("RCPT TO:<{t}> ORCPT=rfc822;{}", xtext(AsRef::<str>::as_ref(t)));
         let replies =
             transaction(&mut session, "MAIL FROM:<me@x.org>", &[&a, &b], &rcpt, true).unwrap();

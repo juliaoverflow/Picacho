@@ -12,7 +12,6 @@ use std::{
 /// One SMTP transaction a fixture took: its MAIL FROM, RCPT TOs and message.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Transaction {
-    #[allow(dead_code)]
     pub(super) mail: String,
     pub(super) rcpt: Vec<String>,
     pub(super) message: Vec<u8>,
@@ -562,4 +561,43 @@ fn burl_is_skipped_for_drafts_with_bcc() {
     assert!(!burl_allowed(&Draft { bcc: "bo@example.com".into(), ..d.clone() }));
     // A Bcc that can't be read isn't sent by reference either.
     assert!(!burl_allowed(&Draft { bcc: "<<<".into(), ..d }));
+}
+
+/// RFC 1870 §4: the size MAIL FROM declares is the size the server gets,
+/// by DATA and by BDAT alike. (The composer's MIME already ends every line
+/// with CRLF; `data_size_counts_line_endings_as_sent` covers bare ones.)
+#[test]
+fn declared_size_matches_what_is_sent() -> Result<()> {
+    for ehlo in [
+        "250-fixture\r\n250-SIZE 10000000\r\n250 AUTH PLAIN\r\n",
+        "250-fixture\r\n250-SIZE 10000000\r\n250-CHUNKING\r\n250 AUTH PLAIN\r\n",
+    ] {
+        let fixture = SmtpFixture::start(ehlo, no_script())?;
+        let (b, a, path) = smtp_account(&fixture)?;
+        let forwarded = path.join("original.eml");
+        std::fs::write(&forwarded, "From: x@example.com\nSubject: old\n\nline one\nline two\n".repeat(20))?;
+        let d = Draft {
+            id: format!("size-{}", ehlo.len()),
+            account: a.id.clone(),
+            to: "ana@example.com".into(),
+            subject: "Size".into(),
+            body: "See attached.".into(),
+            attachments: vec![forwarded],
+            ..Draft::default()
+        };
+        b.store.save_draft(&d)?;
+        b.send(&a, &d)?;
+        let seen = fixture.finish();
+        let t = &seen.transactions[0];
+        let declared: usize = t
+            .mail
+            .split(' ')
+            .find_map(|p| p.strip_prefix("SIZE="))
+            .context("no SIZE")?
+            .parse()?;
+        assert_eq!(declared, t.message.len(), "{}", t.mail);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
