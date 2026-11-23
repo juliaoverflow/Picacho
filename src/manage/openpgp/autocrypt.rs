@@ -137,12 +137,26 @@ impl Keyring {
         if added
             && let Some(fp) = self.found_fingerprint(email)
         {
-            let from_lookup = before.as_deref() == Some(fp.as_str()) && !self.autocrypt.contains(&fp);
-            if !from_lookup && !self.autocrypt.contains(&fp) {
+            // The same key kept from a lookup is only refreshed, unmarked.
+            if before.as_deref() != Some(fp.as_str()) && !self.autocrypt.contains(&fp) {
                 self.autocrypt.push(fp);
             }
         }
         Ok(added)
+    }
+    /// Forgets the key Autocrypt gave for `email` (Autocrypt 1.1 §2.3 peer
+    /// state is the caller's): only a key known solely from Autocrypt
+    /// headers or Gossip, never one imported by hand, found by WKD, DNS or
+    /// a keyserver, or compared with its owner. Returns whether one was.
+    pub fn reset_peer(&mut self, email: &str) -> bool {
+        let Some(fp) = self.found_fingerprint(email) else {
+            return false;
+        };
+        if !self.autocrypt.contains(&fp) || self.checked(&fp) {
+            return false;
+        }
+        self.remove(&fp);
+        true
     }
     /// The fingerprint of the found key kept for `email`, if there is one.
     pub(super) fn found_fingerprint(&self, email: &str) -> Option<String> {
@@ -189,6 +203,56 @@ mod tests {
             peer,
             Peer { last_seen: 200, autocrypt_timestamp: 150, mutual: false, fingerprint: "B".into() }
         );
+    }
+
+    /// reset_peer forgets only a key Autocrypt alone gave: never one
+    /// imported by hand, found by WKD, DNS or a keyserver, or checked.
+    #[test]
+    fn reset_peer_never_touches_manual_wkd_dns_or_verified_keys() {
+        let ana = public_bytes("Ana <ana@example.org>");
+        // Autocrypt's own: forgotten, and only Ana's.
+        let bo = public_bytes("Bo <bo@example.se>");
+        let mut ring = Keyring::default();
+        ring.add_autocrypt("ana@example.org", &ana).unwrap();
+        ring.add_autocrypt("bo@example.se", &bo).unwrap();
+        assert!(ring.reset_peer("Ana@Example.org"));
+        assert!(ring.key_for("ana@example.org").is_none());
+        assert!(ring.key_for("bo@example.se").is_some());
+        assert!(!ring.autocrypt.contains(&key_fingerprint(&ana).unwrap()));
+        assert!(!ring.reset_peer("ana@example.org"));
+        // Imported by hand, even after Autocrypt sent the same key.
+        let mut ring = Keyring::default();
+        let armored = SignedPublicKey::from_bytes(&ana[..])
+            .unwrap()
+            .to_armored_string(Default::default())
+            .unwrap();
+        ring.import(&armored, "").unwrap();
+        ring.add_autocrypt("ana@example.org", &ana).unwrap();
+        let before = ring.clone();
+        assert!(!ring.reset_peer("ana@example.org"));
+        assert_eq!(ring, before);
+        // Found by WKD, by DNS (validated or not) or a keyserver, even
+        // when Autocrypt sent the same key after.
+        for source in [
+            Source::Wkd,
+            Source::Dane { dnssec_validated: true },
+            Source::Dane { dnssec_validated: false },
+            Source::KeysOpenpgpOrg,
+        ] {
+            let mut ring = Keyring::default();
+            ring.add_found_from("ana@example.org", &ana, source).unwrap();
+            ring.add_autocrypt("ana@example.org", &ana).unwrap();
+            let before = ring.clone();
+            assert!(!ring.reset_peer("ana@example.org"), "{source:?}");
+            assert_eq!(ring, before, "{source:?}");
+        }
+        // From Autocrypt, but compared with its owner.
+        let mut ring = Keyring::default();
+        ring.add_autocrypt("ana@example.org", &ana).unwrap();
+        ring.verify(&key_fingerprint(&ana).unwrap());
+        let before = ring.clone();
+        assert!(!ring.reset_peer("ana@example.org"));
+        assert_eq!(ring, before);
     }
 
     /// Autocrypt 1.1 §2.3: stale only when the header is more than 35

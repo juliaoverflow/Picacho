@@ -1201,6 +1201,20 @@ impl Backend {
             let _ = self.set_keyring(next);
         }
     }
+    /// Forgets what Autocrypt learned of `email` (Autocrypt 1.1 §2.3): its
+    /// peer state, and its key where only Autocrypt gave it (see
+    /// `Keyring::reset_peer`). Their next message starts afresh.
+    // Backend-only until the UI calls it: resetting a person's Autocrypt state.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reset_autocrypt_peer(&self, email: &str) -> Result<()> {
+        self.store
+            .remove_preference(&crate::manage::openpgp::peer_preference_key(email))?;
+        let mut next = crate::manage::openpgp::Keyring::clone(&self.keyring());
+        if next.reset_peer(email) {
+            self.set_keyring(next)?;
+        }
+        Ok(())
+    }
     /// What OpenPGP found when the message was last read, if it had any.
     pub fn verdict(&self, id: &str) -> Option<crate::manage::openpgp::Verdict> {
         self.verdicts.lock().unwrap().get(id).cloned()
@@ -5300,6 +5314,13 @@ mod layout_tests {
         // From the future: as if received now.
         b.learn_autocrypt(&mail("Fri, 1 Jan 2100 00:00:00 +0000", None, false));
         assert!(peer().last_seen <= chrono::Utc::now().timestamp());
+        // A reset forgets the state and Autocrypt's key; an older message
+        // then counts again.
+        b.reset_autocrypt_peer("ana@example.org")?;
+        assert_eq!(peer(), Peer::default());
+        assert_eq!(kept(), None);
+        b.learn_autocrypt(&mail("Sun, 1 Sep 2024 10:00:00 +0000", Some(&first), false));
+        assert_eq!(kept(), key_fingerprint(&first));
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }
