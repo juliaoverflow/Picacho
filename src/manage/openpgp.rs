@@ -1722,6 +1722,92 @@ mod tests {
         assert!(hand.own_public_bytes("bo@example.se").is_none());
     }
 
+    /// The decrypted payload of a PGP/MIME message, exactly as encrypted:
+    /// the root of the Cryptographic Payload (RFC 9788 §1.7).
+    fn payload(sent: &[u8], key: &SignedSecretKey) -> Vec<u8> {
+        let (armored, _) = crate::manage::crypto::encrypted_part(sent).unwrap();
+        let (message, _) = Message::from_string(&armored).unwrap();
+        let mut opened = message.decrypt(&Password::empty(), key).unwrap();
+        if opened.is_compressed() {
+            opened = opened.decompress().unwrap();
+        }
+        opened.as_data_vec().unwrap()
+    }
+
+    /// The header block of `raw` (up to the first blank line).
+    fn head(raw: &[u8]) -> String {
+        let text = String::from_utf8_lossy(raw).into_owned();
+        text.split("\r\n\r\n").next().unwrap_or_default().to_owned()
+    }
+
+    /// RFC 9788 §2.1.1 and §3.2.1: a message encrypted with its subject
+    /// hidden carries hp="cipher" on the root of the Cryptographic Payload,
+    /// the real Subject and the routing headers inside, "..." outside, and
+    /// never a Bcc inside.
+    #[test]
+    fn encrypted_payload_carries_protected_headers() {
+        let ana = key("Ana <ana@example.org>", "");
+        let bo = key("Bo <bo@example.se>", "");
+        let mut anas = Keyring::default();
+        anas.import(&ana.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+        anas.import(&armored_public(&bo), "").unwrap();
+        let raw = String::from_utf8_lossy(MESSAGE).replace(
+            "Subject: Plans\r\n",
+            "Cc: Cy <cy@example.net>\r\nBcc: secret@example.com\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\nSubject: Plans\r\n",
+        );
+        let how = Protect { sign: false, encrypt: true, subject: true, ..Default::default() };
+        let sent = protect(raw.as_bytes(), "ana@example.org", &["bo@example.se".into()], how, &anas).unwrap();
+        let outer = head(&sent);
+        assert!(outer.contains("\r\nSubject: ...") && !outer.contains("Plans"), "{outer}");
+        assert!(outer.contains("Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\""), "{outer}");
+        let inner = payload(&sent, &bo);
+        let inner_head = head(&inner);
+        let parsed = mailparse::parse_mail(&inner).unwrap();
+        assert_eq!(parsed.ctype.mimetype, "text/plain");
+        assert_eq!(parsed.ctype.params.get("hp").map(String::as_str), Some("cipher"));
+        assert_eq!(parsed.ctype.params.get("protected-headers").map(String::as_str), Some("v1"));
+        use mailparse::MailHeaderMap;
+        for (name, value) in [
+            ("Subject", "Plans"),
+            ("From", "Ana <ana@example.org>"),
+            ("To", "Bo <bo@example.se>"),
+            ("Cc", "Cy <cy@example.net>"),
+            ("Date", "Mon, 23 Nov 2026 10:00:00 +0000"),
+            ("Message-ID", "<1@example.org>"),
+        ] {
+            assert_eq!(parsed.headers.get_first_value(name).as_deref(), Some(value), "{name} in {inner_head}");
+        }
+        assert!(parsed.headers.get_first_value("Bcc").is_none(), "{inner_head}");
+        assert_eq!(parsed.get_body().unwrap().trim(), "Meet at noon.");
+    }
+
+    /// Autocrypt 1.1 §2.4 (Key Gossip): encrypted to several people, the
+    /// root part of the encrypted payload has one Autocrypt-Gossip header
+    /// per recipient with the key the mail is encrypted to; none outside.
+    #[test]
+    fn gossip_headers_go_inside_the_encryption() {
+        use pgp::ser::Serialize as _;
+        let ana = key("Ana <ana@example.org>", "");
+        let bo = key("Bo <bo@example.se>", "");
+        let cy = key("Cy <cy@example.net>", "");
+        let mut anas = Keyring::default();
+        anas.import(&ana.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+        anas.import(&armored_public(&bo), "").unwrap();
+        anas.import(&armored_public(&cy), "").unwrap();
+        let to = ["bo@example.se".to_owned(), "cy@example.net".to_owned()];
+        let how = Protect { sign: false, encrypt: true, ..Default::default() };
+        let sent = protect(MESSAGE, "ana@example.org", &to, how, &anas).unwrap();
+        assert!(!String::from_utf8_lossy(&sent).contains("Autocrypt-Gossip"));
+        let inner = payload(&sent, &cy);
+        let gossip = crate::sync::keys::autocrypt_gossip(&inner, &to);
+        let cy_bytes = SignedPublicKey::from(cy.clone()).to_bytes().unwrap();
+        let bo_bytes = SignedPublicKey::from(bo.clone()).to_bytes().unwrap();
+        assert_eq!(gossip, vec![("bo@example.se".into(), bo_bytes), ("cy@example.net".into(), cy_bytes)]);
+        // One recipient: nothing to gossip.
+        let alone = protect(MESSAGE, "ana@example.org", &to[..1], how, &anas).unwrap();
+        assert!(!String::from_utf8_lossy(&payload(&alone, &bo)).contains("Autocrypt-Gossip"));
+    }
+
     #[test]
     fn sending_needs_keys_for_everyone() {
         let ana = key("Ana <ana@example.org>", "");
