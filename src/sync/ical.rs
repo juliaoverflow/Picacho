@@ -3150,6 +3150,11 @@ mod tests {
         assert_eq!(back.events[0].attendees[0].status, Some(PartStat::Accepted));
         assert_eq!(back.events[0].start, e.start);
         assert!(r.lines().all(|l| l.len() <= 76));
+        // RFC 5546 §3.2.3: an answer to one occurrence names it.
+        let one = Event { recurrence_id: Some(e.start), ..e.clone() };
+        let r = reply(&one, "qa@example.com", "QA", PartStat::Declined).unwrap();
+        assert_eq!(parse(&r).events[0].recurrence_id, Some(e.start));
+        assert!(r.contains("RECURRENCE-ID:20261124T090000Z"), "{r}");
     }
 
     #[test]
