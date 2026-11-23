@@ -345,6 +345,9 @@ pub(crate) struct ServerLimits {
     /// FUTURERELEASE (RFC 4865): how far ahead it holds a message for
     /// release, in seconds (0 where it doesn't).
     pub(crate) future_release: u64,
+    /// FUTURERELEASE's max-future-release-date-time (RFC 4865 §3): the
+    /// latest moment it holds a message until, a Unix time.
+    pub(crate) future_release_until: Option<i64>,
     /// MT-PRIORITY (RFC 6710): it takes a message's priority.
     pub(crate) mt_priority: bool,
     /// The priority profile it named (MIXER, STANAG4406, NSEP), if any.
@@ -403,8 +406,13 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
             Some("CHUNKING") => limits.chunking = true,
             Some("REQUIRETLS") => limits.require_tls = true,
             Some("STARTTLS") => limits.starttls = true,
+            // RFC 4865 §3: "FUTURERELEASE <max interval> <max date-time>".
             Some("FUTURERELEASE") => {
-                limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0)
+                limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                limits.future_release_until = words
+                    .next()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.timestamp());
             }
             Some("ENHANCEDSTATUSCODES") => limits.enhanced = true,
             // "MT-PRIORITY MIXER" (a profile, or none).
@@ -457,6 +465,18 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
         }
     }
     limits
+}
+/// HOLDFOR's seconds (RFC 4865 §4) for a message due at `at` when it is
+/// `now`, where the server can hold it that long: within its
+/// max-future-release-interval and, if it named one, not after its
+/// max-future-release-date-time. HOLDFOR rather than HOLDUNTIL, since a
+/// time from now doesn't depend on this computer's clock agreeing with
+/// the server's. `None` where it can't (no FUTURERELEASE gives 0).
+fn hold_seconds(limits: &ServerLimits, at: i64, now: i64) -> Option<u64> {
+    let ahead = (at - now).max(1) as u64;
+    let within = ahead <= limits.future_release;
+    let before_end = limits.future_release_until.is_none_or(|end| at <= end);
+    (within && before_end).then_some(ahead)
 }
 /// What happened to a message the server accepted.
 pub(crate) struct Delivered {
@@ -1222,14 +1242,13 @@ pub(crate) fn deliver_bytes(
     // Held for later: for how long, from the server's own clock.
     let hold_for = match hold_until {
         None => None,
-        Some(at) => {
-            let ahead = (at - chrono::Utc::now().timestamp()).max(1) as u64;
-            if limits.future_release < ahead {
+        Some(at) => match hold_seconds(&limits, at, chrono::Utc::now().timestamp()) {
+            Some(ahead) => Some(ahead),
+            None => {
                 let _ = session.command("QUIT");
                 return Err(NoServerHold.into());
             }
-            Some(ahead)
-        }
+        },
     };
     let envelope = message.envelope();
     let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
@@ -1910,6 +1929,29 @@ mod tests {
     /// RFC 1870 §4: the size declared for DATA counts bare CR and LF as
     /// the CRLF they're sent as, and the unended last line's CRLF; it
     /// matches what the server gets once it undoes the dot-stuffing.
+    /// RFC 4865 §3: both limits FUTURERELEASE names are kept to.
+    #[test]
+    fn future_release_keeps_to_the_servers_interval_and_date() {
+        let limits = server_limits(["FUTURERELEASE 604800 2030-01-01T00:00:00Z"].into_iter());
+        assert_eq!(limits.future_release, 604_800);
+        let end = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z").unwrap().timestamp();
+        assert_eq!(limits.future_release_until, Some(end));
+        let now = end - 10 * 86_400;
+        assert_eq!(hold_seconds(&limits, now + 3600, now), Some(3600));
+        // Past the interval.
+        assert_eq!(hold_seconds(&limits, now + 8 * 86_400, now), None);
+        // Within the interval, but after the date-time.
+        let late = end - 3600;
+        assert_eq!(hold_seconds(&limits, end + 60, late), None);
+        assert_eq!(hold_seconds(&limits, end, late), Some(3600));
+        // Only an interval (the date-time is optional in practice).
+        let open = server_limits(["FUTURERELEASE 600"].into_iter());
+        assert_eq!(open.future_release_until, None);
+        assert_eq!(hold_seconds(&open, now + 600, now), Some(600));
+        // No FUTURERELEASE: nothing is held.
+        assert_eq!(hold_seconds(&ServerLimits::default(), now + 60, now), None);
+    }
+
     #[test]
     fn data_size_counts_line_endings_as_sent() {
         for message in [

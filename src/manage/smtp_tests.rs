@@ -601,3 +601,35 @@ fn declared_size_matches_what_is_sent() -> Result<()> {
     }
     Ok(())
 }
+
+/// RFC 4865 §3: a server whose max-future-release-date-time is before
+/// the message is due isn't handed it, though its interval would allow
+/// it; the draft stays scheduled here.
+#[test]
+fn scheduled_mail_isnt_handed_over_past_the_servers_last_date() -> Result<()> {
+    let at = chrono::Utc::now().timestamp() + 3 * 86_400;
+    let end = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%dT%H:%M:%SZ");
+    let ehlo: &'static str = Box::leak(
+        format!("250-fixture\r\n250-FUTURERELEASE 604800 {end}\r\n250 AUTH PLAIN\r\n").into_boxed_str(),
+    );
+    let fixture = SmtpFixture::start(ehlo, no_script())?;
+    let (b, mut a, path) = smtp_account(&fixture)?;
+    a.server_send_later = true;
+    let d = Draft {
+        id: "far".into(),
+        account: a.id.clone(),
+        to: "ana@example.com".into(),
+        subject: "Later".into(),
+        body: "Hi".into(),
+        send_at: Some(at),
+        ..Draft::default()
+    };
+    b.store.save_draft(&d)?;
+    assert!(!b.hand_to_server(&a, &d.id)?);
+    assert!(b.store.draft(&d.id)?.is_some());
+    let seen = fixture.finish();
+    assert!(!seen.commands.iter().any(|c| c.starts_with("MAIL")), "{:?}", seen.commands);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
