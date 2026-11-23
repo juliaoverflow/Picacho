@@ -1001,11 +1001,12 @@ impl Server {
             return (401, b"{}".to_vec());
         }
         let base = format!("https://localhost:{}", self.port);
-        if method == "GET" && path == "/.well-known/jmap" {
-            if let Some(to) = &self.session_redirect {
-                // A 3xx's body is the Location it names (see `serve`).
-                return (307, to.clone().into_bytes());
-            }
+        if method == "GET"
+            && path == "/.well-known/jmap"
+            && let Some(to) = &self.session_redirect
+        {
+            // A 3xx's body is the Location it names (see `serve`).
+            return (307, to.clone().into_bytes());
         }
         if method == "GET" && (path == "/.well-known/jmap" || path == "/jmap/session") {
             self.session_reads += 1;
@@ -2412,14 +2413,16 @@ fn jmap_card_changes_use_if_in_state() -> Result<()> {
 /// with mail is deleted with it only when asked (`onDestroyRemoveEmails`).
 #[test]
 fn jmap_mailbox_rights_moves_and_removal() -> Result<()> {
-    let mut fixture = Server::default();
-    fixture.boxes = Some(vec![
+    let mut fixture = Server {
+        boxes: Some(vec![
         json!({ "id": "i", "name": "Inbox", "role": "inbox", "parentId": null, "totalThreads": 3, "unreadThreads": 1,
                 "myRights": { "mayRename": false, "mayDelete": false, "mayCreateChild": true, "mayAddItems": true } }),
         json!({ "id": "w", "name": "Work", "parentId": null, "isSubscribed": true }),
         json!({ "id": "r", "name": "Reports", "parentId": null, "myRights": { "mayAddItems": false } }),
         json!({ "id": "p", "name": "Projects", "parentId": null, "isSubscribed": false }),
-    ]);
+        ]),
+        ..Default::default()
+    };
     fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
     fixture.emails.push(Message {
         id: "M1".into(),
@@ -2539,7 +2542,7 @@ fn jmap_calendar_scheduling_uses_one_channel() -> Result<()> {
     assert_eq!(b.send_invitations(&a, "off@x")?, 1);
     assert_eq!(mails(&server), before + 1, "invited by mail");
     b.delete_event("off@x")?;
-    assert_eq!(last(&server).0, false);
+    assert!(!last(&server).0);
 
     // A server that doesn't name the addresses it sends as: refused.
     let error = format!("{:#}", b.set_server_scheduling(true).unwrap_err());
@@ -2556,11 +2559,11 @@ fn jmap_calendar_scheduling_uses_one_channel() -> Result<()> {
     let mut changed = b.calendar_events().into_iter().find(|s| s.event.uid == "on@x").unwrap().event;
     changed.summary = "Long lunch".into();
     b.save_event(changed, None)?;
-    assert_eq!(last(&server).0, true);
+    assert!(last(&server).0);
     // Cancelled: the server tells them.
     assert_eq!(b.cancel_invitations(&a, "on@x")?, 1);
     b.delete_event("on@x")?;
-    assert_eq!(last(&server).0, true);
+    assert!(last(&server).0);
     assert_eq!(mails(&server), before, "no mail while the server schedules");
 
     // Someone else's event (an invitation answered here): the server

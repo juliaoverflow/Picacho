@@ -401,8 +401,11 @@ pub struct Session {
     session_state: String,
     stale: std::sync::atomic::AtomicBool,
     /// Where pushed changes arrive over a WebSocket, where the server has
-    /// one (RFC 8887).
+    /// one (RFC 8887) and it pushes there (`supportsPush`).
     websocket_url: String,
+    /// RFC 8887 §4.3.5: the last `pushState` the WebSocket gave, sent back
+    /// when it is opened again so changes missed meanwhile come at once.
+    push_state: Mutex<String>,
     /// Other accounts with mail that this sign-in reaches (shared with
     /// it): (id, name). The one used is `account_id`.
     other_accounts: Vec<(String, String)>,
@@ -824,11 +827,15 @@ impl Session {
             uploads: Slots::new(usize_of(&core["maxConcurrentUpload"], 4)),
             session_state: v["state"].as_str().unwrap_or_default().to_owned(),
             stale: std::sync::atomic::AtomicBool::new(false),
+            // RFC 8887 §4.2: `supportsPush` false means the WebSocket takes
+            // requests but pushes nothing; it's no use for following changes.
             websocket_url: caps[WEBSOCKET]["url"]
                 .as_str()
                 .filter(|u| u.starts_with("wss://") || cfg!(test))
+                .filter(|_| caps[WEBSOCKET]["supportsPush"].as_bool() != Some(false))
                 .unwrap_or_default()
                 .to_owned(),
+            push_state: Mutex::new(String::new()),
             other_accounts,
             read_only,
             mail_limits: MailLimits::read(&account[MAIL]),
@@ -1492,9 +1499,11 @@ impl Session {
             for patch in patches.values() {
                 let targets = patch.as_object().into_iter().flatten().flat_map(|(path, v)| {
                     let one = path.strip_prefix("mailboxIds/").filter(|_| v == &Value::Bool(true)).map(str::to_owned);
-                    let all = (path == "mailboxIds")
-                        .then(|| v.as_object().into_iter().flatten().map(|(k, _)| k.clone()).collect::<Vec<_>>())
-                        .unwrap_or_default();
+                    let all: Vec<String> = if path == "mailboxIds" {
+                        v.as_object().into_iter().flatten().map(|(k, _)| k.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
                     one.into_iter().chain(all)
                 });
                 for id in targets {
@@ -3290,14 +3299,24 @@ impl Session {
             &self.tls,
             Duration::from_secs(u64::from(PING_SECONDS) * 2),
         )?;
-        socket.send_text(
-            // RFC 8887 §4.3.5: `dataTypes` null means every type.
-            &json!({
-                "@type": "WebSocketPushEnable",
-                "dataTypes": if push.types.iter().any(|t| t == "*") { Value::Null } else { json!(push.names()) },
-            })
-            .to_string(),
-        )?;
+        // RFC 8887 §4.3.5: `dataTypes` null means every type; `pushState`,
+        // where one was given before, has the server send what changed
+        // since at once.
+        let mut enable = json!({
+            "@type": "WebSocketPushEnable",
+            "dataTypes": if push.types.iter().any(|t| t == "*") { Value::Null } else { json!(push.names()) },
+        });
+        let since = self.push_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !since.is_empty() {
+            enable["pushState"] = json!(since);
+        }
+        socket.send_text(&enable.to_string())?;
+        // RFC 8887 §4.3.5: pushes stop before the socket closes, so none is
+        // lost in flight.
+        let finish = |socket: &mut super::websocket::Socket<_>| {
+            let _ = socket.send_text(r#"{"@type":"WebSocketPushDisable"}"#);
+            let _ = socket.close();
+        };
         // Reconnected now and then, as servers and proxies end long
         // connections anyway.
         let until = std::time::Instant::now() + Duration::from_secs(10 * 60);
@@ -3305,16 +3324,19 @@ impl Session {
         let mut unanswered = 0;
         while std::time::Instant::now() < until {
             if stop.load(Ordering::Acquire) {
-                let _ = socket.close();
+                finish(&mut socket);
                 return Ok(());
             }
             match socket.receive()? {
                 super::websocket::Incoming::Text(text) => {
                     unanswered = 0;
+                    if let Some(state) = push_state_of(&text) {
+                        *self.push_state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+                    }
                     if state_change_for(&text, &self.account_id, push) {
                         heard()?;
                         if push.close_after_state {
-                            let _ = socket.close();
+                            finish(&mut socket);
                             return Ok(());
                         }
                     }
@@ -3323,7 +3345,7 @@ impl Session {
                 super::websocket::Incoming::Idle => {
                     unanswered += 1;
                     if unanswered > 2 {
-                        let _ = socket.close();
+                        finish(&mut socket);
                         return Ok(());
                     }
                     socket.ping()?
@@ -3331,9 +3353,15 @@ impl Session {
                 super::websocket::Incoming::Closed => return Ok(()),
             }
         }
-        let _ = socket.close();
+        finish(&mut socket);
         Ok(())
     }
+}
+
+/// A StateChange's `pushState` (RFC 8887 §4.3.5), to resume from.
+fn push_state_of(data: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    (v["@type"] == "StateChange").then(|| v["pushState"].as_str().map(str::to_owned)).flatten()
 }
 
 /// Whether a StateChange (RFC 8620 §7.1) says a type `push` follows
@@ -4047,7 +4075,7 @@ mod tests {
         let found: Vec<&str> = m.marks.iter().map(|r| &m.text[r.clone()]).collect();
         assert_eq!(found, ["fixture", "more"]);
         let unclosed = Marked::parse("a <mark>b");
-        assert_eq!(unclosed.marks, [2..3]);
+        assert_eq!(unclosed.marks, vec![2..3]);
         assert!(Marked::parse("<mark></mark>x").marks.is_empty());
     }
 
@@ -4075,6 +4103,17 @@ mod tests {
     fn blob_digests_are_base64_hashes() {
         assert_eq!(blob_digest("sha-256", b"abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
         assert_eq!(blob_digest("sha", b"abc"), "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=");
+    }
+
+    /// RFC 8887 §4.3.5: a StateChange's pushState is kept to resume from.
+    #[test]
+    fn push_states_are_read() {
+        assert_eq!(
+            push_state_of(r#"{"@type":"StateChange","changed":{},"pushState":"p7"}"#).as_deref(),
+            Some("p7")
+        );
+        assert_eq!(push_state_of(r#"{"@type":"StateChange","changed":{}}"#), None);
+        assert_eq!(push_state_of(r#"{"@type":"Response","pushState":"x"}"#), None);
     }
 
     #[test]
