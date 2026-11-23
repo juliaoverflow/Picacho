@@ -18,17 +18,12 @@ pub(crate) const FORMAT_HEADER: &str = "X-Picacho-Format";
 fn raw_header(name: &'static str, value: String) -> header::HeaderValue {
     header::HeaderValue::new(header::HeaderName::new_from_ascii_str(name), value)
 }
-/// The message a draft makes, as sent (`draft: false`) or as saved in the
-/// server's Drafts folder: then incomplete drafts are allowed, Bcc is kept,
-/// and Picacho's own headers let it be found again.
-pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
-    build_to(a, d, draft, None)
-}
-/// As `build`, sent only to `only_to` when given: the To and Cc headers
-/// are the draft's, but the envelope (and so whom it is encrypted to)
-/// names that one address. RFC 5322 §3.6.3: a Bcc recipient's own copy
-/// of a message whose other copy has no Bcc field.
-fn build_to(a: &Account, d: &Draft, draft: bool, only_to: Option<&str>) -> Result<Message> {
+/// Whom a draft is from: one of the mailbox's other addresses (unless
+/// sent as an alias), else the account, with the name to show.
+fn sender<'a>(
+    a: &'a Account,
+    d: &Draft,
+) -> Result<(Option<&'a crate::manage::model::Identity>, Mailbox)> {
     // One of the mailbox's other addresses, unless sent as an alias.
     let identity = match d.identity.as_str() {
         "" => None,
@@ -54,7 +49,39 @@ fn build_to(a: &Account, d: &Draft, draft: bool, only_to: Option<&str>) -> Resul
         ),
         None => Mailbox::new(Some(a.name.clone()), a.email.parse()?),
     };
+    Ok((identity, from))
+}
+/// The message a draft makes, as sent (`draft: false`) or as saved in the
+/// server's Drafts folder: then incomplete drafts are allowed, Bcc is kept,
+/// and Picacho's own headers let it be found again.
+pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
+    build_to(a, d, draft, None, None)
+}
+/// As `build`, sent only to `only_to` when given: the To and Cc headers
+/// are the draft's, but the envelope (and so whom it is encrypted to)
+/// names that one address. RFC 5322 §3.6.3: a Bcc recipient's own copy
+/// of a message whose other copy has no Bcc field. `message_id`, when
+/// given, is the one all copies of the message share.
+fn build_to(
+    a: &Account,
+    d: &Draft,
+    draft: bool,
+    only_to: Option<&str>,
+    message_id: Option<&str>,
+) -> Result<Message> {
+    let (identity, from) = sender(a, d)?;
     let mut builder = Message::builder().from(from.clone()).subject(&d.subject);
+    if !draft {
+        // RFC 5322 §3.6.4: a Message-ID unique to this message. Without
+        // one, lettre would name the computer's host; this uses the
+        // sender's domain (the alias's, sent as an alias) and a random
+        // part, so it says nothing about the computer.
+        let id = match message_id {
+            Some(id) => id.to_owned(),
+            None => new_message_id(&from_address(a, d)?),
+        };
+        builder = builder.message_id(Some(id));
+    }
     let mut count = 0;
     for (field, list) in [(0, &d.to), (1, &d.cc), (2, &d.bcc)] {
         for (name, address) in recipients(list)? {
@@ -1022,13 +1049,16 @@ fn deliver_bcc_apart(
         ..d.clone()
     };
     let mut delivered = None;
+    // One message, however many copies: the same Message-ID in each, so
+    // replies thread together.
+    let message_id = new_message_id(&from_address(a, d)?);
     if !recipients(&d.to)?.is_empty() || !recipients(&d.cc)?.is_empty() {
-        let message = build(a, &visible, false)?;
+        let message = build_to(a, &visible, false, None, Some(&message_id))?;
         let bytes = protected(&message, &visible, keys)?;
         delivered = Some(deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None)?);
     }
     for (_, address) in recipients(&d.bcc)? {
-        let message = build_to(a, &visible, false, Some(&address))?;
+        let message = build_to(a, &visible, false, Some(&address), Some(&message_id))?;
         let bytes = protected(&message, &visible, keys)?;
         let alone = deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None);
         let alone = match delivered {
@@ -1040,6 +1070,35 @@ fn deliver_bcc_apart(
         delivered.get_or_insert(alone);
     }
     delivered.context("Add at least one recipient.")
+}
+
+/// A new Message-ID at `address`'s domain (RFC 5322 §3.6.4): random
+/// (a version 4 UUID), so unique, and naming nothing about the computer.
+/// An internationalized domain is written as ASCII (IDNA).
+pub(crate) fn new_message_id(address: &str) -> String {
+    let domain = address
+        .rsplit_once('@')
+        .and_then(|(_, domain)| idna::domain_to_ascii(domain).ok())
+        .filter(|d| !d.is_empty() && !d.contains(['<', '>', ' ', '[', ']']))
+        .unwrap_or_else(|| "localhost".into());
+    format!("<{}@{domain}>", uuid::Uuid::new_v4().simple())
+}
+/// The address a draft is sent from, as Message-IDs name its domain: the
+/// alias's, else the sending address's or the account's.
+fn from_address(a: &Account, d: &Draft) -> Result<String> {
+    if !d.send_as.trim().is_empty() {
+        return Ok(d.send_as.trim().to_owned());
+    }
+    Ok(sender(a, d)?.1.email.to_string())
+}
+/// The Message-ID a built message has.
+#[cfg(test)]
+fn message_id_of(message: &Message) -> String {
+    message
+        .headers()
+        .get_raw("Message-ID")
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// `raw` with the draft's Bcc field added in front, for the sender's own
@@ -1995,6 +2054,40 @@ mod tests {
             written,
             "MAIL FROM:<me@x.org>\r\nRCPT TO:<a@x.org> ORCPT=rfc822;a@x.org\r\nRCPT TO:<b@x.org> ORCPT=rfc822;b@x.org\r\n"
         );
+    }
+
+    /// RFC 5322 §3.6.4: every sent message has a Message-ID at the
+    /// sender's domain (the alias's, sent as one), random each time, and
+    /// never the computer's name.
+    #[test]
+    fn message_ids_use_the_senders_domain() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Hi".into(),
+            ..Draft::default()
+        };
+        let id = |m: &Message| message_id_of(m);
+        let first = id(&build(&a, &d, false)?);
+        let second = id(&build(&a, &d, false)?);
+        assert!(first.starts_with('<') && first.ends_with("@example.com>"), "{first}");
+        assert_ne!(first, second);
+        assert_eq!(first.len(), "<@example.com>".len() + 32);
+        let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+        if !host.trim().is_empty() {
+            assert!(!first.contains(host.trim()), "{first}");
+        }
+        let alias = Draft {
+            send_as: "shop@alias.example".into(),
+            ..d.clone()
+        };
+        assert!(id(&build(&a, &alias, false)?).ends_with("@alias.example>"));
+        // Drafts saved on the server get none: their sent message will.
+        assert!(id(&build(&a, &d, true)?).is_empty());
+        assert!(new_message_id("ana@bücher.example").ends_with("@xn--bcher-kva.example>"));
+        assert!(new_message_id("odd").ends_with("@localhost>"));
+        Ok(())
     }
 
     #[test]

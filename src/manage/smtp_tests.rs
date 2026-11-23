@@ -310,6 +310,16 @@ fn encrypted_bcc_recipients_each_get_their_own_copy() -> Result<()> {
         assert!(!headers.contains("bo@example.com") && !headers.contains("di@example.com"), "{headers}");
         assert!(headers.contains("multipart/encrypted"), "{headers}");
     }
+    // The same message to everyone: one Message-ID, at the sender's domain.
+    let id = |t: &Transaction| {
+        t.headers()
+            .lines()
+            .find(|l| l.starts_with("Message-ID:"))
+            .map(str::to_owned)
+    };
+    let main_id = id(main).unwrap_or_default();
+    assert!(main_id.ends_with("@example.com>"), "{main_id}");
+    assert!(seen.transactions.iter().all(|t| id(t).as_deref() == Some(main_id.as_str())));
     assert!(sent.starts_with("Bcc: bo@example.com, di@example.com\r\n"), "{sent}");
     drop(b);
     std::fs::remove_dir_all(path)?;
