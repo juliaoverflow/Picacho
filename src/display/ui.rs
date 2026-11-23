@@ -184,6 +184,19 @@ const TITLEBAR_HEIGHT: f32 = 38.;
 const TEXT_ZOOM: &str = "text_zoom";
 /// The text zoom steps, as browsers have them.
 const ZOOM_STEPS: [f32; 11] = [0.5, 0.67, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2., 3.];
+/// The text zoom one step from `now` (`direction` 1 or -1, within
+/// `ZOOM_STEPS`), or the email's own size (0). A zoom between steps (set by
+/// hand) moves from 100%.
+fn next_text_zoom(now: f32, direction: i32) -> f32 {
+    if direction == 0 {
+        return 1.;
+    }
+    let at = ZOOM_STEPS
+        .iter()
+        .position(|z| (z - now).abs() < 0.01)
+        .unwrap_or(4) as i32;
+    ZOOM_STEPS[(at + direction).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize]
+}
 /// Space around full-size Settings, the same on every side.
 const MAXIMIZED_MARGIN: f32 = 40.;
 const SIDEBAR_WIDTH: f32 = 228.;
@@ -901,6 +914,10 @@ enum Action {
     /// Lists every message of a long conversation.
     ExpandThread,
     ShowOriginal,
+    /// Emails one zoom step larger (1), smaller (-1), or at their own size
+    /// (0), from the email's menu: the zoom a phone, without ⌘+ and ⌘−,
+    /// reaches (WCAG 1.4.4).
+    TextZoom(i32),
     /// Lists the subscriptions detected in an account, or in every account
     /// (All Accounts' id).
     OpenSubscriptions(String),
@@ -6210,6 +6227,18 @@ impl MailApp {
             entries.push(entry("Copy Message Text", "copy", Action::CopyText(body)));
         }
         entries.push(entry("Show Raw", "code", Action::ShowOriginal));
+        // The text zoom, for touch screens that have no ⌘+ and ⌘−.
+        entries.push(Entry::Separator);
+        let zoom = self.text_zoom();
+        if zoom < ZOOM_STEPS[ZOOM_STEPS.len() - 1] {
+            entries.push(entry("Larger Text", "zoom-in", Action::TextZoom(1)));
+        }
+        if zoom > ZOOM_STEPS[0] {
+            entries.push(entry("Smaller Text", "zoom-out", Action::TextZoom(-1)));
+        }
+        if (zoom - 1.).abs() > 0.01 {
+            entries.push(entry("Actual Size", "a-large-small", Action::TextZoom(0)));
+        }
         // Accounts shared through the same JMAP sign-in copy on the server.
         for (id, label) in self.jmap_copy_targets() {
             entries.push(entry(format!("Copy to {label}"), "copy", Action::CopyToJmapAccount(id)));
@@ -7141,6 +7170,10 @@ impl MailApp {
             ),
             Action::Unsubscribe(sub) => self.unsubscribe(sub, w, cx),
             Action::ShowOriginal => self.handle(Action::ShowSource(SourceView::Original), w, cx),
+            Action::TextZoom(direction) => {
+                self.menu = None;
+                self.step_text_zoom(direction, cx);
+            }
             Action::ShowSource(view) => {
                 self.source_view = view;
                 self.load_details(cx);
@@ -11000,24 +11033,18 @@ impl MailApp {
     }
 }
 impl MailApp {
-    /// Emails one zoom step larger (1), smaller (-1), or at their own size
-    /// (0); the step is kept for every email.
-    fn step_text_zoom(&mut self, direction: i32, cx: &mut Context<Self>) {
-        let now = self
-            .backend
+    /// The emails' text zoom, as last set (1: their own size).
+    fn text_zoom(&self) -> f32 {
+        self.backend
             .store
             .preference(TEXT_ZOOM)
             .and_then(|z| z.parse::<f32>().ok())
-            .unwrap_or(1.);
-        let at = ZOOM_STEPS
-            .iter()
-            .position(|z| (z - now).abs() < 0.01)
-            .unwrap_or(4) as i32;
-        let next = if direction == 0 {
-            1.
-        } else {
-            ZOOM_STEPS[(at + direction).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize]
-        };
+            .unwrap_or(1.)
+    }
+    /// Emails one zoom step larger (1), smaller (-1), or at their own size
+    /// (0); the step is kept for every email.
+    fn step_text_zoom(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let next = next_text_zoom(self.text_zoom(), direction);
         let _ = self.backend.store.set_preference(TEXT_ZOOM, &next.to_string());
         self.html_view.update(cx, |v, cx| v.set_text_zoom(next, cx));
         self.notice(format!("Emails at {}%", (next * 100.).round()), false, cx);

@@ -203,6 +203,10 @@ impl HtmlView {
         }
     }
     #[cfg(test)]
+    pub fn text_zoom(&self) -> f32 {
+        self.text_zoom
+    }
+    #[cfg(test)]
     pub fn has_document(&self) -> bool {
         self.worker.is_some()
     }

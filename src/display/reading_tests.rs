@@ -686,3 +686,103 @@ fn a_long_press_selects_a_word_in_an_email_and_offers_to_copy_it(cx: &mut TestAp
         );
     });
 }
+
+#[test]
+fn text_zoom_steps_like_a_browsers_and_stops_at_its_ends() {
+    assert_eq!(next_text_zoom(1., 1), 1.1);
+    assert_eq!(next_text_zoom(1.1, -1), 1.);
+    assert_eq!(next_text_zoom(2., 1), 3.);
+    assert_eq!(next_text_zoom(3., 1), 3., "no larger than 300%");
+    assert_eq!(next_text_zoom(0.5, -1), 0.5, "no smaller than 50%");
+    assert_eq!(next_text_zoom(1.75, 0), 1.);
+    assert_eq!(
+        next_text_zoom(1.3, 1),
+        1.1,
+        "a zoom between steps moves from 100%"
+    );
+}
+
+/// Touch screens have no ⌘+ and ⌘−: the email's menu (a long press, or a
+/// secondary click) zooms it, with the same steps and the same saved zoom.
+#[gpui::test]
+fn the_emails_menu_zooms_its_text(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    cx.simulate_resize(size(px(1440.), px(900.)));
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html =
+            Some("<body style=\"margin:0\"><p style=\"height:300px\">Hello</p></body>".into());
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    let settle = |cx: &mut VisualTestContext| {
+        for _ in 0..15 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    settle(cx);
+    let choose = |label: &str, cx: &mut VisualTestContext| {
+        let email = cx.debug_bounds("html-email").expect("the email is shown");
+        let at = point(email.left() + px(40.), email.top() + px(30.));
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        settle(cx);
+        let (index, labels) = view.read_with(cx, |this, _| {
+            let menu = this.menu.as_ref().expect("the email's menu opens");
+            let labels: Vec<String> = menu
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item { label, .. } => Some(label.to_string()),
+                    Entry::Separator => None,
+                })
+                .collect();
+            let index = menu
+                .entries
+                .iter()
+                .position(|e| matches!(e, Entry::Item { label: l, .. } if l.as_ref() == label));
+            (index, labels)
+        });
+        let index = index.unwrap_or_else(|| panic!("{label} in {labels:?}"));
+        let item: &'static str = Box::leak(format!("menu-item-{index}").into_boxed_str());
+        let item = cx.debug_bounds(item).expect("the menu is drawn").center();
+        cx.simulate_mouse_move(item, None, Modifiers::none());
+        cx.simulate_click(item, Modifiers::none());
+        settle(cx);
+        labels
+    };
+    let zoom = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, cx| this.html_view.read(cx).text_zoom())
+    };
+    let labels = choose("Larger Text", cx);
+    assert!(
+        !labels.iter().any(|l| l == "Actual Size"),
+        "at 100%: {labels:?}"
+    );
+    assert_eq!(zoom(cx), 1.1);
+    choose("Larger Text", cx);
+    assert_eq!(zoom(cx), 1.25);
+    assert_eq!(
+        store.preference(TEXT_ZOOM).as_deref(),
+        Some("1.25"),
+        "kept for every email"
+    );
+    choose("Smaller Text", cx);
+    assert_eq!(zoom(cx), 1.1);
+    choose("Actual Size", cx);
+    assert_eq!(zoom(cx), 1.);
+    view.read_with(cx, |this, _| assert!(this.menu.is_none()));
+}
