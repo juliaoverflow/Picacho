@@ -2468,12 +2468,13 @@ mod tests {
             subject: "Grüße".into(),
             ..Default::default()
         };
-        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com", "")).unwrap();
+        let to = ["ana@example.com".to_owned()];
+        let raw = String::from_utf8(receipt(&a, &m, &to, "")).unwrap();
         assert!(raw.contains("Content-Type: message/global-disposition-notification\r\n"), "{raw}");
         assert!(raw.contains("Final-Recipient: utf-8;jörg@bücher.example\r\n"), "{raw}");
         assert!(has_global_part(raw.as_bytes()));
         a.email = "me@example.com".into();
-        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com", "rfc822;me@example.com")).unwrap();
+        let raw = String::from_utf8(receipt(&a, &m, &to, "rfc822;me@example.com")).unwrap();
         assert!(raw.contains("Content-Type: message/disposition-notification\r\n"), "{raw}");
         assert!(raw.contains("Final-Recipient: rfc822;me@example.com\r\n"), "{raw}");
         assert!(!has_global_part(raw.as_bytes()));
