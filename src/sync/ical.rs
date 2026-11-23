@@ -137,15 +137,22 @@ pub struct Event {
     /// COMMENT: a note with an iTIP message (a proposed time's reason).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// STATUS as written (RFC 5545 §3.8.1.11: TENTATIVE, CONFIRMED,
+    /// IN-PROCESS…), uppercase, so writing the event from its fields keeps
+    /// it; `cancelled` and `completed` say the two Picacho acts on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
 }
 
 /// Properties `write_event` writes from an event's fields; others are
 /// kept as they came (`Event::kept`).
-const MODELLED: [&str; 25] = [
+/// CREATED isn't one: RFC 5545 §3.8.7.1 has it stay as it was first
+/// written, so it is kept; LAST-MODIFIED is written anew (§3.8.7.3).
+const MODELLED: [&str; 24] = [
     "COMMENT", "BEGIN", "END", "UID", "DTSTAMP", "SEQUENCE", "DTSTART", "DTEND", "DUE", "DURATION",
     "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "SUMMARY", "LOCATION", "DESCRIPTION",
     "RRULE", "ORGANIZER", "ATTENDEE", "COMPLETED", "PERCENT-COMPLETE", "LAST-MODIFIED",
-    "CREATED", "X-PICACHO",
+    "X-PICACHO",
 ];
 
 /// The lines of a component (unfolded, BEGIN and END included) that
@@ -1116,8 +1123,9 @@ fn parse_lines(lines: Vec<String>) -> Calendar {
                 "SEQUENCE" => e.sequence = value.trim().parse().unwrap_or(0),
                 "RRULE" => e.recurrence = value.trim().to_owned(),
                 "STATUS" => {
-                    e.cancelled |= value.trim().eq_ignore_ascii_case("CANCELLED");
-                    e.completed |= value.trim().eq_ignore_ascii_case("COMPLETED");
+                    e.status = value.trim().to_ascii_uppercase();
+                    e.cancelled |= e.status == "CANCELLED";
+                    e.completed |= e.status == "COMPLETED";
                 }
                 "COMPLETED" => e.completed = true,
                 _ => {}
@@ -2225,8 +2233,10 @@ pub fn write_event(e: &Event) -> String {
         if e.completed {
             lines.push("STATUS:COMPLETED".to_owned());
             lines.push(format!("COMPLETED:{}", stamp(Utc::now().timestamp())));
-        } else {
-            lines.push("STATUS:NEEDS-ACTION".to_owned());
+        } else if !e.cancelled {
+            // RFC 5545 §3.8.1.11: a task's other open state (IN-PROCESS) stays.
+            let open = matches!(e.status.as_str(), "IN-PROCESS" | "NEEDS-ACTION");
+            lines.push(format!("STATUS:{}", if open { e.status.as_str() } else { "NEEDS-ACTION" }));
         }
     } else {
         lines.push(at("DTSTART", e.start));
@@ -2247,7 +2257,11 @@ pub fn write_event(e: &Event) -> String {
     }
     if e.cancelled {
         lines.push("STATUS:CANCELLED".to_owned());
+    } else if !e.task && matches!(e.status.as_str(), "TENTATIVE" | "CONFIRMED") {
+        // RFC 5545 §3.8.1.11: an event's other states, as they came.
+        lines.push(format!("STATUS:{}", e.status));
     }
+    lines.push(format!("LAST-MODIFIED:{}", stamp(Utc::now().timestamp())));
     lines.push(format!("SUMMARY:{}", escape(&e.summary)));
     if !e.location.is_empty() {
         lines.push(format!("LOCATION:{}", escape(&e.location)));
@@ -2328,6 +2342,148 @@ fn trigger(before: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Calendar objects as Google, iCloud and Nextcloud write them: several
+    /// reminders of different kinds, X- properties, ATTACH, a changed
+    /// occurrence (RECURRENCE-ID) and the calendar's own VTIMEZONE.
+    const GOOGLE: &str = include_str!("../../tests/fixtures/ical/google.ics");
+    const ICLOUD: &str = include_str!("../../tests/fixtures/ical/icloud.ics");
+    const NEXTCLOUD: &str = include_str!("../../tests/fixtures/ical/nextcloud.ics");
+
+    /// The top-level property lines of each component (not its
+    /// sub-components), with DTSTAMP and LAST-MODIFIED left out since
+    /// writing renews them.
+    fn own_lines(component: &str) -> Vec<String> {
+        let lines = unfold(component);
+        let mut depth = 0;
+        let mut out = Vec::new();
+        for l in &lines {
+            let u = l.to_ascii_uppercase();
+            if u.starts_with("BEGIN:") {
+                depth += 1;
+                continue;
+            }
+            if u.starts_with("END:") {
+                depth -= 1;
+                continue;
+            }
+            if depth == 1 && !u.starts_with("DTSTAMP") && !u.starts_with("LAST-MODIFIED") {
+                out.push(l.clone());
+            }
+        }
+        out
+    }
+    /// The VALARM blocks of a component, each as its lines in order.
+    fn alarm_blocks(component: &str) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        let mut current: Option<Vec<String>> = None;
+        for l in unfold(component) {
+            let u = l.to_ascii_uppercase();
+            if u == "BEGIN:VALARM" {
+                current = Some(Vec::new());
+            } else if u == "END:VALARM" {
+                out.extend(current.take());
+            } else if let Some(c) = current.as_mut() {
+                c.push(l);
+            }
+        }
+        out
+    }
+
+    /// Every fixture is edited (its title changed) and written from its
+    /// fields: what Picacho doesn't model comes back exactly once, the
+    /// reminders aren't doubled, and a modelled property isn't also kept.
+    #[test]
+    fn edited_events_from_other_apps_lose_and_double_nothing() {
+        for (name, text) in [("google", GOOGLE), ("icloud", ICLOUD), ("nextcloud", NEXTCLOUD)] {
+            let mut events = parse(text).events;
+            let series_at = events.iter().position(|e| e.recurrence_id.is_none()).unwrap();
+            let original_series = events.remove(series_at);
+            let original_overrides = events;
+            for e in std::iter::once(&original_series).chain(&original_overrides) {
+                // RFC 5545 §3.6.1: what `write_event` writes from fields
+                // isn't also in `kept`, or it would be written twice.
+                let mut depth = 0;
+                for line in unfold(&e.kept) {
+                    let u = line.to_ascii_uppercase();
+                    if u.starts_with("BEGIN:") {
+                        depth += 1;
+                    } else if u.starts_with("END:") {
+                        depth -= 1;
+                    } else if depth == 0 {
+                        let n = split_line(&line).unwrap().0;
+                        assert!(!MODELLED.contains(&n.as_str()), "{name}: {n} is modelled and kept");
+                    }
+                }
+            }
+            // Edited here: written from the fields, each changed
+            // occurrence too.
+            let edit = |e: &Event| Event { summary: format!("{} (edited)", e.summary), source: String::new(), ..e.clone() };
+            let series = edit(&original_series);
+            let overrides: Vec<Event> = original_overrides.iter().map(edit).collect();
+            let written = to_store_all(&series, &overrides);
+            let back = parse(&written).events;
+            assert_eq!(back.len(), 1 + overrides.len(), "{name}");
+            let pairs = std::iter::once((&original_series, &back[0])).chain(original_overrides.iter().zip(&back[1..]));
+            for (before, after) in pairs {
+                assert_eq!(after.summary, format!("{} (edited)", before.summary), "{name}");
+                assert_eq!(after.alarms, before.alarms, "{name}: reminders");
+                assert_eq!(after.kept, before.kept, "{name}: kept");
+                assert_eq!((after.start, after.end, after.recurrence_id), (before.start, before.end, before.recurrence_id), "{name}");
+                assert_eq!(after.attendees, before.attendees, "{name}");
+                assert_eq!(after.exdates, before.exdates, "{name}");
+                // Each of the component's own properties is there as
+                // many times as it was, SUMMARY aside.
+                let was = own_lines(&before.source);
+                let now = own_lines(&after.source);
+                for line in &was {
+                    let n = split_line(line).unwrap().0;
+                    if matches!(n.as_str(), "SUMMARY" | "DTSTART" | "DTEND" | "RECURRENCE-ID" | "EXDATE" | "ATTENDEE" | "ORGANIZER") {
+                        // Written from fields, perhaps with parameters in
+                        // another order; compared through the fields above.
+                        continue;
+                    }
+                    assert_eq!(
+                        now.iter().filter(|l| *l == line).count(),
+                        was.iter().filter(|l| *l == line).count(),
+                        "{name}: {line} in\n{}",
+                        now.join("\n")
+                    );
+                }
+                // As many reminders, none doubled.
+                let (alarms_was, alarms_now) = (alarm_blocks(&before.source), alarm_blocks(&after.source));
+                assert_eq!(alarms_now.len(), alarms_was.len(), "{name}: {:#?}", alarms_now);
+                // A rich reminder comes back exactly as it was.
+                for block in alarms_was.iter().filter(|b| !kept_lines(&[vec![String::new(), "BEGIN:VALARM".into()], (*b).clone(), vec!["END:VALARM".into(), String::new()]].concat()).is_empty()) {
+                    assert_eq!(alarms_now.iter().filter(|b| *b == block).count(), 1, "{name}: {block:?}");
+                }
+            }
+            // Written again unchanged, nothing grows.
+            let (s2, o2) = back.split_first().unwrap();
+            let again = to_store_all(&Event { source: String::new(), ..s2.clone() }, &o2.iter().map(|o| Event { source: String::new(), ..o.clone() }).collect::<Vec<_>>());
+            assert_eq!(unfold(&again).len(), unfold(&written).len(), "{name}");
+        }
+    }
+    /// The fixtures' details as read.
+    #[test]
+    fn other_apps_fixtures_are_read() {
+        let google = parse(GOOGLE).events;
+        assert_eq!(google.len(), 2);
+        assert_eq!(google[0].alarms, [600, 86_400]);
+        assert!(google[0].kept.contains("ACTION:EMAIL"));
+        assert!(google[0].kept.contains("ATTACH;FILENAME=Agenda.pdf"));
+        assert_eq!(google[0].status, "CONFIRMED");
+        assert!(google[0].kept.contains("CREATED:20261020T080000Z"));
+        assert_eq!(google[1].recurrence_id, Some(google[0].start + 7 * 86_400));
+        let icloud = parse(ICLOUD).events;
+        assert_eq!(icloud[0].alarms, [1800], "{:?}", icloud[0].alarms);
+        // The sound, the never-firing default and the acknowledged one
+        // are kept whole.
+        assert_eq!(icloud[0].kept.matches("BEGIN:VALARM").count(), 3);
+        let nextcloud = parse(NEXTCLOUD).events;
+        assert_eq!(nextcloud[0].alarms, [900]);
+        assert_eq!(nextcloud[0].status, "TENTATIVE");
+        assert!(nextcloud[0].kept.contains("REPEAT:2"));
+    }
     #[test]
     fn edits_keep_what_picacho_doesnt_read() {
         let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:k\r\nDTSTART:20261124T090000Z\r\nDTEND:20261124T100000Z\r\nSUMMARY:Review\r\nCATEGORIES:Work,Q4\r\nCLASS:PRIVATE\r\nATTACH:https://x.example/agenda.pdf\r\nCOLOR:teal\r\nATTENDEE;ROLE=OPT-PARTICIPANT;CUTYPE=ROOM;PARTSTAT=ACCEPTED;CN=Room 4:mailto:room@x.example\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT1H\r\nATTENDEE:mailto:me@x.example\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
