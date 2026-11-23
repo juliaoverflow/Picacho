@@ -206,6 +206,26 @@ pub(super) fn has_hp_parameter(payload: &[u8]) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("clear") || v.eq_ignore_ascii_case("cipher"))
 }
 
+/// RFC 9788 §4.10.1: the message an RFC8551HP payload wraps, when
+/// `payload` (the root of a Cryptographic Payload) is one: a single
+/// message/rfc822 part, the message it holds not itself a Cryptographic
+/// Layer, and no hp parameter on either. That message's header fields are
+/// the protected ones and its body is what is shown (§4.10.2).
+pub(super) fn unwrapped(payload: &[u8]) -> Option<Vec<u8>> {
+    let parsed = mailparse::parse_mail(payload).ok()?;
+    if !parsed.ctype.mimetype.eq_ignore_ascii_case("message/rfc822") || parsed.ctype.params.contains_key("hp") {
+        return None;
+    }
+    let message = parsed.get_body_raw().ok()?;
+    let wrapped = mailparse::parse_mail(&message).ok()?;
+    let kind = wrapped.ctype.mimetype.to_ascii_lowercase();
+    let layer = matches!(
+        kind.as_str(),
+        "multipart/signed" | "multipart/encrypted" | "application/pkcs7-mime" | "application/x-pkcs7-mime"
+    );
+    (!layer && !wrapped.ctype.params.contains_key("hp")).then_some(message)
+}
+
 /// RFC 9788 §5.2.1 step 2 and RFC 9787 §1.1.2: the User-Facing fields of
 /// `outer` that `compose` obscures or takes off the outside, (name,
 /// decoded value), for a Legacy Display Element. Only an encrypted
@@ -254,10 +274,12 @@ fn same_address(a: Option<&str>, b: Option<&str>) -> bool {
 /// carries is shown as it is there, in place of any outer one of its
 /// name, and the HP-Outer fields, which record what went outside, aren't
 /// shown. Without, the outer fields as they are, then the payload.
-pub(super) fn readable(outer: &[u8], payload: &[u8]) -> Vec<u8> {
+/// `inferred`: the payload has Header Protection by its structure (an
+/// RFC8551HP one unwrapped, RFC 9788 §4.10.2) rather than a parameter.
+pub(super) fn readable(outer: &[u8], payload: &[u8], inferred: bool) -> Vec<u8> {
     let payload_text = latin1(payload);
     let (head, body_at) = head_of(&payload_text);
-    if !has_header_protection(head) {
+    if !inferred && !has_header_protection(head) {
         let mut out = outer.to_vec();
         out.extend_from_slice(payload);
         return out;
@@ -279,7 +301,11 @@ pub(super) fn readable(outer: &[u8], payload: &[u8]) -> Vec<u8> {
         .filter(|f| !carried(&f.name))
         .map(|f| f.lines)
         .collect();
-    for field in inner.iter().filter(|f| f.name != "hp-outer") {
+    let outer_mime_version = fields(&out).iter().any(|f| f.name == "mime-version");
+    for field in inner
+        .iter()
+        .filter(|f| f.name != "hp-outer" && !(outer_mime_version && f.name == "mime-version"))
+    {
         out.push_str(&field.lines);
     }
     out.push_str("\r\n");
@@ -503,6 +529,81 @@ mod tests {
         assert!(!String::from_utf8_lossy(&payload).contains("hp-legacy-display"));
     }
 
+    /// `content` signed by `key` as RFC 3156 §5 multipart/signed (headers
+    /// and body, no outer fields).
+    fn signed_mime(content: &str, key: &pgp::composed::SignedSecretKey) -> String {
+        use pgp::composed::DetachedSignature;
+        let sub = key.secret_subkeys.iter().find(|s| s.signatures.iter().any(|g| g.key_flags().sign())).unwrap();
+        let signature = DetachedSignature::sign_binary_data(
+            rand08::thread_rng(),
+            &sub.key,
+            &pgp::types::Password::empty(),
+            pgp::crypto::hash::HashAlgorithm::Sha256,
+            content.as_bytes(),
+        )
+        .unwrap()
+        .to_armored_string(Default::default())
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+        format!("Content-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"s\"\r\n\r\n--s\r\n{content}\r\n--s\r\nContent-Type: application/pgp-signature\r\n\r\n{signature}\r\n--s--\r\n")
+    }
+
+    /// `payload` encrypted to `key` as RFC 3156 §4 multipart/encrypted,
+    /// after the fields `outer`.
+    fn encrypted_mime(outer: &str, payload: &str, key: &pgp::composed::SignedSecretKey) -> String {
+        let public = pgp::composed::SignedPublicKey::from(key.clone());
+        let sub = super::super::encryption_subkey(&public).unwrap();
+        let mut builder = pgp::composed::MessageBuilder::from_bytes("", payload.as_bytes().to_vec())
+            .seipd_v1(rand08::thread_rng(), pgp::crypto::sym::SymmetricKeyAlgorithm::AES256);
+        builder.encrypt_to_key(rand08::thread_rng(), &sub.key).unwrap();
+        let armored = builder
+            .to_armored_string(rand08::thread_rng(), Default::default())
+            .unwrap()
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        format!("{outer}MIME-Version: 1.0\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"e\"\r\n\r\n--e\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n\r\n--e\r\nContent-Type: application/octet-stream\r\n\r\n{armored}\r\n--e--\r\n")
+    }
+
+    const WRAPPED: &str = "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nSubject: Hidden plans\r\nMessage-ID: <1@example.org>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
+    const WRAPPED_OUTER: &str = "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nSubject: ...\r\nMessage-ID: <1@example.org>\r\n";
+
+    /// RFC 9788 §4.10: a payload that is one message/rfc822 with no hp
+    /// parameter (RFC 8551's wrapped form) is read as the message it
+    /// holds: its Subject, not the outer one, and its body, not the
+    /// wrapper. Encrypted, signed and encrypted, and signed only; the
+    /// signature over the wrapper counts.
+    #[test]
+    fn wrapped_rfc822_payloads_are_read_as_their_message() {
+        use super::super::{Signature, open};
+        let ana = super::super::test_key("Ana <ana@example.org>", "");
+        let mut ring = super::super::Keyring::default();
+        ring.import(&ana.to_armored_string(Default::default()).unwrap(), "").unwrap();
+        let payload = format!("Content-Type: message/rfc822\r\n\r\n{WRAPPED}");
+        let signed = signed_mime(&payload, &ana);
+        for (raw, signature) in [
+            (encrypted_mime(WRAPPED_OUTER, &payload, &ana), Signature::None),
+            (encrypted_mime(WRAPPED_OUTER, &signed, &ana), Signature::Good("Ana <ana@example.org>".into())),
+            (format!("{WRAPPED_OUTER}MIME-Version: 1.0\r\n{signed}"), Signature::Good("Ana <ana@example.org>".into())),
+        ] {
+            let (readable, verdict) = open(raw.as_bytes(), &ring).unwrap();
+            let readable = String::from_utf8(readable).unwrap();
+            assert_eq!(verdict.signature, signature, "{readable}");
+            assert_eq!(values(&readable, "Subject"), ["Hidden plans"], "{readable}");
+            assert_eq!(values(&readable, "From"), ["Ana <ana@example.org>"], "{readable}");
+            let parsed = mailparse::parse_mail(readable.as_bytes()).unwrap();
+            assert_eq!(parsed.ctype.mimetype, "text/plain", "{readable}");
+            assert_eq!(parsed.get_body().unwrap(), "Meet at noon.\r\n");
+        }
+        // A signed message inside is a layer of its own, and one with an
+        // hp parameter is RFC 9788's: neither is unwrapped.
+        let layer = format!("Content-Type: message/rfc822\r\n\r\n{signed}");
+        assert!(unwrapped(layer.as_bytes()).is_none());
+        let marked = format!("Content-Type: message/rfc822; hp=\"cipher\"\r\n\r\n{WRAPPED}");
+        assert!(unwrapped(marked.as_bytes()).is_none());
+        assert_eq!(unwrapped(payload.as_bytes()).as_deref(), Some(WRAPPED.as_bytes()));
+    }
+
     /// Brief Q5: a payload without an hp parameter is never stripped, even
     /// with a part marked hp-legacy-display="1" (RFC 9788 §4.1: the
     /// marker means something only with Header Protection).
@@ -528,7 +629,7 @@ mod tests {
     fn readable_messages_show_the_protected_headers() {
         let outer = b"From: Ana <ana@example.org>\r\nSubject: ...\r\nReceived: by mx\r\nMIME-Version: 1.0\r\n";
         let payload = b"Subject: Plans\r\nFrom: Ana Lima <ANA@EXAMPLE.ORG>\r\nHP-Outer: Subject: ...\r\nContent-Type: text/plain; hp=\"cipher\"\r\n\r\nHi\r\n";
-        let shown = String::from_utf8(readable(outer, payload)).unwrap();
+        let shown = String::from_utf8(readable(outer, payload, false)).unwrap();
         assert_eq!(values(&shown, "Subject"), ["Plans"], "{shown}");
         assert_eq!(values(&shown, "From"), ["Ana Lima <ANA@EXAMPLE.ORG>"], "{shown}");
         assert_eq!(values(&shown, "Received"), ["by mx"], "{shown}");
@@ -537,13 +638,13 @@ mod tests {
         // A protected From for another address isn't shown in place of the
         // outer one (RFC 9788 §4.4.3).
         let other = String::from_utf8_lossy(payload).replace("ANA@EXAMPLE.ORG", "boss@bank.example");
-        let shown = String::from_utf8(readable(outer, other.as_bytes())).unwrap();
+        let shown = String::from_utf8(readable(outer, other.as_bytes(), false)).unwrap();
         assert_eq!(values(&shown, "From"), ["Ana <ana@example.org>"], "{shown}");
         assert_eq!(values(&shown, "Subject"), ["Plans"], "{shown}");
         // No hp parameter: a Subject in the payload's header is just a
         // header there, and the outer one is what's shown.
         let plain = b"Subject: Not me\r\nContent-Type: text/plain\r\n\r\nHi\r\n";
-        let shown = String::from_utf8(readable(outer, plain)).unwrap();
+        let shown = String::from_utf8(readable(outer, plain, false)).unwrap();
         assert_eq!(values(&shown, "Subject")[0], "...", "{shown}");
         assert!(same_address(Some("ana@bücher.example"), Some("ANA@xn--bcher-kva.example")));
         assert!(!same_address(Some("ana@example.org"), Some("ana@example.org.evil")));

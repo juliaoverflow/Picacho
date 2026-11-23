@@ -737,7 +737,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             // RFC 9788 §4.5: the Cryptographic Payload is the signed part,
             // whose headers are the protected ones.
             return Some((
-                protected::readable(&outer_headers(&full), &shown_payload(&content)),
+                shown(&outer_headers(&full), &content),
                 Verdict {
                     decrypted: true,
                     signature,
@@ -745,7 +745,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             ));
         }
         return Some((
-            protected::readable(&outer, &shown_payload(&inner)),
+            shown(&outer, &inner),
             Verdict {
                 decrypted: true,
                 signature,
@@ -756,7 +756,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
         Some((content, sig)) => {
             let signature = check(&sig, &content, &ring.public_keys(), from.as_deref());
             Some((
-                protected::readable(&outer_headers(raw), &content),
+                shown(&outer_headers(raw), &content),
                 Verdict {
                     decrypted: false,
                     signature,
@@ -765,6 +765,17 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
         }
         // Not PGP/MIME: inline PGP, or PGP/MIME a list wrapped in a part.
         None => open_inline(raw, ring, from.as_deref()).or_else(|| open_nested(raw, ring)),
+    }
+}
+
+/// The message shown for `outer` (its outer header fields) and `payload`
+/// (the root of its Cryptographic Payload). RFC 9788 §4.10: a payload
+/// that wraps the message whole (message/rfc822, the older RFC 8551 form)
+/// is read as that message, its header fields the protected ones.
+fn shown(outer: &[u8], payload: &[u8]) -> Vec<u8> {
+    match protected::unwrapped(payload) {
+        Some(message) => protected::readable(outer, &message, true),
+        None => protected::readable(outer, &shown_payload(payload), false),
     }
 }
 
