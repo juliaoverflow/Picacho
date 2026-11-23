@@ -19,6 +19,7 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
+pub mod keys;
 mod nested;
 mod signers;
 
