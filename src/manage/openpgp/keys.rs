@@ -143,7 +143,6 @@ fn validity(lasts: std::time::Duration) -> Result<Duration> {
 /// primary key does (never, with `None`). A signing subkey's binding keeps
 /// its embedded back-signature (§5.2.1.9), which covers the two keys, not
 /// the binding, and so stays valid.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn set_expiry(key: &SignedSecretKey, lasts: Option<std::time::Duration>) -> Result<SignedSecretKey> {
     resign(key, lasts.map(validity).transpose()?, Supersede::Newer)
 }
@@ -151,7 +150,6 @@ pub fn set_expiry(key: &SignedSecretKey, lasts: Option<std::time::Duration>) -> 
 /// Whether `resign` adds newer signatures after the old ones or replaces
 /// them (for a key just made, which no one else has yet).
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum Supersede {
     Newer,
     Replace,
@@ -239,7 +237,6 @@ impl Keyring {
     /// only what its newest self-signature says). The re-signed key takes
     /// the old one's place; others see the new date once they have the
     /// key again (sent by hand, or by Autocrypt or WKD).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn renew(&mut self, fp: &str, from_now: Option<std::time::Duration>) -> Result<()> {
         use pgp::composed::Deserializable as _;
         let (at, key) = self
