@@ -38,6 +38,8 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                 while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
                     i += 1;
                 }
+                // RFC 5228 §2.3: a bracketed comment ends with `*/`.
+                ensure!(i + 1 < chars.len(), "A comment in the script isn't closed.");
                 i += 2;
             }
             '"' => {
@@ -115,10 +117,12 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                         while i < chars.len() && chars[i] != '\n' {
                             i += 1;
                         }
+                        // RFC 5228 §2.4.2: it ends at a line of a lone dot.
+                        ensure!(i < chars.len(), "A text: string in the script isn't closed.");
                         let line: String = chars[start..i].iter().collect();
                         let line = line.trim_end_matches('\r');
                         i += 1;
-                        if line == "." || i > chars.len() {
+                        if line == "." {
                             break;
                         }
                         s.push_str(line.strip_prefix('.').filter(|_| line.starts_with("..")).unwrap_or(line));
@@ -290,6 +294,7 @@ pub fn read(text: &str) -> Result<Read> {
             "require" => {}
             "if" | "elsif" => match rule_of(c) {
                 Some(rule) => out.filters.rules.push(rule),
+                None if dated_vacation_of(c, &mut out.filters) => {}
                 None => out.left_out += 1,
             },
             "include" => {
@@ -428,6 +433,45 @@ fn rule_test(t: &Test) -> Option<Rule> {
     Some(rule)
 }
 
+/// `if allof (currentdate …) { vacation …; }`, a reply only between two
+/// dates (RFC 5260 §5), as Roundcube and Picacho write it: read as the
+/// vacation reply with its first and last day. False where it isn't one.
+fn dated_vacation_of(c: &Command, filters: &mut Filters) -> bool {
+    let Some([action]) = c.block.as_deref() else { return false };
+    if action.name != "vacation" || c.name != "if" {
+        return false;
+    }
+    let tests: &[Test] = match c.tests.as_slice() {
+        [t] if t.name == "allof" => &t.tests,
+        tests => tests,
+    };
+    let mut bounds = (None, None);
+    for t in tests {
+        // currentdate :value "ge"|"le" "date" "YYYY-MM-DD"
+        let strings: Vec<&str> = t
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                Arg::Strings(s) if s.len() == 1 => Some(s[0].as_str()),
+                _ => None,
+            })
+            .collect();
+        let valued = t.args.contains(&Arg::Tag("value".into()));
+        let date = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok();
+        match (t.name.as_str(), valued, strings.as_slice()) {
+            ("currentdate", true, ["ge", "date", d]) if date(d) && bounds.0.is_none() => bounds.0 = Some((*d).to_owned()),
+            ("currentdate", true, ["le", "date", d]) if date(d) && bounds.1.is_none() => bounds.1 = Some((*d).to_owned()),
+            _ => return false,
+        }
+    }
+    if bounds == (None, None) {
+        return false;
+    }
+    vacation_of(action, filters);
+    (filters.vacation.from, filters.vacation.until) = bounds;
+    true
+}
+
 /// A top-level `vacation`'s reply, where it is one Picacho can show.
 fn vacation_of(c: &Command, filters: &mut Filters) {
     let mut v = std::mem::take(&mut filters.vacation);
@@ -438,6 +482,11 @@ fn vacation_of(c: &Command, filters: &mut Filters) {
         match (&c.args[i], c.args.get(i + 1)) {
             (Arg::Tag(t), Some(Arg::Number(n))) if t == "days" => {
                 v.days = (*n).clamp(1, 30) as u32;
+                i += 1;
+            }
+            // RFC 6131 §2: the period in seconds; as days, rounded up.
+            (Arg::Tag(t), Some(Arg::Number(n))) if t == "seconds" => {
+                v.days = n.div_ceil(86_400).clamp(1, 30) as u32;
                 i += 1;
             }
             (Arg::Tag(t), Some(Arg::Strings(s))) if t == "subject" => {
@@ -456,6 +505,92 @@ fn vacation_of(c: &Command, filters: &mut Filters) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scripts as Roundcube's managesieve plugin, Fastmail and
+    /// Dovecot/Pigeonhole users write them (RFC 5228 and its extensions).
+    const ROUNDCUBE: &str = include_str!("../../tests/fixtures/sieve/roundcube.sieve");
+    const FASTMAIL: &str = include_str!("../../tests/fixtures/sieve/fastmail.sieve");
+    const DOVECOT: &str = include_str!("../../tests/fixtures/sieve/dovecot.sieve");
+
+    #[test]
+    fn roundcube_scripts_are_read() {
+        let read = read(ROUNDCUBE).unwrap();
+        let rules = &read.filters.rules;
+        // The two single-test rules; `anyof` and `allof` with two tests
+        // are more than a rule.
+        assert_eq!(rules.len(), 2, "{rules:#?}");
+        assert_eq!(rules[0].act, Act::Redirect("me@mobile.example".into()));
+        assert!(rules[0].keep_copy);
+        assert_eq!((rules[1].field, rules[1].value.as_str()), (Field::LargerThan, "10240"));
+        assert_eq!(read.left_out, 2);
+        // The vacation reply within its dates (RFC 5260 currentdate).
+        let v = &read.filters.vacation;
+        assert!(v.on);
+        assert_eq!((v.days, v.subject.as_str()), (1, "Out of office"));
+        assert_eq!(v.body, "I am away until January 5th.\n\n.For urgent matters, call the office.\n");
+        assert_eq!((v.from.as_deref(), v.until.as_deref()), (Some("2026-12-20"), Some("2027-01-05")));
+    }
+
+    #[test]
+    fn fastmail_scripts_are_read() {
+        let read = read(FASTMAIL).unwrap();
+        // Nested blocks, `set`, `duplicate` and `exists` are parsed and
+        // counted, not refused.
+        let rules = &read.filters.rules;
+        assert_eq!(rules.len(), 0, "{rules:#?}");
+        assert!(read.left_out >= 5, "{}", read.left_out);
+        assert!(!read.filters.vacation.on, "the reply is inside an `if`");
+    }
+
+    #[test]
+    fn dovecot_scripts_are_read() {
+        let read = read(DOVECOT).unwrap();
+        assert_eq!(read.filters.rules.len(), 0);
+        assert_eq!(read.filters.include.as_deref(), Some("after"));
+        let v = &read.filters.vacation;
+        assert!(v.on);
+        assert_eq!((v.subject.as_str(), v.body.as_str()), ("Away", "Back Monday."));
+        // :seconds 3600 is under a day: the closest a day count says.
+        assert_eq!(v.days, 1);
+        assert!(read.left_out >= 4, "{}", read.left_out);
+    }
+
+    #[test]
+    fn grammar_corners_parse() {
+        // A comment right after a tag, a bracketed comment across lines,
+        // a `text:` with a comment after it, CRLF line ends, and a
+        // string with escaped quotes and backslashes.
+        let script = "require [\"fileinto\"]; # hash\r\n/* a\r\n * block */\r\nif header :is \"subject\" \"say \\\"hi\\\" \\\\\" { fileinto \"A\"; }\r\nvacation text: # why\r\nline\r\n.\r\n;\r\n";
+        let read = read(script).unwrap();
+        assert_eq!(read.filters.rules[0].value, "say \"hi\" \\");
+        assert_eq!(read.filters.vacation.body, "line\n");
+        // A `text:` not closed with a lone dot is an error, not a body.
+        assert!(super::read("vacation text:\r\nno end\r\n").is_err());
+        // An unclosed bracketed comment too.
+        assert!(super::read("keep; /* no end").is_err());
+    }
+
+    /// Picacho's own script, read as another app's would be, says the same.
+    #[test]
+    fn picachos_own_scripts_read_back() {
+        use crate::sync::sieve::{Vacation, script};
+        let filters = Filters {
+            rules: vec![Rule { field: Field::Subject, value: "x".into(), act: Act::Discard, stop: true, ..Default::default() }],
+            vacation: Vacation {
+                on: true,
+                subject: "Away".into(),
+                body: "Back soon.".into(),
+                days: 3,
+                from: Some("2026-12-20".into()),
+                until: Some("2027-01-05".into()),
+            },
+            include: None,
+        };
+        let ext: Vec<String> = ["vacation", "date", "relational"].iter().map(|s| s.to_string()).collect();
+        let read = read(&script(&filters, &ext, &[]).unwrap()).unwrap();
+        assert_eq!(read.filters, filters);
+        assert_eq!(read.left_out, 0);
+    }
 
     #[test]
     fn other_apps_scripts_are_read_into_rules() {
