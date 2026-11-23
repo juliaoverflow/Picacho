@@ -155,11 +155,14 @@ impl Backend {
         let mut server = self
             .calendar_server()
             .context("No calendar server is set up.")?;
-        ensure!(
-            server.jmap_account.is_empty() || !on,
-            "Calendars on a JMAP server are scheduled by Picacho."
-        );
-        if on {
+        // A JMAP server sends them where it names the addresses it sends
+        // as (ParticipantIdentity); CalDAV, where it auto-schedules.
+        if on && let Some(a) = self.calendar_jmap(&server)? {
+            ensure!(
+                self.with_jmap_calendars(&a, crate::sync::jscal::server_can_schedule)?,
+                "This JMAP server doesn't say which of your addresses it sends invitations as, so Picacho keeps emailing them."
+            );
+        } else if on {
             ensure!(
                 caldav::schedules(&server, &self.calendar_password()?, self.tls_connector()?)?,
                 "This calendar server doesn't send invitations itself (it doesn't offer calendar-auto-schedule), so Picacho keeps emailing them."
@@ -255,14 +258,16 @@ impl Backend {
         };
         let calendar_id = calendar.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
         let event_id = stored.href.strip_prefix("jmap:").filter(|i| !i.is_empty());
+        let scheduling = self.jmap_scheduling(server, &stored.event);
         let (id, version) = self.with_jmap_calendars(&a, |s| {
-            let id = crate::sync::jscal::save_event_in(
+            let id = crate::sync::jscal::save_event_scheduled(
                 s,
                 event_id,
                 calendar_id,
                 &stored.event,
                 &stored.overrides,
                 Some(&stored.etag),
+                scheduling,
             )?;
             Ok((id.clone(), crate::sync::jscal::version_of(s, &id).unwrap_or_default()))
         })?;
@@ -286,7 +291,18 @@ impl Backend {
         let Some(id) = stored.href.strip_prefix("jmap:").filter(|i| !i.is_empty()) else {
             return Ok(());
         };
-        self.with_jmap_calendars(&a, |s| crate::sync::jscal::delete_event(s, id))
+        let scheduling = self.jmap_scheduling(server, &stored.event);
+        self.with_jmap_calendars(&a, |s| crate::sync::jscal::delete_event_scheduled(s, id, scheduling))
+    }
+    /// Who tells a JMAP calendar event's participants: the server, where
+    /// server scheduling is on and the event is organized here (then
+    /// `send_invitations` sends nothing itself); otherwise Picacho, by mail.
+    fn jmap_scheduling(&self, server: &caldav::Server, event: &Event) -> crate::sync::jscal::Scheduling {
+        if server.server_schedules && self.organized_here(event) {
+            crate::sync::jscal::Scheduling::ByServer
+        } else {
+            crate::sync::jscal::Scheduling::ByPicacho
+        }
     }
     /// Makes a new calendar on the server (MKCALENDAR, or Calendar/set),
     /// returning it.

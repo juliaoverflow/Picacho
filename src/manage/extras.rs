@@ -124,12 +124,14 @@ impl Backend {
                 let Some(identity) = identity else {
                     return Ok(false);
                 };
-                s.send_receipt(
-                    id,
-                    &identity.id,
-                    &format!("Read: {}", m.subject),
-                    &format!("Your message “{}” was displayed.", m.subject),
-                )?;
+                // RFC 9007 §2 with RFC 8098 §3.2.3: the Original-Recipient
+                // the receiving server noted goes in the report too.
+                let mut receipt = crate::sync::jmap::Receipt::displayed(
+                    format!("Read: {}", m.subject),
+                    format!("Your message “{}” was displayed.", m.subject),
+                );
+                receipt.original_recipient = original_recipient.clone();
+                s.send_receipt(id, &identity.id, &receipt)?;
                 Ok(true)
             })?;
             if !by_server {

@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 // Calendars.
 
 /// A calendar on a JMAP server.
-/// A method refused for a reason worth handling: `cannotCalculateChanges`
-/// (the state is too old), `stateMismatch` (`ifInState` no longer holds).
+/// A method refused for a reason worth handling: `stateMismatch`
+/// (`ifInState` no longer holds), `unknownMethod`, `forbidden`…
 fn refused(e: &anyhow::Error, kind: &str) -> bool {
     e.downcast_ref::<crate::sync::jmap::MethodError>()
         .is_some_and(|m| m.is(kind))
@@ -41,7 +41,9 @@ fn changes(s: &Session, method: &str, account: &str, since: &str) -> Result<Opti
             json!({ "accountId": account, "sinceState": since, "maxChanges": 500 }),
         ) {
             Ok(v) => v,
-            Err(e) if refused(&e, "cannotCalculateChanges") => return Ok(None),
+            // RFC 8620 §5.2: too old a state, or a server without the
+            // method: everything is read again.
+            Err(e) if crate::sync::jmap::must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let ids = |key: &str| -> Vec<String> {
@@ -168,12 +170,225 @@ pub fn calendars(s: &Session) -> Result<Vec<JmapCalendar>> {
                 id: c["id"].as_str()?.to_owned(),
                 name: c["name"].as_str().unwrap_or("Calendar").to_owned(),
                 color: c["color"].as_str().unwrap_or_default().to_owned(),
-                // Without rights listed, assume it can be written.
-                writable: c["myRights"]["mayWriteAll"].as_bool().unwrap_or(true)
-                    || c["myRights"]["mayWriteOwn"].as_bool().unwrap_or(false),
+                // Without rights listed, assume it can be written; with
+                // them, as they say.
+                writable: if c["myRights"].is_object() {
+                    c["myRights"]["mayWriteAll"].as_bool().unwrap_or(false)
+                        || c["myRights"]["mayWriteOwn"].as_bool().unwrap_or(false)
+                } else {
+                    true
+                },
             })
         })
         .collect())
+}
+
+/// The calendars and the address books changed since `since`
+/// (`Calendar/changes`, `AddressBook/changes`, RFC 8620 §5.2): what to
+/// read again, and what is gone. `None` where the server can't say.
+// Backend-only until the UI calls it: following calendar and address-book
+// lists by /changes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn collection_changes(s: &Session, kind: &str, since: &str) -> Result<Option<Changed>> {
+    let account = match kind {
+        "Calendar" | "ParticipantIdentity" | "CalendarEventNotification" => s.calendars_account(),
+        "AddressBook" => s.contacts_account(),
+        "Principal" | "ShareNotification" => s.principals_account(),
+        _ => bail!("Not a kind with /changes here: {kind}"),
+    }
+    .context("This JMAP server doesn't keep those.")?
+    .to_owned();
+    changes(s, &format!("{kind}/changes"), &account, since)
+}
+
+/// What changed in a /query's results since `since` (`Foo/queryChanges`,
+/// RFC 8620 §5.6) for calendars' events or contact cards; `None` where the
+/// server can't say.
+// Backend-only until the UI calls it: following event and card queries by
+// /queryChanges.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn query_changes(s: &Session, kind: &str, filter: Value, since: &str) -> Result<Option<crate::sync::jmap::QueryChanges>> {
+    let account = match kind {
+        "CalendarEvent" => s.calendars_account(),
+        "ContactCard" => s.contacts_account(),
+        _ => bail!("Not a kind with /queryChanges here: {kind}"),
+    }
+    .context("This JMAP server doesn't keep those.")?
+    .to_owned();
+    let v = match s.call_one(
+        &format!("{kind}/queryChanges"),
+        json!({ "accountId": account, "filter": filter, "sinceQueryState": since }),
+    ) {
+        Ok(v) => v,
+        Err(e) if crate::sync::jmap::must_resync(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let ids = |k: &str| -> Vec<String> {
+        v[k].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect()
+    };
+    Ok(Some(crate::sync::jmap::QueryChanges {
+        removed: ids("removed"),
+        added: v["added"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| Some((a["id"].as_str()?.to_owned(), a["index"].as_u64()? as usize)))
+            .collect(),
+        total: v["total"].as_u64().map(|n| n as usize),
+        new_state: v["newQueryState"].as_str().unwrap_or_default().to_owned(),
+    }))
+}
+
+/// Copies events or cards from another account this sign-in reaches into
+/// its own (`CalendarEvent/copy`, `ContactCard/copy`, RFC 8620 §5.4), into
+/// `into` (a calendar or address book id): the new ids, by old id.
+// Backend-only until the UI calls it: copying events and cards between
+// accounts.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn copy_from(s: &Session, kind: &str, from_account: &str, ids: &[String], into: &str) -> Result<std::collections::HashMap<String, String>> {
+    let (account, key) = match kind {
+        "CalendarEvent" => (s.calendars_account(), "calendarIds"),
+        "ContactCard" => (s.contacts_account(), "addressBookIds"),
+        _ => bail!("Not a kind with /copy here: {kind}"),
+    };
+    let account = account.context("This JMAP server doesn't keep those.")?.to_owned();
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(s.max_set()) {
+        let create: Map<String, Value> = chunk
+            .iter()
+            .map(|id| (id.clone(), json!({ "id": id, key: { into: true } })))
+            .collect();
+        let mut args = json!({ "fromAccountId": from_account, "accountId": account, "create": create });
+        if kind == "CalendarEvent" {
+            args["sendSchedulingMessages"] = json!(false);
+        }
+        let v = s.call_one(&format!("{kind}/copy"), args)?;
+        if let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next()) {
+            bail!("The server didn't copy {id}: {}", e["type"].as_str().unwrap_or("refused"));
+        }
+        out.extend(
+            v["created"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, c)| Some((k.clone(), c["id"].as_str()?.to_owned()))),
+        );
+    }
+    Ok(out)
+}
+
+/// Reads iCalendar data kept as blobs as events (CalendarEvent/parse, JMAP
+/// for Calendars): the server's reading, by blob id, of each it can read.
+// Backend-only until the UI calls it: reading an attached .ics on the
+// server.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_events(s: &Session, blobs: &[String]) -> Result<std::collections::HashMap<String, Vec<ical::Event>>> {
+    let account = s.calendars_account().context("This JMAP server has no calendars.")?.to_owned();
+    let v = s.call_one("CalendarEvent/parse", json!({ "accountId": account, "blobIds": blobs }))?;
+    Ok(v["parsed"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(blob, events)| {
+            // A blob may hold one event or several.
+            let list: Vec<ical::Event> = match events {
+                Value::Array(a) => a.iter().filter_map(from_jscalendar).collect(),
+                one => from_jscalendar(one).into_iter().collect(),
+            };
+            (blob.clone(), list)
+        })
+        .collect())
+}
+
+/// A calendars or contacts account's limits (JMAP for Calendars and RFC
+/// 9610 §1.3): how many calendars or books an event or card may be in, and
+/// whether new ones may be made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectionLimits {
+    pub max_per_item: Option<usize>,
+    pub may_create: bool,
+}
+/// The limits of the sign-in's calendars (`Calendar`) or contacts
+/// (`AddressBook`) account, from the session.
+// Backend-only until the UI calls it: calendars' and contacts' account
+// limits.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn collection_limits(caps: &Value, kind: &str) -> CollectionLimits {
+    let (per, create) = match kind {
+        "Calendar" => ("maxCalendarsPerEvent", "mayCreateCalendar"),
+        _ => ("maxAddressBooksPerCard", "mayCreateAddressBook"),
+    };
+    CollectionLimits {
+        max_per_item: caps[per].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0),
+        may_create: caps[create].as_bool().unwrap_or(true),
+    }
+}
+
+/// Who a calendar or address book is shared with, and what each may do
+/// (`shareWith`, RFC 9670 §3): by principal id, the rights given.
+// Backend-only until the UI calls it: sharing a calendar or address book.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn share_with(s: &Session, kind: &str, id: &str, with: &Map<String, Value>) -> Result<()> {
+    let account = match kind {
+        "Calendar" => s.calendars_account(),
+        "AddressBook" => s.contacts_account(),
+        _ => bail!("Only calendars and address books are shared this way."),
+    }
+    .context("This JMAP server doesn't keep those.")?
+    .to_owned();
+    let v = s.call_one(
+        &format!("{kind}/set"),
+        json!({ "accountId": account, "update": { id: { "shareWith": with } } }),
+    )?;
+    if let Some(e) = v["notUpdated"].get(id) {
+        bail!("The server didn't share it: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+    }
+    Ok(())
+}
+
+/// A principal in the server's directory (RFC 9670 §2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Principal {
+    pub id: String,
+    /// `individual`, `group`, `resource`, `location` or `other`.
+    pub kind: String,
+    pub name: String,
+    pub email: String,
+    /// The accounts it has that the sign-in may reach, by id.
+    pub accounts: Vec<String>,
+}
+/// Principals by id (Principal/get, RFC 9670 §2.1), or all (`None`).
+// Backend-only until the UI calls it: the directory of people.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn principals(s: &Session, ids: Option<&[String]>) -> Result<Vec<Principal>> {
+    let account = s.principals_account().context("This JMAP server has no directory of people.")?.to_owned();
+    let v = s.call_one("Principal/get", json!({ "accountId": account, "ids": ids }))?;
+    Ok(v["list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some(Principal {
+                id: p["id"].as_str()?.to_owned(),
+                kind: p["type"].as_str().unwrap_or("individual").to_owned(),
+                name: p["name"].as_str().unwrap_or_default().to_owned(),
+                email: p["email"].as_str().unwrap_or_default().to_owned(),
+                accounts: p["accounts"].as_object().into_iter().flatten().map(|(k, _)| k.clone()).collect(),
+            })
+        })
+        .collect())
+}
+/// Changes the sign-in's own principal: its name and description (RFC
+/// 9670 §2.3; the server decides what else may change).
+// Backend-only until the UI calls it: editing one's own directory entry.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn update_principal(s: &Session, id: &str, patch: &Map<String, Value>) -> Result<()> {
+    let account = s.principals_account().context("This JMAP server has no directory of people.")?.to_owned();
+    let v = s.call_one("Principal/set", json!({ "accountId": account, "update": { id: patch } }))?;
+    if let Some(e) = v["notUpdated"].get(id) {
+        bail!("The server didn't change it: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+    }
+    Ok(())
 }
 
 /// An event as kept here, with where it is on the JMAP server.
@@ -454,6 +669,15 @@ pub fn from_jscalendar(v: &Value) -> Option<ical::Event> {
     if let Some(rule) = v["recurrenceRules"].as_array().and_then(|r| r.first()) {
         e.recurrence = rrule(rule, if all_day { None } else { zone }).unwrap_or_default();
     }
+    // RFC 8984 §4.5.2: reminders relative to the start, as `alarms` holds
+    // them (seconds before; negative after). Others stay in the JSON.
+    for (_, a) in v["alerts"].as_object().into_iter().flatten() {
+        if let Some(before) = alert_seconds_before(a)
+            && !e.alarms.contains(&before)
+        {
+            e.alarms.push(before);
+        }
+    }
     for (_, p) in v["participants"].as_object().into_iter().flatten() {
         let roles = &p["roles"];
         let person = ical::Attendee {
@@ -649,7 +873,46 @@ pub fn to_jscalendar(e: &ical::Event, overrides: &[ical::Event]) -> Map<String, 
         "recurrenceOverrides".into(),
         if over.is_empty() { Value::Null } else { Value::Object(over) },
     );
+    let alerts: Map<String, Value> = e
+        .alarms
+        .iter()
+        .enumerate()
+        .map(|(i, before)| (format!("a{}", i + 1), alert_before(*before)))
+        .collect();
+    p.insert(
+        "alerts".into(),
+        if alerts.is_empty() { Value::Null } else { Value::Object(alerts) },
+    );
     p
+}
+
+/// A reminder `before` seconds before the start (negative: after), as a
+/// JSCalendar alert (RFC 8984 §4.5.2: an OffsetTrigger's offset is a
+/// signed duration from the start).
+fn alert_before(before: i64) -> Value {
+    let offset = if before >= 0 {
+        format!("-{}", write_duration(before))
+    } else {
+        write_duration(-before)
+    };
+    json!({ "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": offset }, "action": "display" })
+}
+/// An alert's seconds before the start, where it is a display reminder
+/// relative to the start; others (`AbsoluteTrigger`, relative to the end,
+/// email) aren't `alarms`' and stay in the JSON.
+fn alert_seconds_before(a: &Value) -> Option<i64> {
+    let t = &a["trigger"];
+    if t["@type"].as_str().is_some_and(|k| k != "OffsetTrigger")
+        || t["relativeTo"].as_str().is_some_and(|r| r != "start")
+        || a["action"].as_str().is_some_and(|k| k != "display")
+    {
+        return None;
+    }
+    let offset = t["offset"].as_str()?;
+    match offset.strip_prefix('-') {
+        Some(rest) => duration(rest),
+        None => duration(offset.strip_prefix('+').unwrap_or(offset)).map(|s| -s),
+    }
 }
 
 /// The events of `calendars` (ids) overlapping `from`..`to`, with
@@ -739,67 +1002,91 @@ pub fn event_changes(
     Ok(Some((events, gone, changed.state)))
 }
 
+/// Who tells an event's participants about a change (JMAP for Calendars:
+/// `sendSchedulingMessages`, and each participant's `scheduleAgent`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scheduling {
+    /// Picacho emails invitations itself (iMIP): the server sends nothing,
+    /// and participants are `scheduleAgent: client`.
+    #[default]
+    ByPicacho,
+    /// The server sends them, for an event organized here: participants
+    /// are `scheduleAgent: server` and the change is sent with
+    /// `sendSchedulingMessages: true`.
+    ByServer,
+}
+impl Scheduling {
+    fn agent(self) -> &'static str {
+        match self {
+            Scheduling::ByPicacho => "client",
+            Scheduling::ByServer => "server",
+        }
+    }
+    fn sends(self) -> bool {
+        self == Scheduling::ByServer
+    }
+}
+
+/// Whether the server can send invitations as this sign-in: it names at
+/// least one participant identity (JMAP for Calendars: the addresses it
+/// schedules as). Without one, there is no one it would send them from.
+pub fn server_can_schedule(s: &Session) -> Result<bool> {
+    Ok(!participant_identities(s)?.is_empty())
+}
+
 /// Creates or changes an event in `calendar`; returns its id. With
 /// `in_state` (its version when read), only if the event is still as it
 /// was read: a change made elsewhere meanwhile is reported (`Conflict`)
-/// rather than overwritten.
-pub fn save_event_in(
+/// rather than overwritten. `scheduling` says who tells the participants.
+pub fn save_event_scheduled(
     s: &Session,
     id: Option<&str>,
     calendar: &str,
     event: &ical::Event,
     overrides: &[ical::Event],
     in_state: Option<&str>,
+    scheduling: Scheduling,
 ) -> Result<String> {
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
     let mut props = to_jscalendar(event, overrides);
+    if scheduling != Scheduling::ByPicacho
+        && let Some(Value::Object(people)) = props.get_mut("participants")
+    {
+        for p in people.values_mut() {
+            p["scheduleAgent"] = json!(scheduling.agent());
+        }
+    }
     props.insert("calendarIds".into(), json!({ calendar: true }));
     // An edit keeps what Picacho doesn't model in the server's copy: the
     // other properties of each location and participant (their links,
     // roles, invitedBy…), and the rest of the event isn't sent at all.
-    let current = match id {
+    let (current, read_state) = match id {
         Some(id) => get_all(s, "CalendarEvent/get", account, &[id.to_owned()])
-            .ok()
-            .and_then(|(list, _)| list.into_iter().next()),
-        None => None,
+            .map(|(list, state)| (list.into_iter().next(), state))
+            .unwrap_or_default(),
+        None => (None, String::new()),
     };
     if let Some(current) = &current {
         merge_entries(&mut props, current, "participants", &["sendTo", "roles", "name", "participationStatus", "scheduleAgent", "@type"]);
-        if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("locations"), current["locations"].as_object())
-            && let Some((_, mine)) = new.iter_mut().next()
-            && let Some((_, theirs)) = old.iter().next()
-            && let (Some(mine), Some(theirs)) = (mine.as_object_mut(), theirs.as_object())
-        {
-            for (k, v) in theirs {
-                mine.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-        }
+        keep_unmodelled(&mut props, current, event);
     }
     let args = match id {
         Some(id) => {
             // Moving to another calendar replaces the set.
-            json!({ "accountId": account, "update": { id: props }, "sendSchedulingMessages": false })
+            json!({ "accountId": account, "update": { id: props }, "sendSchedulingMessages": scheduling.sends() })
         }
-        None => json!({ "accountId": account, "create": { "e": props }, "sendSchedulingMessages": false }),
+        None => json!({ "accountId": account, "create": { "e": props }, "sendSchedulingMessages": scheduling.sends() }),
     };
     // Only over the version it was read in (`in_state`: the event's
     // version, `event_version`): one changed elsewhere meanwhile isn't
-    // overwritten. Compared per event, since JMAP's ifInState would refuse
-    // for any change to any event.
-    if let (Some(version), Some(id)) = (in_state.filter(|s| !s.is_empty()), id) {
-        let (now, _) = get_all(s, "CalendarEvent/get", account, &[id.to_owned()])?;
-        if let Some(current) = now.first()
-            && event_version(current) != version
-        {
-            bail!(Conflict("This event was changed elsewhere since it was read. Refresh the calendar and make the change again."));
+    // overwritten.
+    const CHANGED: &str = "This event was changed elsewhere since it was read. Refresh the calendar and make the change again.";
+    let v = match (in_state.filter(|s| !s.is_empty()), id, &current) {
+        (Some(version), Some(id), Some(current)) => {
+            ensure!(event_version(current) == version, Conflict(CHANGED));
+            set_if_unchanged(s, "CalendarEvent", account, id, version, &read_state, args, event_version, CHANGED)?
         }
-    }
-    let v = match s.call_one("CalendarEvent/set", args) {
-        Ok(v) => v,
-        Err(e) if refused(&e, "stateMismatch") => {
-            bail!(Conflict("This event was changed elsewhere since it was read. Refresh the calendar and make the change again."))
-        }
-        Err(e) => return Err(e),
+        _ => s.call_one("CalendarEvent/set", args)?,
     };
     if let Some(id) = id {
         if let Some(e) = v["notUpdated"].get(id) {
@@ -814,6 +1101,141 @@ pub fn save_event_in(
         .as_str()
         .context("The server didn't say which event it added.")?
         .to_owned())
+}
+
+/// What of the server's copy of an event (`current`) Picacho doesn't model
+/// is kept through an edit (RFC 8984: at minimum, round-tripped unchanged):
+///
+/// * locations: the first's other fields (coordinates, links…), and the
+///   others whole while the location shown is unchanged;
+/// * recurrence: rules after the first, and `excludedRecurrenceRules`, are
+///   never sent (so stay); the first rule's fields Picacho doesn't write
+///   (`rscale`, `skip`, `firstDayOfWeek`…) are kept while it is the same;
+/// * occurrence overrides: each one's patch keeps the properties Picacho
+///   doesn't write (an override's own alerts, participants…);
+/// * alerts: those that aren't a plain reminder before the start (an
+///   absolute time, relative to the end, by email…) are kept, and plain
+///   reminders that are unchanged keep their entry (`acknowledged`…).
+///
+/// Everything else (links, virtualLocations, localizations, timeZones,
+/// freeBusyStatus, privacy, color, keywords, categories…) isn't sent at
+/// all, so the server keeps it as it is.
+fn keep_unmodelled(props: &mut Map<String, Value>, current: &Value, event: &ical::Event) {
+    // Locations.
+    if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("locations"), current["locations"].as_object())
+        && let Some((_, mine)) = new.iter_mut().next()
+        && let Some((first_key, theirs)) = old.iter().next()
+        && let (Some(mine), Some(theirs)) = (mine.as_object_mut(), theirs.as_object())
+    {
+        let same_place = theirs.get("name") == mine.get("name");
+        for (k, v) in theirs {
+            mine.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if same_place {
+            // The location shown is as it was: every location as it was,
+            // under its own key.
+            let mut all = old.clone();
+            if let Some(first) = all.get_mut(first_key) {
+                *first = Value::Object(mine.clone());
+            }
+            *new = all;
+        }
+    }
+    // The first recurrence rule's own fields, and any after it.
+    if let (Some(Value::Array(new)), Some(old)) = (props.get_mut("recurrenceRules"), current["recurrenceRules"].as_array())
+        && let (Some(mine), Some(theirs)) = (new.first_mut(), old.first())
+    {
+        let zone = current["timeZone"].as_str();
+        let same = rrule(theirs, zone).as_deref() == Some(event.recurrence.as_str());
+        if same {
+            *mine = theirs.clone();
+        }
+        new.extend(old.iter().skip(1).cloned());
+    }
+    // Each override's other properties.
+    if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("recurrenceOverrides"), current["recurrenceOverrides"].as_object()) {
+        for (at, mine) in new.iter_mut() {
+            let (Some(mine), Some(theirs)) = (mine.as_object_mut(), old.get(at).and_then(Value::as_object)) else {
+                continue;
+            };
+            if mine.get("excluded") == Some(&json!(true)) {
+                continue;
+            }
+            for (k, v) in theirs {
+                if k != "excluded" {
+                    mine.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
+    // Alerts.
+    let old_alerts = current["alerts"].as_object();
+    let mut alerts: Map<String, Value> = old_alerts
+        .into_iter()
+        .flatten()
+        .filter(|(_, a)| alert_seconds_before(a).is_none())
+        .map(|(k, a)| (k.clone(), a.clone()))
+        .collect();
+    for (i, before) in event.alarms.iter().enumerate() {
+        let kept = old_alerts
+            .into_iter()
+            .flatten()
+            .find(|(k, a)| alert_seconds_before(a) == Some(*before) && !alerts.contains_key(*k));
+        match kept {
+            Some((k, a)) => {
+                alerts.insert(k.clone(), a.clone());
+            }
+            None => {
+                let mut key = format!("a{}", i + 1);
+                while alerts.contains_key(&key) {
+                    key.push('x');
+                }
+                alerts.insert(key, alert_before(*before));
+            }
+        }
+    }
+    props.insert(
+        "alerts".into(),
+        if alerts.is_empty() { Value::Null } else { Value::Object(alerts) },
+    );
+}
+
+/// `{kind}/set` with `args`, changing `id` only while it is still at
+/// `version` (as `version_of` reads it): sent with `ifInState`, the state
+/// it was read in (RFC 8620 §5.3), so nothing changes between the check and
+/// the write. The state covers every object of the kind, so a mismatch is
+/// read again: where `id` itself is unchanged, the change is tried once
+/// more in the new state; where it changed, it is a `Conflict`.
+#[allow(clippy::too_many_arguments)]
+fn set_if_unchanged(
+    s: &Session,
+    kind: &str,
+    account: &str,
+    id: &str,
+    version: &str,
+    read_state: &str,
+    args: Value,
+    version_of: fn(&Value) -> String,
+    changed: &'static str,
+) -> Result<Value> {
+    let mut state = read_state.to_owned();
+    for _ in 0..2 {
+        let mut call = args.clone();
+        if !state.is_empty() {
+            call["ifInState"] = json!(state);
+        }
+        match s.call_one(&format!("{kind}/set"), call) {
+            Err(e) if refused(&e, "stateMismatch") => {
+                let (now, new_state) = get_all(s, &format!("{kind}/get"), account, &[id.to_owned()])?;
+                match now.first() {
+                    Some(current) if version_of(current) == version => state = new_state,
+                    _ => bail!(Conflict(changed)),
+                }
+            }
+            other => return other,
+        }
+    }
+    bail!(Conflict(changed))
 }
 
 /// Each entry of `key` in `props` (as Picacho wrote it) takes the other
@@ -849,11 +1271,13 @@ fn merge_entries(props: &mut Map<String, Value>, current: &Value, key: &str, our
 }
 
 /// Removes an event.
-pub fn delete_event(s: &Session, id: &str) -> Result<()> {
+/// `Scheduling::ByServer` has the server tell the participants it is
+/// cancelled.
+pub fn delete_event_scheduled(s: &Session, id: &str, scheduling: Scheduling) -> Result<()> {
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
     let v = s.call_one(
         "CalendarEvent/set",
-        json!({ "accountId": account, "destroy": [id], "sendSchedulingMessages": false }),
+        json!({ "accountId": account, "destroy": [id], "sendSchedulingMessages": scheduling.sends() }),
     )?;
     if let Some(e) = v["notDestroyed"].get(id)
         && e["type"] != "notFound"
@@ -1036,7 +1460,11 @@ pub fn from_jscontact(v: &Value) -> Card {
 pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
     let mut p = Map::new();
     p.insert("@type".into(), json!("Card"));
-    p.insert("version".into(), json!("1.0"));
+    // RFC 9553 §2.1.2: the version a card was written in is the card's;
+    // an edit doesn't claim another.
+    if before.is_none_or(|b| b["version"].is_null()) {
+        p.insert("version".into(), json!("1.0"));
+    }
     if !card.uid.is_empty() {
         p.insert("uid".into(), json!(card.uid));
     }
@@ -1077,14 +1505,21 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
         }
         if out.is_empty() { Value::Null } else { Value::Object(out) }
     };
-    p.insert(
-        "emails".into(),
-        keep("emails", "address", &card.emails, &|e| json!({ "@type": "EmailAddress", "address": e })),
-    );
-    p.insert(
-        "phones".into(),
-        keep("phones", "number", &card.phones, &|n| json!({ "@type": "Phone", "number": n })),
-    );
+    // Unchanged lists aren't sent, so the server's copy (its order, and
+    // entries Picacho reads as the same) stays as it is.
+    let old = before.map(from_jscontact).unwrap_or_default();
+    if before.is_none() || old.emails != card.emails {
+        p.insert(
+            "emails".into(),
+            keep("emails", "address", &card.emails, &|e| json!({ "@type": "EmailAddress", "address": e })),
+        );
+    }
+    if before.is_none() || old.phones != card.phones {
+        p.insert(
+            "phones".into(),
+            keep("phones", "number", &card.phones, &|n| json!({ "@type": "Phone", "number": n })),
+        );
+    }
     let old_org = before.map(|b| from_jscontact(b).org).unwrap_or_default();
     if old_org != card.org {
         p.insert(
@@ -1102,7 +1537,6 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
             },
         );
     }
-    let old = before.map(from_jscontact).unwrap_or_default();
     if old.addresses != card.addresses {
         // Each address that is as it was keeps its entry (its parts,
         // labels and coordinates); new ones are written in full.
@@ -1219,14 +1653,45 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
             },
         );
     }
+    // RFC 9553 §2.7.1: `localizations` patch the card by path, per
+    // language. A property replaced here may no longer have what a patch
+    // names, so its patches go; the others (and the rest) stay.
+    if let Some(local) = before.and_then(|b| b["localizations"].as_object()) {
+        let replaced: Vec<&String> = p.keys().filter(|k| !["@type", "version", "uid"].contains(&k.as_str())).collect();
+        let mut kept = Map::new();
+        let mut changed = false;
+        for (lang, patch) in local {
+            let Some(patch) = patch.as_object() else { continue };
+            let still: Map<String, Value> = patch
+                .iter()
+                .filter(|(path, _)| {
+                    let top = path.split('/').next().unwrap_or_default();
+                    !replaced.iter().any(|r| r.as_str() == top)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            changed |= still.len() != patch.len();
+            if !still.is_empty() {
+                kept.insert(lang.clone(), Value::Object(still));
+            }
+        }
+        if changed {
+            p.insert(
+                "localizations".into(),
+                if kept.is_empty() { Value::Null } else { Value::Object(kept) },
+            );
+        }
+    }
     p
 }
 
 /// Every card in the account's address books, each with its id (in
 /// `href`, as `jmap:<id>`) and its own version (`etag`). Read in pieces
 /// the server takes (`maxObjectsInGet`). Returns the cards, the book new
-/// cards go to, and the ContactCard state they were read in.
-pub fn cards_in(s: &Session) -> Result<(Vec<Card>, String, String)> {
+/// cards go to, and the ContactCard state they were read in. Photos kept
+/// as blobs are reused from `known` (the cards as last read) where the
+/// blob is the same.
+pub fn cards_in(s: &Session, known: &[Card]) -> Result<(Vec<Card>, String, String)> {
     let account = s.contacts_account().context("This JMAP server has no contacts.")?;
     let books = address_books(s)?;
     // Every id by query, then the cards in pieces; a server without
@@ -1247,38 +1712,65 @@ pub fn cards_in(s: &Session) -> Result<(Vec<Card>, String, String)> {
         state = v["state"].as_str().unwrap_or_default().to_owned();
     }
     let mut out: Vec<Card> = list.iter().map(jmap_card).collect();
-    // Photos the server keeps as blobs (RFC 9610 §2.2: `media`'s `blobId`),
-    // inlined as the vCard path has them; a few hundred at most per read.
-    let mut fetched = 0;
-    for (card, raw) in out.iter_mut().zip(&list) {
-        if !card.photo.is_empty() || fetched >= 200 {
-            continue;
-        }
-        let Some((blob, kind)) = raw["media"].as_object().into_iter().flatten().find_map(|(_, m)| {
-            (m["kind"].as_str() == Some("photo"))
-                .then(|| Some((m["blobId"].as_str()?.to_owned(), m["mediaType"].as_str().unwrap_or("image/jpeg").to_owned())))
-                .flatten()
-        }) else {
-            continue;
-        };
-        fetched += 1;
-        if let Ok(bytes) = s.download_in(account, &blob, "photo", &kind, 1 << 20) {
-            use base64::Engine as _;
-            card.photo = format!(
-                "data:{kind};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            );
-            // Not a change of the photo: the card still came with a blob.
-            card.photo_blob = blob;
-            card.photo_read = card.photo.clone();
-        }
-    }
+    fill_photos(s, account, &mut out, &list, known);
     let book = books
         .iter()
         .find(|b| b.writable)
         .map(|b| format!("jmap:{}", b.id))
         .unwrap_or_default();
     Ok((out, book, state))
+}
+/// The most photos downloaded in one read; the rest come on later reads.
+const PHOTOS_PER_READ: usize = 200;
+/// A card's photo kept as a blob (RFC 9610 §2.2: `media`'s `blobId`):
+/// the blob id and its media type.
+fn photo_blob(raw: &Value) -> Option<(String, String)> {
+    raw["media"].as_object().into_iter().flatten().find_map(|(_, m)| {
+        (m["kind"].as_str() == Some("photo"))
+            .then(|| Some((m["blobId"].as_str()?.to_owned(), m["mediaType"].as_str().unwrap_or("image/jpeg").to_owned())))
+            .flatten()
+    })
+}
+/// Inlines the photos the server keeps as blobs, as the vCard path has
+/// them. A photo already read from the same blob is reused from `known`
+/// (RFC 8620 §6: a blob id names data that never changes); the others are
+/// downloaded several at once, up to `PHOTOS_PER_READ`.
+fn fill_photos(s: &Session, account: &str, cards: &mut [Card], raw: &[Value], known: &[Card]) {
+    use base64::Engine as _;
+    let cached: std::collections::HashMap<&str, &Card> = known
+        .iter()
+        .filter(|k| !k.photo_blob.is_empty() && !k.photo_read.is_empty())
+        .map(|k| (k.photo_blob.as_str(), k))
+        .collect();
+    let mut wanted: Vec<(usize, String, String)> = Vec::new();
+    for (i, (card, raw)) in cards.iter_mut().zip(raw).enumerate() {
+        if !card.photo.is_empty() {
+            continue;
+        }
+        let Some((blob, kind)) = photo_blob(raw) else { continue };
+        if let Some(k) = cached.get(blob.as_str()) {
+            // What was read from the blob, not a local edit of it.
+            card.photo = k.photo_read.clone();
+            card.photo_read = card.photo.clone();
+            card.photo_blob = blob;
+        } else if wanted.len() < PHOTOS_PER_READ {
+            wanted.push((i, blob, kind));
+        }
+    }
+    let downloaded = s.in_parallel(&wanted, |(_, blob, kind)| {
+        s.download_in(account, blob, "photo", kind, 1 << 20).ok()
+    });
+    for ((i, blob, kind), bytes) in wanted.into_iter().zip(downloaded) {
+        let Some(bytes) = bytes else { continue };
+        let card = &mut cards[i];
+        card.photo = format!(
+            "data:{kind};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        // Not a change of the photo: the card still came with a blob.
+        card.photo_blob = blob;
+        card.photo_read = card.photo.clone();
+    }
 }
 fn jmap_card(c: &Value) -> Card {
     let mut card = from_jscontact(c);
@@ -1290,8 +1782,9 @@ fn jmap_card(c: &Value) -> Card {
 }
 /// What changed among the cards since `since` (ContactCard/changes): the
 /// cards created or changed, the hrefs (`jmap:<id>`) of those gone, and the
-/// new state. `None` when the server can't say.
-pub fn card_changes(s: &Session, since: &str) -> Result<Option<CardChanges>> {
+/// new state. `None` when the server can't say. Photos are as `cards_in`
+/// reads them.
+pub fn card_changes(s: &Session, since: &str, known: &[Card]) -> Result<Option<CardChanges>> {
     let account = s.contacts_account().context("This JMAP server has no contacts.")?;
     let Some(changed) = changes(s, "ContactCard/changes", account, since)? else {
         return Ok(None);
@@ -1302,7 +1795,9 @@ pub fn card_changes(s: &Session, since: &str) -> Result<Option<CardChanges>> {
         .iter()
         .map(|id| format!("jmap:{id}"))
         .collect();
-    Ok(Some((list.iter().map(jmap_card).collect(), gone, changed.state)))
+    let mut cards: Vec<Card> = list.iter().map(jmap_card).collect();
+    fill_photos(s, account, &mut cards, &list, known);
+    Ok(Some((cards, gone, changed.state)))
 }
 
 /// Creates or changes a card; returns it as saved.
@@ -1315,21 +1810,18 @@ pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
     match existing {
         Some(id) => {
             // Only over the version it was read in: a card changed
-            // elsewhere meanwhile isn't overwritten. JMAP has no per-object
-            // condition, so this reads it first and compares (ifInState
-            // would also refuse for any other card's change).
-            if !card.etag.is_empty() {
-                let (now, _) = get_all(s, "ContactCard/get", account, &[id.to_owned()])?;
-                if let Some(current) = now.first()
-                    && card_version(current) != card.etag
-                {
-                    bail!(Conflict("This contact was changed elsewhere since it was read. Refresh contacts and make the change again."));
+            // elsewhere meanwhile isn't overwritten.
+            const CHANGED: &str = "This contact was changed elsewhere since it was read. Refresh contacts and make the change again.";
+            let args = json!({ "accountId": account, "update": { id: props } });
+            let v = if card.etag.is_empty() {
+                s.call_one("ContactCard/set", args)?
+            } else {
+                let (now, state) = get_all(s, "ContactCard/get", account, &[id.to_owned()])?;
+                if let Some(current) = now.first() {
+                    ensure!(card_version(current) == card.etag, Conflict(CHANGED));
                 }
-            }
-            let v = s.call_one(
-                "ContactCard/set",
-                json!({ "accountId": account, "update": { id: props } }),
-            )?;
+                set_if_unchanged(s, "ContactCard", account, id, &card.etag, &state, args, card_version, CHANGED)?
+            };
             if let Some(e) = v["notUpdated"].get(id) {
                 bail!("The server didn't change the contact: {}", e["type"].as_str().unwrap_or("refused"));
             }
@@ -1538,8 +2030,10 @@ pub fn dismiss_notices(s: &Session, notices: &[Notice]) -> Result<()> {
             .filter(|n| n.kind == kind)
             .map(|n| n.id.as_str())
             .collect();
-        if let (Some(account), false) = (account, ids.is_empty()) {
-            s.call_one(&format!("{kind}/set"), json!({ "accountId": account, "destroy": ids }))?;
+        let Some(account) = account else { continue };
+        // RFC 8620 §5.3: at most `maxObjectsInSet` in one /set.
+        for chunk in ids.chunks(s.max_set()) {
+            s.call_one(&format!("{kind}/set"), json!({ "accountId": account, "destroy": chunk }))?;
         }
     }
     Ok(())
@@ -1683,6 +2177,120 @@ mod tests {
         assert_eq!(written["recurrenceOverrides"].as_object().unwrap().len(), 1);
     }
 
+    /// Reminders read and write as JSCalendar alerts (RFC 8984 §4.5.2).
+    #[test]
+    fn jscalendar_alerts_are_reminders() {
+        let v = json!({
+            "@type": "Event", "uid": "a@x", "start": "2026-11-24T10:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+            "alerts": {
+                "ten": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT10M" } },
+                "after": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "PT5M" } },
+                "end": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT5M", "relativeTo": "end" } },
+                "at": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2026-11-24T08:00:00Z" } },
+            },
+        });
+        let mut e = from_jscalendar(&v).unwrap();
+        e.alarms.sort();
+        assert_eq!(e.alarms, [-300, 600]);
+        let written = Value::Object(to_jscalendar(&e, &[]));
+        let mut offsets: Vec<&str> = written["alerts"].as_object().unwrap().values().map(|a| a["trigger"]["offset"].as_str().unwrap()).collect();
+        offsets.sort();
+        assert_eq!(offsets, ["-PT10M", "PT5M"]);
+    }
+
+    /// An edit keeps what Picacho doesn't model (RFC 8984): other alerts,
+    /// later recurrence rules and the first rule's own fields, other
+    /// locations and their details, and overrides' other properties.
+    #[test]
+    fn jscalendar_edits_keep_what_is_not_modelled() {
+        let current = json!({
+            "@type": "Event", "uid": "a@x", "title": "Planning", "start": "2026-11-24T10:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+            "locations": {
+                "room": { "@type": "Location", "name": "Room 4", "coordinates": "geo:52.5,13.4" },
+                "parking": { "@type": "Location", "name": "Garage" },
+            },
+            "recurrenceRules": [
+                { "@type": "RecurrenceRule", "frequency": "weekly", "byDay": [{ "day": "tu" }], "firstDayOfWeek": "mo", "rscale": "gregorian" },
+                { "@type": "RecurrenceRule", "frequency": "monthly", "byMonthDay": [1] },
+            ],
+            "recurrenceOverrides": {
+                "2026-12-01T10:00:00": { "title": "Planning (moved)", "alerts": { "x": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2026-12-01T08:00:00Z" } } } },
+            },
+            "alerts": {
+                "mine": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT10M" }, "acknowledged": "2026-11-24T08:50:00Z" },
+                "mail": { "@type": "Alert", "action": "email", "trigger": { "@type": "OffsetTrigger", "offset": "-P1D" } },
+            },
+            "virtualLocations": { "v": { "@type": "VirtualLocation", "uri": "https://meet.example/x" } },
+            "privacy": "private", "color": "red", "keywords": { "work": true },
+        });
+        let mut e = from_jscalendar(&current).unwrap();
+        let (changed, excluded) = overrides(&current, &e);
+        e.exdates = excluded;
+        e.summary = "Planning, renamed".into();
+        let mut props = to_jscalendar(&e, &changed);
+        keep_unmodelled(&mut props, &current, &e);
+        let p = Value::Object(props);
+        assert_eq!(p["title"], "Planning, renamed");
+        // Locations, with their details.
+        assert_eq!(p["locations"]["room"]["coordinates"], "geo:52.5,13.4");
+        assert_eq!(p["locations"]["parking"]["name"], "Garage");
+        // Rules: the first's own fields and the second rule.
+        assert_eq!(p["recurrenceRules"][0]["rscale"], "gregorian");
+        assert_eq!(p["recurrenceRules"][0]["firstDayOfWeek"], "mo");
+        assert_eq!(p["recurrenceRules"][1]["frequency"], "monthly");
+        // The override's own alert.
+        assert_eq!(p["recurrenceOverrides"]["2026-12-01T10:00:00"]["alerts"]["x"]["trigger"]["@type"], "AbsoluteTrigger");
+        // The email alert stays; the reminder keeps its entry.
+        assert_eq!(p["alerts"]["mail"]["action"], "email");
+        assert_eq!(p["alerts"]["mine"]["acknowledged"], "2026-11-24T08:50:00Z");
+        // Not modelled at all: not sent, so the server keeps them.
+        for k in ["virtualLocations", "privacy", "color", "keywords", "links", "localizations", "timeZones"] {
+            assert!(p.get(k).is_none(), "{k} isn't sent");
+        }
+        // A reminder removed goes; the email one stays.
+        e.alarms.clear();
+        let mut props = to_jscalendar(&e, &changed);
+        keep_unmodelled(&mut props, &current, &e);
+        let alerts = props["alerts"].as_object().unwrap();
+        assert_eq!(alerts.keys().collect::<Vec<_>>(), ["mail"]);
+    }
+
+    /// An edit keeps what it doesn't change (RFC 9553): unknown and
+    /// unmodelled properties aren't sent, unchanged lists stay as they are,
+    /// and localizations go only for what was replaced.
+    #[test]
+    fn jscontact_edits_keep_what_is_not_modelled() {
+        let v = json!({
+            "@type": "Card", "version": "2.0", "uid": "u1",
+            "name": { "full": "Sophie Chen" },
+            "emails": { "b": { "@type": "EmailAddress", "address": "b@example.com" }, "a": { "@type": "EmailAddress", "address": "a@example.com" } },
+            "notes": { "n": { "@type": "Note", "note": "Met in Lyon" } },
+            "localizations": {
+                "fr": { "name/full": "Sophie Chen (fr)", "titles/t/name": "Chercheuse" },
+                "jp": { "name/full": "陳ソフィー" },
+            },
+            "titles": { "t": { "@type": "Title", "name": "Researcher" } },
+            "nicknames": { "k": { "@type": "Nickname", "name": "Soph" } },
+            "example.com:custom": { "x": 1 },
+        });
+        let card = from_jscontact(&v);
+        // Only the note changes.
+        let mut edited = card.clone();
+        edited.note = "Met in Paris".into();
+        let patch = to_jscontact(&edited, Some(&v));
+        assert_eq!(patch["notes"]["n"]["note"], "Met in Paris");
+        for k in ["version", "emails", "phones", "name", "titles", "nicknames", "example.com:custom", "localizations"] {
+            assert!(!patch.contains_key(k), "{k} isn't sent: {patch:?}");
+        }
+        // The name changes: its localizations go, the title's stay.
+        let mut renamed = card.clone();
+        renamed.name = "Sophie Martin".into();
+        let patch = to_jscontact(&renamed, Some(&v));
+        assert_eq!(patch["localizations"], json!({ "fr": { "titles/t/name": "Chercheuse" } }));
+        // A new card says its version.
+        assert_eq!(to_jscontact(&card, None)["version"], "1.0");
+    }
+
     #[test]
     fn jscontact_cards_keep_their_labels() {
         let v = json!({
@@ -1707,6 +2315,11 @@ mod tests {
         assert_eq!(patch["emails"]["work"]["contexts"]["work"], true);
         assert_eq!(patch["emails"]["emails3"]["address"], "new@example.com");
         assert!(!patch.contains_key("name") && !patch.contains_key("organizations"));
+        // The phones didn't change: not sent, so the server keeps them.
+        assert!(!patch.contains_key("phones"));
+        let mut phoned = card.clone();
+        phoned.phones.push("+1 555 0199".into());
+        let patch = to_jscontact(&phoned, Some(&v));
         assert_eq!(patch["phones"]["m"]["features"]["mobile"], true);
     }
 }

@@ -66,6 +66,43 @@ struct Server {
     dav_log: Vec<(u64, char, String, bool)>,
     /// The most results one /query returns, as a server's own limit.
     query_limit: usize,
+    /// Blob ids downloaded, in order.
+    downloads: Vec<String>,
+    /// The session's maxObjectsInGet and maxObjectsInSet, where set (0:
+    /// 100); calls naming more are refused with `requestTooLarge`.
+    max_objects: usize,
+    /// Where /.well-known/jmap redirects (a 307), if anywhere; the session
+    /// is then at /jmap/session.
+    session_redirect: Option<String>,
+    /// Where downloads redirect, by blob id: the address a 302 names.
+    blob_redirects: HashMap<String, String>,
+    /// The Authorization header each /cdn/ request came with.
+    cdn_auth: Vec<String>,
+    /// Paths requested, in order.
+    paths: Vec<String>,
+    /// Mailboxes as `Mailbox/set` left them, where it was used (else the
+    /// fixed `mailboxes()`).
+    boxes: Option<Vec<Value>>,
+    /// Identities added after `id1`; the Identity state is `i<count>`.
+    extra_identities: Vec<Value>,
+    /// ParticipantIdentity/get names one address (else unknownMethod).
+    participant_identities: bool,
+    /// Each CalendarEvent/set: (sendSchedulingMessages, the participants'
+    /// scheduleAgents).
+    scheduling: Vec<(bool, Vec<String>)>,
+    /// The mail account's capability (RFC 8621 §1.3.1), where set.
+    mail_caps: Option<Value>,
+    /// Read receipts the server sent (MDN/send's MDN objects).
+    mdns: Vec<Value>,
+    /// The Sieve capability's maxSizeScript, where set (else 64 KiB).
+    sieve_max_size: Option<usize>,
+    /// Quota: the bytes used (else 2048) and the Quota state.
+    quota_used: Option<u64>,
+    quota_state: u64,
+    /// Blob/get answers with a digest that doesn't match.
+    bad_digest: bool,
+    /// Calendar/set shareWith and Principal/set patches, as sent.
+    shared_with: Vec<Value>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -89,11 +126,13 @@ impl Server {
                 "submissionExtensions": { "DSN": [], "REQUIRETLS": [], "FUTURERELEASE": ["86400"] },
             },
             "urn:ietf:params:jmap:vacationresponse": {},
+            "urn:ietf:params:jmap:mdn": {},
+            "urn:ietf:params:jmap:blob": { "maxSizeBlobSet": 1000, "supportedDigestAlgorithms": ["sha", "sha-256"] },
         });
         json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
-                    "maxObjectsInGet": 100, "maxObjectsInSet": 100,
+                    "maxObjectsInGet": self.object_limit(), "maxObjectsInSet": self.object_limit(),
                     "maxCallsInRequest": 2, "maxSizeRequest": 1_000_000,
                 },
                 "urn:ietf:params:jmap:mail": {},
@@ -101,15 +140,20 @@ impl Server {
                 "urn:ietf:params:jmap:vacationresponse": {},
                 "urn:ietf:params:jmap:calendars": {},
                 "urn:ietf:params:jmap:contacts": {},
+                "urn:ietf:params:jmap:mdn": {},
+                "urn:ietf:params:jmap:blob": {},
+                "urn:ietf:params:jmap:principals": {},
             },
             "accounts": {
                 "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
                 "u2": { "name": "Team", "isPersonal": false, "accountCapabilities": account },
+                "u3": { "name": "Archive", "isPersonal": false, "isReadOnly": true, "accountCapabilities": account },
             },
             "primaryAccounts": {
                 "urn:ietf:params:jmap:mail": "u1",
                 "urn:ietf:params:jmap:calendars": "u1",
                 "urn:ietf:params:jmap:contacts": "u1",
+                "urn:ietf:params:jmap:principals": "u1",
             },
             "username": "qa@example.com",
             "apiUrl": format!("{base}/api"),
@@ -117,6 +161,21 @@ impl Server {
             "uploadUrl": format!("{base}/upload/{{accountId}}/"),
             "state": self.state_name(),
         })
+    }
+    fn object_limit(&self) -> usize {
+        if self.max_objects == 0 { 100 } else { self.max_objects }
+    }
+    /// RFC 8620 §5.1, §5.3: a call naming more objects than the session
+    /// allows is refused.
+    fn too_many_objects(&self, args: &Value) -> bool {
+        let count = |v: &Value| match v {
+            Value::Array(a) => a.len(),
+            Value::Object(o) => o.len(),
+            _ => 0,
+        };
+        ["ids", "create", "update", "destroy", "blobIds", "emailIds"]
+            .iter()
+            .any(|k| count(&args[*k]) > self.object_limit())
     }
     fn touch(&mut self, id: &str, destroyed: bool) {
         self.state += 1;
@@ -197,6 +256,9 @@ impl Server {
                 json!({ "type": "invalidArguments", "arguments": ["ids"] }),
             )];
         }
+        if self.too_many_objects(args) {
+            return vec![("error".into(), json!({ "type": "requestTooLarge" }))];
+        }
         let ids_of = |args: &Value| -> Option<Vec<String>> {
             if let Some(r) = args.get("#ids") {
                 let i: usize = r["resultOf"].as_str().unwrap()[1..].parse().unwrap();
@@ -215,8 +277,59 @@ impl Server {
         };
         let state = self.state.to_string();
         match name {
+            "Mailbox/set" => {
+                let boxes = self.boxes.get_or_insert_with(|| Self::mailboxes().as_array().unwrap().clone());
+                let mut out = json!({ "updated": {}, "created": {}, "destroyed": [] });
+                for (key, props) in args["create"].as_object().into_iter().flatten() {
+                    let id = format!("box{}", boxes.len());
+                    let mut m = props.clone();
+                    m["id"] = json!(id);
+                    boxes.push(m);
+                    out["created"][key] = json!({ "id": id });
+                }
+                for (id, patch) in args["update"].as_object().into_iter().flatten() {
+                    let rights = boxes.iter().find(|m| m["id"] == id.as_str()).map(|m| m["myRights"].clone());
+                    if rights.as_ref().is_some_and(|r| r["mayRename"] == false) {
+                        out["notUpdated"][id] = json!({ "type": "forbidden" });
+                        continue;
+                    }
+                    let m = boxes.iter_mut().find(|m| m["id"] == id.as_str()).unwrap();
+                    for (k, v) in patch.as_object().unwrap() {
+                        m[k] = v.clone();
+                    }
+                    out["updated"][id] = Value::Null;
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    let id = id.as_str().unwrap().to_owned();
+                    let has = self.emails.iter().any(|e| e.mailboxes.contains(&id));
+                    if has && args["onDestroyRemoveEmails"] != true {
+                        out["notDestroyed"][&id] = json!({ "type": "mailboxHasEmail" });
+                        continue;
+                    }
+                    // Its messages go where they are in no other mailbox.
+                    self.emails.retain(|e| !(e.mailboxes == [id.clone()]));
+                    for e in &mut self.emails {
+                        e.mailboxes.retain(|m| *m != id);
+                    }
+                    self.boxes.as_mut().unwrap().retain(|m| m["id"] != id.as_str());
+                    out["destroyed"].as_array_mut().unwrap().push(json!(id));
+                }
+                vec![(name.into(), out)]
+            }
+            "Mailbox/query" => {
+                let all = self.boxes.clone().unwrap_or_else(|| Self::mailboxes().as_array().unwrap().clone());
+                let ids: Vec<&Value> = all
+                    .iter()
+                    .filter(|m| args["filter"]["isSubscribed"].as_bool().is_none_or(|on| m["isSubscribed"].as_bool().unwrap_or(true) == on))
+                    .map(|m| &m["id"])
+                    .collect();
+                vec![(name.into(), json!({ "ids": ids, "queryState": "mq1" }))]
+            }
             "Mailbox/get" => {
-                let all = Self::mailboxes();
+                let all = match &self.boxes {
+                    Some(b) => Value::Array(b.clone()),
+                    None => Self::mailboxes(),
+                };
                 let list = match ids_of(args) {
                     Some(ids) => all
                         .as_array()
@@ -227,10 +340,12 @@ impl Server {
                         .collect(),
                     None => all,
                 };
-                vec![(name.into(), json!({ "list": list, "state": "m1" }))]
+                let state = if self.boxes.is_some() { "m2" } else { "m1" };
+                vec![(name.into(), json!({ "list": list, "state": state }))]
             }
-            // The mailboxes don't change here.
-            "Mailbox/changes" if args["sinceState"] == "m1" => vec![(
+            // The mailboxes don't change here, unless Mailbox/set changed
+            // them (then the state is too old: read them all).
+            "Mailbox/changes" if args["sinceState"] == "m1" && self.boxes.is_none() => vec![(
                 name.into(),
                 json!({ "oldState": "m1", "newState": "m1", "hasMoreChanges": false,
                         "created": [], "updated": [], "destroyed": [] }),
@@ -395,10 +510,27 @@ impl Server {
                 }
                 vec![(name.into(), json!({ "created": created }))]
             }
-            "Identity/get" => vec![(
-                name.into(),
-                json!({ "list": [{ "id": "id1", "name": "QA", "email": "qa@example.com" }] }),
-            )],
+            "Identity/get" => {
+                let all = vec![json!({ "id": "id1", "name": "QA", "email": "qa@example.com",
+                    "replyTo": [{ "name": "QA desk", "email": "desk@example.com" }],
+                    "bcc": null, "textSignature": "-- \nQA", "htmlSignature": "<p>QA</p>" })];
+                let mut all = all;
+                all.extend(self.extra_identities.iter().cloned());
+                let list: Vec<Value> = match ids_of(args) {
+                    Some(ids) => all.into_iter().filter(|i| ids.iter().any(|w| i["id"] == w.as_str())).collect(),
+                    None => all,
+                };
+                vec![(name.into(), json!({ "list": list, "state": format!("i{}", self.extra_identities.len()) }))]
+            }
+            "Identity/changes" => {
+                let since: usize = args["sinceState"].as_str().unwrap().trim_start_matches('i').parse().unwrap_or(0);
+                let created: Vec<&Value> = self.extra_identities[since.min(self.extra_identities.len())..]
+                    .iter()
+                    .map(|i| &i["id"])
+                    .collect();
+                vec![(name.into(), json!({ "oldState": format!("i{since}"), "newState": format!("i{}", self.extra_identities.len()),
+                    "hasMoreChanges": false, "created": created, "updated": [], "destroyed": [] }))]
+            }
             "Calendar/get" => vec![(
                 name.into(),
                 json!({ "list": [
@@ -440,8 +572,33 @@ impl Server {
                 let state = if self.dav_changes { format!("e{}", self.dav_state) } else { "e".into() };
                 vec![(name.into(), json!({ "list": list, "state": state }))]
             }
+            "ContactCard/set" | "CalendarEvent/set"
+                if args["ifInState"].is_string() && self.dav_changes =>
+            {
+                // RFC 8620 §5.3: refused unless the state is still that.
+                let kind = if name.starts_with("Calendar") { 'e' } else { 'k' };
+                if args["ifInState"] != format!("{kind}{}", self.dav_state).as_str() {
+                    return vec![("error".into(), json!({ "type": "stateMismatch" }))];
+                }
+                let mut plain = args.clone();
+                plain.as_object_mut().unwrap().remove("ifInState");
+                self.dav_state += 1;
+                self.method(name, &plain, earlier)
+            }
+            "ParticipantIdentity/get" if self.participant_identities => vec![(
+                name.into(),
+                json!({ "list": [{ "id": "pi1", "name": "QA", "sendTo": { "imip": "mailto:qa@example.com" } }] }),
+            )],
             "CalendarEvent/set" => {
-                assert_eq!(args["sendSchedulingMessages"], false, "Picacho invites by mail");
+                // Who tells the participants: each /set's sendSchedulingMessages
+                // and the participants' scheduleAgent, in order.
+                let agents: Vec<String> = ["create", "update"]
+                    .iter()
+                    .flat_map(|k| args[*k].as_object().into_iter().flatten())
+                    .flat_map(|(_, e)| e["participants"].as_object().into_iter().flatten())
+                    .filter_map(|(_, p)| p["scheduleAgent"].as_str().map(str::to_owned))
+                    .collect();
+                self.scheduling.push((args["sendSchedulingMessages"] == true, agents));
                 let mut out = json!({});
                 if let Some(create) = args["create"].as_object() {
                     for (key, props) in create {
@@ -464,6 +621,51 @@ impl Server {
                     self.events.retain(|e| e["id"] != *id);
                 }
                 vec![(name.into(), out)]
+            }
+            "Calendar/changes" | "AddressBook/changes" | "ShareNotification/changes" => vec![(
+                name.into(),
+                json!({ "oldState": args["sinceState"], "newState": "c2", "hasMoreChanges": false,
+                        "created": ["c9"], "updated": [], "destroyed": ["c1"] }),
+            )],
+            "CalendarEvent/queryChanges" | "ContactCard/queryChanges" => vec![(
+                name.into(),
+                json!({ "oldQueryState": args["sinceQueryState"], "newQueryState": "q2", "total": 1,
+                        "removed": ["E0"], "added": [{ "id": "E9", "index": 0 }] }),
+            )],
+            "CalendarEvent/copy" | "ContactCard/copy" => {
+                assert_eq!(args["fromAccountId"], "u2");
+                let created: serde_json::Map<String, Value> = args["create"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|k| (k.clone(), json!({ "id": format!("copy-{k}") })))
+                    .collect();
+                vec![(name.into(), json!({ "created": created }))]
+            }
+            "CalendarEvent/parse" => {
+                let parsed: serde_json::Map<String, Value> = args["blobIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| (b.as_str().unwrap().to_owned(), json!([{ "@type": "Event", "uid": "p@x", "title": "Parsed",
+                        "start": "2026-12-01T09:00:00", "timeZone": "Etc/UTC", "duration": "PT30M" }])))
+                    .collect();
+                vec![(name.into(), json!({ "parsed": parsed, "notParsable": [], "notFound": [] }))]
+            }
+            "Calendar/set" if args["update"].as_object().is_some_and(|u| u.values().any(|p| p.get("shareWith").is_some())) => {
+                self.shared_with.push(args["update"].clone());
+                let updated: serde_json::Map<String, Value> =
+                    args["update"].as_object().unwrap().keys().map(|k| (k.clone(), Value::Null)).collect();
+                vec![(name.into(), json!({ "updated": updated }))]
+            }
+            "Principal/get" => vec![(
+                name.into(),
+                json!({ "list": [{ "id": "P1", "type": "individual", "name": "Bo Lindqvist", "email": "bo@example.se",
+                                   "accounts": { "u2": {} } }], "state": "p1" }),
+            )],
+            "Principal/set" => {
+                self.shared_with.push(args["update"].clone());
+                vec![(name.into(), json!({ "updated": { "P1": null } }))]
             }
             "AddressBook/get" => vec![(
                 name.into(),
@@ -515,10 +717,32 @@ impl Server {
                         let undo = self.undo.get(id)?;
                         Some(json!({ "id": id, "emailId": "M1", "undoStatus": undo,
                                      "sendAt": "2026-12-01T09:00:00Z",
-                                     "deliveryStatus": { "bo@example.se": { "delivered": "queued", "smtpReply": "250 OK" } } }))
+                                     "deliveryStatus": {
+                                         "bo@example.se": { "delivered": "queued", "smtpReply": "250 OK", "displayed": "unknown" },
+                                         "cy@example.net": { "delivered": "yes", "smtpReply": "250 OK", "displayed": "yes" },
+                                     } }))
                     })
                     .collect();
                 vec![(name.into(), json!({ "list": list, "state": "sub" }))]
+            }
+            "EmailSubmission/set" if args.get("destroy").is_some() => {
+                let mut out = json!({ "destroyed": [] });
+                for id in args["destroy"].as_array().unwrap() {
+                    let id = id.as_str().unwrap();
+                    match self.undo.get(id).map(String::as_str) {
+                        Some("pending") => out["notDestroyed"][id] = json!({ "type": "forbidden" }),
+                        Some(_) => {
+                            self.undo.remove(id);
+                            out["destroyed"].as_array_mut().unwrap().push(json!(id));
+                        }
+                        None => out["notDestroyed"][id] = json!({ "type": "notFound" }),
+                    }
+                }
+                vec![(name.into(), out)]
+            }
+            "EmailSubmission/queryChanges" => {
+                vec![(name.into(), json!({ "oldQueryState": args["sinceQueryState"], "newQueryState": "sq2",
+                    "removed": ["held0"], "added": [{ "id": "held9", "index": 0 }] }))]
             }
             "EmailSubmission/set" if args.get("update").is_some() => {
                 let mut out = json!({ "updated": {} });
@@ -564,12 +788,122 @@ impl Server {
                     name.to_owned(),
                     json!({ "created": { "s": { "id": "sub1" } } }),
                 )];
-                // onSuccessUpdateEmail runs as an implicit Email/set.
+                // onSuccessUpdateEmail and onSuccessDestroyEmail run as an
+                // implicit Email/set.
                 if let Some(patch) = args["onSuccessUpdateEmail"]["#s"].as_object() {
-                    let update = json!({ "update": { email_id: patch } });
+                    let update = json!({ "update": { email_id.clone(): patch } });
                     out.extend(self.method("Email/set", &update, earlier));
                 }
+                if args["onSuccessDestroyEmail"] == json!(["#s"]) {
+                    let destroy = json!({ "destroy": [email_id] });
+                    out.extend(self.method("Email/set", &destroy, earlier));
+                }
                 out
+            }
+            "Blob/get" => {
+                let blob = ids_of(args).unwrap()[0].clone();
+                let data = self.blobs.get(&blob).cloned().unwrap_or_default();
+                let from = args["offset"].as_u64().unwrap_or(0) as usize;
+                let len = args["length"].as_u64().map_or(usize::MAX, |l| l as usize);
+                let part = &data[from.min(data.len())..from.saturating_add(len).min(data.len())];
+                use base64::Engine as _;
+                let mut item = json!({ "id": blob, "data:asBase64": base64::engine::general_purpose::STANDARD.encode(part) });
+                if args["properties"].as_array().unwrap().iter().any(|p| p == "digest:sha-256") {
+                    use sha2::Digest as _;
+                    let mut hash = sha2::Sha256::digest(part).to_vec();
+                    if self.bad_digest {
+                        hash[0] ^= 1;
+                    }
+                    item["digest:sha-256"] = json!(base64::engine::general_purpose::STANDARD.encode(hash));
+                }
+                vec![(name.into(), json!({ "list": [item], "notFound": [] }))]
+            }
+            "Blob/lookup" => {
+                let list: Vec<Value> = args["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| {
+                        let users: Vec<&String> = self.emails.iter().filter(|m| m.blob == b.as_str().unwrap()).map(|m| &m.id).collect();
+                        json!({ "id": b, "matchedIds": { "Email": users } })
+                    })
+                    .collect();
+                vec![(name.into(), json!({ "list": list, "notFound": [] }))]
+            }
+            "MDN/send" => {
+                let mut sent = serde_json::Map::new();
+                for (key, mdn) in args["send"].as_object().into_iter().flatten() {
+                    self.mdns.push(mdn.clone());
+                    sent.insert(key.clone(), json!({ "finalRecipient": "rfc822; qa@example.com" }));
+                    // onSuccessUpdateEmail runs as an implicit Email/set.
+                    if let Some(patch) = args["onSuccessUpdateEmail"][format!("#{key}")].as_object()
+                        && let Some(id) = mdn["forEmailId"].as_str()
+                    {
+                        let update = json!({ "update": { id: patch } });
+                        let _ = self.method("Email/set", &update, earlier);
+                    }
+                }
+                vec![(name.into(), json!({ "sent": sent }))]
+            }
+            "MDN/parse" => {
+                let mut parsed = serde_json::Map::new();
+                for blob in args["blobIds"].as_array().into_iter().flatten() {
+                    parsed.insert(blob.as_str().unwrap().to_owned(), json!({
+                        "forEmailId": "M1", "originalMessageId": "<m1@example.com>",
+                        "finalRecipient": "rfc822; bo@example.se", "reportingUA": "Other/2",
+                        "disposition": { "actionMode": "automatic-action", "sendingMode": "mdn-sent-automatically", "type": "displayed" },
+                    }));
+                }
+                vec![(name.into(), json!({ "parsed": parsed, "notParsable": [], "notFound": [] }))]
+            }
+            "Email/parse" => {
+                let mut parsed = serde_json::Map::new();
+                for blob in args["blobIds"].as_array().into_iter().flatten() {
+                    let blob = blob.as_str().unwrap();
+                    if !self.blobs.contains_key(blob) {
+                        continue;
+                    }
+                    let mut e = json!({ "subject": "Attached", "from": [{ "email": "ana@example.org" }], "preview": "Short preview" });
+                    if args["fetchTextBodyValues"] == true {
+                        let most = args["maxBodyValueBytes"].as_u64().unwrap_or(u64::MAX) as usize;
+                        let text = "The whole first paragraph of the attached message.";
+                        e["textBody"] = json!([{ "partId": "1", "type": "text/plain" }]);
+                        e["bodyValues"] = json!({ "1": { "value": &text[..text.len().min(most)], "isTruncated": text.len() > most } });
+                    }
+                    parsed.insert(blob.to_owned(), e);
+                }
+                vec![(name.into(), json!({ "parsed": parsed, "notParsable": [], "notFound": [] }))]
+            }
+            "Email/copy" => {
+                let mut created = serde_json::Map::new();
+                for (key, c) in args["create"].as_object().into_iter().flatten() {
+                    let Some(original) = self.emails.iter().find(|m| m.id == c["id"]).cloned() else {
+                        continue;
+                    };
+                    self.next += 1;
+                    let id = format!("C{}", self.next);
+                    self.emails.push(Message {
+                        id: id.clone(),
+                        mailboxes: c["mailboxIds"].as_object().unwrap().keys().cloned().collect(),
+                        ..original
+                    });
+                    created.insert(key.clone(), json!({ "id": id }));
+                }
+                vec![(name.into(), json!({ "created": created }))]
+            }
+            "Blob/copy" => {
+                let copied: serde_json::Map<String, Value> = args["blobIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b.as_str())
+                    .map(|b| (b.to_owned(), json!(format!("copy-{b}"))))
+                    .collect();
+                vec![(name.into(), json!({ "copied": copied }))]
+            }
+            "CalendarEventNotification/set" => {
+                let destroyed = args["destroy"].clone();
+                vec![(name.into(), json!({ "destroyed": destroyed }))]
             }
             "SieveScript/get" => {
                 let list: Vec<Value> = self
@@ -580,6 +914,40 @@ impl Server {
                     })
                     .collect();
                 vec![(name.into(), json!({ "list": list, "state": "x" }))]
+            }
+            "SieveScript/query" => {
+                let ids: Vec<&String> = self
+                    .scripts
+                    .iter()
+                    .filter(|x| args["filter"]["isActive"].as_bool().is_none_or(|on| x.3 == on))
+                    .filter(|x| args["filter"]["name"].as_str().is_none_or(|n| x.1 == n))
+                    .map(|x| &x.0)
+                    .collect();
+                vec![(name.into(), json!({ "ids": ids, "queryState": "sq" }))]
+            }
+            "SieveScript/set" if args.get("destroy").is_some() || args["update"].as_object().is_some_and(|u| u.values().any(|p| p.get("name").is_some())) => {
+                let mut out = json!({ "updated": {}, "destroyed": [] });
+                for (id, p) in args["update"].as_object().into_iter().flatten() {
+                    let new = p["name"].as_str().unwrap().to_owned();
+                    if self.scripts.iter().any(|x| x.1 == new && x.0 != *id) {
+                        out["notUpdated"][id] = json!({ "type": "alreadyExists" });
+                        continue;
+                    }
+                    self.scripts.iter_mut().find(|x| x.0 == *id).unwrap().1 = new;
+                    out["updated"][id] = Value::Null;
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    let id = id.as_str().unwrap();
+                    match self.scripts.iter().find(|x| x.0 == id) {
+                        Some(x) if x.3 => out["notDestroyed"][id] = json!({ "type": "sieveIsActive" }),
+                        Some(_) => {
+                            self.scripts.retain(|x| x.0 != id);
+                            out["destroyed"].as_array_mut().unwrap().push(json!(id));
+                        }
+                        None => out["notDestroyed"][id] = json!({ "type": "notFound" }),
+                    }
+                }
+                vec![(name.into(), out)]
             }
             "SieveScript/validate" => {
                 let text = String::from_utf8_lossy(&self.blobs[args["blobId"].as_str().unwrap()])
@@ -655,17 +1023,41 @@ impl Server {
             "Quota/get" => vec![(
                 name.into(),
                 json!({ "list": [{ "id": "q", "resourceType": "octets", "scope": "account",
-                                   "used": 2048, "hardLimit": 1048576 }] }),
+                                   "used": self.quota_used.unwrap_or(2048), "hardLimit": 1048576 }],
+                        "state": format!("qs{}", self.quota_state) }),
             )],
+            "Quota/changes" => {
+                let since: u64 = args["sinceState"].as_str().unwrap().trim_start_matches("qs").parse().unwrap();
+                let updated: Vec<&str> = if since < self.quota_state { vec!["q"] } else { vec![] };
+                vec![(name.into(), json!({ "oldState": args["sinceState"], "newState": format!("qs{}", self.quota_state),
+                    "hasMoreChanges": false, "created": [], "updated": updated, "destroyed": [] }))]
+            }
+            "Quota/query" => vec![(name.into(), json!({ "ids": ["q"], "queryState": "qq" }))],
             _ => vec![("error".into(), json!({ "type": "unknownMethod" }))],
         }
     }
     fn respond(&mut self, method: &str, path: &str, auth: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        self.paths.push(path.to_owned());
+        // A CDN's presigned address: no sign-in wanted, nor kept.
+        if let Some(blob) = path.strip_prefix("/cdn/") {
+            self.cdn_auth.push(auth.to_owned());
+            return match self.blobs.get(blob) {
+                Some(b) => (200, b.clone()),
+                None => (404, Vec::new()),
+            };
+        }
         if auth != AUTH && auth != TOKEN {
             return (401, b"{}".to_vec());
         }
         let base = format!("https://localhost:{}", self.port);
-        if method == "GET" && path == "/.well-known/jmap" {
+        if method == "GET"
+            && path == "/.well-known/jmap"
+            && let Some(to) = &self.session_redirect
+        {
+            // A 3xx's body is the Location it names (see `serve`).
+            return (307, to.clone().into_bytes());
+        }
+        if method == "GET" && (path == "/.well-known/jmap" || path == "/jmap/session") {
             self.session_reads += 1;
             if self.modern {
                 return (200, self.modern_session(&base).to_string().into_bytes());
@@ -681,9 +1073,10 @@ impl Server {
                         "urn:ietf:params:jmap:sieve": {},
                     },
                     "accounts": { "u1": { "name": "qa@example.com", "accountCapabilities": {
-                        "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {},
+                        "urn:ietf:params:jmap:mail": self.mail_caps.clone().unwrap_or(json!({})), "urn:ietf:params:jmap:submission": {},
                         "urn:ietf:params:jmap:sieve": {
-                            "sieveExtensions": ["fileinto", "vacation", "imap4flags", "include"] } } } },
+                            "sieveExtensions": ["fileinto", "vacation", "imap4flags", "include"],
+                            "maxSizeScript": self.sieve_max_size.unwrap_or(65536), "maxNumberScripts": 5 } } } },
                     "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
                     "username": "qa@example.com",
                     "apiUrl": format!("{base}/api"),
@@ -698,11 +1091,19 @@ impl Server {
         if method == "POST" && path == "/api" {
             let request: Value = serde_json::from_slice(body).unwrap();
             let mut responses = Vec::new();
-            let mut earlier: Vec<Value> = Vec::new();
+            // RFC 8620 §3.3: creation ids from earlier requests resolve as
+            // if made in this one.
+            let mut earlier: Vec<Value> = request["createdIds"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, id)| json!({ "created": { k.clone(): { "id": id } } }))
+                .collect();
+            let carried = earlier.len();
             for call in request["methodCalls"].as_array().unwrap() {
                 let (name, args, id) = (call[0].as_str().unwrap(), &call[1], &call[2]);
                 assert!(
-                    args["accountId"] == "u1" || (self.modern && args["accountId"] == "u2"),
+                    args["accountId"] == "u1" || (self.modern && (args["accountId"] == "u2" || args["accountId"] == "u3")),
                     "{name} names the account"
                 );
                 for (n, v) in self.method(name, args, &earlier) {
@@ -712,12 +1113,17 @@ impl Server {
                     }
                 }
             }
-            return (
-                200,
-                json!({ "methodResponses": responses, "sessionState": self.state_name() })
-                    .to_string()
-                    .into_bytes(),
-            );
+            let mut reply = json!({ "methodResponses": responses, "sessionState": self.state_name() });
+            if request.get("createdIds").is_some() {
+                let mut ids = request["createdIds"].clone();
+                for v in &earlier[carried..] {
+                    for (k, c) in v["created"].as_object().into_iter().flatten() {
+                        ids[k] = c["id"].clone();
+                    }
+                }
+                reply["createdIds"] = ids;
+            }
+            return (200, reply.to_string().into_bytes());
         }
         if method == "POST" && (path.starts_with("/upload/u1/") || path.starts_with("/upload/u2/")) {
             self.next += 1;
@@ -734,6 +1140,10 @@ impl Server {
             && let Some(rest) = path.strip_prefix("/download/u1/")
         {
             let blob = rest.split('/').next().unwrap();
+            self.downloads.push(blob.to_owned());
+            if let Some(to) = self.blob_redirects.get(blob) {
+                return (302, to.clone().into_bytes());
+            }
             return match self.blobs.get(blob) {
                 Some(b) => (200, b.clone()),
                 None => (404, Vec::new()),
@@ -844,9 +1254,15 @@ fn serve(
         reader.read_exact(&mut body).unwrap();
         let (status, reply) = server.lock().unwrap().respond(&method, &path, &auth, &body);
         let stream = reader.get_mut();
+        // A redirect's reply is where it goes.
+        let (location, reply) = if (300..400).contains(&status) {
+            (format!("Location: {}\r\n", String::from_utf8_lossy(&reply)), Vec::new())
+        } else {
+            (String::new(), reply)
+        };
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} X\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             reply.len()
         );
         let _ = stream.write_all(&reply);
@@ -1116,9 +1532,12 @@ fn jmap_sieve_filters_and_vacation() -> Result<()> {
     assert!(again.active);
     assert_eq!(again.filters, filters);
 
-    // Saved again: the same script is replaced, not a second one made.
+    // Saved again: the same script is replaced, not a second one made,
+    // and its text uploaded once for both validating and saving (RFC 9661).
+    let blobs_before = server.lock().unwrap().blobs.len();
     b.save_filters(&a, &filters)?;
     assert_eq!(server.lock().unwrap().scripts.len(), 2);
+    assert_eq!(server.lock().unwrap().blobs.len(), blobs_before + 1);
 
     // No rules: back to the script it included.
     let mut none = filters.clone();
@@ -1350,13 +1769,28 @@ fn jmap_shared_accounts_are_added_and_sign_in_as_their_owner() -> Result<()> {
     a.provider = Provider::Jmap;
     a.incoming_port = port;
     b.store.save_account(&a)?;
-    let found = b.jmap_shared(&a)?;
-    assert_eq!(found, vec![("u2".to_owned(), "Team".to_owned())]);
+    let mut found = b.jmap_shared(&a)?;
+    found.sort();
+    // RFC 8620 §2: isPersonal and isReadOnly show in the names.
+    assert_eq!(
+        found,
+        vec![
+            ("u2".to_owned(), "Team (shared)".to_owned()),
+            ("u3".to_owned(), "Archive (shared, read-only)".to_owned()),
+        ]
+    );
     let team = b.add_jmap_shared(&a, "u2", "Team")?;
     assert_eq!(team.jmap_account, "u2");
     assert_eq!(team.credentials_of, a.id);
     assert_eq!(team.label(), "Team");
-    assert!(b.jmap_shared(&a)?.is_empty(), "already added");
+    assert_eq!(b.jmap_shared(&a)?.len(), 1, "Team already added");
+    // A read-only account's changes are refused before they're sent.
+    let archive = b.add_jmap_shared(&a, "u3", "Archive")?;
+    let error = b
+        .with_jmap(&archive, |s| s.destroy(&["M1".to_owned()]))
+        .unwrap_err();
+    assert!(error.downcast_ref::<crate::sync::jmap::ReadOnly>().is_some(), "{error:#}");
+    b.remove_account(&archive.id)?;
     b.sync(&team, Folder::Inbox, 50)?;
     let error = format!("{:#}", b.remove_account(&a.id).unwrap_err());
     assert!(error.contains("Team"), "{error}");
@@ -1594,6 +2028,8 @@ fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
         let made = s.events.iter().find(|e| e["title"] == "Lunch").unwrap();
         assert_eq!(made["calendarIds"]["c1"], true);
         assert_eq!(made["participants"]["p0"]["scheduleAgent"], "client");
+        // Picacho invites by mail: the server is told to send nothing.
+        assert!(s.scheduling.iter().all(|(sends, _)| !sends), "{:?}", s.scheduling);
     }
     b.delete_event(&saved.event.uid)?;
     assert!(!server.lock().unwrap().events.iter().any(|e| e["title"] == "Lunch"));
@@ -1632,6 +2068,20 @@ fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
     let status = b.submission_status(&a, "held1")?.unwrap();
     assert_eq!(status.undo, "canceled");
     assert_eq!(status.delivery[0].1, "queued");
+    // RFC 8621 §7: a read receipt's `displayed`.
+    assert_eq!(status.displayed, ["cy@example.net"]);
+    // Its record goes once no longer needed; a pending one stays.
+    b.with_jmap(&a, |s| s.forget_submissions(&["held1".to_owned()]))?;
+    assert!(!server.lock().unwrap().undo.contains_key("held1"));
+    server.lock().unwrap().undo.insert("held2".into(), "pending".into());
+    assert!(b.with_jmap(&a, |s| s.forget_submissions(&["held2".to_owned()])).is_err());
+    let changes = b.with_jmap(&a, |s| s.pending_submission_changes("sq1"))?.unwrap();
+    assert_eq!((changes.removed, changes.added), (vec!["held0".to_owned()], vec![("held9".to_owned(), 0)]));
+    // Sent without keeping a copy: the message is gone once sent.
+    let before = server.lock().unwrap().emails.len();
+    let options = crate::sync::jmap::SendOptions { keep_no_copy: true, ..Default::default() };
+    b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &options)?;
+    assert_eq!(server.lock().unwrap().emails.len(), before);
     Ok(())
 }
 
@@ -1707,5 +2157,726 @@ fn jmap_calendars_and_contacts_sync_by_changes() -> Result<()> {
         let sets = s.calls.iter().filter(|c| *c == "ContactCard/set").count();
         assert_eq!(sets, 0, "not overwritten: {:?}", s.calls);
     }
+    Ok(())
+}
+
+/// Contact photos the server keeps as blobs are downloaded once, several
+/// at a time, and reused on later reads while the blob is the same.
+#[test]
+fn jmap_contact_photos_download_once_and_are_reused() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        dav_changes: true,
+        ..Default::default()
+    };
+    for i in 0..6 {
+        let blob = format!("P{i}");
+        fixture.blobs.insert(blob.clone(), format!("photo {i}").into_bytes());
+        fixture.cards.push(json!({
+            "@type": "Card", "id": format!("K{i}"), "uid": format!("u{i}"), "name": { "full": format!("Person {i}") },
+            "media": { "p": { "@type": "Media", "kind": "photo", "blobId": blob, "mediaType": "image/png" } },
+        }));
+    }
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    assert_eq!(b.connect_jmap_contacts(&a)?, 6);
+    {
+        let mut downloads = server.lock().unwrap().downloads.clone();
+        downloads.sort();
+        assert_eq!(downloads, ["P0", "P1", "P2", "P3", "P4", "P5"]);
+    }
+    let three = b.contacts().into_iter().find(|c| c.name == "Person 3").unwrap();
+    assert_eq!(three.photo_bytes().as_deref(), Some(&b"photo 3"[..]));
+    assert_eq!(three.photo_blob, "P3");
+    // Read again: the photos are already here.
+    {
+        let mut s = server.lock().unwrap();
+        s.downloads.clear();
+        // One photo is replaced by a new blob, which is downloaded.
+        s.blobs.insert("P9".into(), b"photo 9".to_vec());
+        s.cards[1]["media"]["p"]["blobId"] = json!("P9");
+        s.cards[3]["name"]["full"] = json!("Person 3b");
+        s.dav_state += 1;
+        let state = s.dav_state;
+        s.dav_log.push((state, 'k', "K1".into(), false));
+        s.dav_log.push((state, 'k', "K3".into(), false));
+    }
+    b.sync_contacts()?;
+    assert_eq!(server.lock().unwrap().downloads, ["P9"]);
+    let one = b.contacts().into_iter().find(|c| c.name == "Person 1").unwrap();
+    assert_eq!(one.photo_bytes().as_deref(), Some(&b"photo 9"[..]));
+    // Changed, but its photo is the same blob: not downloaded again.
+    let three = b.contacts().into_iter().find(|c| c.name == "Person 3b").unwrap();
+    assert_eq!(three.photo_bytes().as_deref(), Some(&b"photo 3"[..]));
+    // A photo kept from before isn't an edit: saving leaves `media` alone.
+    b.save_contact(three)?;
+    assert_eq!(server.lock().unwrap().cards[3]["media"]["p"]["blobId"], "P3");
+    Ok(())
+}
+
+/// A submission the server refuses as a whole (a method error, RFC 8620
+/// §3.6.2) still lets the import before it be seen, so its copy is removed
+/// rather than left behind in Drafts.
+#[test]
+fn jmap_refused_submission_leaves_no_orphaned_import() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        refuse: Some("EmailSubmission/set"),
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let options = crate::sync::jmap::SendOptions::default();
+    let error = b
+        .send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &options)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("EmailSubmission/set"), "{error:#}");
+    let s = server.lock().unwrap();
+    assert!(s.calls.contains(&"Email/import".to_owned()), "{:?}", s.calls);
+    assert!(s.emails.is_empty(), "the imported copy is removed");
+    Ok(())
+}
+
+/// A server without ContactCard/changes (`unknownMethod`) has its cards
+/// read whole again, rather than failing the sync.
+#[test]
+fn jmap_contacts_without_changes_are_read_whole() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    fixture.cards.push(json!({ "@type": "Card", "id": "K0", "uid": "bo", "name": { "full": "Bo" } }));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    assert_eq!(b.connect_jmap_contacts(&a)?, 1);
+    server
+        .lock()
+        .unwrap()
+        .cards
+        .push(json!({ "@type": "Card", "id": "K1", "uid": "cy", "name": { "full": "Cy" } }));
+    assert_eq!(b.sync_contacts()?, 2);
+    Ok(())
+}
+
+/// Copies, blob copies, held submissions and dismissed notices go in
+/// pieces the server takes (RFC 8620 §5.1, §5.3: `maxObjectsInGet` and
+/// `maxObjectsInSet`), however many there are.
+#[test]
+fn jmap_batches_respect_the_object_limits() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        max_objects: 2,
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    for i in 0..5 {
+        fixture.emails.push(Message {
+            id: format!("M{i}"),
+            blob: "B0".into(),
+            mailboxes: vec!["i".into()],
+            keywords: vec![],
+            subject: format!("Message {i}"),
+            received: "2026-10-24T10:00:00Z".into(),
+        });
+        fixture.undo.insert(format!("held{i}"), "pending".into());
+    }
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let ids: Vec<String> = (0..5).map(|i| format!("M{i}")).collect();
+    let copied = b.with_jmap(&a, |s| s.copy_from("u2", &ids, "w", &[]))?;
+    assert_eq!(copied.len(), 5);
+    let blobs: Vec<String> = (0..5).map(|i| format!("B{i}")).collect();
+    let copied = b.with_jmap(&a, |s| s.copy_blobs("u2", &blobs))?;
+    assert_eq!(copied.len(), 5);
+    assert_eq!(b.held_submissions(&a)?.len(), 5);
+    let notices: Vec<crate::sync::jscal::Notice> = (0..5)
+        .map(|i| crate::sync::jscal::Notice {
+            id: format!("n{i}"),
+            kind: "CalendarEventNotification".into(),
+            text: String::new(),
+        })
+        .collect();
+    b.with_jmap(&a, |s| crate::sync::jscal::dismiss_notices(s, &notices))?;
+    let s = server.lock().unwrap();
+    let count = |m: &str| s.calls.iter().filter(|c| *c == m).count();
+    assert_eq!(count("Email/copy"), 3);
+    assert_eq!(count("Blob/copy"), 3);
+    assert_eq!(count("CalendarEventNotification/set"), 3);
+    assert!(count("EmailSubmission/get") >= 3, "{:?}", s.calls);
+    Ok(())
+}
+
+/// RFC 8620 §2.2: the well-known address's redirect within the server is
+/// followed and remembered, so the next sign-in starts where it ended; one
+/// to another host is refused, naming it.
+#[test]
+fn jmap_session_redirects_are_followed_and_kept() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    server.lock().unwrap().session_redirect = Some(format!("https://localhost:{port}/jmap/session"));
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.with_jmap(&a, |s| s.identities().map(drop))?;
+    {
+        let mut s = server.lock().unwrap();
+        assert_eq!(s.paths[..2], ["/.well-known/jmap", "/jmap/session"]);
+        s.paths.clear();
+    }
+    // Signed in again: straight to where the redirect went.
+    b.jmap.lock().unwrap().clear();
+    b.with_jmap(&a, |s| s.identities().map(drop))?;
+    assert_eq!(server.lock().unwrap().paths[0], "/jmap/session");
+    // Another host (an IP address isn't the name entered): refused.
+    server.lock().unwrap().session_redirect = Some(format!("https://127.0.0.1:{port}/jmap/session"));
+    let (b2, mut other, path2) = backend(&cert)?;
+    let _cleanup2 = Cleanup(path2);
+    other.provider = Provider::Jmap;
+    other.incoming_port = port;
+    let error = format!("{:#}", b2.check_jmap(&other, &b2.test_secret.clone().unwrap()).unwrap_err());
+    assert!(error.contains("127.0.0.1") && error.contains("enter that as the server"), "{error}");
+    Ok(())
+}
+
+/// A download redirected to another host (a CDN's presigned address) is
+/// followed without the account's credentials.
+#[test]
+fn jmap_blob_redirects_drop_credentials_off_the_origin() -> Result<()> {
+    let mut fixture = Server::default();
+    fixture.blobs.insert("B-cdn".into(), MESSAGE.to_vec());
+    let (cert, port, server, _running) = start(fixture)?;
+    server
+        .lock()
+        .unwrap()
+        .blob_redirects
+        .insert("B-cdn".into(), format!("https://127.0.0.1:{port}/cdn/B-cdn"));
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let bytes = b.with_jmap(&a, |s| s.download("B-cdn", "m.eml", "message/rfc822", 1 << 20))?;
+    assert_eq!(bytes, MESSAGE);
+    assert_eq!(server.lock().unwrap().cdn_auth, [""], "no Authorization off the origin");
+    // Back on the origin, the credentials go again.
+    server
+        .lock()
+        .unwrap()
+        .blob_redirects
+        .insert("B-cdn".into(), format!("https://localhost:{port}/download/u1/B-1/m.eml"));
+    server.lock().unwrap().blobs.insert("B-1".into(), b"one".to_vec());
+    let bytes = b.with_jmap(&a, |s| s.download("B-cdn", "m.eml", "message/rfc822", 1 << 20))?;
+    assert_eq!(bytes, b"one");
+    Ok(())
+}
+
+/// More calls than the server takes in one request: a creation id made in
+/// one request is named in the next, carried in `createdIds` (RFC 8620
+/// §3.3).
+#[test]
+fn jmap_creation_ids_cross_requests() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let blob = b.with_jmap(&a, |s| s.upload(MESSAGE, "message/rfc822"))?;
+    // The server takes two calls a time: the submission goes in a second
+    // request, naming the import's `#m`.
+    let answers = b.with_jmap(&a, |s| {
+        s.call(&[
+            ("Email/import", json!({ "accountId": "u1", "emails": { "m": {
+                "blobId": blob, "mailboxIds": { "d": true }, "keywords": {} } } })),
+            ("Identity/get", json!({ "accountId": "u1" })),
+            ("EmailSubmission/set", json!({ "accountId": "u1", "create": { "s": {
+                "identityId": "id1", "emailId": "#m",
+                "envelope": { "mailFrom": { "email": "qa@example.com" }, "rcptTo": [{ "email": "r@example.com" }] } } } })),
+        ])
+    })?;
+    assert_eq!(answers.len(), 3);
+    assert_eq!(answers[2].value()?["created"]["s"]["id"], "sub1");
+    assert_eq!(server.lock().unwrap().sent.len(), 1);
+    Ok(())
+}
+
+/// A card is changed with `ifInState` (RFC 8620 §5.3): another card's change
+/// in between moves the state, and the change is tried again since this card
+/// is as it was; this card's own change in between is a conflict.
+#[test]
+fn jmap_card_changes_use_if_in_state() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        dav_changes: true,
+        ..Default::default()
+    };
+    fixture.cards.push(json!({ "@type": "Card", "id": "K0", "uid": "bo", "name": { "full": "Bo" }, "updated": "1" }));
+    fixture.cards.push(json!({ "@type": "Card", "id": "K1", "uid": "cy", "name": { "full": "Cy" }, "updated": "1" }));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_contacts(&a)?;
+    // Saved as read: one ContactCard/set, with the state it was read in.
+    let mut bo = b.contacts().into_iter().find(|c| c.name == "Bo").unwrap();
+    bo.note = "One".into();
+    let bo = b.save_contact(bo)?;
+    assert_eq!(server.lock().unwrap().cards[0]["notes"]["n1"]["note"], "One");
+    // Another card changes on the server: the state moves, this card is
+    // still as read, so the change goes through on the second try.
+    {
+        let mut s = server.lock().unwrap();
+        s.dav_state += 1;
+        s.calls.clear();
+    }
+    let mut again = bo.clone();
+    again.note = "Two".into();
+    b.save_contact(again)?;
+    {
+        let s = server.lock().unwrap();
+        assert_eq!(s.cards[0]["notes"]["n1"]["note"], "Two");
+        assert_eq!(s.calls.iter().filter(|c| *c == "ContactCard/set").count(), 2, "{:?}", s.calls);
+    }
+    Ok(())
+}
+
+/// Mailboxes (RFC 8621 §2): rights, subscription and thread counts are
+/// read; a folder is moved under another and subscribed to; a folder the
+/// sign-in may not rename is refused before anything is sent; and a folder
+/// with mail is deleted with it only when asked (`onDestroyRemoveEmails`).
+#[test]
+fn jmap_mailbox_rights_moves_and_removal() -> Result<()> {
+    let mut fixture = Server {
+        boxes: Some(vec![
+        json!({ "id": "i", "name": "Inbox", "role": "inbox", "parentId": null, "totalThreads": 3, "unreadThreads": 1,
+                "myRights": { "mayRename": false, "mayDelete": false, "mayCreateChild": true, "mayAddItems": true } }),
+        json!({ "id": "w", "name": "Work", "parentId": null, "isSubscribed": true }),
+        json!({ "id": "r", "name": "Reports", "parentId": null, "myRights": { "mayAddItems": false } }),
+        json!({ "id": "p", "name": "Projects", "parentId": null, "isSubscribed": false }),
+        ]),
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["p".into()],
+        keywords: vec![],
+        subject: "Plans".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.with_jmap(&a, |s| {
+        let boxes = s.reload_mailboxes()?;
+        let inbox = boxes.iter().find(|m| m.id == "i").unwrap();
+        assert_eq!((inbox.total_threads, inbox.unread_threads), (3, 1));
+        assert!(!inbox.may_rename() && !inbox.may_delete() && inbox.may_create_child());
+        assert_eq!(boxes.iter().find(|m| m.id == "p").unwrap().is_subscribed, Some(false));
+        // Refused here: the server isn't asked.
+        let before = server.lock().unwrap().calls.len();
+        assert!(s.rename_mailbox("i", "Post").is_err());
+        assert!(s.move_mailbox("i", Some("w")).is_err());
+        assert!(s.destroy_mailbox_with("i", true).is_err());
+        assert_eq!(server.lock().unwrap().calls.len(), before);
+        // A folder that takes no messages: refused here.
+        let mut patch = serde_json::Map::new();
+        patch.insert("M1".into(), json!({ "mailboxIds/r": true }));
+        let e = s.update(patch).unwrap_err();
+        assert!(e.to_string().contains("Reports"), "{e}");
+        // With mail in it, unless its mail goes too: refused.
+        assert!(s.destroy_mailbox_with("p", false).is_err());
+        Ok(())
+    })?;
+    // Moved under Work, its path changing with it, and subscribed to.
+    let change = b.move_folder_jmap(&a, "Projects", Some("Work"))?;
+    assert_eq!(change.moved, [("Projects".to_owned(), "Work/Projects".to_owned())]);
+    assert!(b.move_folder_jmap(&a, "Work", Some("Work/Projects")).is_err(), "not inside itself");
+    assert!(!b.subscribed_folders_jmap(&a)?.contains(&"Work/Projects".to_owned()));
+    b.subscribe_folder_jmap(&a, "Work/Projects", true)?;
+    // This fixture has no Mailbox/queryChanges: listed again.
+    assert!(b.subscribed_folders_jmap(&a)?.contains(&"Work/Projects".to_owned()));
+    assert!(server.lock().unwrap().calls.contains(&"Mailbox/queryChanges".to_owned()));
+    // Deleted with the mail only it held.
+    let left = b.delete_remote_folder(&a, "Work/Projects")?;
+    assert!(left.iter().all(|f| f.name != "Work/Projects"));
+    assert!(server.lock().unwrap().emails.is_empty());
+    Ok(())
+}
+
+/// Identities are read with their Reply-To, Bcc and signatures (RFC 8621
+/// §6), and once read, only what changed is asked (Identity/changes).
+#[test]
+fn jmap_identities_read_their_defaults_and_changes() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let list = b.jmap_identities(&a)?;
+    assert_eq!(list.len(), 1);
+    assert_eq!(crate::sync::jmap::addresses(&list[0].reply_to), "QA desk <desk@example.com>");
+    assert_eq!(list[0].text_signature, "-- \nQA");
+    assert_eq!(list[0].html_signature, "<p>QA</p>");
+    server.lock().unwrap().extra_identities.push(json!({ "id": "id2", "name": "Ops", "email": "ops@example.com" }));
+    let before = server.lock().unwrap().calls.len();
+    let list = b.jmap_identities(&a)?;
+    assert_eq!(list.len(), 2);
+    let calls = server.lock().unwrap().calls[before..].to_vec();
+    assert_eq!(calls, ["Identity/changes", "Identity/get"]);
+    // Nothing changed: no Identity/get at all.
+    let before = server.lock().unwrap().calls.len();
+    assert_eq!(b.jmap_identities(&a)?.len(), 2);
+    assert_eq!(server.lock().unwrap().calls[before..], ["Identity/changes"]);
+    Ok(())
+}
+
+/// Server scheduling for JMAP calendars is opt-in. Off (the default), the
+/// server is told to send nothing and Picacho emails the guests, as before.
+/// On, the server sends for events organized here and Picacho emails
+/// nothing; never both for one change. Invitations from others are still
+/// answered by mail, the server sending nothing.
+#[test]
+fn jmap_calendar_scheduling_uses_one_channel() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    let lunch = |uid: &str, organizer: &str| {
+        let mut e = crate::sync::ical::Event {
+            uid: uid.into(),
+            summary: "Lunch".into(),
+            start: 4_100_000_000,
+            end: 4_100_003_600,
+            utc: true,
+            ..Default::default()
+        };
+        e.organizer = Some(crate::sync::ical::Attendee { email: organizer.into(), ..Default::default() });
+        e.attendees.push(crate::sync::ical::Attendee { email: "bo@example.se".into(), ..Default::default() });
+        e
+    };
+    let mails = |server: &Arc<Mutex<Server>>| server.lock().unwrap().sent.len();
+    let last = |server: &Arc<Mutex<Server>>| server.lock().unwrap().scheduling.last().cloned().unwrap();
+
+    // Off: byte-for-byte as before. The server sends nothing, participants
+    // are client-scheduled, and Picacho emails the guest.
+    b.save_event(lunch("off@x", "qa@example.com"), None)?;
+    assert_eq!(last(&server), (false, vec!["client".to_owned(), "client".to_owned()]));
+    let before = mails(&server);
+    assert_eq!(b.send_invitations(&a, "off@x")?, 1);
+    assert_eq!(mails(&server), before + 1, "invited by mail");
+    b.delete_event("off@x")?;
+    assert!(!last(&server).0);
+
+    // A server that doesn't name the addresses it sends as: refused.
+    let error = format!("{:#}", b.set_server_scheduling(true).unwrap_err());
+    assert!(error.contains("keeps emailing"), "{error}");
+    server.lock().unwrap().participant_identities = true;
+    b.set_server_scheduling(true)?;
+
+    // On, organized here: the server sends; Picacho emails nothing.
+    let before = mails(&server);
+    b.save_event(lunch("on@x", "qa@example.com"), None)?;
+    assert_eq!(last(&server), (true, vec!["server".to_owned(), "server".to_owned()]));
+    assert_eq!(b.send_invitations(&a, "on@x")?, 1);
+    // Changed: the server again.
+    let mut changed = b.calendar_events().into_iter().find(|s| s.event.uid == "on@x").unwrap().event;
+    changed.summary = "Long lunch".into();
+    b.save_event(changed, None)?;
+    assert!(last(&server).0);
+    // Cancelled: the server tells them.
+    assert_eq!(b.cancel_invitations(&a, "on@x")?, 1);
+    b.delete_event("on@x")?;
+    assert!(last(&server).0);
+    assert_eq!(mails(&server), before, "no mail while the server schedules");
+
+    // Someone else's event (an invitation answered here): the server
+    // sends nothing for it; the answer goes by mail.
+    b.save_event(lunch("theirs@x", "ana@example.org"), None)?;
+    assert_eq!(last(&server), (false, vec!["client".to_owned(), "client".to_owned()]));
+    Ok(())
+}
+
+/// The mail account's limits (RFC 8621 §1.3.1) are said before anything is
+/// sent: folder depth, top-level folders, name length, attachments' size
+/// and how many folders a message may be in.
+#[test]
+fn jmap_mail_limits_are_honoured() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        mail_caps: Some(json!({
+            "maxMailboxesPerEmail": 1, "maxMailboxDepth": 2, "maxSizeMailboxName": 100,
+            "maxSizeAttachmentsPerEmail": 1000, "mayCreateTopLevelMailbox": false,
+        })),
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let big = format!(
+        "From: qa@example.com\r\nTo: r@example.com\r\nSubject: Big\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nHi\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=x.bin\r\n\r\n{}\r\n--b--\r\n",
+        "x".repeat(4000)
+    );
+    b.with_jmap(&a, |s| {
+        s.reload_mailboxes()?;
+        let before = server.lock().unwrap().calls.len();
+        assert!(s.create_mailbox("Top", None).is_err(), "not at the top");
+        assert!(s.create_mailbox(&"n".repeat(101), Some("w")).is_err(), "name too long");
+        assert!(s.import(MESSAGE, &["i", "w"], &[]).is_err(), "one folder per message");
+        let mut patch = serde_json::Map::new();
+        patch.insert("M1".into(), json!({ "mailboxIds": { "i": true, "w": true } }));
+        assert!(s.update(patch).is_err());
+        let options = crate::sync::jmap::SendOptions::default();
+        let e = s.send("id1", "qa@example.com", &["r@example.com".into()], big.as_bytes(), Some("d"), Some("s"), &options).unwrap_err();
+        assert!(e.to_string().contains("attachments"), "{e}");
+        assert_eq!(server.lock().unwrap().calls.len(), before, "nothing was asked of the server");
+        // Within the limits: made.
+        let id = s.create_mailbox("Inner", Some("w"))?;
+        // Inner is 2 deep; one inside it would be 3.
+        assert!(s.create_mailbox("Deeper", Some(&id)).is_err());
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Email/parse with bodyValues (RFC 8621 §4.9): the start of an attached
+/// message's text, not only its preview.
+#[test]
+fn jmap_parsed_messages_read_their_text() -> Result<()> {
+    let mut fixture = Server::default();
+    fixture.blobs.insert("B-att".into(), MESSAGE.to_vec());
+    let (cert, port, _server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let (e, text) = b.with_jmap(&a, |s| s.parse_blob_with_text("B-att", 4096))?.unwrap();
+    assert_eq!(e.subject.as_deref(), Some("Attached"));
+    assert_eq!(text, "The whole first paragraph of the attached message.");
+    let (_, cut) = b.with_jmap(&a, |s| s.parse_blob_with_text("B-att", 9))?.unwrap();
+    assert_eq!(cut, "The whole");
+    let (plain, none) = b.with_jmap(&a, |s| s.parse_blob_with_text("B-att", 0))?.unwrap();
+    assert_eq!(plain.preview.as_deref(), Some("Short preview"));
+    assert!(none.is_empty());
+    assert!(b.with_jmap(&a, |s| s.parse_blob_with_text("B-none", 0))?.is_none());
+    Ok(())
+}
+
+/// Read receipts over JMAP (RFC 9007): MDN/send carries the whole report
+/// (reporting program, the Original-Recipient noted, the disposition), and
+/// MDN/parse reads one received.
+#[test]
+fn jmap_read_receipts_carry_every_field() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    let raw = b"From: Ana <ana@example.org>\r\nTo: qa@example.com\r\nOriginal-Recipient: rfc822;qa@example.com\r\nDisposition-Notification-To: ana@example.org\r\nSubject: Please confirm\r\nMessage-ID: <m1@example.com>\r\n\r\nHello\r\n";
+    fixture.blobs.insert("B0".into(), raw.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["i".into()],
+        keywords: vec![],
+        subject: "Please confirm".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let mut m = b.sync(&a, Folder::Inbox, 50)?.remove(0);
+    m.set_receipt_to("ana@example.org");
+    b.send_receipt(&a, &m)?;
+    {
+        let s = server.lock().unwrap();
+        let mdn = &s.mdns[0];
+        assert_eq!(mdn["forEmailId"], "M1");
+        assert_eq!(mdn["disposition"]["type"], "displayed");
+        assert_eq!(mdn["disposition"]["actionMode"], "manual-action");
+        assert_eq!(mdn["originalRecipient"], "rfc822;qa@example.com");
+        assert!(mdn["reportingUA"].as_str().unwrap().starts_with("Picacho/"));
+        assert!(s.emails[0].keywords.contains(&"$mdnsent".to_owned()));
+        assert!(s.sent.is_empty(), "the server wrote it, not a submission");
+    }
+    let parsed = b.with_jmap(&a, |s| s.parse_receipts(&["R1".to_owned()]))?;
+    let r = &parsed["R1"];
+    assert_eq!(r.for_email_id.as_deref(), Some("M1"));
+    assert_eq!(r.disposition, "displayed");
+    assert!(r.automatic);
+    assert_eq!(r.reporting_ua.as_deref(), Some("Other/2"));
+    Ok(())
+}
+
+/// Sieve scripts over JMAP (RFC 9661): found by query, renamed, removed
+/// (not the active one), and a script larger than the server keeps is
+/// refused before it is uploaded.
+#[test]
+fn jmap_sieve_query_rename_destroy_and_limits() -> Result<()> {
+    let mut fixture = Server {
+        sieve_max_size: Some(40),
+        ..Default::default()
+    };
+    fixture.blobs.insert("B-v".into(), b"require \"fileinto\";".to_vec());
+    fixture.scripts.push(("V".into(), "vendor".into(), "B-v".into(), true));
+    fixture.scripts.push(("O".into(), "old".into(), "B-v".into(), false));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.with_jmap(&a, |s| {
+        assert_eq!(s.query_sieve(json!({ "isActive": true }))?, ["V"]);
+        s.sieve_rename("O", "older")?;
+        assert!(s.sieve_rename("O", "vendor").is_err(), "the name is taken");
+        assert!(s.sieve_destroy("V").is_err(), "the active one stays");
+        s.sieve_destroy("O")?;
+        let before = server.lock().unwrap().blobs.len();
+        let e = s.sieve_upload(&"x".repeat(41)).unwrap_err();
+        assert!(e.to_string().contains("larger"), "{e}");
+        assert_eq!(server.lock().unwrap().blobs.len(), before, "not uploaded");
+        Ok(())
+    })?;
+    let s = server.lock().unwrap();
+    assert_eq!(s.scripts.iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), ["vendor"]);
+    Ok(())
+}
+
+/// Storage is read once, then followed by Quota/changes (RFC 9425 §4.2):
+/// unchanged, nothing more is asked; changed, only that quota.
+#[test]
+fn jmap_quota_follows_changes() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    assert_eq!(b.quota(&a)?.unwrap().used_kib, 2);
+    let before = server.lock().unwrap().calls.len();
+    assert_eq!(b.quota(&a)?.unwrap().used_kib, 2);
+    assert_eq!(server.lock().unwrap().calls[before..], ["Quota/changes"]);
+    {
+        let mut s = server.lock().unwrap();
+        s.quota_used = Some(4096);
+        s.quota_state += 1;
+    }
+    assert_eq!(b.quota(&a)?.unwrap().used_kib, 4);
+    assert_eq!(b.with_jmap(&a, |s| s.query_quotas(&["Mail"]))?, ["q"]);
+    Ok(())
+}
+
+/// The Blob extension (RFC 9404): a range read is checked against the
+/// digest the server gives; Blob/lookup says what uses a blob; data larger
+/// than Blob/upload takes goes by the ordinary upload.
+#[test]
+fn jmap_blob_digests_lookup_and_limits() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["i".into()],
+        keywords: vec![],
+        subject: "Over JMAP".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.with_jmap(&a, |s| {
+        let head = s.header_block("M1")?.unwrap();
+        assert!(head.starts_with(b"From: Sophie Chen"));
+        server.lock().unwrap().bad_digest = true;
+        let e = s.header_block("M1").unwrap_err();
+        assert!(e.to_string().contains("digest"), "{e}");
+        let used = s.lookup_blobs(&["B0".to_owned()], &["Email"])?;
+        assert_eq!(used["B0"]["Email"], ["M1"]);
+        // Over maxSizeBlobSet (1000 bytes here): uploaded, not inline.
+        let before = server.lock().unwrap().calls.len();
+        s.upload_inline(&[b'x'; 2000], "application/octet-stream")?;
+        assert!(!server.lock().unwrap().calls[before..].contains(&"Blob/upload".to_owned()));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Calendars and contacts over JMAP beyond events and cards: the lists'
+/// own /changes, /queryChanges, copies from a shared account,
+/// CalendarEvent/parse, account limits, sharing, and the directory of
+/// people (RFC 9670).
+#[test]
+fn jmap_calendars_and_contacts_changes_copy_parse_and_sharing() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    use crate::sync::jscal;
+    b.with_jmap(&a, |s| {
+        let c = jscal::collection_changes(s, "Calendar", "c1")?.unwrap();
+        assert_eq!((c.changed, c.destroyed, c.state), (vec!["c9".to_owned()], vec!["c1".to_owned()], "c2".to_owned()));
+        assert!(jscal::collection_changes(s, "AddressBook", "b1")?.is_some());
+        assert!(jscal::collection_changes(s, "ShareNotification", "n1")?.is_some());
+        // A server without ParticipantIdentity/changes: read again.
+        assert!(jscal::collection_changes(s, "ParticipantIdentity", "x")?.is_none());
+        let q = jscal::query_changes(s, "CalendarEvent", json!({}), "q1")?.unwrap();
+        assert_eq!((q.removed, q.added), (vec!["E0".to_owned()], vec![("E9".to_owned(), 0)]));
+        let copied = jscal::copy_from(s, "ContactCard", "u2", &["K5".to_owned()], "b1")?;
+        assert_eq!(copied["K5"], "copy-K5");
+        let parsed = jscal::parse_events(s, &["ics1".to_owned()])?;
+        assert_eq!(parsed["ics1"][0].summary, "Parsed");
+        let mut with = serde_json::Map::new();
+        with.insert("P1".into(), json!({ "mayReadItems": true, "mayWriteAll": false }));
+        jscal::share_with(s, "Calendar", "c1", &with)?;
+        let people = jscal::principals(s, None)?;
+        assert_eq!((people[0].name.as_str(), people[0].email.as_str()), ("Bo Lindqvist", "bo@example.se"));
+        assert_eq!(people[0].accounts, ["u2"]);
+        let mut patch = serde_json::Map::new();
+        patch.insert("description".into(), json!("On leave in December"));
+        jscal::update_principal(s, "P1", &patch)?;
+        Ok(())
+    })?;
+    let shared = server.lock().unwrap().shared_with.clone();
+    assert_eq!(shared[0]["c1"]["shareWith"]["P1"]["mayReadItems"], true);
+    assert_eq!(shared[1]["P1"]["description"], "On leave in December");
+    let limits = jscal::collection_limits(&json!({ "maxCalendarsPerEvent": 1, "mayCreateCalendar": false }), "Calendar");
+    assert_eq!(limits, jscal::CollectionLimits { max_per_item: Some(1), may_create: false });
+    assert_eq!(jscal::collection_limits(&json!({}), "AddressBook"), jscal::CollectionLimits { max_per_item: None, may_create: true });
     Ok(())
 }

@@ -3932,6 +3932,7 @@ impl Backend {
                     require_tls: a.require_tls,
                     receipts: a.delivery_receipts.then(|| d.id.clone()),
                     hold_until,
+                    ..Default::default()
                 };
                 if let Some(at) = hold_until {
                     let ahead = (at - chrono::Utc::now().timestamp()).max(0) as u64;
