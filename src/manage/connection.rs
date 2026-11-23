@@ -115,6 +115,11 @@ impl Connection {
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
     }
+    /// What sends this session's synchronizing literals (see
+    /// `run_with_literals`), where it has the tap that carries them.
+    pub(super) fn literals(&self) -> Option<crate::sync::stream::Literals> {
+        self.tap.as_ref().map(|t| t.literals())
+    }
     /// Runs a command with literals (`Part`s, text first), returning what
     /// the server sent for it. Needs the tap, which carries the literals.
     fn with_literals(

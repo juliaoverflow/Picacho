@@ -4959,7 +4959,7 @@ fn search(c: &mut Connection, a: &Account, starred_only: bool) -> Result<Vec<u32
     }
     let ext = c.extensions()?;
     let selected = c.current().cloned().unwrap_or_default();
-    search_uids(&mut c.session, &ext, &selected, &query)
+    search_uids(&mut c.session, None, &ext, &selected, &query)
 }
 
 /// The server mailbox behind a mailbox view.

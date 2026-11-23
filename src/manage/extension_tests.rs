@@ -2049,3 +2049,56 @@ fn extension_replies_with_literals_are_read() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 9051 §4.3 (RFC 3501 §4.3): 8-bit search text is never quoted. On a
+/// server without LITERAL+ or UTF8=ACCEPT it goes as a synchronizing
+/// literal, sent once the server says to go ahead, with CHARSET UTF-8.
+#[test]
+fn eight_bit_search_text_goes_as_a_synchronizing_literal() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut searches = Vec::new();
+        let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+            return searches;
+        };
+        while let Some((tag, command, literals)) = command_with_literals(&mut p) {
+            let upper = command.to_ascii_uppercase();
+            if upper.starts_with("LOGIN") {
+            } else if upper == "CAPABILITY" {
+                p.send("* CAPABILITY IMAP4rev1\r\n");
+            } else if upper.starts_with("LIST") {
+                p.send("* LIST () \"/\" INBOX\r\n");
+            } else if upper.starts_with("SELECT") {
+                p.send("* 2 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 9] ok\r\n");
+            } else if upper.starts_with("UID SEARCH") {
+                searches.push((command.clone(), literals));
+                p.send("* SEARCH\r\n");
+            } else if upper == "LOGOUT" {
+                p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                break;
+            } else {
+                panic!("Unexpected IMAP command: {command}");
+            }
+            p.ok(&tag);
+        }
+        searches
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let found = b.search_server(&a, &Folder::Inbox.into(), "café", 10)?;
+    assert_eq!(found.total, 0);
+    b.disconnect(&a.id);
+    let searches = server.join().unwrap();
+    assert_eq!(
+        searches,
+        [(
+            "UID SEARCH CHARSET UTF-8 TEXT {}".to_owned(),
+            vec!["café".as_bytes().to_vec()]
+        )]
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
