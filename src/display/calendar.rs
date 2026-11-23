@@ -396,6 +396,7 @@ impl MailApp {
                 .when(!e.location.is_empty(), |d| {
                     d.child(row("Where", e.location.clone()))
                 })
+                .children(e.details().into_iter().map(|(label, text)| row(label, text)))
                 .when_some(organizer, |d, o| d.child(row("Organizer", o)))
                 .when(!people.is_empty(), |d| d.child(row("Guests", people)))
                 .when(invited, |d| {

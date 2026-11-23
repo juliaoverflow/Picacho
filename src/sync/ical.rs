@@ -226,9 +226,49 @@ impl Event {
         let (lat, lon): (f64, f64) = (lat.trim().parse().ok()?, lon.trim().parse().ok()?);
         ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
     }
-    /// Sets GEO (RFC 5545 §3.8.1.6), or clears it with `None`.
-    pub fn set_coordinates(&mut self, at: Option<(f64, f64)>) {
-        self.geo = at.map(|(lat, lon)| format!("{lat:.6};{lon:.6}")).unwrap_or_default();
+    /// What the invitation card shows besides time, place and people, as
+    /// (label, text) rows: ways to join (CONFERENCE), the map position
+    /// (GEO, where no place is named), CATEGORIES, CLASS when not public,
+    /// and the reminders that do more than show a note.
+    pub fn details(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        for c in &self.conferences {
+            let label = if c.label.is_empty() { c.features.join(", ").to_lowercase() } else { c.label.clone() };
+            out.push(("Join", if label.is_empty() { c.uri.clone() } else { format!("{label}: {}", c.uri) }));
+        }
+        if let Some((lat, lon)) = self.coordinates().filter(|_| self.location.is_empty()) {
+            out.push(("Where", format!("{lat:.5}, {lon:.5}")));
+        }
+        if !self.categories.is_empty() {
+            out.push(("Categories", self.categories.join(", ")));
+        }
+        match self.class.as_str() {
+            "" | "PUBLIC" => {}
+            "CONFIDENTIAL" => out.push(("Privacy", "Confidential".into())),
+            _ => out.push(("Privacy", "Private".into())),
+        }
+        let others: Vec<String> = self
+            .reminders()
+            .iter()
+            .filter(|a| a.action != "DISPLAY" && a.action != "NONE" && !a.acknowledged)
+            .map(|a| {
+                let how = match a.action.as_str() {
+                    "EMAIL" => "email",
+                    "AUDIO" => "sound",
+                    _ => "other",
+                };
+                let minutes = a.before / 60;
+                let mut text = if minutes >= 0 { format!("{how} {minutes} min before") } else { format!("{how} {} min after", -minutes) };
+                if a.repeat > 0 {
+                    text.push_str(&format!(", {} more every {} min", a.repeat, a.interval / 60));
+                }
+                text
+            })
+            .collect();
+        if !others.is_empty() {
+            out.push(("Reminders", others.join("; ")));
+        }
+        out
     }
     /// Every reminder in full: the plain ones Picacho edits (`alarms`)
     /// and the others kept as they came (an email, a sound, repeats).
@@ -2771,7 +2811,7 @@ mod tests {
         let mut e = parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:i\r\nDTSTART:20261124T090000Z\r\nCATEGORIES:A\\, B,C\r\nCATEGORIES:D\r\nIMAGE;VALUE=URI;DISPLAY=BADGE;FMTTYPE=image/png:https://x.example/i.png\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").events.remove(0);
         assert_eq!(e.categories, ["A, B", "C", "D"]);
         assert_eq!(e.images, [Image { uri: "https://x.example/i.png".into(), media_type: "image/png".into(), display: "BADGE".into(), extra: "VALUE=URI".into() }]);
-        e.set_coordinates(Some((-33.8688, 151.2093)));
+        e.geo = "-33.8688;151.2093".into();
         e.conferences.push(Conference { uri: "tel:+1-555-0100".into(), label: "Dial in; PIN 42".into(), features: vec!["PHONE".into()], extra: "VALUE=URI".into() });
         e.source.clear();
         let back = parse(&to_store(&e)).events.remove(0);
@@ -2796,6 +2836,13 @@ mod tests {
         assert_eq!(email.description, "Starts in an hour");
         let repeating = r.iter().find(|a| a.repeat > 0).unwrap();
         assert_eq!((repeating.before, repeating.repeat, repeating.interval), (300, 2, 300));
+        let details = e.details();
+        assert!(details.contains(&("Join", "Talk: https://cloud.example.at/call/x7y8z9".into())), "{details:?}");
+        assert!(details.contains(&("Categories", "Work, Finance".into())));
+        assert!(details.contains(&("Privacy", "Confidential".into())));
+        assert!(details.contains(&("Reminders", "email 60 min before".into())));
+        // A place is named, so GEO isn't shown as one.
+        assert!(!details.iter().any(|(l, _)| *l == "Where"));
         let icloud = parse(ICLOUD).events.remove(0).reminders();
         assert!(icloud.iter().any(|a| a.action == "AUDIO" && a.before == 7200));
         assert!(icloud.iter().any(|a| a.action == "NONE"));
