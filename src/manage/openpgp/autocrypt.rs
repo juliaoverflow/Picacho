@@ -91,6 +91,32 @@ impl Peer {
     }
 }
 
+impl Keyring {
+    /// Whether mail from your address `email` says prefer-encrypt=mutual.
+    pub fn prefers_mutual(&self, email: &str) -> bool {
+        let email = email.trim().to_lowercase();
+        self.prefer_mutual.iter().any(|e| *e == email)
+    }
+    /// Turns prefer-encrypt=mutual on or off for your address `email`.
+    pub fn set_prefers_mutual(&mut self, email: &str, on: bool) {
+        let email = email.trim().to_lowercase();
+        self.prefer_mutual.retain(|e| *e != email);
+        if on {
+            self.prefer_mutual.push(email);
+        }
+    }
+    /// The Autocrypt header line (with its CRLF) for mail from `from`, where
+    /// you have a key for it (Autocrypt 1.1 §2.1: in every message, signed
+    /// or not), saying prefer-encrypt=mutual where you chose it (§2.2).
+    pub fn autocrypt_header_line(&self, from: &str) -> Option<String> {
+        let public = self.own_public_bytes(from)?;
+        Some(format!(
+            "Autocrypt: {}\r\n",
+            crate::sync::keys::autocrypt_header_with(from, &public, self.prefers_mutual(from))
+        ))
+    }
+}
+
 /// What Autocrypt suggests for encrypting a message (Autocrypt 1.1 §2.3,
 /// "Recommendation structure"). Only a suggestion: it never turns
 /// Encrypt on in the composer by itself.
@@ -384,6 +410,34 @@ mod tests {
         assert_eq!(found.recommend(&both(Some(peer(true, 36 * day, &ana))), true, false), Discourage);
     }
 
+    /// Autocrypt 1.1 §2.2: your header says prefer-encrypt=mutual only
+    /// for the addresses you turned it on for, and reads back as such.
+    #[test]
+    fn own_autocrypt_header_carries_the_chosen_preference() {
+        let mut ring = Keyring::default();
+        assert_eq!(ring.autocrypt_header_line("ana@example.org"), None);
+        ring.secret.push(
+            super::super::test_key("Ana <ana@example.org>", "")
+                .to_armored_string(Default::default())
+                .unwrap(),
+        );
+        let read = |ring: &Keyring| {
+            let line = ring.autocrypt_header_line("ana@example.org").unwrap();
+            assert!(line.starts_with("Autocrypt: addr=ana@example.org;") && line.ends_with("\r\n"));
+            let raw = format!("From: ana@example.org\r\nDate: Tue, 1 Oct 2024 10:00:00 +0000\r\n{line}\r\n");
+            crate::sync::keys::autocrypt_full(raw.as_bytes()).unwrap()
+        };
+        let off = read(&ring);
+        assert!(!off.mutual);
+        assert_eq!(Some(off.key), ring.own_public_bytes("ana@example.org"));
+        ring.set_prefers_mutual("Ana@Example.org", true);
+        assert!(ring.prefers_mutual("ana@example.org"));
+        assert!(read(&ring).mutual);
+        ring.set_prefers_mutual("ana@example.org", false);
+        assert!(ring.prefer_mutual.is_empty());
+        assert!(!read(&ring).mutual);
+    }
+
     /// Autocrypt 1.1 §2.3: stale only when the header is more than 35
     /// days older than last_seen.
     #[test]
@@ -442,7 +496,7 @@ mod tests {
         let ring: Keyring = serde_json::from_str(old).unwrap();
         assert_eq!(ring.found, ["AB"]);
         assert_eq!(ring.verified, ["AB"]);
-        assert!(ring.dnssec.is_empty() && ring.autocrypt.is_empty());
+        assert!(ring.dnssec.is_empty() && ring.autocrypt.is_empty() && ring.prefer_mutual.is_empty());
         // And saved again, the empty new fields aren't written.
         assert_eq!(serde_json::to_string(&ring).unwrap(), old);
     }

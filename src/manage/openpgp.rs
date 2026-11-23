@@ -53,6 +53,11 @@ pub struct Keyring {
     /// may forget; a lookup that finds the same key takes it off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub autocrypt: Vec<String>,
+    /// Your addresses whose Autocrypt header says prefer-encrypt=mutual
+    /// (Autocrypt 1.1 §2.2, `accounts[addr].prefer_encrypt`), lowercased.
+    /// Off (nopreference) unless turned on in Settings → Encryption.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefer_mutual: Vec<String>,
 }
 
 /// One key, as Settings lists it.

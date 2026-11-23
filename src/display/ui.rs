@@ -711,6 +711,8 @@ enum Action {
     RemoveKey(String),
     /// Marks a found OpenPGP key as compared with its owner.
     VerifyKey(String),
+    /// Turns Autocrypt's prefer-encrypt=mutual on or off for this address of yours.
+    ToggleAutocryptMutual(String),
     /// Opens (or closes) the fingerprint check for this key.
     CheckKey(String),
     /// Compares the fingerprint in the field with this key's.
@@ -6463,6 +6465,7 @@ impl MailApp {
             | Action::ImportSetupMessage(_)
             | Action::RemoveKey(_)
             | Action::VerifyKey(_)
+            | Action::ToggleAutocryptMutual(_)
             | Action::CheckKey(_)
             | Action::MatchFingerprint(_)
             | Action::ExportPublicKeys
