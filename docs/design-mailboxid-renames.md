@@ -1,87 +1,135 @@
 # Design note: keeping cached mail across folder renames (MAILBOXID, RFC 8474)
 
-Status: proposal only. Nothing in it is implemented.
+Status: design only, not implemented. The supervisor decided to leave it as
+a design. It needs one owner across the store, parcels, receipts, drafts
+and offline code.
 
-## The problem
+## The problem, and what it costs today
 
 A cached IMAP message's id is `{account}:{remote}:{validity}:{uid}`
-(for example `a1:Projects/2026:42:7`). The id is the `messages` table's
-primary key and is used as a key in many places:
+(`a1:Projects/2026:42:7`). It is the `messages` table's primary key, and
+copies of it are kept elsewhere (see the inventory below).
 
-- the `messages` table itself, and the parcel and receipt scans
-  (`parcel_scan.id`, `receipt_scan.id`, `mail_id` inside their JSON);
-- offline changes (`offline_changes.data`, whole `Mail` values with ids);
-- drafts (`Draft::original`, the message a reply or forward answers);
-- snoozed mail (by Message-ID, so it isn't affected), undo entries, and
-  layouts (`{account}:{remote}:{validity}:` prefixes);
-- code that parses the id: `rsplit(':')` for UID and validity in
-  `backend.rs` (`validity_of`, the catalog) and `connection.rs`
-  (`select_for`).
+Renaming a folder (`Backend::rename_remote_folder`) calls `forget_mailbox`
+for the old name and every folder inside it. RFC 3501 §6.3.5 keeps UIDs
+and UIDVALIDITY across a rename, but the cache:
 
-Renaming a folder (`rename_remote_folder`) calls `forget_mailbox` for the
-old name and every folder inside it. That drops their cached mail, its
-downloaded sources included, and the next check downloads it again. Under
-RFC 3501 §6.3.5 a rename keeps UIDVALIDITY and UIDs, so this re-download
-isn't needed. The same applies when another client renames a folder: the
-old name's mail disappears from the cache and the new name's is fetched
+- drops every cached message of the folder and its subfolders, downloaded
+  sources included (`raw`/`source` columns);
+- re-lists them on the next check (headers: about 1 to 2 KB each), and
+  downloads their sources again in the background up to the offline window
+  (`download_batch`, 12 MB per batch). A 5,000-message, 2 GB folder costs
+  ~10 MB of headers and up to 2 GB of re-download. On Gmail that counts
+  against the 1 GB/day background budget (`GMAIL_DAILY_BUDGET`);
+- loses per-message state that is only kept here: reading choices
+  (`reading:` preferences), parcel and receipt findings, which are
+  re-scanned, and a draft's link to the message it answers.
+
+A rename done by another client looks the same: the old name's mail goes
+when its folder disappears from the listing, and the new name's is fetched
 from scratch.
 
-## What RFC 8474 offers
+## Inventory of references to a message id
 
-With OBJECTID, `MAILBOXID` (STATUS, or the `MAILBOXID` response code on
-SELECT/CREATE) names a mailbox and survives renames (§4.1). A folder that
-was renamed elsewhere can be recognized: the same MAILBOXID under a new
-name.
+Found by grepping for the id's construction (`format!("{}:{remote}:…")`,
+`format!("{account}:{remote}:{validity}:")`) and for every struct field or
+preference that holds a `Mail::id`. The list is exhaustive for the code at
+commit a30540b, as far as those greps reach. Ids are never built anywhere
+else (the constructions are in backend.rs, archive.rs, extras.rs,
+remote_search.rs and store.rs), and the stored copies are these:
 
-## Options
+| Where | Field | Kind |
+|---|---|---|
+| `messages` | `id` (primary key), `data.id` (JSON), `data.remote_folder`, `folder` (the mailbox key, `remote:` + name for custom folders) | row |
+| `parcel_scan` | `id` (= message id), `data` → `Sighting.mail_id` | row |
+| `receipt_scan` | `id` (= message id), `data` → `Sighting.mail_id` | row |
+| `offline_changes` | `data` → `QueuedChange.mails[].id` and `.remote_folder` (whole `Mail` values) | row |
+| `mailbox_state` | `remote` (part of the primary key) | row, by name |
+| `drafts` | `data` → `Draft.original` (the answered message's id); `Draft.remote: RemoteDraft { mailbox, … }` (Drafts folder only) | row |
+| preference `reading:["acct","id"]` | key (`manage::reading::message_key`) | preference |
+| preference `draft_removals:{account}` | `RemoteDraft.mailbox` (Drafts folder only) | preference |
+| preference `parcel_statuses` | `Override.ids` (tracking numbers and orders, not message ids) | not affected |
+| preference `hidden_receipts` | keys by order or Message-ID header | not affected |
+| snoozed mail | by Message-ID header and folder name (`Snoozed.folder`) | by name |
+| in memory | layouts (`{acct}:{remote}:{v}:` prefixes), the UI's message list, undo entries (`undo::Moved.before`) | rebuilt or dropped |
+| thread ids `t:{remote}:{validity}:{root}` (`extras.rs`) | `data.thread_id` | JSON, by name |
 
-1. **Re-key on rename (no MAILBOXID needed for our own renames).** After a
-   successful RENAME, in one transaction:
-   - Rewrite `messages.id`, `json data.id` and `data.remote_folder` from
-     `{account}:{old}:{v}:` to `{account}:{new}:{v}:`. The same goes for
-     the parcel and receipt scans' ids and `mail_id`, `mailbox_state.remote`,
-     and drafts' `original`.
-   - Rewrite queued offline changes, or drop the ones naming the old
-     mailbox (they'd fail anyway).
-   - Rebuild layouts (they are in memory: `forget_layout` is enough).
-
-   That covers our own renames, which is the common case.
-2. **Detect renames elsewhere (needs MAILBOXID).** Keep each folder's
-   MAILBOXID in `mailbox_state`. When a listing no longer has a name but
-   has a new one with the same MAILBOXID, apply the same re-keying as (1).
-   Without OBJECTID, renames done elsewhere still look like delete plus
-   create, as they do today.
-3. **Stable ids (`{account}:{mailboxid}:{uid}`).** Changing the id scheme
-   would mean migrating every row and every stored reference, and two
-   schemes would coexist on servers without OBJECTID. That's too risky for
-   the benefit.
+Ids are also parsed for their validity and UID (`rsplit(':')`) in
+backend.rs (`validity_of`, the catalog) and connection.rs (`select_for`).
+Those parts don't change in a rename.
 
 ## Proposal
 
-Do (1), then (2). Both use one store function
-(`Store::rename_mailbox(account, old, new)`) that re-keys in a single
-transaction, with:
+### 1. Re-key on our own RENAME
 
-- a prefix match on the primary key's range (as `cached_ids` already
-  does), so only the affected rows are visited;
-- a test that renames a folder holding downloaded mail with parcel and
-  receipt scan rows, an offline change and a draft reply, and finds them
-  all under the new name;
-- folders inside the renamed one (`folder_and_inside`) re-keyed the same
-  way.
+`Store::rename_mailbox(account, old, new) -> Result<()>`, called by
+`rename_remote_folder` for each `(old, new)` in `moved` in place of
+`forget_mailbox`, in one SQLite transaction (`BEGIN IMMEDIATE`, as the
+store's transactions already are):
 
-## Risks (why this wasn't done in this lane)
+1. `messages`: for the rows with `id` in `[{acct}:{old}:, {acct}:{old}:\u{10FFFF})`
+   (a primary-key range, as `cached_ids` uses), rewrite `id`, `data.id`,
+   `data.remote_folder` and `folder` (the mailbox key), and `data.thread_id`
+   where it is `t:{old}:…`.
+2. `parcel_scan`, `receipt_scan`: rewrite `id` by the same range, and the
+   `mail_id` of their sightings.
+3. `mailbox_state`: move the `(account, old)` row to `(account, new)`.
+4. `drafts`: rewrite `data.original` where it starts with the old prefix.
+5. `offline_changes`: rewrite each queued `Mail`'s `id` and `remote_folder`
+   (see below).
+6. preferences: rename `reading:` keys whose id has the old prefix (a range
+   on the preference key's JSON form), and `Snoozed.folder` where it names
+   `old`.
 
-- It touches store.rs's schema users across lanes: parcels and receipts
-  (scan tables), offline changes, drafts and layouts. One missed
-  reference leaves a dangling id: a draft whose "original" is gone, or a
-  parcel pointing nowhere.
-- A crash halfway is safe only if everything happens in one SQLite
-  transaction. Layouts and the UI's in-memory state also hold ids, and
-  have to be refreshed after it commits.
-- UIDVALIDITY could change across a rename on a non-conforming server.
-  Then the next SELECT's validity check forgets the mail anyway (as it
-  does today), so it isn't a correctness risk, just a wasted re-key.
+After the commit: `forget_layout` for both names, so the next view is
+built from the store, plus the UI's usual refresh after a folder change.
 
-These touch other lanes' tables, so the supervisor should decide before
-anyone builds this.
+Crash safety: everything above is one transaction. A crash before the
+commit leaves the old ids, and the server has the new name. That is today's
+situation, because the next check sees the old name gone and forgets it,
+so nothing worse than today can happen. The RENAME itself goes before the
+transaction: if the RENAME fails, nothing is re-keyed. If the transaction
+fails after a successful RENAME, fall back to `forget_mailbox` (today's
+behaviour).
+
+### 2. Offline changes queued against the old name
+
+A queued change names messages by id and `remote_folder`. Rewriting them in
+the same transaction (step 5) lets them replay against the new name with
+the same UIDs. That is correct, since UIDs survive the rename. A queued
+`MoveTo(old)` (into the renamed folder) is rewritten to `MoveTo(new)`. Not
+rewriting would make them fail and be dropped at replay (`replay_queue`
+drops refused changes), which loses the user's offline actions.
+
+### 3. Renames made elsewhere (MAILBOXID)
+
+With OBJECTID, keep each folder's MAILBOXID (STATUS `MAILBOXID`, or the
+SELECT response code) in `mailbox_state`. When a listing lacks a known
+name but has a new one with the same MAILBOXID, run `rename_mailbox` before
+the check would forget it. Without OBJECTID, the behaviour stays as today.
+
+### Rejected: ids by MAILBOXID
+
+`{account}:{mailboxid}:{uid}` would make renames free. But it means
+migrating every row and reference above, and keeping two schemes for
+servers without OBJECTID. The migration is the risk this design avoids.
+
+## Test plan
+
+- `rename_mailbox` unit test (store): a folder with two messages (one
+  downloaded), a parcel_scan and a receipt_scan row, a `reading:`
+  preference, a draft whose `original` is one of them, a queued offline
+  `Read(true)` on one and a `MoveTo(old)` on another, a `t:` thread id, and
+  a `mailbox_state` row. After the rename all of them name the new folder,
+  the source is still there (no re-download), and nothing names the old
+  prefix (checked with a `LIKE '{acct}:{old}:%'` count on every table).
+- Same with a folder inside the renamed one (`Projects/2026` →
+  `Archive/2026`, from `folder_and_inside`).
+- Mock server: rename a folder holding downloaded mail. The next check
+  sends no `BODY.PEEK[]` and no header FETCH for those UIDs (SELECT with
+  CONDSTORE only).
+- Failure path: the RENAME is refused, so nothing is re-keyed. The
+  transaction fails (simulated) after the RENAME, so the result is
+  `forget_mailbox` (today's behaviour), not a half re-key.
+- MAILBOXID (part 3): a listing where `Old` is replaced by `New` with the
+  same MAILBOXID re-keys, and one with a different MAILBOXID forgets.
