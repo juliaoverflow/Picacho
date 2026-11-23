@@ -37,6 +37,10 @@ pub(crate) enum Mechanism {
     OAuthBearer,
     XOAuth2,
     Gssapi,
+    /// GS2-KRB5 (RFC 5801): Kerberos through the GS2 family, with the TLS
+    /// channel binding in its -PLUS form.
+    Gs2Krb5Plus,
+    Gs2Krb5,
 }
 
 /// For a password, best first: SCRAM proves both sides without sending the
@@ -63,9 +67,12 @@ pub(crate) const SCRAM_ORDER: [Mechanism; 6] = [
 ];
 /// For an access token: the standard mechanism, then the older one.
 pub(crate) const TOKEN_ORDER: [Mechanism; 2] = [Mechanism::OAuthBearer, Mechanism::XOAuth2];
-/// For a Kerberos ticket: GSSAPI alone. An account set to Kerberos never
-/// falls back to a password.
-pub(crate) const KERBEROS_ORDER: [Mechanism; 1] = [Mechanism::Gssapi];
+/// For a Kerberos ticket: GS2-KRB5-PLUS where the channel binding is
+/// known (the ticket can't be relayed onto another connection), then
+/// GSSAPI, then GS2-KRB5. An account set to Kerberos never falls back to a
+/// password.
+pub(crate) const KERBEROS_ORDER: [Mechanism; 3] =
+    [Mechanism::Gs2Krb5Plus, Mechanism::Gssapi, Mechanism::Gs2Krb5];
 
 impl Mechanism {
     pub(crate) fn name(self) -> &'static str {
@@ -82,6 +89,8 @@ impl Mechanism {
             Self::OAuthBearer => "OAUTHBEARER",
             Self::XOAuth2 => "XOAUTH2",
             Self::Gssapi => "GSSAPI",
+            Self::Gs2Krb5Plus => "GS2-KRB5-PLUS",
+            Self::Gs2Krb5 => "GS2-KRB5",
         }
     }
     /// The best of `order` among the mechanisms a server offers (names in
@@ -108,7 +117,13 @@ impl Mechanism {
     }
     /// SCRAM with channel binding.
     pub(crate) fn plus(self) -> bool {
-        matches!(self, Self::ScramSha512Plus | Self::ScramSha256Plus | Self::ScramSha1Plus)
+        matches!(
+            self,
+            Self::ScramSha512Plus | Self::ScramSha256Plus | Self::ScramSha1Plus | Self::Gs2Krb5Plus
+        )
+    }
+    fn gs2(self) -> bool {
+        matches!(self, Self::Gs2Krb5 | Self::Gs2Krb5Plus)
     }
     fn scram(self) -> Option<Hash> {
         match self {
@@ -172,6 +187,8 @@ enum State {
     GssOffer(Box<dyn crate::sync::gss::Context>),
     /// GSSAPI: established; the server's security-layer offer is next.
     GssLayer(Box<dyn crate::sync::gss::Context>),
+    /// GS2-KRB5: the context is being established.
+    Gs2Context(Box<dyn crate::sync::gss::Context>),
     Done,
 }
 
@@ -278,6 +295,41 @@ impl Exchange {
                     Vec::new()
                 };
                 (answer, State::Refused(reason))
+            }
+            // RFC 5801 §4: the GS2 header, then the context's first
+            // token without its RFC 2743 §3.1 framing; the header and the
+            // TLS binding go into the context's channel bindings (§5).
+            (m, State::Start) if m.gs2() => {
+                let authzid = if self.authzid.is_empty() {
+                    String::new()
+                } else {
+                    format!("a={}", saslname(&self.authzid))
+                };
+                let header = if m.plus() {
+                    ensure!(
+                        !self.credentials.binding.is_empty(),
+                        "The connection's channel binding isn't known."
+                    );
+                    format!("p=tls-server-end-point,{authzid},")
+                } else {
+                    format!("n,{authzid},")
+                };
+                let mut bindings = header.clone().into_bytes();
+                if m.plus() {
+                    bindings.extend_from_slice(&self.credentials.binding);
+                }
+                let mut context = match self.gss.take() {
+                    Some(context) => context,
+                    None => crate::sync::gss::start_bound(&format!("{service}@{host}"), bindings)?,
+                };
+                let (token, done) = context.step(&[])?;
+                let mut message = header.into_bytes();
+                message.extend_from_slice(unframed(&token)?);
+                (message, if done { State::Done } else { State::Gs2Context(context) })
+            }
+            (m, State::Gs2Context(mut context)) if m.gs2() => {
+                let (token, done) = context.step(challenge)?;
+                (token, if done { State::Done } else { State::Gs2Context(context) })
             }
             (Mechanism::Gssapi, State::Start) => {
                 let mut context = match self.gss.take() {
@@ -416,7 +468,10 @@ impl Exchange {
     /// GSSAPI must have finished its security-layer exchange, which is
     /// what proves the server holds the service's key.
     fn unfinished_gss(&self) -> bool {
-        matches!(self.state, State::GssContext(_) | State::GssLayer(_) | State::GssOffer(_))
+        matches!(
+            self.state,
+            State::GssContext(_) | State::GssLayer(_) | State::GssOffer(_) | State::Gs2Context(_)
+        )
     }
     /// After the server accepted: for SCRAM, that it also proved itself.
     /// Servers may send their signature with the success reply instead of
@@ -503,6 +558,27 @@ fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A GSS-API initial context token without its framing (RFC 2743 §3.1:
+/// 0x60, a DER length, then the mechanism's OID, then the inner token),
+/// as GS2 sends it (RFC 5801 §4). Kerberos' must name Kerberos 5's OID.
+fn unframed(token: &[u8]) -> Result<&[u8]> {
+    const KRB5_OID: [u8; 11] = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+    let malformed = || anyhow::anyhow!("Kerberos made a malformed first token.");
+    let rest = token.strip_prefix(&[0x60]).ok_or_else(malformed)?;
+    let (&first, rest) = rest.split_first().ok_or_else(malformed)?;
+    // DER: a short length, or 0x8n and n big-endian bytes of it.
+    let (length, rest) = if first < 0x80 {
+        (first as usize, rest)
+    } else {
+        let n = (first & 0x7f) as usize;
+        ensure!((1..=4).contains(&n) && rest.len() >= n, malformed());
+        let length = rest[..n].iter().fold(0usize, |acc, b| (acc << 8) | *b as usize);
+        (length, &rest[n..])
+    };
+    ensure!(length == rest.len(), malformed());
+    rest.strip_prefix(&KRB5_OID).ok_or_else(malformed)
 }
 
 /// A name as SCRAM writes it: "=" and "," escaped.
@@ -918,6 +994,75 @@ mod tests {
         let mut x = Exchange::new(Mechanism::Gssapi, credentials(user, ""));
         x.gss = Some(Box::new(FakeGss { steps: 0, mutual }));
         x
+    }
+
+    /// RFC 5801 §4: GS2-KRB5's first message is the GS2 header and the
+    /// token without its RFC 2743 framing; the context then completes with
+    /// no security-layer exchange.
+    #[test]
+    fn gs2_krb5_follows_rfc_5801() -> Result<()> {
+        // Chosen over GSSAPI only with a channel binding to give.
+        assert_eq!(Mechanism::choose(&KERBEROS_ORDER, ["GSSAPI", "GS2-KRB5-PLUS"]), Some(Mechanism::Gssapi));
+        assert_eq!(
+            Mechanism::choose_bound(&KERBEROS_ORDER, ["GSSAPI", "GS2-KRB5-PLUS"], true),
+            Some(Mechanism::Gs2Krb5Plus)
+        );
+        assert_eq!(Mechanism::choose(&KERBEROS_ORDER, ["gs2-krb5"]), Some(Mechanism::Gs2Krb5));
+        // Framing: 0x60, length, Kerberos 5's OID, inner token.
+        let inner = b"\x01\x00ap-req";
+        let mut framed = vec![0x60, (11 + inner.len()) as u8];
+        framed.extend([0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02]);
+        framed.extend(inner);
+        assert_eq!(unframed(&framed)?, inner);
+        let mut long = vec![0x60, 0x81, (11 + inner.len()) as u8];
+        long.extend(&framed[2..]);
+        assert_eq!(unframed(&long)?, inner);
+        assert!(unframed(b"ap-req").is_err());
+        assert!(unframed(&framed[..framed.len() - 1]).is_err());
+        let mut other_mech = framed.clone();
+        other_mech[12] = 0x03;
+        assert!(unframed(&other_mech).is_err());
+        /// A context whose first token is `framed` and which completes on
+        /// the server's reply.
+        struct Framed(Vec<u8>, bool);
+        impl crate::sync::gss::Context for Framed {
+            fn step(&mut self, input: &[u8]) -> Result<(Vec<u8>, bool)> {
+                if input.is_empty() {
+                    return Ok((self.0.clone(), false));
+                }
+                assert_eq!(input, b"ap-rep");
+                ensure!(self.1, "no mutual authentication");
+                Ok((Vec::new(), true))
+            }
+            fn unwrap(&mut self, _: &[u8]) -> Result<Vec<u8>> {
+                bail!("GS2 has no security layer")
+            }
+            fn wrap(&mut self, _: &[u8]) -> Result<Vec<u8>> {
+                bail!("GS2 has no security layer")
+            }
+        }
+        let mut x = Exchange::new(Mechanism::Gs2Krb5, credentials("ana", ""));
+        x.gss = Some(Box::new(Framed(framed.clone(), true)));
+        assert_eq!(x.initial().unwrap(), [b"n,,".as_slice(), inner].concat());
+        assert!(x.unfinished_gss());
+        assert!(x.step(b"ap-rep")?.is_empty());
+        x.finish(None)?;
+        // With a binding and an authorization identity: their header.
+        let mut c = credentials("ana", "");
+        c.binding = vec![9; 32];
+        let mut x = Exchange::new(Mechanism::Gs2Krb5Plus, c).acting_as("shared");
+        x.gss = Some(Box::new(Framed(framed.clone(), true)));
+        assert_eq!(x.initial().unwrap(), [b"p=tls-server-end-point,a=shared,".as_slice(), inner].concat());
+        // A server that can't prove itself, or accepts too early, fails.
+        let mut x = Exchange::new(Mechanism::Gs2Krb5, credentials("ana", ""));
+        x.gss = Some(Box::new(Framed(framed.clone(), false)));
+        x.initial();
+        assert!(x.step(b"ap-rep").is_err());
+        let mut x = Exchange::new(Mechanism::Gs2Krb5, credentials("ana", ""));
+        x.gss = Some(Box::new(Framed(framed, true)));
+        x.initial();
+        assert!(x.finish(None).is_err());
+        Ok(())
     }
 
     #[test]
