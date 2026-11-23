@@ -347,6 +347,10 @@ pub struct Session {
     /// Other accounts with mail that this sign-in reaches (shared with
     /// it): (id, name). The one used is `account_id`.
     other_accounts: Vec<(String, String)>,
+    /// The accounts the sign-in may only read (RFC 8620 §2: `isReadOnly`),
+    /// whose /set, /copy, /import and the like are refused here rather
+    /// than sent.
+    read_only: std::collections::HashSet<String>,
     mailboxes: Mutex<Vec<Mailbox>>,
     /// The capabilities the server and the mail account have (session and
     /// account capability URIs), for the extensions used when there.
@@ -643,8 +647,22 @@ impl Session {
             })
             .map(|(id, a)| {
                 let name = a["name"].as_str().unwrap_or(id).to_owned();
+                // RFC 8620 §2: `isPersonal` false is another's account
+                // shared with the sign-in; read-only ones say so too.
+                let name = match (a["isPersonal"].as_bool(), a["isReadOnly"].as_bool()) {
+                    (_, Some(true)) => format!("{name} (shared, read-only)"),
+                    (Some(false), _) => format!("{name} (shared)"),
+                    _ => name,
+                };
                 (id.clone(), name)
             })
+            .collect();
+        let read_only = v["accounts"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, a)| a["isReadOnly"].as_bool() == Some(true))
+            .map(|(id, _)| id.clone())
             .collect();
         let submission_caps = &account[SUBMISSION];
         let submission_extensions = submission_caps["submissionExtensions"]
@@ -710,6 +728,7 @@ impl Session {
                 .unwrap_or_default()
                 .to_owned(),
             other_accounts,
+            read_only,
             username: v["username"].as_str().unwrap_or_default().to_owned(),
             sieve: caps.get(SIEVE).map(|_| {
                 let ext = &account[SIEVE]["sieveExtensions"];
@@ -824,6 +843,14 @@ impl Session {
                 out.extend(self.call(chunk)?);
             }
             return Ok(out);
+        }
+        // RFC 8620 §2: an account that is `isReadOnly` refuses every change;
+        // asked here, so the user hears why rather than "forbidden".
+        if let Some((name, _)) = calls.iter().find(|(name, args)| {
+            writes(name)
+                && args["accountId"].as_str().is_some_and(|a| self.read_only.contains(a))
+        }) {
+            bail!(ReadOnly { method: (*name).to_owned() });
         }
         let mut using = vec![CORE, MAIL];
         if calls
@@ -2926,6 +2953,25 @@ fn answers(calls: &[(&str, Value)], responses: &[Value]) -> Vec<Answer> {
     out
 }
 
+/// Whether a method changes an account (RFC 8620 §5.3–5.5 and the methods
+/// built on them): what a read-only account refuses.
+fn writes(method: &str) -> bool {
+    let verb = method.rsplit('/').next().unwrap_or_default();
+    matches!(verb, "set" | "copy" | "import" | "upload" | "send")
+}
+/// A change asked of an account the sign-in may only read (RFC 8620 §2:
+/// `isReadOnly`).
+#[derive(Debug)]
+pub struct ReadOnly {
+    pub method: String,
+}
+impl std::fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "This account is shared with you read-only, so it can't be changed ({}).", self.method)
+    }
+}
+impl std::error::Error for ReadOnly {}
+
 /// RFC 8620 §5.2: the server can't say what changed since a state (it is
 /// too old, or the server keeps no such history). Everything is read
 /// again rather than reported as a failure.
@@ -3175,6 +3221,16 @@ mod tests {
         assert!(e.to_string().contains("https"), "{e}");
         let e = session_redirect_allowed(&u(from), &u("https://evil.example/s")).unwrap_err();
         assert!(e.to_string().contains("evil.example"), "{e}");
+    }
+
+    #[test]
+    fn writing_methods_are_known() {
+        for m in ["Email/set", "Email/copy", "Email/import", "Blob/upload", "MDN/send", "Mailbox/set"] {
+            assert!(writes(m), "{m}");
+        }
+        for m in ["Email/get", "Email/query", "Email/changes", "Blob/get", "Email/parse"] {
+            assert!(!writes(m), "{m}");
+        }
     }
 
     #[test]

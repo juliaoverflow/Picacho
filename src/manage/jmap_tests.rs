@@ -119,6 +119,7 @@ impl Server {
             "accounts": {
                 "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
                 "u2": { "name": "Team", "isPersonal": false, "accountCapabilities": account },
+                "u3": { "name": "Archive", "isPersonal": false, "isReadOnly": true, "accountCapabilities": account },
             },
             "primaryAccounts": {
                 "urn:ietf:params:jmap:mail": "u1",
@@ -780,7 +781,7 @@ impl Server {
             for call in request["methodCalls"].as_array().unwrap() {
                 let (name, args, id) = (call[0].as_str().unwrap(), &call[1], &call[2]);
                 assert!(
-                    args["accountId"] == "u1" || (self.modern && args["accountId"] == "u2"),
+                    args["accountId"] == "u1" || (self.modern && (args["accountId"] == "u2" || args["accountId"] == "u3")),
                     "{name} names the account"
                 );
                 for (n, v) in self.method(name, args, &earlier) {
@@ -1440,13 +1441,28 @@ fn jmap_shared_accounts_are_added_and_sign_in_as_their_owner() -> Result<()> {
     a.provider = Provider::Jmap;
     a.incoming_port = port;
     b.store.save_account(&a)?;
-    let found = b.jmap_shared(&a)?;
-    assert_eq!(found, vec![("u2".to_owned(), "Team".to_owned())]);
+    let mut found = b.jmap_shared(&a)?;
+    found.sort();
+    // RFC 8620 §2: isPersonal and isReadOnly show in the names.
+    assert_eq!(
+        found,
+        vec![
+            ("u2".to_owned(), "Team (shared)".to_owned()),
+            ("u3".to_owned(), "Archive (shared, read-only)".to_owned()),
+        ]
+    );
     let team = b.add_jmap_shared(&a, "u2", "Team")?;
     assert_eq!(team.jmap_account, "u2");
     assert_eq!(team.credentials_of, a.id);
     assert_eq!(team.label(), "Team");
-    assert!(b.jmap_shared(&a)?.is_empty(), "already added");
+    assert_eq!(b.jmap_shared(&a)?.len(), 1, "Team already added");
+    // A read-only account's changes are refused before they're sent.
+    let archive = b.add_jmap_shared(&a, "u3", "Archive")?;
+    let error = b
+        .with_jmap(&archive, |s| s.destroy(&["M1".to_owned()]))
+        .unwrap_err();
+    assert!(error.downcast_ref::<crate::sync::jmap::ReadOnly>().is_some(), "{error:#}");
+    b.remove_account(&archive.id)?;
     b.sync(&team, Folder::Inbox, 50)?;
     let error = format!("{:#}", b.remove_account(&a.id).unwrap_err());
     assert!(error.contains("Team"), "{error}");
