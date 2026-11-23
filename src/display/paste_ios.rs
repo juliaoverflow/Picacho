@@ -67,7 +67,9 @@ pub(super) fn clipboard_html() -> Option<String> {
                 ("com.apple.flat-rtfd", NSRTFDTextDocumentType),
             ] {
                 let Some(d) = data(board, kind) else { continue };
-                let Some(text) = attributed_string(d, document) else { continue };
+                let Some(text) = attributed_string(d, document) else {
+                    continue;
+                };
                 // UIKit's own HTML of it first: headings, quotes, lists and
                 // tables kept, which styled runs alone lose.
                 if let Some(html) = attributed_html(&text) {

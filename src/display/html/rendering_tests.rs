@@ -738,3 +738,160 @@ fn remote_resources_load_side_by_side_and_say_what_they_accept() {
     );
     assert!(request.contains("accept: image/webp"), "{request}");
 }
+
+/// Text zoom: the worker takes and gives the view's pixels and works in the
+/// document's, so painting, link clicks, selection, focus, scrollable boxes
+/// and the email's height all move together, by the zoom applied once.
+/// A zoom applied twice or not at all puts each probe on another element.
+#[test]
+fn text_zoom_maps_paint_hits_selection_and_extents_through_one_factor() {
+    // In CSS pixels: a 100px red block with three words, a 40px green link
+    // below it, then a 100px box that scrolls 200px.
+    let html = "<body style='margin:0'>\
+        <div id='red' style='height:100px;background:#ff0000'>\
+        <span id='words' style='display:inline-block;font:20px/30px monospace'>alpha beta gamma</span></div>\
+        <a id='link' href='https://example.com/zoomed' style='display:block;height:40px;background:#00ff00'>Link</a>\
+        <div id='scroll' style='height:100px;overflow:auto'><div style='height:300px'></div></div>";
+    for zoom in [1.5f32, 2.] {
+        // The document alone: laid out narrower by the zoom, then scaled up.
+        let mut email = EmailDocument::new(html, true);
+        email.set_text_zoom(zoom);
+        let css_height = email.layout(600);
+        assert_eq!(css_height, 240., "{zoom}");
+        assert_eq!(email.zoom(), zoom, "shown at the text zoom");
+        assert_eq!(bx(&email, "red").2, 600. / zoom, "laid out 600 / zoom wide");
+        let char_width = bx(&email, "words").2 / 16.;
+        assert!(char_width > 5., "the words are laid out: {char_width}");
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let commands = worker::spawn(html.into(), Default::default(), true, Tone::Light, 1, tx);
+        commands.send(Command::TextZoom(zoom)).unwrap();
+        commands
+            .send(Command::Layout {
+                width: 600,
+                height: 800,
+                scale: 2.,
+            })
+            .unwrap();
+        // The email's height and its scrollable box, in the view's pixels.
+        let (width, height, scrollers) = wait_for(&mut rx, |o| match o {
+            Output::State {
+                width,
+                height,
+                scrollers,
+                ..
+            } => Some((width, height, scrollers)),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(width, 600, "{zoom}");
+        assert_eq!(
+            height,
+            240. * zoom,
+            "{zoom}: the reader scrolls the zoomed height"
+        );
+        assert_eq!(scrollers.len(), 1, "{zoom}");
+        let s = &scrollers[0];
+        assert_eq!(
+            (s.x, s.y, s.width, s.height),
+            (0., 140. * zoom, 600., 100. * zoom),
+            "{zoom}: the scrollable box where it is painted"
+        );
+
+        // Painting: at window scale 2, the red-to-green edge at 100 CSS
+        // pixels is at 100 * zoom view pixels, 200 * zoom device pixels.
+        commands
+            .send(Command::Paint {
+                band: 0,
+                width: 600,
+                scale: 2.,
+            })
+            .unwrap();
+        let ((pw, _), pixels) = wait_for(&mut rx, |o| match o {
+            Output::Tile { size, pixels, .. } => Some((size, pixels)),
+            _ => None,
+        })
+        .unwrap();
+        let bgr = |x: f32, y: f32| {
+            let at = (y.round() as usize * pw as usize + x.round() as usize) * 4;
+            [pixels[at], pixels[at + 1], pixels[at + 2]]
+        };
+        let edge = 2. * 100. * zoom;
+        assert_eq!(
+            bgr(1100., edge - 3.),
+            [0, 0, 255],
+            "{zoom}: red above the edge (BGRA)"
+        );
+        assert_eq!(bgr(1100., edge + 3.), [0, 255, 0], "{zoom}: green below it");
+
+        // A click 20 CSS pixels into the link, in view pixels, opens it.
+        let (x, y) = (300., (100. + 20.) * zoom);
+        for event in [
+            UiEvent::PointerMove(mouse(x, y, false)),
+            UiEvent::PointerDown(mouse(x, y, true)),
+            UiEvent::PointerUp(mouse(x, y, false)),
+        ] {
+            commands.send(Command::Pointer(event)).unwrap();
+        }
+        let opened = wait_for(&mut rx, |o| match o {
+            Output::Open(url) => Some(url),
+            _ => None,
+        });
+        assert_eq!(
+            opened.as_deref(),
+            Some("https://example.com/zoomed"),
+            "{zoom}"
+        );
+
+        // A long press on "beta" (characters 6 to 9) selects it.
+        commands
+            .send(Command::SelectWord {
+                x: 7.5 * char_width * zoom,
+                y: 15. * zoom,
+            })
+            .unwrap();
+        let selected = wait_for(&mut rx, |o| match o {
+            Output::State {
+                selection: Some(s), ..
+            } => Some(s),
+            _ => None,
+        });
+        assert_eq!(selected.as_deref(), Some("beta"), "{zoom}");
+
+        // Tab to the link: it is brought into view where it is painted.
+        commands
+            .send(Command::Key(BlitzKeyEvent {
+                key: keyboard_types::Key::Named(keyboard_types::NamedKey::Tab),
+                code: keyboard_types::Code::Tab,
+                modifiers: keyboard_types::Modifiers::empty(),
+                location: keyboard_types::Location::Standard,
+                is_auto_repeating: false,
+                is_composing: false,
+                state: KeyState::Pressed,
+                text: None,
+            }))
+            .unwrap();
+        let reveal = wait_for(&mut rx, |o| match o {
+            Output::Reveal { top, bottom, .. } => Some((top, bottom)),
+            _ => None,
+        });
+        assert_eq!(reveal, Some((100. * zoom, 140. * zoom)), "{zoom}");
+
+        // The wheel over the box scrolls it by view pixels: 190 of its 200
+        // CSS pixels leave it short of its end, and 10 more reach it.
+        let (x, y) = (300., 190. * zoom);
+        commands
+            .send(Command::Pointer(UiEvent::PointerMove(mouse(x, y, false))))
+            .unwrap();
+        let down_after = |rx: &mut _, dy: f32| {
+            commands.send(Command::Wheel { x, y, dx: 0., dy }).unwrap();
+            wait_for(rx, |o| match o {
+                Output::State { scrollers, .. } => scrollers.first().map(|s| (s.up, s.down)),
+                _ => None,
+            })
+            .unwrap()
+        };
+        assert_eq!(down_after(&mut rx, -190. * zoom), (true, true), "{zoom}");
+        assert_eq!(down_after(&mut rx, -10. * zoom), (true, false), "{zoom}");
+    }
+}
