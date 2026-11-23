@@ -96,6 +96,9 @@ selection, and lifting it opens that menu. A `#` link, and Tab reaching an
 element out of view, scroll the reader to it (`HtmlReveal`); a wheel over one
 of the email's own scrollable boxes scrolls that box while it can. Scripts,
 form controls and embedded frames are disabled (a form's other content shows).
+Interactive email keeps working without its controls showing: a click on a
+`<label>` checks its hidden checkbox or radio button, and `:checked` rules
+then show the chosen tab, carousel slide or opened section.
 
 The document is laid out in CSS pixels at the reader's width, with the
 window's height and scale for `vh` units and media queries (resolution

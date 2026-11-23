@@ -895,3 +895,91 @@ fn text_zoom_maps_paint_hits_selection_and_extents_through_one_factor() {
         assert_eq!(down_after(&mut rx, -10. * zoom), (true, false), "{zoom}");
     }
 }
+
+/// Interactive ("kinetic") email: hidden checkboxes and radio buttons toggled
+/// by their labels, with `:checked` rules showing what was chosen: tabs,
+/// carousels, accordions and reveals. The inputs themselves stay hidden
+/// (`READER_CSS`), but Blitz keeps their state, follows a label to its input
+/// (HTML §4.10.4) and matches `:checked` (Selectors 4 §14.3.1).
+#[test]
+fn labels_toggle_hidden_inputs_and_checked_styles_follow() {
+    let html = "<style>\
+        .panel { display: none; height: 40px }\
+        #a:checked ~ #pa, #b:checked ~ #pb { display: block }\
+        #pa { background: #ff0000 } #pb { background: #0000ff }\
+        #more + #extra { height: 0; overflow: hidden }\
+        #more:checked + #extra { height: 50px; background: #00ff00 }\
+        </style><body style='margin:0'>\
+        <input type='radio' name='tabs' id='a' checked><input type='radio' name='tabs' id='b'>\
+        <label for='a' style='display:block;height:30px'>A</label>\
+        <label for='b' style='display:block;height:30px'>B</label>\
+        <div class='panel' id='pa'></div><div class='panel' id='pb'></div>\
+        <label style='display:block'><span style='display:block;height:30px'>More</span>\
+        <input type='checkbox' id='more'><div id='extra'></div></label>";
+    let (commands, mut rx) = spawn(html, Tone::Light);
+    let height = |rx: &mut _| {
+        wait_for(rx, |o| match o {
+            Output::State { height, .. } => Some(height),
+            _ => None,
+        })
+        .unwrap()
+    };
+    // Tab A's panel shows; the extra box is closed.
+    let closed = height(&mut rx);
+    assert_eq!(closed, 130.);
+    let click = |y: f32| {
+        for event in [
+            UiEvent::PointerMove(mouse(10., y, false)),
+            UiEvent::PointerDown(mouse(10., y, true)),
+            UiEvent::PointerUp(mouse(10., y, false)),
+        ] {
+            commands.send(Command::Pointer(event)).unwrap();
+        }
+    };
+    let paint = |rx: &mut _, y: usize| {
+        commands
+            .send(Command::Paint {
+                band: 0,
+                width: 400,
+                scale: 1.,
+            })
+            .unwrap();
+        let ((pw, _), pixels) = wait_for(rx, |o| match o {
+            Output::Tile { size, pixels, .. } => Some((size, pixels)),
+            _ => None,
+        })
+        .unwrap();
+        let at = (y * pw as usize + 10) * 4;
+        [pixels[at + 2], pixels[at + 1], pixels[at]]
+    };
+    assert_eq!(paint(&mut rx, 70), [255, 0, 0], "tab A's panel");
+    // A label shows it can be clicked.
+    commands
+        .send(Command::Pointer(UiEvent::PointerMove(mouse(10., 45., false))))
+        .unwrap();
+    let cursor = wait_for(&mut rx, |o| match o {
+        Output::State { cursor, .. } => Some(cursor),
+        _ => None,
+    });
+    assert_eq!(cursor, Some(gpui::CursorStyle::PointingHand));
+    // Tab B's label: its radio is checked, A's is not, B's panel shows.
+    click(45.);
+    let mut tab_b = None;
+    for _ in 0..3 {
+        if paint(&mut rx, 70) == [0, 0, 255] {
+            tab_b = Some(());
+            break;
+        }
+    }
+    assert!(tab_b.is_some(), "tab B's panel replaces A's");
+    // The label around a checkbox opens the box after it.
+    click(115.);
+    let opened = (0..6).any(|_| {
+        wait_for(&mut rx, |o| match o {
+            Output::State { height, .. } => Some(height),
+            _ => None,
+        }) == Some(closed + 50.)
+    });
+    assert!(opened, "the checkbox's label opens the box");
+    assert_eq!(paint(&mut rx, 150), [0, 255, 0]);
+}

@@ -63,7 +63,8 @@ pub fn warm_up() {
 /// "Unsubscribe" in a narrow cell came out a letter per line.
 ///
 /// Forms stay (whole newsletters sit inside a `<form>`); only their controls
-/// are hidden. The `data-picacho-*` markers are set by `EmailDocument`:
+/// are hidden. Their labels still check them (interactive email's tabs and
+/// reveals), so a label shows the pointer a link does. The `data-picacho-*` markers are set by `EmailDocument`:
 /// a fixed box is placed like an absolute one, since the email is one long
 /// page rather than a scrolling viewport; a sticky one stays in its place;
 /// and a block holding only images has no line height of its own, as in
@@ -71,6 +72,7 @@ pub fn warm_up() {
 const READER_CSS: &str = "body { margin: 12px; font: 14px sans-serif; overflow-wrap: break-word; } \
 img { max-width: 100%; height: auto; } \
 iframe, object, embed, input, button, textarea, select { display: none !important; } \
+label { cursor: pointer; } \
 [data-picacho-fixed] { position: absolute !important; } \
 [data-picacho-sticky] { position: relative !important; } \
 [data-picacho-images] { line-height: 0 !important; }";
