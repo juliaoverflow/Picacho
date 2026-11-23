@@ -437,6 +437,11 @@ pub struct Session {
     /// The Sieve extensions of the account's filters, where it has JMAP
     /// for Sieve Scripts.
     sieve: Option<Vec<String>>,
+    /// RFC 9404 §4.1: the largest blob Blob/upload makes (`maxSizeBlobSet`,
+    /// `None` for no limit), and the digest algorithms Blob/get offers
+    /// (`supportedDigestAlgorithms`).
+    blob_max_set: Option<usize>,
+    blob_digests: Vec<String>,
     /// RFC 9661 §1.3.1: the largest script in bytes (`maxSizeScript`), the
     /// longest script name (`maxSizeScriptName`), and how many scripts the
     /// account may keep (`maxNumberScripts`); `None` where unlimited.
@@ -841,6 +846,13 @@ impl Session {
                     .filter_map(|e| e.as_str().map(str::to_owned))
                     .collect()
             }),
+            blob_max_set: account[BLOB]["maxSizeBlobSet"].as_u64().and_then(|n| usize::try_from(n).ok()),
+            blob_digests: account[BLOB]["supportedDigestAlgorithms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d.as_str().map(str::to_ascii_lowercase))
+                .collect(),
             sieve_limits: {
                 let caps = &account[SIEVE];
                 let n = |k: &str| caps[k].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
@@ -2452,7 +2464,10 @@ impl Session {
     /// upload; otherwise as `upload` does. Returns its blob id.
     pub fn upload_inline(&self, bytes: &[u8], kind: &str) -> Result<String> {
         use base64::Engine as _;
-        if !self.has(BLOB) || bytes.len() > 256 * 1024 {
+        // Small data inline, within what Blob/upload takes (RFC 9404 §4.1:
+        // `maxSizeBlobSet`, counted as the bytes, not their base64).
+        let most = self.blob_max_set.unwrap_or(usize::MAX).min(256 * 1024);
+        if !self.has(BLOB) || bytes.len() > most {
             return self.upload(bytes, kind);
         }
         let v = self.one(
@@ -2481,24 +2496,62 @@ impl Session {
         if !self.has(BLOB) {
             return Ok(None);
         }
+        // RFC 9404 §4.2: a digest of the range read, where the server
+        // offers SHA-256 (or SHA-1), to check what came.
+        let digest = ["sha-256", "sha"].into_iter().find(|d| self.blob_digests.iter().any(|x| x == d));
+        let mut properties = vec!["data:asBase64".to_owned()];
+        properties.extend(digest.map(|d| format!("digest:{d}")));
         let v = self.one(
             "Blob/get",
             json!({
                 "accountId": self.account_id,
                 "ids": [blob],
-                "properties": ["data:asBase64"],
+                "properties": properties,
                 "offset": offset,
                 "length": length,
             }),
         )?;
-        let Some(data) = v["list"][0]["data:asBase64"].as_str() else {
+        let got = &v["list"][0];
+        let Some(data) = got["data:asBase64"].as_str() else {
             return Ok(None);
         };
-        Ok(Some(
-            base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .context("The server's data isn't base64.")?,
-        ))
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("The server's data isn't base64.")?;
+        if let Some(d) = digest
+            && let Some(said) = got[format!("digest:{d}")].as_str()
+        {
+            ensure!(blob_digest(d, &bytes) == said, "The server's data doesn't match its digest; it was changed on the way.");
+        }
+        Ok(Some(bytes))
+    }
+    /// Which messages, mailboxes or threads use each blob (Blob/lookup, RFC
+    /// 9404 §4.3): by blob id, then data type (`Email`, `Mailbox`,
+    /// `Thread`), the ids.
+    // Backend-only until the UI calls it: finding what uses a blob.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn lookup_blobs(&self, blobs: &[String], types: &[&str]) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+        ensure!(self.has(BLOB), "This JMAP server can't say what uses its data.");
+        let mut out = HashMap::new();
+        for chunk in blobs.chunks(self.max_get()) {
+            let v = self.one(
+                "Blob/lookup",
+                json!({ "accountId": self.account_id, "typeNames": types, "ids": chunk }),
+            )?;
+            for b in v["list"].as_array().into_iter().flatten() {
+                let Some(id) = b["id"].as_str() else { continue };
+                let by_type = b["matchedIds"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(t, ids)| {
+                        (t.clone(), ids.as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect())
+                    })
+                    .collect();
+                out.insert(id.to_owned(), by_type);
+            }
+        }
+        Ok(out)
     }
     /// Sends a read receipt for message `id` (MDN/send, RFC 9007), from
     /// `identity`; the server marks the message `$mdnsent`.
@@ -2705,6 +2758,18 @@ impl Session {
         )?;
         Ok(v["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect())
     }
+}
+
+/// A blob digest as RFC 9404 §4.2 writes it: the base64 of the hash
+/// (`sha` is SHA-1, RFC 3230's name).
+fn blob_digest(algorithm: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let hash: Vec<u8> = match algorithm {
+        "sha" => sha1::Sha1::digest(bytes).to_vec(),
+        _ => sha2::Sha256::digest(bytes).to_vec(),
+    };
+    base64::engine::general_purpose::STANDARD.encode(hash)
 }
 
 /// Mail's storage used and allowed among `list` (RFC 9425 §4.1).
@@ -4003,6 +4068,13 @@ mod tests {
         assert_eq!(none.max_mailboxes_per_email, None);
         assert!(none.may_create_top_level_mailbox);
         assert_eq!(none.max_size_attachments_per_email, usize::MAX);
+    }
+
+    /// RFC 9404 §4.2: digests are the base64 of the hash.
+    #[test]
+    fn blob_digests_are_base64_hashes() {
+        assert_eq!(blob_digest("sha-256", b"abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_eq!(blob_digest("sha", b"abc"), "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=");
     }
 
     #[test]

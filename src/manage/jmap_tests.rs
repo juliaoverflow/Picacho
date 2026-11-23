@@ -99,6 +99,8 @@ struct Server {
     /// Quota: the bytes used (else 2048) and the Quota state.
     quota_used: Option<u64>,
     quota_state: u64,
+    /// Blob/get answers with a digest that doesn't match.
+    bad_digest: bool,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -123,6 +125,7 @@ impl Server {
             },
             "urn:ietf:params:jmap:vacationresponse": {},
             "urn:ietf:params:jmap:mdn": {},
+            "urn:ietf:params:jmap:blob": { "maxSizeBlobSet": 1000, "supportedDigestAlgorithms": ["sha", "sha-256"] },
         });
         json!({
             "capabilities": {
@@ -136,6 +139,7 @@ impl Server {
                 "urn:ietf:params:jmap:calendars": {},
                 "urn:ietf:params:jmap:contacts": {},
                 "urn:ietf:params:jmap:mdn": {},
+                "urn:ietf:params:jmap:blob": {},
             },
             "accounts": {
                 "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
@@ -746,6 +750,36 @@ impl Server {
                     out.extend(self.method("Email/set", &destroy, earlier));
                 }
                 out
+            }
+            "Blob/get" => {
+                let blob = ids_of(args).unwrap()[0].clone();
+                let data = self.blobs.get(&blob).cloned().unwrap_or_default();
+                let from = args["offset"].as_u64().unwrap_or(0) as usize;
+                let len = args["length"].as_u64().map_or(usize::MAX, |l| l as usize);
+                let part = &data[from.min(data.len())..from.saturating_add(len).min(data.len())];
+                use base64::Engine as _;
+                let mut item = json!({ "id": blob, "data:asBase64": base64::engine::general_purpose::STANDARD.encode(part) });
+                if args["properties"].as_array().unwrap().iter().any(|p| p == "digest:sha-256") {
+                    use sha2::Digest as _;
+                    let mut hash = sha2::Sha256::digest(part).to_vec();
+                    if self.bad_digest {
+                        hash[0] ^= 1;
+                    }
+                    item["digest:sha-256"] = json!(base64::engine::general_purpose::STANDARD.encode(hash));
+                }
+                vec![(name.into(), json!({ "list": [item], "notFound": [] }))]
+            }
+            "Blob/lookup" => {
+                let list: Vec<Value> = args["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| {
+                        let users: Vec<&String> = self.emails.iter().filter(|m| m.blob == b.as_str().unwrap()).map(|m| &m.id).collect();
+                        json!({ "id": b, "matchedIds": { "Email": users } })
+                    })
+                    .collect();
+                vec![(name.into(), json!({ "list": list, "notFound": [] }))]
             }
             "MDN/send" => {
                 let mut sent = serde_json::Map::new();
@@ -2703,5 +2737,45 @@ fn jmap_quota_follows_changes() -> Result<()> {
     }
     assert_eq!(b.quota(&a)?.unwrap().used_kib, 4);
     assert_eq!(b.with_jmap(&a, |s| s.query_quotas(&["Mail"]))?, ["q"]);
+    Ok(())
+}
+
+/// The Blob extension (RFC 9404): a range read is checked against the
+/// digest the server gives; Blob/lookup says what uses a blob; data larger
+/// than Blob/upload takes goes by the ordinary upload.
+#[test]
+fn jmap_blob_digests_lookup_and_limits() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["i".into()],
+        keywords: vec![],
+        subject: "Over JMAP".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.with_jmap(&a, |s| {
+        let head = s.header_block("M1")?.unwrap();
+        assert!(head.starts_with(b"From: Sophie Chen"));
+        server.lock().unwrap().bad_digest = true;
+        let e = s.header_block("M1").unwrap_err();
+        assert!(e.to_string().contains("digest"), "{e}");
+        let used = s.lookup_blobs(&["B0".to_owned()], &["Email"])?;
+        assert_eq!(used["B0"]["Email"], ["M1"]);
+        // Over maxSizeBlobSet (1000 bytes here): uploaded, not inline.
+        let before = server.lock().unwrap().calls.len();
+        s.upload_inline(&[b'x'; 2000], "application/octet-stream")?;
+        assert!(!server.lock().unwrap().calls[before..].contains(&"Blob/upload".to_owned()));
+        Ok(())
+    })?;
     Ok(())
 }
