@@ -96,6 +96,9 @@ struct Server {
     mdns: Vec<Value>,
     /// The Sieve capability's maxSizeScript, where set (else 64 KiB).
     sieve_max_size: Option<usize>,
+    /// Quota: the bytes used (else 2048) and the Quota state.
+    quota_used: Option<u64>,
+    quota_state: u64,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -937,8 +940,16 @@ impl Server {
             "Quota/get" => vec![(
                 name.into(),
                 json!({ "list": [{ "id": "q", "resourceType": "octets", "scope": "account",
-                                   "used": 2048, "hardLimit": 1048576 }] }),
+                                   "used": self.quota_used.unwrap_or(2048), "hardLimit": 1048576 }],
+                        "state": format!("qs{}", self.quota_state) }),
             )],
+            "Quota/changes" => {
+                let since: u64 = args["sinceState"].as_str().unwrap().trim_start_matches("qs").parse().unwrap();
+                let updated: Vec<&str> = if since < self.quota_state { vec!["q"] } else { vec![] };
+                vec![(name.into(), json!({ "oldState": args["sinceState"], "newState": format!("qs{}", self.quota_state),
+                    "hasMoreChanges": false, "created": [], "updated": updated, "destroyed": [] }))]
+            }
+            "Quota/query" => vec![(name.into(), json!({ "ids": ["q"], "queryState": "qq" }))],
             _ => vec![("error".into(), json!({ "type": "unknownMethod" }))],
         }
     }
@@ -2669,5 +2680,28 @@ fn jmap_sieve_query_rename_destroy_and_limits() -> Result<()> {
     })?;
     let s = server.lock().unwrap();
     assert_eq!(s.scripts.iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), ["vendor"]);
+    Ok(())
+}
+
+/// Storage is read once, then followed by Quota/changes (RFC 9425 §4.2):
+/// unchanged, nothing more is asked; changed, only that quota.
+#[test]
+fn jmap_quota_follows_changes() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    assert_eq!(b.quota(&a)?.unwrap().used_kib, 2);
+    let before = server.lock().unwrap().calls.len();
+    assert_eq!(b.quota(&a)?.unwrap().used_kib, 2);
+    assert_eq!(server.lock().unwrap().calls[before..], ["Quota/changes"]);
+    {
+        let mut s = server.lock().unwrap();
+        s.quota_used = Some(4096);
+        s.quota_state += 1;
+    }
+    assert_eq!(b.quota(&a)?.unwrap().used_kib, 4);
+    assert_eq!(b.with_jmap(&a, |s| s.query_quotas(&["Mail"]))?, ["q"]);
     Ok(())
 }

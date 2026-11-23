@@ -430,6 +430,8 @@ pub struct Session {
     principals_account: Option<String>,
     /// The Mailbox state `mailboxes` was read in, for Mailbox/changes.
     mailbox_state: Mutex<String>,
+    /// The quotas as last read, and the Quota state then (Quota/changes).
+    quotas: Mutex<(Option<String>, Vec<Value>)>,
     /// The account's name for itself (the session's `username`).
     username: String,
     /// The Sieve extensions of the account's filters, where it has JMAP
@@ -861,6 +863,7 @@ impl Session {
             calendars_account: v["primaryAccounts"][CALENDARS].as_str().map(str::to_owned),
             principals_account: v["primaryAccounts"][PRINCIPALS].as_str().map(str::to_owned),
             mailbox_state: Mutex::new(String::new()),
+            quotas: Mutex::new((None, Vec::new())),
         })
     }
 
@@ -2644,26 +2647,82 @@ impl Session {
         if !self.quota {
             return Ok(None);
         }
-        let v = self.one(
-            "Quota/get",
-            json!({ "accountId": self.account_id, "ids": null }),
-        )?;
-        Ok(v["list"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|q| q["resourceType"] == "octets")
-            .filter(|q| q["scope"] != "global")
-            // Mail's quota (RFC 9425 §4.1: `types` names what it counts),
-            // not a calendar's or contacts' alone.
-            .filter(|q| {
-                q["types"].as_array().is_none_or(|t| {
-                    t.is_empty() || t.iter().any(|v| v == "Mail" || v == "Email")
-                })
-            })
-            .find_map(|q| Some((q["used"].as_u64()?, q["hardLimit"].as_u64()?))))
+        // Once read, only what changed since (Quota/changes, RFC 9425 §4.2):
+        // nothing changed, nothing more is asked.
+        let (since, known) = self.quotas.lock().unwrap().clone();
+        let list = match since.as_deref().map(|since| self.quota_changes(since, &known)) {
+            Some(Ok(Some(list))) => list,
+            Some(Err(e)) => return Err(e),
+            _ => {
+                let v = self.one("Quota/get", json!({ "accountId": self.account_id, "ids": null }))?;
+                let list = v["list"].as_array().cloned().unwrap_or_default();
+                *self.quotas.lock().unwrap() = (v["state"].as_str().map(str::to_owned), list.clone());
+                list
+            }
+        };
+        Ok(mail_quota(&list))
     }
+    /// The quotas brought up to date from `since`, or `None` where the server
+    /// can't say.
+    fn quota_changes(&self, since: &str, known: &[Value]) -> Result<Option<Vec<Value>>> {
+        let v = match self.one(
+            "Quota/changes",
+            json!({ "accountId": self.account_id, "sinceState": since }),
+        ) {
+            Ok(v) => v,
+            Err(e) if must_resync(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if v["hasMoreChanges"] == true {
+            return Ok(None);
+        }
+        let ids = |k: &str| -> Vec<String> {
+            v[k].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect()
+        };
+        let changed: Vec<String> = ids("created").into_iter().chain(ids("updated")).collect();
+        let destroyed = ids("destroyed");
+        let mut list: Vec<Value> = known
+            .iter()
+            .filter(|q| q["id"].as_str().is_none_or(|id| !changed.iter().any(|c| c == id) && !destroyed.iter().any(|d| d == id)))
+            .cloned()
+            .collect();
+        if !changed.is_empty() {
+            let got = self.one("Quota/get", json!({ "accountId": self.account_id, "ids": changed }))?;
+            list.extend(got["list"].as_array().cloned().unwrap_or_default());
+        }
+        *self.quotas.lock().unwrap() = (v["newState"].as_str().map(str::to_owned), list.clone());
+        Ok(Some(list))
+    }
+    /// The ids of the account's quotas that count mail (Quota/query, RFC
+    /// 9425 §4.4, filtered on `types`).
+    // Backend-only until the UI calls it: listing quotas by Quota/query.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn query_quotas(&self, types: &[&str]) -> Result<Vec<String>> {
+        ensure!(self.quota, "This JMAP server doesn't report storage.");
+        let v = self.one(
+            "Quota/query",
+            json!({ "accountId": self.account_id, "filter": { "types": types } }),
+        )?;
+        Ok(v["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect())
+    }
+}
 
+/// Mail's storage used and allowed among `list` (RFC 9425 §4.1).
+fn mail_quota(list: &[Value]) -> Option<(u64, u64)> {
+    list.iter()
+        .filter(|q| q["resourceType"] == "octets")
+        .filter(|q| q["scope"] != "global")
+        // Mail's quota (RFC 9425 §4.1: `types` names what it counts), not a
+        // calendar's or contacts' alone.
+        .filter(|q| {
+            q["types"].as_array().is_none_or(|t| {
+                t.is_empty() || t.iter().any(|v| v == "Mail" || v == "Email")
+            })
+        })
+        .find_map(|q| Some((q["used"].as_u64()?, q["hardLimit"].as_u64()?)))
+}
+
+impl Session {
     /// Follows the server's pushed changes (an event source) until `stop`
     /// or the connection ends, calling `heard` whenever mail changed.
     pub fn listen(
