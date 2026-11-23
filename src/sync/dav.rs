@@ -514,6 +514,12 @@ impl Client {
         Ok(out)
     }
 
+    /// A REPORT whose answer is the body as it is, not a multistatus (RFC
+    /// 4791 §7.10 free-busy-query answers text/calendar), Depth 1.
+    pub fn report_text(&self, collection: &url::Url, query: &str) -> Result<String> {
+        self.xml("REPORT", collection, "1", query)
+    }
+
     /// What changed in a collection since `token` (RFC 6578 sync-collection),
     /// as hrefs and ETags only. An empty token lists everything.
     pub fn changes(&self, collection: &url::Url, token: &str) -> Result<Changes> {

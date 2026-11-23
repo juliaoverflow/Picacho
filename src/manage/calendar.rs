@@ -602,15 +602,21 @@ impl Backend {
                 crate::sync::jscal::free_busy(s, attendees, from, to)
             });
         }
-        caldav::free_busy(
-            &server,
-            &self.calendar_password()?,
-            self.tls_connector()?,
-            organizer,
-            attendees,
-            from,
-            to,
-        )
+        let password = self.calendar_password()?;
+        // Your own busy time from your calendars (RFC 4791 §7.10
+        // free-busy-query), which every CalDAV server answers; the
+        // scheduling outbox (RFC 6638 §5) for everyone else's.
+        let (me, others): (Vec<String>, Vec<String>) =
+            attendees.iter().cloned().partition(|a| a.eq_ignore_ascii_case(organizer));
+        let mut out = Vec::new();
+        if !me.is_empty() {
+            let busy = caldav::own_free_busy(&server, &password, self.tls_connector()?, &self.calendars(), from, to)?;
+            out.push(ical::FreeBusy { attendee: organizer.to_owned(), busy });
+        }
+        if !others.is_empty() {
+            out.extend(caldav::free_busy(&server, &password, self.tls_connector()?, organizer, &others, from, to)?);
+        }
+        Ok(out)
     }
     /// Reads the calendars and their events again.
     pub fn sync_calendar(&self) -> Result<usize> {

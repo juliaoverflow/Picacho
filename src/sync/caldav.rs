@@ -234,6 +234,43 @@ pub fn free_busy(
     Ok(out)
 }
 
+/// When the account is busy in `calendars` over `from`..`to`, by each
+/// calendar's free-busy-query REPORT (RFC 4791 §7.10): the server works
+/// out the busy time itself, repeats and all, and gives only the periods,
+/// not the events. Periods from every calendar, merged and in order.
+pub fn own_free_busy(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    calendars: &[Calendar],
+    from: i64,
+    to: i64,
+) -> Result<Vec<(i64, i64)>> {
+    ensure!(to > from, "The time asked about ends before it starts.");
+    let c = client(server, password, tls)?;
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:free-busy-query xmlns:c=\"{}\"><c:time-range start=\"{}\" end=\"{}\"/></c:free-busy-query>",
+        dav::CALDAV,
+        stamp(from),
+        stamp(to)
+    );
+    let mut busy = Vec::new();
+    for cal in calendars.iter().filter(|c| c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT")) {
+        // RFC 4791 §7.10: a 200 with a text/calendar VFREEBUSY.
+        let text = c.report_text(&url::Url::parse(&cal.href)?, &body)?;
+        busy.extend(ical::parse_free_busy(&text).into_iter().flat_map(|f| f.busy));
+    }
+    busy.sort();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in busy {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
+}
+
 /// A resource's events as kept: the series (or single event) and its
 /// changed occurrences. Resources with no event (a task) give none.
 fn stored(cal: &str, resource: dav::Resource) -> Option<Stored> {
@@ -608,6 +645,27 @@ mod tests {
         remove_from_inbox(&srv, "secret", tls(), &items[0])?;
         let seen = server.join().unwrap();
         assert_eq!(seen.iter().filter(|(m, ..)| m == "PUT").count(), 1);
+        Ok(())
+    }
+
+    /// RFC 4791 §7.10: each calendar is asked for its busy time over the
+    /// range; overlapping periods from two calendars become one.
+    #[test]
+    fn own_busy_time_comes_from_free_busy_query() -> Result<()> {
+        let (port, server) = dav::test_server(2, |method, path, body| {
+            assert_eq!(method, "REPORT");
+            assert!(body.contains("<c:free-busy-query") && body.contains("start=\"20261124T000000Z\" end=\"20261125T000000Z\""), "{body}");
+            let periods = if path == "/cal/work/" { "20261124T090000Z/20261124T100000Z" } else { "20261124T093000Z/PT1H,20261124T150000Z/20261124T160000Z" };
+            ("200 OK", format!("BEGIN:VCALENDAR\r\nBEGIN:VFREEBUSY\r\nDTSTART:20261124T000000Z\r\nDTEND:20261125T000000Z\r\nFREEBUSY:{periods}\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n"))
+        });
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let cal = |p: &str| Calendar { href: format!("http://127.0.0.1:{port}{p}"), ..Default::default() };
+        // A task list isn't asked.
+        let tasks = Calendar { components: vec!["VTODO".into()], ..cal("/cal/tasks/") };
+        let from = 1_795_478_400; // 2026-11-24T00:00Z
+        let busy = own_free_busy(&srv, "secret", native_tls::TlsConnector::new()?, &[cal("/cal/work/"), cal("/cal/home/"), tasks], from, from + 86_400)?;
+        assert_eq!(busy, [(from + 9 * 3600, from + 10 * 3600 + 1800), (from + 15 * 3600, from + 16 * 3600)]);
+        assert_eq!(server.join().unwrap().len(), 2);
         Ok(())
     }
 
