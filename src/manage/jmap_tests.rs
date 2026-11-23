@@ -71,6 +71,15 @@ struct Server {
     /// The session's maxObjectsInGet and maxObjectsInSet, where set (0:
     /// 100); calls naming more are refused with `requestTooLarge`.
     max_objects: usize,
+    /// Where /.well-known/jmap redirects (a 307), if anywhere; the session
+    /// is then at /jmap/session.
+    session_redirect: Option<String>,
+    /// Where downloads redirect, by blob id: the address a 302 names.
+    blob_redirects: HashMap<String, String>,
+    /// The Authorization header each /cdn/ request came with.
+    cdn_auth: Vec<String>,
+    /// Paths requested, in order.
+    paths: Vec<String>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -715,11 +724,26 @@ impl Server {
         }
     }
     fn respond(&mut self, method: &str, path: &str, auth: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        self.paths.push(path.to_owned());
+        // A CDN's presigned address: no sign-in wanted, nor kept.
+        if let Some(blob) = path.strip_prefix("/cdn/") {
+            self.cdn_auth.push(auth.to_owned());
+            return match self.blobs.get(blob) {
+                Some(b) => (200, b.clone()),
+                None => (404, Vec::new()),
+            };
+        }
         if auth != AUTH && auth != TOKEN {
             return (401, b"{}".to_vec());
         }
         let base = format!("https://localhost:{}", self.port);
         if method == "GET" && path == "/.well-known/jmap" {
+            if let Some(to) = &self.session_redirect {
+                // A 3xx's body is the Location it names (see `serve`).
+                return (307, to.clone().into_bytes());
+            }
+        }
+        if method == "GET" && (path == "/.well-known/jmap" || path == "/jmap/session") {
             self.session_reads += 1;
             if self.modern {
                 return (200, self.modern_session(&base).to_string().into_bytes());
@@ -789,6 +813,9 @@ impl Server {
         {
             let blob = rest.split('/').next().unwrap();
             self.downloads.push(blob.to_owned());
+            if let Some(to) = self.blob_redirects.get(blob) {
+                return (302, to.clone().into_bytes());
+            }
             return match self.blobs.get(blob) {
                 Some(b) => (200, b.clone()),
                 None => (404, Vec::new()),
@@ -899,9 +926,15 @@ fn serve(
         reader.read_exact(&mut body).unwrap();
         let (status, reply) = server.lock().unwrap().respond(&method, &path, &auth, &body);
         let stream = reader.get_mut();
+        // A redirect's reply is where it goes.
+        let (location, reply) = if (300..400).contains(&status) {
+            (format!("Location: {}\r\n", String::from_utf8_lossy(&reply)), Vec::new())
+        } else {
+            (String::new(), reply)
+        };
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} X\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             reply.len()
         );
         let _ = stream.write_all(&reply);
@@ -1923,5 +1956,69 @@ fn jmap_batches_respect_the_object_limits() -> Result<()> {
     assert_eq!(count("Blob/copy"), 3);
     assert_eq!(count("CalendarEventNotification/set"), 3);
     assert!(count("EmailSubmission/get") >= 3, "{:?}", s.calls);
+    Ok(())
+}
+
+/// RFC 8620 §2.2: the well-known address's redirect within the server is
+/// followed and remembered, so the next sign-in starts where it ended; one
+/// to another host is refused, naming it.
+#[test]
+fn jmap_session_redirects_are_followed_and_kept() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    server.lock().unwrap().session_redirect = Some(format!("https://localhost:{port}/jmap/session"));
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.with_jmap(&a, |s| s.identities().map(drop))?;
+    {
+        let mut s = server.lock().unwrap();
+        assert_eq!(s.paths[..2], ["/.well-known/jmap", "/jmap/session"]);
+        s.paths.clear();
+    }
+    // Signed in again: straight to where the redirect went.
+    b.jmap.lock().unwrap().clear();
+    b.with_jmap(&a, |s| s.identities().map(drop))?;
+    assert_eq!(server.lock().unwrap().paths[0], "/jmap/session");
+    // Another host (an IP address isn't the name entered): refused.
+    server.lock().unwrap().session_redirect = Some(format!("https://127.0.0.1:{port}/jmap/session"));
+    let (b2, mut other, path2) = backend(&cert)?;
+    let _cleanup2 = Cleanup(path2);
+    other.provider = Provider::Jmap;
+    other.incoming_port = port;
+    let error = format!("{:#}", b2.check_jmap(&other, &b2.test_secret.clone().unwrap()).unwrap_err());
+    assert!(error.contains("127.0.0.1") && error.contains("enter that as the server"), "{error}");
+    Ok(())
+}
+
+/// A download redirected to another host (a CDN's presigned address) is
+/// followed without the account's credentials.
+#[test]
+fn jmap_blob_redirects_drop_credentials_off_the_origin() -> Result<()> {
+    let mut fixture = Server::default();
+    fixture.blobs.insert("B-cdn".into(), MESSAGE.to_vec());
+    let (cert, port, server, _running) = start(fixture)?;
+    server
+        .lock()
+        .unwrap()
+        .blob_redirects
+        .insert("B-cdn".into(), format!("https://127.0.0.1:{port}/cdn/B-cdn"));
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let bytes = b.with_jmap(&a, |s| s.download("B-cdn", "m.eml", "message/rfc822", 1 << 20))?;
+    assert_eq!(bytes, MESSAGE);
+    assert_eq!(server.lock().unwrap().cdn_auth, [""], "no Authorization off the origin");
+    // Back on the origin, the credentials go again.
+    server
+        .lock()
+        .unwrap()
+        .blob_redirects
+        .insert("B-cdn".into(), format!("https://localhost:{port}/download/u1/B-1/m.eml"));
+    server.lock().unwrap().blobs.insert("B-1".into(), b"one".to_vec());
+    let bytes = b.with_jmap(&a, |s| s.download("B-cdn", "m.eml", "message/rfc822", 1 << 20))?;
+    assert_eq!(bytes, b"one");
     Ok(())
 }

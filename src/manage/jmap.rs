@@ -381,25 +381,30 @@ impl Backend {
         Ok(session)
     }
     /// Signs in with the account's password, or its access token.
+    /// RFC 8620 §2.2: the session resource's address after the redirects
+    /// of the last sign-in is kept, so later ones start there. Where it no
+    /// longer works, the entered server's well-known address is tried.
     fn open_jmap(&self, a: &Account, secret: &Secret) -> Result<Session> {
-        if a.oauth {
-            Session::open_token(
-                &a.incoming_host,
-                a.incoming_port,
-                &secret.access_token,
-                &a.jmap_account,
-                self.tls_connector()?,
-            )
-        } else {
-            Session::open(
-                &a.incoming_host,
-                a.incoming_port,
-                a.login(),
-                &secret.password,
-                &a.jmap_account,
-                self.tls_connector()?,
-            )
+        let entered = crate::sync::jmap::session_url(&a.incoming_host, a.incoming_port);
+        let key = format!("jmap_session_url:{}:{entered}", a.id);
+        let saved = self.store.preference(&key).filter(|u| !u.is_empty() && *u != entered);
+        let open = |start: &str| -> Result<Session> {
+            if a.oauth {
+                Session::open_token(start, &secret.access_token, &a.jmap_account, self.tls_connector()?)
+            } else {
+                Session::open_at(start, a.login(), &secret.password, &a.jmap_account, self.tls_connector()?)
+            }
+        };
+        let session = match saved.as_deref().map(open) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) if e.downcast_ref::<AccessFailure>().is_some() => return Err(e),
+            _ => open(&entered)?,
+        };
+        if saved.as_deref() != Some(session.resource_url()) {
+            let kept = if session.resource_url() == entered { "" } else { session.resource_url() };
+            let _ = self.store.set_preference(&key, kept);
         }
+        Ok(session)
     }
     /// The name the server's session gives the account (its address, on
     /// most servers), for a browser sign-in that didn't say.

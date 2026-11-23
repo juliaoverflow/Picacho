@@ -308,6 +308,8 @@ pub struct Session {
     download_url: String,
     upload_url: String,
     event_source_url: String,
+    /// Where the session resource was read, after any redirects.
+    resource_url: String,
     /// The last event's id from the event source, sent back when it is
     /// opened again.
     last_event_id: std::sync::Mutex<String>,
@@ -386,6 +388,37 @@ pub fn session_url(host: &str, port: u16) -> String {
     }
 }
 
+/// Whether sign-in may follow the session resource's redirect from
+/// `first` (the address entered) to `next`, taking the credentials along
+/// (RFC 8620 §2.2). Only to https, and only within the entered host's
+/// registrable domain (the Public Suffix List's, private names included,
+/// so one `github.io` site can't send Picacho to another); an IP address
+/// only to itself.
+fn session_redirect_allowed(first: &url::Url, next: &url::Url) -> Result<()> {
+    let target = next.host_str().unwrap_or("another server").to_owned();
+    ensure!(
+        next.scheme() == "https" || (cfg!(test) && next.scheme() == first.scheme()),
+        "The JMAP server sent Picacho on to {target} without https://, so it wasn't followed."
+    );
+    let same = match (first.host(), next.host()) {
+        (Some(url::Host::Domain(a)), Some(url::Host::Domain(b))) => {
+            let (a, b) = (a.trim_end_matches('.').to_ascii_lowercase(), b.trim_end_matches('.').to_ascii_lowercase());
+            a == b
+                || matches!(
+                    (psl::domain_str(&a), psl::domain_str(&b)),
+                    (Some(x), Some(y)) if x == y
+                )
+        }
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    ensure!(
+        same,
+        "The JMAP server sent Picacho on to {target}; enter that as the server instead."
+    );
+    Ok(())
+}
+
 /// A transport failure in the terms Picacho's retries understand: nothing
 /// reached (try later), or the connection broke (a read may be repeated).
 /// The most read of a JMAP session document or upload answer: a few
@@ -446,11 +479,12 @@ fn usize_of(v: &Value, default: usize) -> usize {
 }
 
 impl Session {
-    /// Signs in: reads the session resource at `host` and checks that the
-    /// account has mail. `tls` verifies the server (the system's roots).
-    pub fn open(
-        host: &str,
-        port: u16,
+    /// Signs in: reads the session resource at `start` (`session_url` of
+    /// the server, or where an earlier sign-in's redirects ended, so later
+    /// ones don't depend on them) and checks that the account has mail.
+    /// `tls` verifies the server (the system's roots).
+    pub fn open_at(
+        start: &str,
         login: &str,
         password: &str,
         account: &str,
@@ -463,12 +497,12 @@ impl Session {
         } else {
             [Auth::Basic, Auth::Bearer]
         };
-        Self::open_with(host, port, login, password, account, &order, tls)
+        Self::open_with(start, login, password, account, &order, tls)
     }
-    /// Signs in with an OAuth access token.
+    /// Signs in with an OAuth access token, from the session resource at
+    /// `start` (`session_url`, or an earlier session's `resource_url`).
     pub fn open_token(
-        host: &str,
-        port: u16,
+        start: &str,
         token: &str,
         account: &str,
         tls: native_tls::TlsConnector,
@@ -477,11 +511,10 @@ impl Session {
             !token.is_empty(),
             "Your sign-in expired. Reconnect the account."
         );
-        Self::open_with(host, port, "", token, account, &[Auth::Bearer], tls)
+        Self::open_with(start, "", token, account, &[Auth::Bearer], tls)
     }
     fn open_with(
-        host: &str,
-        port: u16,
+        start: &str,
         login: &str,
         password: &str,
         account: &str,
@@ -497,17 +530,18 @@ impl Session {
             .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
             .https_only(!cfg!(test))
             .build()?;
-        let start = session_url(host, port);
         let mut tried = Vec::new();
         for &auth in order {
             if auth == Auth::Bearer && password.chars().any(char::is_whitespace) {
                 break;
             }
-            match Self::fetch_session(&http, &start, auth, login, password) {
-                Ok(resource) => {
-                    return Self::from_resource(
+            match Self::fetch_session(&http, start, auth, login, password) {
+                Ok((resource, at)) => {
+                    let mut session = Self::from_resource(
                         http, tls, auth, login, password, account, &resource,
-                    );
+                    )?;
+                    session.resource_url = at;
+                    return Ok(session);
                 }
                 Err(e) if e.downcast_ref::<AccessFailure>().is_some() => tried.push(e),
                 Err(e) => return Err(e),
@@ -524,10 +558,13 @@ impl Session {
         auth: Auth,
         login: &str,
         password: &str,
-    ) -> Result<Value> {
+    ) -> Result<(Value, String)> {
         let mut url = url::Url::parse(start)?;
         let host = url.host_str().unwrap_or_default().to_owned();
-        for _ in 0..5 {
+        let first = url.clone();
+        // RFC 8620 §2.2: the well-known address may redirect; at most five
+        // hops are followed.
+        for _ in 0..=5 {
             let request = http.get(url.clone()).header("Accept", "application/json");
             let response = Self::authorize(request, auth, login, password)
                 .send()
@@ -540,12 +577,7 @@ impl Session {
                     .and_then(|l| l.to_str().ok())
                     .context("The JMAP server redirected without saying where.")?;
                 let next = url.join(next)?;
-                // Credentials go only to the server that was entered.
-                ensure!(
-                    next.host_str() == Some(host.as_str()),
-                    "The JMAP server sent Picacho on to {}; enter that as the server instead.",
-                    next.host_str().unwrap_or("another server")
-                );
+                session_redirect_allowed(&first, &next)?;
                 url = next;
                 continue;
             }
@@ -564,8 +596,9 @@ impl Session {
             if !status.is_success() {
                 return Err(problem(status, &body));
             }
-            return serde_json::from_str(&body)
-                .context("The JMAP server's session isn't JSON Picacho can read.");
+            let resource = serde_json::from_str(&body)
+                .context("The JMAP server's session isn't JSON Picacho can read.")?;
+            return Ok((resource, url.to_string()));
         }
         bail!("The JMAP server redirected too many times.")
     }
@@ -651,6 +684,7 @@ impl Session {
             download_url: url("downloadUrl")?,
             upload_url: url("uploadUrl")?,
             event_source_url: url("eventSourceUrl").unwrap_or_default(),
+            resource_url: String::new(),
             last_event_id: Default::default(),
             submission: caps.get(SUBMISSION).is_some()
                 && (account.get(SUBMISSION).is_some() || account.is_null()),
@@ -725,6 +759,11 @@ impl Session {
         Self::authorize(r, self.auth, &self.login, &self.password)
     }
 
+    /// Where the session resource was read, after any redirects: kept, so
+    /// later sign-ins start there (`open_at`).
+    pub fn resource_url(&self) -> &str {
+        &self.resource_url
+    }
     /// The account's name for itself: its address, on most servers.
     pub fn username(&self) -> &str {
         &self.username
@@ -1288,11 +1327,7 @@ impl Session {
             &self.download_url,
             &[("accountId", account), ("blobId", blob), ("name", name), ("type", kind)],
         );
-        let response = self
-            .signed(self.http.get(&url))
-            .timeout(DOWNLOAD_TIMEOUT)
-            .send()
-            .map_err(|e| transport(e, "download"))?;
+        let response = self.get_following(&url)?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
@@ -1319,6 +1354,34 @@ impl Session {
             .map_err(|e| anyhow::Error::new(e).context("JMAP download failed"))?;
         ensure!(bytes.len() <= limit, "Message exceeds the download limit.");
         Ok(bytes)
+    }
+    /// GETs a download, following redirects (a CDN's, or a presigned
+    /// address) over https, at most five. Credentials go only to the
+    /// download address's own origin: a redirect elsewhere is followed
+    /// without them, as such addresses carry their own authorization.
+    fn get_following(&self, start: &str) -> Result<reqwest::blocking::Response> {
+        let origin = url::Url::parse(start).context("The JMAP download address isn't an address.")?;
+        let mut url = origin.clone();
+        for _ in 0..=5 {
+            let request = self.http.get(url.clone()).timeout(DOWNLOAD_TIMEOUT);
+            let request = if url.origin() == origin.origin() { self.signed(request) } else { request };
+            let response = request.send().map_err(|e| transport(e, "download"))?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let next = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .context("The JMAP server redirected the download without saying where.")?;
+            let next = url.join(next)?;
+            ensure!(
+                next.scheme() == "https" || (cfg!(test) && url.scheme() == next.scheme()),
+                "The JMAP server redirected the download to an address that isn't https://."
+            );
+            url = next;
+        }
+        bail!("The JMAP server redirected the download too many times.")
     }
     /// Uploads a blob, returning its id.
     pub fn upload(&self, bytes: &[u8], kind: &str) -> Result<String> {
@@ -3088,6 +3151,30 @@ mod tests {
         let mut all = String::new();
         reader.read_to_string(&mut all).unwrap();
         assert_eq!(all, "data: x\n\n");
+    }
+
+    /// Sign-in follows a redirect within the entered host's registrable
+    /// domain only, over https, and an IP address only to itself.
+    #[test]
+    fn session_redirects_stay_within_the_domain() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let ok = |a: &str, b: &str| session_redirect_allowed(&u(a), &u(b)).is_ok();
+        let from = "https://fastmail.com/.well-known/jmap";
+        assert!(ok(from, "https://api.fastmail.com/jmap/session"));
+        assert!(ok("https://www.example.co.uk/.well-known/jmap", "https://jmap.example.co.uk/s"));
+        assert!(!ok(from, "https://evil.example/jmap/session"));
+        // Private suffixes count: one tenant isn't another.
+        assert!(!ok("https://x.github.io/.well-known/jmap", "https://y.github.io/s"));
+        assert!(ok("https://x.github.io/.well-known/jmap", "https://x.github.io/s"));
+        assert!(!ok("https://a.co.uk/.well-known/jmap", "https://b.co.uk/s"));
+        // IP addresses only to themselves.
+        assert!(ok("https://192.0.2.1/.well-known/jmap", "https://192.0.2.1:8443/s"));
+        assert!(!ok("https://192.0.2.1/.well-known/jmap", "https://192.0.2.2/s"));
+        // Never down to http.
+        let e = session_redirect_allowed(&u(from), &u("http://api.fastmail.com/s")).unwrap_err();
+        assert!(e.to_string().contains("https"), "{e}");
+        let e = session_redirect_allowed(&u(from), &u("https://evil.example/s")).unwrap_err();
+        assert!(e.to_string().contains("evil.example"), "{e}");
     }
 
     #[test]
