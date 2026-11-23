@@ -96,15 +96,57 @@ pub struct Metadata {
     pub revocation: Option<String>,
     /// The server's issuer identifier, for the callback's `iss` (RFC 9207).
     pub issuer: Option<String>,
+    /// How the token endpoint wants a client with a secret to say so.
+    pub client_auth: ClientAuth,
+}
+/// How a client with a secret authenticates at the token endpoint
+/// (RFC 6749 §2.3.1, RFC 8414 §2 `token_endpoint_auth_methods_supported`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientAuth {
+    /// HTTP Basic with the form-encoded id and secret: what RFC 6749
+    /// §2.3.1 requires servers to support, and RFC 8414 §2's default.
+    #[default]
+    Basic,
+    /// `client_id` and `client_secret` in the request body, for servers
+    /// that list only that (and Google, whose documentation uses it).
+    Post,
 }
 /// Reads a server's metadata document, keeping only https endpoints.
+/// Refused: a document whose `jwks_uri` isn't https (RFC 8414 §2), or
+/// one listing PKCE methods without S256 (RFC 9700 §2.1.1: "plain"
+/// protects nothing against a code seen in transit). One that lists none
+/// is used, with S256 sent anyway: many servers that check PKCE omit it.
 pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
     let https = |key: &str| -> Option<String> {
         let u = v[key].as_str()?;
         let parsed = url::Url::parse(u).ok()?;
         (parsed.scheme() == "https" || cfg!(test)).then(|| u.to_owned())
     };
+    ensure!(
+        v["jwks_uri"].is_null() || https("jwks_uri").is_some(),
+        "The server's sign-in keys (jwks_uri) aren't served over https."
+    );
+    if let Some(methods) = v["code_challenge_methods_supported"].as_array() {
+        ensure!(
+            methods.iter().any(|m| m.as_str() == Some("S256")),
+            "The server's sign-in doesn't support PKCE with S256, which Picacho requires."
+        );
+    }
+    let listed = |key: &str, value: &str| {
+        v[key]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|m| m.as_str() == Some(value)))
+    };
+    let client_auth = if v["token_endpoint_auth_methods_supported"].is_array()
+        && !listed("token_endpoint_auth_methods_supported", "client_secret_basic")
+        && listed("token_endpoint_auth_methods_supported", "client_secret_post")
+    {
+        ClientAuth::Post
+    } else {
+        ClientAuth::Basic
+    };
     Ok(Metadata {
+        client_auth,
         authorization: https("authorization_endpoint")
             .context("The server's sign-in settings have no https authorization endpoint.")?,
         token: https("token_endpoint")
@@ -272,10 +314,11 @@ pub fn sso_scopes(supported: &[String], extra: &str) -> String {
 }
 
 /// Checks that a metadata document fetched from `origin` is that server's
-/// own (RFC 8414 §3.3): its `issuer`, where it names one, is `origin`.
+/// own (RFC 8414 §3.3): its `issuer`, which §2 requires, is `origin`. A
+/// trailing `/` is allowed, as servers write their origin both ways.
 fn issued_by(v: &serde_json::Value, origin: &str) -> Result<()> {
     match v["issuer"].as_str() {
-        None => Ok(()),
+        None => Err(anyhow::anyhow!("its sign-in settings name no issuer")),
         Some(issuer) if issuer.trim_end_matches('/').eq_ignore_ascii_case(origin) => Ok(()),
         Some(issuer) => Err(anyhow::anyhow!(
             "its sign-in settings are for {issuer}, not {origin}"
@@ -897,6 +940,8 @@ pub struct Grant {
     /// The issuer the ID token must name: the server's own (from its
     /// metadata), or Google's or Microsoft's.
     issuer: Option<String>,
+    /// How the server's token endpoint takes a client secret.
+    client_auth: ClientAuth,
 }
 impl Grant {
     fn issuer(&self, provider: Provider, own_endpoints: bool) -> Issuer<'_> {
@@ -956,6 +1001,7 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         client_id: account.client_id.clone(),
         token: String::new(),
         issuer: None,
+        client_auth: ClientAuth::Post,
     })
 }
 
@@ -1004,6 +1050,7 @@ fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         client_id,
         token: metadata.token,
         issuer: metadata.issuer,
+        client_auth: metadata.client_auth,
     })
 }
 
@@ -1049,6 +1096,7 @@ fn authorize_sso(
         client_id,
         token: metadata.token,
         issuer: metadata.issuer,
+        client_auth: metadata.client_auth,
     })
 }
 
@@ -1069,17 +1117,19 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     } else {
         account.client_id.as_str()
     };
-    let mut fields = vec![
-        ("client_id", client_id),
-        ("code", &grant.code),
+    let fields = [
+        ("code", grant.code.as_str()),
         ("redirect_uri", &grant.redirect),
         ("grant_type", "authorization_code"),
         ("code_verifier", &grant.verifier),
     ];
-    if !account.client_secret.is_empty() {
-        fields.push(("client_secret", &account.client_secret));
-    }
-    let (mut secret, value) = exchange(token, &fields)?;
+    let client = TokenClient {
+        id: client_id,
+        secret: &account.client_secret,
+        // Google's documentation sends the secret in the body.
+        auth: if jmap { grant.client_auth } else { ClientAuth::Post },
+    };
+    let (mut secret, value) = exchange(token, &fields, &client)?;
     secret.client_secret = account.client_secret.clone();
     let (who, _) = checked_identity(
         value["id_token"].as_str().unwrap_or_default(),
@@ -1255,12 +1305,16 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
     let (secret, value) = exchange(
         request.endpoints.token.as_str(),
         &[
-            ("client_id", client_id.as_str()),
             ("code", code),
             ("redirect_uri", &request.browser.redirect),
             ("grant_type", "authorization_code"),
             ("code_verifier", &request.browser.verifier),
         ],
+        &TokenClient {
+            id: &client_id,
+            secret: "",
+            auth: ClientAuth::Basic,
+        },
     )?;
     let (mut who, subject) = checked_identity(
         value["id_token"].as_str().unwrap_or_default(),
@@ -1349,8 +1403,46 @@ pub(crate) fn pinal_driven(
     pinal_redeem(&request, &code?)
 }
 
-fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_json::Value)> {
-    let response = http()?.post(endpoint).form(fields).send()?;
+/// Who asks the token endpoint: the client's id, its secret (empty for
+/// a public client) and how a secret is given.
+struct TokenClient<'a> {
+    id: &'a str,
+    secret: &'a str,
+    auth: ClientAuth,
+}
+/// A token request: `fields` and the client, which a public client names
+/// in the body (RFC 6749 §3.2.1) and a confidential one authenticates as
+/// its server asks (§2.3.1): with HTTP Basic, the id and secret each
+/// form-encoded first, or both in the body.
+fn token_request(
+    http: &reqwest::blocking::Client,
+    endpoint: &str,
+    fields: &[(&str, &str)],
+    client: &TokenClient<'_>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut fields = fields.to_vec();
+    let request = http.post(endpoint);
+    let request = if client.secret.is_empty() {
+        if !client.id.is_empty() {
+            fields.push(("client_id", client.id));
+        }
+        request
+    } else if client.auth == ClientAuth::Basic {
+        let encode = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+        request.basic_auth(encode(client.id), Some(encode(client.secret)))
+    } else {
+        fields.push(("client_id", client.id));
+        fields.push(("client_secret", client.secret));
+        request
+    };
+    request.form(&fields)
+}
+fn exchange(
+    endpoint: &str,
+    fields: &[(&str, &str)],
+    client: &TokenClient<'_>,
+) -> Result<(Secret, serde_json::Value)> {
+    let response = token_request(&http()?, endpoint, fields, client).send()?;
     let status = response.status();
     let value: serde_json::Value = bounded_json(response)?;
     // Do not include the whole provider response: it can contain credentials
@@ -1398,33 +1490,34 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
         );
     }
     let found_token;
-    let (token, scope) = if account.service == Service::Pinal {
+    let (token, scope, auth) = if account.service == Service::Pinal {
         found_token = pinal_endpoints(&http()?)?.token.to_string();
-        (found_token.as_str(), "")
+        (found_token.as_str(), "", ClientAuth::Basic)
     } else if account.provider == Provider::Jmap {
-        found_token = jmap_metadata(&account.incoming_host, account.incoming_port)?
-            .token
-            .to_string();
-        (found_token.as_str(), "")
+        let metadata = jmap_metadata(&account.incoming_host, account.incoming_port)?;
+        found_token = metadata.token;
+        (found_token.as_str(), "", metadata.client_auth)
     } else if let Some(sso) = &account.sso {
-        found_token = sso_metadata(&sso.issuer)?.token;
-        (found_token.as_str(), "")
+        let metadata = sso_metadata(&sso.issuer)?;
+        found_token = metadata.token;
+        (found_token.as_str(), "", metadata.client_auth)
     } else {
         let (_, token, scope) = endpoints(account.provider);
-        (token, scope)
+        (token, scope, ClientAuth::Post)
     };
     let mut fields = vec![
-        ("client_id", account.client_id.as_str()),
-        ("refresh_token", &secret.refresh_token),
+        ("refresh_token", secret.refresh_token.as_str()),
         ("grant_type", "refresh_token"),
     ];
     if account.provider == Provider::Outlook {
         fields.push(("scope", scope));
     }
-    if !secret.client_secret.is_empty() {
-        fields.push(("client_secret", &secret.client_secret));
-    }
-    let (next, _) = exchange(token, &fields)?;
+    let client = TokenClient {
+        id: &account.client_id,
+        secret: &secret.client_secret,
+        auth,
+    };
+    let (next, _) = exchange(token, &fields, &client)?;
     secret.access_token = next.access_token;
     secret.expires_at = next.expires_at;
     if !next.refresh_token.is_empty() {
@@ -1441,7 +1534,8 @@ mod tests {
         let origin = "https://api.fastmail.com";
         let own = serde_json::json!({"issuer": "https://api.fastmail.com/"});
         assert!(issued_by(&own, origin).is_ok());
-        assert!(issued_by(&serde_json::json!({}), origin).is_ok());
+        // RFC 8414 §3.3: an issuer is required, and must be the server's.
+        assert!(issued_by(&serde_json::json!({}), origin).is_err());
         let other = serde_json::json!({"issuer": "https://login.example.net"});
         assert!(issued_by(&other, origin).is_err());
     }
@@ -1646,6 +1740,70 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// RFC 6749 §2.3.1: a secret goes in HTTP Basic, its parts form-encoded,
+    /// unless the server lists only `client_secret_post`; a public client
+    /// names itself in the body.
+    #[test]
+    fn token_requests_authenticate_the_client_as_the_server_asks() {
+        let http = reqwest::blocking::Client::new();
+        let fields = [("grant_type", "refresh_token"), ("refresh_token", "rt")];
+        let build = |client: TokenClient<'_>| {
+            let r = token_request(&http, "https://id.example/token", &fields, &client).build().unwrap();
+            let auth = r.headers().get("authorization").map(|v| v.to_str().unwrap().to_owned());
+            let body = String::from_utf8(r.body().unwrap().as_bytes().unwrap().to_vec()).unwrap();
+            (auth, body)
+        };
+        let (auth, body) = build(TokenClient { id: "app:1", secret: "sécret/+", auth: ClientAuth::Basic });
+        let expected = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("app%3A1:s%C3%A9cret%2F%2B"));
+        assert_eq!(auth.as_deref(), Some(expected.as_str()));
+        assert_eq!(body, "grant_type=refresh_token&refresh_token=rt");
+        let (auth, body) = build(TokenClient { id: "app", secret: "s", auth: ClientAuth::Post });
+        assert_eq!(auth, None);
+        assert_eq!(body, "grant_type=refresh_token&refresh_token=rt&client_id=app&client_secret=s");
+        let (auth, body) = build(TokenClient { id: "app", secret: "", auth: ClientAuth::Basic });
+        assert_eq!(auth, None);
+        assert_eq!(body, "grant_type=refresh_token&refresh_token=rt&client_id=app");
+        // The method comes from the server's metadata.
+        let doc = |methods: serde_json::Value| {
+            parse_metadata(&serde_json::json!({
+                "issuer": "https://id.example",
+                "authorization_endpoint": "https://id.example/a",
+                "token_endpoint": "https://id.example/t",
+                "token_endpoint_auth_methods_supported": methods,
+            }))
+            .unwrap()
+            .client_auth
+        };
+        assert_eq!(doc(serde_json::json!(["client_secret_post"])), ClientAuth::Post);
+        assert_eq!(doc(serde_json::json!(["client_secret_post", "client_secret_basic"])), ClientAuth::Basic);
+        assert_eq!(doc(serde_json::Value::Null), ClientAuth::Basic);
+    }
+
+    /// RFC 8414 §2 and RFC 9700 §2.1.1: PKCE must allow S256, and the
+    /// signing keys must be served over https.
+    #[test]
+    fn metadata_must_allow_s256_and_serve_keys_over_https() {
+        let doc = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "issuer": "https://id.example",
+                "authorization_endpoint": "https://id.example/a",
+                "token_endpoint": "https://id.example/t",
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            parse_metadata(&v)
+        };
+        assert!(doc(serde_json::json!({})).is_ok());
+        assert!(doc(serde_json::json!({"code_challenge_methods_supported": ["plain", "S256"]})).is_ok());
+        assert!(doc(serde_json::json!({"code_challenge_methods_supported": ["plain"]})).is_err());
+        assert!(doc(serde_json::json!({"code_challenge_methods_supported": []})).is_err());
+        assert!(doc(serde_json::json!({"jwks_uri": "https://id.example/keys"})).is_ok());
+        // Tests accept loopback http endpoints; a jwks_uri that isn't a URL
+        // at all is refused everywhere.
+        assert!(doc(serde_json::json!({"jwks_uri": "not a url"})).is_err());
+    }
+
     #[test]
     fn pkce_is_url_safe_and_correct_length() {
         let v = random_url_token();
@@ -1751,6 +1909,7 @@ mod tests {
                 client_id: client.into(),
                 token: String::new(),
                 issuer: Some(issuer.into()),
+                client_auth: ClientAuth::Basic,
             };
             assert!(matches!(grant.issuer(Provider::Jmap, true), Issuer::Exact(i) if i == issuer));
             let grant = Grant { issuer: None, ..grant };
