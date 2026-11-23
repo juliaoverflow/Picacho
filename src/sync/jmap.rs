@@ -154,7 +154,7 @@ impl Mailbox {
 }
 
 /// A name and address.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize, PartialEq)]
 pub struct Address {
     #[serde(default)]
     pub name: Option<String>,
@@ -302,7 +302,7 @@ impl Changes {
 }
 
 /// An address the account may send as.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize)]
 pub struct Identity {
     pub id: String,
     #[serde(default)]
@@ -312,6 +312,16 @@ pub struct Identity {
     /// Whether this account may remove it (`mayDelete`).
     #[serde(default, rename = "mayDelete")]
     pub may_delete: bool,
+    /// RFC 8621 §6: the Reply-To and Bcc its messages get by default.
+    #[serde(default, rename = "replyTo")]
+    pub reply_to: Option<Vec<Address>>,
+    #[serde(default)]
+    pub bcc: Option<Vec<Address>>,
+    /// RFC 8621 §6: its signatures, as plain text and as HTML.
+    #[serde(default, rename = "textSignature")]
+    pub text_signature: String,
+    #[serde(default, rename = "htmlSignature")]
+    pub html_signature: String,
 }
 impl Identity {
     /// Whether it sends as `address`: the same address, or a whole domain
@@ -1681,13 +1691,52 @@ impl Session {
     // Sending.
 
     pub fn identities(&self) -> Result<Vec<Identity>> {
+        Ok(self.identities_with_state()?.0)
+    }
+    /// The identities and the Identity state they were read in.
+    pub fn identities_with_state(&self) -> Result<(Vec<Identity>, String)> {
         ensure!(self.submission, "This JMAP server doesn't send mail.");
         let v = self.one(
             "Identity/get",
             json!({ "accountId": self.account_id, "ids": null }),
         )?;
-        serde_json::from_value(v["list"].clone())
-            .context("The JMAP server's identities aren't in a form Picacho can read.")
+        let list = serde_json::from_value(v["list"].clone())
+            .context("The JMAP server's identities aren't in a form Picacho can read.")?;
+        Ok((list, v["state"].as_str().unwrap_or_default().to_owned()))
+    }
+    /// `known` brought up to date with what changed since `since`
+    /// (Identity/changes, RFC 8620 §5.2, then Identity/get of those), and
+    /// the new state; `None` where the server can't say.
+    pub fn identity_changes(&self, since: &str, known: &[Identity]) -> Result<Option<(Vec<Identity>, String)>> {
+        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        let v = match self.one(
+            "Identity/changes",
+            json!({ "accountId": self.account_id, "sinceState": since }),
+        ) {
+            Ok(v) => v,
+            Err(e) if must_resync(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if v["hasMoreChanges"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let ids = |key: &str| -> Vec<String> {
+            v[key].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect()
+        };
+        let changed: Vec<String> = ids("created").into_iter().chain(ids("updated")).collect();
+        let destroyed = ids("destroyed");
+        let mut list: Vec<Identity> = known
+            .iter()
+            .filter(|i| !destroyed.contains(&i.id) && !changed.contains(&i.id))
+            .cloned()
+            .collect();
+        if !changed.is_empty() {
+            let got = self.one("Identity/get", json!({ "accountId": self.account_id, "ids": changed }))?;
+            let fresh: Vec<Identity> = serde_json::from_value(got["list"].clone())
+                .context("The JMAP server's identities aren't in a form Picacho can read.")?;
+            list.extend(fresh);
+        }
+        Ok(Some((list, v["newState"].as_str().unwrap_or_default().to_owned())))
     }
     /// Sends a finished message: it is added to `drafts` (or `sent`, where
     /// there's no Drafts) and submitted, and once the server accepts it,
@@ -1966,13 +2015,14 @@ impl Session {
         if let Some(name) = &change.name {
             patch.insert("name".into(), json!(name));
         }
-        if let Some(reply_to) = &change.reply_to {
-            let list: Vec<Value> = reply_to
+        for (key, list) in [("replyTo", &change.reply_to), ("bcc", &change.bcc)] {
+            let Some(list) = list else { continue };
+            let list: Vec<Value> = list
                 .iter()
                 .map(|(name, email)| json!({ "name": name, "email": email }))
                 .collect();
             patch.insert(
-                "replyTo".into(),
+                key.into(),
                 if list.is_empty() { Value::Null } else { Value::Array(list) },
             );
         }
@@ -2333,9 +2383,10 @@ impl Session {
         Ok(())
     }
 
-    /// The parts of each message that matched a search, with the matches
-    /// marked (RFC 8621 §5): message id → its preview, as plain text.
-    pub fn search_snippets(&self, filter: &Value, ids: &[String]) -> Result<HashMap<String, String>> {
+    /// The parts of each message that matched a search (SearchSnippet/get,
+    /// RFC 8621 §5), by message id: its subject and preview, each with the
+    /// matches marked.
+    pub fn search_snippets(&self, filter: &Value, ids: &[String]) -> Result<HashMap<String, SearchSnippet>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -2346,11 +2397,14 @@ impl Session {
                 json!({ "accountId": self.account_id, "filter": filter, "emailIds": chunk }),
             )?;
             for snippet in v["list"].as_array().into_iter().flatten() {
-                if let (Some(id), Some(preview)) =
-                    (snippet["emailId"].as_str(), snippet["preview"].as_str())
-                {
-                    out.insert(id.to_owned(), unmark(preview));
-                }
+                let Some(id) = snippet["emailId"].as_str() else { continue };
+                out.insert(
+                    id.to_owned(),
+                    SearchSnippet {
+                        subject: snippet["subject"].as_str().map(Marked::parse),
+                        preview: snippet["preview"].as_str().map(Marked::parse),
+                    },
+                );
             }
         }
         Ok(out)
@@ -2942,16 +2996,62 @@ impl Drop for Turn<'_> {
     }
 }
 
-/// A search snippet as plain text: its `<mark>` tags gone and its
-/// entities read (RFC 8621 §5.1 escapes the rest).
-fn unmark(html: &str) -> String {
-    html.replace("<mark>", "")
-        .replace("</mark>", "")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
+/// What of a message matched a search (RFC 8621 §5.1): its subject and
+/// preview, where the server gives them (`null` where the field didn't
+/// match, or for the preview, where it can't say).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchSnippet {
+    pub subject: Option<Marked>,
+    pub preview: Option<Marked>,
+}
+
+/// A search snippet's text with its matches (RFC 8621 §5.1: HTML whose only
+/// tags are `<mark>`, the rest escaped).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Marked {
+    /// The plain text, entities read.
+    pub text: String,
+    /// Where the matches are in `text`, as byte ranges.
+    pub marks: Vec<std::ops::Range<usize>>,
+}
+impl Marked {
+    pub fn parse(html: &str) -> Self {
+        let mut text = String::with_capacity(html.len());
+        let mut marks = Vec::new();
+        let mut open: Option<usize> = None;
+        let mut rest = html;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<mark>") {
+                open.get_or_insert(text.len());
+                rest = after;
+            } else if let Some(after) = rest.strip_prefix("</mark>") {
+                if let Some(start) = open.take()
+                    && start < text.len()
+                {
+                    marks.push(start..text.len());
+                }
+                rest = after;
+            } else if rest.starts_with('&')
+                && let Some((c, len)) = [("&lt;", '<'), ("&gt;", '>'), ("&quot;", '"'), ("&#39;", '\''), ("&apos;", '\''), ("&amp;", '&')]
+                    .iter()
+                    .find(|(e, _)| rest.starts_with(e))
+                    .map(|(e, c)| (*c, e.len()))
+            {
+                text.push(c);
+                rest = &rest[len..];
+            } else {
+                let c = rest.chars().next().unwrap_or_default();
+                text.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        if let Some(start) = open
+            && start < text.len()
+        {
+            marks.push(start..text.len());
+        }
+        Self { text, marks }
+    }
 }
 
 /// How a message is submitted, beyond its envelope.
@@ -2993,7 +3093,9 @@ pub struct SubmissionStatus {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdentityChange {
     pub name: Option<String>,
+    /// (name, address) each; empty: none.
     pub reply_to: Option<Vec<(String, String)>>,
+    pub bcc: Option<Vec<(String, String)>>,
     pub text_signature: Option<String>,
     pub html_signature: Option<String>,
 }
@@ -3453,6 +3555,18 @@ mod tests {
         assert!(uses_result_references(&json!({ "#ids": { "resultOf": "c0", "name": "Email/query", "path": "/ids" } })));
         assert!(!uses_result_references(&json!({ "create": { "s": { "emailId": "#m" } } })));
         assert!(!uses_result_references(&json!({ "onSuccessUpdateEmail": { "#s": { "keywords/$draft": null } } })));
+    }
+
+    /// Snippets keep where their matches are, and read their entities.
+    #[test]
+    fn search_snippets_keep_their_marks() {
+        let m = Marked::parse("…the <mark>fixture</mark> &amp; <mark>more</mark> &lt;3");
+        assert_eq!(m.text, "…the fixture & more <3");
+        let found: Vec<&str> = m.marks.iter().map(|r| &m.text[r.clone()]).collect();
+        assert_eq!(found, ["fixture", "more"]);
+        let unclosed = Marked::parse("a <mark>b");
+        assert_eq!(unclosed.marks, [2..3]);
+        assert!(Marked::parse("<mark></mark>x").marks.is_empty());
     }
 
     #[test]

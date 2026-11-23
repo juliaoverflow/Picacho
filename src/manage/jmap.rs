@@ -1008,8 +1008,11 @@ impl Backend {
                 let ids: Vec<String> = page.emails.iter().map(|e| e.id.clone()).collect();
                 if let Ok(snippets) = s.search_snippets(&filter, &ids) {
                     for (m, e) in out.mails.iter_mut().zip(&page.emails) {
-                        if let Some(preview) = snippets.get(&e.id).filter(|p| !p.trim().is_empty()) {
-                            m.snippet = preview.clone();
+                        let Some(found) = snippets.get(&e.id) else { continue };
+                        // The preview that matched; where only the subject
+                        // did, the message's own preview stays.
+                        if let Some(preview) = found.preview.as_ref().filter(|p| !p.text.trim().is_empty()) {
+                            m.snippet = preview.text.clone();
                         }
                     }
                 }
@@ -1259,7 +1262,23 @@ impl Backend {
         ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
-        self.with_jmap(a, |s| s.identities())
+        // Once read, only what changed since (Identity/changes).
+        let key = format!("jmap_identities:{}", a.id);
+        let saved: Option<(Vec<crate::sync::jmap::Identity>, String)> = self
+            .store
+            .preference(&key)
+            .and_then(|j| serde_json::from_str(&j).ok());
+        let (list, state) = self.with_jmap(a, |s| {
+            if let Some((known, since)) = &saved
+                && !since.is_empty()
+                && let Some(fresh) = s.identity_changes(since, known)?
+            {
+                return Ok(fresh);
+            }
+            s.identities_with_state()
+        })?;
+        let _ = self.store.set_preference(&key, &serde_json::to_string(&(&list, &state))?);
+        Ok(list)
     }
     /// Changes a sending identity on the JMAP server (name, Reply-To,
     /// signatures).

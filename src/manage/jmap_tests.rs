@@ -83,6 +83,8 @@ struct Server {
     /// Mailboxes as `Mailbox/set` left them, where it was used (else the
     /// fixed `mailboxes()`).
     boxes: Option<Vec<Value>>,
+    /// Identities added after `id1`; the Identity state is `i<count>`.
+    extra_identities: Vec<Value>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -483,10 +485,27 @@ impl Server {
                 }
                 vec![(name.into(), json!({ "created": created }))]
             }
-            "Identity/get" => vec![(
-                name.into(),
-                json!({ "list": [{ "id": "id1", "name": "QA", "email": "qa@example.com" }] }),
-            )],
+            "Identity/get" => {
+                let all = vec![json!({ "id": "id1", "name": "QA", "email": "qa@example.com",
+                    "replyTo": [{ "name": "QA desk", "email": "desk@example.com" }],
+                    "bcc": null, "textSignature": "-- \nQA", "htmlSignature": "<p>QA</p>" })];
+                let mut all = all;
+                all.extend(self.extra_identities.iter().cloned());
+                let list: Vec<Value> = match ids_of(args) {
+                    Some(ids) => all.into_iter().filter(|i| ids.iter().any(|w| i["id"] == w.as_str())).collect(),
+                    None => all,
+                };
+                vec![(name.into(), json!({ "list": list, "state": format!("i{}", self.extra_identities.len()) }))]
+            }
+            "Identity/changes" => {
+                let since: usize = args["sinceState"].as_str().unwrap().trim_start_matches('i').parse().unwrap_or(0);
+                let created: Vec<&Value> = self.extra_identities[since.min(self.extra_identities.len())..]
+                    .iter()
+                    .map(|i| &i["id"])
+                    .collect();
+                vec![(name.into(), json!({ "oldState": format!("i{since}"), "newState": format!("i{}", self.extra_identities.len()),
+                    "hasMoreChanges": false, "created": created, "updated": [], "destroyed": [] }))]
+            }
             "Calendar/get" => vec![(
                 name.into(),
                 json!({ "list": [
@@ -2256,5 +2275,32 @@ fn jmap_mailbox_rights_moves_and_removal() -> Result<()> {
     let left = b.delete_remote_folder(&a, "Work/Projects")?;
     assert!(left.iter().all(|f| f.name != "Work/Projects"));
     assert!(server.lock().unwrap().emails.is_empty());
+    Ok(())
+}
+
+/// Identities are read with their Reply-To, Bcc and signatures (RFC 8621
+/// §6), and once read, only what changed is asked (Identity/changes).
+#[test]
+fn jmap_identities_read_their_defaults_and_changes() -> Result<()> {
+    let (cert, port, server, _running) = start(Server::default())?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let list = b.jmap_identities(&a)?;
+    assert_eq!(list.len(), 1);
+    assert_eq!(crate::sync::jmap::addresses(&list[0].reply_to), "QA desk <desk@example.com>");
+    assert_eq!(list[0].text_signature, "-- \nQA");
+    assert_eq!(list[0].html_signature, "<p>QA</p>");
+    server.lock().unwrap().extra_identities.push(json!({ "id": "id2", "name": "Ops", "email": "ops@example.com" }));
+    let before = server.lock().unwrap().calls.len();
+    let list = b.jmap_identities(&a)?;
+    assert_eq!(list.len(), 2);
+    let calls = server.lock().unwrap().calls[before..].to_vec();
+    assert_eq!(calls, ["Identity/changes", "Identity/get"]);
+    // Nothing changed: no Identity/get at all.
+    let before = server.lock().unwrap().calls.len();
+    assert_eq!(b.jmap_identities(&a)?.len(), 2);
+    assert_eq!(server.lock().unwrap().calls[before..], ["Identity/changes"]);
     Ok(())
 }
