@@ -18,10 +18,12 @@ pub(crate) const FORMAT_HEADER: &str = "X-Picacho-Format";
 fn raw_header(name: &'static str, value: String) -> header::HeaderValue {
     header::HeaderValue::new(header::HeaderName::new_from_ascii_str(name), value)
 }
-/// The message a draft makes, as sent (`draft: false`) or as saved in the
-/// server's Drafts folder: then incomplete drafts are allowed, Bcc is kept,
-/// and Picacho's own headers let it be found again.
-pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
+/// Whom a draft is from: one of the mailbox's other addresses (unless
+/// sent as an alias), else the account, with the name to show.
+fn sender<'a>(
+    a: &'a Account,
+    d: &Draft,
+) -> Result<(Option<&'a crate::manage::model::Identity>, Mailbox)> {
     // One of the mailbox's other addresses, unless sent as an alias.
     let identity = match d.identity.as_str() {
         "" => None,
@@ -47,7 +49,39 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
         ),
         None => Mailbox::new(Some(a.name.clone()), a.email.parse()?),
     };
+    Ok((identity, from))
+}
+/// The message a draft makes, as sent (`draft: false`) or as saved in the
+/// server's Drafts folder: then incomplete drafts are allowed, Bcc is kept,
+/// and Picacho's own headers let it be found again.
+pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
+    build_to(a, d, draft, None, None)
+}
+/// As `build`, sent only to `only_to` when given: the To and Cc headers
+/// are the draft's, but the envelope (and so whom it is encrypted to)
+/// names that one address. RFC 5322 §3.6.3: a Bcc recipient's own copy
+/// of a message whose other copy has no Bcc field. `message_id`, when
+/// given, is the one all copies of the message share.
+fn build_to(
+    a: &Account,
+    d: &Draft,
+    draft: bool,
+    only_to: Option<&str>,
+    message_id: Option<&str>,
+) -> Result<Message> {
+    let (identity, from) = sender(a, d)?;
     let mut builder = Message::builder().from(from.clone()).subject(&d.subject);
+    if !draft {
+        // RFC 5322 §3.6.4: a Message-ID unique to this message. Without
+        // one, lettre would name the computer's host; this uses the
+        // sender's domain (the alias's, sent as an alias) and a random
+        // part, so it says nothing about the computer.
+        let id = match message_id {
+            Some(id) => id.to_owned(),
+            None => new_message_id(&from_address(a, d)?),
+        };
+        builder = builder.message_id(Some(id));
+    }
     let mut count = 0;
     for (field, list) in [(0, &d.to), (1, &d.cc), (2, &d.bcc)] {
         for (name, address) in recipients(list)? {
@@ -75,7 +109,13 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
             builder = builder.raw_header(raw_header(FORMAT_HEADER, "markdown".into()));
         }
     } else {
-        ensure!(count > 0, "Add at least one recipient.");
+        ensure!(count > 0 || only_to.is_some(), "Add at least one recipient.");
+        if let Some(to) = only_to {
+            builder = builder.envelope(lettre::address::Envelope::new(
+                Some(from.email.clone()),
+                vec![to.parse().with_context(|| format!("“{to}” isn't a valid address."))?],
+            )?);
+        }
     }
     // Sent as an alias, the forwarding service puts the alias in From; the
     // mailbox's own address must not show up elsewhere in the message.
@@ -134,37 +174,72 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
     }
     // Plain text as format=flowed (RFC 3676): long paragraphs reflow on
     // narrow screens instead of breaking mid-sentence.
+    // A formatted body's `file:` pictures read as their alt text there:
+    // no local file name goes out (`html_body_with`). A draft's copy in
+    // Drafts keeps its source, which is how it's read back (FORMAT_HEADER).
+    let text_body = if !draft && d.formatted && !file_images(&d.body).is_empty() {
+        rewrite_file_images(&d.body, false, |_| None)
+    } else {
+        d.body.clone()
+    };
     let plain = || {
         SinglePart::builder()
             .header(
                 header::ContentType::parse("text/plain; charset=utf-8; format=flowed; delsp=no")
                     .expect("a valid content type"),
             )
-            .body(flowed(&d.body))
+            .body(flowed(&text_body))
     };
+    // Pictures placed in a formatted body (`![…](file:<attachment name>)`)
+    // go beside its HTML, named by Content-ID (RFC 2387, RFC 2392).
+    let inline = if d.formatted {
+        inline_images(&d.body, &d.attachments, &from_address(a, d)?)
+    } else {
+        InlineImages::default()
+    };
+    let html = || SinglePart::html(html_body_with(&d.body, &inline));
     // Without attachments, the text alone: a multipart/mixed wrapper made
     // every message look like it had some.
     if d.attachments.is_empty() {
         return Ok(if d.formatted {
-            builder.multipart(
-                MultiPart::alternative()
-                    .singlepart(plain())
-                    .singlepart(SinglePart::html(html_body(&d.body))),
-            )?
+            builder.multipart(MultiPart::alternative().singlepart(plain()).singlepart(html()))?
         } else {
             builder.singlepart(plain())?
         });
     }
-    let text = if d.formatted {
-        MultiPart::alternative()
-            .singlepart(plain())
-            .singlepart(SinglePart::html(html_body(&d.body)))
+    let mut total = d.body.len();
+    let text = if d.formatted && !inline.images.is_empty() {
+        // RFC 2387 §3.1: the HTML first, its pictures after; the required
+        // `type` parameter names the HTML's type.
+        let kind = header::ContentType::parse(&format!(
+            "multipart/related; type=\"text/html\"; boundary=\"{}\"",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .expect("a valid content type");
+        let mut related = MultiPart::builder().header(kind).singlepart(html());
+        for image in &inline.images {
+            let meta = std::fs::metadata(&image.path)
+                .with_context(|| format!("The picture {} can't be read.", image.path.display()))?;
+            total += meta.len() as usize;
+            ensure!(
+                total < 4 * DEFAULT_LIMIT,
+                "Attachments are too large to send by email. Share them by link instead."
+            );
+            let bytes = std::fs::read(&image.path)?;
+            let name = image.name.clone();
+            related = related.singlepart(
+                Attachment::new_inline_with_name(image.content_id.clone(), name)
+                    .body(bytes, content_type(&image.path)),
+            );
+        }
+        MultiPart::alternative().singlepart(plain()).multipart(related)
+    } else if d.formatted {
+        MultiPart::alternative().singlepart(plain()).singlepart(html())
     } else {
         MultiPart::alternative().singlepart(plain())
     };
     let mut multipart = MultiPart::mixed().multipart(text);
-    let mut total = d.body.len();
-    for path in &d.attachments {
+    for path in d.attachments.iter().filter(|p| !inline.images.iter().any(|i| &i.path == *p)) {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("The attachment {} can't be read.", path.display()))?;
         total += meta.len() as usize;
@@ -238,17 +313,32 @@ pub(crate) fn flowed(text: &str) -> String {
 /// One attached file. A forwarded message (message/rfc822) goes as it is
 /// (7bit or 8bit, as RFC 2046 asks of messages), so recipients' apps open it
 /// as a message; when its lines are too long for that, it is encoded like any
-/// other file.
+/// other file. One whose headers are in UTF-8 (an internationalized message)
+/// goes as message/global (RFC 6532 §3.7), which may be encoded like any
+/// other part where message/rfc822 may not.
 fn attachment_part(name: String, bytes: Vec<u8>, kind: header::ContentType) -> SinglePart {
     use lettre::message::{Body, header::ContentTransferEncoding};
     if kind == header::ContentType::parse("message/rfc822").unwrap() {
+        let head_end = memchr::memmem::find(&bytes, b"\r\n\r\n")
+            .or_else(|| memchr::memmem::find(&bytes, b"\n\n"))
+            .unwrap_or(bytes.len());
+        if !bytes[..head_end].is_ascii() && std::str::from_utf8(&bytes[..head_end]).is_ok() {
+            let global = header::ContentType::parse("message/global").unwrap();
+            return Attachment::new(name).body(bytes, global);
+        }
         let encoding = if bytes.is_ascii() {
             ContentTransferEncoding::SevenBit
         } else {
             ContentTransferEncoding::EightBit
         };
+        // UTF-8 text is given as text: as bytes, lettre takes any non-ASCII
+        // as binary and refuses 8bit for it.
+        let text: lettre::message::MaybeString = match String::from_utf8(bytes) {
+            Ok(text) => text.into(),
+            Err(e) => e.into_bytes().into(),
+        };
         // Refused, it hands the bytes back: no copy is kept for trying.
-        return match Body::new_with_encoding(bytes, encoding) {
+        return match Body::new_with_encoding(text, encoding) {
             Ok(body) => SinglePart::builder()
                 .header(kind)
                 .header(header::ContentDisposition::attachment(&name))
@@ -305,6 +395,9 @@ pub(crate) struct ServerLimits {
     /// FUTURERELEASE (RFC 4865): how far ahead it holds a message for
     /// release, in seconds (0 where it doesn't).
     pub(crate) future_release: u64,
+    /// FUTURERELEASE's max-future-release-date-time (RFC 4865 §3): the
+    /// latest moment it holds a message until, a Unix time.
+    pub(crate) future_release_until: Option<i64>,
     /// MT-PRIORITY (RFC 6710): it takes a message's priority.
     pub(crate) mt_priority: bool,
     /// The priority profile it named (MIXER, STANAG4406, NSEP), if any.
@@ -324,6 +417,28 @@ impl std::fmt::Display for NoServerHold {
     }
 }
 impl std::error::Error for NoServerHold {}
+
+/// Encrypted mail with Bcc through a service that takes one message for
+/// all its recipients (Proton, JMAP): its encryption would name every Bcc
+/// recipient's key to everyone, and the service can't be sent a separate
+/// copy for each without delivering to To and Cc again or filing each copy
+/// in Sent. Refused before anything is sent; the recipients can be written
+/// to separately.
+#[derive(Debug)]
+pub(crate) struct EncryptedBccUnsupported {
+    /// The service, as named to the person sending.
+    pub(crate) service: String,
+}
+impl std::fmt::Display for EncryptedBccUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Encrypted mail with Bcc can't be sent through {} without showing who got a Bcc. Send to them separately, or turn off Encrypt.",
+            self.service
+        )
+    }
+}
+impl std::error::Error for EncryptedBccUnsupported {}
 pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerLimits {
     let mut limits = ServerLimits::default();
     for line in lines {
@@ -341,8 +456,13 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
             Some("CHUNKING") => limits.chunking = true,
             Some("REQUIRETLS") => limits.require_tls = true,
             Some("STARTTLS") => limits.starttls = true,
+            // RFC 4865 §3: "FUTURERELEASE <max interval> <max date-time>".
             Some("FUTURERELEASE") => {
-                limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0)
+                limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                limits.future_release_until = words
+                    .next()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.timestamp());
             }
             Some("ENHANCEDSTATUSCODES") => limits.enhanced = true,
             // "MT-PRIORITY MIXER" (a profile, or none).
@@ -395,6 +515,57 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
         }
     }
     limits
+}
+/// A delivery time limit (DELIVERBY, RFC 2852) as the account asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeliverBy {
+    /// How long, in seconds.
+    pub(crate) seconds: u64,
+    /// Late, it is delivered and the sender told (N) rather than returned
+    /// (R).
+    pub(crate) notify: bool,
+    /// Each server on the way reports relaying it (T).
+    pub(crate) trace: bool,
+}
+impl DeliverBy {
+    /// The account's limit, if it sets one; N and T mean nothing alone.
+    pub(crate) fn of(a: &Account) -> Option<Self> {
+        (a.deliver_within_hours > 0).then(|| Self {
+            seconds: u64::from(a.deliver_within_hours) * 3600,
+            notify: a.deliver_late_notify,
+            trace: a.deliver_by_trace,
+        })
+    }
+    /// The BY= value (RFC 2852 §4: `by-time;by-mode[trace]`) for a server
+    /// whose least by-time is `minimum` seconds. That minimum is for R mode
+    /// only (§4: a server refuses an R by-time below it); an N by-time is
+    /// as asked. At most nine digits.
+    pub(crate) fn parameter(self, minimum: u64) -> String {
+        let seconds = if self.notify {
+            self.seconds
+        } else {
+            self.seconds.max(minimum)
+        }
+        .min(999_999_999);
+        format!(
+            "{seconds};{}{}",
+            if self.notify { "N" } else { "R" },
+            if self.trace { "T" } else { "" }
+        )
+    }
+}
+
+/// HOLDFOR's seconds (RFC 4865 §4) for a message due at `at` when it is
+/// `now`, where the server can hold it that long: within its
+/// max-future-release-interval and, if it named one, not after its
+/// max-future-release-date-time. HOLDFOR rather than HOLDUNTIL, since a
+/// time from now doesn't depend on this computer's clock agreeing with
+/// the server's. `None` where it can't (no FUTURERELEASE gives 0).
+fn hold_seconds(limits: &ServerLimits, at: i64, now: i64) -> Option<u64> {
+    let ahead = (at - now).max(1) as u64;
+    let within = ahead <= limits.future_release;
+    let before_end = limits.future_release_until.is_none_or(|end| at <= end);
+    (within && before_end).then_some(ahead)
 }
 /// What happened to a message the server accepted.
 pub(crate) struct Delivered {
@@ -462,6 +633,9 @@ const HELLO: &str = "[127.0.0.1]";
 struct Reply {
     code: u16,
     lines: Vec<String>,
+    /// The server offered ENHANCEDSTATUSCODES: its replies start with one
+    /// (RFC 2034 §3). Elsewhere text like "5.1.1" is only text.
+    enhanced: bool,
 }
 impl Reply {
     /// A completion (2xx). Intermediate replies (3xx: 334, 354) are
@@ -469,12 +643,34 @@ impl Reply {
     fn positive(&self) -> bool {
         (200..300).contains(&self.code)
     }
+    /// The reply's text, its lines joined. RFC 2034 §4: each line of a
+    /// multi-line reply starts with the same enhanced code; it is kept on
+    /// the first line only.
     fn text(&self) -> String {
-        self.lines.join(" ")
+        let code = self.enhanced().map(|_| {
+            self.lines[0].split_whitespace().next().unwrap_or("").to_owned()
+        });
+        let mut out = String::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            let line = match &code {
+                Some(code) if i > 0 => line
+                    .strip_prefix(code.as_str())
+                    .map_or(line.as_str(), str::trim_start),
+                _ => line.as_str(),
+            };
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(line);
+        }
+        out
     }
     /// The enhanced status code (RFC 3463) the reply starts with, if any.
     /// Only one whose class agrees with the reply code's (RFC 2034 §4).
     fn enhanced(&self) -> Option<(u8, u16, u16)> {
+        if !self.enhanced {
+            return None;
+        }
         enhanced_code(self.lines.first()?).filter(|(class, ..)| u16::from(*class) == self.code / 100)
     }
     /// "Too many recipients" (RFC 5321 §4.5.3.1.10): 452, or 4.5.3. The
@@ -494,7 +690,7 @@ impl Reply {
 }
 
 /// An enhanced status code at the start of a reply line: `5.1.1 …`.
-fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
+pub(crate) fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
     let code = line.split_whitespace().next()?;
     let mut parts = code.split('.');
     fn digits(p: &str, most: usize) -> Option<&str> {
@@ -509,7 +705,7 @@ fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
 
 /// What an enhanced status code (RFC 3463, and the IANA registry) means,
 /// for the codes people most often meet.
-fn meaning(class: u8, subject: u16, detail: u16) -> Option<&'static str> {
+pub(crate) fn meaning(class: u8, subject: u16, detail: u16) -> Option<&'static str> {
     if class == 2 {
         return None;
     }
@@ -573,11 +769,14 @@ impl Patience for native_tls::TlsStream<Wire> {
 /// An SMTP session: commands out, replies in.
 struct Session<S: Read + Write> {
     reader: BufReader<S>,
+    /// The last EHLO listed ENHANCEDSTATUSCODES (RFC 2034).
+    enhanced: bool,
 }
 impl<S: Read + Write + Patience> Session<S> {
     fn new(stream: S) -> Self {
         Self {
             reader: BufReader::new(stream),
+            enhanced: false,
         }
     }
     fn reply(&mut self) -> Result<Reply> {
@@ -611,7 +810,11 @@ impl<S: Read + Write + Patience> Session<S> {
             );
             lines.push(rest.get(1..).unwrap_or("").to_owned());
             if !rest.starts_with('-') {
-                return Ok(Reply { code, lines });
+                return Ok(Reply {
+                    code,
+                    lines,
+                    enhanced: self.enhanced,
+                });
             }
         }
     }
@@ -636,7 +839,7 @@ impl<S: Read + Write + Patience> Session<S> {
     fn expect(&mut self, line: &str, what: &str) -> Result<Reply> {
         let reply = self.command(line)?;
         if !reply.positive() {
-            return Err(Refused(format!("{what}: {} {}", reply.code, reply.text())).into());
+            return Err(Refused(format!("{what}: {}", reply.explained())).into());
         }
         Ok(reply)
     }
@@ -651,6 +854,7 @@ impl<S: Read + Write + Patience> Session<S> {
                 // HELO takes a domain, not an address literal (RFC 5321
                 // §4.1.1.1).
                 self.expect("HELO localhost.localdomain", "The outgoing server refused HELO")?;
+                self.enhanced = false;
                 return Ok(ServerLimits::default());
             }
             return Err(Refused(format!(
@@ -659,9 +863,9 @@ impl<S: Read + Write + Patience> Session<S> {
             ))
             .into());
         }
-        Ok(server_limits(
-            reply.lines.iter().skip(1).map(String::as_str),
-        ))
+        let limits = server_limits(reply.lines.iter().skip(1).map(String::as_str));
+        self.enhanced = limits.enhanced;
+        Ok(limits)
     }
     /// Signs in with the best mechanism the server offers.
     fn authenticate(
@@ -734,7 +938,7 @@ impl<S: Read + Write + Patience> Session<S> {
                     let extra = reply
                         .lines
                         .first()
-                        .map(|t| match enhanced_code(t) {
+                        .map(|t| match reply.enhanced() {
                             Some(_) => t.split_once(' ').map_or("", |(_, rest)| rest.trim()),
                             None => t.trim(),
                         })
@@ -754,15 +958,16 @@ impl<S: Read + Write + Patience> Session<S> {
                     }
                 }
                 _ => {
+                    // RFC 4954 §6 and RFC 3463: 535 5.7.8 and the like say
+                    // why; the mechanism's own reason (SCRAM's e=) follows.
                     let why = match exchange.refusal() {
-                        Some(reason) => format!("{} ({reason})", reply.text()),
-                        None => reply.text(),
+                        Some(reason) => format!("{} ({reason})", reply.explained()),
+                        None => reply.explained(),
                     };
                     return Err(Refused(format!(
-                        "{} refused the sign-in with {}: {} {why}",
+                        "{} refused the sign-in with {}: {why}",
                         endpoint.host,
                         mechanism.name(),
-                        reply.code
                     ))
                     .into());
                 }
@@ -774,9 +979,8 @@ impl<S: Read + Write + Patience> Session<S> {
         let reply = self.command("DATA")?;
         if reply.code != 354 {
             return Err(Refused(format!(
-                "The server refused the message: {} {}",
-                reply.code,
-                reply.text()
+                "The server refused the message: {}",
+                reply.explained()
             ))
             .into());
         }
@@ -785,7 +989,16 @@ impl<S: Read + Write + Patience> Session<S> {
         // megabytes and more).
         dot_stuff_into(bytes, self.reader.get_mut())?;
         self.flush()?;
-        self.final_reply()
+        // RFC 5321 §4.1.1.4: only a 2xx after the final dot accepts it.
+        let reply = self.final_reply()?;
+        if !reply.positive() {
+            return Err(Refused(format!(
+                "The server refused the message: {}",
+                reply.explained()
+            ))
+            .into());
+        }
+        Ok(reply)
     }
     /// The message as is, in BDAT chunks (CHUNKING); with PIPELINING all
     /// chunks go before their replies are read.
@@ -822,9 +1035,8 @@ impl<S: Read + Write + Patience> Session<S> {
                     pending -= 1;
                     if !r.positive() {
                         return Err(Refused(format!(
-                            "The server refused the message: {} {}",
-                            r.code,
-                            r.text()
+                            "The server refused the message: {}",
+                            r.explained()
                         ))
                         .into());
                     }
@@ -881,7 +1093,7 @@ fn open(
             greeting.code == 220,
             "{} refused the connection: {}",
             endpoint.host,
-            greeting.text()
+            greeting.explained()
         );
         session
     } else {
@@ -891,7 +1103,7 @@ fn open(
             greeting.code == 220,
             "{} refused the connection: {}",
             endpoint.host,
-            greeting.text()
+            greeting.explained()
         );
         let limits = plain.ehlo()?;
         // Never send credentials or mail unencrypted.
@@ -906,7 +1118,7 @@ fn open(
             reply.code == 220,
             "{} refused STARTTLS: {}",
             endpoint.host,
-            reply.text()
+            reply.explained()
         );
         // Anything sent before the handshake could be an attacker's.
         ensure!(
@@ -953,82 +1165,108 @@ pub(crate) fn deliver(
     hold_until: Option<i64>,
     keys: &Keys,
 ) -> Result<Delivered> {
-    // Encrypted with Bcc: the Bcc recipients' keys would be listed in
-    // the copy everyone gets (each encrypted session key names its key),
-    // telling To and Cc who else got it. Each Bcc recipient gets a copy of
-    // their own instead, encrypted to them alone and the sender.
-    if d.encrypt && !d.bcc.trim().is_empty() {
-        let visible = Draft {
-            bcc: String::new(),
-            ..d.clone()
-        };
-        let message = build(a, &visible, false)?;
-        let bytes = protected(&message, &visible, keys)?;
-        let delivered = deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None)?;
-        for (_, address) in recipients(&d.bcc)? {
-            let alone = Draft {
-                to: d.to.clone(),
-                cc: d.cc.clone(),
-                bcc: address.clone(),
-                ..d.clone()
-            };
-            let message = build(a, &alone, false)?;
-            // Encrypted to the Bcc recipient and the sender only; the
-            // envelope sends it to them alone.
-            let only = Draft {
-                to: address.clone(),
-                cc: String::new(),
-                bcc: String::new(),
-                ..d.clone()
-            };
-            let envelope_message = build(a, &only, false)?;
-            let bytes = protected(&envelope_message, &only, keys)?;
-            // The visible headers are the To/Cc copy's, as Bcc shows them.
-            let bytes = with_headers_of(&message, bytes);
-            deliver_bytes(a, &only, &envelope_message, bytes, endpoint, secret, tls, hold_until, None)
-                .with_context(|| format!("The message went to its other recipients, but not to {address}."))?;
-        }
-        return Ok(delivered);
-    }
-    let message = build(a, d, false)?;
-    let bytes = protected(&message, d, keys)?;
-    deliver_bytes(a, d, &message, bytes, endpoint, secret, tls, hold_until, None)
+    let mut delivered = if d.encrypt && !d.bcc.trim().is_empty() {
+        deliver_bcc_apart(a, d, endpoint, secret, tls, hold_until, keys)?
+    } else {
+        let message = build(a, d, false)?;
+        let bytes = protected(&message, d, keys)?;
+        deliver_bytes(a, d, &message, bytes, endpoint, secret, tls, hold_until, None)?
+    };
+    // RFC 5322 §3.6.3: what went out has no Bcc field; the sender's own
+    // copy (in Sent) keeps it, so it shows whom the message also went to.
+    delivered.raw = with_bcc(delivered.raw, d)?;
+    Ok(delivered)
 }
 
-/// `bytes` (a protected message) with the To and Cc of `message` in place
-/// of its own, so a Bcc recipient's own copy shows who it went to.
-fn with_headers_of(message: &Message, bytes: Vec<u8>) -> Vec<u8> {
-    let shown = message.formatted();
-    let header = |raw: &[u8], name: &str| -> Option<String> {
-        use mailparse::MailHeaderMap as _;
-        let (h, _) = mailparse::parse_headers(raw).ok()?;
-        h.get_first_header(name)
-            .map(|h| String::from_utf8_lossy(h.get_key_raw()).into_owned() + ": " + &String::from_utf8_lossy(h.get_value_raw()))
+/// Encrypted with Bcc: the Bcc recipients' keys would be listed in the
+/// copy everyone gets (each encrypted session key names its key), telling
+/// To and Cc who else got it. Each Bcc recipient gets a copy of their own
+/// instead, encrypted to them alone and the sender; its To and Cc are the
+/// message's, with no Bcc field (RFC 5322 §3.6.3), and its envelope names
+/// only them. The result is the To/Cc copy (or, with no To or Cc, the first
+/// Bcc copy), for Sent.
+fn deliver_bcc_apart(
+    a: &Account,
+    d: &Draft,
+    endpoint: &Endpoint,
+    secret: &str,
+    tls: &native_tls::TlsConnector,
+    hold_until: Option<i64>,
+    keys: &Keys,
+) -> Result<Delivered> {
+    let visible = Draft {
+        bcc: String::new(),
+        ..d.clone()
     };
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let Some(split) = text.find("\r\n\r\n") else {
-        return bytes;
-    };
-    let (head, body) = text.split_at(split);
-    let mut lines: Vec<String> = Vec::new();
-    let mut skip = false;
-    for line in head.split("\r\n") {
-        if !line.starts_with([' ', '\t']) {
-            let name = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
-            skip = name == "to" || name == "cc";
-        }
-        if !skip {
-            lines.push(line.to_owned());
-        }
+    let mut delivered = None;
+    // One message, however many copies: the same Message-ID in each, so
+    // replies thread together.
+    let message_id = new_message_id(&from_address(a, d)?);
+    if !recipients(&d.to)?.is_empty() || !recipients(&d.cc)?.is_empty() {
+        let message = build_to(a, &visible, false, None, Some(&message_id))?;
+        let bytes = protected(&message, &visible, keys)?;
+        delivered = Some(deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None)?);
     }
-    for name in ["To", "Cc"] {
-        if let Some(h) = header(&shown, name) {
-            lines.push(h);
-        }
+    for (_, address) in recipients(&d.bcc)? {
+        let message = build_to(a, &visible, false, Some(&address), Some(&message_id))?;
+        let bytes = protected(&message, &visible, keys)?;
+        let alone = deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None);
+        let alone = match delivered {
+            Some(_) => alone.with_context(|| {
+                format!("The message went to its other recipients, but not to {address}.")
+            })?,
+            None => alone?,
+        };
+        delivered.get_or_insert(alone);
     }
-    let mut out = lines.join("\r\n").into_bytes();
-    out.extend_from_slice(body.as_bytes());
-    out
+    delivered.context("Add at least one recipient.")
+}
+
+/// A new Message-ID at `address`'s domain (RFC 5322 §3.6.4): random
+/// (a version 4 UUID), so unique, and naming nothing about the computer.
+/// An internationalized domain is written as ASCII (IDNA).
+pub(crate) fn new_message_id(address: &str) -> String {
+    let domain = address
+        .rsplit_once('@')
+        .and_then(|(_, domain)| idna::domain_to_ascii(domain).ok())
+        .filter(|d| !d.is_empty() && !d.contains(['<', '>', ' ', '[', ']']))
+        .unwrap_or_else(|| "localhost".into());
+    format!("<{}@{domain}>", uuid::Uuid::new_v4().simple())
+}
+/// The address a draft is sent from, as Message-IDs name its domain: the
+/// alias's, else the sending address's or the account's.
+fn from_address(a: &Account, d: &Draft) -> Result<String> {
+    if !d.send_as.trim().is_empty() {
+        return Ok(d.send_as.trim().to_owned());
+    }
+    Ok(sender(a, d)?.1.email.to_string())
+}
+/// The Message-ID a built message has.
+#[cfg(test)]
+fn message_id_of(message: &Message) -> String {
+    message
+        .headers()
+        .get_raw("Message-ID")
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `raw` with the draft's Bcc field added in front, for the sender's own
+/// copy; as it is without Bcc recipients. Outside any signature or
+/// encryption, which cover the body part only (RFC 3156 §5, RFC 8551).
+fn with_bcc(raw: Vec<u8>, d: &Draft) -> Result<Vec<u8>> {
+    let mut list = lettre::message::Mailboxes::new();
+    for (name, address) in recipients(&d.bcc)? {
+        list.push(Mailbox::new(name, address.parse()?));
+    }
+    if list.iter().next().is_none() {
+        return Ok(raw);
+    }
+    let mut headers = header::Headers::new();
+    headers.set(header::Bcc::from(list));
+    let mut out = headers.to_string().into_bytes();
+    out.extend_from_slice(&raw);
+    Ok(out)
 }
 
 /// What the server can be told to fetch instead of being sent the
@@ -1067,10 +1305,17 @@ pub(crate) fn deliver_bytes(
         "SMTP delivery failed. Your draft has been kept; check the server and account settings.";
     let (mut session, limits) = open(endpoint, secret, tls).context(failed)?;
     let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
-    if bytes.len() > limit {
+    // As the server will count it (RFC 1870 §4): with DATA, every line
+    // ending a CRLF; with BDAT, the bytes as they are.
+    let size = if limits.chunking {
+        bytes.len()
+    } else {
+        data_size(&bytes)
+    };
+    if size > limit {
         bail!(
             "This message is {} with its attachments; {} accepts up to {}. Remove an attachment or share it by link.",
-            megabytes(bytes.len()),
+            megabytes(size),
             endpoint.host,
             megabytes(limit)
         );
@@ -1086,14 +1331,13 @@ pub(crate) fn deliver_bytes(
     // Held for later: for how long, from the server's own clock.
     let hold_for = match hold_until {
         None => None,
-        Some(at) => {
-            let ahead = (at - chrono::Utc::now().timestamp()).max(1) as u64;
-            if limits.future_release < ahead {
+        Some(at) => match hold_seconds(&limits, at, chrono::Utc::now().timestamp()) {
+            Some(ahead) => Some(ahead),
+            None => {
                 let _ = session.command("QUIT");
                 return Err(NoServerHold.into());
             }
-            Some(ahead)
-        }
+        },
     };
     let envelope = message.envelope();
     let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
@@ -1102,7 +1346,7 @@ pub(crate) fn deliver_bytes(
     let from = ascii_domain(&from);
     let mut mail = format!("MAIL FROM:<{from}>");
     if limits.size_offered {
-        mail.push_str(&format!(" SIZE={}", bytes.len()));
+        mail.push_str(&format!(" SIZE={size}"));
     }
     let non_ascii = envelope
         .from()
@@ -1136,8 +1380,9 @@ pub(crate) fn deliver_bytes(
     }
     let receipts = a.delivery_receipts && limits.dsn;
     if receipts {
-        // RFC 3461: return headers only, identified by the draft.
-        mail.push_str(&format!(" RET=HDRS ENVID={}", xtext(&d.id)));
+        // RFC 3461 §4.3, §4.4: what a failure returns (the headers unless
+        // asked otherwise), identified by the draft.
+        mail.push_str(&format!(" RET={} ENVID={}", a.dsn.ret(), xtext(&d.id)));
     }
     if a.require_tls {
         mail.push_str(" REQUIRETLS");
@@ -1159,20 +1404,19 @@ pub(crate) fn deliver_bytes(
         };
         mail.push_str(&format!(" MT-PRIORITY={level}"));
     }
-    // A time limit (RFC 2852): returned rather than delivered late. Not
-    // with a held message, whose release would count against it.
-    if a.deliver_within_hours > 0
-        && hold_for.is_none()
+    // A time limit (RFC 2852). Not with a held message, whose release
+    // would count against it.
+    if hold_for.is_none()
         && let Some(minimum) = limits.deliver_by
+        && let Some(by) = DeliverBy::of(a)
     {
-        // At most nine digits (RFC 2852 §4); the server's minimum is said.
-        let seconds = (u64::from(a.deliver_within_hours) * 3600).max(minimum).min(999_999_999);
-        mail.push_str(&format!(" BY={seconds};R"));
+        mail.push_str(&format!(" BY={}", by.parameter(minimum)));
     }
     let rcpt = |to: &lettre::Address| {
         let mut line = format!("RCPT TO:<{}>", ascii_domain(to.as_ref()));
         if receipts {
-            line.push_str(" NOTIFY=SUCCESS,FAILURE,DELAY");
+            // RFC 3461 §4.1: the reports the account asks for.
+            line.push_str(&format!(" NOTIFY={}", a.dsn.notify()));
             // The address as written, so a report names it (RFC 3461 §4.2).
             // Non-ASCII ones would need RFC 6533's utf-8-addr form; left out.
             let to: &str = to.as_ref();
@@ -1414,10 +1658,16 @@ pub(crate) fn deliver_raw(
         );
     }
     let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
+    // RFC 1870 §4: as the server counts it (see `deliver_bytes`).
+    let size = if limits.chunking {
+        bytes.len()
+    } else {
+        data_size(bytes)
+    };
     ensure!(
-        bytes.len() <= limit,
+        size <= limit,
         "This message is {}; {} accepts up to {}.",
-        megabytes(bytes.len()),
+        megabytes(size),
         endpoint.host,
         megabytes(limit)
     );
@@ -1425,10 +1675,17 @@ pub(crate) fn deliver_raw(
     // receipts, which must never be answered (RFC 8098 §3).
     let mut mail = format!("MAIL FROM:<{from}>");
     if limits.size_offered {
-        mail.push_str(&format!(" SIZE={}", bytes.len()));
+        mail.push_str(&format!(" SIZE={size}"));
     }
-    if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) {
+    // RFC 6531 §3.4 and RFC 6532 §3: UTF-8 addresses, or headers in UTF-8
+    // (such as a message/global-disposition-notification, RFC 6533 §6),
+    // need SMTPUTF8.
+    let head_end = memchr::memmem::find(bytes, b"\r\n\r\n").unwrap_or(bytes.len());
+    let utf8_report = has_global_part(bytes);
+    if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) || utf8_report {
         ensure!(limits.utf8, "{} can't send to this address (no SMTPUTF8).", endpoint.host);
+        mail.push_str(" SMTPUTF8");
+    } else if !bytes[..head_end].is_ascii() && limits.utf8 {
         mail.push_str(" SMTPUTF8");
     }
     // 8-bit content only where the server takes it (RFC 6152 §3).
@@ -1481,6 +1738,37 @@ fn dot_stuffed(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     dot_stuff_into(bytes, &mut out).expect("writing to memory");
     out
+}
+/// The size of `bytes` as DATA sends it, for SIZE (RFC 1870 §4): each
+/// line ending (CRLF, or a bare CR or LF, which `dot_stuff_into` makes
+/// CRLF) counts two octets, and an unended last line gains its CRLF. The
+/// dots stuffed in and the final `.` line aren't counted: RFC 1870 §4
+/// counts the message's own octets, which the server gets back after it
+/// removes them.
+fn data_size(bytes: &[u8]) -> usize {
+    let mut size = 0;
+    let mut i = 0;
+    let mut line_start = true;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' | b'\n' => {
+                if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+                size += 2;
+                line_start = true;
+            }
+            _ => {
+                size += 1;
+                line_start = false;
+            }
+        }
+        i += 1;
+    }
+    if !line_start {
+        size += 2;
+    }
+    size
 }
 /// `bytes` dot-stuffed (RFC 5321 §4.5.2) with CRLF line ends and the final
 /// `.` line, written to `out` in pieces of at most a few hundred kilobytes.
@@ -1566,8 +1854,16 @@ pub(crate) fn receipt(
         now.format("%a, %b %-d %Y at %-H:%M"),
         m.subject.replace(['\r', '\n'], " ")
     ));
+    // RFC 6533 §6: a report naming an address or message id that isn't
+    // ASCII is message/global-disposition-notification, its addresses of
+    // type utf-8 (which reads UTF-8 as is, as message/global does).
+    let international = !a.email.is_ascii()
+        || !original.is_ascii()
+        || !original_recipient.is_ascii();
     out.push_str(&format!(
-        "--{boundary}\r\nContent-Type: message/disposition-notification\r\n\r\n"
+        "--{boundary}\r\nContent-Type: message/{}disposition-notification\r\n{}\r\n",
+        if international { "global-" } else { "" },
+        if international { "Content-Transfer-Encoding: 8bit\r\n" } else { "" },
     ));
     out.push_str(&format!(
         "Reporting-UA: Picacho; Picacho {}\r\n",
@@ -1581,13 +1877,24 @@ pub(crate) fn receipt(
     if original_recipient.contains(';') {
         out.push_str(&format!("Original-Recipient: {}\r\n", original_recipient.trim()));
     }
-    out.push_str(&format!("Final-Recipient: rfc822;{}\r\n", a.email));
+    let address_type = if a.email.is_ascii() { "rfc822" } else { "utf-8" };
+    out.push_str(&format!("Final-Recipient: {address_type};{}\r\n", a.email));
     if !original.is_empty() {
         out.push_str(&format!("Original-Message-ID: {original}\r\n"));
     }
     out.push_str("Disposition: manual-action/MDN-sent-manually; displayed\r\n");
     out.push_str(&format!("--{boundary}--\r\n"));
     out.into_bytes()
+}
+/// Whether a message has a part of a message/global type (RFC 6532 §3.7,
+/// RFC 6533 §6) among its own parts, whose UTF-8 needs SMTPUTF8. Only the
+/// top-level parts' own headers are looked at, not what they contain.
+fn has_global_part(bytes: &[u8]) -> bool {
+    let Ok(mail) = mailparse::parse_mail(bytes) else {
+        return false;
+    };
+    let global = |m: &mailparse::ParsedMail| m.ctype.mimetype.to_ascii_lowercase().starts_with("message/global");
+    global(&mail) || mail.subparts.iter().any(global)
 }
 /// Whether a message can't go as 7- or 8-bit text (RFC 6152): it has a
 /// NUL, a bare CR or LF, or a line over 998 octets.
@@ -1656,9 +1963,148 @@ pub(crate) fn recipients(list: &str) -> Result<Vec<(Option<String>, String)>> {
     Ok(out)
 }
 
+/// Pictures a formatted body places, with the Content-IDs its HTML names
+/// them by.
+#[derive(Debug, Default)]
+struct InlineImages {
+    images: Vec<InlineImage>,
+}
+#[derive(Debug)]
+struct InlineImage {
+    /// The attachment's file name, as `file:` named it.
+    name: String,
+    path: std::path::PathBuf,
+    /// Without its angle brackets.
+    content_id: String,
+}
+/// The pictures `markdown` places with `![alt](file:<name>)` where `name`
+/// is exactly one of `attachments`' file names; each is given a Content-ID
+/// at `from`'s domain (RFC 2392, RFC 5322 §3.6.4), random so unique.
+fn inline_images(markdown: &str, attachments: &[std::path::PathBuf], from: &str) -> InlineImages {
+    let mut found = InlineImages::default();
+    let domain = new_message_id(from);
+    let domain = domain.trim_end_matches('>').rsplit_once('@').map_or("localhost", |(_, d)| d).to_owned();
+    for name in file_images(markdown) {
+        if found.images.iter().any(|i| i.name == name) {
+            continue;
+        }
+        let matching: Vec<&std::path::PathBuf> = attachments
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == name.as_str()))
+            .collect();
+        // Two attachments of one name: which is meant can't be told.
+        if let [path] = matching[..] {
+            found.images.push(InlineImage {
+                name,
+                path: path.clone(),
+                content_id: format!("{}@{domain}", uuid::Uuid::new_v4().simple()),
+            });
+        }
+    }
+    found
+}
+/// The names `![…](file:<name>)` images in `markdown` refer to, in order.
+fn file_images(markdown: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(tree) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else {
+        return names;
+    };
+    fn walk(node: &markdown::mdast::Node, names: &mut Vec<String>) {
+        if let markdown::mdast::Node::Image(image) = node
+            && let Some(name) = image.url.strip_prefix("file:")
+        {
+            names.push(name.to_owned());
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, names);
+        }
+    }
+    walk(&tree, &mut names);
+    names
+}
+
 /// The HTML version of a formatted (Markdown) body. Raw HTML in the text is
 /// escaped, not passed through.
+#[cfg(test)]
 pub(crate) fn html_body(markdown: &str) -> String {
+    html_body_with(markdown, &InlineImages::default())
+}
+/// As `html_body`, with `![…](file:<name>)` pictures shown from `inline`'s
+/// parts by `cid:` (RFC 2392). One not among them (its attachment removed,
+/// or never there) shows its alt text: a `file:` address never goes out,
+/// so no local file name or path does either.
+fn html_body_with(markdown: &str, inline: &InlineImages) -> String {
+    // Each placed picture's address becomes a placeholder the compiler
+    // lets through (it drops `cid:` as an unknown protocol); after, the
+    // placeholder becomes the `cid:` address.
+    let placeholder = |i: usize| format!("https://inline.invalid/{i}");
+    let markdown = rewrite_file_images(markdown, true, |name| {
+        inline
+            .images
+            .iter()
+            .position(|image| image.name == name)
+            .map(placeholder)
+    });
+    let mut html = html_compiled(&markdown);
+    for (i, image) in inline.images.iter().enumerate() {
+        html = html.replace(
+            &format!("src=\"{}\"", placeholder(i)),
+            &format!("src=\"cid:{}\"", image.content_id),
+        );
+    }
+    html
+}
+/// `markdown` with each `file:` image either pointed at what `resolve`
+/// gives for its name, or replaced by its alt text where it gives nothing:
+/// escaped to stay text where the result is compiled (`escape`), as it is
+/// for the plain text.
+fn rewrite_file_images(
+    markdown: &str,
+    escape: bool,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> String {
+    let Ok(tree) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else {
+        return markdown.to_owned();
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    fn walk(
+        node: &markdown::mdast::Node,
+        escape: bool,
+        resolve: &dyn Fn(&str) -> Option<String>,
+        edits: &mut Vec<(usize, usize, String)>,
+    ) {
+        if let markdown::mdast::Node::Image(image) = node
+            && let Some(name) = image.url.strip_prefix("file:")
+            && let Some(at) = &image.position
+        {
+            // The alt text, escaped so it stays text.
+            let alt: String = image
+                .alt
+                .chars()
+                .flat_map(|c| {
+                    let special = matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '!' | '<' | '>' | '#' | '&');
+                    (escape && special).then_some('\\').into_iter().chain(std::iter::once(c))
+                })
+                .collect();
+            let replacement = match resolve(name) {
+                Some(url) => format!("![{alt}](<{url}>)"),
+                None => alt,
+            };
+            edits.push((at.start.offset, at.end.offset, replacement));
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, escape, resolve, edits);
+        }
+    }
+    walk(&tree, escape, &resolve, &mut edits);
+    let mut out = markdown.to_owned();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        out.replace_range(start..end, &replacement);
+    }
+    out
+}
+/// The compiled HTML document of a Markdown body.
+fn html_compiled(markdown: &str) -> String {
     let options = markdown::Options {
         parse: markdown::ParseOptions::gfm(),
         compile: markdown::CompileOptions {
@@ -1715,9 +2161,9 @@ mod tests {
     fn enhanced_codes_and_completions_are_strict() {
         assert_eq!(enhanced_code("5.1.1 no such user"), Some((5, 1, 1)));
         assert_eq!(enhanced_code("5.1234.1 odd"), None);
-        let r = Reply { code: 354, lines: vec!["go ahead".into()] };
+        let r = Reply { code: 354, lines: vec!["go ahead".into()], enhanced: true };
         assert!(!r.positive());
-        let r = Reply { code: 250, lines: vec!["5.0.0 mismatched".into()] };
+        let r = Reply { code: 250, lines: vec!["5.0.0 mismatched".into()], enhanced: true };
         assert_eq!(r.enhanced(), None);
         let limits = server_limits(["SIZE", "BURL imap://imap.example.com", "LIMITS RCPTDOMAINMAX=2"].into_iter());
         assert!(limits.size_offered && limits.size.is_none() && limits.burl_imap);
@@ -1732,6 +2178,80 @@ mod tests {
         assert!(html.contains("<em>there</em><br />"));
         assert!(html.contains("<li>one</li>"));
         assert!(!html.contains("<script>"));
+    }
+
+    /// RFC 1870 §4: the size declared for DATA counts bare CR and LF as
+    /// the CRLF they're sent as, and the unended last line's CRLF; it
+    /// matches what the server gets once it undoes the dot-stuffing.
+    /// RFC 2852 §4: BY= in each mode, with trace; the server's minimum
+    /// raises R mode's time only; nothing without a time limit.
+    #[test]
+    fn deliver_by_modes_and_trace() {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        assert_eq!(DeliverBy::of(&a), None);
+        a.deliver_late_notify = true;
+        a.deliver_by_trace = true;
+        assert_eq!(DeliverBy::of(&a), None, "N and T alone ask for nothing");
+        a.deliver_within_hours = 1;
+        let by = |notify, trace| DeliverBy {
+            notify,
+            trace,
+            ..DeliverBy::of(&a).unwrap()
+        };
+        assert_eq!(by(false, false).parameter(0), "3600;R");
+        assert_eq!(by(true, false).parameter(0), "3600;N");
+        assert_eq!(by(false, true).parameter(0), "3600;RT");
+        assert_eq!(by(true, true).parameter(0), "3600;NT");
+        assert_eq!(by(false, false).parameter(7200), "7200;R");
+        assert_eq!(by(true, true).parameter(7200), "3600;NT");
+        let long = DeliverBy { seconds: 10_000_000_000, notify: false, trace: false };
+        assert_eq!(long.parameter(0), "999999999;R");
+    }
+
+    /// RFC 4865 §3: both limits FUTURERELEASE names are kept to.
+    #[test]
+    fn future_release_keeps_to_the_servers_interval_and_date() {
+        let limits = server_limits(["FUTURERELEASE 604800 2030-01-01T00:00:00Z"].into_iter());
+        assert_eq!(limits.future_release, 604_800);
+        let end = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z").unwrap().timestamp();
+        assert_eq!(limits.future_release_until, Some(end));
+        let now = end - 10 * 86_400;
+        assert_eq!(hold_seconds(&limits, now + 3600, now), Some(3600));
+        // Past the interval.
+        assert_eq!(hold_seconds(&limits, now + 8 * 86_400, now), None);
+        // Within the interval, but after the date-time.
+        let late = end - 3600;
+        assert_eq!(hold_seconds(&limits, end + 60, late), None);
+        assert_eq!(hold_seconds(&limits, end, late), Some(3600));
+        // Only an interval (the date-time is optional in practice).
+        let open = server_limits(["FUTURERELEASE 600"].into_iter());
+        assert_eq!(open.future_release_until, None);
+        assert_eq!(hold_seconds(&open, now + 600, now), Some(600));
+        // No FUTURERELEASE: nothing is held.
+        assert_eq!(hold_seconds(&ServerLimits::default(), now + 60, now), None);
+    }
+
+    #[test]
+    fn data_size_counts_line_endings_as_sent() {
+        for message in [
+            &b"a\r\nb\r\n"[..],
+            b"a\nb\rc\r\n",
+            b"a\n.\n..b\r",
+            b"no ending",
+            b"",
+            b"\r\r\n\n",
+        ] {
+            let stuffed = dot_stuffed(message);
+            // What the server keeps: the stuffed text without the final
+            // line, its doubled dots undone.
+            let body = &stuffed[..stuffed.len() - 3];
+            let kept: usize = body
+                .split_inclusive(|b| *b == b'\n')
+                .map(|line| line.len() - usize::from(line.starts_with(b"..")))
+                .sum();
+            assert_eq!(data_size(message), kept, "{:?}", String::from_utf8_lossy(message));
+        }
+        assert_eq!(data_size(b"a\nb"), 6);
     }
 
     #[test]
@@ -1753,6 +2273,7 @@ mod tests {
     /// or reply.
     #[test]
     fn sender_values_cannot_inject_headers() -> Result<()> {
+        // (See also `international_receipts_are_global_reports`.)
         let mut a = Account::new(crate::manage::model::Provider::Imap);
         a.email = "me@example.com".into();
         let m = crate::manage::model::Mail {
@@ -1773,6 +2294,176 @@ mod tests {
         let sent = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
         assert!(!sent.contains("\r\nBcc:"), "{sent}");
         Ok(())
+    }
+
+    /// A formatted draft with its attachments in a fresh folder.
+    fn with_files(files: &[(&str, &[u8])]) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("picacho-inline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = files
+            .iter()
+            .map(|(name, bytes)| {
+                let path = dir.join(name);
+                std::fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    /// RFC 2387: a picture a formatted body places by `file:` goes in
+    /// multipart/related (type="text/html") beside the HTML, which names
+    /// it by `cid:`, and leaves the attachments; others stay attached.
+    #[test]
+    fn pictures_in_the_body_go_inline_by_content_id() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let (dir, attachments) = with_files(&[("Pasted image.png", b"\x89PNG-1"), ("notes.pdf", b"%PDF")]);
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Look".into(),
+            body: "Here:\n\n![Pasted image](<file:Pasted image.png>)\n\nAnd `![x](file:notes.pdf)` in code.".into(),
+            formatted: true,
+            attachments,
+            ..Draft::default()
+        };
+        let raw = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
+        let parsed = mailparse::parse_mail(raw.as_bytes())?;
+        assert_eq!(parsed.ctype.mimetype, "multipart/mixed");
+        let alternative = &parsed.subparts[0];
+        assert_eq!(alternative.ctype.mimetype, "multipart/alternative");
+        assert_eq!(alternative.subparts[0].ctype.mimetype, "text/plain");
+        let related = &alternative.subparts[1];
+        assert_eq!(related.ctype.mimetype, "multipart/related");
+        assert_eq!(related.ctype.params.get("type").map(String::as_str), Some("text/html"));
+        let html = related.subparts[0].get_body()?;
+        let image = &related.subparts[1];
+        assert_eq!(image.ctype.mimetype, "image/png");
+        use mailparse::MailHeaderMap as _;
+        let cid = image.headers.get_first_value("Content-ID").unwrap();
+        let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
+        assert!(cid.ends_with("@example.com"), "{cid}");
+        assert!(html.contains(&format!("src=\"cid:{cid}\"")), "{html}");
+        assert_eq!(image.get_content_disposition().disposition, mailparse::DispositionType::Inline);
+        assert_eq!(image.get_body_raw()?, b"\x89PNG-1");
+        // The PDF stays an attachment, and only it; the code span is text.
+        assert_eq!(parsed.subparts.len(), 2);
+        assert!(parsed.subparts[1].ctype.mimetype == "application/pdf");
+        assert!(html.contains("<code>![x](file:notes.pdf)</code>"), "{html}");
+        // No local name or `file:` address goes out as a picture's source;
+        // the plain text reads the alt text.
+        assert!(!html.contains("src=\"file:") && !html.contains("Pasted image.png"), "{html}");
+        let plain = alternative.subparts[0].get_body()?;
+        assert!(plain.contains("Pasted image") && !plain.contains("<file:"), "{plain}");
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// A `file:` picture with no attachment of its name (removed, or never
+    /// there), or two of that name, shows its alt text; other images
+    /// (https, data:) are as before.
+    #[test]
+    fn unmatched_file_pictures_are_their_alt_text() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let (dir, attachments) = with_files(&[("other.txt", b"x")]);
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Look".into(),
+            body: "![My *photo*](file:/home/me/secret/photo.png) and ![web](https://example.com/a.png)".into(),
+            formatted: true,
+            attachments,
+            ..Draft::default()
+        };
+        let raw = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
+        assert!(!raw.contains("file:") && !raw.contains("/home/me"), "{raw}");
+        assert!(!raw.contains("multipart/related"));
+        let parsed = mailparse::parse_mail(raw.as_bytes())?;
+        let html = parsed.subparts[0].subparts[1].get_body()?;
+        // Its alt text as text (Markdown's alt is plain: emphasis dropped).
+        assert!(html.contains("<p>My photo and "), "{html}");
+        assert!(html.contains("<img src=\"https://example.com/a.png\" alt=\"web\" />"), "{html}");
+        // Unchanged where there are no `file:` pictures.
+        assert_eq!(
+            html_body_with("![web](https://example.com/a.png)", &InlineImages::default()),
+            html_body("![web](https://example.com/a.png)")
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Without `file:` pictures, the MIME structure is as before: the
+    /// alternative straight in mixed, and the HTML as `html_body` made it.
+    #[test]
+    fn messages_without_inline_pictures_are_unchanged() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let (dir, attachments) = with_files(&[("photo.png", b"\x89PNG")]);
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Look".into(),
+            body: "**Bold** and ![web](https://example.com/a.png)".into(),
+            formatted: true,
+            attachments,
+            ..Draft::default()
+        };
+        let raw = build(&a, &d, false)?.formatted();
+        let parsed = mailparse::parse_mail(&raw)?;
+        assert_eq!(parsed.subparts[0].ctype.mimetype, "multipart/alternative");
+        assert_eq!(parsed.subparts[0].subparts[1].ctype.mimetype, "text/html");
+        assert_eq!(
+            parsed.subparts[0].subparts[1].get_body()?.replace("\r\n", "\n"),
+            html_body(&d.body)
+        );
+        assert_eq!(parsed.subparts[0].subparts[0].get_body()?, flowed(&d.body));
+        assert_eq!(parsed.subparts[1].get_content_disposition().disposition, mailparse::DispositionType::Attachment);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// RFC 6532 §3.7: a forwarded message whose headers are in UTF-8 is
+    /// attached as message/global; an ASCII one stays message/rfc822, as
+    /// it is.
+    #[test]
+    fn internationalized_forwards_are_message_global() {
+        let kind = header::ContentType::parse("message/rfc822").unwrap();
+        let formatted = |part: SinglePart| String::from_utf8_lossy(&part.formatted()).into_owned();
+        let global = formatted(attachment_part(
+            "fwd.eml".into(),
+            "From: Jörg <jörg@bücher.example>\r\nSubject: Grüße\r\n\r\nHallo\r\n".as_bytes().to_vec(),
+            kind.clone(),
+        ));
+        assert!(global.contains("Content-Type: message/global"), "{global}");
+        let plain = formatted(attachment_part(
+            "fwd.eml".into(),
+            b"From: ana@example.com\r\nSubject: Hi\r\n\r\nHall\xc3\xb6\r\n".to_vec(),
+            kind,
+        ));
+        assert!(plain.contains("Content-Type: message/rfc822"), "{plain}");
+        assert!(plain.contains("Content-Transfer-Encoding: 8bit"), "{plain}");
+    }
+
+    /// RFC 6533 §6: a read receipt naming non-ASCII addresses is a
+    /// message/global-disposition-notification with utf-8 addresses; an
+    /// ASCII one stays message/disposition-notification.
+    #[test]
+    fn international_receipts_are_global_reports() {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "jörg@bücher.example".into();
+        let m = crate::manage::model::Mail {
+            message_id: "<id@example.com>".into(),
+            subject: "Grüße".into(),
+            ..Default::default()
+        };
+        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com", "")).unwrap();
+        assert!(raw.contains("Content-Type: message/global-disposition-notification\r\n"), "{raw}");
+        assert!(raw.contains("Final-Recipient: utf-8;jörg@bücher.example\r\n"), "{raw}");
+        assert!(has_global_part(raw.as_bytes()));
+        a.email = "me@example.com".into();
+        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com", "rfc822;me@example.com")).unwrap();
+        assert!(raw.contains("Content-Type: message/disposition-notification\r\n"), "{raw}");
+        assert!(raw.contains("Final-Recipient: rfc822;me@example.com\r\n"), "{raw}");
+        assert!(!has_global_part(raw.as_bytes()));
     }
 
     /// Mail sent as an alias asks for read receipts at the alias and
@@ -1904,11 +2595,95 @@ mod tests {
         assert_eq!(xtext("a+b=c d"), "a+2Bb+3Dc+20d");
     }
 
+    /// A stream whose replies are scripted and whose writes are kept.
+    struct Scripted {
+        replies: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.replies.read(buf)
+        }
+    }
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Patience for Scripted {
+        fn wait_for(&mut self, _: Option<Duration>) {}
+    }
+    fn scripted(replies: &str) -> Session<Scripted> {
+        Session::new(Scripted {
+            replies: std::io::Cursor::new(replies.as_bytes().to_vec()),
+            written: Vec::new(),
+        })
+    }
+
+    /// RFC 2034 and RFC 3463: once EHLO offers ENHANCEDSTATUSCODES, every
+    /// refusal (a command, the sign-in, DATA and its end, BDAT) says what
+    /// its code means; a code repeated on each line shows once; and from a
+    /// server that didn't offer them, a code-like text is only text.
+    #[test]
+    fn enhanced_codes_are_read_everywhere_a_server_refuses() {
+        let ehlo = "250-fixture\r\n250 ENHANCEDSTATUSCODES\r\n";
+        let text = |e: anyhow::Error| format!("{e:#}");
+        // A plain command.
+        let mut s = scripted(&format!("{ehlo}550-5.7.1 Relaying\r\n550 5.7.1 denied\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.expect("RSET", "Refused").unwrap_err());
+        assert_eq!(e, "Refused: The server refused this by its policy (550 5.7.1 Relaying denied)");
+        // DATA refused before the message.
+        let mut s = scripted(&format!("{ehlo}554 5.3.4 Too big\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.data(b"x").unwrap_err());
+        assert!(e.contains("The message is too large (554 5.3.4 Too big)"), "{e}");
+        // DATA refused after it: no longer taken as accepted.
+        let mut s = scripted(&format!("{ehlo}354 go\r\n550 5.7.26 DMARC\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.data(b"x").unwrap_err());
+        assert!(e.contains("sender checks (550 5.7.26 DMARC)"), "{e}");
+        // BDAT.
+        let mut s = scripted(&format!("{ehlo}552 5.2.2 Mailbox full\r\n"));
+        s.ehlo().unwrap();
+        let e = text(s.bdat(b"x", false).unwrap_err());
+        assert!(e.contains("That mailbox is full (552 5.2.2"), "{e}");
+        // The sign-in.
+        let mut s = scripted(&format!("{ehlo}535 5.7.8 Bad credentials\r\n"));
+        let limits = ServerLimits {
+            auth: vec!["PLAIN".into()],
+            ..s.ehlo().unwrap()
+        };
+        let endpoint = Endpoint {
+            host: "mail.example".into(),
+            port: 587,
+            user: "me".into(),
+            oauth: false,
+            implicit_tls: false,
+            kerberos: false,
+        };
+        let e = text(s.authenticate(&endpoint, &limits, "pw").unwrap_err());
+        assert_eq!(
+            e,
+            "mail.example refused the sign-in with PLAIN: The sign-in wasn't accepted (535 5.7.8 Bad credentials)"
+        );
+        // Without ENHANCEDSTATUSCODES: the text as it is.
+        let mut s = scripted("250-fixture\r\n250 SIZE\r\n550 5.1.1 is just text\r\n");
+        s.ehlo().unwrap();
+        let e = text(s.expect("RSET", "Refused").unwrap_err());
+        assert_eq!(e, "Refused: 550 5.1.1 is just text");
+    }
+
     #[test]
     fn enhanced_codes_explain_refusals() {
         let reply = |code, line: &str| Reply {
             code,
             lines: vec![line.to_owned()],
+            enhanced: true,
         };
         let gone = reply(550, "5.1.1 <x@example.com>: Recipient address rejected");
         assert_eq!(gone.enhanced(), Some((5, 1, 1)));
@@ -1926,36 +2701,11 @@ mod tests {
 
     #[test]
     fn recipients_go_in_as_many_transactions_as_the_server_needs() {
-        use std::io::Cursor;
-        // A stream whose replies are scripted and whose writes are kept.
-        struct Scripted {
-            replies: Cursor<Vec<u8>>,
-            written: Vec<u8>,
-        }
-        impl Read for Scripted {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.replies.read(buf)
-            }
-        }
-        impl Write for Scripted {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.written.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl Patience for Scripted {
-            fn wait_for(&mut self, _: Option<Duration>) {}
-        }
         let a: lettre::Address = "a@x.org".parse().unwrap();
         let b: lettre::Address = "b@x.org".parse().unwrap();
         let script = "250 2.1.0 OK\r\n250 2.1.5 OK\r\n452 4.5.3 Too many recipients\r\n";
-        let mut session = Session::new(Scripted {
-            replies: Cursor::new(script.as_bytes().to_vec()),
-            written: Vec::new(),
-        });
+        let mut session = scripted(script);
+        session.enhanced = true;
         let rcpt = |t: &lettre::Address| format!("RCPT TO:<{t}> ORCPT=rfc822;{}", xtext(AsRef::<str>::as_ref(t)));
         let replies =
             transaction(&mut session, "MAIL FROM:<me@x.org>", &[&a, &b], &rcpt, true).unwrap();
@@ -1966,6 +2716,40 @@ mod tests {
             written,
             "MAIL FROM:<me@x.org>\r\nRCPT TO:<a@x.org> ORCPT=rfc822;a@x.org\r\nRCPT TO:<b@x.org> ORCPT=rfc822;b@x.org\r\n"
         );
+    }
+
+    /// RFC 5322 §3.6.4: every sent message has a Message-ID at the
+    /// sender's domain (the alias's, sent as one), random each time, and
+    /// never the computer's name.
+    #[test]
+    fn message_ids_use_the_senders_domain() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Hi".into(),
+            ..Draft::default()
+        };
+        let id = |m: &Message| message_id_of(m);
+        let first = id(&build(&a, &d, false)?);
+        let second = id(&build(&a, &d, false)?);
+        assert!(first.starts_with('<') && first.ends_with("@example.com>"), "{first}");
+        assert_ne!(first, second);
+        assert_eq!(first.len(), "<@example.com>".len() + 32);
+        let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+        if !host.trim().is_empty() {
+            assert!(!first.contains(host.trim()), "{first}");
+        }
+        let alias = Draft {
+            send_as: "shop@alias.example".into(),
+            ..d.clone()
+        };
+        assert!(id(&build(&a, &alias, false)?).ends_with("@alias.example>"));
+        // Drafts saved on the server get none: their sent message will.
+        assert!(id(&build(&a, &d, true)?).is_empty());
+        assert!(new_message_id("ana@bücher.example").ends_with("@xn--bcher-kva.example>"));
+        assert!(new_message_id("odd").ends_with("@localhost>"));
+        Ok(())
     }
 
     #[test]

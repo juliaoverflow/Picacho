@@ -1154,6 +1154,31 @@ impl MailApp {
                 Action::ToggleDeliveryReceipts(a.id.clone()),
                 cx,
             ))
+            // RFC 3461 §4.1, §4.3: which reports, and how much of the
+            // message a failure report returns.
+            .when(a.delivery_receipts, |page| {
+                let dsn = a.dsn;
+                let toggle = |title: &str, caption: &str, key: &str, on: bool, change: DsnChange| {
+                    self.switch_setting(
+                        title,
+                        caption,
+                        format!("dsn-{key}-{}", a.id),
+                        on,
+                        Action::SetDsn(a.id.clone(), change),
+                        cx,
+                    )
+                };
+                page.child(toggle("Report delivery", "When it arrives.", "success", dsn.success, DsnChange::Success))
+                    .child(toggle("Report failure", "When it can't be delivered.", "failure", dsn.failure, DsnChange::Failure))
+                    .child(toggle("Report delays", "When delivery is taking longer than usual.", "delay", dsn.delay, DsnChange::Delay))
+                    .child(toggle(
+                        "Return the full message",
+                        "A failure report includes the whole message rather than only its headers.",
+                        "full",
+                        dsn.return_full,
+                        DsnChange::ReturnFull,
+                    ))
+            })
             .when_some(a.sso.as_ref(), |page, sso| {
                 let c = self.colors();
                 page.child(
@@ -1222,6 +1247,39 @@ impl MailApp {
                     ),
                 ))
             })
+            // RFC 2852 §4: what a late message does, and a trace of its
+            // way; only with a time limit.
+            .when(
+                !matches!(a.provider, Provider::Proton | Provider::Jmap) && a.deliver_within_hours > 0,
+                |page| {
+                    page.child(self.setting(
+                        "If it's late",
+                        "Return it to you, or deliver it anyway and tell you it was late.",
+                        self.segmented(
+                            &format!("deliver-late-{}", a.id),
+                            [(false, "Return it"), (true, "Deliver and tell me")]
+                                .into_iter()
+                                .map(|(notify, label)| {
+                                    (
+                                        label.to_owned(),
+                                        Action::SetDeliverLateNotify(a.id.clone(), notify),
+                                        a.deliver_late_notify == notify,
+                                    )
+                                })
+                                .collect(),
+                            cx,
+                        ),
+                    ))
+                    .child(self.switch_setting(
+                        "Trace its delivery",
+                        "Each server on the way reports passing it on, where they support it (DELIVERBY trace).",
+                        format!("deliver-by-trace-{}", a.id),
+                        a.deliver_by_trace,
+                        Action::ToggleDeliverByTrace(a.id.clone()),
+                        cx,
+                    ))
+                },
+            )
             .when(a.provider != Provider::Proton, |page| {
                 page.child(self.switch_setting(
                     "Let the server send scheduled messages",

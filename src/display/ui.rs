@@ -649,6 +649,14 @@ pub(super) enum Undo {
     /// Messages just snoozed, by Message-ID: back to the inbox now.
     Snooze(String, Vec<String>),
 }
+/// Which delivery report option (`DsnOptions`) a switch turns over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DsnChange {
+    Success,
+    Failure,
+    Delay,
+    ReturnFull,
+}
 #[derive(Clone)]
 enum Action {
     /// Proton sign-in: a security key or passkey, this way.
@@ -995,6 +1003,13 @@ enum Action {
     ToggleRequireTls(String),
     /// An account's delivery time limit (`Account::deliver_within_hours`).
     SetDeliverWithin(String, u32),
+    /// Whether a late message is delivered with a note (DELIVERBY N mode)
+    /// rather than returned: (account, on).
+    SetDeliverLateNotify(String, bool),
+    /// Turns DELIVERBY's trace on or off for an account.
+    ToggleDeliverByTrace(String),
+    /// Turns one of an account's delivery report options on or off.
+    SetDsn(String, DsnChange),
     /// Signs this account (its id) in with Kerberos, or with its password again.
     ToggleKerberos(String),
     /// The account being set up signs in with Kerberos instead of a password.
@@ -1747,6 +1762,9 @@ pub struct MailApp {
     /// Invitations found in messages, by message id (None: none found, or
     /// still looking).
     invitations: HashMap<String, Option<calendar::Invitation>>,
+    /// Delivery reports (DSN) read from downloaded messages, by message id
+    /// (None: not a report).
+    delivery_reports: HashMap<String, Option<crate::sync::dsn::DeliveryReport>>,
     /// The message whose invitation is being answered.
     invitation_busy: Option<String>,
     /// The invitation (its message) whose propose-a-time form is open.
@@ -2743,6 +2761,7 @@ impl MailApp {
             key_checking: None,
             key_check_input,
             invitations: HashMap::new(),
+            delivery_reports: HashMap::new(),
             invitation_busy: None,
             proposing: None,
             calendar_url,
@@ -6721,6 +6740,22 @@ impl MailApp {
             Action::SetDeliverWithin(id, hours) => {
                 self.edit_account(&id, |a| a.deliver_within_hours = hours, cx)
             }
+            Action::SetDeliverLateNotify(id, on) => {
+                self.edit_account(&id, |a| a.deliver_late_notify = on, cx)
+            }
+            Action::ToggleDeliverByTrace(id) => {
+                self.edit_account(&id, |a| a.deliver_by_trace = !a.deliver_by_trace, cx)
+            }
+            Action::SetDsn(id, change) => self.edit_account(
+                &id,
+                |a| match change {
+                    DsnChange::Success => a.dsn.success = !a.dsn.success,
+                    DsnChange::Failure => a.dsn.failure = !a.dsn.failure,
+                    DsnChange::Delay => a.dsn.delay = !a.dsn.delay,
+                    DsnChange::ReturnFull => a.dsn.return_full = !a.dsn.return_full,
+                },
+                cx,
+            ),
             Action::ToggleSetupKerberos => {
                 self.setup_kerberos = !self.setup_kerberos;
                 self.setup_sso &= !self.setup_kerberos;
