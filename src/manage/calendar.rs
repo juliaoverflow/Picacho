@@ -809,7 +809,19 @@ impl Backend {
         let stored = self
             .stored_event(uid)
             .context("This event is no longer in your calendar. Read it again.")?;
-        caldav::attach(&server, &self.calendar_password()?, self.tls_connector()?, &stored, path)?;
+        caldav::attach(&server, &self.calendar_password()?, self.tls_connector()?, &stored, path, None, None)?;
+        self.sync_calendar()?;
+        Ok(())
+    }
+    /// Takes a file the calendar server keeps (its MANAGED-ID, RFC 8607
+    /// §3.6) off an event, then reads the calendar again.
+    pub fn remove_event_attachment(&self, uid: &str, managed_id: &str) -> Result<()> {
+        let server = self.calendar_server().context("No calendar server is set up.")?;
+        ensure!(self.calendar_jmap(&server)?.is_none(), "Attachments are kept on CalDAV calendars.");
+        let stored = self
+            .stored_event(uid)
+            .context("This event is no longer in your calendar. Read it again.")?;
+        caldav::remove_attachment(&server, &self.calendar_password()?, self.tls_connector()?, &stored, managed_id, None)?;
         self.sync_calendar()?;
         Ok(())
     }

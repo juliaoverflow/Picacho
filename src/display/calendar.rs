@@ -1079,6 +1079,12 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::RemoveEventAttachment(uid, managed_id) => {
+                self.calendar_run(cx, move |b| {
+                    b.remove_event_attachment(&uid, &managed_id)?;
+                    Ok("Removed the attachment".into())
+                });
+            }
             Action::DeleteCalendar(href) => {
                 self.calendar_run(cx, move |b| {
                     b.delete_calendar(&href)?;
@@ -1326,6 +1332,42 @@ impl MailApp {
 
     /// The account an event you organize is sent from: the one whose
     /// address organizes it, or (for a new event) the first.
+    /// The event's attached files (ATTACH); those the server keeps (RFC
+    /// 8607 MANAGED-ID) can be removed here.
+    fn event_attachments(&self, uid: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = self.colors();
+        let stored = self.backend.stored_event(uid).filter(|_| !uid.is_empty())?;
+        let files = stored.event.attachments();
+        if files.is_empty() {
+            return None;
+        }
+        let mut list = div().id("event-attachments").flex().flex_col().gap_1();
+        for (i, f) in files.into_iter().enumerate() {
+            let size = f.size.map(|s| format!(" ({} KB)", s.div_ceil(1024))).unwrap_or_default();
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon_el("paperclip", 13., c.muted))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(format!(
+                        "{}{size}",
+                        if f.name.is_empty() { "Attachment".to_owned() } else { f.name.clone() }
+                    )))
+                    .when(!f.managed_id.is_empty(), |d| {
+                        d.child(self.button(
+                            format!("event-attachment-remove-{i}"),
+                            "Remove",
+                            "",
+                            Action::RemoveEventAttachment(uid.to_owned(), f.managed_id.clone()),
+                            false,
+                            cx,
+                        ))
+                    }),
+            );
+        }
+        Some(list.into_any_element())
+    }
     /// Under the guests: those the server says it couldn't reach (RFC 6638
     /// §7.3 SCHEDULE-STATUS 3.x or 5.x), and a way to send again.
     fn undelivered_guests(&self, uid: &str, cx: &Context<Self>) -> Option<AnyElement> {
@@ -2068,6 +2110,7 @@ impl MailApp {
                     .child(labelled("Notes", "event-notes", &self.event_notes))
                     .child(labelled("Guests (invited by mail; separated by commas)", "event-guests", &self.event_guests))
                     .children(self.undelivered_guests(uid, cx))
+                    .children(self.event_attachments(uid, cx))
                     .child(
                         div()
                             .flex()

@@ -754,6 +754,9 @@ enum Action {
     /// Attaches a file to an event (its UID) where the calendar keeps
     /// attachments itself (RFC 8607).
     AttachToEvent(String),
+    /// Takes a file the calendar server keeps off an event: (UID,
+    /// MANAGED-ID), RFC 8607 §3.6.
+    RemoveEventAttachment(String, String),
     /// Adds the task in the form; marks a task (its UID) done.
     AddTask,
     CompleteTask(String),
@@ -6446,6 +6449,7 @@ impl MailApp {
             | Action::RenameCalendar(_)
             | Action::DeleteCalendar(_)
             | Action::AttachToEvent(_)
+            | Action::RemoveEventAttachment(..)
             | Action::AddTask
             | Action::CompleteTask(_)
             | Action::EditTask(_)

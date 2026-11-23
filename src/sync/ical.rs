@@ -252,7 +252,54 @@ pub struct Alarm {
     pub acknowledged: bool,
 }
 
+/// A file attached to an event (ATTACH, RFC 5545 §3.8.1.1), as
+/// `Event::attachments` reads it from what's kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Attachment {
+    /// Where it is (a URI), or empty for one inline (VALUE=BINARY).
+    pub uri: String,
+    /// FILENAME (RFC 8607 §4.2), else the URI's last part.
+    pub name: String,
+    /// FMTTYPE: its media type, where given.
+    pub media_type: String,
+    /// SIZE (RFC 8607 §4.3), in octets, where given.
+    pub size: Option<u64>,
+    /// MANAGED-ID (RFC 8607 §4.1): the server keeps it, and updates or
+    /// removes it by this.
+    pub managed_id: String,
+}
+
 impl Event {
+    /// The files attached to the event (ATTACH lines kept as they came).
+    pub fn attachments(&self) -> Vec<Attachment> {
+        let mut depth = 0;
+        let mut out = Vec::new();
+        for line in unfold(&self.kept) {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("BEGIN:") {
+                depth += 1;
+            } else if upper.starts_with("END:") {
+                depth -= 1;
+            } else if depth == 0
+                && let Some((name, params, value)) = split_line(&line)
+                && name == "ATTACH"
+            {
+                let inline = param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("BINARY"));
+                let uri = if inline { String::new() } else { value.trim().to_owned() };
+                let file = param(&params, "FILENAME").map(str::to_owned).unwrap_or_else(|| {
+                    uri.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("").to_owned()
+                });
+                out.push(Attachment {
+                    uri,
+                    name: file,
+                    media_type: param(&params, "FMTTYPE").unwrap_or_default().to_owned(),
+                    size: param(&params, "SIZE").and_then(|s| s.parse().ok()),
+                    managed_id: param(&params, "MANAGED-ID").unwrap_or_default().to_owned(),
+                });
+            }
+        }
+        out
+    }
     /// GEO's latitude and longitude, where it holds two numbers in range.
     pub fn coordinates(&self) -> Option<(f64, f64)> {
         let (lat, lon) = self.geo.split_once(';')?;

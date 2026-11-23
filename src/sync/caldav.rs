@@ -678,14 +678,18 @@ pub fn remove_from_inbox(
 }
 
 /// Attaches a file to an event where the calendar keeps attachments itself
-/// (managed attachments, RFC 8607). Returns the event's new ETag; the
-/// server adds the ATTACH to it, so read the event again to show it.
+/// (managed attachments, RFC 8607), or replaces the one with MANAGED-ID
+/// `replacing`. `occurrence`: only that one of a repeating event (§3.4
+/// `rid`). Returns the event's new ETag; the server changes the ATTACH in
+/// it, so read the event again to show it.
 pub fn attach(
     server: &Server,
     password: &str,
     tls: native_tls::TlsConnector,
     stored: &Stored,
     path: &std::path::Path,
+    replacing: Option<&str>,
+    occurrence: Option<i64>,
 ) -> Result<String> {
     ensure!(!stored.href.is_empty(), "Save the event before attaching files.");
     let c = client(server, password, tls)?;
@@ -694,10 +698,23 @@ pub fn attach(
         c.manages_attachments(&calendar)?,
         "This calendar server can't keep attachments."
     );
+    // RFC 8607 §6: the server's limits, said before the file is sent.
+    let (most_size, most_count) = c.attachment_limits(&calendar).unwrap_or((None, None));
     // Servers refuse large files anyway; don't read a huge one into memory.
     const MOST: u64 = 100 * 1024 * 1024;
+    let most = most_size.map_or(MOST, |m| m.min(MOST));
     let size = std::fs::metadata(path)?.len();
-    ensure!(size <= MOST, "This file is too large to attach to an event (100 MB at most).");
+    ensure!(
+        size <= most,
+        "This file is too large to attach to this event ({} at most).",
+        if most >= 1 << 20 { format!("{} MB", most >> 20) } else { format!("{} KB", (most >> 10).max(1)) }
+    );
+    if let Some(n) = most_count.filter(|_| replacing.is_none()) {
+        ensure!(
+            (stored.event.attachments().iter().filter(|a| !a.managed_id.is_empty()).count() as u64) < n,
+            "This event has as many attachments as the server allows ({n})."
+        );
+    }
     let data = std::fs::read(path)?;
     let name = path
         .file_name()
@@ -705,7 +722,35 @@ pub fn attach(
         .unwrap_or("attachment")
         .to_owned();
     let kind = mime_guess::from_path(path).first_or_octet_stream().to_string();
-    c.add_attachment(&url::Url::parse(&stored.href)?, &stored.etag, &name, &kind, data)
+    let change = match replacing {
+        Some(managed_id) => dav::AttachmentChange::Update { managed_id, name: &name, content_type: &kind, data },
+        None => dav::AttachmentChange::Add { name: &name, content_type: &kind, data },
+    };
+    let rids = occurrence.map(|at| vec![rid(&stored.event, at)]).unwrap_or_default();
+    Ok(c.attachment(&url::Url::parse(&stored.href)?, &stored.etag, &change, &rids)?.etag)
+}
+
+/// Removes a managed attachment (RFC 8607 §3.6) from an event, or from
+/// only `occurrence` of a repeating one. Returns the event's new ETag.
+pub fn remove_attachment(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    stored: &Stored,
+    managed_id: &str,
+    occurrence: Option<i64>,
+) -> Result<String> {
+    ensure!(!managed_id.is_empty(), "This attachment isn't kept by the calendar server.");
+    let c = client(server, password, tls)?;
+    let rids = occurrence.map(|at| vec![rid(&stored.event, at)]).unwrap_or_default();
+    Ok(c.attachment(&url::Url::parse(&stored.href)?, &stored.etag, &dav::AttachmentChange::Remove { managed_id }, &rids)?.etag)
+}
+
+/// An occurrence's RECURRENCE-ID as RFC 8607 §3.4's `rid` writes it: UTC,
+/// or a date for all-day events.
+fn rid(series: &ical::Event, at: i64) -> String {
+    let t = chrono::DateTime::from_timestamp(at, 0).unwrap_or_default();
+    if series.all_day { t.format("%Y%m%d").to_string() } else { t.format("%Y%m%dT%H%M%SZ").to_string() }
 }
 
 /// Removes an event.
@@ -780,6 +825,58 @@ mod tests {
         let seen = server.join().unwrap();
         assert_eq!(seen.iter().filter(|(m, ..)| m == "PUT").count(), 1);
         Ok(())
+    }
+
+    /// RFC 8607: an attachment is added with its name (filename* where it
+    /// isn't ASCII), replaced and removed by its MANAGED-ID, for one
+    /// occurrence by `rid`; the server's limits are said before sending.
+    #[test]
+    fn managed_attachments() -> Result<()> {
+        assert_eq!(dav_disposition("plan.pdf"), "attachment;filename=\"plan.pdf\"");
+        assert_eq!(dav_disposition("Pläne 2026.pdf"), "attachment;filename=\"Pl_ne 2026.pdf\";filename*=UTF-8''Pl%C3%A4ne%202026.pdf");
+        let (port, server) = dav::test_server(8, |method, path, body| match (method, path) {
+            ("OPTIONS", _) => ("200 OK", String::new()),
+            ("PROPFIND", "/cal/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><c:max-attachment-size>20</c:max-attachment-size><c:max-attachments-per-resource>1</c:max-attachments-per-resource></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("POST", p) if p.starts_with("/cal/e.ics?action=attachment-update&managed-id=m1&rid=20261124T090000Z") => {
+                assert!(body.ends_with("small"), "{body}");
+                ("200 OK", String::new())
+            }
+            ("POST", "/cal/e.ics?action=attachment-remove&managed-id=m1") => ("204 No Content", String::new()),
+            _ => ("404 Not Found", format!("{method} {path}")),
+        });
+        let dir = std::env::temp_dir().join(format!("picacho-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let (small, big) = (dir.join("s.txt"), dir.join("b.txt"));
+        std::fs::write(&small, "small")?;
+        std::fs::write(&big, "x".repeat(100))?;
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let at = 1_795_510_800; // 2026-11-24T09:00Z
+        let stored = Stored {
+            event: ical::parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\nDTSTART:20261117T090000Z\r\nRRULE:FREQ=WEEKLY\r\nATTACH;MANAGED-ID=m1;FILENAME=agenda.txt;SIZE=12;FMTTYPE=text/plain:https://dav.example/att/m1\r\nATTACH:https://example.org/files/map.png\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").events.remove(0),
+            calendar: format!("http://127.0.0.1:{port}/cal/"),
+            href: format!("http://127.0.0.1:{port}/cal/e.ics"),
+            ..Default::default()
+        };
+        let files = stored.event.attachments();
+        assert_eq!(files.len(), 2);
+        assert_eq!((files[0].name.as_str(), files[0].size, files[0].managed_id.as_str()), ("agenda.txt", Some(12), "m1"));
+        assert_eq!((files[1].name.as_str(), files[1].managed_id.as_str()), ("map.png", ""));
+        // Too large for the server; one too many.
+        let err = attach(&srv, "secret", tls(), &stored, &big, Some("m1"), None).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let err = attach(&srv, "secret", tls(), &stored, &small, None, None).unwrap_err();
+        assert!(err.to_string().contains("as many attachments"), "{err}");
+        // Replaced for one occurrence; then removed.
+        attach(&srv, "secret", tls(), &stored, &small, Some("m1"), Some(at))?;
+        remove_attachment(&srv, "secret", tls(), &stored, "m1", None)?;
+        assert!(remove_attachment(&srv, "secret", tls(), &stored, "", None).is_err());
+        assert_eq!(server.join().unwrap().len(), 8);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    fn dav_disposition(name: &str) -> String {
+        dav::content_disposition(name)
     }
 
     /// RFC 6638 §5.1.2, §10.2: each recipient's request-status is read;

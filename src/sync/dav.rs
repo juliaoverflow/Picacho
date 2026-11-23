@@ -286,7 +286,7 @@ fn namespace_of(name: &str) -> Option<&'static str> {
         "calendar" | "calendar-data" | "calendar-home-set" | "schedule-inbox-URL"
         | "schedule-outbox-URL" | "schedule-tag" | "supported-calendar-component-set"
         | "supported-calendar-data" | "min-date-time" | "max-date-time" | "max-instances"
-        | "max-attendees-per-instance" | "calendar-description" | "calendar-timezone"
+        | "max-attendees-per-instance" | "max-attachment-size" | "max-attachments-per-resource" | "calendar-description" | "calendar-timezone"
         | "mkcalendar-response" | "schedule-response" | "recipient" | "request-status"
         | "calendar-user-address-set" | "schedule-default-calendar-URL" => CALDAV,
         "addressbook" | "address-data" | "addressbook-home-set" | "supported-address-data"
@@ -1038,30 +1038,45 @@ impl Client {
         self.find_href(&principal, "schedule-inbox-URL", CALDAV)?
             .context("This server has no scheduling inbox.")
     }
-    /// Adds a file to a calendar resource (managed attachments, RFC 8607
-    /// §3.4: POST `?action=attachment-add`), returning the resource's new
-    /// ETag. The server keeps the file and puts an ATTACH in the event.
-    pub fn add_attachment(
+    /// Adds, replaces or removes a managed attachment (RFC 8607 §3.4–§3.6),
+    /// for the whole event or only the occurrences `rids` names (§3.4:
+    /// `rid=` RECURRENCE-ID values, `M` for the series itself).
+    pub fn attachment(
         &self,
         href: &url::Url,
         etag: &str,
-        name: &str,
-        content_type: &str,
-        data: Vec<u8>,
-    ) -> Result<String> {
+        change: &AttachmentChange,
+        rids: &[String],
+    ) -> Result<AttachmentResult> {
         let mut url = href.clone();
-        url.query_pairs_mut().append_pair("action", "attachment-add");
-        let disposition = format!(
-            "attachment;filename=\"{}\"",
-            name.replace(['"', '\\', '\r', '\n'], "_")
-        );
+        {
+            let mut q = url.query_pairs_mut();
+            match change {
+                AttachmentChange::Add { .. } => q.append_pair("action", "attachment-add"),
+                AttachmentChange::Update { managed_id, .. } => {
+                    q.append_pair("action", "attachment-update").append_pair("managed-id", managed_id)
+                }
+                AttachmentChange::Remove { managed_id } => {
+                    q.append_pair("action", "attachment-remove").append_pair("managed-id", managed_id)
+                }
+            };
+            if !rids.is_empty() {
+                q.append_pair("rid", &rids.join(","));
+            }
+        }
         let mut request = self
             .http
             .post(url.clone())
-            .basic_auth(&self.user, Some(&self.password))
-            .header("Content-Type", content_type)
-            .header("Content-Disposition", disposition)
-            .body(data);
+            .basic_auth(&self.user, Some(&self.password));
+        match change {
+            AttachmentChange::Add { name, content_type, data } | AttachmentChange::Update { name, content_type, data, .. } => {
+                request = request
+                    .header("Content-Type", *content_type)
+                    .header("Content-Disposition", content_disposition(name))
+                    .body(data.clone());
+            }
+            AttachmentChange::Remove { .. } => {}
+        }
         if !etag.is_empty() && !etag.starts_with("W/") {
             request = request.header("If-Match", etag);
         }
@@ -1077,13 +1092,46 @@ impl Client {
         {
             bail!("The server has no room for this attachment.");
         }
-        ensure!(status.is_success(), "The server didn't add the attachment ({status}).");
-        Ok(response
-            .headers()
-            .get("ETag")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_owned())
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::CONFLICT {
+            // RFC 8607 §3.8: a precondition says which limit it was.
+            let body = body_text(response).unwrap_or_default();
+            bail!(
+                "{}",
+                if body.contains("max-attachment-size") {
+                    "This file is larger than the calendar server takes."
+                } else if body.contains("max-attachments-per-resource") {
+                    "This event has as many attachments as the server allows."
+                } else if body.contains("valid-managed-id") {
+                    "That attachment is no longer on the event. Read it again."
+                } else if body.contains("valid-rid") {
+                    "That occurrence isn't part of the event."
+                } else {
+                    "The calendar server refused the attachment."
+                }
+            );
+        }
+        ensure!(status.is_success(), "The server didn't change the attachment ({status}).");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        // RFC 8607 §3.4: the new attachment's id, for updating or removing it.
+        Ok(AttachmentResult { etag: header("ETag"), managed_id: header("Cal-Managed-ID") })
+    }
+    /// A calendar home's limits on managed attachments (RFC 8607 §6.1–§6.2:
+    /// `max-attachment-size`, `max-attachments-per-resource`), where it says.
+    pub fn attachment_limits(&self, url: &url::Url) -> Result<(Option<u64>, Option<u64>)> {
+        let body = format!(
+            "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"{CALDAV}\"><d:prop><c:max-attachment-size/><c:max-attachments-per-resource/></d:prop></d:propfind>"
+        );
+        let text = self.xml("PROPFIND", url, "0", &body)?;
+        let doc = parse(&text)?;
+        let number = |name: &str| text_of(doc.root(), name).and_then(|t| t.parse::<u64>().ok());
+        Ok((number("max-attachment-size"), number("max-attachments-per-resource")))
     }
     /// Whether a calendar collection keeps attachments itself (RFC 8607
     /// `calendar-managed-attachments` in its DAV header).
@@ -1220,6 +1268,47 @@ impl std::fmt::Display for Forbidden {
     }
 }
 impl std::error::Error for Forbidden {}
+
+/// A change to a managed attachment (RFC 8607 §3.4–§3.6).
+pub enum AttachmentChange<'a> {
+    Add { name: &'a str, content_type: &'a str, data: Vec<u8> },
+    /// Replaces the file with MANAGED-ID `managed_id`.
+    Update { managed_id: &'a str, name: &'a str, content_type: &'a str, data: Vec<u8> },
+    Remove { managed_id: &'a str },
+}
+/// What the server answered to an attachment change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentResult {
+    /// The event's new ETag, where it said.
+    pub etag: String,
+    /// The attachment's MANAGED-ID (`Cal-Managed-ID`), for an add or update.
+    pub managed_id: String,
+}
+
+/// A Content-Disposition for a file named `name` (RFC 8607 §3.4, RFC 6266
+/// §4.3): a plain ASCII `filename`, and RFC 8187's `filename*` with the
+/// name as it is where it isn't plain ASCII.
+pub(crate) fn content_disposition(name: &str) -> String {
+    let plain: String = name
+        .chars()
+        .map(|c| if c.is_ascii_graphic() && !matches!(c, '"' | '\\' | '%') || c == ' ' { c } else { '_' })
+        .collect();
+    if plain == name {
+        return format!("attachment;filename=\"{plain}\"");
+    }
+    // RFC 8187 §3.2.1: attr-char stays, everything else is %-encoded UTF-8.
+    let encoded: String = name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    format!("attachment;filename=\"{plain}\";filename*=UTF-8''{encoded}")
+}
 
 /// The server sent the request elsewhere: a redirect to another host,
 /// which isn't followed with the password unasked.
