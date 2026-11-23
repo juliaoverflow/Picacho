@@ -785,6 +785,9 @@ enum Action {
     /// Lists the server's address books; renames one (its href) as in the
     /// form, deletes one, or makes it where new contacts go.
     ListAddressBooks,
+    /// Asks the contacts server for those matching the filter (RFC 6352
+    /// addressbook-query), for books it doesn't list whole.
+    SearchServerContacts,
     RenameAddressBook(String),
     DeleteAddressBook(String),
     RefreshAccount(String),
@@ -6390,6 +6393,7 @@ impl MailApp {
             | Action::ConnectJmapContacts(_)
             | Action::CreateAddressBook
             | Action::ListAddressBooks
+            | Action::SearchServerContacts
             | Action::RenameAddressBook(_)
             | Action::DeleteAddressBook(_)) => self.contacts_action(action, w, cx),
             action @ (Action::LoadServerIdentities(_)

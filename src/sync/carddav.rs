@@ -895,6 +895,57 @@ pub fn to_vcard4(text: &str) -> String {
 
 const QUERY: &str = "<?xml version=\"1.0\"?><c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag/><c:address-data/></d:prop></c:addressbook-query>";
 
+/// An addressbook-query (RFC 6352 §8.6) for the cards whose `properties`
+/// (`FN`, `EMAIL`, `NICKNAME`, `TEL`…) contain `text`: any of them
+/// (`anyof`), compared without case (`i;unicode-casemap`, RFC 5051;
+/// `match-type` contains, RFC 6352 §10.5.4).
+/// At most `limit` cards (§8.6.1), so a huge book isn't read whole.
+pub fn search_query(properties: &[&str], text: &str, limit: Option<u32>) -> String {
+    let filters: String = properties
+        .iter()
+        .map(|p| {
+            format!(
+                "<c:prop-filter name=\"{}\"><c:text-match collation=\"i;unicode-casemap\" match-type=\"contains\">{}</c:text-match></c:prop-filter>",
+                xml_text(&p.to_ascii_uppercase()),
+                xml_text(text)
+            )
+        })
+        .collect();
+    let limit = limit.map_or(String::new(), |n| format!("<c:limit><c:nresults>{n}</c:nresults></c:limit>"));
+    format!(
+        "<?xml version=\"1.0\"?><c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag/><c:address-data/></d:prop><c:filter test=\"anyof\">{filters}</c:filter>{limit}</c:addressbook-query>"
+    )
+}
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// The cards in every address book whose name, nickname or email address
+/// contains `text`, as the server finds them (RFC 6352 §8.6): for
+/// address books too large to read whole, and directories (such as an
+/// organization's) that list only what is asked for.
+pub fn search(server: &Server, password: &str, tls: native_tls::TlsConnector, text: &str, limit: u32) -> Result<Vec<Card>> {
+    ensure!(!text.trim().is_empty(), "Write something to look for.");
+    let client = dav::Client::new(&server.user, password, tls)?;
+    let books = dav::discover(&client, &server.url, "carddav", "addressbook", "addressbook-home-set", dav::CARDDAV)?;
+    let query = search_query(&["FN", "NICKNAME", "EMAIL"], text.trim(), Some(limit));
+    let mut out = Vec::new();
+    for book in &books {
+        for resource in client.list(&book.href, &query, "address-data")? {
+            for mut card in parse_vcards(&resource.data) {
+                card.href = resource.href.to_string();
+                card.etag = resource.etag.clone();
+                out.push(card);
+            }
+        }
+        if out.len() >= limit as usize {
+            break;
+        }
+    }
+    out.truncate(limit as usize);
+    Ok(out)
+}
+
 /// Reads every address book the account can see, whole. Returns the
 /// cards, each with its href and ETag, and the address book new cards go to
 /// (the first one the account may write to).
@@ -1134,6 +1185,32 @@ mod tests {
         let again = parse_vcards(&write_vcards(&cards));
         assert_eq!(again[0].emails, cards[0].emails);
         assert_eq!(again[1].name, cards[1].name);
+    }
+
+    /// RFC 6352 §8.6: a search is an addressbook-query with prop-filters
+    /// (any of them), case-insensitive, limited; its cards come back with
+    /// their hrefs.
+    #[test]
+    fn the_server_is_searched_by_addressbook_query() -> Result<()> {
+        let q = search_query(&["fn", "EMAIL"], "Ana & <Co>", Some(5));
+        assert!(q.contains("<c:filter test=\"anyof\"><c:prop-filter name=\"FN\"><c:text-match collation=\"i;unicode-casemap\" match-type=\"contains\">Ana &amp; &lt;Co&gt;</c:text-match></c:prop-filter><c:prop-filter name=\"EMAIL\">"), "{q}");
+        assert!(q.contains("<c:limit><c:nresults>5</c:nresults></c:limit></c:addressbook-query>"));
+        assert!(roxmltree::Document::parse(&q).is_ok());
+        let (port, server) = dav::test_server(2, |method, _, body| match method {
+            "PROPFIND" => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\"><d:response><d:href>/dir/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><r:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            _ => {
+                assert!(body.contains("match-type=\"contains\">lind</c:text-match>") && body.contains("name=\"NICKNAME\""), "{body}");
+                ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\"><d:response><d:href>/dir/bo.vcf</d:href><d:propstat><d:prop><d:getetag>\"1\"</d:getetag><r:address-data>BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bo Lindqvist\r\nEMAIL:bo@example.se\r\nEND:VCARD\r\n</r:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into())
+            }
+        });
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let found = search(&srv, "secret", native_tls::TlsConnector::new()?, " lind ", 50)?;
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].name.as_str(), found[0].etag.as_str()), ("Bo Lindqvist", "\"1\""));
+        assert!(found[0].href.ends_with("/dir/bo.vcf"));
+        assert!(search(&srv, "secret", native_tls::TlsConnector::new()?, "  ", 50).is_err());
+        server.join().unwrap();
+        Ok(())
     }
 
     /// RFC 6352 §6.2.2–§6.2.3: each book's vCard versions and size are

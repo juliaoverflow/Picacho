@@ -304,6 +304,17 @@ impl MailApp {
                     Ok(format!("Read {n} contacts from {}", a.email))
                 });
             }
+            Action::SearchServerContacts => {
+                let text = self.contact_filter.read(cx).value().trim().to_owned();
+                self.contacts_run(cx, move |b| {
+                    let n = b.search_server_contacts(&text)?;
+                    Ok(match n {
+                        0 => "The server has no one else by that.".to_owned(),
+                        1 => "Found 1 more on the server".to_owned(),
+                        n => format!("Found {n} more on the server"),
+                    })
+                });
+            }
             Action::ListAddressBooks => {
                 if self.contacts_busy {
                     return;
@@ -730,6 +741,21 @@ impl MailApp {
                     } else {
                         "No one matches."
                     }),
+            )
+            // A CardDAV server can be asked for more (RFC 6352 §8.6).
+            .when(
+                !filter.is_empty()
+                    && self.backend.contacts_server().is_some_and(|s| s.jmap_account.is_empty()),
+                |d| {
+                    d.child(div().px_4().pb_3().child(self.button(
+                        "contacts-search-server",
+                        "Search the server",
+                        "search",
+                        Action::SearchServerContacts,
+                        busy,
+                        cx,
+                    )))
+                },
             )
         } else {
             list.children(shown.into_iter().enumerate().map(|(i, card)| {
