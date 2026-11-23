@@ -2490,24 +2490,39 @@ impl Session {
     }
     /// Sends a read receipt for message `id` (MDN/send, RFC 9007), from
     /// `identity`; the server marks the message `$mdnsent`.
-    pub fn send_receipt(&self, id: &str, identity: &str, subject: &str, text: &str) -> Result<()> {
+    pub fn send_receipt(&self, id: &str, identity: &str, receipt: &Receipt) -> Result<()> {
         ensure!(self.has(MDN), "This JMAP server can't send read receipts.");
+        // RFC 9007 §2: the MDN object; the server fills in what's left out
+        // (`reportingUA`, `finalRecipient`, `originalMessageId`).
+        let mut mdn = json!({
+            "forEmailId": id,
+            "subject": receipt.subject,
+            "textBody": receipt.text,
+            "includeOriginalMessage": receipt.include_original,
+            "disposition": {
+                "actionMode": if receipt.automatic { "automatic-action" } else { "manual-action" },
+                "sendingMode": if receipt.automatic { "mdn-sent-automatically" } else { "mdn-sent-manually" },
+                "type": receipt.disposition,
+            },
+        });
+        for (key, value) in [
+            ("reportingUA", &receipt.reporting_ua),
+            ("finalRecipient", &receipt.final_recipient),
+            ("originalRecipient", &receipt.original_recipient),
+        ] {
+            if !value.is_empty() {
+                mdn[key] = json!(value);
+            }
+        }
+        if !receipt.extension.is_empty() {
+            mdn["extensionFields"] = json!(receipt.extension);
+        }
         let v = self.one(
             "MDN/send",
             json!({
                 "accountId": self.account_id,
                 "identityId": identity,
-                "send": { "r": {
-                    "forEmailId": id,
-                    "subject": subject,
-                    "textBody": text,
-                    "includeOriginalMessage": false,
-                    "disposition": {
-                        "actionMode": "manual-action",
-                        "sendingMode": "mdn-sent-manually",
-                        "type": "displayed",
-                    },
-                } },
+                "send": { "r": mdn },
                 "onSuccessUpdateEmail": { "#r": { "keywords/$mdnsent": true } },
             }),
         )?;
@@ -2515,6 +2530,33 @@ impl Session {
             bail!("The server didn't send the read receipt: {}", set_error(e));
         }
         Ok(())
+    }
+    /// Reads read receipts kept as blobs (MDN/parse, RFC 9007 §2.2), by blob
+    /// id; those the server can't read as one are left out.
+    // Backend-only until the UI calls it: reading receipts by MDN/parse.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn parse_receipts(&self, blobs: &[String]) -> Result<HashMap<String, ParsedReceipt>> {
+        ensure!(self.has(MDN), "This JMAP server can't read read receipts.");
+        let mut out = HashMap::new();
+        for chunk in blobs.chunks(self.max_get()) {
+            let v = self.one("MDN/parse", json!({ "accountId": self.account_id, "blobIds": chunk }))?;
+            for (blob, m) in v["parsed"].as_object().into_iter().flatten() {
+                let text = |k: &str| m[k].as_str().map(str::to_owned);
+                out.insert(
+                    blob.clone(),
+                    ParsedReceipt {
+                        for_email_id: text("forEmailId"),
+                        original_message_id: text("originalMessageId"),
+                        final_recipient: text("finalRecipient"),
+                        disposition: m["disposition"]["type"].as_str().unwrap_or_default().to_owned(),
+                        automatic: m["disposition"]["actionMode"] == "automatic-action",
+                        reporting_ua: text("reportingUA"),
+                        error: m["error"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_owned)).collect(),
+                    },
+                );
+            }
+        }
+        Ok(out)
     }
     /// The automatic reply while away (RFC 8621 §8), where the account has
     /// it.
@@ -3229,6 +3271,57 @@ impl Marked {
         }
         Self { text, marks }
     }
+}
+
+/// A read receipt as MDN/send writes it (RFC 9007 §2, RFC 8098 §3.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub subject: String,
+    pub text: String,
+    /// `displayed`, `deleted`, `dispatched` or `processed`.
+    pub disposition: String,
+    /// Sent without the user being asked (`automatic-action`).
+    pub automatic: bool,
+    pub include_original: bool,
+    /// `reportingUA`: the program writing it (`Picacho/1.0`); empty: the
+    /// server's.
+    pub reporting_ua: String,
+    /// `finalRecipient` (`rfc822; a@example.com`); empty: the server's.
+    pub final_recipient: String,
+    /// `originalRecipient`: as the receiving server noted it.
+    pub original_recipient: String,
+    /// Other report fields, by name.
+    pub extension: HashMap<String, String>,
+}
+impl Receipt {
+    /// A manual "displayed" receipt with this subject and text.
+    pub fn displayed(subject: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            subject: subject.into(),
+            text: text.into(),
+            disposition: "displayed".into(),
+            automatic: false,
+            include_original: false,
+            reporting_ua: concat!("Picacho/", env!("CARGO_PKG_VERSION")).into(),
+            final_recipient: String::new(),
+            original_recipient: String::new(),
+            extension: HashMap::new(),
+        }
+    }
+}
+
+/// A read receipt as MDN/parse reads it (RFC 9007 §2.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParsedReceipt {
+    /// The message it reports on, where the server found it here.
+    pub for_email_id: Option<String>,
+    pub original_message_id: Option<String>,
+    pub final_recipient: Option<String>,
+    /// `displayed`, `deleted`, `dispatched` or `processed`.
+    pub disposition: String,
+    pub automatic: bool,
+    pub reporting_ua: Option<String>,
+    pub error: Vec<String>,
 }
 
 /// How a message is submitted, beyond its envelope.

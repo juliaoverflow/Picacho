@@ -92,6 +92,8 @@ struct Server {
     scheduling: Vec<(bool, Vec<String>)>,
     /// The mail account's capability (RFC 8621 §1.3.1), where set.
     mail_caps: Option<Value>,
+    /// Read receipts the server sent (MDN/send's MDN objects).
+    mdns: Vec<Value>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -115,6 +117,7 @@ impl Server {
                 "submissionExtensions": { "DSN": [], "REQUIRETLS": [], "FUTURERELEASE": ["86400"] },
             },
             "urn:ietf:params:jmap:vacationresponse": {},
+            "urn:ietf:params:jmap:mdn": {},
         });
         json!({
             "capabilities": {
@@ -127,6 +130,7 @@ impl Server {
                 "urn:ietf:params:jmap:vacationresponse": {},
                 "urn:ietf:params:jmap:calendars": {},
                 "urn:ietf:params:jmap:contacts": {},
+                "urn:ietf:params:jmap:mdn": {},
             },
             "accounts": {
                 "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
@@ -737,6 +741,32 @@ impl Server {
                     out.extend(self.method("Email/set", &destroy, earlier));
                 }
                 out
+            }
+            "MDN/send" => {
+                let mut sent = serde_json::Map::new();
+                for (key, mdn) in args["send"].as_object().into_iter().flatten() {
+                    self.mdns.push(mdn.clone());
+                    sent.insert(key.clone(), json!({ "finalRecipient": "rfc822; qa@example.com" }));
+                    // onSuccessUpdateEmail runs as an implicit Email/set.
+                    if let Some(patch) = args["onSuccessUpdateEmail"][format!("#{key}")].as_object()
+                        && let Some(id) = mdn["forEmailId"].as_str()
+                    {
+                        let update = json!({ "update": { id: patch } });
+                        let _ = self.method("Email/set", &update, earlier);
+                    }
+                }
+                vec![(name.into(), json!({ "sent": sent }))]
+            }
+            "MDN/parse" => {
+                let mut parsed = serde_json::Map::new();
+                for blob in args["blobIds"].as_array().into_iter().flatten() {
+                    parsed.insert(blob.as_str().unwrap().to_owned(), json!({
+                        "forEmailId": "M1", "originalMessageId": "<m1@example.com>",
+                        "finalRecipient": "rfc822; bo@example.se", "reportingUA": "Other/2",
+                        "disposition": { "actionMode": "automatic-action", "sendingMode": "mdn-sent-automatically", "type": "displayed" },
+                    }));
+                }
+                vec![(name.into(), json!({ "parsed": parsed, "notParsable": [], "notFound": [] }))]
             }
             "Email/parse" => {
                 let mut parsed = serde_json::Map::new();
@@ -2520,5 +2550,53 @@ fn jmap_parsed_messages_read_their_text() -> Result<()> {
     assert_eq!(plain.preview.as_deref(), Some("Short preview"));
     assert!(none.is_empty());
     assert!(b.with_jmap(&a, |s| s.parse_blob_with_text("B-none", 0))?.is_none());
+    Ok(())
+}
+
+/// Read receipts over JMAP (RFC 9007): MDN/send carries the whole report
+/// (reporting program, the Original-Recipient noted, the disposition), and
+/// MDN/parse reads one received.
+#[test]
+fn jmap_read_receipts_carry_every_field() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    let raw = b"From: Ana <ana@example.org>\r\nTo: qa@example.com\r\nOriginal-Recipient: rfc822;qa@example.com\r\nDisposition-Notification-To: ana@example.org\r\nSubject: Please confirm\r\nMessage-ID: <m1@example.com>\r\n\r\nHello\r\n";
+    fixture.blobs.insert("B0".into(), raw.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["i".into()],
+        keywords: vec![],
+        subject: "Please confirm".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let mut m = b.sync(&a, Folder::Inbox, 50)?.remove(0);
+    m.set_receipt_to("ana@example.org");
+    b.send_receipt(&a, &m)?;
+    {
+        let s = server.lock().unwrap();
+        let mdn = &s.mdns[0];
+        assert_eq!(mdn["forEmailId"], "M1");
+        assert_eq!(mdn["disposition"]["type"], "displayed");
+        assert_eq!(mdn["disposition"]["actionMode"], "manual-action");
+        assert_eq!(mdn["originalRecipient"], "rfc822;qa@example.com");
+        assert!(mdn["reportingUA"].as_str().unwrap().starts_with("Picacho/"));
+        assert!(s.emails[0].keywords.contains(&"$mdnsent".to_owned()));
+        assert!(s.sent.is_empty(), "the server wrote it, not a submission");
+    }
+    let parsed = b.with_jmap(&a, |s| s.parse_receipts(&["R1".to_owned()]))?;
+    let r = &parsed["R1"];
+    assert_eq!(r.for_email_id.as_deref(), Some("M1"));
+    assert_eq!(r.disposition, "displayed");
+    assert!(r.automatic);
+    assert_eq!(r.reporting_ua.as_deref(), Some("Other/2"));
     Ok(())
 }
