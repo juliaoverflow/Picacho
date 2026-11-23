@@ -753,6 +753,21 @@ fn rid(series: &ical::Event, at: i64) -> String {
     if series.all_day { t.format("%Y%m%d").to_string() } else { t.format("%Y%m%dT%H%M%SZ").to_string() }
 }
 
+/// Moves an event to the calendar `target` on the same server (MOVE, RFC
+/// 4918 §9.9; RFC 4791 §5.3.3 has the server check the target takes it).
+/// Returns it as kept there.
+pub fn move_event(server: &Server, password: &str, tls: native_tls::TlsConnector, stored: &Stored, target: &str) -> Result<Stored> {
+    let from = url::Url::parse(&stored.href)?;
+    let name = from.path_segments().and_then(|mut s| s.next_back()).filter(|n| !n.is_empty()).context("This event has no resource name.")?;
+    let mut to = url::Url::parse(target)?;
+    if !to.path().ends_with('/') {
+        to.set_path(&format!("{}/", to.path()));
+    }
+    let to = to.join(name)?;
+    let etag = client(server, password, tls)?.transfer(&from, &to, &stored.etag, false)?;
+    Ok(Stored { calendar: target.to_owned(), href: to.to_string(), etag, ..stored.clone() })
+}
+
 /// Removes an event.
 pub fn delete(
     server: &Server,

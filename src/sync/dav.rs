@@ -1049,14 +1049,38 @@ impl Client {
                 body,
             )?)
     }
+    /// Makes an address book at `href` in `home`: by extended MKCOL (RFC
+    /// 5689) where the home's DAV header says `extended-mkcol` (§3.1),
+    /// else, as RFC 6352 §6.3.1 lets an older server do, by plain MKCOL
+    /// with no body, then PROPPATCH of its resource type and name.
+    pub fn make_address_book(&self, home: &url::Url, href: &url::Url, name: &str, setup: &CollectionSetup) -> Result<()> {
+        let extended = self.compliance(home).map(|c| c.iter().any(|k| k == "extended-mkcol")).unwrap_or(false);
+        if extended {
+            return self.make_collection_with(href, false, name, "", setup);
+        }
+        self.send("MKCOL", href, &[], String::new())?;
+        let description = if setup.description.trim().is_empty() {
+            String::new()
+        } else {
+            format!("<c:addressbook-description>{}</c:addressbook-description>", xml_escape(setup.description.trim()))
+        };
+        let body = format!(
+            "<?xml version=\"1.0\"?><d:propertyupdate xmlns:d=\"DAV:\" xmlns:c=\"{CARDDAV}\"><d:set><d:prop><d:resourcetype><d:collection/><c:addressbook/></d:resourcetype><d:displayname>{}</d:displayname>{description}</d:prop></d:set></d:propertyupdate>",
+            xml_escape(name)
+        );
+        let text = self.xml("PROPPATCH", href, "0", &body)?;
+        let refused = refused_properties(&text);
+        if !refused.is_empty() {
+            // A plain collection was made, not an address book: taken back.
+            let _ = self.delete(href, "");
+            bail!("The server refused {}.", refused.join(", "));
+        }
+        Ok(())
+    }
     /// Makes a collection at `href`: a calendar (MKCALENDAR, RFC 4791
     /// §5.3.1) for events, or an address book (extended MKCOL, RFC 5689),
-    /// named `name`, with a calendar's colour where given.
-    pub fn make_collection(&self, href: &url::Url, calendar: bool, name: &str, color: &str) -> Result<()> {
-        self.make_collection_with(href, calendar, name, color, &CollectionSetup::default())
-    }
-    /// As `make_collection`, with a calendar's description and time zone
-    /// (RFC 4791 §5.2.1–§5.2.2) set as it is made. The server's answer is
+    /// named `name`, with a calendar's colour where given, and a
+    /// description and calendar time zone (RFC 4791 §5.2.1–§5.2.2). The server's answer is
     /// read (RFC 4791 §5.3.1.2, RFC 5689 §3.2: a `mkcol-response` or
     /// `mkcalendar-response` saying which properties it refused); one it
     /// refuses means the collection wasn't made.
@@ -1353,6 +1377,70 @@ impl Client {
             .compliance(url)?
             .iter()
             .any(|c| c == "calendar-managed-attachments"))
+    }
+
+    /// Copies (COPY, RFC 4918 §9.8) or moves (MOVE, §9.9) a resource to
+    /// `to` on the same server, never over one already there
+    /// (`Overwrite: F`, §10.6), and only if it is still the version with
+    /// `etag`. Returns the ETag at `to`, where the server says.
+    pub fn transfer(&self, from: &url::Url, to: &url::Url, etag: &str, keep_original: bool) -> Result<String> {
+        ensure!(from.origin() == to.origin(), "A copy or move stays on one server.");
+        let mut headers = vec![("Destination", to.as_str()), ("Overwrite", "F")];
+        if !etag.is_empty() && !etag.starts_with("W/") {
+            headers.push(("If-Match", etag));
+        }
+        let response = self.send(if keep_original { "COPY" } else { "MOVE" }, from, &headers, String::new())?;
+        // 201 made, 204 replaced; a 207 lists what failed (§9.8.8, §9.9.4).
+        if response.status().as_u16() == 207 {
+            let text = body_text(response)?;
+            let doc = parse(&text)?;
+            let failed = responses(&doc).any(|(_, r)| {
+                r.children().find(|c| is(c, "status")).and_then(|s| s.text()).is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')))
+            });
+            ensure!(!failed, "The server didn't {} all of it.", if keep_original { "copy" } else { "move" });
+            return Ok(String::new());
+        }
+        Ok(response.headers().get("ETag").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned())
+    }
+    // Backend-only until the UI calls it: CalDAV and CardDAV writes are
+    // guarded by If-Match/If-Schedule-Tag-Match already; a lock is for a
+    // longer edit (a WebDAV file) that nothing here makes yet.
+    #[allow(dead_code)]
+    /// Locks a resource for writing (LOCK, RFC 4918 §9.10): an exclusive
+    /// write lock for `seconds`, so another client's change can't land
+    /// between reading and writing it. Returns the lock token (§10.5).
+    pub fn lock(&self, href: &url::Url, owner: &str, seconds: u32) -> Result<String> {
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:lockinfo xmlns:d=\"DAV:\"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype><d:owner>{}</d:owner></d:lockinfo>",
+            xml_escape(owner)
+        );
+        let timeout = format!("Second-{seconds}");
+        let response = self.send(
+            "LOCK",
+            href,
+            &[("Content-Type", "application/xml; charset=utf-8"), ("Depth", "0"), ("Timeout", &timeout)],
+            body,
+        )?;
+        // The Lock-Token header (§10.5), else the body's locktoken.
+        let header = response
+            .headers()
+            .get("Lock-Token")
+            .and_then(|v| v.to_str().ok())
+            .map(|t| t.trim().trim_start_matches('<').trim_end_matches('>').to_owned());
+        let text = body_text(response)?;
+        let token = header.filter(|t| !t.is_empty()).or_else(|| {
+            let doc = roxmltree::Document::parse(&text).ok()?;
+            let token = doc.descendants().find(|n| is(n, "locktoken"))?;
+            token.descendants().find(|n| is(n, "href"))?.text().map(|t| t.trim().to_owned())
+        });
+        token.context("The server didn't say the lock's token.")
+    }
+    // Backend-only until the UI calls it (see `lock`).
+    #[allow(dead_code)]
+    /// Releases a lock (UNLOCK, RFC 4918 §9.11).
+    pub fn unlock(&self, href: &url::Url, token: &str) -> Result<()> {
+        self.send("UNLOCK", href, &[("Lock-Token", &format!("<{token}>"))], String::new())?;
+        Ok(())
     }
 
     /// Removes a resource, if it is still the version with `etag`.
@@ -1743,7 +1831,7 @@ pub fn test_server(
                     length = v.trim().parse().unwrap();
                 }
                 // Conditional headers, for tests to check: kept before the body.
-                if line.to_ascii_lowercase().starts_with("if-schedule-tag-match:") {
+                if ["if-schedule-tag-match:", "destination:", "overwrite:", "timeout:", "lock-token:"].iter().any(|h| line.to_ascii_lowercase().starts_with(h)) {
                     conditions.push_str(&line);
                 }
                 // "ana:secret", base64; or a Digest answer, which the test
@@ -1893,6 +1981,68 @@ mod tests {
         let read = read_collection(&client, &collection, Some(&gone), &known, |_| Ok(vec![]), multiget)?;
         assert!(read.whole);
         assert_eq!(server.join().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// RFC 5689 §3.1: an address book is made by extended MKCOL where the
+    /// home says `extended-mkcol`; else by MKCOL and PROPPATCH, and a
+    /// PROPPATCH refused takes the plain collection back.
+    #[test]
+    fn address_books_without_extended_mkcol() -> Result<()> {
+        let (port, server) = test_server(4, |method, path, body| match (method, path) {
+            // The test server's OPTIONS lists no extended-mkcol.
+            ("OPTIONS", _) => ("200 OK", String::new()),
+            ("MKCOL", _) => {
+                assert!(body.is_empty(), "{body}");
+                ("201 Created", String::new())
+            }
+            ("PROPPATCH", _) => {
+                assert!(body.contains("<c:addressbook/>") && body.contains("<d:displayname>Friends</d:displayname>"), "{body}");
+                ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/ab/new/</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat></d:response></d:multistatus>".into())
+            }
+            ("DELETE", _) => ("204 No Content", String::new()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let client = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?;
+        let at = |p: &str| url::Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+        let err = client.make_address_book(&at("/ab/"), &at("/ab/new/"), "Friends", &CollectionSetup::default()).unwrap_err();
+        assert!(err.to_string().contains("resourcetype"), "{err}");
+        let seen: Vec<String> = server.join().unwrap().iter().map(|(m, ..)| m.clone()).collect();
+        assert_eq!(seen, ["OPTIONS", "MKCOL", "PROPPATCH", "DELETE"]);
+        Ok(())
+    }
+
+    /// RFC 4918 §9.8–§9.11: COPY and MOVE never overwrite and go only
+    /// within the server; LOCK's token is read from its header or body.
+    #[test]
+    fn copy_move_and_lock() -> Result<()> {
+        let (port, server) = test_server(4, |method, path, body| match (method, path) {
+            ("MOVE", "/a/e.ics") => {
+                let lower = body.to_ascii_lowercase();
+                assert!(lower.contains("destination: http://127.0.0.1:") && lower.contains("/b/e.ics") && lower.contains("overwrite: f"), "{body}");
+                ("201 Created", String::new())
+            }
+            ("COPY", "/a/f.ics") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/b/f.ics</d:href><d:status>HTTP/1.1 423 Locked</d:status></d:response></d:multistatus>".into()),
+            ("LOCK", "/doc") => {
+                assert!(body.contains("<d:exclusive/>") && body.contains("<d:owner>Picacho</d:owner>"), "{body}");
+                ("200 OK", "<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery><d:activelock><d:locktoken><d:href>urn:uuid:e71d4fae-5dec</d:href></d:locktoken></d:activelock></d:lockdiscovery></d:prop>".into())
+            }
+            ("UNLOCK", "/doc") => {
+                assert!(body.to_ascii_lowercase().contains("lock-token: <urn:uuid:e71d4fae-5dec>"), "{body}");
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", String::new()),
+        });
+        let client = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?;
+        let at = |p: &str| url::Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+        assert_eq!(client.transfer(&at("/a/e.ics"), &at("/b/e.ics"), "\"1\"", false)?, "\"e-0\"");
+        assert!(client.transfer(&at("/a/f.ics"), &at("/b/f.ics"), "", true).unwrap_err().to_string().contains("copy"));
+        assert!(client.transfer(&at("/a/e.ics"), &url::Url::parse("http://other.example/b/e.ics")?, "", false).is_err());
+        let token = client.lock(&at("/doc"), "Picacho", 60)?;
+        assert_eq!(token, "urn:uuid:e71d4fae-5dec");
+        client.unlock(&at("/doc"), &token)?;
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 4);
         Ok(())
     }
 

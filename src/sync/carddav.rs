@@ -1056,7 +1056,7 @@ pub fn create_book(server: &Server, password: &str, tls: native_tls::TlsConnecto
     let home = client.home(&server.url, "carddav", "addressbook-home-set", dav::CARDDAV)?;
     let href = dav::new_href(&home, &uuid::Uuid::new_v4().to_string(), "x")?;
     let href = url::Url::parse(&format!("{}/", href.as_str().trim_end_matches(".x")))?;
-    client.make_collection(&href, false, name, "")?;
+    client.make_address_book(&home, &href, name, &dav::CollectionSetup::default())?;
     Ok(href.to_string())
 }
 

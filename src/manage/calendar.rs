@@ -864,12 +864,26 @@ impl Backend {
             }
         };
         let mut stored = existing.unwrap_or_default();
-        if stored.calendar != target {
-            // Moving it to another calendar: a new resource there.
-            stored.href.clear();
-            stored.etag.clear();
+        // Where it was, for taking it out of a calendar it moves from.
+        let before = stored.clone();
+        let moving = !stored.href.is_empty() && stored.calendar != target;
+        // The old copy is left to delete where the server didn't move it.
+        let mut left_behind = false;
+        if moving {
+            // RFC 4918 §9.9: moved on the server, keeping it whole, where
+            // both calendars are there (CalDAV; JMAP moves by saving).
+            match self.calendar_move(&server, &stored, &target) {
+                Ok(Some(moved)) => stored = moved,
+                // Else a new resource there, and the old one deleted.
+                _ => {
+                    stored.href.clear();
+                    stored.etag.clear();
+                    stored.schedule_tag.clear();
+                    left_behind = true;
+                }
+            }
         }
-        if !stored.href.is_empty() {
+        if !stored.href.is_empty() || moving {
             event.sequence = stored.event.sequence + 1;
             // Edited here: written from its fields.
             event.source.clear();
@@ -882,16 +896,24 @@ impl Backend {
                 event.exdates = stored.event.exdates.clone();
             }
         }
-        let old = stored.clone();
         stored.event = event;
         let saved = self.calendar_save(&server, &target, &stored)?;
-        if !old.href.is_empty() && old.calendar != target {
-            let _ = self.calendar_delete(&server, &old);
+        if left_behind {
+            let _ = self.calendar_delete(&server, &before);
         }
         events.retain(|s| s.event.uid != saved.event.uid);
         events.push(saved.clone());
         self.save_events(events)?;
         Ok(saved)
+    }
+    /// Moves an event's resource to the calendar `target` on the server
+    /// (MOVE, RFC 4918 §9.9), returning it there. `None` where it can't
+    /// be (JMAP), so it is saved anew instead.
+    fn calendar_move(&self, server: &caldav::Server, stored: &Stored, target: &str) -> Result<Option<Stored>> {
+        if self.calendar_jmap(server)?.is_some() || target.starts_with("jmap:") {
+            return Ok(None);
+        }
+        caldav::move_event(server, &self.calendar_password()?, self.tls_connector()?, stored, target).map(Some)
     }
     /// Every time an event happens between `from` and `to`: repeating
     /// events once for each repeat, changed and cancelled repeats as they
@@ -2141,6 +2163,49 @@ mod tests {
         let series = back.remove(0);
         assert_eq!(ical::occurrences(&series, &back, 0, 2_000_000_000).len(), 4);
         drop(server);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    /// An event moved to another calendar is moved on the server (MOVE,
+    /// RFC 4918 §9.9), then saved there; where the server can't, it is
+    /// saved there anew and the old copy deleted, not left behind.
+    #[test]
+    fn moving_an_event_between_calendars() -> Result<()> {
+        let (port, server) = crate::sync::dav::test_server(6, |method, path, _| match (method, path) {
+            ("PROPFIND", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/home/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response><d:response><d:href>/work/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("MOVE", "/home/a.ics") => ("201 Created", String::new()),
+            ("PUT", "/work/a.ics") => ("204 No Content", String::new()),
+            // This server can't move the second.
+            ("MOVE", "/home/b.ics") => ("403 Forbidden", String::new()),
+            ("PUT", "/work/b.ics") => ("201 Created", String::new()),
+            ("DELETE", "/home/b.ics") => ("204 No Content", String::new()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let path = std::env::temp_dir().join(format!("picacho-cal-{}", uuid::Uuid::new_v4()));
+        let mut b = Backend::new(Arc::new(Store::open(&path)?));
+        b.test_secret = Some(Secret { password: "secret".into(), ..Default::default() });
+        let base = format!("http://127.0.0.1:{port}");
+        b.store.set_preference(SERVER, &serde_json::to_string(&caldav::Server { url: base.clone(), user: "ana".into(), ..Default::default() })?)?;
+        let cals = caldav::calendars(&b.calendar_server().unwrap(), "secret", b.tls_connector()?)?;
+        b.store.set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        let at = |uid: &str| Stored {
+            event: Event { uid: uid.into(), summary: "Lunch".into(), start: 1_800_000_000, end: 1_800_003_600, ..Default::default() },
+            calendar: format!("{base}/home/"),
+            href: format!("{base}/home/{uid}.ics"),
+            etag: "\"1\"".into(),
+            ..Default::default()
+        };
+        b.save_events(vec![at("a"), at("b")])?;
+        let work = format!("{base}/work/");
+        let moved = b.save_event(at("a").event, Some(&work))?;
+        assert_eq!((moved.calendar.as_str(), moved.href.as_str()), (work.as_str(), format!("{work}a.ics").as_str()));
+        let saved = b.save_event(at("b").event, Some(&work))?;
+        assert_eq!(saved.href, format!("{work}b.ics"));
+        assert_eq!(b.calendar_events().len(), 2);
+        let seen: Vec<String> = server.join().unwrap().iter().skip(1).map(|(m, p, _)| format!("{m} {p}")).collect();
+        assert_eq!(seen, ["MOVE /home/a.ics", "PUT /work/a.ics", "MOVE /home/b.ics", "PUT /work/b.ics", "DELETE /home/b.ics"]);
         drop(b);
         std::fs::remove_dir_all(path)?;
         Ok(())
