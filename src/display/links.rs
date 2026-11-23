@@ -64,6 +64,11 @@ impl LinkSafety {
     /// the site itself and its `www.` are trusted: the names under it
     /// belong to other people.
     fn trusts(&self, url: &url::Url) -> bool {
+        // Over HTTPS only: a trusted site's plain http link can be changed
+        // on the way, so it's warned about like any other.
+        if url.scheme() != "https" {
+            return false;
+        }
         let Some(host) = url.host_str().map(|h| h.trim_end_matches('.').to_lowercase()) else {
             return false;
         };
@@ -103,7 +108,7 @@ pub(super) fn link_dangers(url: &url::Url) -> Vec<&'static str> {
             dangers.push("It goes to a bare IP address, not a named site.");
         }
         Some(url::Host::Domain(host)) => {
-            if host.split('.').any(|label| label.starts_with("xn--")) {
+            if confusable(host) {
                 dangers.push("Its address uses look-alike letters from other alphabets.");
             }
             if host.split('.').count() > 4 {
@@ -118,10 +123,65 @@ pub(super) fn link_dangers(url: &url::Url) -> Vec<&'static str> {
     dangers
 }
 
+/// Whether an internationalized name could pass for another (in the
+/// spirit of UTS #39's checks): a label mixing Latin with Cyrillic or
+/// Greek, or one written wholly in Cyrillic or Greek letters that all have
+/// Latin twins (`аррӏе`). A name wholly in one other script (`пример.рф`,
+/// `例え.jp`) is the site's own language, not a trick.
+pub(super) fn confusable(host: &str) -> bool {
+    if !host.split('.').any(|l| l.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("xn--"))) {
+        return false;
+    }
+    let (unicode, result) = idna::domain_to_unicode(host);
+    if result.is_err() {
+        return true;
+    }
+    // Cyrillic and Greek letters drawn like Latin ones.
+    const TWINS: &str = "аеорсухіјѕԁԛԝӏһкмнтвгпьАВЕКМНОРСТХІЈЅԌԚԜαοрνιτκυχАΒΕΖΗΙΚΜΝΟΡΤΥΧ";
+    unicode.split('.').any(|label| {
+        let latin = label.chars().any(|c| c.is_ascii_alphabetic());
+        let cyrillic = label.chars().any(|c| ('\u{0400}'..='\u{052F}').contains(&c));
+        let greek = label.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
+        let mixed = [latin, cyrillic, greek].iter().filter(|b| **b).count() > 1;
+        let disguised = (cyrillic || greek)
+            && !latin
+            && label
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| TWINS.contains(c));
+        mixed || disguised
+    })
+}
+
 impl MailApp {
     /// Opens a link from an email (clicked, or chosen from its menu): at
     /// once, or after the warning on a phone.
     pub(super) fn open_email_link(&mut self, url: String, cx: &mut Context<Self>) {
+        // An email link writes a message here, not in another app.
+        if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) {
+            self.menu = None;
+            self.pending_link = Some(url);
+            cx.notify();
+            return;
+        }
+        // A link to another message (RFC 2392 `mid:`): opened here, where
+        // it's in the mailbox.
+        if let Some(id) = url.get(..4).filter(|p| p.eq_ignore_ascii_case("mid:")).map(|_| &url[4..]) {
+            self.menu = None;
+            let id = crate::manage::subscriptions::percent_decoded(id.split('/').next().unwrap_or(id));
+            let id = format!("<{}>", id.trim_matches(['<', '>']));
+            match self.backend.store.by_message_id(&id).ok().flatten() {
+                Some(m) => {
+                    if !self.messages.iter().any(|x| x.id == m.id) {
+                        self.messages.push(m.clone());
+                    }
+                    self.pending_link = Some(format!("open:{}", m.id));
+                    cx.notify();
+                }
+                None => self.notice("That message isn't in your mailbox.", true, cx),
+            }
+            return;
+        }
         self.menu = None;
         let url = if self.clean_links {
             crate::manage::tracking::clean_url(&url).unwrap_or(url)
@@ -145,6 +205,12 @@ impl MailApp {
                 site,
                 key: self.links.shown,
             });
+            cx.notify();
+            return;
+        }
+        // On a desktop, only a link with a known trick is held back.
+        if web && !self.mobile.on && !link_dangers(&parsed).is_empty() && !self.links.trusts(&parsed) {
+            self.modal = Some(Modal::LinkWarning(parsed.to_string()));
             cx.notify();
             return;
         }
@@ -311,6 +377,69 @@ mod tests {
         assert_eq!(link_dangers(&url("http://example.com/")).len(), 1);
         assert_eq!(link_dangers(&url("https://192.168.1.1/")).len(), 1);
         assert_eq!(link_dangers(&url("https://xn--pple-43d.com/")).len(), 1);
+        // A name in its own language isn't a trick.
+        assert!(link_dangers(&url("https://xn--e1afmkfd.xn--p1ai/")).is_empty());
+        assert!(link_dangers(&url("https://xn--r8jz45g.jp/")).is_empty());
         assert_eq!(link_dangers(&url("https://bank.com@evil.net/")).len(), 1);
+    }
+}
+
+/// A `mailto:` link's parts (RFC 6068): recipients and the fields a new
+/// message takes from it, percent-decoded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Mailto {
+    pub(super) to: String,
+    pub(super) cc: String,
+    pub(super) bcc: String,
+    pub(super) subject: String,
+    pub(super) body: String,
+    pub(super) in_reply_to: String,
+}
+impl Mailto {
+    pub(super) fn parse(link: &str) -> Option<Self> {
+        let rest = link.get(7..).filter(|_| link[..7].eq_ignore_ascii_case("mailto:"))?;
+        let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let decode = crate::manage::subscriptions::percent_decoded;
+        let one_line = |s: String| -> String { s.chars().filter(|c| !matches!(c, '\r' | '\n')).collect() };
+        let mut out = Self {
+            to: one_line(decode(to)),
+            ..Self::default()
+        };
+        let add = |list: &mut String, value: String| {
+            if !list.is_empty() {
+                list.push_str(", ");
+            }
+            list.push_str(&one_line(value));
+        };
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value = decode(value);
+            match key.to_ascii_lowercase().as_str() {
+                "to" => add(&mut out.to, value),
+                "cc" => add(&mut out.cc, value),
+                "bcc" => add(&mut out.bcc, value),
+                "subject" => out.subject = one_line(value),
+                // CRLF in the body is its line breaks (§2).
+                "body" => out.body = value.replace("\r\n", "\n"),
+                "in-reply-to" => out.in_reply_to = one_line(value),
+                _ => {}
+            }
+        }
+        (!out.to.is_empty() || !out.subject.is_empty() || !out.body.is_empty()).then_some(out)
+    }
+}
+
+#[cfg(test)]
+mod mailto_tests {
+    use super::Mailto;
+    #[test]
+    fn mailto_links_fill_a_new_message() {
+        let m = Mailto::parse("mailto:ana@example.org,bo@x.se?cc=cy@x.se&subject=Hi%20there&body=Line%201%0D%0ALine%202&x-evil=1").unwrap();
+        assert_eq!(m.to, "ana@example.org,bo@x.se");
+        assert_eq!(m.cc, "cy@x.se");
+        assert_eq!(m.subject, "Hi there");
+        assert_eq!(m.body, "Line 1\nLine 2");
+        assert_eq!(Mailto::parse("mailto:?subject=x%0D%0ABcc:%20y").unwrap().subject, "xBcc: y");
+        assert!(Mailto::parse("https://x").is_none());
     }
 }

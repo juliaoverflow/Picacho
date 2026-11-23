@@ -158,7 +158,9 @@ fn capable_server_extensions_are_used() -> Result<()> {
                     compressed += 1;
                     continue;
                 } else if upper.starts_with("LIST") {
-                    assert_eq!(command, "LIST \"\" \"*\" RETURN (SPECIAL-USE)");
+                    // SPECIAL-USE's attributes come in the plain listing;
+                    // RETURN needs LIST-EXTENDED, which this server lacks.
+                    assert_eq!(command, "LIST \"\" *");
                     p.send("* LIST (\\HasChildren) \".\" INBOX\r\n");
                     p.send("* LIST (\\Sent) \".\" \"INBOX.Sent\"\r\n");
                     p.send("* LIST () \".\" \"INBOX.Receipts\"\r\n");

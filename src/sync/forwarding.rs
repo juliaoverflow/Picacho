@@ -93,7 +93,9 @@ impl Client {
             .send()
             .with_context(|| format!("Could not reach {}", self.service.label()))?;
         let status = response.status();
-        let text = response.text().unwrap_or_default();
+        // Alias lists are kilobytes; a service answering without end isn't
+        // held in memory whole.
+        let text = crate::sync::public_net::bounded_text(response, 32 * 1024 * 1024).unwrap_or_default();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             bail!(
                 "{} did not accept the API key. Check it and try again.",
@@ -316,7 +318,10 @@ impl Client {
             "{} answered {status}",
             self.service.label()
         );
-        let v: Value = serde_json::from_str(&response.text().unwrap_or_default()).unwrap_or_default();
+        let v: Value = serde_json::from_str(
+            &crate::sync::public_net::bounded_text(response, 32 * 1024 * 1024).unwrap_or_default(),
+        )
+        .unwrap_or_default();
         Ok(alias_listed(self.service, &v))
     }
 
@@ -660,10 +665,18 @@ fn error_message(text: &str) -> Option<String> {
         .find(|m| !m.is_empty())
         .map(|m| m.chars().take(200).collect())
 }
+/// Whether `id` (an alias's or contact's, as the service gave it) is safe in
+/// a request's path: numbers, UUIDs and the like. One with `/`, `..`, `?`
+/// and so on would make the request another, sent with the account's key.
+fn path_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
 fn alias(id: &Value, email: &Value, enabled: Option<bool>, note: &Value) -> Option<Alias> {
     let email = str_of(email).trim().to_lowercase();
     let id = str_of(id);
-    (!email.is_empty() && !id.is_empty()).then(|| Alias {
+    (!email.is_empty() && path_id(&id)).then(|| Alias {
         id,
         email,
         enabled: enabled.unwrap_or(true),
@@ -728,8 +741,9 @@ fn parse_contact(c: &Value) -> Option<ReverseAlias> {
             .map(|(inner, _)| inner.trim().to_lowercase())
             .unwrap_or_default();
     }
-    (!address.is_empty() && address.contains('@')).then(|| ReverseAlias {
-        id: str_of(&c["id"]),
+    let id = str_of(&c["id"]);
+    (!address.is_empty() && address.contains('@') && path_id(&id)).then(|| ReverseAlias {
+        id,
         contact: str_of(&c["contact"]).trim().to_owned(),
         address,
         blocked: c["block_forward"].as_bool().unwrap_or(false),

@@ -58,7 +58,9 @@ pub fn release_unused_soon() {
         static LAST: AtomicU64 = AtomicU64::new(0);
         let now = START.elapsed().as_millis() as u64 + 1;
         let last = LAST.load(Ordering::Relaxed);
-        if last != 0 && now - last < EVERY.as_millis() as u64 {
+        // `now` may be from before another thread's trim: saturating, not
+        // underflowing (a panic in debug builds, a second trim in release).
+        if last != 0 && now.saturating_sub(last) < EVERY.as_millis() as u64 {
             return;
         }
         if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {

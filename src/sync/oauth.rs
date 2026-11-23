@@ -92,6 +92,10 @@ pub struct Metadata {
     pub token: String,
     pub registration: Option<String>,
     pub scopes: Vec<String>,
+    /// Where tokens are given up (RFC 7009), where the server has it.
+    pub revocation: Option<String>,
+    /// The server's issuer identifier, for the callback's `iss` (RFC 9207).
+    pub issuer: Option<String>,
 }
 /// Reads a server's metadata document, keeping only https endpoints.
 pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
@@ -106,6 +110,8 @@ pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
         token: https("token_endpoint")
             .context("The server's sign-in settings have no https token endpoint.")?,
         registration: https("registration_endpoint"),
+        revocation: https("revocation_endpoint"),
+        issuer: v["issuer"].as_str().map(str::to_owned),
         scopes: v["scopes_supported"]
             .as_array()
             .into_iter()
@@ -164,11 +170,10 @@ pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
             .header("Accept", "application/json")
             .send()
             .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<serde_json::Value>());
-        // A document that can't be used is passed over for the next one.
-        match found
             .map_err(anyhow::Error::from)
-            .and_then(|v| issued_by(&v, &origin).and_then(|()| parse_metadata(&v)))
+            .and_then(bounded_json);
+        // A document that can't be used is passed over for the next one.
+        match found.and_then(|v| issued_by(&v, &origin).and_then(|()| parse_metadata(&v)))
         {
             Ok(m) => {
                 KNOWN.lock().unwrap().push((origin, m.clone()));
@@ -217,8 +222,9 @@ pub fn sso_metadata(issuer: &str) -> Result<Metadata> {
             .header("Accept", "application/json")
             .send()
             .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<serde_json::Value>());
-        match found.map_err(anyhow::Error::from).and_then(|v| {
+            .map_err(anyhow::Error::from)
+            .and_then(bounded_json);
+        match found.and_then(|v| {
             // OpenID Connect Discovery §4.3: exactly the issuer asked for.
             let named = v["issuer"].as_str().unwrap_or_default().trim_end_matches('/');
             ensure!(
@@ -293,7 +299,7 @@ fn register(endpoint: &str, redirect: &str) -> Result<String> {
         .context("Couldn't reach the server to register Picacho for sign-in.")?
         .error_for_status()
         .context("The server didn't register Picacho for browser sign-in.")?
-        .json()?;
+        .and_then_bounded_json()?;
     Ok(v["client_id"]
         .as_str()
         .context("The server registered Picacho without a client id.")?
@@ -336,14 +342,70 @@ fn endpoints(provider: Provider) -> (&'static str, &'static str, &'static str) {
         ),
     }
 }
+/// Gives up a refresh token (RFC 7009) at `endpoint`, so it can't be used
+/// once the account is removed here. Best effort: a server that can't is
+/// left alone; the token expires there in time.
+pub fn revoke(endpoint: &str, client_id: &str, token: &str) {
+    if token.is_empty() || !endpoint.starts_with("https://") {
+        return;
+    }
+    let Ok(client) = http() else { return };
+    let _ = client
+        .post(endpoint)
+        .form(&[
+            ("token", token),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", client_id),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .send();
+}
+/// Google's revocation endpoint; Microsoft's identity platform has none
+/// (tokens are revoked from the account's own page).
+pub fn provider_revocation(provider: Provider) -> Option<&'static str> {
+    (provider == Provider::Gmail).then_some("https://oauth2.googleapis.com/revoke")
+}
 fn random_url_token() -> String {
     URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+}
+/// A sign-in server's JSON answer, read up to a megabyte (they are a few
+/// kilobytes): one answering without end isn't held in memory whole.
+fn bounded_json(response: reqwest::blocking::Response) -> Result<serde_json::Value> {
+    let text = crate::sync::public_net::bounded_text(response, 1024 * 1024)?;
+    Ok(serde_json::from_str(&text)?)
+}
+/// `bounded_json`, as a step at the end of a request's chain.
+trait BoundedJson {
+    fn and_then_bounded_json(self) -> Result<serde_json::Value>;
+}
+impl BoundedJson for reqwest::blocking::Response {
+    fn and_then_bounded_json(self) -> Result<serde_json::Value> {
+        bounded_json(self)
+    }
 }
 fn http() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(30))
+        .redirect(same_origin_redirects())
         .build()?)
+}
+/// Redirects followed only within the origin first asked (scheme, host and
+/// port), a few at most. A 307 or 308 sends a POST's body again: a token
+/// request's code, verifier, refresh token or client secret, which another
+/// host, or the same one over plain HTTP, must never be sent.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if same && attempt.previous().len() <= 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 /// The Gravatar picture for an address, or `None` when it has none. Only
@@ -388,7 +450,7 @@ pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
         .bearer_auth(access_token)
         .send()?
         .error_for_status()?
-        .json()?;
+        .and_then_bounded_json()?;
     let Some(picture) = info["picture"].as_str().filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
@@ -448,6 +510,9 @@ struct Browser {
     verifier: String,
     challenge: String,
     state: String,
+    /// The issuer the callback must name where it names one (RFC 9207
+    /// §2.4: a mix-up of servers is refused).
+    issuer: Option<String>,
 }
 impl Browser {
     /// Microsoft registers `http://localhost`; Google and Pinal accept the
@@ -471,6 +536,7 @@ impl Browser {
             challenge: URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
             verifier,
             state: random_url_token(),
+            issuer: None,
         }
     }
     /// Opens `url` in the system browser and waits for the authorization code.
@@ -576,6 +642,15 @@ impl Browser {
         if params.get("state") != Some(&self.state) {
             return None;
         }
+        // RFC 9207: an `iss` other than the server's own is an answer from
+        // another server, mixed in.
+        if let (Some(expected), Some(given)) = (&self.issuer, params.get("iss"))
+            && given != expected
+        {
+            return Some(Err(anyhow::anyhow!(
+                "The sign-in answered for another server ({given}); nothing was signed in."
+            )));
+        }
         if let Some(error) = params.get("error") {
             return Some(Err(anyhow::anyhow!(if error == "access_denied" {
                 "Sign-in was cancelled.".to_owned()
@@ -619,8 +694,13 @@ pub struct Identity {
 /// Reads the ID token's claims. It came straight from the token endpoint
 /// over verified TLS, which OpenID Connect Core §3.1.3.7 accepts in place
 /// of checking its signature.
+#[cfg(test)]
 fn identity(id_token: &str) -> Identity {
-    let claims = id_token
+    identity_of(&claims_of(id_token))
+}
+/// An ID token's claims (its middle part), or `null`.
+fn claims_of(id_token: &str) -> serde_json::Value {
+    id_token
         .split('.')
         .nth(1)
         .and_then(|p| {
@@ -630,7 +710,9 @@ fn identity(id_token: &str) -> Identity {
                 .ok()
         })
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+fn identity_of(claims: &serde_json::Value) -> Identity {
     let text = |key: &str| claims[key].as_str().unwrap_or_default().to_owned();
     let email = [text("email"), text("preferred_username"), text("upn")]
         .into_iter()
@@ -640,6 +722,55 @@ fn identity(id_token: &str) -> Identity {
         email,
         name: text("name"),
     }
+}
+
+/// The ID token's claims checked as OpenID Connect Core §3.1.3.7 asks of
+/// a token straight from the token endpoint: issued to this client (`aud`,
+/// and `azp` with several audiences), not expired, with the `nonce` this
+/// sign-in sent (where one was), and naming a subject. Returns who signed
+/// in and the subject. No ID token at all is no identity, not an error.
+fn checked_identity(
+    id_token: &str,
+    client_id: &str,
+    nonce: Option<&str>,
+) -> Result<(Identity, String)> {
+    if id_token.is_empty() {
+        return Ok((Identity::default(), String::new()));
+    }
+    let claims = claims_of(id_token);
+    ensure!(claims.is_object(), "The sign-in's ID token couldn't be read.");
+    let audiences: Vec<&str> = match &claims["aud"] {
+        serde_json::Value::String(a) => vec![a.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    if !client_id.is_empty() {
+        ensure!(
+            audiences.contains(&client_id),
+            "The sign-in's ID token was issued to another app."
+        );
+        if audiences.len() > 1
+            && let Some(azp) = claims["azp"].as_str()
+        {
+            ensure!(azp == client_id, "The sign-in's ID token was issued to another app.");
+        }
+    }
+    if let Some(exp) = claims["exp"].as_i64() {
+        // A few minutes' leeway for clocks that disagree.
+        ensure!(
+            exp + 300 >= chrono::Utc::now().timestamp(),
+            "The sign-in's ID token has expired. Check this device's clock."
+        );
+    }
+    if let Some(nonce) = nonce {
+        ensure!(
+            claims["nonce"].as_str() == Some(nonce),
+            "The sign-in's ID token doesn't belong to this sign-in."
+        );
+    }
+    let subject = claims["sub"].as_str().unwrap_or_default().to_owned();
+    ensure!(!subject.is_empty(), "The sign-in's ID token names no account.");
+    Ok((identity_of(&claims), subject))
 }
 
 /// What the browser handed back: an authorization code and the values that
@@ -708,7 +839,8 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
 /// (Fastmail), else registered for this sign-in.
 fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     let metadata = jmap_metadata(&account.incoming_host, account.incoming_port)?;
-    let browser = Browser::new("127.0.0.1", "/callback")?;
+    let mut browser = Browser::new("127.0.0.1", "/callback")?;
+    browser.issuer = metadata.issuer.clone();
     let own = jmap_client(account);
     let client_id = if !own.id.is_empty() {
         own.id
@@ -758,7 +890,8 @@ fn authorize_sso(
     cancel: Arc<AtomicBool>,
 ) -> Result<Grant> {
     let metadata = sso_metadata(&sso.issuer)?;
-    let browser = Browser::new("127.0.0.1", "/callback")?;
+    let mut browser = Browser::new("127.0.0.1", "/callback")?;
+    browser.issuer = metadata.issuer.clone();
     let client_id = if !account.client_id.is_empty() {
         account.client_id.clone()
     } else if let Some(endpoint) = &metadata.registration {
@@ -821,10 +954,8 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     }
     let (mut secret, value) = exchange(token, &fields)?;
     secret.client_secret = account.client_secret.clone();
-    Ok((
-        secret,
-        identity(value["id_token"].as_str().unwrap_or_default()),
-    ))
+    let (who, _) = checked_identity(value["id_token"].as_str().unwrap_or_default(), client_id, None)?;
+    Ok((secret, who))
 }
 
 /// What Picacho asks Pinal for: who you are, and reading, organizing,
@@ -860,7 +991,7 @@ fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
             .send()
             .context("Could not reach Pinal Accounts. Check your connection.")?;
         if response.status().is_success()
-            && let Ok(value) = response.json::<serde_json::Value>()
+            && let Ok(value) = bounded_json(response)
             && value["authorization_endpoint"].is_string()
         {
             config = Some(value);
@@ -945,6 +1076,8 @@ struct PinalRequest {
     url: url::Url,
     endpoints: PinalEndpoints,
     browser: Browser,
+    /// The nonce the ID token must carry back.
+    nonce: String,
 }
 fn pinal_request(hint: &str, hosted: bool) -> Result<PinalRequest> {
     let endpoints = pinal_endpoints(&http()?)?;
@@ -955,13 +1088,14 @@ fn pinal_request(hint: &str, hosted: bool) -> Result<PinalRequest> {
     };
     let mut url = endpoints.authorize.clone();
     let client_id = pinal_client_id();
+    let nonce = random_url_token();
     url.query_pairs_mut().extend_pairs([
         ("client_id", client_id.as_str()),
         ("redirect_uri", &browser.redirect),
         ("response_type", "code"),
         ("scope", PINAL_SCOPES),
         ("state", &browser.state),
-        ("nonce", &random_url_token()),
+        ("nonce", &nonce),
         ("code_challenge", &browser.challenge),
         ("code_challenge_method", "S256"),
     ]);
@@ -972,6 +1106,7 @@ fn pinal_request(hint: &str, hosted: bool) -> Result<PinalRequest> {
         url,
         endpoints,
         browser,
+        nonce,
     })
 }
 /// Turns Pinal's code into tokens and says whose mailbox they open.
@@ -987,7 +1122,11 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
             ("code_verifier", &request.browser.verifier),
         ],
     )?;
-    let mut who = identity(value["id_token"].as_str().unwrap_or_default());
+    let (mut who, subject) = checked_identity(
+        value["id_token"].as_str().unwrap_or_default(),
+        &client_id,
+        Some(&request.nonce),
+    )?;
     if who.email.is_empty() {
         // Pinal keeps the ID token small; the address is in its userinfo.
         let info: serde_json::Value = http()?
@@ -996,8 +1135,13 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
             .send()
             .and_then(|r| r.error_for_status())
             .context("Could not reach Pinal Accounts. Check your connection.")?
-            .json()?;
+            .and_then_bounded_json()?;
         let text = |key: &str| info[key].as_str().unwrap_or_default().to_owned();
+        // The same account as the ID token's (OpenID Connect Core §5.3.4).
+        ensure!(
+            subject.is_empty() || text("sub") == subject,
+            "Pinal Accounts answered for another account."
+        );
         if info["email_verified"].as_bool() != Some(false) {
             who.email = text("email");
         }
@@ -1063,7 +1207,7 @@ pub(crate) fn pinal_driven(
 fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_json::Value)> {
     let response = http()?.post(endpoint).form(fields).send()?;
     let status = response.status();
-    let value: serde_json::Value = response.json()?;
+    let value: serde_json::Value = bounded_json(response)?;
     // Do not include the whole provider response: it can contain credentials
     // or codes. The error code and Microsoft's AADSTS number are safe to show.
     if !status.is_success() {

@@ -99,6 +99,40 @@ impl MailApp {
         self.compose_with(0, None, None, Some(to), None, w, cx);
     }
 
+    /// A new message from a `mailto:` link (RFC 6068), in Picacho's own
+    /// composer: its recipients, Cc, Bcc, subject and body. Other header
+    /// fields the link names are left out (§4: In-Reply-To aside, a link
+    /// mustn't set what isn't shown).
+    pub(super) fn compose_mailto(&mut self, link: &str, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = super::links::Mailto::parse(link) else {
+            self.notice("That email link isn't valid.", true, cx);
+            return;
+        };
+        self.compose_with(0, None, None, Some(m.to.clone()), None, w, cx);
+        // The composer just opened is the newest.
+        if let Some(composer) = self.composers.last().cloned() {
+            composer.update(cx, |c, cx| {
+                if !m.cc.is_empty() {
+                    c.draft.cc = m.cc.clone();
+                }
+                if !m.bcc.is_empty() {
+                    c.draft.bcc = m.bcc.clone();
+                }
+                if !m.subject.is_empty() {
+                    c.draft.subject = m.subject.clone();
+                }
+                if !m.body.is_empty() {
+                    c.draft.body = format!("{}{}", m.body, c.draft.body);
+                }
+                if !m.in_reply_to.is_empty() {
+                    c.draft.reply_id = m.in_reply_to.clone();
+                }
+                c.reload_fields(w, cx);
+                cx.notify();
+            });
+        }
+    }
+
     /// `intro` (a suggested reply) starts the body, above the signature and
     /// quote.
     #[allow(clippy::too_many_arguments)]

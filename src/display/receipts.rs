@@ -7,6 +7,7 @@
 //! one taken for a receipt wrongly can be hidden.
 use super::summary::{WIDGET_WIDTH, tag};
 use super::*;
+use super::summary::SummaryItem;
 use crate::manage::receipts::{self, Amount, Kind, LineKind, Listed};
 use chrono::{Datelike, TimeZone};
 
@@ -131,15 +132,27 @@ impl MailApp {
     /// what its emails say matched.
     fn shown_receipts<'a>(&'a self, cx: &App) -> Vec<(&'a Listed, bool)> {
         let query = self.receipt_query(cx);
-        self.listed_receipts(self.receipts_show_hidden)
-            .filter_map(|l| match query.as_deref() {
-                None => Some((l, false)),
-                Some(q) => {
+        let listed: Vec<&Listed> = self.listed_receipts(self.receipts_show_hidden).collect();
+        let Some(q) = query else {
+            return listed.into_iter().map(|l| (l, false)).collect();
+        };
+        // Search results again only once something they depend on changed
+        // (see `search_key`), not on every frame.
+        let key = self.search_key(
+            &q,
+            listed.iter().map(|l| (l.first().mail_id.as_str(), l.emails.len(), l.hidden)),
+        );
+        let found = self.cached_search("receipts", key, || {
+            listed
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| {
                     let account = self.account_name(&l.first().account);
-                    receipt_matches(l, q, account.as_deref(), &self.parcel_texts).map(|e| (l, e))
-                }
-            })
-            .collect()
+                    receipt_matches(l, &q, account.as_deref(), &self.parcel_texts).map(|e| (i, e))
+                })
+                .collect()
+        });
+        found.iter().filter_map(|&(i, e)| Some((*listed.get(i)?, e))).collect()
     }
 
     /// The Receipts page's search button: opens the search field, or
@@ -398,21 +411,12 @@ impl MailApp {
     }
 
     /// The Receipts page: every receipt, by month, newest first.
-    pub(super) fn receipts_page(&self, all: bool, cx: &Context<Self>) -> AnyElement {
+    /// The Receipts page's top: its title, count, search and notices.
+    fn receipts_header(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let count = self.listed_receipts(false).count();
         let hidden = self.receipts.len() - count;
         let show_hidden = self.receipts_show_hidden;
-        let searched = self.receipt_query(cx).is_some();
-        // By month: (its first second, its receipts).
-        let mut months: Vec<(i64, Vec<Shown<'_>>)> = Vec::new();
-        for (i, (l, in_email)) in self.shown_receipts(cx).into_iter().enumerate() {
-            let start = month_start(l.date);
-            match months.last_mut() {
-                Some((m, list)) if *m == start => list.push((i, l, in_email)),
-                _ => months.push((start, vec![(i, l, in_email)])),
-            }
-        }
         div()
             .id("summary-receipts-page")
             .debug_selector(|| "summary-receipts-page".into())
@@ -485,8 +489,15 @@ impl MailApp {
                 )
             })
             .children(self.summary_download_status(false, cx))
-            .when(months.is_empty(), |d| {
-                d.child(
+            .into_any_element()
+    }
+
+    /// What the Receipts page shows when it lists no receipt.
+    fn receipts_empty(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let show_hidden = self.receipts_show_hidden;
+        let searched = self.receipt_query(cx).is_some();
+        div().pt_3().child(
                     div()
                         .id("summary-receipts-empty")
                         .debug_selector(|| "summary-receipts-empty".into())
@@ -508,15 +519,14 @@ impl MailApp {
                                 self.receipts_empty_text()
                             },
                         ),
-                )
-            })
-            .children(
-                months
-                    .into_iter()
-                    .enumerate()
-                    .map(|(m, (start, list))| self.receipts_month(m, start, list, all, cx)),
-            )
-            .child(
+        )
+        .into_any_element()
+    }
+
+    /// What the Receipts page says under its receipts.
+    fn receipts_footer(&self) -> AnyElement {
+        let c = self.colors();
+        div().pt_3().child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
@@ -525,22 +535,121 @@ impl MailApp {
                          emails say; nothing is looked up online.",
                         fmt_count(self.receipts_scanned),
                     )),
-            )
+        )
+        .into_any_element()
+    }
+
+    /// The Receipts page's rows: each month's heading, then its receipts.
+    fn receipt_items<'a>(&'a self, cx: &App) -> Vec<ReceiptItem<'a>> {
+        let mut items = Vec::new();
+        let mut month = None;
+        let shown = self.shown_receipts(cx);
+        for (i, &(l, in_email)) in shown.iter().enumerate() {
+            let start = month_start(l.date);
+            if month != Some(start) {
+                month = Some(start);
+                let list: Vec<&Listed> = shown[i..]
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .take_while(|l| month_start(l.date) == start)
+                    .collect();
+                items.push(ReceiptItem::Month { start, list });
+            }
+            items.push(ReceiptItem::Receipt { l, in_email });
+        }
+        items
+    }
+
+    /// The Receipts page, its rows virtualized (see `summary_list`).
+    pub(super) fn receipts_page(&self, cx: &Context<Self>) -> AnyElement {
+        let items = self.receipt_items(cx);
+        // For the rows built this frame (see `summary_rows`): each receipt by
+        // its place in `receipts`, a month's heading as `usize::MAX`.
+        let rows: Vec<(usize, bool)> = items
+            .iter()
+            .map(|item| match item {
+                ReceiptItem::Month { .. } => (usize::MAX, false),
+                ReceiptItem::Receipt { l, in_email, .. } => {
+                    (super::summary::index_in(&self.receipts, l).unwrap_or(usize::MAX), *in_email)
+                }
+            })
+            .collect();
+        *self.summary_rows.borrow_mut() = Rc::new(rows);
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for item in &items {
+                match item {
+                    ReceiptItem::Month { start, list, .. } => (0u8, *start, list.len()).hash(&mut h),
+                    ReceiptItem::Receipt { l, in_email, .. } => {
+                        (1u8, l.key(), l.emails.len(), l.hidden, in_email).hash(&mut h)
+                    }
+                }
+            }
+            let mut open: Vec<&String> = self.summary_expanded.iter().collect();
+            open.sort();
+            open.hash(&mut h);
+            (self.receipts_search, self.parcel_texts_loading, self.summary_downloads, self.receipts_scanned).hash(&mut h);
+            (self.dark, self.receipts_show_hidden).hash(&mut h);
+            h.finish()
+        };
+        let count = items.len().max(1);
+        self.summary_list("receipts", count, key, cx, |this, item, cx| {
+            let all = this.account.as_deref() == Some(fwd::ALL_MAIL);
+            match item {
+                SummaryItem::Header => this.receipts_header(cx),
+                SummaryItem::Footer => this.receipts_footer(),
+                SummaryItem::Row { i, .. } => this.receipt_list_row(i, all, cx),
+            }
+        })
+    }
+
+    /// Row `i` of the Receipts page's list: a month's heading, or a receipt
+    /// in its month's card. From the rows made as the page was drawn
+    /// (`summary_rows`); the neighbours say where a month starts and ends.
+    fn receipt_list_row(&self, i: usize, all: bool, cx: &Context<Self>) -> AnyElement {
+        let rows = self.summary_rows.borrow().clone();
+        let Some(&(at, in_email)) = rows.get(i) else {
+            return self.receipts_empty(cx);
+        };
+        let receipt = |r: Option<&(usize, bool)>| r.and_then(|&(at, _)| self.receipts.get(at));
+        let Some(l) = receipt(Some(&(at, in_email))) else {
+            // A month's heading: its receipts are the rows up to the next.
+            let list: Vec<&Listed> = rows[i + 1..]
+                .iter()
+                .take_while(|(at, _)| *at != usize::MAX)
+                .filter_map(|r| receipt(Some(r)))
+                .collect();
+            let m = rows[..i].iter().filter(|(at, _)| *at == usize::MAX).count();
+            let start = list.first().map_or(0, |l| month_start(l.date));
+            return self.receipts_month(m, start, &list);
+        };
+        let first = i == 0 || rows[i - 1].0 == usize::MAX;
+        let last = rows.get(i + 1).is_none_or(|(at, _)| *at == usize::MAX);
+        // Its place among the receipts shown, as its ids have it.
+        let n = rows[..i].iter().filter(|(at, _)| *at != usize::MAX).count();
+        let row = self.receipt_row(n, !first, l, all, in_email, cx);
+        self.card_edge_below(row, last)
+    }
+
+    /// A receipt row in its month's card: the card's sides, and its rounded
+    /// bottom under the month's last (the month's heading is its top).
+    fn card_edge_below(&self, row: AnyElement, last: bool) -> AnyElement {
+        let c = self.colors();
+        div()
+            .border_l_1()
+            .border_r_1()
+            .border_color(rgb(c.border))
+            .when(last, |d| d.border_b_1().rounded_b(px(10.)))
+            .child(row)
             .into_any_element()
     }
 
-    /// A month on the Receipts page: its name and what was spent, then its
-    /// receipts.
-    fn receipts_month(
-        &self,
-        m: usize,
-        start: i64,
-        list: Vec<Shown<'_>>,
-        all: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
+    /// A month's heading on the Receipts page: its name and what was spent,
+    /// the top of the card its receipts make (see `receipt_items`).
+    fn receipts_month(&self, m: usize, start: i64, list: &[&Listed]) -> AnyElement {
         let c = self.colors();
-        let spent = receipts::totals(list.iter().map(|(_, l, _)| *l).filter(|l| !l.hidden));
+        let spent = receipts::totals(list.iter().copied().filter(|l| !l.hidden));
         let name = chrono::Local
             .timestamp_opt(start, 0)
             .single()
@@ -549,47 +658,33 @@ impl MailApp {
         div()
             .id(SharedString::from(format!("summary-receipts-month-{m}")))
             .debug_selector(move || format!("summary-receipts-month-{m}"))
+            .mt_3()
+            .px_3()
+            .py_2()
             .flex()
-            .flex_col()
-            .rounded(px(10.))
+            .items_center()
+            .gap_2()
             .border_1()
             .border_color(rgb(c.border))
+            .bg(rgb(c.raised))
+            .rounded_t(px(10.))
             .child(
                 div()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(rgb(c.border))
-                    .bg(rgb(c.raised))
-                    .rounded_t(px(10.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(name),
-                    )
-                    .when(!spent.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "summary-receipts-month-total-{m}"
-                                )))
-                                .debug_selector(move || format!("summary-receipts-month-total-{m}"))
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(show_totals(&spent)),
-                        )
-                    }),
+                    .flex_1()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(name),
             )
-            .children(
-                list.into_iter()
-                    .enumerate()
-                    .map(|(j, (i, l, in_email))| self.receipt_row(i, j > 0, l, all, in_email, cx)),
-            )
+            .when(!spent.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id(SharedString::from(format!("summary-receipts-month-total-{m}")))
+                        .debug_selector(move || format!("summary-receipts-month-total-{m}"))
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(show_totals(&spent)),
+                )
+            })
             .into_any_element()
     }
 
@@ -773,7 +868,13 @@ impl MailApp {
 
 /// A receipt on the Receipts page: its place in the list, and whether
 /// only what its emails say matched the search.
-type Shown<'a> = (usize, &'a Listed, bool);
+/// A row of the Receipts page's list.
+enum ReceiptItem<'a> {
+    /// A month's heading, with its receipts (for its total).
+    Month { start: i64, list: Vec<&'a Listed> },
+    /// A receipt, and whether only what its emails say matched the search.
+    Receipt { l: &'a Listed, in_email: bool },
+}
 
 /// Whether a receipt matches a search (lowercase): every word of it is in
 /// who was paid, its order, amount, kind, account, or one of its emails'

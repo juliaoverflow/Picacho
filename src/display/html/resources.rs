@@ -137,8 +137,7 @@ impl Resources {
         self.fetcher.get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Fetch>();
             let rx = Arc::new(Mutex::new(rx));
-            let proxies = Arc::new(Proxies::system());
-            let client = client(&proxies);
+            let (proxies, client) = shared_client();
             for _ in 0..FETCHERS {
                 let (rx, client, proxies) = (rx.clone(), client.clone(), proxies.clone());
                 let shared = Shared {
@@ -155,6 +154,21 @@ impl Resources {
             tx
         })
     }
+}
+/// The HTTP client and proxies every email's fetches share. Each made its
+/// own before: a blocking client is a runtime thread and connection pool of
+/// its own, one more for each email opened with remote content allowed.
+/// Each email still keeps to its own limits (`Shared`).
+fn shared_client() -> (Arc<Proxies>, Option<reqwest::blocking::Client>) {
+    static SHARED: std::sync::OnceLock<(Arc<Proxies>, Option<reqwest::blocking::Client>)> =
+        std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let proxies = Arc::new(Proxies::system());
+            let client = client(&proxies);
+            (proxies, client)
+        })
+        .clone()
 }
 fn client(proxies: &Arc<Proxies>) -> Option<reqwest::blocking::Client> {
     let redirects = proxies.clone();
@@ -288,41 +302,7 @@ fn allowed_ip(ip: std::net::IpAddr) -> bool {
     cfg!(test) || public_ip(ip)
 }
 
-/// Whether `ip` is on the internet: not this computer, a private or
-/// link-local network, carrier-grade NAT, or a reserved range.
-fn public_ip(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_multicast()
-                || a == 0
-                // 100.64.0.0/10, shared address space (carrier-grade NAT).
-                || (a == 100 && (64..128).contains(&b))
-                // 198.18.0.0/15, benchmarking; 240.0.0.0/4, reserved.
-                || (a == 198 && (18..20).contains(&b))
-                || a >= 240)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return public_ip(IpAddr::V4(v4));
-            }
-            let first = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fc00::/7, unique local; fe80::/10, link-local.
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
-        }
-    }
-}
+use crate::sync::public_net::public_ip;
 
 /// The proxies the fetches go through, as reqwest finds them (`HTTP_PROXY`
 /// and the like, or the system's settings on macOS and Windows).
@@ -362,6 +342,12 @@ impl Proxies {
         let Some(url::Host::Domain(name)) = url.host() else {
             return true;
         };
+        // The proxy itself, at any port: `PublicOnly` lets its name reach
+        // the local network (to connect through it), and a proxy on this
+        // computer or the network is usually left out of the proxying.
+        if self.hosts.contains(&name.to_ascii_lowercase()) {
+            return false;
+        }
         if !self.routes(url) {
             // Straight there: `PublicOnly` checks the name as it connects.
             return true;
@@ -370,7 +356,9 @@ impl Proxies {
         match (name, 0).to_socket_addrs() {
             Ok(found) => {
                 let found: Vec<_> = found.collect();
-                found.is_empty() || found.iter().any(|a| allowed_ip(a.ip()))
+                // Every address: with a public one and a private one, the
+                // proxy may well connect to the private one.
+                found.is_empty() || found.iter().all(|a| allowed_ip(a.ip()))
             }
             Err(_) => true,
         }
@@ -414,6 +402,11 @@ impl NetProvider for Resources {
                 .map(|(bytes, _)| bytes)
                 .unwrap_or_default();
             let bytes = self.local_served(&url, &bytes);
+            handler.bytes(url, Bytes::from(bytes));
+        } else if let Some(part) = self.inline.at_location(&url) {
+            // A part sent with the message at that address (MHTML's
+            // Content-Location): its own copy, nothing fetched.
+            let bytes = self.local_served(&url, &part);
             handler.bytes(url, Bytes::from(bytes));
         } else if request.url.scheme() == "cid" {
             let part = self.inline.get(&url);
@@ -538,6 +531,9 @@ mod tests {
         let url = |u: &str| url::Url::parse(u).unwrap();
         assert!(proxies.routes(&url("https://images.example/a.png")));
         assert!(!proxies.routes(&url("https://direct.example/a.png")));
+        // The proxy itself isn't a place an email may load from, at any port.
+        assert!(!proxies.admits(&url("http://proxy.corp.example:8080/admin")));
+        assert!(!proxies.admits(&url("https://PROXY.corp.example/")));
         // `localhost` is this computer however it is reached.
         assert!(!public_ip("127.0.0.1".parse().unwrap()));
         assert!(Proxies::with(Matcher::builder().build()).hosts.is_empty());

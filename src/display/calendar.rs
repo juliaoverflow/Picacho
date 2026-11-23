@@ -261,6 +261,8 @@ impl MailApp {
             "REPLY" => "Answer to your invitation",
             "COUNTER" => "New time proposed",
             "DECLINECOUNTER" => "Your proposed time wasn't taken",
+            "REFRESH" => "A guest asks for the latest version",
+            "ADD" => "More times added",
             "PUBLISH" | "" => "Event",
             _ if changed.is_some() => "Updated invitation",
             _ => "Invitation",
@@ -295,10 +297,21 @@ impl MailApp {
                 } else {
                     at.name.clone()
                 };
+                // Optional guests and rooms say so (ROLE, CUTYPE).
+                let role = ical::extra_param(&at.extra, "ROLE").unwrap_or_default();
+                let kind = ical::extra_param(&at.extra, "CUTYPE").unwrap_or_default();
+                let name = if role.eq_ignore_ascii_case("OPT-PARTICIPANT") {
+                    format!("{name}, optional")
+                } else if kind.eq_ignore_ascii_case("ROOM") || kind.eq_ignore_ascii_case("RESOURCE") {
+                    format!("{name}, {}", kind.to_ascii_lowercase())
+                } else {
+                    name
+                };
                 match at.status {
                     Some(PartStat::Accepted) => format!("{name} (yes)"),
                     Some(PartStat::Declined) => format!("{name} (no)"),
                     Some(PartStat::Tentative) => format!("{name} (maybe)"),
+                    Some(PartStat::Delegated) => format!("{name} (delegated)"),
                     _ => name,
                 }
             })
@@ -505,8 +518,33 @@ impl MailApp {
                             )),
                     )
                 })
-                .when(!e.description.is_empty() && inv.method == "COUNTER", |d| {
-                    d.child(row("Note", e.description.clone()))
+                .when(inv.method == "REFRESH" && self.backend.stored_event(&e.uid).is_some(), |d| {
+                    d.child(div().mt_2().flex().child(self.button(
+                        "invite-refresh",
+                        "Send It Again",
+                        "send",
+                        Action::AnswerRefresh(m.id.clone()),
+                        true,
+                        cx,
+                    )))
+                })
+                .when(inv.method == "ADD" && self.backend.stored_event(&e.uid).is_some(), |d| {
+                    d.child(div().mt_2().flex().child(self.button(
+                        "invite-add",
+                        "Add to Calendar",
+                        "check",
+                        Action::TakeAddedOccurrences(m.id.clone()),
+                        true,
+                        cx,
+                    )))
+                })
+                // A guest's note with a proposed time (COMMENT; older
+                // Picachos wrote it as the description).
+                .when(inv.method == "COUNTER" && !(e.comment.is_empty() && e.description.is_empty()), |d| {
+                    d.child(row(
+                        "Note",
+                        if e.comment.is_empty() { e.description.clone() } else { e.comment.clone() },
+                    ))
                 })
                 .when_some(answered.filter(|_| invited), |d, s| {
                     d.child(
@@ -631,6 +669,12 @@ impl MailApp {
             Action::DeclineCounter(id) => self.on_invitation(&id, cx, |b, a, m| {
                 b.decline_counter(a, m)
                     .map(|()| "They were told the time stays".into())
+            }),
+            Action::AnswerRefresh(id) => self.on_invitation(&id, cx, |b, a, m| {
+                b.answer_refresh(a, m).map(|()| "They were sent the event as it is now".into())
+            }),
+            Action::TakeAddedOccurrences(id) => self.on_invitation(&id, cx, |b, a, m| {
+                b.take_added(a, m).map(|()| "The added times are in your calendar".into())
             }),
             Action::TakeInvitationUpdate(id) => self.on_invitation(&id, cx, |b, a, m| {
                 b.take_update(a, m)
@@ -921,6 +965,7 @@ impl MailApp {
                             email: a.email.clone(),
                             name: a.name.clone(),
                             status: None,
+                            ..Default::default()
                         });
                     }
                     let kept = event.attendees.clone();

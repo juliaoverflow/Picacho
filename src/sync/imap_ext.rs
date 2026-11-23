@@ -42,7 +42,9 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
     if ext.qresync {
         wanted.push("QRESYNC");
     }
-    if ext.utf8_accept && !ext.rev2 && !ext.offers_rev2 {
+    // UTF8=ACCEPT is enabled alongside rev2 too: rev2 alone allows UTF-8
+    // mailbox names, but not UTF-8 in quoted strings and headers.
+    if ext.utf8_accept {
         wanted.push("UTF8=ACCEPT");
     }
     // Every command Picacho sends names messages by UID already; UIDONLY
@@ -58,6 +60,12 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
     let data = match session.run_command_and_read_response(format!("ENABLE {}", wanted.join(" "))) {
         Ok(data) => data,
         Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => {
+            // UTF8=ONLY servers refuse a session that hasn't enabled
+            // UTF-8 (RFC 6855 §7).
+            ensure!(
+                !ext.utf8_only,
+                "The server only accepts UTF-8 sessions and refused to enable one."
+            );
             return Ok(base);
         }
         Err(e) => return Err(e.into()),
@@ -73,6 +81,10 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
     }
     // rev2's mailbox names are UTF-8 (RFC 9051 §5.1).
     enabled.utf8 |= enabled.rev2;
+    ensure!(
+        !ext.utf8_only || enabled.utf8,
+        "The server only accepts UTF-8 sessions and didn't enable one."
+    );
     Ok(enabled)
 }
 /// Whether the IMAP parser reads UIDONLY's `UIDFETCH` replies as UID
@@ -106,9 +118,21 @@ pub(crate) fn cache_name(name: &str, utf8: bool) -> String {
 
 /// A sequence set such as `1:5,9` as its numbers, refusing sets that would
 /// be absurdly large (a broken or hostile server).
+#[cfg(test)]
 pub(crate) fn parse_set(set: &str) -> Result<Vec<u32>> {
-    const MOST: usize = 20_000_000;
     let mut out = Vec::new();
+    parse_set_into(set, &mut out, 0)?;
+    Ok(out)
+}
+
+/// The most UIDs one reply's sets give, together: a mailbox holds far
+/// fewer. Counted across all of a reply's lines, which each could give as
+/// many before.
+const MOST_UIDS: usize = 20_000_000;
+
+/// `parse_set`, added to `out`, which with them (and `elsewhere`, the
+/// reply's UIDs kept apart from it) may hold at most `MOST_UIDS`.
+fn parse_set_into(set: &str, out: &mut Vec<u32>, elsewhere: usize) -> Result<()> {
     for part in set.split(',').filter(|p| !p.is_empty()) {
         let (a, b) = match part.split_once(':') {
             Some((a, b)) => (a, b),
@@ -121,12 +145,12 @@ pub(crate) fn parse_set(set: &str) -> Result<Vec<u32>> {
         let (lo, hi) = (a.min(b), a.max(b));
         ensure!(lo > 0, "Invalid IMAP UID 0");
         ensure!(
-            out.len() + (hi - lo) as usize <= MOST,
+            (out.len() + elsewhere) as u64 + u64::from(hi - lo) < MOST_UIDS as u64,
             "The server's search result is too large"
         );
         out.extend(lo..=hi);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The UIDs an ESEARCH reply's `ALL` lists (RFC 4731).
@@ -137,7 +161,7 @@ fn esearch_uids(data: &[u8]) -> Result<Vec<u32>> {
         if let Some(i) = words.iter().position(|w| w.eq_ignore_ascii_case("ALL"))
             && let Some(set) = words.get(i + 1)
         {
-            out.extend(parse_set(set)?);
+            parse_set_into(set, &mut out, 0)?;
         }
     }
     Ok(out)
@@ -162,7 +186,7 @@ pub(crate) fn multisearch(
     criteria: &str,
     utf8: bool,
 ) -> Result<Vec<Found>> {
-    ensure!(!criteria.contains(['\r', '\n']) || criteria.contains("}\r\n"), "Invalid IMAP search");
+    ensure!(literals_only(criteria), "Invalid IMAP search");
     if names.is_empty() {
         return Ok(Vec::new());
     }
@@ -176,6 +200,8 @@ pub(crate) fn multisearch(
 /// `* ESEARCH (TAG "a" MAILBOX "INBOX" UIDVALIDITY 9) UID COUNT 3 ALL 4:6`
 fn parse_multisearch(data: &[u8]) -> Result<Vec<Found>> {
     let mut out = Vec::new();
+    // UIDs of the mailboxes already read, which count toward the limit.
+    let mut listed = 0;
     for line in other_lines(data, "ESEARCH")? {
         let tokens = tokens(line);
         let text = |i: usize| match tokens.get(i) {
@@ -188,10 +214,17 @@ fn parse_multisearch(data: &[u8]) -> Result<Vec<Found>> {
         if tokens.first() == Some(&Token::Open) {
             i = 1;
             while i < tokens.len() && tokens[i] != Token::Close {
+                // Keyword and value in pairs: a mailbox named "UIDVALIDITY"
+                // is a value, not read as the keyword.
                 match text(i).map(str::to_ascii_uppercase).as_deref() {
-                    Some("MAILBOX") => found.mailbox = text(i + 1).unwrap_or_default().to_owned(),
+                    Some("MAILBOX") => {
+                        found.mailbox = text(i + 1).unwrap_or_default().to_owned();
+                        i += 1;
+                    }
+                    Some("TAG") => i += 1,
                     Some("UIDVALIDITY") => {
-                        found.validity = text(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0)
+                        found.validity = text(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                        i += 1;
                     }
                     _ => {}
                 }
@@ -202,7 +235,10 @@ fn parse_multisearch(data: &[u8]) -> Result<Vec<Found>> {
         while i < tokens.len() {
             match (text(i).map(str::to_ascii_uppercase).as_deref(), text(i + 1)) {
                 (Some("COUNT"), Some(n)) => found.count = n.parse().unwrap_or(0),
-                (Some("ALL"), Some(set)) => found.uids = parse_set(set)?,
+                (Some("ALL"), Some(set)) => {
+                    found.uids.clear();
+                    parse_set_into(set, &mut found.uids, listed)?;
+                }
                 _ => {}
             }
             i += 1;
@@ -213,6 +249,7 @@ fn parse_multisearch(data: &[u8]) -> Result<Vec<Found>> {
         if found.count == 0 {
             found.count = found.uids.len();
         }
+        listed += found.uids.len();
         out.push(found);
     }
     Ok(out)
@@ -221,8 +258,12 @@ fn parse_multisearch(data: &[u8]) -> Result<Vec<Found>> {
 /// UID SEARCH that also keeps its result on the server as `$` (SEARCHRES,
 /// RFC 5182), for the next commands to act on exactly those messages; it
 /// needs ESEARCH's form of reply. Returns the UIDs.
-pub(crate) fn uid_search_saved(session: &mut ImapSession, criteria: &str) -> Result<Vec<u32>> {
-    let charset = search_charset(criteria, false);
+pub(crate) fn uid_search_saved(
+    session: &mut ImapSession,
+    criteria: &str,
+    utf8: bool,
+) -> Result<Vec<u32>> {
+    let charset = search_charset(criteria, utf8);
     let data = session.run_command_and_read_response(format!(
         "UID SEARCH RETURN (SAVE ALL) {charset}{criteria}"
     ))?;
@@ -301,13 +342,56 @@ pub(crate) fn search_uids(
     Ok(uids)
 }
 
+/// Whether every line break in `command` begins a LITERAL+ literal
+/// (`{n+}\r\n` and exactly `n` bytes, without line breaks of their own).
+/// One literal anywhere let any other line break through before, which
+/// would end the command and start another.
+fn literals_only(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' | b'\n' => {
+                // "{n+}" must come just before.
+                if bytes[i] != b'\r' || bytes.get(i + 1) != Some(&b'\n') {
+                    return false;
+                }
+                let Some(open) = command[..i].rfind('{') else {
+                    return false;
+                };
+                let Some(n) = command[open + 1..i]
+                    .strip_suffix("+}")
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    return false;
+                };
+                let start = i + 2;
+                let Some(text) = bytes.get(start..start + n) else {
+                    return false;
+                };
+                if text.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+                    return false;
+                }
+                i = start + n;
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
 /// A search term's text as an IMAP string the session accepts: quoted
 /// where it can be (ASCII, or any text once UTF8=ACCEPT is on), else a
 /// literal that needs no go-ahead (LITERAL+), else quoted UTF-8, which
 /// most servers searching in UTF-8 accept.
 pub(crate) fn search_string(text: &str, ext: &Extensions, utf8: bool) -> Result<String> {
     let text = text.replace(['\r', '\n'], " ");
-    if text.is_ascii() || utf8 || !ext.literal_plus {
+    // LITERAL- literals hold at most 4096 bytes (RFC 7888 §5).
+    let fits = !ext.literal_minus || text.len() <= 4096;
+    if text.is_ascii() || utf8 || !ext.literal_plus || !fits {
+        // 8-bit text in a quoted string is outside RFC 3501's syntax;
+        // it is the last resort where no non-synchronizing literal can
+        // carry it, and most servers searching in UTF-8 accept it.
         return quote(&text);
     }
     Ok(format!("{{{}+}}\r\n{text}", text.len()))
@@ -344,6 +428,12 @@ pub(crate) fn sorted_search(
         ))?;
         let mut out = Vec::new();
         for line in other_lines(&data, "SORT")? {
+            // With CONDSTORE, a MODSEQ search adds `(MODSEQ n)` at the
+            // end (RFC 7162 §3.1.5); it is no UID.
+            let line = match line.find('(') {
+                Some(at) => &line[..at],
+                None => line,
+            };
             for word in line.split_ascii_whitespace() {
                 out.push(word.parse::<u32>().context("Invalid IMAP SORT response")?);
             }
@@ -417,7 +507,7 @@ fn partial_uids(data: &[u8]) -> Result<(Vec<u32>, Option<usize>)> {
         {
             let set = set.trim_end_matches(')');
             if !set.eq_ignore_ascii_case("NIL") && !set.is_empty() {
-                uids.extend(parse_set(set)?);
+                parse_set_into(set, &mut uids, 0)?;
             }
         }
     }
@@ -494,22 +584,44 @@ pub(crate) fn select_qresync(
     let wire = wire_name(name, utf8);
     let command = format!("SELECT {} (QRESYNC ({validity} {modseq}))", quote(&wire)?);
     let data = session.run_command_and_read_response(command)?;
-    let selected = super::imap::selected_from(&data, name, true)?;
-    if selected.validity != validity {
+    // Where a mailbox was selected before, its end is marked `[CLOSED]`
+    // (RFC 7162 §3.2.11): what came before is about that one, not this.
+    let data = after_closed(&data);
+    let selected = super::imap::selected_from(data, name, true)?;
+    if selected.validity != validity || selected.modseq.is_none() {
+        // A changed validity, or a mailbox that keeps no mod-sequences
+        // ([NOMODSEQ]): nothing to resynchronize from.
         return Ok((selected, None));
     }
     let mut resync = Resync::default();
-    for line in other_lines(&data, "VANISHED")? {
+    for line in other_lines(data, "VANISHED")? {
         let set = line
             .trim_start()
             .strip_prefix("(EARLIER)")
             .or_else(|| line.trim_start().strip_prefix("(earlier)"))
             .unwrap_or(line)
             .trim();
-        resync.vanished.extend(parse_set(set)?);
+        parse_set_into(set, &mut resync.vanished, 0)?;
     }
-    resync.changed = super::imap::rows_from(&data)?;
+    resync.changed = super::imap::rows_from(data)?;
     Ok((selected, Some(resync)))
+}
+/// What follows the last `* OK [CLOSED]` line of a reply, or all of it.
+pub(crate) fn after_closed(data: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut at = 0;
+    while at < data.len() {
+        let end = data[at..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map_or(data.len(), |p| at + p + 2);
+        let line = &data[at..end];
+        if line.len() > 13 && line[..13].eq_ignore_ascii_case(b"* OK [CLOSED]") {
+            start = end;
+        }
+        at = end;
+    }
+    &data[start..]
 }
 
 /// A server or mailbox annotation (METADATA, RFC 5464), such as
@@ -525,8 +637,10 @@ pub(crate) fn get_metadata(
             .all(|e| e.starts_with('/') && !e.contains([' ', '\r', '\n', '"'])),
         "Invalid METADATA entry"
     );
+    // Values past 64 KB aren't sent (MAXSIZE, RFC 5464 §4.2.1): the
+    // server says how long the longest was, rather than a huge reply.
     let data = match session.run_command_and_read_response(format!(
-        "GETMETADATA {} ({})",
+        "GETMETADATA (MAXSIZE 65536) {} ({})",
         quote(mailbox)?,
         entries.join(" ")
     )) {
@@ -571,11 +685,39 @@ pub(crate) fn set_metadata(
 /// Asks the server to report changes in the selected mailbox and every
 /// personal one over this connection (NOTIFY, RFC 5465). Returns whether
 /// it agreed.
-pub(crate) fn notify_personal(session: &mut ImapSession) -> Result<bool> {
-    super::imap::optional(session.run_command_and_check_ok(
+pub(crate) fn notify_personal(session: &mut ImapSession, condstore: bool) -> Result<bool> {
+    // FlagChange for mailboxes other than the selected one needs CONDSTORE
+    // (RFC 5465 §5.4); a server would refuse it with [BADEVENT].
+    let others = if condstore {
+        "MessageNew MessageExpunge FlagChange"
+    } else {
+        "MessageNew MessageExpunge"
+    };
+    let command = format!(
         "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
-         (PERSONAL (MessageNew MessageExpunge FlagChange))",
-    ))
+         (PERSONAL ({others}))"
+    );
+    match session.run_command_and_check_ok(&command) {
+        Ok(()) => Ok(true),
+        // [BADEVENT]: the server named what it can report; ask again
+        // for the essentials alone.
+        Err(imap::error::Error::No(e) | imap::error::Error::Bad(e))
+            if e.to_ascii_uppercase().contains("BADEVENT") =>
+        {
+            super::imap::optional(session.run_command_and_check_ok(
+                "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge)) \
+                 (PERSONAL (MessageNew MessageExpunge))",
+            ))
+        }
+        Err(e) => super::imap::optional(Err(e)),
+    }
+}
+/// Whether a NOTIFY session lost events ([NOTIFICATIONOVERFLOW], RFC 5465
+/// §5.8): the server stopped notifying, and every mailbox may have
+/// changed.
+pub(crate) fn notification_overflow(heard: &[u8]) -> bool {
+    const CODE: &[u8] = b"[NOTIFICATIONOVERFLOW]";
+    heard.windows(CODE.len()).any(|w| w.eq_ignore_ascii_case(CODE))
 }
 /// The mailboxes a NOTIFY session's untagged STATUS lines name, as the
 /// cache keeps their names.
@@ -664,9 +806,12 @@ fn leaf(bs: &imap_proto::BodyStructure<'_>, section: String) -> Leaf {
     };
     let param = |params: &imap_proto::BodyParams<'_>, key: &str| {
         params.as_ref().and_then(|p| {
-            p.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .map(|(_, v)| mailparse_decode(v))
+            let pairs: Vec<(&str, &str)> = p.iter().map(|(k, v)| (&**k, &**v)).collect();
+            rfc2231(&pairs, key).or_else(|| {
+                p.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| mailparse_decode(v))
+            })
         })
     };
     let disposition = common.disposition.as_ref();
@@ -692,6 +837,67 @@ fn leaf(bs: &imap_proto::BodyStructure<'_>, section: String) -> Leaf {
         attachment,
         content_id: other.and_then(|o| o.id).map(str::to_owned),
     }
+}
+/// A parameter in RFC 2231's forms, from a server's BODYSTRUCTURE:
+/// `name*` (charset'language'%XX…), or continued as `name*0`, `name*1*`…
+/// in order. `None` where it isn't written so.
+fn rfc2231(params: &[(&str, &str)], key: &str) -> Option<String> {
+    let lower = key.to_ascii_lowercase();
+    let mut pieces: Vec<(u32, bool, &str)> = Vec::new();
+    for (k, v) in params {
+        let k = k.to_ascii_lowercase();
+        let Some(rest) = k.strip_prefix(&lower).and_then(|r| r.strip_prefix('*')) else {
+            continue;
+        };
+        let (number, encoded) = match rest.strip_suffix('*') {
+            Some(n) => (n, true),
+            None if rest.is_empty() => ("", true),
+            None => (rest, false),
+        };
+        let index = if number.is_empty() { 0 } else { number.parse().ok()? };
+        pieces.push((index, encoded, v));
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    pieces.sort_by_key(|p| p.0);
+    let mut charset = String::from("utf-8");
+    let mut bytes = Vec::new();
+    for (i, (_, encoded, value)) in pieces.iter().enumerate() {
+        let mut value = *value;
+        if *encoded {
+            if i == 0 {
+                // charset'language'
+                let mut parts = value.splitn(3, '\'');
+                if let (Some(cs), Some(_), Some(rest)) = (parts.next(), parts.next(), parts.next()) {
+                    if !cs.is_empty() {
+                        charset = cs.to_owned();
+                    }
+                    value = rest;
+                }
+            }
+            let raw = value.as_bytes();
+            let mut j = 0;
+            while j < raw.len() {
+                if raw[j] == b'%'
+                    && let Some(b) = raw
+                        .get(j + 1..j + 3)
+                        .and_then(|h| std::str::from_utf8(h).ok())
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    bytes.push(b);
+                    j += 3;
+                } else {
+                    bytes.push(raw[j]);
+                    j += 1;
+                }
+            }
+        } else {
+            bytes.extend_from_slice(value.as_bytes());
+        }
+    }
+    let encoding = encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    Some(encoding.decode(&bytes).0.into_owned())
 }
 /// A parameter value, with RFC 2047 encoded words decoded.
 fn mailparse_decode(value: &str) -> String {
@@ -760,6 +966,12 @@ pub(crate) fn fetch_part(
 }
 /// A part's body in its transfer encoding, decoded.
 pub(crate) fn decode_part(raw: &[u8], encoding: &str) -> Result<Vec<u8>> {
+    // The server names the encoding, and it is put in a header line here:
+    // only a name (a line break would add headers of the server's own).
+    ensure!(
+        encoding.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "The server named an invalid transfer encoding."
+    );
     let mut wrapped = format!(
         "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
     )
@@ -789,6 +1001,26 @@ pub(crate) fn fetch_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rfc_2231_parameters_are_read() {
+        assert_eq!(
+            rfc2231(&[("filename*", "utf-8''Caf%C3%A9.pdf")], "filename").as_deref(),
+            Some("Café.pdf")
+        );
+        assert_eq!(
+            rfc2231(&[("NAME*1", "rt.txt"), ("NAME*0*", "iso-8859-1'en'%E9")], "name").as_deref(),
+            Some("ért.txt")
+        );
+        assert_eq!(rfc2231(&[("name", "plain.txt")], "name"), None);
+    }
+    #[test]
+    fn closed_splits_a_reselect_and_overflow_is_seen() {
+        let data = b"* 3 FETCH (UID 9 FLAGS ())\r\n* OK [CLOSED] previous mailbox\r\n* 1 EXISTS\r\n";
+        assert_eq!(after_closed(data), b"* 1 EXISTS\r\n");
+        assert_eq!(after_closed(b"* 1 EXISTS\r\n"), b"* 1 EXISTS\r\n");
+        assert!(notification_overflow(b"* OK [NOTIFICATIONOVERFLOW] lost\r\n"));
+        assert!(!notification_overflow(b"* OK still here\r\n"));
+    }
     use super::*;
 
     #[test]
@@ -796,6 +1028,11 @@ mod tests {
         assert_eq!(parse_set("1:3,7,9:8").unwrap(), vec![1, 2, 3, 7, 8, 9]);
         assert!(parse_set("0").is_err());
         assert!(parse_set("1:4294967295").is_err());
+        // The limit is for a whole reply, not each of its lines.
+        let mut out = Vec::new();
+        parse_set_into("1:15000000", &mut out, 0).unwrap();
+        assert!(parse_set_into("1:15000000", &mut out, 0).is_err());
+        assert!(parse_set_into("1:6000000", &mut Vec::new(), 15_000_000).is_err());
         assert_eq!(
             parse_threads("(2)(3 6 (4 23)(44 7 96))").unwrap(),
             vec![vec![2], vec![3, 6, 4, 23, 44, 7, 96]]
@@ -826,6 +1063,13 @@ mod tests {
             vec!["Caf&AOk-".to_owned()]
         );
         assert_eq!(decode_part(b"aGVsbG8=", "base64").unwrap(), b"hello");
+        assert!(decode_part(b"x", "7bit\r\nContent-Type: text/html").is_err());
+        // Line breaks only as literals' own, of their stated length.
+        assert!(literals_only("TEXT {3+}\r\nabc SUBJECT {2+}\r\nhi"));
+        assert!(literals_only("TEXT \"a\""));
+        assert!(!literals_only("TEXT {3+}\r\nabc\r\nLOGOUT"));
+        assert!(!literals_only("TEXT {9+}\r\nab\r\nLOGOUT"));
+        assert!(!literals_only("TEXT x\r\n"));
         assert_eq!(wire_name("Caf&AOk-", true), "Café");
         assert_eq!(cache_name("Café", true), "Caf&AOk-");
     }

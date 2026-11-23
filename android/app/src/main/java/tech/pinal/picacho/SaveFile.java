@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * "Save as" for Rust (src/android.rs, save_as): GPUI's Android platform has
@@ -39,6 +40,10 @@ public final class SaveFile extends Activity {
 
     private boolean delivered;
     private String source;
+    /** The save this activity answers. */
+    private CountDownLatch mine;
+    /** Set once the activity starts: until then, the save may never begin. */
+    private static volatile boolean started;
 
     /**
      * Called from Rust, never on the UI thread: asks where to save
@@ -51,6 +56,7 @@ public final class SaveFile extends Activity {
             CountDownLatch latch = new CountDownLatch(1);
             done = latch;
             result = FAILED;
+            started = false;
             Activity activity = PicachoActivity.current();
             Context from = activity != null ? activity : context;
             Intent intent = new Intent(from, SaveFile.class)
@@ -61,6 +67,15 @@ public final class SaveFile extends Activity {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             }
             from.startActivity(intent);
+            // Android may not start an activity from the background: then
+            // nothing would ever answer, and every later save would wait
+            // behind this one. Once it has started, the person may take as
+            // long as they like choosing where.
+            if (!latch.await(10, TimeUnit.SECONDS) && !started) {
+                // Should it start after all, it answers no one.
+                done = null;
+                return FAILED;
+            }
             latch.await();
             return result;
         }
@@ -69,6 +84,10 @@ public final class SaveFile extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        started = true;
+        // Recreated (the screen turned) while its picker was open: the same
+        // save, still waiting, which nothing has answered yet.
+        mine = done;
         source = getIntent().getStringExtra(EXTRA_SOURCE);
         if (savedInstanceState != null) {
             // Recreated while the picker is open: its result still comes here.
@@ -126,9 +145,9 @@ public final class SaveFile extends Activity {
             return;
         }
         delivered = true;
-        result = outcome;
         CountDownLatch latch = done;
-        if (latch != null) {
+        if (latch != null && latch == mine) {
+            result = outcome;
             latch.countDown();
         }
         if (!isFinishing()) {

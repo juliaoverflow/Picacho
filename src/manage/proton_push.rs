@@ -140,6 +140,7 @@ impl Backend {
         }
         let (pushed, registered) = (Arc::downgrade(self), Arc::downgrade(self));
         let started = proton_push::start(
+            self.store.clone(),
             Arc::new(move |account, presentation| {
                 if let Some(backend) = pushed.upgrade() {
                     backend.proton_pushed(account, presentation);

@@ -117,6 +117,11 @@ pub struct HtmlView {
     pressed_at: Option<(f32, f32)>,
     /// The link under the pointer.
     hovered: Option<String>,
+    /// The person's text zoom for emails (1: their own size).
+    text_zoom: f32,
+    /// What screen readers are given of the email (its painted strips say
+    /// nothing): its text, and its links (text, address).
+    accessible: Option<(SharedString, Vec<(String, String)>)>,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
 impl EventEmitter<HtmlLink> for HtmlView {}
@@ -176,7 +181,19 @@ impl HtmlView {
             context_at: None,
             pressed_at: None,
             hovered: None,
+            text_zoom: 1.,
+            accessible: None,
         }
+    }
+    /// Shows emails larger or smaller (WCAG 1.4.4), now and from now on.
+    pub fn set_text_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(0.5, 3.);
+        if (zoom - self.text_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.text_zoom = zoom;
+        self.send(Command::TextZoom(zoom));
+        cx.notify();
     }
     /// Says the pointer is over `link` now, if that changed.
     fn hover(&mut self, link: Option<String>, cx: &mut Context<Self>) {
@@ -250,6 +267,7 @@ impl HtmlView {
         let tone = Tone::for_email(html, dark);
         self.dark = dark;
         self.clear(cx);
+        self.accessible = None;
         self.source = html.into();
         self.inline = inline.clone();
         self.blocked = blocked;
@@ -270,6 +288,9 @@ impl HtmlView {
             self.generation,
             self.updates.clone(),
         ));
+        if (self.text_zoom - 1.).abs() > f32::EPSILON {
+            self.send(Command::TextZoom(self.text_zoom));
+        }
         cx.notify();
     }
     /// Takes images no longer shown out of the window's atlas. Strips and
@@ -365,6 +386,10 @@ impl HtmlView {
             }
             Output::Hover(link) => self.hover(link, cx),
             Output::Open(url) => cx.emit(HtmlLink::Opened(url)),
+            Output::Accessible { text, links } => {
+                self.accessible = Some((text.into(), links));
+                cx.notify();
+            }
             Output::Failed => {
                 self.failed = true;
                 self.laid_out = true;
@@ -721,7 +746,19 @@ impl Render for HtmlView {
                     this.hover(None, cx);
                 }
             }))
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, w, cx| {
+                // A way out for keyboard users (WCAG 2.1.2): Escape leaves
+                // the message for the next control, as Tab would; Tab and
+                // Shift-Tab then move among the message's links again.
+                if e.keystroke.key == "escape" {
+                    if e.keystroke.modifiers.shift {
+                        w.focus_prev(cx);
+                    } else {
+                        w.focus_next(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 let command = if cfg!(target_os = "macos") {
                     e.keystroke.modifiers.platform
                 } else {
@@ -758,6 +795,31 @@ impl Render for HtmlView {
                     cx.stop_propagation();
                 }
             }))
+            // For screen readers: the email as a document with its text,
+            // and its links as buttons that open them (WCAG 1.1.1, 2.1.1).
+            .role(gpui::accesskit::Role::Document)
+            .aria_label("Message")
+            .when_some(self.accessible.clone(), |d, (text, links)| {
+                d.aria_description(text).child(
+                    div()
+                        .id("html-email-links")
+                        .absolute()
+                        .size_0()
+                        .overflow_hidden()
+                        .role(gpui::accesskit::Role::List)
+                        .aria_label("Links in this message")
+                        .children(links.into_iter().take(200).enumerate().map(|(i, (label, href))| {
+                            div()
+                                .id(("html-email-link", i))
+                                .role(gpui::accesskit::Role::Link)
+                                .aria_label(label)
+                                .aria_description(href.clone())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(HtmlLink::Opened(href.clone()))
+                                }))
+                        })),
+                )
+            })
             .child(
                 canvas(
                     move |bounds, w, cx| view.update(cx, |this, _| this.prepare(bounds, w)),

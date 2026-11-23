@@ -62,10 +62,21 @@ impl Backend {
     }
     /// Every event known here, soonest first.
     pub fn calendar_events(&self) -> Vec<Stored> {
-        self.store
-            .preference(EVENTS)
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default()
+        self.cached_events().as_ref().clone()
+    }
+    /// The events, parsed only when their saved text changed (see
+    /// `calendar_cache`): whatever wrote it, the text read now decides.
+    fn cached_events(&self) -> Arc<Vec<Stored>> {
+        let text = self.store.preference(EVENTS).unwrap_or_default();
+        let mut cache = self.calendar_cache.lock().unwrap();
+        if let Some((saved, events)) = cache.as_ref()
+            && **saved == *text
+        {
+            return events.clone();
+        }
+        let events: Arc<Vec<Stored>> = Arc::new(serde_json::from_str(&text).unwrap_or_default());
+        *cache = Some((text.into(), events.clone()));
+        events
     }
     fn save_events(&self, mut events: Vec<Stored>) -> Result<()> {
         events.sort_by_key(|s| s.event.start);
@@ -80,9 +91,13 @@ impl Backend {
     pub fn default_calendar(&self) -> Option<caldav::Calendar> {
         let cals = self.calendars();
         let chosen = self.store.preference(DEFAULT).unwrap_or_default();
+        // One that takes events: not a calendar for tasks alone.
+        let events = |c: &&caldav::Calendar| {
+            c.writable && (c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT"))
+        };
         cals.iter()
-            .find(|c| c.href == chosen && c.writable)
-            .or_else(|| cals.iter().find(|c| c.writable))
+            .find(|c| c.href == chosen && events(c))
+            .or_else(|| cals.iter().find(events))
             .cloned()
     }
     /// The calendar new tasks go to: the default one where it takes tasks,
@@ -535,7 +550,9 @@ impl Backend {
     /// the occurrence). Each is shown once; reminders more than a day late
     /// (the computer was off) are skipped.
     pub fn due_reminders(&self, now: i64) -> Vec<(Event, i64)> {
-        let mut shown: std::collections::HashSet<String> = self
+        // Ordered: a HashSet listed its keys in a new order each time, so
+        // the unchanged list was written again on every check.
+        let mut shown: std::collections::BTreeSet<String> = self
             .store
             .preference(REMINDED)
             .and_then(|j| serde_json::from_str(&j).ok())
@@ -553,13 +570,16 @@ impl Backend {
             }
         }
         // Keep only keys for the last week.
+        let before = shown.len();
         shown.retain(|k| {
             k.rsplit('@')
                 .nth(1)
                 .and_then(|t| t.parse::<i64>().ok())
                 .is_some_and(|start| start > now - 7 * 86_400)
         });
-        if let Ok(json) = serde_json::to_string(&shown) {
+        if (!due.is_empty() || shown.len() != before)
+            && let Ok(json) = serde_json::to_string(&shown)
+        {
             let _ = self.store.set_preference(REMINDED, &json);
         }
         due
@@ -638,8 +658,14 @@ impl Backend {
             return Ok(0);
         }
         let mut notes = self.calendar_notices();
+        // Only what was told is removed: an item of another kind (a
+        // counter-proposal, a refresh) stays for an app that handles it.
+        let mut handled = Vec::new();
         for item in &items {
             let cal = ical::parse(&item.data);
+            if matches!(cal.method.to_ascii_uppercase().as_str(), "REPLY" | "REQUEST" | "CANCEL") {
+                handled.push(item);
+            }
             for e in &cal.events {
                 let who = |a: &ical::Attendee| {
                     if a.name.is_empty() { a.email.clone() } else { a.name.clone() }
@@ -669,10 +695,10 @@ impl Backend {
         self.store
             .set_preference(NOTICES, &serde_json::to_string(&notes)?)?;
         let tls = self.tls_connector()?;
-        for item in &items {
+        for item in &handled {
             let _ = caldav::remove_from_inbox(server, password, tls.clone(), item);
         }
-        Ok(items.len())
+        Ok(handled.len())
     }
     /// Renames a calendar (and changes its colour; empty: as it is), on its
     /// server: PROPPATCH, or Calendar/set.
@@ -837,7 +863,7 @@ impl Backend {
     /// now are. Soonest first.
     pub fn agenda(&self, from: i64, to: i64) -> Vec<Event> {
         let mut out: Vec<Event> = self
-            .calendar_events()
+            .cached_events()
             .iter()
             .flat_map(|s| ical::occurrences(&s.event, &s.overrides, from, to))
             .collect();
@@ -1012,6 +1038,9 @@ impl Backend {
                         at.status = Some(status);
                     }
                 }
+                // The event as it came is what's saved: the answer goes in
+                // it too, or it would be lost on the server.
+                with_partstat(&mut kept, &me, status);
                 self.save_invited(kept)
             }
         };
@@ -1046,9 +1075,8 @@ impl Backend {
     /// The calendar's copy of the event an invitation message is about, if
     /// it's in the calendar.
     pub fn stored_event(&self, uid: &str) -> Option<Stored> {
-        self.calendar_events()
-            .into_iter()
-            .find(|s| s.event.uid == uid)
+        // From the parsed events, without copying them all for one.
+        self.cached_events().iter().find(|s| s.event.uid == uid).cloned()
     }
 
     /// A guest's answer (REPLY) to an event you organize: their answer is
@@ -1098,6 +1126,14 @@ impl Backend {
         {
             Some(g) => g.status = Some(status),
             None => bail!("{} isn't a guest of this event.", guest.email),
+        }
+        let changed = match answer.recurrence_id {
+            Some(at) => stored.overrides.iter_mut().find(|o| o.recurrence_id == Some(at)),
+            None => None,
+        };
+        match changed {
+            Some(o) => with_partstat(o, &guest.email, status),
+            None => with_partstat(&mut stored.event, &guest.email, status),
         }
         self.store_updated(stored)?;
         let who = if guest.name.is_empty() {
@@ -1184,6 +1220,14 @@ impl Backend {
             .first()
             .map(|g| g.email.clone())
             .context("The proposal doesn't say who it's from.")?;
+        // As accepting does: the answer goes to the guest the proposal
+        // names, who must be whoever sent it, or anyone's address could be
+        // sent a reply.
+        ensure!(
+            m.from.eq_ignore_ascii_case(&guest),
+            "This proposal is for {guest}, but came from {}.",
+            m.from
+        );
         let stored = self.stored_event(&proposed.uid);
         let event = stored.as_ref().map(|s| &s.event).unwrap_or(proposed);
         let text = format!(
@@ -1274,12 +1318,29 @@ impl Backend {
             .cloned()
             .context("This message has no invitation.")?;
         let (me, _) = self.invited_as(a, &event);
+        // Only from the organizer, and not older than what's kept (RFC
+        // 5546 §2.1.5: SEQUENCE orders revisions).
+        if let Some(organizer) = &event.organizer {
+            ensure!(
+                m.from.eq_ignore_ascii_case(&organizer.email),
+                "This update is from {}, not the event's organizer {}; it wasn't applied.",
+                m.from,
+                organizer.email
+            );
+        }
+        if let Some(kept) = self.stored_event(&event.uid) {
+            ensure!(
+                event.sequence >= kept.event.sequence,
+                "This update is older than the event in your calendar; it wasn't applied."
+            );
+        }
         if let Some(answer) = self.invitation_answer(&event.uid) {
             for g in &mut event.attendees {
                 if g.email.eq_ignore_ascii_case(&me) {
                     g.status = Some(answer);
                 }
             }
+            with_partstat(&mut event, &me, answer);
         }
         self.save_invited(event)
     }
@@ -1303,6 +1364,104 @@ impl Backend {
             .unwrap_or_else(|| mine[0].clone())
     }
 
+    /// Takes one occurrence out of a repeating event (an EXDATE), keeping
+    /// the rest of the series.
+    fn cancel_occurrence(&self, uid: &str, at: i64) -> Result<()> {
+        let Some(mut stored) = self.stored_event(uid) else {
+            return Ok(());
+        };
+        if stored.event.recurrence.is_empty() {
+            return self.delete_event(uid);
+        }
+        stored.overrides.retain(|o| o.recurrence_id != Some(at));
+        if !stored.event.exdates.contains(&at) {
+            stored.event.exdates.push(at);
+        }
+        // The source has no EXDATE for it: written from the fields.
+        stored.event.source.clear();
+        self.store_updated(stored)
+    }
+    /// A guest asks for the event again (METHOD:REFRESH, RFC 5546 §3.2.6):
+    /// the organizer sends them the current version.
+    pub fn answer_refresh(&self, a: &Account, m: &Mail) -> Result<()> {
+        let cal = self
+            .invitation(a, m)?
+            .context("This message asks for no event.")?;
+        ensure!(cal.method == "REFRESH", "This message asks for no event.");
+        let asked = cal.events.first().context("This message asks for no event.")?;
+        let stored = self
+            .stored_event(&asked.uid)
+            .context("The event they ask about isn't in your calendar.")?;
+        // Only to a guest of it, from the address they're invited at.
+        let guest = stored
+            .event
+            .attendees
+            .iter()
+            .find(|g| g.email.eq_ignore_ascii_case(&m.from))
+            .with_context(|| format!("{} isn't a guest of this event.", m.from))?
+            .email
+            .clone();
+        let me = stored
+            .event
+            .organizer
+            .as_ref()
+            .map_or(a.email.clone(), |o| o.email.clone());
+        let calendar = ical::request(&stored.event, &stored.overrides, false);
+        let raw = imip(
+            &me,
+            &a.name,
+            std::slice::from_ref(&guest),
+            &format!("Invitation: {}", stored.event.summary),
+            &format!(
+                "The event as it is now.\r\n\r\n{}\r\n",
+                ical::describe_when(&stored.event)
+            ),
+            "REQUEST",
+            &calendar,
+            &m.message_id,
+        );
+        self.send_raw(a, &me, &guest, &raw)
+    }
+    /// The organizer added occurrences to a repeating event (METHOD:ADD,
+    /// RFC 5546 §3.2.4): each becomes an extra time (RDATE), with its own
+    /// details where they differ.
+    pub fn take_added(&self, a: &Account, m: &Mail) -> Result<()> {
+        let cal = self
+            .invitation(a, m)?
+            .context("This message adds nothing.")?;
+        ensure!(cal.method == "ADD", "This message adds nothing.");
+        let first = cal.events.first().context("This message adds nothing.")?;
+        let mut stored = self
+            .stored_event(&first.uid)
+            .context("The event this adds to isn't in your calendar; ask the organizer for it.")?;
+        ensure!(
+            first
+                .organizer
+                .as_ref()
+                .is_none_or(|o| o.email.eq_ignore_ascii_case(&m.from)),
+            "This addition isn't from the event's organizer; it wasn't applied."
+        );
+        for added in &cal.events {
+            if !stored.event.rdates.contains(&added.start) {
+                stored.event.rdates.push(added.start);
+            }
+            // Different details: kept as that occurrence's own.
+            if added.summary != stored.event.summary
+                || added.location != stored.event.location
+                || added.end - added.start != stored.event.end - stored.event.start
+            {
+                let mut own = added.clone();
+                own.recurrence.clear();
+                own.recurrence_id = Some(added.start);
+                own.source.clear();
+                stored.overrides.retain(|o| o.recurrence_id != Some(added.start));
+                stored.overrides.push(own);
+            }
+        }
+        stored.event.sequence = stored.event.sequence.max(first.sequence);
+        stored.event.source.clear();
+        self.store_updated(stored)
+    }
     /// Saves a changed event to the server and here.
     fn store_updated(&self, stored: Stored) -> Result<()> {
         let server = self
@@ -1322,7 +1481,24 @@ impl Backend {
             .invitation(a, m)?
             .context("This message has no invitation.")?;
         for e in cal.events.iter().filter(|e| e.cancelled) {
-            self.delete_event(&e.uid)?;
+            // Only the organizer cancels (RFC 5546 §3.2.5).
+            if let (Some(kept), Some(organizer)) = (self.stored_event(&e.uid), &e.organizer) {
+                ensure!(
+                    m.from.eq_ignore_ascii_case(&organizer.email)
+                        && kept
+                            .event
+                            .organizer
+                            .as_ref()
+                            .is_none_or(|o| o.email.eq_ignore_ascii_case(&organizer.email)),
+                    "This cancellation isn't from the event's organizer; it wasn't applied."
+                );
+            }
+            // One occurrence cancelled: only it goes, not the series.
+            if let Some(at) = e.recurrence_id {
+                self.cancel_occurrence(&e.uid, at)?;
+            } else {
+                self.delete_event(&e.uid)?;
+            }
         }
         Ok(())
     }
@@ -1393,6 +1569,7 @@ impl Backend {
                 email: me.clone(),
                 name: a.name.clone(),
                 status: None,
+                ..Default::default()
             });
         }
         let calendar = ical::request(&event, overrides, cancel);
@@ -1468,6 +1645,19 @@ impl Backend {
     }
 }
 
+/// Notes `email`'s answer in the event's text as it came, so saving it
+/// keeps the answer and everything Picacho doesn't read alike. Without
+/// that text (or the attendee in it), the event is written from its fields.
+fn with_partstat(event: &mut Event, email: &str, status: PartStat) {
+    if event.source.is_empty() {
+        return;
+    }
+    match crate::sync::ical::set_partstat_in_source(&event.source, email, status) {
+        Some(source) => event.source = source,
+        None => event.source.clear(),
+    }
+}
+
 /// This computer's time zone, as an IANA name ("Europe/Berlin"): `TZ`
 /// when set, else what the system says (macOS, Windows, Linux, Android
 /// and iOS each keep it their own way).
@@ -1489,15 +1679,7 @@ fn one_line(text: &str) -> String {
 }
 
 fn header_text(text: &str) -> String {
-    use base64::Engine as _;
-    if text.is_ascii() && !text.contains(['\r', '\n']) {
-        text.to_owned()
-    } else {
-        format!(
-            "=?UTF-8?B?{}?=",
-            base64::engine::general_purpose::STANDARD.encode(text.replace(['\r', '\n'], " "))
-        )
-    }
+    crate::sync::mime::encoded_words(text)
 }
 
 /// The iMIP message carrying a REPLY: a line of text for people, and the
@@ -1519,7 +1701,8 @@ fn imip_message(
             PartStat::Accepted => "accepted",
             PartStat::Tentative => "tentatively accepted",
             PartStat::Declined => "declined",
-            PartStat::NeedsAction => "answered",
+            PartStat::Delegated => "delegated",
+            PartStat::NeedsAction | PartStat::Completed | PartStat::InProcess => "answered",
         },
         event.summary
     );
@@ -1556,7 +1739,7 @@ fn imip(
     if my_name.is_empty() {
         out.push_str(&format!("From: <{me}>\r\n"));
     } else {
-        out.push_str(&format!("From: {} <{me}>\r\n", header_text(my_name)));
+        out.push_str(&format!("From: {} <{me}>\r\n", crate::sync::mime::display_name(my_name)));
     }
     let to_line = to
         .iter()
@@ -1717,12 +1900,14 @@ mod tests {
                 email: "qa@example.com".into(),
                 name: "QA".into(),
                 status: None,
+                ..Default::default()
             }),
             attendees: vec![
                 ical::Attendee {
                     email: "ana@example.org".into(),
                     name: "Ana".into(),
                     status: None,
+                    ..Default::default()
                 },
                 ical::Attendee {
                     email: "bo@example.se".into(),
@@ -1928,6 +2113,7 @@ mod tests {
                 email: a.email.clone(),
                 name: "QA".into(),
                 status: None,
+                ..Default::default()
             }),
             attendees: vec![guest("ana@example.org"), guest("bo@example.se")],
             ..Default::default()
@@ -1948,6 +2134,7 @@ mod tests {
             email: "ana@example.org".into(),
             name: "Ana".into(),
             status: Some(PartStat::Accepted),
+            ..Default::default()
         }];
         let yes = ical::request(&answer, &[], false).replace("METHOD:REQUEST", "METHOD:REPLY");
         assert_eq!(
@@ -1957,8 +2144,8 @@ mod tests {
         let stored = b.stored_event("party").unwrap();
         assert_eq!(stored.event.attendees[0].status, Some(PartStat::Accepted));
         assert!(
-            kept.lock().unwrap().contains("PARTSTAT=ACCEPTED"),
-            "the server has it"
+            kept.lock().unwrap().replace("\r\n ", "").contains("PARTSTAT=ACCEPTED"),
+            "the server has it: {}", kept.lock().unwrap()
         );
         // Someone else can't answer for her.
         let forged = mail(

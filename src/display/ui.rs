@@ -168,6 +168,10 @@ actions!(
         ShowAttachments,
         Minimize,
         Zoom,
+        /// Emails larger, smaller, or at their own size (WCAG 1.4.4).
+        ZoomIn,
+        ZoomOut,
+        ActualSize,
         Hide,
         HideOthers,
         ShowAll,
@@ -176,6 +180,10 @@ actions!(
 );
 
 const TITLEBAR_HEIGHT: f32 = 38.;
+/// The preference holding emails' text zoom.
+const TEXT_ZOOM: &str = "text_zoom";
+/// The text zoom steps, as browsers have them.
+const ZOOM_STEPS: [f32; 11] = [0.5, 0.67, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2., 3.];
 /// Space around full-size Settings, the same on every side.
 const MAXIMIZED_MARGIN: f32 = 40.;
 const SIDEBAR_WIDTH: f32 = 228.;
@@ -469,6 +477,9 @@ enum Modal {
     AliasGone(String, String),
     /// When to bring these messages back.
     Snooze(Vec<String>),
+    /// A link from an email that looks like a trick (desktop): its
+    /// address, before it opens.
+    LinkWarning(String),
 }
 /// What is deleted for good, once confirmed.
 #[derive(Clone, Debug, PartialEq)]
@@ -671,6 +682,10 @@ enum Action {
     RemoveContact(String),
     /// Encryption settings: import OpenPGP key files.
     ImportKeys,
+    /// Makes a new OpenPGP key for the current account's address.
+    CreateKey,
+    /// Takes in the key an Autocrypt Setup Message carries, with the code typed.
+    ImportSetupMessage(String),
     /// Forgets the OpenPGP key with this fingerprint.
     RemoveKey(String),
     /// Marks a found OpenPGP key as compared with its owner.
@@ -706,6 +721,10 @@ enum Action {
     DeclineCounter(String),
     /// Puts this updated invitation's version in the calendar.
     TakeInvitationUpdate(String),
+    /// Sends a guest who asked (REFRESH) the event as it is now.
+    AnswerRefresh(String),
+    /// Adds the occurrences an organizer added (ADD) to the event.
+    TakeAddedOccurrences(String),
     /// Calendar settings: sign in to the CalDAV server in the form.
     ConnectCalendar,
     SyncCalendar,
@@ -1136,6 +1155,9 @@ type ThreadRows = (String, u64, Rc<Vec<usize>>);
 
 /// How long typing in the sign-in name field pauses before the name applies.
 const LOGIN_PAUSE: Duration = Duration::from_millis(1500);
+/// A search's results: positions in its list, each with whether only what
+/// its emails say matched.
+type SearchFound = Rc<Vec<(usize, bool)>>;
 
 pub struct MailApp {
     backend: Arc<Backend>,
@@ -1216,6 +1238,9 @@ pub struct MailApp {
     menu_focus: FocusHandle,
     /// The menu just opened: focus it once it's drawn.
     menu_focus_pending: bool,
+    /// A link to act on with the window at hand: a `mailto:` to write, or
+    /// `open:<id>`, a message a `mid:` link named.
+    pending_link: Option<String>,
     modal: Option<Modal>,
     dark: bool,
     appearance: Appearance,
@@ -1317,6 +1342,12 @@ pub struct MailApp {
     login_pending: Option<(String, String)>,
     /// Counts edits of the sign-in name, so only the latest pause applies.
     login_revision: u64,
+    /// An account changed in Settings as it is typed (its nickname, its
+    /// Reply-To), saved once typing pauses, the field is left, or the app
+    /// quits: saved on every keystroke, each was a write to the cache, which
+    /// a sync can hold for a while, on the interface's thread.
+    account_unsaved: Option<String>,
+    account_save_revision: u64,
     /// Storage use by account, once asked (None: no quota).
     quotas: HashMap<String, Option<crate::sync::transport::Quota>>,
     /// Where an IMAP account's mail is over JMAP too, where its server says
@@ -1388,6 +1419,8 @@ pub struct MailApp {
     /// A place in the message to show once the reader opens, as a fraction
     /// of its height (from the collapsed reader's preview).
     reveal: Option<f32>,
+    /// Frames `reveal` has waited, laid out, for the message to scroll.
+    reveal_waited: u16,
     switch_anim: u64,
     switch_at: Option<std::time::Instant>,
     /// Whether the open message's details are expanded, and what was read
@@ -1550,6 +1583,14 @@ pub struct MailApp {
     summary_generation: u64,
     /// The Summary's parcels whose history is shown, by key.
     summary_expanded: HashSet<String>,
+    /// The Summary pages' lists (Packages, Receipts): their scroll and
+    /// measured rows, and the key they were measured for (see `summary_list`).
+    summary_lists: std::cell::RefCell<HashMap<&'static str, (ListState, u64)>>,
+    /// The rows a Summary page's list shows this frame, made once as the
+    /// page is drawn for each row it builds: parcels as (index in `summary`,
+    /// only in its emails), receipts as (index in `receipts`, only in its
+    /// emails), with each month's heading as `usize::MAX`.
+    summary_rows: std::cell::RefCell<Rc<Vec<(usize, bool)>>>,
     /// The Summary shows its Packages page (every parcel) rather than its
     /// widgets.
     summary_packages: bool,
@@ -1567,6 +1608,11 @@ pub struct MailApp {
     /// and let go when the Summary closes. An email that couldn't be read
     /// is kept empty, so it isn't asked for again.
     parcel_texts: HashMap<String, String>,
+    /// The last Packages and Receipts searches' results, as positions in
+    /// their lists with whether only the emails matched, by what they were
+    /// worked out from (see `search_key`): searching every parcel and its
+    /// emails' text again on every frame made typing slow.
+    search_cache: std::cell::RefCell<HashMap<&'static str, (u64, SearchFound)>>,
     /// Reading `parcel_texts`; and which reading may still be heard.
     parcel_texts_loading: bool,
     parcel_texts_generation: u64,
@@ -2080,6 +2126,7 @@ impl MailApp {
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
             this.persist_draft(cx);
+            this.save_unsaved_account(cx);
             // Preferences changed just before quitting are still written.
             this.backend.store.flush();
             // Gives back, once, the space compressed sources freed in a
@@ -2174,11 +2221,15 @@ impl MailApp {
         }));
         let nickname_input = input("Nickname", false, window, cx);
         subscriptions.push(cx.subscribe(&nickname_input, |this, input, e, cx| {
-            if matches!(e, InputEvent::Change)
-                && let Some(id) = this.nickname_for.clone()
-            {
-                let nickname = input.read(cx).value().to_string();
-                this.set_nickname(&id, &nickname, cx);
+            match e {
+                InputEvent::Change => {
+                    if let Some(id) = this.nickname_for.clone() {
+                        let nickname = input.read(cx).value().to_string();
+                        this.set_nickname(&id, &nickname, cx);
+                    }
+                }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.save_unsaved_account(cx),
+                _ => {}
             }
         }));
         let login_input = input("Same as the email address", false, window, cx);
@@ -2218,13 +2269,18 @@ impl MailApp {
         }));
         let reply_to_input = input("Replies come to the sending address", false, window, cx);
         subscriptions.push(cx.subscribe(&reply_to_input, |this, input, e, cx| {
-            if matches!(e, InputEvent::Change)
-                && let Some(id) = this.nickname_for.clone()
-            {
-                let value = input.read(cx).value().trim().to_owned();
-                if this.accounts.iter().any(|a| a.id == id && a.reply_to != value) {
-                    this.edit_account(&id, |a| a.reply_to = value, cx);
+            match e {
+                InputEvent::Change => {
+                    if let Some(id) = this.nickname_for.clone() {
+                        let value = input.read(cx).value().trim().to_owned();
+                        if let Some(a) = this.accounts.iter_mut().find(|a| a.id == id && a.reply_to != value) {
+                            a.reply_to = value;
+                            this.save_account_soon(&id, cx);
+                        }
+                    }
                 }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => this.save_unsaved_account(cx),
+                _ => {}
             }
         }));
         let identity_inputs = [
@@ -2237,6 +2293,10 @@ impl MailApp {
             input("Password or app password", true, window, cx),
         ];
         let html_view = cx.new(HtmlView::new);
+        // The person's text zoom for emails, as last set.
+        if let Some(zoom) = backend.store.preference(TEXT_ZOOM).and_then(|z| z.parse::<f32>().ok()) {
+            html_view.update(cx, |v, cx| v.set_text_zoom(zoom, cx));
+        }
         subscriptions.push(
             cx.subscribe(&html_view, |this, _, menu: &HtmlContextMenu, cx| {
                 this.html_menu(menu, cx)
@@ -2396,6 +2456,7 @@ impl MailApp {
             motion,
             menu_focus: cx.focus_handle(),
             menu_focus_pending: false,
+            pending_link: None,
             modal: None,
             dark,
             appearance,
@@ -2456,6 +2517,8 @@ impl MailApp {
             identity_inputs,
             login_pending: None,
             login_revision: 0,
+            account_unsaved: None,
+            account_save_revision: 0,
             quotas: HashMap::new(),
             jmap_access: HashMap::new(),
             nickname_for: None,
@@ -2492,6 +2555,7 @@ impl MailApp {
             open_at: None,
             details_at: None,
             reveal: None,
+            reveal_waited: 0,
             preview_bounds: Rc::new(Cell::new(Bounds::default())),
             switch_anim: 0,
             switch_at: None,
@@ -2579,6 +2643,8 @@ impl MailApp {
             summary_loading: false,
             summary_generation: 0,
             summary_expanded: HashSet::new(),
+            summary_lists: Default::default(),
+            summary_rows: Default::default(),
             summary_packages: false,
             summary_show_hidden: false,
             parcel_editing: None,
@@ -2586,6 +2652,7 @@ impl MailApp {
             parcel_search,
             summary_search: false,
             parcel_texts: HashMap::new(),
+            search_cache: Default::default(),
             parcel_texts_loading: false,
             parcel_texts_generation: 0,
             mail_kinds: None,
@@ -2710,6 +2777,15 @@ impl MailApp {
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
         this.pack_saved_sources(cx);
+        // Interrupted downloads and Sent copies a crash left, off this thread.
+        this.task(
+            cx,
+            |b| {
+                b.tidy_files();
+                Ok(())
+            },
+            |_, _, _| {},
+        );
         this.filter(cx);
         this.apply_theme(window, cx);
         #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -4080,7 +4156,9 @@ impl MailApp {
     ) {
         self.busy += 1;
         let backend = self.backend.clone();
-        let result = views::on_list_thread(move || job(backend));
+        // Every list job checks `load_generation` before using its result;
+        // one a later view's list has superseded isn't built at all.
+        let result = views::on_list_thread_for(self.load_generation, move || job(backend));
         cx.spawn(async move |this, cx| {
             let result = result.await.unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
@@ -4474,6 +4552,8 @@ impl MailApp {
                 Ok(parts) => {
                     this.replace_account_lists(generation, parts, cx);
                 }
+                // Not built: the view it was for is gone.
+                Err(e) if e.is::<views::Superseded>() => {}
                 Err(_) => this.reload_again = true,
             }
             this.reload_follow_up(cx);
@@ -5374,7 +5454,7 @@ impl MailApp {
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(std::path::PathBuf::from)
             .filter(|home| home.is_dir())
-            .unwrap_or_else(|| self.backend.store.path.clone());
+            .unwrap_or_else(|| self.save_start());
         let picker = cx.prompt_for_new_path(&start, Some(&name));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = picker.await else {
@@ -6060,7 +6140,9 @@ impl MailApp {
             return;
         }
         #[allow(unreachable_code)]
-        let picker = cx.prompt_for_new_path(&self.backend.store.path, Some(&name));
+        let start = self.save_start();
+        #[allow(unreachable_code)]
+        let picker = cx.prompt_for_new_path(&start, Some(&name));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = picker.await {
                 let result = std::fs::write(&path, &original.raw);
@@ -6134,6 +6216,19 @@ impl MailApp {
         }
         self.open_menu(menu.position, entries, cx);
     }
+    /// Where a save dialog starts: Downloads, else home, else the data
+    /// directory. Not the data directory first, where the cache (and the
+    /// instance's socket) live: a file saved there sat among them.
+    pub(super) fn save_start(&self) -> std::path::PathBuf {
+        directories::UserDirs::new()
+            .and_then(|d| {
+                d.download_dir()
+                    .map(std::path::Path::to_path_buf)
+                    .or_else(|| Some(d.home_dir().to_path_buf()))
+            })
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.backend.store.path.clone())
+    }
     fn save_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(m) = self.selected_mail() else {
             return;
@@ -6144,12 +6239,9 @@ impl MailApp {
         let Some(account) = self.account_of(&m) else {
             return;
         };
-        let name = std::path::Path::new(&a.name)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let picker = cx.prompt_for_new_path(&self.backend.store.path, Some(&name));
+        let name = safe_file_name(&a.name);
+        let start = self.save_start();
+        let picker = cx.prompt_for_new_path(&start, Some(&name));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = picker.await {
                 let _ = this.update(cx, |this, cx| {
@@ -6292,6 +6384,8 @@ impl MailApp {
             | Action::RemoveServerIdentity(..)
             | Action::AddServerIdentity(_)) => self.server_identity_action(action, w, cx),
             action @ (Action::ImportKeys
+            | Action::CreateKey
+            | Action::ImportSetupMessage(_)
             | Action::RemoveKey(_)
             | Action::VerifyKey(_)
             | Action::CheckKey(_)
@@ -6312,6 +6406,8 @@ impl MailApp {
             | Action::AcceptCounter(_)
             | Action::DeclineCounter(_)
             | Action::TakeInvitationUpdate(_)
+            | Action::AnswerRefresh(_)
+            | Action::TakeAddedOccurrences(_)
             | Action::ConnectCalendar
             | Action::SyncCalendar
             | Action::DismissCalendarNotices
@@ -7086,6 +7182,10 @@ impl MailApp {
             Action::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.menu = None;
+                if matches!(self.modal, Some(Modal::LinkWarning(_))) {
+                    self.modal = None;
+                    self.notice("Link copied", false, cx);
+                }
             }
             Action::OpenEmailLink(url) => self.open_email_link(url, cx),
             Action::LinkChoice(choice) => self.choose_link(choice, cx),
@@ -7093,6 +7193,9 @@ impl MailApp {
             Action::UntrustSite(site) => self.untrust_site(&site, cx),
             Action::OpenUrl(url) => {
                 self.menu = None;
+                if matches!(self.modal, Some(Modal::LinkWarning(_))) {
+                    self.modal = None;
+                }
                 // Addresses can come from an email; only web and email links
                 // are handed to the system.
                 let url = if self.clean_links {
@@ -7107,6 +7210,7 @@ impl MailApp {
             }
             Action::Reveal(fraction) => {
                 self.reveal = Some(fraction.clamp(0., 1.));
+                self.reveal_waited = 0;
                 self.set_reader_collapsed(false, cx);
             }
             Action::ToggleHtml | Action::ToggleRemote | Action::ToggleEmailTheme => {
@@ -7697,10 +7801,40 @@ impl MailApp {
             return;
         }
         a.nickname = nickname.to_owned();
+        self.save_account_soon(id, cx);
+        cx.notify();
+    }
+    /// Saves account `id` (changed here already) once typing pauses; see
+    /// `account_unsaved`.
+    pub(super) fn save_account_soon(&mut self, id: &str, cx: &mut Context<Self>) {
+        // Another account's change is saved before this one's starts waiting.
+        if self.account_unsaved.as_deref().is_some_and(|u| u != id) {
+            self.save_unsaved_account(cx);
+        }
+        self.account_unsaved = Some(id.to_owned());
+        self.account_save_revision += 1;
+        let revision = self.account_save_revision;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LOGIN_PAUSE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.account_save_revision == revision {
+                    this.save_unsaved_account(cx);
+                }
+            });
+        })
+        .detach();
+    }
+    /// Saves the account changed as it was typed, if one waits.
+    pub(super) fn save_unsaved_account(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.account_unsaved.take() else {
+            return;
+        };
+        let Some(a) = self.accounts.iter().find(|a| a.id == id) else {
+            return;
+        };
         if let Err(e) = self.backend.store.save_account(a) {
             self.notice(format!("{e:#}"), true, cx);
         }
-        cx.notify();
     }
     /// Applies a sign-in name being typed (see `login_pending`): saves it
     /// and signs the account's connections out, so the next sign in with it.
@@ -7730,6 +7864,10 @@ impl MailApp {
         // the one shown before applies now.
         if self.login_pending.as_ref().map(|(id, _)| id) != shown.as_ref().map(|(id, _)| id) {
             self.apply_login(cx);
+        }
+        // As a nickname or Reply-To being typed for it.
+        if self.account_unsaved.as_ref() != shown.as_ref().map(|(id, _)| id) {
+            self.save_unsaved_account(cx);
         }
         let Some((id, mut values)) = shown else {
             self.nickname_for = None;
@@ -9069,13 +9207,15 @@ impl MailApp {
                 parts.push("Starred".to_owned());
             }
             parts.push(sender.clone());
-            parts.push(m.subject.clone());
+            // Codes hidden as the row shows them: spoken, they reached any
+            // app reading the screen (accessibility) in full.
+            parts.push(self.hide_codes(m, &m.subject).into_owned());
             parts.push(date_short(m.date).to_string());
             if m.has_attachments {
                 parts.push("Has attachments".to_owned());
             }
             if !m.snippet.is_empty() {
-                parts.push(m.snippet.chars().take(140).collect());
+                parts.push(self.hide_codes(m, &m.snippet).chars().take(140).collect());
             }
             parts.join(", ")
         };
@@ -10386,6 +10526,44 @@ impl MailApp {
             )
             .into_any_element()
     }
+    fn link_warning_modal(&self, link: &str) -> AnyElement {
+        let c = self.colors();
+        let parsed = url::Url::parse(link).ok();
+        let dangers = parsed.as_ref().map(links::link_dangers).unwrap_or_default();
+        // The host as the browser will show it, its registered name bold.
+        let host = parsed
+            .as_ref()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        div()
+            .id("link-warning")
+            .debug_selector(|| "link-warning".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(host),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(c.muted))
+                    .child(link.chars().take(300).collect::<String>()),
+            )
+            .children(dangers.into_iter().map(|d| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.5))
+                    .child(icon_el("warning", 14., c.danger))
+                    .child(d)
+            }))
+            .into_any_element()
+    }
     fn alias_gone_modal(&self, why: &str, from: &str) -> AnyElement {
         let c = self.colors();
         div()
@@ -10477,6 +10655,7 @@ impl MailApp {
             Modal::AliasGone(..) => "Alias No Longer Exists",
             Modal::Snooze(ids) if ids.len() > 1 => "Snooze Messages",
             Modal::Snooze(_) => "Snooze",
+            Modal::LinkWarning(_) => "Check This Link",
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -10492,6 +10671,7 @@ impl MailApp {
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
             Modal::Snooze(_) => self.snooze_modal(),
+            Modal::LinkWarning(url) => self.link_warning_modal(url),
         };
         // Dialogs are laid out inside the window's frame, which is smaller
         // than the window while Picacho draws its own decorations.
@@ -10514,7 +10694,8 @@ impl MailApp {
                 | Modal::NewLabel(_)
                 | Modal::Reconnect(_)
                 | Modal::About
-                | Modal::AliasGone(..) => 400.,
+                | Modal::AliasGone(..)
+                | Modal::LinkWarning(_) => 400.,
                 Modal::Settings | Modal::Original => 820.,
             }))
             .max_w(available_width)
@@ -10653,6 +10834,15 @@ impl MailApp {
         if matches!(modal, Modal::Connect | Modal::Settings | Modal::Snooze(_)) {
             // These carry their own buttons.
             return self.modal_frame(panel, window);
+        } else if let Modal::LinkWarning(url) = modal {
+            footer = footer
+                .child(div().flex_1())
+                .child(self.button("link-warning-copy", "Copy Link", "", Action::CopyText(url.clone()), false, cx))
+                .child(self.button("link-warning-cancel", "Don't Open", "", Action::Close, true, cx))
+                .child(
+                    self.button("link-warning-open", "Open Anyway", "", Action::OpenUrl(url.clone()), false, cx)
+                        .text_color(rgb(c.danger)),
+                );
         } else if let Modal::RemoveAccount(id) = modal {
             footer = footer
                 .child(div().flex_1())
@@ -10809,12 +10999,43 @@ impl MailApp {
             .into_any_element()
     }
 }
+impl MailApp {
+    /// Emails one zoom step larger (1), smaller (-1), or at their own size
+    /// (0); the step is kept for every email.
+    fn step_text_zoom(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let now = self
+            .backend
+            .store
+            .preference(TEXT_ZOOM)
+            .and_then(|z| z.parse::<f32>().ok())
+            .unwrap_or(1.);
+        let at = ZOOM_STEPS
+            .iter()
+            .position(|z| (z - now).abs() < 0.01)
+            .unwrap_or(4) as i32;
+        let next = if direction == 0 {
+            1.
+        } else {
+            ZOOM_STEPS[(at + direction).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize]
+        };
+        let _ = self.backend.store.set_preference(TEXT_ZOOM, &next.to_string());
+        self.html_view.update(cx, |v, cx| v.set_text_zoom(next, cx));
+        self.notice(format!("Emails at {}%", (next * 100.).round()), false, cx);
+    }
+}
+
 impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_reveal(window, cx);
         self.apply_pending_place(window, cx);
         self.apply_pending_new_alias(window, cx);
         self.apply_pending_listed(cx);
+        if let Some(link) = self.pending_link.take() {
+            match link.strip_prefix("open:") {
+                Some(id) => self.open_message_window(id.to_owned(), window, cx),
+                None => self.compose_mailto(&link, window, cx),
+            }
+        }
         self.sync_nickname_input(window, cx);
         if std::mem::take(&mut self.menu_focus_pending) && self.menu.is_some() {
             window.focus(&self.menu_focus, cx);
@@ -11022,6 +11243,9 @@ impl MailApp {
             }))
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.step_text_zoom(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.step_text_zoom(-1, cx)))
+            .on_action(cx.listener(|this, _: &ActualSize, _, cx| this.step_text_zoom(0, cx)))
     }
 }
 /// GPUI's Android clipboard is the app's own: text fields' Paste first takes
@@ -11715,6 +11939,10 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
         key(cx, "secondary-,", ShowAccounts, Some("Mail")),
         key(cx, "secondary-n", Compose, Some("Mail")),
         key(cx, "secondary-f", Search, Some("Mail")),
+        key(cx, "secondary-=", ZoomIn, Some("Mail")),
+        key(cx, "secondary-+", ZoomIn, Some("Mail")),
+        key(cx, "secondary--", ZoomOut, Some("Mail")),
+        key(cx, "secondary-0", ActualSize, Some("Mail")),
         key(cx, "secondary-r", Refresh, Some("Mail")),
         key(cx, "escape", Close, Some("Mail")),
         key(cx, "alt-down", Next, Some("Mail")),
@@ -11764,18 +11992,31 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
 /// service) comes here, so pushes resume with the saved registration
 /// whenever one starts.
 pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
+    let settings = store.clone();
     let backend = Arc::new(Backend::new(store));
     backend.on_proton_notice(|a, title, body| {
         if a.sync.notify {
             crate::display::notify::account_notice(&a.email, &a.id, title, body);
         }
     });
-    backend.on_proton_push(|a, pushed| match pushed {
+    backend.on_proton_push(move |a, pushed| match pushed {
         crate::manage::backend::ProtonPushed::NewMail {
             message,
             sender,
             subject,
-        } => crate::display::notify::new_mail(&a.email, &a.id, message, (sender, subject), 1),
+        } => {
+            // With codes hidden, a pushed subject that may hold one isn't
+            // shown (on the lock screen): there is no message here yet for
+            // the code model to read, as other new mail's subjects are.
+            let subject = if crate::manage::local_ai::otp_enabled(&settings)
+                && crate::manage::mail_kinds::might_be_code(subject, "")
+            {
+                "Sign-in code"
+            } else {
+                subject
+            };
+            crate::display::notify::new_mail(&a.email, &a.id, message, (sender, subject), 1)
+        }
         crate::manage::backend::ProtonPushed::Notice { from, body } => {
             crate::display::notify::account_notice(&a.email, &a.id, from, body)
         }
@@ -11980,6 +12221,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Dark Mode", ToggleTheme),
+                MenuItem::separator(),
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+                MenuItem::action("Actual Size", ActualSize),
             ],
         ),
         menu(
@@ -12947,6 +13192,22 @@ mod tests {
             let a = this.accounts.iter().find(|a| a.id == work).unwrap();
             assert_eq!(a.login(), "work-user2");
         });
+        // A nickname shows as it is typed, and is saved once typing pauses,
+        // not on every keystroke.
+        view.update_in(cx, |this, w, cx| {
+            MailApp::set(&this.nickname_input, "Desk", w, cx);
+        });
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.accounts.iter().find(|a| a.id == work).unwrap().nickname, "Desk");
+            let saved = this.backend.store.accounts().unwrap();
+            assert_ne!(saved.iter().find(|s| s.id == work).unwrap().nickname, "Desk", "not yet");
+        });
+        cx.executor().advance_clock(LOGIN_PAUSE);
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            let saved = this.backend.store.accounts().unwrap();
+            assert_eq!(saved.iter().find(|s| s.id == work).unwrap().nickname, "Desk");
+        });
         // POP mailboxes: deleting for good, but no labels.
         view.update(cx, |this, cx| {
             this.accounts[0].provider = Provider::Pop3;
@@ -13610,5 +13871,38 @@ mod tests {
             let first = &this.messages[this.visible[0]];
             assert!(this.messages.iter().all(|m| m.date >= first.date));
         });
+    }
+}
+
+/// An attachment's name (a sender's choice) made safe to suggest for a
+/// file: no folders (`/` or `\\`, on every system), no control or
+/// direction-changing characters (U+202E shows "doc\u{202E}fdp.exe" as
+/// "docexe.pdf"), and not hidden by a leading dot.
+fn safe_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+        .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').trim();
+    if cleaned.is_empty() { "attachment".into() } else { cleaned.to_owned() }
+}
+
+#[cfg(test)]
+mod save_name_tests {
+    use super::safe_file_name;
+    #[test]
+    fn attachment_names_are_made_safe() {
+        assert_eq!(safe_file_name("report.pdf"), "report.pdf");
+        assert_eq!(safe_file_name("../../.bashrc"), "bashrc");
+        assert_eq!(safe_file_name("C:\\Windows\\evil.dll"), "evil.dll");
+        assert_eq!(safe_file_name("invoice\u{202E}fdp.exe"), "invoicefdp.exe");
+        assert_eq!(safe_file_name("a\r\nb.txt"), "ab.txt");
+        assert_eq!(safe_file_name("..."), "attachment");
+        assert_eq!(safe_file_name("Ana's résumé.pdf"), "Ana's résumé.pdf");
     }
 }

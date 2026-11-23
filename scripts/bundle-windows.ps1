@@ -75,6 +75,14 @@ if (-not (Test-Path $uiExt)) {
     $nupkg = Join-Path $uiDir "package.zip"
     Invoke-WebRequest -UseBasicParsing -OutFile $nupkg `
         "https://api.nuget.org/v3-flatcontainer/wixtoolset.ui.wixext/$wixVersion/wixtoolset.ui.wixext.$wixVersion.nupkg"
+    # Its code runs in the build: checked against the package as published
+    # (5.0.2) before it is unpacked. Another WiX version needs its hash here.
+    $known = @{ "5.0.2" = "5EF2C707614B9F70B6BBADD2D4ABCB4124EFEE215E9B16BFBC80113079A604C7" }
+    $hash = (Get-FileHash -Algorithm SHA256 $nupkg).Hash
+    if (-not $known.ContainsKey($wixVersion) -or $known[$wixVersion] -ne $hash) {
+        Remove-Item -Force $nupkg
+        throw "WiX's UI extension $wixVersion doesn't match its known SHA-256 ($hash)"
+    }
     Expand-Archive -Force $nupkg $uiDir
     if (-not (Test-Path $uiExt)) { throw "WiX's UI extension wasn't found in its package" }
 }

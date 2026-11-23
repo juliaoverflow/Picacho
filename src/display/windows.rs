@@ -40,9 +40,22 @@ pub fn has_dll(dll: &str) -> bool {
     true
 }
 
-/// Windows Hello (webauthn.dll, Windows 10 1903 and later).
+/// Windows Hello (webauthn.dll, Windows 10 1903 and later). Loaded from
+/// System32 alone, and kept loaded: the delay-load helper, when Picacho
+/// first calls into it, then finds this module rather than searching the
+/// app's folder first, where a copy of Picacho run from Downloads would
+/// load any webauthn.dll saved next to it.
 pub fn has_windows_hello() -> bool {
-    has_dll("webauthn.dll")
+    static LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOADED.get_or_init(|| {
+        let name = wide("webauthn.dll");
+        // SAFETY: `name` is NUL-terminated and outlives the call. The module
+        // stays loaded for the process's life, on purpose.
+        let module = unsafe {
+            LoadLibraryExW(name.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)
+        };
+        !module.is_null()
+    })
 }
 
 /// Proton's human verification needs WebView2's loader (built into the

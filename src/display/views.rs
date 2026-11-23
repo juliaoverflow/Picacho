@@ -44,26 +44,52 @@ pub(super) enum Freshness {
 /// read before listing, and its messages, newest first.
 pub(super) type AccountList = (String, (u64, u64), Vec<Mail>);
 
-/// Two lists, each newest first, as one. Messages are moved, not copied.
-fn merge_newest_first(a: Vec<Mail>, b: Vec<Mail>) -> Vec<Mail> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
-    loop {
-        let next = match (a.peek(), b.peek()) {
-            (Some(x), Some(y)) => {
-                if Mail::newest_first(x, y) == std::cmp::Ordering::Greater {
-                    b.next()
-                } else {
-                    a.next()
-                }
-            }
-            (Some(_), None) => a.next(),
-            (None, Some(_)) => b.next(),
-            (None, None) => break,
-        };
-        out.extend(next);
+/// Lists, each newest first, as one, in one pass: merged two at a time,
+/// each account's part moved every row merged so far again. The sort finds
+/// the lists as runs already in order and merges those. Messages are
+/// moved, not copied.
+fn merge_newest_first(base: Vec<Mail>, parts: impl IntoIterator<Item = Vec<Mail>>) -> Vec<Mail> {
+    let mut out = base;
+    for part in parts {
+        out.extend(part);
     }
+    out.sort_by(Mail::newest_first);
     out
+}
+
+/// The newest view generation a list was asked for (see `on_list_thread_for`).
+#[cfg_attr(test, allow(dead_code))]
+static LIST_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A list job asked for in view `generation` that a list for a later view
+/// was asked for after, by the time it runs: its result would be dropped.
+#[derive(Debug)]
+pub(super) struct Superseded;
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Another list was asked for meanwhile.")
+    }
+}
+impl std::error::Error for Superseded {}
+
+/// `on_list_thread` for a list of view `generation` (the interface's
+/// `load_generation`, which only grows): if a list of a later view is asked
+/// for before this one starts, it isn't built, and `Superseded` arrives
+/// instead. Moving quickly through mailboxes queued every one's list, each
+/// built in turn before the one wanted.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn on_list_thread_for<T: Send + 'static>(
+    generation: u64,
+    job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> futures::channel::oneshot::Receiver<anyhow::Result<T>> {
+    use std::sync::atomic::Ordering;
+    LIST_GENERATION.fetch_max(generation, Ordering::AcqRel);
+    on_list_thread(move || {
+        if LIST_GENERATION.load(Ordering::Acquire) > generation {
+            return Err(Superseded.into());
+        }
+        job()
+    })
 }
 
 /// The preference holding the last `Place`.
@@ -439,12 +465,13 @@ impl MailApp {
             .filter(|m| !changed.contains(m.account.as_str()))
             .collect();
         drop(changed);
-        let mut merged = others;
         let mut revisions = Vec::new();
+        let mut lists = Vec::new();
         for (id, revision, messages) in parts {
-            merged = merge_newest_first(merged, messages);
+            lists.push(messages);
             revisions.push((id, revision));
         }
+        let merged = merge_newest_first(others, lists);
         if let Some(key) = self.listed.as_mut() {
             for (id, revision) in revisions {
                 if let Some(i) = key.accounts.iter().position(|a| *a == id) {
@@ -1464,6 +1491,41 @@ mod tests {
             .collect();
         assert_eq!(results, [Some(0), Some(1), None, Some(3), Some(4)]);
         assert_eq!(*order.lock().unwrap(), [0, 1, 3, 4]);
+    }
+
+    /// A list queued for a view that a later view's list was asked for
+    /// after isn't built; the later one is.
+    #[test]
+    fn superseded_list_jobs_are_not_built() {
+        let (hold, wait) = std::sync::mpsc::channel::<()>();
+        // Keeps the list thread busy until both are queued.
+        let blocker = on_list_thread(move || {
+            let _ = wait.recv();
+        });
+        let base = LIST_GENERATION.load(std::sync::atomic::Ordering::Acquire) + 1_000;
+        let old = on_list_thread_for(base, || Ok(1));
+        let new = on_list_thread_for(base + 1, || Ok(2));
+        hold.send(()).unwrap();
+        futures::executor::block_on(blocker).unwrap();
+        let old = futures::executor::block_on(old).unwrap();
+        assert!(old.unwrap_err().is::<Superseded>());
+        assert_eq!(futures::executor::block_on(new).unwrap().unwrap(), 2);
+    }
+
+    /// Several accounts' parts merge with the rest, newest first.
+    #[test]
+    fn account_parts_merge_newest_first() {
+        let mail = |id: &str, date: i64| {
+            let mut m = Mail::placeholder(id.into(), "a", &Mailbox::Standard(Folder::Inbox), "INBOX", 1);
+            m.date = date;
+            m
+        };
+        let merged = merge_newest_first(
+            vec![mail("x", 9), mail("y", 4)],
+            [vec![mail("p", 8), mail("q", 1)], vec![mail("r", 5), mail("s", 4)]],
+        );
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["x", "p", "r", "y", "s", "q"]);
     }
 
     /// Two mailboxes; two of Work's messages were sent to a SimpleLogin alias

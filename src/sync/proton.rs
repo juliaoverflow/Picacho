@@ -366,13 +366,25 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
         );
     }
     let exe = std::env::current_exe().context("Couldn't find Picacho to show Proton's check")?;
+    // The address (with Proton's token in it) goes on the window's standard
+    // input: in its arguments, other users of this computer could read it
+    // from the process list.
     let mut child = std::process::Command::new(exe)
         .arg(VERIFY_FLAG)
-        .arg(verification_url(methods, token))
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .context("Couldn't open a window for Proton's check")?;
+    if let Some(mut input) = child.stdin.take() {
+        use std::io::Write as _;
+        let written = writeln!(input, "{}", verification_url(methods, token));
+        drop(input);
+        if let Err(e) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).context("Couldn't open a window for Proton's check");
+        }
+    }
     // Read as it is written: a webview that logs to standard output could
     // otherwise fill the pipe and stall the window until it was cancelled.
     let reading = child.stdout.take().map(|mut out| {

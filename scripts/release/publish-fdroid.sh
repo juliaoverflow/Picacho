@@ -24,7 +24,10 @@ rclone copy r2:$bucket/archive archive
 for apk in "$@"; do
     cp "../$apk" repo/
 done
-printf '%s' "$FDROID_KEYSTORE_BASE64" | base64 -d > fdroid-repo.jks
+# The signing key: readable by this user alone from the moment it exists,
+# and removed however the script ends.
+trap 'rm -f "$PWD/fdroid-repo.jks"' EXIT
+(umask 077 && printf '%s' "$FDROID_KEYSTORE_BASE64" | base64 -d > fdroid-repo.jks)
 chmod 600 config.yml fdroid-repo.jks
 rsvg-convert -w 512 -h 512 ../packaging/linux/tech.pinal.picacho.svg -o icon.png
 for app in tech.pinal.picacho tech.pinal.picacho.beta; do

@@ -721,7 +721,7 @@ impl MailApp {
                     self.watch_refresh(cx);
                     cx.notify();
                 } else if pull > 0. {
-                    self.hide_pull_box(pull_box_top(pull));
+                    self.hide_pull_box(pull_box_top(pull), cx);
                     cx.notify();
                 }
             }
@@ -729,11 +729,24 @@ impl MailApp {
         }
     }
 
-    /// Sends the pull box back up from `from`.
-    fn hide_pull_box(&mut self, from: f32) {
+    /// Sends the pull box back up from `from`. Once it is out of sight it
+    /// goes (it stayed, drawn above the list on every frame, until the next
+    /// pull).
+    fn hide_pull_box(&mut self, from: f32, cx: &mut Context<Self>) {
         self.mobile.pull_settle = None;
         self.mobile.pull_anim += 1;
-        self.mobile.pull_hide = Some((from, self.mobile.pull_anim));
+        let key = self.mobile.pull_anim;
+        self.mobile.pull_hide = Some((from, key));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PULL_HIDE + Duration::from_millis(50)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mobile.pull_hide.is_some_and(|(_, k)| k == key) {
+                    this.mobile.pull_hide = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Mail is being checked for the open mailbox, by a sync or a retried
@@ -760,7 +773,7 @@ impl MailApp {
                         || (waited >= REFRESH_MIN && !this.mobile_refreshing());
                     if done {
                         this.mobile.refreshing = None;
-                        this.hide_pull_box(PULL_REST);
+                        this.hide_pull_box(PULL_REST, cx);
                         cx.notify();
                     }
                     done

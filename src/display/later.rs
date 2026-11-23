@@ -483,7 +483,17 @@ impl MailApp {
                 "receipt-banner",
                 "mail-open",
                 BannerStyle::Outlined,
-                format!("{} asks to be told when you've read this message.", m.sender),
+                // Who is told: the receipt goes where the message asked,
+                // which may not be its sender (a tracking service).
+                if m.receipt_to().eq_ignore_ascii_case(&m.from) {
+                    format!("{} asks to be told when you've read this message.", m.sender)
+                } else {
+                    format!(
+                        "{} asks that {} be told when you've read this message.",
+                        m.sender,
+                        m.receipt_to()
+                    )
+                },
                 [decline.into_any_element(), send.into_any_element()],
             )
             .into_any_element(),

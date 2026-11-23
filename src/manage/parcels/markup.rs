@@ -136,10 +136,13 @@ fn parcel_of(value: &Value, order_status: Option<Status>) -> Option<Parcel> {
             .is_none_or(|s| same_carrier(s, &k.courier))
     });
     let carrier = stated.or_else(|| known.as_ref().map(|k| k.courier.clone()));
-    let tracking_url = value
-        .get("trackingUrl")
-        .and_then(web_link)
-        .or_else(|| known.as_ref().and_then(known_url));
+    // The carrier's own page for a number the catalog knows, before the
+    // address the email's markup gives (anyone's to write: a lookalike
+    // tracking page). The markup's is for numbers it doesn't know.
+    let tracking_url = known
+        .as_ref()
+        .and_then(known_url)
+        .or_else(|| value.get("trackingUrl").and_then(web_link));
     let expected_arrival = ["expectedArrivalUntil", "expectedArrivalFrom"]
         .iter()
         .find_map(|k| value.get(*k).and_then(text_of));

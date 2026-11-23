@@ -315,6 +315,13 @@ fn pop_server(
                 "-ERR unknown command\r\n".to_owned()
             } else if command == "UIDL" {
                 format!("+OK\r\n{uidl}.\r\n")
+            } else if command == "LIST" {
+                let rows: String = uidl
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().next())
+                    .map(|n| format!("{n} 100\r\n"))
+                    .collect();
+                format!("+OK\r\n{rows}.\r\n")
             } else if let Some(number) = command.strip_prefix("RETR ") {
                 let attempt = count.fetch_add(1, Ordering::Relaxed);
                 if interrupt_first && attempt == 0 {
@@ -576,6 +583,12 @@ fn deleting_pop_server(mailbox: Arc<std::sync::Mutex<PopMailbox>>) -> Result<(Ve
                 let mut rows = String::from("+OK\r\n");
                 for (i, (uid, _)) in messages.iter().enumerate() {
                     rows.push_str(&format!("{} {uid}\r\n", i + 1));
+                }
+                rows + ".\r\n"
+            } else if command == "LIST" {
+                let mut rows = String::from("+OK\r\n");
+                for i in 0..messages.len() {
+                    rows.push_str(&format!("{} 100\r\n", i + 1));
                 }
                 rows + ".\r\n"
             } else if let Some(n) = command.strip_prefix("RETR ") {

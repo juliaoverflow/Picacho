@@ -17,6 +17,9 @@ pub(in crate::display) enum Keys {
     Number,
     /// Text, with Search on the return key (set by the field itself).
     Search,
+    /// A password, PIN, passphrase or key: hidden, without suggestions, and
+    /// kept out of the keyboard's learning (any masked field).
+    Password,
 }
 
 /// The system's reserved edges and the keyboard, in points.
@@ -91,6 +94,7 @@ pub(super) fn show_keyboard(keys: Keys) {
             Keys::Email => KeyboardType::EmailAddress,
             Keys::Url => KeyboardType::URL,
             Keys::Number => KeyboardType::NumberPad,
+            Keys::Password => KeyboardType::Password,
         });
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]

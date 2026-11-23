@@ -42,6 +42,13 @@ pub struct Card {
     /// The photo: a `data:` URI (embedded) or an address.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub photo: String,
+    /// JMAP: the blob the photo was read from, when the server keeps it
+    /// as one (`photo` then holds its bytes inlined to show).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub photo_blob: String,
+    /// What `photo` was as read, to tell an edit from the inlined blob.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub photo_read: String,
     /// A group rather than a person: its members, by UID.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub group: bool,
@@ -59,29 +66,126 @@ impl Card {
     }
 }
 
+/// A structured value's components (N, ADR, ORG), split at `;` but not
+/// at an escaped `\;`, each still escaped.
+fn components(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b';' => {
+                out.push(&value[start..i]);
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push(&value[start.min(value.len())..]);
+    out
+}
+/// A content line's name and parameters, and its value: split at the first
+/// colon outside a quoted parameter value (`TYPE="a:b"`).
+fn split_content(line: &str) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ':' if !quoted => return Some((&line[..i], &line[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+/// A value as written: quoted-printable decoded and in UTF-8 where vCard
+/// 2.1's parameters say (`ENCODING=QUOTED-PRINTABLE`, `CHARSET=`).
+fn decoded_value(head: &str, value: &str) -> String {
+    let upper = head.to_ascii_uppercase();
+    if !upper.contains("QUOTED-PRINTABLE") {
+        return value.to_owned();
+    }
+    let charset = upper
+        .split(';')
+        .find_map(|p| p.strip_prefix("CHARSET="))
+        .unwrap_or("UTF-8")
+        .trim_matches('"')
+        .to_owned();
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'='
+            && let Some(b) = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let encoding = encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    encoding.decode(&out).0.into_owned()
+}
+
 /// An ADR value (`;;street;city;region;code;country`) as one line.
 fn address_line(value: &str) -> String {
-    value
-        .split(';')
+    components(value)
+        .into_iter()
         .map(|p| unescape(p).replace('\n', ", ").trim().to_owned())
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// A one-line address as ADR's parts: the street, then the rest as the
-/// city (`street, city`), since that's how people write them.
+/// A one-line address as ADR's parts (`street, city, region, code,
+/// country`, as people write them, and as `address_line` writes an ADR
+/// back): each part in its field; with fewer parts, the street and the
+/// rest as the city.
 fn address_value(line: &str) -> String {
-    let mut parts = line.splitn(2, ',').map(str::trim);
-    let street = parts.next().unwrap_or_default();
-    let rest = parts.next().unwrap_or_default();
-    format!(";;{};{};;;", escape(street), escape(rest))
+    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+    match parts.as_slice() {
+        [street, city, region, code, country] => format!(
+            ";;{};{};{};{};{}",
+            escape(street),
+            escape(city),
+            escape(region),
+            escape(code),
+            escape(country)
+        ),
+        [street, city, code, country] => format!(
+            ";;{};{};;{};{}",
+            escape(street),
+            escape(city),
+            escape(code),
+            escape(country)
+        ),
+        _ => {
+            let mut it = line.splitn(2, ',').map(str::trim);
+            let street = it.next().unwrap_or_default();
+            let rest = it.next().unwrap_or_default();
+            format!(";;{};{};;;", escape(street), escape(rest))
+        }
+    }
 }
 
 /// A BDAY value (`19900101`, `1990-01-01`, `--0101`, `--01-01`) as
 /// `YYYY-MM-DD` or `--MM-DD`.
 fn birthday_value(value: &str) -> String {
     let v = value.trim().split('T').next().unwrap_or_default();
+    // Apple's placeholder year: no year.
+    if let Some(md) = v.strip_prefix("1604-").or_else(|| v.strip_prefix("1604")) {
+        let digits: String = md.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() == 4 {
+            return format!("--{}-{}", &digits[..2], &digits[2..]);
+        }
+    }
     let digits: String = v.chars().filter(char::is_ascii_digit).collect();
     if v.starts_with("--") && digits.len() == 4 {
         return format!("--{}-{}", &digits[..2], &digits[2..]);
@@ -93,18 +197,25 @@ fn birthday_value(value: &str) -> String {
 }
 
 /// Lines of a vCard file unfolded (continuation lines start with a space or
-/// tab), with CRLF or LF line ends.
+/// tab), with CRLF or LF line ends. vCard 2.1's quoted-printable soft
+/// breaks (a line ending in `=`) join too.
 fn unfold(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
+    let mut soft = false;
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(rest) = line.strip_prefix([' ', '\t'])
+        if soft && let Some(last) = lines.last_mut() {
+            last.pop();
+            last.push_str(line);
+        } else if let Some(rest) = line.strip_prefix([' ', '\t'])
             && let Some(last) = lines.last_mut()
         {
             last.push_str(rest);
         } else {
             lines.push(line.to_owned());
         }
+        let last = lines.last().map(String::as_str).unwrap_or("");
+        soft = last.ends_with('=') && last.to_ascii_uppercase().contains("QUOTED-PRINTABLE");
     }
     lines
 }
@@ -138,9 +249,11 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
     let mut cards = Vec::new();
     let mut current: Option<(Card, String, Vec<String>)> = None;
     for line in unfold(text) {
-        let Some((head, value)) = line.split_once(':') else {
+        let Some((head, value)) = split_content(&line) else {
             continue;
         };
+        let decoded = decoded_value(head, value);
+        let value = decoded.as_str();
         let name = property(head);
         match name.as_str() {
             "BEGIN" if value.eq_ignore_ascii_case("VCARD") => {
@@ -156,7 +269,12 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                     if card.uid.is_empty() {
                         card.uid = card.emails.join(",").to_lowercase();
                     }
-                    if !card.emails.is_empty() || !card.name.is_empty() || card.group {
+                    // No UID and no address (a phone-only card): one made
+                    // from what it says, so it stays the same card.
+                    if card.uid.is_empty() {
+                        card.uid = format!("{}:{}", card.name, card.phones.join(",")).to_lowercase();
+                    }
+                    if !card.emails.is_empty() || !card.phones.is_empty() || !card.name.is_empty() || card.group {
                         cards.push(card);
                     }
                 }
@@ -170,8 +288,8 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                     "FN" => card.name = unescape(value).trim().to_owned(),
                     "N" => {
                         // Family;Given;Additional;Prefix;Suffix
-                        let parts: Vec<String> = value
-                            .split(';')
+                        let parts: Vec<String> = components(value)
+                            .into_iter()
                             .map(|p| unescape(p).trim().to_owned())
                             .collect();
                         let given = parts.get(1).cloned().unwrap_or_default();
@@ -196,8 +314,8 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                         }
                     }
                     "ORG" => {
-                        card.org = value
-                            .split(';')
+                        card.org = components(value)
+                            .into_iter()
                             .map(|p| unescape(p).trim().to_owned())
                             .filter(|p| !p.is_empty())
                             .collect::<Vec<_>>()
@@ -230,11 +348,10 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                         card.group = value.trim().eq_ignore_ascii_case("group")
                     }
                     "MEMBER" | "X-ADDRESSBOOKSERVER-MEMBER" => {
-                        let m = value
-                            .trim()
-                            .trim_start_matches("urn:uuid:")
-                            .trim_start_matches("mailto:")
-                            .to_owned();
+                        // A uid by `urn:uuid:` as the bare uid; any other
+                        // URI (`mailto:`) as it is, so it's written back so.
+                        let v = value.trim();
+                        let m = v.strip_prefix("urn:uuid:").unwrap_or(v).to_owned();
                         if !m.is_empty() {
                             card.members.push(m);
                         }
@@ -257,11 +374,13 @@ fn escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Folds a line at 75 octets.
+/// Folds a line at 75 octets. A line break or NUL inside it (a value a
+/// server or imported file gave, such as a bare CR, which `escape` leaves)
+/// is left out: it would end the line and start a property.
 fn fold(line: &str) -> String {
     let mut out = String::new();
     let mut count = 0;
-    for c in line.chars() {
+    for c in line.chars().filter(|c| !matches!(c, '\r' | '\n' | '\0')) {
         if count + c.len_utf8() > 75 {
             out.push_str("\r\n ");
             count = 1;
@@ -298,12 +417,14 @@ fn own_lines(card: &Card) -> Vec<String> {
     lines.extend(card.addresses.iter().map(|a| format!("ADR:{}", address_value(a))));
     if !card.birthday.is_empty() {
         // 1990-01-01 → 19900101; --01-01 (no year) → --0101.
+        // 1990-01-01 → 1990-01-01. Without a year: vCard 3.0 needs one, so
+        // Apple's placeholder year and its marker (as iOS and macOS write
+        // it); `to_vcard4` makes it vCard 4.0's --MMDD.
         let b = &card.birthday;
-        let written = match b.strip_prefix("--") {
-            Some(md) => format!("--{}", md.replace('-', "")),
-            None => b.replace('-', ""),
-        };
-        lines.push(format!("BDAY:{written}"));
+        match b.strip_prefix("--") {
+            Some(md) => lines.push(format!("BDAY;X-APPLE-OMIT-YEAR=1604:1604-{md}")),
+            None => lines.push(format!("BDAY:{b}")),
+        }
     }
     if !card.photo.is_empty() {
         // vCard 3's form, which every address book reads.
@@ -318,11 +439,13 @@ fn own_lines(card: &Card) -> Vec<String> {
     if card.group {
         // Apple's form, which vCard 3 servers (iCloud too) keep.
         lines.push("X-ADDRESSBOOKSERVER-KIND:group".into());
-        lines.extend(
-            card.members
-                .iter()
-                .map(|m| format!("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:{m}")),
-        );
+        lines.extend(card.members.iter().map(|m| {
+            if m.contains(':') {
+                format!("X-ADDRESSBOOKSERVER-MEMBER:{m}")
+            } else {
+                format!("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:{m}")
+            }
+        }));
     }
     lines
 }
@@ -379,9 +502,11 @@ pub fn write_vcard(card: &Card) -> String {
             .any(|l| property(l.split(':').next().unwrap_or("")) == p)
     };
     for line in original.iter().filter(|l| !l.is_empty()) {
-        let Some((head, value)) = line.split_once(':') else {
+        let Some((head, value)) = split_content(line) else {
             continue;
         };
+        let decoded = decoded_value(head, value);
+        let value = decoded.as_str();
         let p = property(head);
         let keep = match p.as_str() {
             "BEGIN" | "END" => false,
@@ -427,7 +552,8 @@ pub fn write_vcard(card: &Card) -> String {
             "PHOTO" => before.photo == card.photo,
             "KIND" | "X-ADDRESSBOOKSERVER-KIND" => before.group == card.group,
             "MEMBER" | "X-ADDRESSBOOKSERVER-MEMBER" => {
-                let v = value.trim().trim_start_matches("urn:uuid:").trim_start_matches("mailto:");
+                let v = value.trim();
+                let v = v.strip_prefix("urn:uuid:").unwrap_or(v);
                 match members_left.iter().position(|m| m.as_str() == v) {
                     Some(i) => {
                         members_left.remove(i);
@@ -478,7 +604,8 @@ pub fn write_vcard(card: &Card) -> String {
                 !has("X-ADDRESSBOOKSERVER-KIND", &kept) && !has("KIND", &kept)
             }
             "X-ADDRESSBOOKSERVER-MEMBER" => {
-                let v = line.split_once(':').map_or("", |(_, v)| v).trim_start_matches("urn:uuid:");
+                let v = line.split_once(':').map_or("", |(_, v)| v);
+                let v = v.strip_prefix("urn:uuid:").unwrap_or(v);
                 members_left.iter().any(|m| m.as_str() == v)
             }
             _ => true,
@@ -496,6 +623,11 @@ pub fn write_vcard(card: &Card) -> String {
         out.push_str(&fold(line));
     }
     out.push_str("END:VCARD\r\n");
+    // A vCard 4.0 card keeps its version's syntax for what was written
+    // anew (no ENCODING=b, KIND and MEMBER rather than Apple's).
+    if version.trim().eq_ignore_ascii_case("VERSION:4.0") {
+        return to_vcard4(&out);
+    }
     out
 }
 
@@ -556,6 +688,8 @@ pub fn to_vcard4(text: &str) -> String {
             format!("PHOTO:data:image/{kind};base64,{data}")
         } else if upper.starts_with("PHOTO;VALUE=URI:") {
             format!("PHOTO:{}", &line["PHOTO;VALUE=uri:".len()..])
+        } else if let Some(md) = upper.strip_prefix("BDAY;X-APPLE-OMIT-YEAR=1604:1604-") {
+            format!("BDAY:--{}", md.replace('-', ""))
         } else {
             line
         };
@@ -837,7 +971,17 @@ mod tests {
         let written = write_vcard(&moved);
         assert!(!written.contains("Storgatan"));
         assert!(written.contains("ADR:;;Kungsgatan 5;Göteborg;;;\r\n"));
-        assert!(written.contains("BDAY:--0131\r\n") && !written.contains("1990"));
+        // vCard 3.0 needs a year: Apple's placeholder, and its marker.
+        assert!(written.contains("BDAY;X-APPLE-OMIT-YEAR=1604:1604-01-31\r\n") && !written.contains("1990"));
+        assert!(to_vcard4(&written).contains("BDAY:--0131\r\n"));
+        // An address with its region, code and country keeps them.
+        let mut full = bo.clone();
+        full.addresses = vec!["Kungsgatan 5, Göteborg, Västra Götaland, 411 19, Sweden".into()];
+        assert!(write_vcard(&full).contains("ADR:;;Kungsgatan 5;Göteborg;Västra Götaland;411 19;Sweden\r\n"));
+        // Escaped semicolons stay in their part; quoted colons don't split.
+        let tricky = parse_vcards("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:X\r\nN:O\\;Brien;Ann;;;\r\nEMAIL;X-NOTE=\"a:b\":ann@x.org\r\nNOTE;ENCODING=QUOTED-PRINTABLE;CHARSET=ISO-8859-1:Caf=E9\r\nEND:VCARD\r\n");
+        assert_eq!(tricky[0].emails, ["ann@x.org"]);
+        assert_eq!(tricky[0].note, "Café");
         let back = parse_vcards(&written).remove(0);
         assert_eq!(back.addresses, ["Kungsgatan 5, Göteborg"]);
         assert_eq!(back.birthday, "--01-31");

@@ -238,14 +238,21 @@ impl Backend {
     /// Brings snoozed messages back now.
     pub fn unsnooze(&self, a: &Account, message_ids: &[String]) -> Result<Vec<Snoozed>> {
         let now = chrono::Utc::now().timestamp();
-        let mut list = self.snoozed(&a.id);
-        for s in &mut list {
-            if message_ids.contains(&s.message_id) {
-                s.until = now;
+        {
+            // Read and written under the account's lock, as waking does: a
+            // wake running meanwhile would otherwise save its own list over
+            // this one, and the messages stayed snoozed.
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            let mut list = self.snoozed(&a.id);
+            for s in &mut list {
+                if message_ids.contains(&s.message_id) {
+                    s.until = now;
+                }
             }
+            self.store
+                .set_preference(&Self::snooze_key(&a.id), &serde_json::to_string(&list)?)?;
         }
-        self.store
-            .set_preference(&Self::snooze_key(&a.id), &serde_json::to_string(&list)?)?;
         self.wake_due(a)
     }
     /// Brings back the messages whose time has come: each moves from the
@@ -273,7 +280,8 @@ impl Backend {
             let names = c.names(true)?.to_vec();
             let mut woken = Vec::new();
             let mut kept = waiting;
-            for s in due {
+            let mut due = due.into_iter();
+            for s in due.by_ref() {
                 if !names.iter().any(|n| n.name == s.folder) {
                     // Its folder is gone; so is the snooze.
                     continue;
@@ -283,7 +291,10 @@ impl Backend {
                     // Moved out of Snoozed by hand: nothing to bring back.
                     Ok(false) => {}
                     Err(e) if crate::sync::retry::later(&e) => {
+                        // This one and those not reached yet wait for the next try;
+                        // they were dropped, their mail left in Snoozed for good.
                         kept.push(s);
+                        kept.extend(due);
                         self.save_snoozed(None, &a.id, &kept)?;
                         return Err(e);
                     }
@@ -368,13 +379,17 @@ impl Backend {
         }
         let mut woken = Vec::new();
         let mut kept = waiting;
-        for s in due {
+        let mut due = due.into_iter();
+        for s in due.by_ref() {
             match self.wake_proton(a, &s) {
                 Ok(true) => woken.push(s),
                 // Moved out of Snoozed by hand, or its folder is gone.
                 Ok(false) => {}
                 Err(e) if crate::sync::retry::later(&e) => {
+                    // This one and those not reached yet wait for the next try;
+                    // they were dropped, their mail left in Snoozed for good.
                     kept.push(s);
+                    kept.extend(due);
                     self.save_snoozed(None, &a.id, &kept)?;
                     return Err(e);
                 }
@@ -509,13 +524,17 @@ impl Backend {
         }
         let mut woken = Vec::new();
         let mut kept = waiting;
-        for s in due {
+        let mut due = due.into_iter();
+        for s in due.by_ref() {
             match self.wake_jmap(a, &s) {
                 Ok(true) => woken.push(s),
                 // Moved out of Snoozed by hand, or its folder is gone.
                 Ok(false) => {}
                 Err(e) if crate::sync::retry::later(&e) => {
+                    // This one and those not reached yet wait for the next try;
+                    // they were dropped, their mail left in Snoozed for good.
                     kept.push(s);
+                    kept.extend(due);
                     self.save_snoozed(None, &a.id, &kept)?;
                     return Err(e);
                 }
@@ -580,7 +599,7 @@ impl Backend {
         // and MOVE act on exactly those, not on whatever matches by then.
         let saved = ext.searchres && ext.esearch;
         let uids: Vec<u32> = if saved {
-            crate::sync::transport::uid_search_saved(&mut c.session, &criteria)?
+            crate::sync::transport::uid_search_saved(&mut c.session, &criteria, c.enabled.utf8)?
         } else {
             c.uid_search(&criteria)?.into_iter().collect()
         };

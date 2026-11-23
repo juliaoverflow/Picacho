@@ -14,7 +14,14 @@ final class Browser {
      * there) in the browser or mail app. Returns false when nothing can.
      */
     public static boolean open(Context context, String url) {
-        Intent view = new Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        // Web and email links only, whatever asked: an intent:, file: or
+        // content: address could start any app, or hand over a file.
+        Uri uri = Uri.parse(url);
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);
+        if (!scheme.equals("https") && !scheme.equals("http") && !scheme.equals("mailto")) {
+            return false;
+        }
+        Intent view = new Intent(Intent.ACTION_VIEW, uri)
                 .addCategory(Intent.CATEGORY_BROWSABLE)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {

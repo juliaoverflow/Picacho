@@ -654,3 +654,125 @@ fn the_summary_lists_receipts_with_what_was_spent(cx: &mut TestAppContext) {
         assert_eq!(this.selected.as_deref(), Some(format!("{first}:refund").as_str()));
     });
 }
+
+/// A long Packages page builds only the parcels in view, and the others
+/// come into view as it scrolls.
+#[gpui::test]
+fn long_package_pages_build_only_what_shows(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    let now = chrono::Utc::now().timestamp();
+    store
+        .save_messages(&[shipping(
+            &first,
+            "s1",
+            now - 3600,
+            "Your parcel RB123456785GB is on its way.",
+            None,
+        )])
+        .unwrap();
+    act(&view, Action::OpenSummary(first.clone()), cx);
+    frame(cx);
+    // Three hundred, from the one found: each a parcel of its own.
+    view.update(cx, |this, cx| {
+        let one = this.summary[0].clone();
+        this.summary = (0..300)
+            .map(|i| {
+                let mut t = one.clone();
+                t.parcel.tracking_number = format!("RB{i:09}GB");
+                t
+            })
+            .collect();
+        cx.notify();
+    });
+    act(&view, Action::SummaryPackages(true), cx);
+    frame(cx);
+    assert!(cx.debug_bounds("summary-packages-page").is_some());
+    assert!(cx.debug_bounds("summary-package-0").is_some());
+    assert!(cx.debug_bounds("summary-package-299").is_none(), "not built out of view");
+    // Scrolled to the end, the last one shows.
+    view.update(cx, |this, cx| {
+        let state = this.summary_lists.borrow().get("packages").unwrap().0.clone();
+        // Row 299 is the list's item 300 (its top is item 0).
+        state.scroll_to(gpui::ListOffset { item_ix: 300, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    frame(cx);
+    frame(cx);
+    assert!(cx.debug_bounds("summary-package-299").is_some());
+    assert!(cx.debug_bounds("summary-package-0").is_none());
+}
+
+/// A long Receipts page builds only what shows: its months' headings and
+/// receipts come into view, in order, as it scrolls.
+#[gpui::test]
+fn long_receipt_pages_build_only_what_shows(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let first = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    let now = chrono::Utc::now().timestamp();
+    let mut m = shipping(&first, "cafe", now - 60, "Latte\nTotal: $4.50", None);
+    m.subject = "Your receipt from Corner Café".into();
+    m.sender = "Corner Café".into();
+    store.save_messages(&[m]).unwrap();
+    act(&view, Action::OpenSummary(first.clone()), cx);
+    cx.run_until_parked();
+    frame(cx);
+    // 240 receipts, 20 a month for a year back, newest first.
+    view.update(cx, |this, cx| {
+        let one = this.receipts[0].clone();
+        this.receipts = (0..240)
+            .map(|i| {
+                let mut l = one.clone();
+                l.receipt.order = Some(format!("A-{i}"));
+                l.date = now - (i as i64 / 20) * 31 * 86_400 - (i as i64 % 20) * 60;
+                l
+            })
+            .collect();
+        cx.notify();
+    });
+    act(&view, Action::SummaryReceipts(true), cx);
+    frame(cx);
+    // The list's rows, as the page made them: each month's heading, then its
+    // receipts (a month, by its first second, holds 20 here unless the
+    // months fall otherwise, as they may near a month's end).
+    let headings = view.read_with(cx, |this, _| {
+        this.summary_rows.borrow().iter().filter(|(at, _)| *at == usize::MAX).count()
+    });
+    assert!((12..=13).contains(&headings), "{headings} months");
+    assert!(cx.debug_bounds("summary-receipts-page").is_some());
+    assert!(cx.debug_bounds("summary-receipts-month-0").is_some());
+    assert!(cx.debug_bounds("summary-receipts-month-total-0").is_some());
+    assert!(cx.debug_bounds("summary-receipt-0").is_some());
+    assert!(cx.debug_bounds("summary-receipt-239").is_none(), "not built out of view");
+    assert!(cx.debug_bounds("summary-receipts-month-11").is_none());
+    // At the end: the last month's heading and the last receipt.
+    let last_heading = view.read_with(cx, |this, _| {
+        this.summary_rows.borrow().iter().rposition(|(at, _)| *at == usize::MAX).unwrap()
+    });
+    view.update(cx, |this, cx| {
+        let state = this.summary_lists.borrow().get("receipts").unwrap().0.clone();
+        // The page's top is the list's first item.
+        state.scroll_to(gpui::ListOffset { item_ix: 1 + last_heading, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    frame(cx);
+    frame(cx);
+    let month = leak(format!("summary-receipts-month-{}", headings - 1));
+    assert!(cx.debug_bounds(month).is_some());
+    assert!(cx.debug_bounds("summary-receipt-0").is_none());
+    // Its receipts follow it, in order; the last at the very end.
+    let first_after = view.read_with(cx, |this, _| {
+        this.summary_rows.borrow()[last_heading + 1..].iter().filter(|(at, _)| *at != usize::MAX).count()
+    });
+    let first_of_month = leak(format!("summary-receipt-{}", 240 - first_after));
+    assert!(cx.debug_bounds(first_of_month).is_some());
+    view.update(cx, |this, cx| {
+        let state = this.summary_lists.borrow().get("receipts").unwrap().0.clone();
+        let end = state.item_count() - 1;
+        state.scroll_to(gpui::ListOffset { item_ix: end, offset_in_item: px(0.) });
+        cx.notify();
+    });
+    frame(cx);
+    frame(cx);
+    assert!(cx.debug_bounds("summary-receipt-239").is_some());
+}

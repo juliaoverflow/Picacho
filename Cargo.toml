@@ -34,6 +34,9 @@ blitz-traits = "=0.3.0-beta.4"
 # Computed styles of the email's elements (positions, overflow, backgrounds).
 style = { package = "stylo", version = "=0.22.0" }
 percent-encoding = "2"
+encoding_rs = "0.8"
+idna = "1"
+rustls-native-certs = "0.8"
 # Words of Chinese, Japanese, Thai and other scripts written without spaces,
 # for the reader's word selection (the same dictionaries Blitz's text uses).
 icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
@@ -83,13 +86,16 @@ keyring = "4"
 # Builds messages (MIME); Picacho speaks SMTP itself (sync/smtp.rs).
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname"] }
 # Checks DKIM, SPF and DMARC. Pure-Rust crypto, without aws-lc's C build.
-mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory"] }
+mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory", "arc"] }
 # 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
 mailparse = "0.18"
 markdown = "1.0.0"
 # Pasting with formatting: copied HTML becomes the composer's Markdown.
 htmd = "0.5"
 md-5 = "0.11"
+# Finding a forwarded original in an outgoing message (already a
+# dependency of several crates here).
+memchr = "2"
 # Attachment content types from their file names.
 mime_guess = "2"
 # The public suffix list: a trusted link site is never a shared suffix such
@@ -390,5 +396,11 @@ gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch 
 # their Firebase installation (see the folder's README). A [patch] only
 # applies from the top-level workspace, so it must be here rather than in
 # protected_email_bridge.
+# TEMPORARY, as blitz above: the local branch's gpui-mobile, with its
+# password keyboard (patch 0003, `KeyboardType::Password`), until merged;
+# then this section goes and `cargo update -p gpui-mobile`.
+[patch."https://github.com/pinaltech/Picacho-Patches"]
+gpui-mobile = { path = "../Picacho-Patches/gpui-mobile/crate" }
+
 [patch."https://github.com/agusibrahim/fcm_receiver.rs"]
 fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }

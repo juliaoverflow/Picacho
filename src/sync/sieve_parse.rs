@@ -1,0 +1,491 @@
+//! A reader for Sieve scripts (RFC 5228) that other apps wrote: their
+//! grammar (commands, blocks, tests, string lists, numbers with K/M/G,
+//! `text:` multi-line strings, comments), and the rules Picacho can show
+//! and edit taken from them. What doesn't fit a rule is counted, so the
+//! person knows the script does more than the list shows.
+use super::sieve::{Act, Field, Filters, Match, Rule};
+use anyhow::{Result, bail, ensure};
+
+/// A token of the script.
+#[derive(Clone, Debug, PartialEq)]
+enum Token {
+    Identifier(String),
+    Tag(String),
+    Str(String),
+    Number(u64),
+    Open(char),
+    Close(char),
+    Comma,
+    Semicolon,
+}
+
+/// The script's tokens.
+fn tokenize(text: &str) -> Result<Vec<Token>> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            c if c.is_whitespace() => i += 1,
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            '"' => {
+                i += 1;
+                let mut s = String::new();
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                ensure!(i < chars.len(), "A string in the script isn't closed.");
+                i += 1;
+                out.push(Token::Str(s.replace("\r\n", "\n")));
+            }
+            '(' | '[' | '{' => {
+                out.push(Token::Open(c));
+                i += 1;
+            }
+            ')' | ']' | '}' => {
+                out.push(Token::Close(c));
+                i += 1;
+            }
+            ',' => {
+                out.push(Token::Comma);
+                i += 1;
+            }
+            ';' => {
+                out.push(Token::Semicolon);
+                i += 1;
+            }
+            ':' => {
+                let start = i + 1;
+                i += 1;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                out.push(Token::Tag(chars[start..i].iter().collect::<String>().to_ascii_lowercase()));
+            }
+            c if c.is_ascii_digit() => {
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n: u64 = chars[start..i].iter().collect::<String>().parse()?;
+                let scale = match chars.get(i).map(|c| c.to_ascii_uppercase()) {
+                    Some('K') => 1 << 10,
+                    Some('M') => 1 << 20,
+                    Some('G') => 1 << 30,
+                    _ => 1,
+                };
+                if scale > 1 {
+                    i += 1;
+                }
+                out.push(Token::Number(n.saturating_mul(scale)));
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect::<String>().to_ascii_lowercase();
+                // `text:` starts a multi-line string, to a line holding a
+                // lone dot (RFC 5228 §2.4.2), dots doubled at line starts.
+                if word == "text" && chars.get(i) == Some(&':') {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    i += 1;
+                    let mut s = String::new();
+                    loop {
+                        let start = i;
+                        while i < chars.len() && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        let line: String = chars[start..i].iter().collect();
+                        let line = line.trim_end_matches('\r');
+                        i += 1;
+                        if line == "." || i > chars.len() {
+                            break;
+                        }
+                        s.push_str(line.strip_prefix('.').filter(|_| line.starts_with("..")).unwrap_or(line));
+                        s.push('\n');
+                    }
+                    out.push(Token::Str(s));
+                } else {
+                    out.push(Token::Identifier(word));
+                }
+            }
+            other => bail!("The script has a character Sieve doesn't use: {other:?}"),
+        }
+    }
+    Ok(out)
+}
+
+/// An argument of a command or test.
+#[derive(Clone, Debug, PartialEq)]
+enum Arg {
+    Tag(String),
+    Strings(Vec<String>),
+    Number(u64),
+}
+
+/// A test (RFC 5228 §5).
+#[derive(Clone, Debug, PartialEq)]
+struct Test {
+    name: String,
+    args: Vec<Arg>,
+    tests: Vec<Test>,
+}
+
+/// A command and its block.
+#[derive(Clone, Debug, PartialEq)]
+struct Command {
+    name: String,
+    args: Vec<Arg>,
+    tests: Vec<Test>,
+    block: Option<Vec<Command>>,
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    at: usize,
+}
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.at)
+    }
+    fn next(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.at).cloned();
+        self.at += 1;
+        t
+    }
+    fn commands(&mut self, depth: usize) -> Result<Vec<Command>> {
+        ensure!(depth < 32, "The script nests too deeply.");
+        let mut out = Vec::new();
+        while let Some(t) = self.peek() {
+            if *t == Token::Close('}') {
+                break;
+            }
+            out.push(self.command(depth)?);
+        }
+        Ok(out)
+    }
+    fn command(&mut self, depth: usize) -> Result<Command> {
+        let Some(Token::Identifier(name)) = self.next() else {
+            bail!("The script has something where a command should be.");
+        };
+        let args = self.arguments()?;
+        let mut tests = Vec::new();
+        if matches!(self.peek(), Some(Token::Open('('))) {
+            tests = self.test_list(depth)?;
+        } else if matches!(self.peek(), Some(Token::Identifier(_))) {
+            tests.push(self.test(depth)?);
+        }
+        let block = match self.next() {
+            Some(Token::Semicolon) => None,
+            Some(Token::Open('{')) => {
+                let block = self.commands(depth + 1)?;
+                ensure!(self.next() == Some(Token::Close('}')), "A block in the script isn't closed.");
+                Some(block)
+            }
+            _ => bail!("A command in the script doesn't end with ; or a block."),
+        };
+        Ok(Command { name, args, tests, block })
+    }
+    fn arguments(&mut self) -> Result<Vec<Arg>> {
+        let mut out = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token::Tag(t)) => {
+                    out.push(Arg::Tag(t.clone()));
+                    self.at += 1;
+                }
+                Some(Token::Number(n)) => {
+                    out.push(Arg::Number(*n));
+                    self.at += 1;
+                }
+                Some(Token::Str(s)) => {
+                    out.push(Arg::Strings(vec![s.clone()]));
+                    self.at += 1;
+                }
+                Some(Token::Open('[')) => {
+                    self.at += 1;
+                    let mut list = Vec::new();
+                    loop {
+                        match self.next() {
+                            Some(Token::Str(s)) => list.push(s),
+                            Some(Token::Comma) => {}
+                            Some(Token::Close(']')) => break,
+                            _ => bail!("A list in the script isn't written right."),
+                        }
+                    }
+                    out.push(Arg::Strings(list));
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+    fn test_list(&mut self, depth: usize) -> Result<Vec<Test>> {
+        ensure!(self.next() == Some(Token::Open('(')), "A test list in the script isn't written right.");
+        let mut out = Vec::new();
+        loop {
+            out.push(self.test(depth)?);
+            match self.next() {
+                Some(Token::Comma) => {}
+                Some(Token::Close(')')) => break,
+                _ => bail!("A test list in the script isn't written right."),
+            }
+        }
+        Ok(out)
+    }
+    fn test(&mut self, depth: usize) -> Result<Test> {
+        ensure!(depth < 32, "The script nests too deeply.");
+        let Some(Token::Identifier(name)) = self.next() else {
+            bail!("The script has something where a test should be.");
+        };
+        let args = self.arguments()?;
+        let tests = match self.peek() {
+            Some(Token::Open('(')) => self.test_list(depth + 1)?,
+            Some(Token::Identifier(_)) => vec![self.test(depth + 1)?],
+            _ => Vec::new(),
+        };
+        Ok(Test { name, args, tests })
+    }
+}
+
+/// What reading another app's script found: the rules Picacho can show,
+/// and how many of its parts it couldn't.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Read {
+    pub filters: Filters,
+    /// Parts of the script that are more than a rule says (several tests,
+    /// variables, notifications…).
+    pub left_out: usize,
+}
+
+/// Reads a Sieve script, taking what Picacho's rules can say from it.
+pub fn read(text: &str) -> Result<Read> {
+    let tokens = tokenize(text)?;
+    let mut parser = Parser { tokens, at: 0 };
+    let commands = parser.commands(0)?;
+    ensure!(parser.peek().is_none(), "The script has an unmatched closing brace.");
+    let mut out = Read::default();
+    for c in &commands {
+        match c.name.as_str() {
+            "require" => {}
+            "if" | "elsif" => match rule_of(c) {
+                Some(rule) => out.filters.rules.push(rule),
+                None => out.left_out += 1,
+            },
+            "include" => {
+                if let Some(Arg::Strings(names)) = c.args.iter().find(|a| matches!(a, Arg::Strings(_))) {
+                    out.filters.include = names.first().cloned();
+                }
+            }
+            "vacation" => vacation_of(c, &mut out.filters),
+            "keep" | "stop" => {}
+            _ => out.left_out += 1,
+        }
+    }
+    Ok(out)
+}
+
+/// One `if test { action; [stop;] }` as a rule.
+fn rule_of(c: &Command) -> Option<Rule> {
+    let [test] = c.tests.as_slice() else { return None };
+    let (test, negate) = match test.name.as_str() {
+        "not" => (test.tests.first()?, true),
+        _ => (test, false),
+    };
+    let mut rule = rule_test(test)?;
+    rule.negate = negate;
+    let block = c.block.as_ref()?;
+    let mut actions = block.iter().filter(|a| a.name != "stop");
+    let action = actions.next()?;
+    if actions.next().is_some() {
+        return None;
+    }
+    rule.stop = block.iter().any(|a| a.name == "stop");
+    let first = |args: &[Arg]| {
+        args.iter().rev().find_map(|a| match a {
+            Arg::Strings(s) => s.first().cloned(),
+            _ => None,
+        })
+    };
+    rule.act = match action.name.as_str() {
+        "fileinto" => {
+            let name = first(&action.args)?;
+            // A standard folder by its role: kept as the role.
+            let role = action.args.windows(2).find_map(|w| match w {
+                [Arg::Tag(t), Arg::Strings(s)] if t == "specialuse" => s.first().cloned(),
+                _ => None,
+            });
+            Act::Folder(role.unwrap_or_else(|| super::transport::encode_name(&name)))
+        }
+        "discard" => Act::Discard,
+        "keep" => Act::Inbox,
+        "redirect" => {
+            rule.keep_copy = action.args.contains(&Arg::Tag("copy".into()));
+            Act::Redirect(first(&action.args)?)
+        }
+        "reject" | "ereject" => Act::Reject(first(&action.args)?),
+        "addflag" | "setflag" => {
+            let flag = first(&action.args)?;
+            match flag.to_ascii_lowercase().as_str() {
+                "\\seen" => Act::MarkRead,
+                "\\flagged" => Act::Star,
+                f if f.starts_with('\\') => return None,
+                _ => Act::Label(flag),
+            }
+        }
+        _ => return None,
+    };
+    Some(rule)
+}
+
+/// A single test as a rule's field, comparison and value.
+fn rule_test(t: &Test) -> Option<Rule> {
+    let matching = t.args.iter().find_map(|a| match a {
+        Arg::Tag(tag) => match tag.as_str() {
+            "contains" => Some(Match::Contains),
+            "is" => Some(Match::Is),
+            "matches" => Some(Match::Matches),
+            "regex" => Some(Match::Regex),
+            _ => None,
+        },
+        _ => None,
+    });
+    let lists: Vec<&Vec<String>> = t
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            Arg::Strings(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let mut rule = Rule {
+        matching: matching.unwrap_or(Match::Is),
+        ..Rule::default()
+    };
+    // Part selectors and comparators other than the defaults change what
+    // matches; such tests aren't rules.
+    if t.args.iter().any(|a| matches!(a, Arg::Tag(t) if matches!(t.as_str(), "localpart" | "domain" | "user" | "detail" | "comparator" | "count" | "value"))) {
+        return None;
+    }
+    match t.name.as_str() {
+        "address" | "header" | "envelope" => {
+            let [names, values] = lists.as_slice() else { return None };
+            let [value] = values.as_slice() else { return None };
+            rule.value = value.clone();
+            let mut names: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+            names.sort();
+            rule.field = match (t.name.as_str(), names.iter().map(String::as_str).collect::<Vec<_>>().as_slice()) {
+                ("envelope", ["to"]) => Field::DeliveredTo,
+                ("envelope", _) => return None,
+                (_, ["from"]) => Field::From,
+                (_, ["to"]) => Field::To,
+                (_, ["cc", "to"]) => Field::Recipients,
+                ("header", ["subject"]) => Field::Subject,
+                ("header", ["list-id"]) => Field::List,
+                ("header", [name]) => {
+                    rule.header = (*name).to_owned();
+                    Field::Header
+                }
+                _ => return None,
+            };
+        }
+        "body" => {
+            let [values] = lists.as_slice() else { return None };
+            let [value] = values.as_slice() else { return None };
+            rule.field = Field::Body;
+            rule.value = value.clone();
+        }
+        "size" if t.args.contains(&Arg::Tag("over".into())) => {
+            let n = t.args.iter().find_map(|a| match a {
+                Arg::Number(n) => Some(*n),
+                _ => None,
+            })?;
+            rule.field = Field::LargerThan;
+            rule.value = (n / 1024).max(1).to_string();
+        }
+        _ => return None,
+    }
+    Some(rule)
+}
+
+/// A top-level `vacation`'s reply, where it is one Picacho can show.
+fn vacation_of(c: &Command, filters: &mut Filters) {
+    let mut v = std::mem::take(&mut filters.vacation);
+    v.on = true;
+    v.days = 7;
+    let mut i = 0;
+    while i < c.args.len() {
+        match (&c.args[i], c.args.get(i + 1)) {
+            (Arg::Tag(t), Some(Arg::Number(n))) if t == "days" => {
+                v.days = (*n).clamp(1, 30) as u32;
+                i += 1;
+            }
+            (Arg::Tag(t), Some(Arg::Strings(s))) if t == "subject" => {
+                v.subject = s.first().cloned().unwrap_or_default();
+                i += 1;
+            }
+            (Arg::Tag(_), Some(Arg::Strings(_))) => i += 1,
+            (Arg::Strings(s), _) => v.body = s.first().cloned().unwrap_or_default(),
+            _ => {}
+        }
+        i += 1;
+    }
+    filters.vacation = v;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_apps_scripts_are_read_into_rules() {
+        let script = r#"require ["fileinto", "imap4flags", "copy", "body"];
+# Roundcube's way
+if header :contains "subject" "invoice" { fileinto "Bills"; stop; }
+if address :is "from" "boss@example.com" { addflag "\\Flagged"; }
+if not header :matches "list-id" "*announce*" { redirect :copy "me@example.org"; }
+if size :over 5M { discard; }
+if anyof (header :contains "x-spam" "yes", body :contains "viagra") { fileinto "Junk"; }
+vacation :days 3 :subject "Away" text:
+I'm away.
+..Really.
+.
+;
+"#;
+        let read = read(script).unwrap();
+        let rules = &read.filters.rules;
+        assert_eq!(rules.len(), 4, "{rules:#?}");
+        assert_eq!((rules[0].field, rules[0].matching, rules[0].value.as_str()), (Field::Subject, Match::Contains, "invoice"));
+        assert_eq!(rules[0].act, Act::Folder("Bills".into()));
+        assert!(rules[0].stop);
+        assert_eq!(rules[1].act, Act::Star);
+        assert!(rules[2].negate && rules[2].keep_copy);
+        assert_eq!(rules[2].act, Act::Redirect("me@example.org".into()));
+        assert_eq!((rules[3].field, rules[3].value.as_str()), (Field::LargerThan, "5120"));
+        assert_eq!(read.left_out, 1);
+        assert!(read.filters.vacation.on);
+        assert_eq!(read.filters.vacation.days, 3);
+        assert_eq!(read.filters.vacation.body, "I'm away.\n.Really.\n");
+        assert!(super::read("if header { ").is_err());
+    }
+}

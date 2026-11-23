@@ -76,24 +76,39 @@ pub fn write_mbox_message(
 }
 
 /// Splits an mbox file (mboxrd or mboxo) into its messages, with CRLF line
-/// ends as mail is sent. Quoting is undone where mboxrd added it.
-pub fn read_mbox(input: impl Read, mut each: impl FnMut(Vec<u8>) -> Result<()>) -> Result<()> {
+/// ends as mail is sent. Quoting is undone where mboxrd added it. A message
+/// larger than an import may be comes as `None`, without its text.
+pub fn read_mbox(
+    input: impl Read,
+    mut each: impl FnMut(Option<Vec<u8>>) -> Result<()>,
+) -> Result<()> {
     let mut reader = BufReader::new(input);
-    let mut current: Option<Vec<u8>> = None;
+    // The message being read, and whether it outgrew the limit (its text
+    // is then dropped, not padded out to the limit to say so).
+    let mut current: Option<(Vec<u8>, bool)> = None;
     let mut line = Vec::new();
     let mut blank_before = true;
-    let finish = |message: Vec<u8>, each: &mut dyn FnMut(Vec<u8>) -> Result<()>| -> Result<()> {
+    let finish = |(message, too_large): (Vec<u8>, bool),
+                  each: &mut dyn FnMut(Option<Vec<u8>>) -> Result<()>|
+     -> Result<()> {
+        if too_large {
+            return each(None);
+        }
         // The blank line separating messages isn't part of the message.
         let mut message = message;
         if message.ends_with(b"\r\n\r\n") {
             message.truncate(message.len() - 2);
         }
         if !message.iter().all(u8::is_ascii_whitespace) {
-            each(message)?;
+            each(Some(message))?;
         }
         Ok(())
     };
     loop {
+        // A very long line's room isn't kept for the short ones after it.
+        if line.capacity() > 1024 * 1024 {
+            line = Vec::new();
+        }
         line.clear();
         // A line is read up to the import limit: a file without line breaks
         // (not mail) isn't held in memory whole.
@@ -108,18 +123,21 @@ pub fn read_mbox(input: impl Read, mut each: impl FnMut(Vec<u8>) -> Result<()>) 
             .strip_suffix(b"\n")
             .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
             .unwrap_or(&line);
-        if text.starts_with(b"From ") && (blank_before || current.is_none()) {
+        if is_separator(text) && (blank_before || current.is_none()) {
             if let Some(message) = current.take() {
                 finish(message, &mut each)?;
             }
-            current = Some(Vec::new());
+            current = Some((Vec::new(), false));
             blank_before = false;
             continue;
         }
         blank_before = text.is_empty();
-        let Some(message) = current.as_mut() else {
+        let Some((message, too_large)) = current.as_mut() else {
             continue;
         };
+        if *too_large {
+            continue;
+        }
         let quotes = text.iter().take_while(|&&b| b == b'>').count();
         let text = if quotes > 0 && text[quotes..].starts_with(b"From ") {
             &text[1..]
@@ -130,14 +148,38 @@ pub fn read_mbox(input: impl Read, mut each: impl FnMut(Vec<u8>) -> Result<()>) 
             message.extend_from_slice(text);
             message.extend_from_slice(b"\r\n");
         } else {
-            // Over the limit: keep it marked as too large, without its text.
-            message.resize(MAX_IMPORT + 3, 0);
+            // Over the limit: marked as too large, its text let go.
+            *message = Vec::new();
+            *too_large = true;
         }
     }
     if let Some(message) = current {
         finish(message, &mut each)?;
     }
     Ok(())
+}
+
+/// Whether a line is an mbox separator (RFC 4155 §2: `From <sender>
+/// <date>`): a `From ` line naming a sender and ending in a year, not text
+/// that happens to start with "From " after a blank line (an mboxo file's
+/// unquoted "From here on…").
+fn is_separator(line: &[u8]) -> bool {
+    let Some(rest) = line.strip_prefix(b"From ") else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(rest);
+    let mut words = text.split_whitespace();
+    let Some(sender) = words.next() else {
+        return false;
+    };
+    let date: Vec<&str> = words.collect();
+    // asctime: "Wed Nov 23 10:00:00 2026", perhaps with a zone after.
+    !sender.is_empty()
+        && date.len() >= 4
+        && date
+            .iter()
+            .any(|w| w.len() == 4 && w.bytes().all(|b| b.is_ascii_digit()))
+        && date.iter().any(|w| w.matches(':').count() >= 1)
 }
 
 /// Whether a file looks like an mbox (it starts with a `From ` line).
@@ -248,10 +290,14 @@ impl Backend {
             }
             Ok(())
         };
-        let mut add = |raw: Vec<u8>| -> Result<()> {
+        let mut add = |raw: Option<Vec<u8>>| -> Result<()> {
             if cancel.load(Ordering::Relaxed) {
                 bail!("The import was stopped.");
             }
+            let Some(raw) = raw else {
+                moved.skipped += 1;
+                return Ok(());
+            };
             if raw.len() > MAX_IMPORT || mailparse::parse_headers(&raw).is_err() {
                 moved.skipped += 1;
                 return Ok(());
@@ -283,7 +329,7 @@ impl Backend {
                 }
                 let raw = std::fs::read(path)?;
                 // Mail travels with CRLF; files saved elsewhere may use LF.
-                add(crlf(&raw))?;
+                add(Some(crlf(&raw)))?;
             }
         }
         drop(add);
@@ -316,7 +362,7 @@ impl Backend {
             _ => self.with_imap(a, |c| {
                 let remote = remote_name(c.names(false)?, a, mailbox)?;
                 let wire = c.wire(&remote);
-                c.append_heard(&wire, raw, &[imap::types::Flag::Seen])?;
+                c.append_dated(&wire, raw, &[imap::types::Flag::Seen])?;
                 Ok(())
             }),
         }
@@ -379,7 +425,8 @@ mod tests {
     fn messages(mbox: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         read_mbox(mbox, |m| {
-            out.push(m);
+            // A message too large to import, as an empty one.
+            out.push(m.unwrap_or_default());
             Ok(())
         })
         .unwrap();

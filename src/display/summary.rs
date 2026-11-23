@@ -561,15 +561,67 @@ impl MailApp {
     /// its emails say matched.
     fn shown_parcels<'a>(&'a self, cx: &App) -> Vec<(&'a Tracked, bool)> {
         let query = self.parcel_query(cx);
-        self.listed_parcels(self.summary_show_hidden)
-            .filter_map(|t| match query.as_deref() {
-                None => Some((t, false)),
-                Some(q) => {
+        let listed: Vec<&Tracked> = self.listed_parcels(self.summary_show_hidden).collect();
+        let Some(q) = query else {
+            return listed.into_iter().map(|t| (t, false)).collect();
+        };
+        // Each by what a search reads that can change: its emails (by
+        // update and count), and its name, sender and status set by hand.
+        let key = self.search_key(
+            &q,
+            listed.iter().map(|t| {
+                (
+                    t.parcel.key(),
+                    t.updated,
+                    t.history.len(),
+                    t.name.as_deref(),
+                    t.sender.as_deref(),
+                    t.status_label(),
+                )
+            }),
+        );
+        let found = self.cached_search("parcels", key, || {
+            listed
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
                     let account = self.account_name(&t.latest().account);
-                    parcel_matches(t, q, account.as_deref(), &self.parcel_texts).map(|e| (t, e))
-                }
-            })
-            .collect()
+                    parcel_matches(t, &q, account.as_deref(), &self.parcel_texts).map(|e| (i, e))
+                })
+                .collect()
+        });
+        found.iter().filter_map(|&(i, e)| Some((*listed.get(i)?, e))).collect()
+    }
+    /// What a search's results depend on, as one number: the query, the
+    /// listed items (each by what changes when it does), and the emails'
+    /// text loaded so far.
+    pub(super) fn search_key<T: std::hash::Hash>(&self, query: &str, items: impl Iterator<Item = T>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        query.hash(&mut h);
+        for item in items {
+            item.hash(&mut h);
+        }
+        self.parcel_texts.len().hash(&mut h);
+        self.parcel_texts_generation.hash(&mut h);
+        h.finish()
+    }
+    /// A search's results for `key`, worked out by `search` only when its
+    /// last results were for something else.
+    pub(super) fn cached_search(
+        &self,
+        name: &'static str,
+        key: u64,
+        search: impl FnOnce() -> Vec<(usize, bool)>,
+    ) -> super::SearchFound {
+        if let Some((k, found)) = self.search_cache.borrow().get(name)
+            && *k == key
+        {
+            return found.clone();
+        }
+        let found = Rc::new(search());
+        self.search_cache.borrow_mut().insert(name, (key, found.clone()));
+        found
     }
 
     /// The Summary's parcels as listed: without the hidden, unless they
@@ -659,10 +711,12 @@ impl MailApp {
                 .unwrap_or_default()
         };
         let page = self.summary_packages || self.summary_receipts;
+        // The pages are lists that scroll themselves (see `summary_list`);
+        // the widgets, few, scroll as a whole.
         let body = if self.summary_receipts {
-            self.receipts_page(all, cx)
+            self.receipts_page(cx)
         } else if page {
-            self.packages_page(all, cx)
+            self.packages_page(cx)
         } else {
             self.summary_widgets(single, all, cx)
         };
@@ -747,7 +801,15 @@ impl MailApp {
                         d.child(spinner(13., c.muted))
                     }),
             )
-            .child(
+            .child(if page {
+                div()
+                    .id("summary-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .px_5()
+                    .pt_4()
+                    .child(body)
+            } else {
                 div()
                     .id("summary-scroll")
                     .flex_1()
@@ -755,8 +817,8 @@ impl MailApp {
                     .overflow_y_scroll()
                     .px_5()
                     .py_4()
-                    .child(body),
-            )
+                    .child(body)
+            })
     }
 
     /// The Summary's widgets, laid out from the top left: Packages, then
@@ -991,7 +1053,8 @@ impl MailApp {
 
     /// The Packages page: every parcel, last updated first, each opening
     /// to its history.
-    fn packages_page(&self, all: bool, cx: &Context<Self>) -> AnyElement {
+    /// The Packages page's top: its title, count, search and hidden link.
+    fn packages_header(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let packages = self.listed_parcels(false).count();
         let hidden = self.summary.len() - packages;
@@ -1068,9 +1131,13 @@ impl MailApp {
                 )
             })
             .children(self.summary_download_status(false, cx))
-            .child(self.packages(all, cx))
-            .child(
-                div()
+            .into_any_element()
+    }
+
+    /// What the Packages page says under its parcels.
+    fn packages_footer(&self) -> AnyElement {
+        let c = self.colors();
+        div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
                     .child(format!(
@@ -1084,8 +1151,7 @@ impl MailApp {
                             " (turn on Find tracking numbers in Settings → \
                              Local AI to find more)"
                         }
-                    )),
-            )
+                    ))
             .into_any_element()
     }
 
@@ -1199,14 +1265,12 @@ impl MailApp {
             }))
     }
 
-    /// The Packages section: a parcel per row, last updated first.
-    fn packages(&self, all: bool, cx: &Context<Self>) -> AnyElement {
+    /// What the Packages page shows when it lists no parcel.
+    fn packages_empty(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
-        let shown = self.shown_parcels(cx);
-        if shown.is_empty() {
             let searched = self.parcel_query(cx).is_some()
                 && self.listed_parcels(self.summary_show_hidden).next().is_some();
-            return div()
+            div()
                 .id("summary-packages-empty")
                 .debug_selector(|| "summary-packages-empty".into())
                 .py_6()
@@ -1229,22 +1293,112 @@ impl MailApp {
                         "No packages in this mail"
                     },
                 )
-                .into_any_element();
-        }
+                .into_any_element()
+    }
+
+    /// A Summary page that lists many rows (Packages, Receipts): its top,
+    /// its rows, and what it says under them, in one scrolling list that
+    /// builds only the rows in view. Every parcel or receipt, built on each
+    /// frame (with its history, its menu, its stepper), made a long one slow.
+    /// `row` builds each item; `key` changes whenever what the rows show
+    /// does, so their heights are measured again.
+    pub(super) fn summary_list(
+        &self,
+        name: &'static str,
+        count: usize,
+        key: u64,
+        cx: &Context<Self>,
+        row: fn(&mut MailApp, SummaryItem, &Context<MailApp>) -> AnyElement,
+    ) -> AnyElement {
+        // The top and what it says under the rows count as rows too.
+        let total = count + 2;
+        let state = {
+            let mut lists = self.summary_lists.borrow_mut();
+            let (state, known) = lists
+                .entry(name)
+                .or_insert_with(|| (ListState::new(total, ListAlignment::Top, px(600.)), u64::MAX));
+            if state.item_count() != total {
+                state.reset(total);
+                *known = key;
+            } else if *known != key {
+                state.remeasure();
+                *known = key;
+            }
+            state.clone()
+        };
+        let entity = cx.entity();
+        let scroll = state.clone();
+        let list = list(state, move |i, _, cx| {
+            entity.update(cx, |this, cx| {
+                let cx: &Context<Self> = cx;
+                let item = match i {
+                    0 => SummaryItem::Header,
+                    i if i == total - 1 => SummaryItem::Footer,
+                    i => SummaryItem::Row { i: i - 1, first: i == 1, last: i == total - 2 },
+                };
+                row(this, item, cx)
+            })
+        })
+        .with_sizing_behavior(ListSizingBehavior::Auto)
+        .size_full();
+        super::panes::scroll_frame(list, &scroll).size_full().into_any_element()
+    }
+
+    /// The Packages page, its parcels virtualized (see `summary_list`).
+    fn packages_page(&self, cx: &Context<Self>) -> AnyElement {
+        let shown = self.shown_parcels(cx);
+        // For the rows built this frame (see `summary_rows`).
+        let rows: Vec<(usize, bool)> = shown
+            .iter()
+            .filter_map(|(t, e)| Some((index_in(&self.summary, t)?, *e)))
+            .collect();
+        *self.summary_rows.borrow_mut() = Rc::new(rows);
+        let count = shown.len().max(1);
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for (t, in_email) in &shown {
+                (t.parcel.key(), t.updated, t.history.len(), &t.name, &t.sender, in_email, t.hidden).hash(&mut h);
+            }
+            shown.is_empty().hash(&mut h);
+            let mut open: Vec<&String> = self.summary_expanded.iter().collect();
+            open.sort();
+            open.hash(&mut h);
+            format!("{:?}", self.parcel_editing).hash(&mut h);
+            (self.summary_search, self.parcel_texts_loading, self.summary_downloads, self.summary_scanned).hash(&mut h);
+            (self.dark, self.summary_show_hidden).hash(&mut h);
+            h.finish()
+        };
+        self.summary_list("packages", count, key, cx, |this, item, cx| {
+            let all = this.account.as_deref() == Some(fwd::ALL_MAIL);
+            match item {
+                SummaryItem::Header => this.packages_header(cx),
+                SummaryItem::Footer => div().pt_3().child(this.packages_footer()).into_any_element(),
+                SummaryItem::Row { i, first, last } => {
+                    let rows = this.summary_rows.borrow().clone();
+                    // None to list: the one row says why (it has its own border).
+                    let Some((t, in_email)) = rows.get(i).and_then(|&(at, e)| Some((this.summary.get(at)?, e))) else {
+                        return div().pt_3().child(this.packages_empty(cx)).into_any_element();
+                    };
+                    let row = this.package(i, t, all, in_email, cx);
+                    this.card_edge(row, first, last)
+                }
+            }
+        })
+    }
+
+    /// A row of a card the rows of a list make together (see
+    /// `summary_list`): its sides, and its top or bottom edge, rounded, for
+    /// the first or last.
+    pub(super) fn card_edge(&self, row: AnyElement, first: bool, last: bool) -> AnyElement {
+        let c = self.colors();
         div()
-            .id("summary-packages")
-            .debug_selector(|| "summary-packages".into())
-            .flex()
-            .flex_col()
-            .rounded(px(10.))
-            .border_1()
+            .border_l_1()
+            .border_r_1()
             .border_color(rgb(c.border))
-            .children(
-                shown
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (t, in_email))| self.package(i, t, all, in_email, cx)),
-            )
+            .when(first, |d| d.mt_3().border_t_1().rounded_t(px(10.)))
+            .when(last, |d| d.border_b_1().rounded_b(px(10.)))
+            .child(row)
             .into_any_element()
     }
 
@@ -1500,7 +1654,9 @@ impl MailApp {
                 self.summary_link(
                     &format!("summary-track-{i}"),
                     "Track",
-                    Action::OpenUrl(url.clone()),
+                    // An email can name this address: opened as its links are
+                    // (warned about on phones, as an unfamiliar site).
+                    Action::OpenEmailLink(url.clone()),
                     cx,
                 )
                 .into_any_element(),
@@ -1743,7 +1899,7 @@ impl MailApp {
                         self.link(
                             &format!("parcel-track-{i}"),
                             "Track Package",
-                            Action::OpenUrl(url.clone()),
+                            Action::OpenEmailLink(url.clone()),
                             cx,
                         )
                         .into_any_element(),
@@ -1855,4 +2011,24 @@ fn arrival_date(raw: &str) -> Option<String> {
     let date = raw.get(..10)?;
     let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
     Some(date.format("%b %-d, %Y").to_string())
+}
+
+/// An item of a Summary page's list (see `MailApp::summary_list`).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SummaryItem {
+    /// The page's title, count, search and notices.
+    Header,
+    /// Row `i`: the first and last draw the card's top and bottom.
+    Row { i: usize, first: bool, last: bool },
+    /// What the page says under its rows.
+    Footer,
+}
+
+/// Where `item` is in `list`, found from its address (it is one of
+/// `list`'s), without comparing it to each.
+pub(super) fn index_in<T>(list: &[T], item: &T) -> Option<usize> {
+    let size = std::mem::size_of::<T>().max(1);
+    let offset = (item as *const T as usize).checked_sub(list.as_ptr() as usize)?;
+    let i = offset / size;
+    (offset % size == 0 && i < list.len()).then_some(i)
 }

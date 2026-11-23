@@ -27,6 +27,7 @@ unsafe extern "C" {
     static NSDocumentTypeDocumentAttribute: *const AnyObject;
     static NSRTFTextDocumentType: *const AnyObject;
     static NSRTFDTextDocumentType: *const AnyObject;
+    static NSHTMLTextDocumentType: *const AnyObject;
     static NSFontAttributeName: *const AnyObject;
     static NSLinkAttributeName: *const AnyObject;
     static NSStrikethroughStyleAttributeName: *const AnyObject;
@@ -60,7 +61,13 @@ pub(super) fn clipboard_html() -> Option<String> {
                 ("public.rtf", NSRTFTextDocumentType),
                 ("com.apple.flat-rtfd", NSRTFDTextDocumentType),
             ] {
-                if let Some(runs) = data(board, kind).and_then(|d| attributed_runs(d, document)) {
+                let Some(d) = data(board, kind) else { continue };
+                // UIKit's own HTML of it first: headings, quotes, lists and
+                // tables kept, which styled runs alone lose.
+                if let Some(html) = attributed_html(d, document) {
+                    return Some(html);
+                }
+                if let Some(runs) = attributed_runs(d, document) {
                     return Some(super::runs_to_html(&runs));
                 }
             }
@@ -135,6 +142,44 @@ unsafe fn web_archive_html(data: *mut AnyObject) -> Option<String> {
             return None;
         }
         utf8(html)
+    }
+}
+
+/// RTF (or RTFD) as HTML, by UIKit's own conversion of the attributed
+/// string (`NSHTMLTextDocumentType`).
+unsafe fn attributed_html(data: *mut AnyObject, document: *const AnyObject) -> Option<String> {
+    unsafe {
+        let options: *mut AnyObject = msg_send![
+            class!(NSDictionary),
+            dictionaryWithObject: document,
+            forKey: NSDocumentTypeDocumentAttribute
+        ];
+        let text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let text: *mut AnyObject = msg_send![
+            text,
+            initWithData: data,
+            options: options,
+            documentAttributes: null_mut::<*mut AnyObject>(),
+            error: null_mut::<*mut AnyObject>()
+        ];
+        if text.is_null() {
+            return None;
+        }
+        let len: usize = msg_send![text, length];
+        let out_options: *mut AnyObject = msg_send![
+            class!(NSDictionary),
+            dictionaryWithObject: NSHTMLTextDocumentType,
+            forKey: NSDocumentTypeDocumentAttribute
+        ];
+        let html: *mut AnyObject = msg_send![
+            text,
+            dataFromRange: NSRange { location: 0, length: len },
+            documentAttributes: out_options,
+            error: null_mut::<*mut AnyObject>()
+        ];
+        let out = if html.is_null() { None } else { utf8(html) };
+        let _: () = msg_send![text, release];
+        out
     }
 }
 

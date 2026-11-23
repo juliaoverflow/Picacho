@@ -92,12 +92,15 @@ pub(crate) fn append_uids(heard: &[u8]) -> Option<(u32, Vec<u32>)> {
 /// A UID set ("4,7:9") in order, as COPYUID pairs them: a range counts
 /// from its first number to its second, either way.
 fn uid_set_list(set: &str) -> Option<Vec<u32>> {
+    // At most this many in all, not only in each range: a short reply of
+    // ranges repeated ("1:100000,1:100000,…") asked for gigabytes.
+    const MOST: u64 = 1_000_000;
     let mut out = Vec::new();
     for part in set.split(',') {
         match part.split_once(':') {
             Some((a, b)) => {
                 let (a, b): (u32, u32) = (a.parse().ok()?, b.parse().ok()?);
-                if b.abs_diff(a) > 100_000 {
+                if out.len() as u64 + u64::from(b.abs_diff(a)) >= MOST {
                     return None;
                 }
                 if a <= b {
@@ -374,10 +377,11 @@ impl Name {
     /// Whether the server gave this mailbox `attribute`. Attributes are
     /// case-insensitive (\\Noselect, \\NoSelect…).
     pub(crate) fn has(&self, attribute: &str) -> bool {
-        let attribute = attribute.to_ascii_lowercase();
+        // Whole attributes only: `\Sent` is not `\SentArchive`.
+        let attribute = attribute.trim_start_matches('\\');
         self.attributes
             .iter()
-            .any(|a| a.to_ascii_lowercase().contains(&attribute))
+            .any(|a| a.trim_start_matches('\\').eq_ignore_ascii_case(attribute))
     }
     pub(crate) fn delimiter(&self) -> Option<&str> {
         self.delimiter.as_deref().filter(|d| !d.is_empty())
@@ -410,6 +414,8 @@ pub(crate) struct ListOptions {
     /// none of the account's own folders is subscribed (a server or person
     /// that doesn't use subscriptions).
     pub(crate) subscribed_only: bool,
+    /// RETURN options may be used (LIST-EXTENDED, RFC 5258).
+    pub(crate) list_extended: bool,
 }
 
 /// A folder's counters from the listing (LIST-STATUS).
@@ -435,9 +441,12 @@ pub(crate) fn list_full(
     others: &[String],
     utf8: bool,
 ) -> Result<(Vec<Name>, std::collections::HashMap<String, FolderStatus>)> {
-    let extended = options.special_use || options.list_status;
+    // RETURN options are LIST-EXTENDED syntax (RFC 5258), which LIST-STATUS
+    // implies (RFC 5819). Without it, SPECIAL-USE attributes come in the
+    // plain LIST reply (RFC 6154 §2) and subscriptions from LSUB.
+    let extended = options.list_extended || options.list_status;
     let mut returns = Vec::new();
-    if options.special_use {
+    if options.special_use && extended {
         returns.push("SPECIAL-USE".to_owned());
     }
     if options.subscribed_only && extended {
@@ -505,6 +514,17 @@ pub(crate) fn list_full(
     ))
 }
 
+/// A LIST attribute as the server spelled it (`\Noselect`, `\Sent`…).
+fn attribute_text(a: &imap::types::NameAttribute<'_>) -> String {
+    use imap::types::NameAttribute as A;
+    match a {
+        A::NoInferiors => "\\Noinferiors".into(),
+        A::NoSelect => "\\Noselect".into(),
+        A::Marked => "\\Marked".into(),
+        A::Unmarked => "\\Unmarked".into(),
+        A::Custom(c) => c.to_string(),
+    }
+}
 /// The mailboxes `pattern` matches, with `returns` (RETURN options, empty
 /// for none) and the counters LIST-STATUS sends with them. Wire names.
 fn list_pattern(
@@ -520,7 +540,7 @@ fn list_pattern(
                 .iter()
                 .map(|n| Name {
                     name: n.name().into(),
-                    attributes: n.attributes().iter().map(|a| format!("{a:?}")).collect(),
+                    attributes: n.attributes().iter().map(attribute_text).collect(),
                     delimiter: n.delimiter().map(Into::into),
                 })
                 .collect(),
@@ -1090,6 +1110,16 @@ pub(crate) struct Extensions {
     pub(crate) binary: bool,
     /// RFC 7888: literals that need no go-ahead (LITERAL+ or LITERAL-).
     pub(crate) literal_plus: bool,
+    /// Only LITERAL- (RFC 7888 §5, and IMAP4rev2's base): such literals
+    /// may be at most 4096 bytes.
+    pub(crate) literal_minus: bool,
+    /// RFC 6855 §7: the server takes only UTF-8 (UTF8=ONLY).
+    pub(crate) utf8_only: bool,
+    /// RFC 5464: server annotations (METADATA-SERVER), which needn't come
+    /// with mailbox ones (`metadata`).
+    pub(crate) metadata_server: bool,
+    /// RFC 5258: LIST with selection and RETURN options (LIST-EXTENDED).
+    pub(crate) list_extended: bool,
     /// RFC 9051: the server speaks only IMAP4rev2, whose base protocol has
     /// MOVE, UIDPLUS, ESEARCH, NAMESPACE, SPECIAL-USE, LIST-STATUS… without
     /// listing them (they are set here too), and answers SEARCH with
@@ -1196,7 +1226,13 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         utf8_accept: caps.has_str("UTF8=ACCEPT") || caps.has_str("UTF8=ONLY"),
         enable: rev2 || caps.has_str("ENABLE"),
         notify: caps.has_str("NOTIFY"),
-        metadata: caps.has_str("METADATA") || caps.has_str("METADATA-SERVER"),
+        metadata: caps.has_str("METADATA"),
+        // METADATA has the server's annotations too (RFC 5464 §1).
+        metadata_server: caps.has_str("METADATA") || caps.has_str("METADATA-SERVER"),
+        list_extended: rev2 || caps.has_str("LIST-EXTENDED"),
+        utf8_only: caps.has_str("UTF8=ONLY"),
+        literal_minus: !caps.has_str("LITERAL+")
+            && (rev2 || caps.has_str("LITERAL-")),
         objectid: caps.has_str("OBJECTID"),
         preview: caps.has_str("PREVIEW"),
         savedate: caps.has_str("SAVEDATE"),
@@ -1237,7 +1273,12 @@ impl Extensions {
         self.esearch = true;
         self.enable = true;
         self.binary = true;
+        // rev2 has LITERAL- (RFC 9051 §4.3), not unbounded LITERAL+.
+        if !self.literal_plus {
+            self.literal_minus = true;
+        }
         self.literal_plus = true;
+        self.list_extended = true;
         self.list_status = true;
         self.unselect = true;
         self.status_size = true;
@@ -1295,6 +1336,52 @@ pub(crate) fn tokens(line: &str) -> Vec<Token> {
                     }
                 }
                 out.push(Token::Text(text));
+            }
+            // A literal (`{n}` then CRLF then n bytes; RFC 9051 §4.3), as
+            // the reply's lines keep it: its bytes are the string.
+            '{' => {
+                let mut digits = String::new();
+                let mut probe = chars.clone();
+                probe.next();
+                while let Some(&d) = probe.peek() {
+                    if d.is_ascii_digit() || d == '+' {
+                        digits.push(d);
+                        probe.next();
+                    } else {
+                        break;
+                    }
+                }
+                let n = digits.trim_end_matches('+').parse::<usize>().ok();
+                if probe.next() == Some('}')
+                    && let Some(n) = n
+                {
+                    // The line break after it, then the literal's bytes.
+                    if probe.peek() == Some(&'\r') {
+                        probe.next();
+                    }
+                    if probe.peek() == Some(&'\n') {
+                        probe.next();
+                    }
+                    let mut text = String::new();
+                    let mut bytes = 0;
+                    while bytes < n {
+                        let Some(c) = probe.next() else { break };
+                        bytes += c.len_utf8();
+                        text.push(c);
+                    }
+                    chars = probe;
+                    out.push(Token::Text(text));
+                } else {
+                    let mut word = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if matches!(c, ' ' | '(' | ')') {
+                            break;
+                        }
+                        word.push(c);
+                        chars.next();
+                    }
+                    out.push(Token::Text(word));
+                }
             }
             _ => {
                 let mut word = String::new();
@@ -1557,6 +1644,11 @@ pub(crate) struct Selected {
     pub(crate) modseq: Option<u64>,
     /// Whether new keywords may be set here (PERMANENTFLAGS has \\*).
     pub(crate) keywords: bool,
+    /// `[ALERT]` texts the server sent, which must be shown to the person
+    /// (RFC 3501 §7.1).
+    pub(crate) alerts: Vec<String>,
+    /// The mailbox was opened read-only ([READ-ONLY]).
+    pub(crate) read_only: bool,
 }
 
 /// A mailbox name as an IMAP quoted string.
@@ -1598,11 +1690,20 @@ pub(crate) fn selected_from(data: &[u8], name: &str, condstore: bool) -> Result<
         use imap_proto::{MailboxDatum, Response, ResponseCode};
         match response {
             Response::Data {
-                code: Some(code), ..
+                code: Some(code),
+                information,
+                ..
             } => match code {
+                ResponseCode::Alert => {
+                    selected.alerts.extend(information.map(|t| t.trim().to_owned()))
+                }
+                ResponseCode::ReadOnly => selected.read_only = true,
                 ResponseCode::UidValidity(v) => validity = Some(v),
                 ResponseCode::UidNext(n) => selected.uid_next = Some(n),
-                ResponseCode::HighestModSeq(m) if condstore => selected.modseq = Some(m),
+                // 0 is no mod-sequence (RFC 7162 §3.1.2.1).
+                ResponseCode::HighestModSeq(m) if condstore && m > 0 => {
+                    selected.modseq = Some(m)
+                }
                 ResponseCode::PermanentFlags(flags) => {
                     selected.keywords = flags.contains(&"\\*");
                 }
@@ -1814,13 +1915,60 @@ pub(crate) fn uid_ranges(uids: &[u32]) -> String {
     out.join(",")
 }
 
+/// The `[ALERT]` texts in what the server sent (RFC 3501 §7.1: these must
+/// be shown to the person), from lines the imap crate otherwise drops.
+pub(crate) fn alerts_in(heard: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(heard)
+        .lines()
+        .filter_map(|line| {
+            let at = line.to_ascii_uppercase().find("[ALERT]")?;
+            let text = line[at + 7..].trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+        .collect()
+}
+/// What an IMAP refusal's response code (RFC 5530, RFC 9051 §7.1) means,
+/// for the codes a person can do something about. `None` for others.
+pub(crate) fn response_code_meaning(error: &anyhow::Error) -> Option<&'static str> {
+    let text = format!("{error:#}").to_ascii_uppercase();
+    let code = text.split('[').nth(1)?.split([']', ' ']).next()?;
+    Some(match code {
+        "TOOBIG" => "The message is too large for this server.",
+        "ALREADYEXISTS" => "A folder with that name already exists.",
+        "NONEXISTENT" => "That folder doesn't exist on the server any more.",
+        "TRYCREATE" => "The folder doesn't exist on the server; make it first.",
+        "NOPERM" => "This account isn't allowed to do that here.",
+        "INUSE" => "Someone or something else is using that folder now; try again shortly.",
+        "CANNOT" => "The server can't do that (its rules don't allow it).",
+        "LIMIT" => "That goes past one of the server's limits.",
+        "EXPUNGEISSUED" => "Some of those messages were deleted meanwhile.",
+        "CORRUPTION" => "The server says that folder is damaged; ask its administrator.",
+        "SERVERBUG" => "The server failed; try again later.",
+        "PRIVACYREQUIRED" => "The server wants an encrypted connection for that.",
+        "CONTACTADMIN" => "The server asks you to contact its administrator.",
+        "HASCHILDREN" => "Delete the folders inside it first.",
+        "READ-ONLY" => "That folder can only be read, not changed.",
+        "UIDNOTSTICKY" => "This folder can't keep message numbers; it may be read again whole.",
+        "BADCHARSET" => "The server can't search for text in that alphabet.",
+        _ => return None,
+    })
+}
+/// Whether a refusal says the mailbox or account is full ([OVERQUOTA],
+/// RFC 9208 §4.3): no waiting helps; the person must make room.
+pub(crate) fn over_quota(error: &anyhow::Error) -> bool {
+    format!("{error:#}").to_ascii_lowercase().contains("[overquota]")
+}
 /// Servers say this when an account is over its bandwidth or connection
 /// limits; Gmail uses several of these. Retrying immediately makes it worse.
+/// A full mailbox ([OVERQUOTA]) is not a limit on the rate: see
+/// `over_quota`.
 pub(crate) fn throttled(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
+    if text.contains("[overquota]") {
+        return false;
+    }
     [
         "[throttled]",
-        "[overquota]",
         "[limit]",
         "bandwidth limits",
         "too many simultaneous connections",
@@ -2076,5 +2224,18 @@ mod extension_tests {
         assert!(!throttled(&anyhow::anyhow!(
             "NO [AUTHENTICATIONFAILED] bad"
         )));
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    #[test]
+    fn tokens_read_literals() {
+        assert_eq!(
+            tokens("(\"a\" {5}\r\nb c d NIL)"),
+            vec![Token::Open, Token::Text("a".into()), Token::Text("b c d".into()), Token::Nil, Token::Close]
+        );
+        assert_eq!(tokens("{x}"), vec![Token::Text("{x}".into())]);
     }
 }

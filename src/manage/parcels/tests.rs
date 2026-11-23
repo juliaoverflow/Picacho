@@ -1230,3 +1230,12 @@ fn a_parcel_on_its_way_with_no_news_for_weeks_is_probably_delivered() {
     // Not shipped yet: nothing is known of its delivery.
     assert!(!by("ordered").done());
 }
+
+/// A bullet (three bytes in UTF-8) before a status phrase is a separator,
+/// not a place to cut a character in half.
+#[test]
+fn bullets_before_a_status_do_not_panic() {
+    for text in ["Order 123 • Out for delivery", "•out for delivery", "Paket •• out for delivery today"] {
+        assert_eq!(super::words::status_in(text, ""), Some(Status::OutForDelivery), "{text}");
+    }
+}

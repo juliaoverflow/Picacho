@@ -15,13 +15,17 @@ set -eu
 B=${PICACHO_KEYCLOAK:-http://127.0.0.1:18080}
 PORT=${B##*:}
 K="$KEYCLOAK_HOME/bin/kcadm.sh"
-export KCADM_CONFIG="${TMPDIR:-/tmp}/picacho-kcadm.config"
+# Its admin session, in a directory of this user's own (not a fixed name in
+# a shared /tmp another user could make first).
+state="${XDG_RUNTIME_DIR:-$HOME/.cache}/picacho-keycloak"
+mkdir -p -m 700 "$state"
+export KCADM_CONFIG="$state/kcadm.config"
 
 up() { curl -s -o /dev/null -w '%{http_code}' "$B/realms/master" | grep -q 200; }
 if ! up; then
     KC_BOOTSTRAP_ADMIN_USERNAME=admin KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
         nohup "$KEYCLOAK_HOME/bin/kc.sh" start-dev --http-port="$PORT" \
-        >"${TMPDIR:-/tmp}/picacho-keycloak.log" 2>&1 &
+        >"$state/keycloak.log" 2>&1 &
     i=0
     until up; do
         i=$((i + 1))

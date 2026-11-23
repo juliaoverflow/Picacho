@@ -1016,7 +1016,12 @@ impl MailApp {
     pub(super) fn keyboard_fields(&self, cx: &App) -> Vec<(FocusHandle, Keys)> {
         let mut out = vec![];
         let mut add = |state: &Entity<InputState>, keys: Keys| {
-            out.push((state.read(cx).focus_handle(cx), keys));
+            let state = state.read(cx);
+            // Every masked field (passwords, PINs, API keys, passphrases)
+            // asks for the password keyboard, whatever it was listed as: a
+            // plain one learned and synced what was typed.
+            let keys = if state.presentation().is_masked() { Keys::Password } else { keys };
+            out.push((state.focus_handle(cx), keys));
         };
         for (i, state) in self.form.iter().enumerate() {
             add(
@@ -1059,6 +1064,11 @@ impl MailApp {
         }
         add(&self.fwd_server, Keys::Url);
         add(&self.fwd_contact_new, Keys::Email);
+        // Masked, so the password keyboard (see `add`): not listed before,
+        // they got the platform's plain keyboard.
+        for state in [&self.calendar_password, &self.contacts_password, &self.key_passphrase] {
+            add(state, Keys::Password);
+        }
         out.push((self.signature_input.read(cx).focus_handle(cx), Keys::Text));
         if let Some(focus) = self
             .picker

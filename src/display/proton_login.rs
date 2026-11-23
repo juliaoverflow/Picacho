@@ -411,17 +411,34 @@ impl MailApp {
 
 /// A QR code, black on white, `size` wide.
 pub(super) fn qr_code(text: &str, size: f32) -> AnyElement {
-    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+    // Made once for its text, not on every frame (encoding a QR code is
+    // the most work a frame of these sheets does).
+    /// A code's width and which of its modules are dark.
+    type Code = (usize, std::rc::Rc<Vec<bool>>);
+    thread_local! {
+        static MADE: std::cell::RefCell<Option<(String, Option<Code>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let made = MADE.with(|made| {
+        let mut made = made.borrow_mut();
+        if made.as_ref().is_none_or(|(t, _)| t != text) {
+            let code = qrcode::QrCode::new(text.as_bytes()).ok().map(|code| {
+                let dark: Vec<bool> = code
+                    .to_colors()
+                    .into_iter()
+                    .map(|c| c == qrcode::Color::Dark)
+                    .collect();
+                (code.width(), std::rc::Rc::new(dark))
+            });
+            *made = Some((text.to_owned(), code));
+        }
+        made.as_ref().and_then(|(_, code)| code.clone())
+    });
+    let Some((width, dark)) = made else {
         return div()
             .child("The QR code couldn't be made.")
             .into_any_element();
     };
-    let width = code.width();
-    let dark: Vec<bool> = code
-        .to_colors()
-        .into_iter()
-        .map(|c| c == qrcode::Color::Dark)
-        .collect();
     canvas(
         |_, _, _| {},
         move |bounds, _, w, _| {

@@ -51,8 +51,11 @@ win() { printf 'Z:%s' "$(realpath -m "$1")" | tr / '\\'; }
 ui="target/wix/wixtoolset.ui.wixext.5.0.2"
 if [ ! -f "$ui/wixext5/WixToolset.UI.wixext.dll" ]; then
     mkdir -p "$ui"
-    curl -sSfL -o "$ui/package.zip" \
+    curl -sSfL --proto '=https' -o "$ui/package.zip" \
         https://api.nuget.org/v3-flatcontainer/wixtoolset.ui.wixext/5.0.2/wixtoolset.ui.wixext.5.0.2.nupkg
+    # Its code runs in the build: checked against the package as published.
+    echo "5ef2c707614b9f70b6bbadd2d4abcb4124efee215e9b16bfbc80113079a604c7  $ui/package.zip" | sha256sum -c - \
+        || { rm -f "$ui/package.zip"; exit 1; }
     (cd "$ui" && unzip -oq package.zip)
 fi
 $PICACHO_WIX build -arch x64 \

@@ -90,6 +90,8 @@ pub enum Command {
         max_height: f32,
         scale: f32,
     },
+    /// The person's text zoom (1: the email's own size).
+    TextZoom(f32),
     /// A long press: select the word at this point.
     SelectWord {
         x: f32,
@@ -146,6 +148,12 @@ pub enum Output {
     Hover(Option<String>),
     /// A link was clicked: this address, for the view's owner to open.
     Open(String),
+    /// What a screen reader reads of the email (see
+    /// `EmailDocument::accessible_text`), after its first layout.
+    Accessible {
+        text: String,
+        links: Vec<(String, String)>,
+    },
     /// The renderer failed on this email; nothing more will come.
     Failed,
     Thumbnail {
@@ -262,6 +270,14 @@ fn run(
 ) {
     let send = |output| out.unbounded_send(Update { generation, output }).is_ok();
     let mut doc = EmailDocument::with_parts(&html, inline.clone(), blocked, tone);
+    // Whether the pointer passing over an element can change how it looks:
+    // only through a `:hover` rule, in the email's styles or a stylesheet it
+    // links (not read yet). Most email has neither: there, a move from one
+    // element to another needs no restyle and repaint of what is shown.
+    let hover_styles = {
+        let lower = html.to_ascii_lowercase();
+        lower.contains(":hover") || lower.contains("<link")
+    };
     // Kept until the first layout shows whether the email's own dark styles
     // darken it (see `EmailDocument::mostly_light`).
     let mut source = (tone == Tone::NativeDark).then_some(html);
@@ -274,6 +290,7 @@ fn run(
     let mut word = None;
     let mut hovered: Option<String> = None;
     let mut clicks: Option<Clicks> = None;
+    let mut told_accessible = false;
     loop {
         // While resources are arriving, look every 40 ms for them; once
         // none are, sleep until a command comes rather than waking 25 times
@@ -361,7 +378,7 @@ fn run(
                         }
                     }
                     restyle |= interactive
-                        || hover != doc.doc.get_hover_node_id()
+                        || (hover_styles && hover != doc.doc.get_hover_node_id())
                         || cursor != doc.cursor();
                     selection_changed |= interactive;
                 }
@@ -422,6 +439,10 @@ fn run(
                 Command::Paint { band, width, scale } => {
                     paints.insert(band, (width, scale));
                 }
+                Command::TextZoom(z) => {
+                    doc.set_text_zoom(z);
+                    relayout |= width > 0;
+                }
                 Command::Context { x, y } => contexts.push((x / zoom, y / zoom)),
                 Command::Thumbnail {
                     width: w,
@@ -443,9 +464,17 @@ fn run(
             if let Some(html) = source.take()
                 && doc.mostly_light()
             {
+                let zoom = doc.text_zoom();
                 doc = EmailDocument::with_parts(&html, inline.clone(), blocked, Tone::InvertedDark);
                 doc.set_screen(screen.0, screen.1);
+                doc.set_text_zoom(zoom);
                 height = doc.layout(width);
+            }
+            // Once, for screen readers: the email's text and links.
+            if !told_accessible {
+                told_accessible = true;
+                let (text, links) = doc.accessible_text();
+                send(Output::Accessible { text, links });
             }
         } else if restyle && width > 0 {
             doc.resolve();

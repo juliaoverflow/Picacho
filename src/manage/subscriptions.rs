@@ -8,7 +8,7 @@
 //! sent from the person's account, a page to open) is shown to them first.
 use crate::manage::model::{Draft, Folder, Mail};
 use crate::sync::auth::SignedUnsubscribe;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -171,7 +171,28 @@ pub enum Method {
 /// The addresses in a List-Unsubscribe header, in its order.
 pub fn targets(header: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut rest = header;
+    // Comments (RFC 2369 §2 allows them: `(Use this) <mailto:…>`) out
+    // first, so an angle bracket inside one isn't read as an address.
+    let mut plain = String::with_capacity(header.len());
+    let mut depth = 0usize;
+    let mut in_angle = false;
+    for c in header.chars() {
+        match c {
+            '<' if depth == 0 => {
+                in_angle = true;
+                plain.push(c);
+            }
+            '>' if depth == 0 => {
+                in_angle = false;
+                plain.push(c);
+            }
+            '(' if !in_angle => depth += 1,
+            ')' if !in_angle && depth > 0 => depth -= 1,
+            _ if depth == 0 => plain.push(c),
+            _ => {}
+        }
+    }
+    let mut rest = plain.as_str();
     while let Some(start) = rest.find('<') {
         let Some(end) = rest[start..].find('>') else {
             break;
@@ -275,6 +296,10 @@ impl Plan {
     }
 }
 
+/// Percent-decoding (`%XX`), for `mailto:` and `mid:` links.
+pub(crate) fn percent_decoded(s: &str) -> String {
+    decode(s)
+}
 /// Percent-decoding for mailto: parts.
 fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -306,20 +331,6 @@ pub enum Outcome {
     Open(String),
 }
 
-/// The redirects a one-click request follows: a few, and only to HTTPS,
-/// so the request is never sent on in the clear.
-fn https_redirects() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            attempt.error("too many redirects")
-        } else if attempt.url().scheme() != "https" {
-            attempt.error("redirected to an address that isn't HTTPS")
-        } else {
-            attempt.follow()
-        }
-    })
-}
-
 /// Carries out `plan` for `account`. Mail goes out through `send`.
 pub fn unsubscribe(
     plan: &Plan,
@@ -331,19 +342,55 @@ pub fn unsubscribe(
             if !plan.verified {
                 bail!("The sender's request to unsubscribe couldn't be verified.");
             }
-            let response = reqwest::blocking::Client::builder()
+            // The sender chose the address: it, and wherever it redirects,
+            // must be on the internet, not this computer or its network.
+            let target = url::Url::parse(url).context("The sender's unsubscribe address isn't valid.")?;
+            if crate::sync::public_net::names_local_address(&target) {
+                bail!("The sender's unsubscribe address is on a local network.");
+            }
+            // Redirects by hand: a client follows 301, 302 and 303 as a GET,
+            // and a one-click request must stay a POST (RFC 8058 §3.2).
+            let client = reqwest::blocking::Client::builder()
                 .min_tls_version(reqwest::tls::Version::TLS_1_2)
                 .timeout(std::time::Duration::from_secs(30))
-                .redirect(https_redirects())
-                .build()?
-                .post(url)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body("List-Unsubscribe=One-Click")
-                .send()?;
-            if !response.status().is_success() {
-                bail!("The sender refused the request ({}).", response.status());
+                .dns_resolver(std::sync::Arc::new(crate::sync::public_net::PublicOnly))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let mut at = target;
+            for _ in 0..5 {
+                let response = client
+                    .post(at.clone())
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("List-Unsubscribe=One-Click")
+                    .send()?;
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(Outcome::Done);
+                }
+                // 301–303: the POST was taken, and a page to see after is
+                // offered; nothing more to send.
+                if matches!(status.as_u16(), 301..=303) {
+                    return Ok(Outcome::Done);
+                }
+                if matches!(status.as_u16(), 307 | 308) {
+                    let next = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|l| l.to_str().ok())
+                        .and_then(|l| at.join(l).ok())
+                        .context("The sender's redirect had no address.")?;
+                    if next.scheme() != "https" {
+                        bail!("The sender redirected the request to an address that isn't HTTPS.");
+                    }
+                    if crate::sync::public_net::names_local_address(&next) {
+                        bail!("The sender redirected the request to an address on a local network.");
+                    }
+                    at = next;
+                    continue;
+                }
+                bail!("The sender refused the request ({status}).");
             }
-            Ok(Outcome::Done)
+            bail!("The sender redirected the request too many times.")
         }
         Method::Mail { to, subject } => {
             let draft = Draft {

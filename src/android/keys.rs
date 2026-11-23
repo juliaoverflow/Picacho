@@ -271,6 +271,12 @@ impl<'c> KeyToken<'c> {
         };
         let command = first[4];
         let length = usize::from(u16::from_be_bytes([first[5], first[6]]));
+        // CTAPHID carries at most one first packet and 128 continuations
+        // (sequence 0 to 127): a longer length is a broken (or hostile)
+        // device's, whose sequence count would otherwise overflow.
+        if length > FIRST + 128 * NEXT {
+            return Err(lost());
+        }
         let mut data = first[7..7 + length.min(FIRST)].to_vec();
         let mut sequence = 0u8;
         while data.len() < length {
@@ -280,7 +286,7 @@ impl<'c> KeyToken<'c> {
             }
             let take = (length - data.len()).min(NEXT);
             data.extend_from_slice(&report[5..5 + take]);
-            sequence += 1;
+            sequence = sequence.checked_add(1).ok_or_else(lost)?;
         }
         Ok((command, data))
     }
@@ -388,6 +394,12 @@ impl<'c> KeyToken<'c> {
                 // More of the answer waits: GET RESPONSE.
                 (0x61, more) => {
                     data.extend_from_slice(&answer.data);
+                    // A key's answer is a few kilobytes at most: one that
+                    // keeps saying "more" doesn't fill memory until the time
+                    // is up.
+                    if data.len() > 64 * 1024 {
+                        return Err(WebauthnCError::Ctap(CtapError::Ctap1InvalidLength));
+                    }
                     answer = self.nfc_exchange(&[0x00, 0xc0, 0x00, 0x00, more])?;
                 }
                 // Still working: ask again (NFCCTAP_GETRESPONSE).

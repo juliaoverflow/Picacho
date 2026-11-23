@@ -722,7 +722,7 @@ impl From<&Mailbox> for Mailbox {
 }
 
 /// A server folder that is not one of the standard mailboxes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteFolder {
     pub name: String,
     pub label: String,
@@ -1164,6 +1164,23 @@ impl InlineParts {
         self.parts.insert(id, std::sync::Arc::new(bytes));
         true
     }
+    /// Adds a part under its Content-Location (RFC 2557): an absolute
+    /// URL the HTML refers to it by, kept apart from Content-IDs.
+    pub fn insert_location(&mut self, location: &str, bytes: Vec<u8>) -> bool {
+        let location = location.trim();
+        if !location.contains(':') || location.len() > 2048 {
+            return false;
+        }
+        self.insert(&format!("loc:{location}"), bytes)
+    }
+    /// The part at a Content-Location the message gave, if any: the
+    /// message's own copy, served without fetching anything.
+    pub fn at_location(&self, url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        if self.parts.is_empty() {
+            return None;
+        }
+        self.parts.get(&format!("loc:{}", url.trim()).to_lowercase()).cloned()
+    }
     /// The part a `cid:` URL names, if the message has it. The URL's id
     /// may be percent-encoded (RFC 2392).
     pub fn get(&self, url: &str) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -1251,7 +1268,7 @@ pub fn initials(name: &str) -> String {
         .to_uppercase()
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Secret {
     pub password: String,
     pub access_token: String,
@@ -1274,6 +1291,25 @@ pub struct Secret {
     /// account's keys. The password itself isn't kept.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proton_key: String,
+}
+/// Says which secrets are there, never what they are: one printed for
+/// debugging (`{:?}`, an error's details) would otherwise put passwords
+/// and tokens in a log.
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kept = |s: &str| if s.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("Secret")
+            .field("password", &kept(&self.password))
+            .field("access_token", &kept(&self.access_token))
+            .field("refresh_token", &kept(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("client_secret", &kept(&self.client_secret))
+            .field("mail_bundle", &kept(&self.mail_bundle))
+            .field("mail_key", &kept(&self.mail_key))
+            .field("proton_uid", &self.proton_uid)
+            .field("proton_key", &kept(&self.proton_key))
+            .finish()
+    }
 }
 impl Secret {
     pub(crate) fn proton(&self) -> crate::sync::proton::Saved {

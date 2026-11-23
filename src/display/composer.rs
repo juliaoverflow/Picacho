@@ -187,6 +187,22 @@ pub(super) struct Composer {
 
 impl Composer {
     #[allow(clippy::too_many_arguments)]
+    /// Shows the draft's fields again after they were changed in code.
+    pub(super) fn reload_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let values = [
+            self.draft.to.clone(),
+            self.draft.cc.clone(),
+            self.draft.bcc.clone(),
+            self.draft.reply_to.clone(),
+        ];
+        for (state, value) in self.recipients.iter().zip(values) {
+            state.update(cx, |s, cx| s.set_text(value, window, cx));
+        }
+        let subject = self.draft.subject.clone();
+        self.subject.update(cx, |s, cx| s.set_text(subject, window, cx));
+        let body = self.draft.body.clone();
+        self.body.update(cx, |s, cx| s.set_text(body, window, cx));
+    }
     pub(super) fn new(
         draft: Draft,
         placement: Placement,
@@ -709,6 +725,31 @@ impl Composer {
     /// clipboard has no formatting, leaving the paste to the text field.
     fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.paste = None;
+        // A copied picture or files: attached.
+        if let Some(item) = cx.read_from_clipboard() {
+            let mut files = Vec::new();
+            for entry in item.entries() {
+                match entry {
+                    ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
+                        let extension = image.format.mime_type().rsplit('/').next().unwrap_or("png");
+                        let extension = extension.split('+').next().unwrap_or(extension);
+                        let name = format!("Pasted image.{extension}");
+                        match self.backend.save_pasted(&self.draft.id, &name, &image.bytes) {
+                            Ok(path) => files.push(path),
+                            Err(e) => eprintln!("A pasted picture couldn't be kept: {e:#}"),
+                        }
+                    }
+                    ClipboardEntry::ExternalPaths(paths) => {
+                        files.extend(paths.paths().iter().cloned())
+                    }
+                    _ => {}
+                }
+            }
+            if !files.is_empty() && item.text().is_none_or(|t| t.trim().is_empty()) {
+                self.add_files(files, cx);
+                return true;
+            }
+        }
         let Some(plain) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
         };
@@ -2546,7 +2587,7 @@ impl Render for ComposeWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.composer.read(cx).colors;
         let title = self.composer.read(cx).title(cx);
-        window.set_window_title(&title);
+        super::window::set_title(window, &title);
         let composer = self.composer.clone();
         div()
             .key_context("Detached")

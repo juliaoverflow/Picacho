@@ -111,14 +111,14 @@ impl Backend {
                     .collect::<Result<_>>()?;
                 // A server refusing it (one mailbox it can't search, say)
                 // is searched folder by folder below instead.
-                let found =
-                    crate::sync::transport::multisearch(&mut c.session, &wire, &criteria, utf8)
-                        .unwrap_or_default();
-                let searched = if found.is_empty() {
-                    Vec::new()
-                } else {
-                    std::mem::take(&mut remotes)
-                };
+                // A reply without a mailbox is no match there (RFC 7377
+                // §2 lets the server leave those out); only a refusal is
+                // searched again.
+                let (found, searched) =
+                    match crate::sync::transport::multisearch(&mut c.session, &wire, &criteria, utf8) {
+                        Ok(found) => (found, std::mem::take(&mut remotes)),
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
                 for f in found {
                     let Some((remote, folder)) = searched
                         .iter()

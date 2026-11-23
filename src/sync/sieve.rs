@@ -31,14 +31,27 @@ pub enum Field {
     Recipients,
     /// The List-Id header: mail from a mailing list.
     List,
+    /// The message's text (Sieve `body`, RFC 5173).
+    Body,
+    /// The message's size in kilobytes, over the value (Sieve `size`).
+    LargerThan,
+    /// A header named in the rule's `header` (RFC 5228 §5.7).
+    Header,
+    /// The address mail was delivered to (Sieve `envelope "to"`), which
+    /// for mail sent as Bcc or by a list differs from To.
+    DeliveredTo,
 }
 impl Field {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 9] = [
         Self::From,
         Self::To,
         Self::Recipients,
         Self::Subject,
         Self::List,
+        Self::Body,
+        Self::LargerThan,
+        Self::Header,
+        Self::DeliveredTo,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -47,6 +60,49 @@ impl Field {
             Self::Recipients => "To or Cc",
             Self::Subject => "Subject",
             Self::List => "Mailing list",
+            Self::Body => "Text",
+            Self::LargerThan => "Larger than (KB)",
+            Self::Header => "Header",
+            Self::DeliveredTo => "Delivered to",
+        }
+    }
+    /// The Sieve extension it needs, if any.
+    pub fn needs(self) -> Option<&'static str> {
+        match self {
+            Self::Body => Some("body"),
+            Self::DeliveredTo => Some("envelope"),
+            _ => None,
+        }
+    }
+}
+/// How a rule's value is compared (RFC 5228 §2.7.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Match {
+    #[default]
+    Contains,
+    Is,
+    /// With `*` and `?` wildcards.
+    Matches,
+    /// A regular expression (the `regex` extension).
+    Regex,
+}
+impl Match {
+    pub const ALL: [Self; 4] = [Self::Contains, Self::Is, Self::Matches, Self::Regex];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Contains => "contains",
+            Self::Is => "is",
+            Self::Matches => "matches",
+            Self::Regex => "matches the pattern",
+        }
+    }
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Contains => ":contains",
+            Self::Is => ":is",
+            Self::Matches => ":matches",
+            Self::Regex => ":regex",
         }
     }
 }
@@ -62,6 +118,13 @@ pub enum Act {
     Star,
     /// Thrown away; it never arrives.
     Discard,
+    /// Sent on to another address (`redirect`; with `copy`, a copy goes
+    /// and the message is kept too).
+    Redirect(String),
+    /// Refused, with this reason sent back (`reject`, RFC 5429).
+    Reject(String),
+    /// Given a label (an IMAP keyword, imap4flags).
+    Label(String),
 }
 /// One filter: mail whose `field` contains `value` gets `act`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +132,18 @@ pub struct Rule {
     pub field: Field,
     pub value: String,
     pub act: Act,
+    /// How `value` is compared.
+    #[serde(default)]
+    pub matching: Match,
+    /// The rule applies when the test doesn't match (`not`).
+    #[serde(default)]
+    pub negate: bool,
+    /// For `Field::Header`: the header's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header: String,
+    /// With `Act::Redirect`, the message is also kept (`:copy`, RFC 3894).
+    #[serde(default)]
+    pub keep_copy: bool,
     /// No later rule applies to mail this one matched.
     #[serde(default)]
     pub stop: bool,
@@ -111,6 +186,10 @@ pub struct State {
     /// The server has no Sieve, only an automatic reply while away (JMAP's
     /// VacationResponse): no rules, and no choice of how often it answers.
     pub vacation_only: bool,
+    /// The other app's active script as read (see `sieve_parse`): its rules
+    /// Picacho can take over, and how many parts it couldn't read as
+    /// rules. `None` where there's no such script or it can't be read.
+    pub other_rules: Option<super::sieve_parse::Read>,
 }
 impl State {
     pub fn has(&self, extension: &str) -> bool {
@@ -118,6 +197,17 @@ impl State {
             .iter()
             .any(|e| e.eq_ignore_ascii_case(extension))
     }
+}
+
+/// A string in a ManageSieve command (a script's name): quoted, which
+/// RFC 5804 allows no line break or NUL in. One with them (a name a server
+/// listed) is refused, so it can't end the command and start another.
+fn protocol_string(text: &str) -> Result<String> {
+    anyhow::ensure!(
+        !text.contains(['\r', '\n', '\0']),
+        "The server named a filter script with a line break in it."
+    );
+    Ok(format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")))
 }
 
 /// A Sieve string, quoted.
@@ -143,7 +233,9 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
             "This server can't run another script from Picacho's."
         );
         require.push("include");
-        body.push_str(&format!("include :personal {};\r\n", string(other)));
+        // :optional (RFC 6609 §3.2): the other script being deleted must
+        // not make every message fail delivery.
+        body.push_str(&format!("include :personal :optional {};\r\n", string(other)));
     }
     let vacation = &filters.vacation;
     if vacation.on {
@@ -174,7 +266,9 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         if !tests.is_empty() {
             require.extend(["date", "relational"]);
         }
-        let mut reply = format!(":days {}", vacation.days.clamp(1, 30));
+        // A fixed :handle (RFC 5230 §4.2): editing the reply's text
+        // doesn't make it go again to everyone already answered.
+        let mut reply = format!(":days {} :handle \"picacho-vacation\"", vacation.days.clamp(1, 30));
         if !vacation.subject.trim().is_empty() {
             reply.push_str(&format!(" :subject {}", string(vacation.subject.trim())));
         }
@@ -198,20 +292,76 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
             !value.is_empty(),
             "Each filter needs something to look for."
         );
+        let m = rule.matching.tag();
+        if rule.matching == Match::Regex {
+            ensure!(has("regex"), "This server can't match patterns in filters.");
+            require.push("regex");
+        }
+        if let Some(ext) = rule.field.needs() {
+            ensure!(has(ext), "This server can't filter on {} ({ext}).", rule.field.label());
+            require.push(ext);
+        }
         let test = match rule.field {
-            Field::From => format!("address :contains \"from\" {}", string(value)),
-            Field::To => format!("address :contains \"to\" {}", string(value)),
-            Field::Recipients => format!("address :contains [\"to\", \"cc\"] {}", string(value)),
-            Field::Subject => format!("header :contains \"subject\" {}", string(value)),
-            Field::List => format!("header :contains \"list-id\" {}", string(value)),
+            Field::From => format!("address {m} \"from\" {}", string(value)),
+            Field::To => format!("address {m} \"to\" {}", string(value)),
+            Field::Recipients => format!("address {m} [\"to\", \"cc\"] {}", string(value)),
+            Field::Subject => format!("header {m} \"subject\" {}", string(value)),
+            Field::List => format!("header {m} \"list-id\" {}", string(value)),
+            Field::Body => format!("body :text {m} {}", string(value)),
+            Field::LargerThan => {
+                let kb: u64 = value
+                    .trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
+                    .parse()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .context("Enter a size in kilobytes, such as 5000.")?;
+                format!("size :over {kb}K")
+            }
+            Field::Header => {
+                let name = rule.header.trim();
+                ensure!(
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':'),
+                    "Name the header the filter looks at."
+                );
+                format!("header {m} {} {}", string(name), string(value))
+            }
+            Field::DeliveredTo => format!("envelope {m} \"to\" {}", string(value)),
         };
+        let test = if rule.negate { format!("not {test}") } else { test };
         let action = match &rule.act {
             Act::Inbox => "keep;".to_owned(),
             Act::Folder(name) => {
                 ensure!(has("fileinto"), "This server can't file mail into folders.");
                 require.push("fileinto");
-                // Sieve names folders in UTF-8.
-                format!("fileinto {};", string(&super::transport::decode_name(name)))
+                // A standard folder by its role (`\\Trash`): the server
+                // finds it by its special use (RFC 8579), whatever it's
+                // called; its usual name if the server can't.
+                if let Some(role) = name.strip_prefix('\\') {
+                    let plain = match role {
+                        "Junk" => "Junk",
+                        "Trash" => "Trash",
+                        "Archive" => "Archive",
+                        "Sent" => "Sent",
+                        other => bail!("“{other}” isn't a folder filters can use."),
+                    };
+                    if has("special-use") {
+                        require.push("special-use");
+                        format!("fileinto :specialuse {} {};", string(name), string(plain))
+                    } else {
+                        format!("fileinto {};", string(plain))
+                    }
+                } else {
+                    // `mailbox`'s :create (RFC 5490): a folder deleted
+                    // since isn't a reason to lose the mail.
+                    let create = if has("mailbox") {
+                        require.push("mailbox");
+                        ":create "
+                    } else {
+                        ""
+                    };
+                    // Sieve names folders in UTF-8.
+                    format!("fileinto {create}{};", string(&super::transport::decode_name(name)))
+                }
             }
             Act::MarkRead => {
                 ensure!(
@@ -230,6 +380,31 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
                 "addflag \"\\\\Flagged\";".to_owned()
             }
             Act::Discard => "discard;".to_owned(),
+            Act::Redirect(to) => {
+                let to = to.trim();
+                ensure!(
+                    to.contains('@') && !to.contains(|c: char| c.is_whitespace() || c == ','),
+                    "Enter the one address mail is sent on to."
+                );
+                if rule.keep_copy {
+                    ensure!(has("copy"), "This server can't send a copy and keep the message too.");
+                    require.push("copy");
+                    format!("redirect :copy {};", string(to))
+                } else {
+                    format!("redirect {};", string(to))
+                }
+            }
+            Act::Reject(reason) => {
+                ensure!(has("reject"), "This server can't refuse mail from a filter.");
+                require.push("reject");
+                format!("reject {};", string(reason.trim()))
+            }
+            Act::Label(label) => {
+                ensure!(has("imap4flags"), "This server can't label mail from a filter.");
+                require.push("imap4flags");
+                let keyword = super::transport::keyword(label)?;
+                format!("addflag {};", string(&keyword))
+            }
         };
         body.push_str(&format!(
             "if {test} {{\r\n  {action}{}\r\n}}\r\n",
@@ -360,8 +535,10 @@ impl<S: Read + Write> Session<S> {
         stream.flush()?;
         Ok(())
     }
-    /// Lines until OK/NO/BYE; the data lines before it (literals read in).
-    fn response(&mut self) -> Result<(Vec<String>, Reply)> {
+    /// Lines until OK/NO/BYE; the data lines before it, each as its words
+    /// (quoted strings, atoms and literals alike, so a literal stays on
+    /// its own line: `"SIEVE" {n}` is one line of two words).
+    fn response(&mut self) -> Result<(Vec<Vec<String>>, Reply)> {
         let mut data = Vec::new();
         loop {
             let line = self.line()?;
@@ -379,22 +556,26 @@ impl<S: Read + Write> Session<S> {
                     return Ok((data, Reply::new(ok, text)));
                 }
             }
-            if let Some(len) = literal_len(&line) {
-                data.push(self.literal(len)?);
-                let rest = self.line()?;
-                if !rest.trim().is_empty() {
-                    data.push(rest);
-                }
-            } else {
-                data.push(line);
+            // A line may hold several literals: each `{n}` ends a piece.
+            let mut words_of_line = Vec::new();
+            let mut piece = line;
+            while let Some(len) = literal_len(&piece) {
+                let head = piece[..piece.rfind('{').unwrap_or(0)].to_owned();
+                words_of_line.extend(words(&head));
+                words_of_line.push(self.literal(len)?);
+                piece = self.line()?;
+            }
+            words_of_line.extend(words(&piece));
+            if !words_of_line.is_empty() {
+                data.push(words_of_line);
             }
         }
     }
-    fn command(&mut self, line: &str) -> Result<(Vec<String>, Reply)> {
+    fn command(&mut self, line: &str) -> Result<(Vec<Vec<String>>, Reply)> {
         self.send(&format!("{line}\r\n"))?;
         self.response()
     }
-    fn expect(&mut self, line: &str, what: &str) -> Result<Vec<String>> {
+    fn expect(&mut self, line: &str, what: &str) -> Result<Vec<Vec<String>>> {
         let (data, reply) = self.command(line)?;
         ensure!(
             reply.ok,
@@ -402,6 +583,15 @@ impl<S: Read + Write> Session<S> {
             reply.explain()
         );
         Ok(data)
+    }
+}
+/// A base64 SASL payload as a ManageSieve string: quoted where short, a
+/// literal past the 1024 octets RFC 5804 §4 allows a quoted string.
+fn sasl_string(b64: &str) -> String {
+    if b64.len() <= 1000 {
+        format!("\"{b64}\"")
+    } else {
+        format!("{{{}+}}\r\n{b64}", b64.len())
     }
 }
 /// `{12}` or `{12+}` at the end of a line: a literal of that many bytes.
@@ -451,10 +641,9 @@ struct Capabilities {
     /// NOOP are there (servers from before it lack them).
     rfc5804: bool,
 }
-fn capabilities(lines: &[String]) -> Capabilities {
+fn capabilities(lines: &[Vec<String>]) -> Capabilities {
     let mut caps = Capabilities::default();
-    for line in lines {
-        let w = words(line);
+    for w in lines {
         match (w.first().map(|s| s.to_ascii_uppercase()), w.get(1)) {
             (Some(k), Some(v)) if k == "SASL" => {
                 caps.sasl = v.split_whitespace().map(str::to_ascii_uppercase).collect()
@@ -540,19 +729,36 @@ fn open(
     );
     let mut line = format!("AUTHENTICATE \"{}\"", mechanism.name());
     if let Some(first) = exchange.initial() {
-        line.push_str(&format!(" \"{}\"", sasl::encode(&first)));
+        line.push(' ');
+        line.push_str(&sasl_string(&sasl::encode(&first)));
     }
     session.send(&format!("{line}\r\n"))?;
     loop {
         let reply = session.line()?;
         let upper = reply.to_ascii_uppercase();
         if upper.starts_with("OK") {
-            // SCRAM's signature may come with the OK: `OK (SASL "…")`.
-            let data = reply
-                .split_once("SASL \"")
-                .and_then(|(_, rest)| rest.split_once('"'))
-                .map(|(b64, _)| sasl::decode(b64))
-                .transpose()?;
+            // SCRAM's signature may come with the OK: `OK (SASL "…")`,
+            // the string perhaps a literal (`OK (SASL {n}`).
+            let data = match upper.find("(SASL ") {
+                Some(at) => {
+                    let rest = &reply[at + 6..];
+                    let b64 = match literal_len(rest) {
+                        Some(len) => {
+                            let text = session.literal(len)?;
+                            session.line()?;
+                            text
+                        }
+                        None => words(rest)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default()
+                            .trim_end_matches(')')
+                            .to_owned(),
+                    };
+                    Some(sasl::decode(&b64)?)
+                }
+                None => None,
+            };
             exchange
                 .finish(data.as_deref())
                 .context(crate::manage::status::AccessFailure::Authentication)?;
@@ -588,27 +794,31 @@ fn open(
                 return Err(e.context(crate::manage::status::AccessFailure::Authentication));
             }
         };
-        session.send(&format!("\"{}\"\r\n", sasl::encode(&answer)))?;
+        session.send(&format!("{}\r\n", sasl_string(&sasl::encode(&answer))))?;
     }
-    // RFC 5804's capabilities after AUTHENTICATE (and SCRAM) are
-    // unchanged here; a NOOP confirms the session works before scripts
-    // are touched, where the server has it.
+    // The capabilities may differ once signed in (RFC 5804 §2.1: a
+    // user's own SIEVE extensions); asked again where the server has
+    // CAPABILITY as a command (RFC 5804 servers). This also confirms the
+    // session works before scripts are touched.
+    let mut caps = caps;
     if caps.rfc5804 {
-        let (_, reply) = session.command("NOOP")?;
+        let (lines, reply) = session.command("CAPABILITY")?;
         ensure!(reply.ok, "The filter server isn't answering: {}", reply.explain());
+        let after = capabilities(&lines);
+        if !after.sieve.is_empty() {
+            caps.sieve = after.sieve;
+        }
     }
     Ok((
         session,
         Opened {
             extensions: caps.sieve,
-            rfc5804: caps.rfc5804,
         },
     ))
 }
 /// What `open` learned of the server.
 struct Opened {
     extensions: Vec<String>,
-    rfc5804: bool,
 }
 /// A refusal that is a REFERRAL: where the account's filters are.
 fn referral(reply: &Reply, endpoint: &Endpoint) -> Option<anyhow::Error> {
@@ -651,8 +861,7 @@ fn scripts(session: &mut Secured) -> Result<Vec<(String, bool)>> {
     let lines = session.expect("LISTSCRIPTS", "list filter scripts")?;
     Ok(lines
         .iter()
-        .filter_map(|l| {
-            let w = words(l);
+        .filter_map(|w| {
             let name = w.first()?.clone();
             let active = w.get(1).is_some_and(|a| a.eq_ignore_ascii_case("ACTIVE"));
             Some((name, active))
@@ -671,12 +880,22 @@ pub fn load(endpoint: &Endpoint, secret: &str, tls: &native_tls::TlsConnector) -
             &format!("GETSCRIPT {}", string(SCRIPT)),
             "read Picacho's filters",
         )?;
-        data.into_iter().next()
+        data.into_iter().next().and_then(|w| w.into_iter().next())
     } else {
         None
     };
+    // The other app's active script, to offer its rules.
+    let other = listed
+        .iter()
+        .find(|(n, a)| *a && n != SCRIPT)
+        .and_then(|(name, _)| {
+            let (data, reply) = session.command(&format!("GETSCRIPT {}", protocol_string(name).ok()?)).ok()?;
+            reply.ok.then(|| data.into_iter().next().and_then(|w| w.into_iter().next())).flatten()
+        });
     let _ = session.command("LOGOUT");
-    Ok(loaded(extensions, &listed, own.as_deref()))
+    let mut state = loaded(extensions, &listed, own.as_deref());
+    state.other_rules = other.and_then(|text| super::sieve_parse::read(&text).ok());
+    Ok(state)
 }
 
 /// What a filter server has, from its scripts (name, whether active) and
@@ -728,8 +947,15 @@ pub fn save(
             // Back to whichever script it included, else none.
             let next = filters.include.clone().unwrap_or_default();
             session.expect(
-                &format!("SETACTIVE {}", string(&next)),
+                &format!("SETACTIVE {}", protocol_string(&next)?),
                 "turn the filters off",
+            )?;
+        }
+        // Then removed, so the rules don't come back on the next load.
+        if listed.iter().any(|(n, _)| n == SCRIPT) {
+            session.expect(
+                &format!("DELETESCRIPT {}", string(SCRIPT)),
+                "remove the filters",
             )?;
         }
     } else {
@@ -751,25 +977,10 @@ pub fn save(
         if !check.ok && !check.text.to_ascii_lowercase().contains("unknown command") {
             bail!("The filter server rejected the filters: {}", check.explain());
         }
-        let exists = listed.iter().any(|(n, _)| n == SCRIPT);
-        let active = listed.iter().any(|(n, a)| n == SCRIPT && *a);
-        if opened.rfc5804 && exists && !active {
-            // An inactive script is replaced whole: written under another
-            // name, then renamed over it (RENAMESCRIPT), so a failure never
-            // leaves half of one. (The active one can't be deleted; PUTSCRIPT
-            // replaces it in one step anyway.)
-            let staging = format!("{SCRIPT}-new");
-            let _ = session.command(&format!("DELETESCRIPT {}", string(&staging)));
-            session.expect(
-                &format!("PUTSCRIPT {} {literal}", string(&staging)),
-                "save the filters",
-            )?;
-            session.expect(&format!("DELETESCRIPT {}", string(SCRIPT)), "replace the filters")?;
-            session.expect(
-                &format!("RENAMESCRIPT {} {}", string(&staging), string(SCRIPT)),
-                "replace the filters",
-            )?;
-        } else {
+        // PUTSCRIPT replaces a script in one step (RFC 5804 §2.6), active
+        // or not: no second copy that a quota (QUOTA/MAXSCRIPTS) could
+        // refuse.
+        {
             let (_, put) = session.command(&format!("PUTSCRIPT {} {literal}", string(SCRIPT)))?;
             ensure!(put.ok, "The filter server refused to save the filters: {}", put.explain());
             // The script was saved, with warnings (RFC 5804 §1.3): worth
@@ -795,12 +1006,22 @@ pub fn save(
         other_active: other,
         active: !empty,
         vacation_only: false,
+        ..Default::default()
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A script name with a line break can't end a command and start another.
+    #[test]
+    fn protocol_strings_refuse_line_breaks() {
+        assert_eq!(protocol_string("a\"b").unwrap(), "\"a\\\"b\"");
+        for bad in ["x\r\nLOGOUT", "x\nLOGOUT", "x\rLOGOUT", "x\0"] {
+            assert!(protocol_string(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn replies_carry_their_codes() {
@@ -833,12 +1054,14 @@ mod tests {
                     value: "news@shop.example".into(),
                     act: Act::Folder("Caf&AOk-".into()),
                     stop: true,
+                    ..Default::default()
                 },
                 Rule {
                     field: Field::Subject,
                     value: "say \"hi\"".into(),
                     act: Act::MarkRead,
                     stop: false,
+                    ..Default::default()
                 },
             ],
             vacation: Vacation {

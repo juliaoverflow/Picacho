@@ -287,11 +287,18 @@ impl Model {
         let result = self.place(&partial, &self.path(store));
         let _ = std::fs::remove_file(&partial);
         result?;
-        // What was installed has to load.
-        match self.kind {
+        // What was installed has to load. One that doesn't is removed:
+        // left, it counted as installed (`installed` checks the file is
+        // there), and failed again each time it was used.
+        let loaded = match self.kind {
             Kind::Scorer => self.load(store).map(drop),
             Kind::Tagger => self.load_tagger(store).map(drop),
+        };
+        if loaded.is_err() {
+            let path = self.path(store);
+            let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
         }
+        loaded
     }
 
     /// The unpublished model's file from `local_dir`.

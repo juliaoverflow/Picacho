@@ -54,9 +54,17 @@ public class GpuiInputActivity extends NativeActivity {
                 case 3: type = InputType.TYPE_CLASS_NUMBER; break;
                 case 4: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI; break;
                 case 5: type = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL; break;
+                // A password, PIN or passphrase: the keyboard shows no
+                // suggestions and learns nothing of it (nor syncs it).
+                case 6: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS; break;
             }
             input.setInputType(type);
-            input.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+            int ime = EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+            if (keyboardType == 6) {
+                ime |= EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
+            }
+            input.setImeOptions(ime);
             input.requestFocus();
             InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
             imm.restartInput(input);

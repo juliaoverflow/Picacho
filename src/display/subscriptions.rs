@@ -522,7 +522,17 @@ impl MailApp {
                                 this.notice(format!("Unsubscribed from {who}"), false, cx)
                             }
                             Outcome::Open(url) => {
-                                this.open_external(&url, cx);
+                                // The sender's page: only a web link, as an
+                                // email's links are (not cleaned of what
+                                // looks like tracking, which may be the
+                                // unsubscribe token).
+                                match crate::display::html::openable_url(&url) {
+                                    Some(url) => this.open_external(url.as_str(), cx),
+                                    None => {
+                                        this.notice("Picacho only opens web and email links.", true, cx);
+                                        return;
+                                    }
+                                }
                                 this.notice(
                                     format!("Finish unsubscribing from {who} on the page that opened"),
                                     false,

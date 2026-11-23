@@ -245,6 +245,9 @@ struct Pending {
     stage: Stage,
 }
 
+/// The saved text of the calendar's events, and the events read from it.
+type CalendarCache = (Arc<str>, Arc<Vec<crate::sync::caldav::Stored>>);
+
 pub struct Backend {
     pub store: Arc<Store>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -266,6 +269,10 @@ pub struct Backend {
     certificates: Mutex<Option<Arc<crate::manage::smime::Certificates>>>,
     /// What S/MIME found in messages read with it, by id. Memory only.
     smime_verdicts: Mutex<HashMap<String, crate::manage::smime::Verdict>>,
+    /// The calendar's events as last read, with the saved text they were
+    /// read from: the calendar and invitations ask for them as they draw,
+    /// and every event was parsed again for each.
+    calendar_cache: Mutex<Option<CalendarCache>>,
     /// Signed-in IMAP connections by account; see `connection.rs`.
     connections: Mutex<HashMap<String, Connection>>,
     limits: Mutex<Limits>,
@@ -348,6 +355,7 @@ impl Backend {
             verdicts: Mutex::new(HashMap::new()),
             certificates: Mutex::new(None),
             smime_verdicts: Mutex::new(HashMap::new()),
+            calendar_cache: Mutex::new(None),
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
             layouts: Mutex::new(HashMap::new()),
@@ -686,15 +694,23 @@ impl Backend {
             )
         };
         let who = owner.as_ref().unwrap_or(a);
-        // One renewal at a time: an account and those sharing its sign-in
-        // renew the same token.
-        static RENEWING: Mutex<()> = Mutex::new(());
-        let _renewing = RENEWING.lock().unwrap_or_else(|e| e.into_inner());
         if who.kerberos {
             // The ticket is the system's; nothing is kept in the keychain
             // (an entry from before Kerberos was chosen is used if present).
             return Ok(self.saved_credentials(&who.id).unwrap_or_default());
         }
+        // One renewal at a time per sign-in: an account and those sharing it
+        // renew the same token. Per sign-in, not one for all: a slow token
+        // server held every account's sign-in, each waiting for its turn.
+        static RENEWING: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+        let renewing = RENEWING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .entry(who.id.clone())
+            .or_default()
+            .clone();
+        let _renewing = renewing.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = self.saved_credentials(&who.id)?;
         if crate::sync::oauth::refresh(who, &mut s)? {
             self.save_credentials(&who.id, &s)?;
@@ -853,6 +869,19 @@ impl Backend {
         );
         let lock = self.account_lock(id);
         let _operation = lock.lock().unwrap();
+        // Its sign-in given up at the provider, so the token kept by it is
+        // no use to anyone (RFC 7009); best effort, in the background.
+        if let Some(a) = self.store.accounts().ok().and_then(|all| all.into_iter().find(|a| a.id == id))
+            && a.oauth
+            && a.credentials_of.is_empty()
+            && let Ok(secret) = self.credentials(&a)
+            && let Some(endpoint) = crate::sync::oauth::provider_revocation(a.provider)
+        {
+            let client_id = a.client_id.clone();
+            std::thread::spawn(move || {
+                crate::sync::oauth::revoke(endpoint, &client_id, &secret.refresh_token)
+            });
+        }
         self.disconnect(id);
         self.stop_watching(id);
         if let Some(a) = self
@@ -877,15 +906,32 @@ impl Backend {
             .map(|a| a.identities)
             .unwrap_or_default();
         let _ = std::fs::remove_dir_all(self.sent_queue(id));
+        // Its drafts' own files (attachments, perhaps large) and picture go
+        // with their rows; nothing else refers to them.
+        let drafts = self.store.drafts(id).unwrap_or_default();
+        let avatar = self.avatar(id);
         self.store.remove_account(id)?;
+        for d in &drafts {
+            let _ = std::fs::remove_dir_all(self.draft_files(&d.id));
+        }
+        if let Some(avatar) = avatar {
+            let _ = std::fs::remove_file(avatar);
+        }
         for i in &identities {
             self.forget_identity_secret(i);
         }
         self.credentials.lock().unwrap().remove(id);
         self.mail_keys.lock().unwrap().remove(id);
         self.readable.lock().unwrap().retain(|_, m| m.account != id);
+        // Message ids begin with their account's.
+        let mine = format!("{id}:");
+        self.readable_order.lock().unwrap().retain(|m| !m.starts_with(&mine));
+        self.verdicts.lock().unwrap().retain(|m, _| !m.starts_with(&mine));
+        self.smime_verdicts.lock().unwrap().retain(|m, _| !m.starts_with(&mine));
         // A missing/inaccessible keychain must not prevent removing local mail.
         let _ = store::secret_entry(id).and_then(|e| e.delete_credential().map_err(Into::into));
+        // The account's mail, perhaps most of the cache: its space given back.
+        let _ = self.store.give_back_space();
         Ok(())
     }
     /// Replaces credentials while preserving the account, cache, and preferences.
@@ -1012,6 +1058,8 @@ impl Backend {
         let readable = self.readable.lock().unwrap();
         for m in messages.iter_mut().filter(|m| m.body.is_none()) {
             if let Some(r) = readable.get(&m.id) {
+                m.subject = r.subject.clone();
+                m.reply_to = r.reply_to.clone();
                 m.snippet = r.snippet.clone();
                 m.set_attachments(r.attachments().to_vec());
                 m.has_attachments = r.has_attachments;
@@ -1027,6 +1075,8 @@ impl Backend {
                 m.body = r.body.clone();
                 m.html = r.html.clone();
                 m.inline = r.inline.clone();
+                m.subject = r.subject.clone();
+                m.reply_to = r.reply_to.clone();
                 m.snippet = r.snippet.clone();
                 m.set_attachments(r.attachments().to_vec());
                 m.has_attachments = r.has_attachments;
@@ -1108,9 +1158,25 @@ impl Backend {
     /// Keeps the key an Autocrypt header in a received message gives for
     /// its sender, if no key for them was imported by hand.
     fn learn_autocrypt(&self, raw: &[u8]) {
-        let Some((email, key)) = crate::sync::keys::autocrypt(raw) else {
+        let Some(header) = crate::sync::keys::autocrypt_full(raw) else {
             return;
         };
+        let (email, key) = (header.addr.clone(), header.key.clone());
+        // Peer state (Autocrypt 1.1 §2.3): an older message than the one
+        // a key was last taken from doesn't replace it.
+        let seen_key = format!("autocrypt_seen:{email}");
+        let last: i64 = self
+            .store
+            .preference(&seen_key)
+            .and_then(|s| s.split(' ').next()?.parse().ok())
+            .unwrap_or(0);
+        if header.date > 0 && header.date < last {
+            return;
+        }
+        let _ = self.store.set_preference(
+            &seen_key,
+            &format!("{} {}", header.date.max(last), if header.mutual { "mutual" } else { "nopreference" }),
+        );
         let ring = self.keyring();
         if ring.key_for(&email).is_some_and(|k| {
             use pgp::ser::Serialize as _;
@@ -2182,6 +2248,9 @@ impl Backend {
             )?;
         }
         let mut messages = Vec::new();
+        // Sizes first (LIST), so a message too large to download is listed
+        // by its headers instead of failing the whole sync before QUIT.
+        let sizes = pop.list().unwrap_or_default();
         for (number, uid) in ids
             .iter()
             .rev()
@@ -2190,9 +2259,24 @@ impl Backend {
         {
             let id = format!("{}:pop:{uid}", a.id);
             let cached = self.store.message(&id)?;
-            let complete = cached.is_some() && self.store.raw(&id)?.is_some();
+            let complete = cached.is_some() && self.store.has_raw(&id)?;
+            let oversized = sizes.get(number).is_some_and(|n| *n > MAX_MESSAGE as u64);
             let mail = if let Some(m) = cached.as_ref().filter(|_| complete) {
                 m.clone()
+            } else if oversized {
+                if let Some(m) = cached {
+                    m
+                } else {
+                    let Some(top) = pop.top(*number, 256 * 1024)? else {
+                        continue;
+                    };
+                    let mut m = parse_message(&top, a, &id, Folder::Inbox, "INBOX", *number)?;
+                    m.body = None;
+                    m.html = None;
+                    m.snippet.clear();
+                    m.size = sizes.get(number).copied().unwrap_or(0).min(u32::MAX as u64) as u32;
+                    m
+                }
             } else {
                 pop.command(&format!("RETR {number}"))?;
                 let raw = pop.multiline(MAX_MESSAGE)?;
@@ -2401,7 +2485,9 @@ impl Backend {
     /// Encrypted mail stays ciphertext on disk.
     fn keep_source(&self, a: &Account, m: &Mail, raw: &[u8]) -> Result<()> {
         self.store.save_raw(&m.id, raw)?;
-        if crate::manage::crypto::encrypted_part(raw).is_some() {
+        // Any kind (S/MIME and inline PGP too, whose ciphertext was read
+        // for a preview and an attachment list).
+        if crate::manage::crypto::is_encrypted(raw) {
             return Ok(());
         }
         if let Ok(mut parsed) = parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid) {
@@ -2689,6 +2775,29 @@ impl Backend {
     fn parse_read(&self, a: &Account, m: &Mail, raw: &[u8]) -> Result<(Mail, Mail)> {
         self.learn_autocrypt(raw);
         let (protection, plain) = self.plaintext_of(a, Some(&m.id), raw)?;
+        // Keys the sender passed along inside the encryption for the
+        // other recipients (Autocrypt-Gossip), where it was decrypted.
+        if plain.len() != raw.len() || plain != raw {
+            let recipients: Vec<String> = crate::sync::smtp::recipients(&format!("{}, {}", m.to, m.cc()))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, a)| a)
+                .collect();
+            let gossip = crate::sync::keys::autocrypt_gossip(&plain, &recipients);
+            if !gossip.is_empty() {
+                let mut next = crate::manage::openpgp::Keyring::clone(&self.keyring());
+                let mut changed = false;
+                for (email, key) in gossip {
+                    // Gossip never replaces a key already kept for someone.
+                    if next.key_for(&email).is_none() {
+                        changed |= next.add_found(&email, &key).unwrap_or(false);
+                    }
+                }
+                if changed {
+                    let _ = self.set_keyring(next);
+                }
+            }
+        }
         let mut next = parse_message(&plain, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         next.unread = m.unread;
         next.starred = m.starred;
@@ -2704,6 +2813,16 @@ impl Backend {
             kept.html = None;
             kept.snippet.clear();
             kept.set_attachments(Vec::new());
+            // The headers the encryption protected (a hidden subject) as
+            // the envelope has them, which the server sees anyway: the
+            // decrypted ones were kept on disk, and snoozing sent the
+            // subject to the server in the clear. `with_readable` puts the
+            // decrypted ones back while the message is in memory.
+            if let Ok((outer, _)) = mailparse::parse_headers(raw) {
+                use mailparse::MailHeaderMap;
+                kept.subject = outer.get_first_value("Subject").unwrap_or_default();
+                kept.reply_to = outer.get_first_value("Reply-To").unwrap_or_default();
+            }
             self.keep_readable(next.clone());
             Ok((next, kept))
         } else {
@@ -2841,8 +2960,9 @@ impl Backend {
                     .run_command_and_check_ok(format!("RENAME {from} {to}")),
                 || format!("rename “{label}”"),
             )?;
-            for (_, new) in &moved {
+            for (old, new) in &moved {
                 subscribe(c, new)?;
+                let _ = c.session.unsubscribe(c.wire(old));
             }
             Ok(FolderChange {
                 folders: custom_folders(c.names(true)?),
@@ -2880,6 +3000,9 @@ impl Backend {
             let label = decode_name(name);
             let wire = c.wire(name);
             allowed(c.session.delete(&wire), || format!("delete “{label}”"))?;
+            // Its subscription goes too (RFC 3501 §6.3.4 leaves it): a
+            // folder of that name made later isn't subscribed unasked.
+            let _ = c.session.unsubscribe(&wire);
             Ok(custom_folders(c.names(true)?))
         })?;
         self.store.save_folders(&a.id, &folders)?;
@@ -3271,6 +3394,12 @@ impl Backend {
             if label.is_some() {
                 c.require_rights(&first.remote_folder, "w", "change labels")?;
             }
+            // RFC 4314 §2.1: \Seen needs `s`, \Flagged and others `w`.
+            match &change {
+                Change::Read(_) => c.require_rights(&first.remote_folder, "s", "mark messages read")?,
+                Change::Star(_) => c.require_rights(&first.remote_folder, "w", "star messages")?,
+                _ => {}
+            }
             // Moving mail into or out of Spam tells the server's spam
             // filter which it is ($Junk/$NotJunk, RFC 5788's registry), where
             // the mailbox keeps keywords. Out of Spam to Trash says nothing.
@@ -3463,12 +3592,9 @@ impl Backend {
             return self.mark_all_read_jmap(a, mailbox);
         }
         if mailbox.folder().is_virtual() {
-            let unread: Vec<Mail> = self
-                .store
-                .messages(&a.id, mailbox, usize::MAX >> 1)?
-                .into_iter()
-                .filter(|m| m.unread)
-                .collect();
+            // Only the unread ones, without bodies, asked of the cache: every
+            // message's text and HTML were read before to find them.
+            let unread = self.store.unread_summaries(&a.id, mailbox.clone())?;
             return self.change_many(a, &unread, Change::Read(true));
         }
         let lock = self.account_lock(&a.id);
@@ -3568,7 +3694,7 @@ impl Backend {
                         }
                         self.store.save_raw(&m.id, raw)?;
                         // Encrypted mail stays ciphertext on disk; it is read on open.
-                        if crate::manage::crypto::encrypted_part(raw).is_some() {
+                        if crate::manage::crypto::is_encrypted(raw) {
                             stored += 1;
                             continue;
                         }
@@ -4030,7 +4156,7 @@ impl Backend {
             };
             let (validity, uid) = crate::sync::transport::append_uid(&heard)
                 .context("The server didn't say where it filed the message.")?;
-            let url = c.submit_url(&a.incoming_host, a.login(), &wire, validity, uid);
+            let url = c.submit_url(&a.incoming_host, a.incoming_port, a.login(), &wire, validity, uid);
             Ok((sent, validity, uid, url))
         });
         let Ok((sent, validity, uid, url)) = filed else {
@@ -4082,15 +4208,19 @@ impl Backend {
             return None;
         }
         let source = self.store.raw(&m.id).ok()??;
-        // The draft attaches exactly that source.
+        // The draft attaches exactly that source; only a file of its size
+        // is read to compare.
         let attached = d.attachments.iter().any(|p| {
             p.extension().is_some_and(|e| e.eq_ignore_ascii_case("eml"))
+                && std::fs::metadata(p).is_ok_and(|m| m.len() == source.len() as u64)
                 && std::fs::read(p).is_ok_and(|bytes| bytes == source)
         });
         if !attached || source.len() < 64 {
             return None;
         }
-        let at = raw.windows(source.len()).position(|w| w == source.as_slice())?;
+        // A substring search, not a comparison at every offset (slow on
+        // repetitive mail).
+        let at = memchr::memmem::find(raw, &source)?;
         Some((m, at))
     }
     /// Where copies for Sent that couldn't be saved yet wait, per account.
@@ -4116,10 +4246,30 @@ impl Backend {
             .map_or(0, |d| d.as_nanos());
         let name = format!("{nanos:020}-{}.eml", uuid::Uuid::new_v4());
         // Written whole, then named, so a half-written file is never filed.
+        // One that fails is removed: queues read only `.eml` files, so it
+        // would otherwise stay (see `tidy_files` for one a crash left).
         let partial = dir.join(format!("{name}.partial"));
-        std::fs::write(&partial, raw)?;
-        std::fs::rename(partial, dir.join(name))?;
-        Ok(())
+        let written = std::fs::write(&partial, raw).and_then(|()| std::fs::rename(&partial, dir.join(name)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        Ok(written?)
+    }
+    /// Files left behind by work that was interrupted: downloads not
+    /// resumed in a week, and copies for Sent whose writing a crash cut
+    /// short. Run when the app starts, off the interface's thread.
+    pub fn tidy_files(&self) {
+        self.remove_stale_partials();
+        let Ok(queues) = std::fs::read_dir(self.store.path.join("sent-copies")) else {
+            return;
+        };
+        for queue in queues.flatten() {
+            large::remove_older_than(
+                &queue.path(),
+                std::time::Duration::from_secs(86_400),
+                |p| p.extension().is_some_and(|x| x == "partial"),
+            );
+        }
     }
     /// How many copies for Sent are waiting to be saved for an account.
     #[cfg(test)]
@@ -4316,6 +4466,18 @@ impl Backend {
             Err(_) => path,
         }
     }
+    /// Saves bytes pasted into draft `id` (a copied picture) among its own
+    /// files, under `name` (made distinct), returning the file.
+    pub fn save_pasted(&self, id: &str, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf> {
+        let dir = self.draft_files(id);
+        std::fs::create_dir_all(&dir)?;
+        let mut used: HashSet<String> = std::fs::read_dir(&dir)
+            .map(|e| e.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect())
+            .unwrap_or_default();
+        let target = dir.join(distinct_name(name, &mut used));
+        std::fs::write(&target, bytes)?;
+        Ok(target)
+    }
     fn draft_removals(&self, account: &str) -> Vec<RemoteDraft> {
         self.store
             .preference(&format!("draft_removals:{account}"))
@@ -4330,11 +4492,7 @@ impl Backend {
     }
     /// Where the attachments of a draft found on the server are kept.
     fn draft_files(&self, id: &str) -> std::path::PathBuf {
-        let safe: String = id
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-            .collect();
-        self.store.path.join("draft-files").join(safe)
+        self.store.path.join("draft-files").join(draft_folder(id))
     }
     /// Keeps the account's drafts and its server's Drafts folder in step:
     /// drafts written here are uploaded (replacing their earlier copy),
@@ -4606,12 +4764,14 @@ impl Backend {
         Ok(d)
     }
     pub fn attachment(&self, a: &Account, m: &Mail, part: usize) -> Result<Vec<u8>> {
-        let lock = self.account_lock(&a.id);
-        let _operation = lock.lock().unwrap();
-        // A message too large to download whole: just this part.
+        // A message too large to download whole: just this part, from the
+        // server, under the account's lock. One downloaded already needs no
+        // lock: saving its attachment waited behind a whole sync.
         if let Some(attachment) = m.attachments().iter().find(|x| x.part == part && !x.section.is_empty())
-            && self.store.raw(&m.id)?.is_none()
+            && !self.store.has_raw(&m.id)?
         {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
             let attachment = attachment.clone();
             if a.provider == Provider::Proton {
                 return self.proton_attachment(a, m, &attachment.section);
@@ -4625,7 +4785,12 @@ impl Backend {
             });
         }
         let raw = self.store.raw(&m.id)?.context("Open this message first")?;
-        let (_, raw) = self.plaintext(a, &raw)?;
+        // Decrypting may read the account's keys: briefly, under its lock.
+        let (_, raw) = {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            self.plaintext(a, &raw)?
+        };
         let parsed = mailparse::parse_mail(&raw)?;
         let mut leaves = Vec::new();
         collect_leaves(&parsed, &mut leaves);
@@ -4635,6 +4800,28 @@ impl Backend {
             .get_body_raw()
             .map_err(Into::into)
     }
+}
+
+/// The folder name of draft `id`'s files: the id itself when it is safe as
+/// a name (Picacho's own, UUIDs), else a hash of it. Replacing what wasn't
+/// safe with `_` gave "a.b" and "a_b" one folder, and a draft's id can come
+/// from a server's copy, so one could share (or, discarded, delete)
+/// another's files.
+fn draft_folder(id: &str) -> String {
+    let safe = !id.is_empty()
+        && id.len() <= 100
+        && !id.starts_with("h-")
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if safe {
+        return id.to_owned();
+    }
+    use sha2::Digest as _;
+    let hash: String = sha2::Sha256::digest(id.as_bytes())
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("h-{hash}")
 }
 
 /// `name`, or "name (2).ext" and so on when one in `used` is the same
@@ -4891,6 +5078,11 @@ mod layout_tests {
         assert!(b.store.draft("shared-id")?.is_none());
         // A removal queued while a sync works through earlier ones stays.
         b.queue_draft_removal("other", remote(1))?;
+        // Draft ids that differ have folders that differ.
+        assert_eq!(draft_folder("6f1c-uuid"), "6f1c-uuid");
+        assert_ne!(draft_folder("a.b"), draft_folder("a_b"));
+        assert_ne!(draft_folder("h-x"), "h-x");
+        assert!(draft_folder("../../etc").starts_with("h-"));
         let seen = b.draft_removals("other");
         b.queue_draft_removal("other", remote(2))?;
         b.clear_draft_removals("other", &seen)?;

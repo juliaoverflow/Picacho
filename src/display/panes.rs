@@ -318,6 +318,12 @@ impl MailApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // The size first: a file chosen by mistake (a disk image)
+                    // isn't read into memory whole only to be refused.
+                    anyhow::ensure!(
+                        std::fs::metadata(&path)?.len() <= 20 << 20,
+                        "Choose a picture under 20 MB."
+                    );
                     let bytes = std::fs::read(&path)?;
                     anyhow::ensure!(bytes.len() <= 20 << 20, "Choose a picture under 20 MB.");
                     backend.set_avatar(&key, &bytes, "custom")

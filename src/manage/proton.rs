@@ -381,6 +381,13 @@ impl Backend {
         result
     }
     fn keep_proton_tokens(&self, a: &Account, session: &Session) {
+        // The newest tokens taken and saved in one step. The session is
+        // shared (the event watcher and syncs): two threads could take
+        // tokens in one order and save them in the other, leaving a used,
+        // single-use refresh token in the keychain to sign the account out
+        // at the next launch. Not the account lock, which callers may hold.
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         let Some(saved) = session.renewed() else {
             return;
         };

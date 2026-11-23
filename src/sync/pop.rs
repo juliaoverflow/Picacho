@@ -33,27 +33,37 @@ impl Rejected {
     /// sign-ins (`LOGIN-DELAY`), or a temporary fault (`SYS/TEMP`). The
     /// credentials aren't at fault.
     pub(crate) fn temporary(&self) -> bool {
-        matches!(
-            self.code.as_deref(),
-            Some("IN-USE" | "LOGIN-DELAY" | "SYS/TEMP")
-        )
+        self.is("IN-USE") || self.is("LOGIN-DELAY") || self.is("SYS/TEMP")
+    }
+    /// Whether the code is `code` or one below it in the hierarchy
+    /// (`SYS/TEMP/DISK` is SYS/TEMP; RFC 3206 §4 and RFC 2449 §8: clients
+    /// must treat unknown sub-codes as their parent).
+    fn is(&self, code: &str) -> bool {
+        self.code.as_deref().is_some_and(|c| {
+            c == code || c.strip_prefix(code).is_some_and(|rest| rest.starts_with('/'))
+        })
     }
     /// A sign-in refused for the credentials themselves: `AUTH`, or no
     /// code at all from a server without RESP-CODES/AUTH-RESP-CODE.
     fn credentials(&self) -> bool {
-        !self.temporary() && !matches!(self.code.as_deref(), Some("SYS/PERM"))
+        !self.temporary() && !self.is("SYS/PERM") && !self.is("UTF8")
     }
 }
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let what = match self.code.as_deref() {
-            Some("IN-USE") => "The POP3 mailbox is in use by another session",
+        let what = if self.is("IN-USE") {
+            "The POP3 mailbox is in use by another session"
+        } else if self.is("LOGIN-DELAY") {
             // Words in this one let the account pause as for a server limit.
-            Some("LOGIN-DELAY") => "The POP3 server limits how often this account signs in [THROTTLED]",
-            Some("SYS/TEMP") => "The POP3 server has a temporary problem [UNAVAILABLE]",
-            Some("SYS/PERM") => "The POP3 server has a lasting problem",
-            Some("UTF8") => "The POP3 server can't handle UTF-8 here",
-            _ => "POP3 server rejected the request",
+            "The POP3 server limits how often this account signs in [THROTTLED]"
+        } else if self.is("SYS/TEMP") {
+            "The POP3 server has a temporary problem [UNAVAILABLE]"
+        } else if self.is("SYS/PERM") {
+            "The POP3 server has a lasting problem"
+        } else if self.is("UTF8") {
+            "The POP3 server can't handle UTF-8 here"
+        } else {
+            "POP3 server rejected the request"
         };
         if self.text.is_empty() {
             f.write_str(what)
@@ -71,14 +81,32 @@ pub struct PopSession<T: Read + Write> {
     reader: BufReader<T>,
     /// What CAPA listed (uppercase), once asked.
     caps: Vec<String>,
+    /// A SASL initial response too long for the AUTH line, sent after the
+    /// server's first (empty) challenge.
+    pending_initial: Option<String>,
+    /// UTF8 was turned on (RFC 6856).
+    pub(crate) utf8_on: bool,
+    /// The greeting's `<…@…>` timestamp, where it has one: APOP's
+    /// challenge (RFC 1939 §7).
+    apop: Option<String>,
 }
 impl<T: Read + Write> PopSession<T> {
     pub(crate) fn new(stream: T) -> Result<Self> {
         let mut s = Self {
             reader: BufReader::new(stream),
             caps: Vec::new(),
+            pending_initial: None,
+            utf8_on: false,
+            apop: None,
         };
-        s.status()?;
+        let greeting = s.status()?;
+        // `+OK POP3 ready <1896.697170952@dbc.mtview.ca.us>`
+        s.apop = greeting
+            .rfind('<')
+            .zip(greeting.rfind('>'))
+            .filter(|(a, b)| a < b)
+            .map(|(a, b)| greeting[a..=b].to_owned())
+            .filter(|t| t.contains('@') && !t.contains(char::is_whitespace));
         Ok(s)
     }
     fn status(&mut self) -> Result<String> {
@@ -160,7 +188,19 @@ impl<T: Read + Write> PopSession<T> {
     }
     /// Signs in with AUTH and a SASL mechanism (RFC 5034).
     pub(crate) fn authenticate(&mut self, exchange: &mut sasl::Exchange) -> Result<()> {
-        let command = format!("AUTH {}", exchange.mechanism().name());
+        // The client's first message goes with the command (RFC 5034 §4),
+        // where the whole line stays within POP3's 255 octets; else it
+        // follows the server's empty challenge.
+        let mut command = format!("AUTH {}", exchange.mechanism().name());
+        if let Some(first) = exchange.initial() {
+            let encoded = if first.is_empty() { "=".to_owned() } else { sasl::encode(&first) };
+            if command.len() + 1 + encoded.len() + 2 <= 255 {
+                command = format!("{command} {encoded}");
+            } else {
+                // Too long: sent after the challenge instead.
+                self.pending_initial = Some(encoded);
+            }
+        }
         write!(self.reader.get_mut(), "{command}\r\n")?;
         self.reader.get_mut().flush()?;
         loop {
@@ -187,6 +227,11 @@ impl<T: Read + Write> PopSession<T> {
             let challenge = line
                 .strip_prefix('+')
                 .context("Invalid POP3 sign-in reply")?;
+            if let Some(first) = self.pending_initial.take() {
+                write!(self.reader.get_mut(), "{first}\r\n")?;
+                self.reader.get_mut().flush()?;
+                continue;
+            }
             let answer = match exchange.step(&sasl::decode(challenge)?) {
                 Ok(answer) => answer,
                 Err(e) => {
@@ -316,6 +361,9 @@ impl<T: Read + Write> PopSession<T> {
         Self {
             reader: BufReader::new(stream),
             caps: Vec::new(),
+            pending_initial: None,
+            utf8_on: false,
+            apop: None,
         }
     }
 }
@@ -370,6 +418,7 @@ pub(crate) fn pop_login(
             },
         ))
         .map_err(rejected)?;
+        s.capabilities_after_login();
         return Ok(s);
     }
     if a.kerberos {
@@ -389,6 +438,7 @@ pub(crate) fn pop_login(
             },
         ))
         .map_err(rejected)?;
+        s.capabilities_after_login();
         return Ok(s);
     }
     // SCRAM where offered; else USER/PASS (unless the server lists
@@ -415,7 +465,7 @@ pub(crate) fn pop_login(
             .map_err(rejected)?,
         None => {
             ensure!(
-                user_pass,
+                user_pass || s.apop.is_some(),
                 "{} offers no sign-in method Picacho supports.",
                 a.incoming_host
             );
@@ -424,16 +474,26 @@ pub(crate) fn pop_login(
             // `UTF8 USER`).
             if !(a.login().is_ascii() && password.is_ascii()) {
                 ensure!(
-                    s.caps.iter().any(|c| c == "UTF8 USER"),
+                    s.utf8_on && s.caps.iter().any(|c| c == "UTF8 USER"),
                     "{} can't take a sign-in name or password with non-ASCII characters (POP3 UTF8 USER).",
                     a.incoming_host
                 );
             }
-            for command in [format!("USER {}", a.login()), format!("PASS {password}")] {
-                s.command(&command).map_err(rejected)?;
+            // APOP where the server lists no USER but greeted with a
+            // timestamp: the password goes as a digest (RFC 1939 §7).
+            if !s.caps.is_empty() && !s.has("USER") && let Some(stamp) = s.apop.clone() {
+                use md5::Digest as _;
+                let digest = md5::Md5::digest(format!("{stamp}{password}").as_bytes());
+                let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                s.command(&format!("APOP {} {hex}", a.login())).map_err(rejected)?;
+            } else {
+                for command in [format!("USER {}", a.login()), format!("PASS {password}")] {
+                    s.command(&command).map_err(rejected)?;
+                }
             }
         }
     }
+    s.capabilities_after_login();
     Ok(s)
 }
 impl<T: Read + Write> PopSession<T> {
@@ -442,13 +502,37 @@ impl<T: Read + Write> PopSession<T> {
     /// signing in (AUTHORIZATION state). Best effort.
     fn utf8(&mut self) {
         if self.has("UTF8") {
-            let _ = self.command("UTF8");
+            // A refusal leaves the session in ASCII; it is noted so a
+            // non-ASCII sign-in isn't attempted as if UTF-8 were on.
+            self.utf8_on = self.command("UTF8").is_ok();
+        }
+    }
+    /// Asks CAPA again once signed in (RFC 2449 §5: the TRANSACTION
+    /// state's capabilities may differ: TOP, UIDL, EXPIRE, LOGIN-DELAY).
+    /// What was listed before stays where the server doesn't answer.
+    fn capabilities_after_login(&mut self) {
+        let before = std::mem::take(&mut self.caps);
+        match self.capabilities() {
+            Ok(caps) if !caps.is_empty() => {}
+            _ => self.caps = before,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn response_codes_match_their_hierarchy() {
+        let r = Rejected::parse("-ERR [SYS/TEMP/DISK] full");
+        assert!(r.temporary() && !r.credentials());
+        let r = Rejected::parse("-ERR [SYS/PERM/GONE] closed");
+        assert!(!r.temporary() && !r.credentials());
+        let r = Rejected::parse("-ERR [UTF8/USER] no");
+        assert!(!r.credentials());
+        let r = Rejected::parse("-ERR [SYS/TEMPORARY] odd");
+        assert!(!r.temporary());
+        assert!(Rejected::parse("-ERR [AUTH] wrong").credentials());
+    }
     use super::*;
     use std::io::Cursor;
     #[test]

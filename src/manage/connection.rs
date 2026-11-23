@@ -49,6 +49,8 @@ pub(super) struct Connection {
     pub(super) enabled: crate::sync::transport::Enabled,
     /// A copy of what the server sends, when asked (`heard`).
     tap: Option<crate::sync::stream::Tap>,
+    /// `[ALERT]`s the server sent that haven't been shown yet.
+    pub(super) alerts: Vec<String>,
 }
 impl Connection {
     pub(super) fn new(session: ImapSession) -> Self {
@@ -65,6 +67,7 @@ impl Connection {
             used: Instant::now(),
             enabled: Default::default(),
             tap: None,
+            alerts: Vec::new(),
         }
     }
     /// Runs `command` (a raw IMAP command) and returns what the server
@@ -76,6 +79,7 @@ impl Connection {
         }
         let result = self.session.run_command_and_check_ok(command);
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        self.alerts.extend(crate::sync::transport::alerts_in(&copy));
         result.map(|()| copy)
     }
     /// Appends a message with `flags` to `mailbox` (a wire name), returning
@@ -90,6 +94,24 @@ impl Connection {
             tap.start();
         }
         let result = self.session.append_with_flags(mailbox, raw, flags);
+        let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        result.map(|()| copy)
+    }
+    /// As `append_heard`, keeping the message's own date as when it
+    /// arrived (APPEND's date-time, RFC 3501 §6.3.11): imported mail sorts
+    /// by when it was sent, not when it was imported.
+    pub(super) fn append_dated(
+        &mut self,
+        mailbox: &str,
+        raw: &[u8],
+        flags: &[imap::types::Flag<'_>],
+    ) -> imap::error::Result<Vec<u8>> {
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result = self
+            .session
+            .append_with_flags_and_date(mailbox, raw, flags, message_date(raw));
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
     }
@@ -129,10 +151,17 @@ impl Connection {
         }
         let flags = flag_list(flags);
         let head = format!("APPEND {}", crate::sync::transport::quote(mailbox)?);
-        let each = format!(" ({flags}) ");
+        // Each with its own date, as `append_dated`.
+        let each: Vec<String> = messages
+            .iter()
+            .map(|raw| match message_date(raw) {
+                Some(d) => format!(" ({flags}) \"{}\" ", d.format("%d-%b-%Y %H:%M:%S %z")),
+                None => format!(" ({flags}) "),
+            })
+            .collect();
         let mut parts = vec![Part::Text(&head)];
-        for raw in messages {
-            parts.push(Part::Text(&each));
+        for (raw, each) in messages.iter().zip(&each) {
+            parts.push(Part::Text(each));
             parts.push(Part::Literal(raw));
         }
         Ok(vec![self.with_literals(&parts)?])
@@ -201,6 +230,7 @@ impl Connection {
     pub(super) fn submit_url(
         &mut self,
         host: &str,
+        port: u16,
         user: &str,
         mailbox: &str,
         validity: u32,
@@ -211,11 +241,22 @@ impl Connection {
             crate::sync::transport::reads_urlauth(),
             "This build can't read the server's URL authorizations."
         );
+        // RFC 5092: the user is `enc-user` (`@`, `/`, `;`, `:` escaped);
+        // the port is given where it isn't IMAP's 143.
+        let authority = if port == 0 || port == 143 {
+            host.to_owned()
+        } else {
+            format!("{host}:{port}")
+        };
+        // Valid for a day (RFC 4467 §3: `;EXPIRE=`), long enough for the
+        // submission server to fetch it, not forever.
+        let expire = (chrono::Utc::now() + chrono::Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%SZ");
         let url = format!(
-            "imap://{}@{host}/{};UIDVALIDITY={validity}/;UID={uid};urlauth=submit+{}",
-            url_mailbox(user),
+            "imap://{}@{authority}/{};UIDVALIDITY={validity}/;UID={uid};EXPIRE={expire};urlauth=submit+{}",
+            url_user(user),
             url_mailbox(mailbox),
-            url_mailbox(user)
+            url_user(user)
         );
         let heard = self.heard(&format!(
             "GENURLAUTH {} INTERNAL",
@@ -323,6 +364,7 @@ impl Connection {
             // Other users' and shared folders, where the server has them.
             self.namespace()?;
             let options = crate::sync::transport::ListOptions {
+                list_extended: ext.list_extended,
                 special_use: ext.special_use,
                 list_status: ext.list_status,
                 condstore: ext.condstore,
@@ -423,6 +465,7 @@ impl Connection {
         self.selected = None;
         let selected =
             crate::sync::transport::select(&mut self.session, name, condstore, self.enabled.utf8)?;
+        self.alerts.extend(selected.alerts.iter().cloned());
         self.selected = Some(selected.clone());
         Ok(selected)
     }
@@ -442,6 +485,7 @@ impl Connection {
             validity,
             modseq,
         )?;
+        self.alerts.extend(selected.alerts.iter().cloned());
         self.selected = Some(selected.clone());
         Ok((selected, resync))
     }
@@ -523,6 +567,16 @@ impl Backend {
             connection.names = None;
         }
         let result = work(&mut connection);
+        // The server's [ALERT]s are shown to the person (RFC 3501 §7.1).
+        let alerts = std::mem::take(&mut connection.alerts);
+        if !alerts.is_empty()
+            && let Some(hear) = self.proton_notice.lock().unwrap().clone()
+        {
+            let mut seen = std::collections::HashSet::new();
+            for alert in alerts.iter().filter(|t| seen.insert(t.as_str())) {
+                hear(a, "Message from your mail server", alert);
+            }
+        }
         match &result {
             Ok(_) => {
                 connection.used = Instant::now();
@@ -542,7 +596,18 @@ impl Backend {
                 until,
                 budget: false,
             }),
-            _ => e,
+            // A full mailbox (RFC 9208's [OVERQUOTA]) isn't a rate limit:
+            // waiting won't help, making room will.
+            _ if crate::sync::transport::over_quota(&e) => e.context(
+                "The mailbox is full: the server's storage quota is used up. \
+                 Delete or archive mail to make room.",
+            ),
+            // Other response codes, said plainly (the server's own words
+            // stay in the chain).
+            _ => match crate::sync::transport::response_code_meaning(&e) {
+                Some(meaning) => e.context(meaning),
+                None => e,
+            },
         })
     }
     fn pooled(&self, a: &Account) -> Option<Connection> {
@@ -624,7 +689,10 @@ impl Backend {
             entry.1 += bytes as u64;
             *entry
         };
-        let _ = self.store.set_preference(
+        // Written in the background, batched with other settings: as its
+        // own write, every downloaded message cost a transaction more. The
+        // count is kept in memory meanwhile, and reads back from it.
+        let _ = self.store.set_preference_soon(
             &format!("traffic:{}", a.id),
             &format!("{} {}", total.0, total.1),
         );
@@ -655,6 +723,17 @@ impl Backend {
     }
 }
 
+/// A message's Date header as APPEND's date-time, if it has a sane one.
+fn message_date(raw: &[u8]) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    use mailparse::MailHeaderMap as _;
+    let (headers, _) = mailparse::parse_headers(raw).ok()?;
+    let date = headers.get_first_value("Date")?;
+    let parsed = chrono::DateTime::parse_from_rfc2822(date.trim()).ok()?;
+    // Not before 1971 nor in the future: a server refuses those.
+    let now = chrono::Utc::now().timestamp();
+    (31_536_000..=now + 86_400).contains(&parsed.timestamp()).then_some(parsed)
+}
+
 /// Flags as APPEND writes them, without \\Recent (servers set it).
 fn flag_list(flags: &[imap::types::Flag<'_>]) -> String {
     flags
@@ -679,15 +758,39 @@ fn url_mailbox(name: &str) -> String {
         .collect()
 }
 
-/// SIZE in a STATUS reply: `* STATUS "Sent" (SIZE 123456)`.
+/// A user name in an IMAP URL (RFC 5092 `enc-user`): only unreserved
+/// characters, sub-delims but `;`, and `&` and `=` are left as they are;
+/// `@`, `/`, `:` and `;` are escaped, so an address can be a user name.
+fn url_user(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,=".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// SIZE in a STATUS reply: `* STATUS "Sent" (SIZE 123456)`. Read from the
+/// attribute list after the mailbox name, which may itself say SIZE.
 fn status_size(heard: &[u8]) -> Option<u64> {
-    let text = String::from_utf8_lossy(heard).to_ascii_uppercase();
-    let at = text.find("(SIZE ").or_else(|| text.find(" SIZE "))?;
-    let rest = &text[at + 6..];
-    rest.split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
+    let text = String::from_utf8_lossy(heard);
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("* ")?;
+        if !rest.get(..7)?.eq_ignore_ascii_case("STATUS ") {
+            return None;
+        }
+        // The list is the line's last parenthesized group.
+        let open = rest.rfind('(')?;
+        let list = rest[open + 1..].trim_end().strip_suffix(')')?;
+        let words: Vec<&str> = list.split_ascii_whitespace().collect();
+        words
+            .chunks(2)
+            .find(|c| c.len() == 2 && c[0].eq_ignore_ascii_case("SIZE"))
+            .and_then(|c| c[1].parse().ok())
+    })
 }
 
 /// The URL in a GENURLAUTH reply: `* GENURLAUTH "imap://…:internal:…"`.

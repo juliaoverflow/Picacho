@@ -80,13 +80,30 @@ impl Backend {
         ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
         // The address is the sender's to write: checked for every provider,
         // not only for SMTP's envelope (`deliver_raw`).
+        // One plain address: list separators, quotes or a second `@` could
+        // make more than one recipient of it for some servers.
         ensure!(
-            !to.contains(|c: char| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
-                && to.contains('@'),
+            !to.contains(|c: char| {
+                c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"' | '(' | ')')
+            }) && to.matches('@').count() == 1
+                && !to.starts_with('@')
+                && !to.ends_with('@'),
             "The read receipt's address “{to}” isn't valid."
         );
         ensure!(m.account == a.id, "Message belongs to another account");
-        let raw = crate::sync::smtp::receipt(a, m, &to);
+        // Original-Recipient, where the receiving server noted it (RFC
+        // 8098 §3.2.3: copied into the report when present).
+        let original_recipient = self
+            .original(a, m)
+            .ok()
+            .and_then(|raw| {
+                use mailparse::MailHeaderMap as _;
+                mailparse::parse_headers(&raw)
+                    .ok()
+                    .and_then(|(h, _)| h.get_first_value("Original-Recipient"))
+            })
+            .unwrap_or_default();
+        let raw = crate::sync::smtp::receipt(a, m, &to, &original_recipient);
         if a.provider == Provider::Proton {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
@@ -123,9 +140,11 @@ impl Backend {
             let _operation = lock.lock().unwrap();
             let s = self.credentials(a)?;
             let secret = if a.oauth { s.access_token } else { s.password };
+            // A report goes with the null reverse-path (RFC 8098 §3), so
+            // nothing ever answers it.
             crate::sync::smtp::deliver_raw(
                 a,
-                &a.email,
+                "",
                 &[to],
                 &raw,
                 &crate::sync::smtp::Endpoint::of(a),
@@ -240,9 +259,20 @@ impl Backend {
     /// Where the account's filter server is: ManageSieve on the incoming
     /// server's host.
     fn sieve_endpoint(a: &Account) -> sieve::Endpoint {
+        // Where the domain says its filter server is (RFC 5804 §1.8: SRV
+        // `_sieve._tcp`), when that's in the domain itself, as for JMAP:
+        // DNS isn't authenticated. Else the incoming server, on 4190.
+        let (host, port) = crate::sync::discover::domain(&a.email)
+            .and_then(|domain| {
+                crate::sync::auth::srv(&format!("_sieve._tcp.{domain}"))
+                    .ok()?
+                    .into_iter()
+                    .find(|(host, _)| host == &domain || host.ends_with(&format!(".{domain}")))
+            })
+            .unwrap_or_else(|| (a.incoming_host.clone(), sieve::PORT));
         sieve::Endpoint {
-            host: a.incoming_host.clone(),
-            port: sieve::PORT,
+            host,
+            port,
             user: a.login().to_owned(),
             oauth: a.oauth,
             kerberos: a.kerberos,
@@ -306,7 +336,7 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_imap(a, |c| {
-            if !c.extensions()?.metadata {
+            if !c.extensions()?.metadata_server {
                 return Ok(ServerNotes::default());
             }
             let mut notes = ServerNotes::default();

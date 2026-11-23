@@ -116,6 +116,10 @@ fn connect(file: &Path) -> Result<Connection> {
     // The write-ahead log is cut back to this after each checkpoint; left
     // alone it stayed as large as it had ever grown (24 MB here).
     db.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
+    // Per connection, as SQLite keeps it: the preference writer's ran with
+    // FULL, a disk flush on each of its many small writes. In WAL mode,
+    // NORMAL loses no committed data on a crash of the app.
+    db.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(db)
 }
 
@@ -158,7 +162,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS parcel_scan_account ON parcel_scan(account);
             -- What each message was found to say about receipts (see `receipts`).
             CREATE TABLE IF NOT EXISTS receipt_scan (id TEXT PRIMARY KEY, account TEXT NOT NULL, state INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS receipt_scan_account ON receipt_scan(account);")?;
+            CREATE INDEX IF NOT EXISTS receipt_scan_account ON receipt_scan(account);
+            -- Changes made offline, one row each, in order (see `offline.rs`):
+            -- the whole queue was one preference, read and written again for
+            -- every change.
+            CREATE TABLE IF NOT EXISTS offline_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, messages INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS offline_changes_account ON offline_changes(account, seq);")?;
         // Compressed sources get a column of their own (see `pack`), so a
         // build from before them finds `raw` empty and downloads the
         // message again, rather than reading compressed bytes as mail.
@@ -175,7 +184,13 @@ impl Store {
             // rows: download progress is counted up to every 400 ms while
             // mail downloads. (`downloads` was an earlier form of it.)
             "DROP INDEX IF EXISTS downloads;
-             CREATE INDEX IF NOT EXISTS downloaded ON messages(account, date, json_extract(data,'$.size'), {NOT_DOWNLOADED});"
+             CREATE INDEX IF NOT EXISTS downloaded ON messages(account, date, json_extract(data,'$.size'), {NOT_DOWNLOADED});
+             -- Copies of one Gmail message (one per label), for sharing a
+             -- downloaded source between them (`share_gmail_raw`, `gmail_raw`).
+             CREATE INDEX IF NOT EXISTS gmail ON messages(account, {GMAIL_ID}) WHERE {GMAIL_ID} > 0;
+             -- A server mailbox's rows, for replacing or forgetting them
+             -- (under the write lock, which a scan of the account held).
+             CREATE INDEX IF NOT EXISTS remote_folder ON messages(account, json_extract(data,'$.remote_folder'));"
         ))?;
         // Other connections write too (preferences); taking the write lock
         // when a transaction begins means one that reads first can't find
@@ -308,9 +323,28 @@ impl Store {
             "DELETE FROM preferences WHERE key=?1",
             [format!("folders:{id}")],
         )?;
-        for key in [format!("pop_erased:{id}"), format!("pop_downloaded:{id}")] {
+        for key in [
+            format!("pop_erased:{id}"),
+            format!("pop_downloaded:{id}"),
+            // Changes and draft removals waiting for a connection that
+            // will never come, the picture, and traffic and folder order.
+            format!("offline_changes:{id}"),
+            format!("draft_removals:{id}"),
+            format!("avatar:{id}"),
+            format!("avatar_source:{id}"),
+            format!("traffic:{id}"),
+            format!("folder_order:{id}"),
+            format!("jmap_submissions:{id}"),
+        ] {
             tx.execute("DELETE FROM preferences WHERE key=?1", [key])?;
         }
+        // Each JMAP mailbox's state (`jmap_state:<account>:<mailbox>`); by
+        // prefix with substr, as an id may hold LIKE's wildcards.
+        let state = format!("jmap_state:{id}:");
+        tx.execute(
+            "DELETE FROM preferences WHERE substr(key,1,length(?1))=?1",
+            [&state],
+        )?;
         tx.execute(
             "DELETE FROM preferences WHERE substr(key,1,8)='reading:' AND json_valid(substr(key,9)) AND json_extract(substr(key,9),'$[0]')=?1", [id],
         )?;
@@ -321,6 +355,7 @@ impl Store {
             "mailbox_state",
             "parcel_scan",
             "receipt_scan",
+            "offline_changes",
         ] {
             tx.execute(
                 &format!(
@@ -333,6 +368,8 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// The newest `limit` cached messages of a mailbox, bodies included.
+    #[cfg(test)]
     pub fn messages(
         &self,
         account: &str,
@@ -403,11 +440,7 @@ impl Store {
         // ordinary mailbox is asked for alone, so that SQLite reads it from
         // the (account, folder, date) index rather than scanning and
         // sorting every message of the account.
-        let which = match folder {
-            Folder::Starred => "(folder=?2 OR json_extract(data,'$.starred'))",
-            Folder::All => "(folder=?2 OR folder<>'drafts')",
-            _ => "folder=?2",
-        };
+        let which = virtual_rows(folder).unwrap_or("folder=?2");
         let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND {which} ORDER BY date DESC, id DESC LIMIT ?3"))?;
         let mut rows = q.query(params![
             account,
@@ -463,21 +496,32 @@ impl Store {
     /// much memory as the mailbox's text.
     pub fn mark_mailbox_read(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<()> {
         let mailbox = mailbox.into();
-        if mailbox.folder().is_virtual() {
-            // Starred and All Mail gather rows of other mailboxes.
-            let mut cached = self.messages(account, mailbox, usize::MAX >> 1)?;
-            cached.retain(|m| m.unread);
-            for m in &mut cached {
-                m.unread = false;
-            }
-            return self.save_messages(&cached);
-        }
+        // Starred and All Mail gather rows of other mailboxes; they are
+        // marked in place too, not read whole and written back. Every copy
+        // of a message (Gmail's labels) is marked, as it is on the server.
+        let which = virtual_rows(mailbox.folder()).unwrap_or("folder=?2");
         // The same condition as the `unread` index, so it finds the rows.
         self.write().execute(
-            "UPDATE messages SET data=json_set(data,'$.unread',json('false')) WHERE account=?1 AND folder=?2 AND json_extract(data,'$.unread')",
+            &format!("UPDATE messages SET data=json_set(data,'$.unread',json('false')) WHERE account=?1 AND {which} AND json_extract(data,'$.unread')"),
             params![account, mailbox.key()],
         )?;
         Ok(())
+    }
+    /// The unread messages of `mailbox`, without bodies, newest first:
+    /// what marking it read changes. Read mail isn't read at all.
+    pub fn unread_summaries(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<Vec<Mail>> {
+        let mailbox = mailbox.into();
+        let which = virtual_rows(mailbox.folder()).unwrap_or("folder=?2");
+        let db = self.read();
+        let mut q = db.prepare(&format!(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND {which} AND json_extract(data,'$.unread') ORDER BY date DESC, id DESC"
+        ))?;
+        let mut rows = q.query(params![account, mailbox.key()])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(serde_json::from_str(row.get_ref(0)?.as_str()?)?);
+        }
+        Ok(out)
     }
     /// How many messages `mailbox` has cached, counted by the database
     /// rather than by reading them all.
@@ -658,27 +702,9 @@ impl Store {
     /// threads, a batch at a time.
     pub fn parcel_search_texts(&self, ids: &[String]) -> Result<HashMap<String, String>> {
         let mut out = HashMap::new();
-        for chunk in ids.chunks(PARCEL_BATCH) {
-            type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
-            let rows: Vec<Row> = {
-                let db = self.read();
-                let mut q = db.prepare(&format!(
-                    "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
-                ))?;
-                let mut rows = Vec::new();
-                for id in chunk {
-                    if let Some(r) = q
-                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
-                        .next()
-                    {
-                        let (data, (raw, source)) = r?;
-                        rows.push((id.clone(), data, raw, source));
-                    }
-                }
-                rows
-            };
+        self.source_batches(ids.iter().map(String::as_str), PARCEL_BATCH, |rows| {
             let texts = parallel_map(rows, |(id, data, raw, source)| {
-                let raw = unpack(raw, source).ok().flatten();
+                let raw = unpack_scan(raw, source);
                 let text = serde_json::from_str::<Mail>(&data).ok().map(|mail| {
                     let read = ParcelText::of(mail, raw.as_deref());
                     let text: String = read.text().chars().take(PARCEL_SEARCH_TEXT).collect();
@@ -687,7 +713,8 @@ impl Store {
                 (id, text)
             });
             out.extend(texts.into_iter().filter_map(|(id, text)| Some((id, text?))));
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
     /// Every parcel `accounts`' cached mail tells of, outside Sent, Drafts
@@ -784,31 +811,11 @@ impl Store {
             // batch's sources are inflated, parsed and read on several
             // threads; with the model, which reads on one thread, only the
             // first two.
-            for chunk in unread.chunks(PARCEL_BATCH) {
-                type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
-                let rows: Vec<Row> = {
-                    let db = self.read();
-                    let mut q = db.prepare(&format!(
-                        "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
-                    ))?;
-                    let mut rows = Vec::new();
-                    for row in chunk {
-                        if let Some(r) = q
-                            .query_map([&row.id], |r| {
-                                Ok((r.get::<_, String>(0)?, source_columns(r, 1)?))
-                            })?
-                            .next()
-                        {
-                            let (data, (raw, source)) = r?;
-                            rows.push((row.id.clone(), data, raw, source));
-                        }
-                    }
-                    rows
-                };
-                let with_model = model.is_some();
+            let with_model = model.is_some();
+            self.source_batches(unread.iter().map(|r| r.id.as_str()), PARCEL_BATCH, |rows| {
                 let read = parallel_map(rows, |(id, data, raw, source)| {
                     // A source that can't be read leaves the cached text.
-                    let raw = unpack(raw, source).ok().flatten();
+                    let raw = unpack_scan(raw, source);
                     let readable = serde_json::from_str::<Mail>(&data)
                         .ok()
                         .map(|mail| ParcelText::of(mail, raw.as_deref()));
@@ -824,7 +831,8 @@ impl Store {
                     fresh.push((id.clone(), true, list.clone()));
                     results.insert(id, list);
                 }
-            }
+                Ok(())
+            })?;
             if !fresh.is_empty() {
                 let mut db = self.write();
                 let tx = db.transaction()?;
@@ -960,11 +968,9 @@ impl Store {
                     }
                 }
             }
-            for chunk in unread.chunks(PARCEL_BATCH) {
-                let ids: Vec<&str> = chunk.iter().map(|r| r.id.as_str()).collect();
-                let rows = self.source_rows(&ids)?;
+            self.source_batches(unread.iter().map(|r| r.id.as_str()), PARCEL_BATCH, |rows| {
                 let read = parallel_map(rows, |(id, data, raw, source)| {
-                    let raw = unpack(raw, source).ok().flatten();
+                    let raw = unpack_scan(raw, source);
                     let r = serde_json::from_str::<Mail>(&data).ok().and_then(|mail| {
                         let from = format!("{} <{}>", mail.sender, mail.from);
                         let read = ParcelText::of(mail, raw.as_deref());
@@ -981,7 +987,8 @@ impl Store {
                     fresh.push((id.clone(), true, r.clone()));
                     results.insert(id, r);
                 }
-            }
+                Ok(())
+            })?;
             if !fresh.is_empty() {
                 let mut db = self.write();
                 let tx = db.transaction()?;
@@ -1068,21 +1075,45 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
     /// The kept data and saved source of messages, by id: (id, data, raw,
-    /// source), for `unpack`.
-    fn source_rows(&self, ids: &[&str]) -> Result<Vec<SourceRow>> {
-        let db = self.read();
-        let mut q = db.prepare(&format!("SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"))?;
-        let mut rows = Vec::new();
-        for id in ids {
-            if let Some(r) = q
-                .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
-                .next()
-            {
-                let (data, (raw, source)) = r?;
-                rows.push(((*id).to_owned(), data, raw, source));
+    /// source), for `unpack`, handed to `each` a batch at a time. A batch
+    /// has at most `max_rows` rows and, unless one row alone is larger,
+    /// `SOURCE_BATCH_BYTES` of saved data; the cache is free for other
+    /// work between batches. Ids no longer cached are left out.
+    fn source_batches<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+        max_rows: usize,
+        mut each: impl FnMut(Vec<SourceRow>) -> Result<()>,
+    ) -> Result<()> {
+        let mut ids = ids.into_iter().peekable();
+        while ids.peek().is_some() {
+            let rows = {
+                let db = self.read();
+                let mut q = db.prepare_cached(&format!(
+                    "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
+                ))?;
+                let mut rows = Vec::new();
+                let mut bytes = 0;
+                while rows.len() < max_rows && bytes < SOURCE_BATCH_BYTES {
+                    let Some(id) = ids.next() else { break };
+                    if let Some(r) = q
+                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
+                        .next()
+                    {
+                        let (data, (raw, source)) = r?;
+                        bytes += data.len()
+                            + raw.as_ref().map_or(0, Vec::len)
+                            + source.as_ref().map_or(0, Vec::len);
+                        rows.push((id.to_owned(), data, raw, source));
+                    }
+                }
+                rows
+            };
+            if !rows.is_empty() {
+                each(rows)?;
             }
         }
-        Ok(rows)
+        Ok(())
     }
     /// Which of `accounts`' messages have a sign-in or verification code,
     /// which tell where a package is, and which are receipts (see
@@ -1159,28 +1190,10 @@ impl Store {
                 }
             }
             // Each likely one read whole, then judged.
-            for chunk in maybe.chunks(PARCEL_BATCH) {
-                type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
-                let rows: Vec<Row> = {
-                    let db = self.read();
-                    let mut q = db.prepare(&format!(
-                        "SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"
-                    ))?;
-                    let mut rows = Vec::new();
-                    for id in chunk {
-                        if let Some(r) = q
-                            .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
-                            .next()
-                        {
-                            let (data, (raw, source)) = r?;
-                            rows.push((id.clone(), data, raw, source));
-                        }
-                    }
-                    rows
-                };
-                let with_model = detector.is_some();
+            let with_model = detector.is_some();
+            self.source_batches(maybe.iter().map(String::as_str), PARCEL_BATCH, |rows| {
                 let read = parallel_map(rows, |(id, data, raw, source)| {
-                    let raw = unpack(raw, source).ok().flatten();
+                    let raw = unpack_scan(raw, source);
                     let read = serde_json::from_str::<Mail>(&data)
                         .ok()
                         .map(|mail| ParcelText::of(mail, raw.as_deref()));
@@ -1204,7 +1217,8 @@ impl Store {
                         kinds.codes.insert(id);
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
         // A tracking number is shaped like a code: package updates aren't
         // code mail.
@@ -1273,32 +1287,20 @@ impl Store {
         };
         let mut changed = 0;
         // In batches, so other work gets the cache in between.
-        for chunk in ids.chunks(100) {
-            let rows: Vec<(String, String, Option<Vec<u8>>)> = {
-                let db = self.read();
-                let mut q = db.prepare(&format!("SELECT data, {SOURCE_COLUMNS} FROM messages WHERE id=?1"))?;
-                let mut rows = Vec::new();
-                for id in chunk {
-                    if let Some(row) = q
-                        .query_map([id], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
-                        .next()
-                    {
-                        let (data, (raw, source)) = row?;
-                        rows.push((id.clone(), data, unpack(raw, source)?));
-                    }
-                }
-                rows
-            };
+        self.source_batches(ids.iter().map(String::as_str), 100, |rows| {
             let mut updates = Vec::new();
-            for (id, data, raw) in rows {
+            for (id, data, raw, source) in rows {
                 let Ok(mail) = serde_json::from_str::<Mail>(&data) else {
                     continue;
                 };
+                // Inflated one at a time: a batch's sources were all held
+                // inflated at once before.
+                let raw = unpack_scan(raw, source);
                 // Encrypted sources hold no readable text; what is cached stays.
                 let parsed = raw
                     .as_deref()
                     .filter(|raw| {
-                        crate::manage::crypto::encrypted_part(raw).is_none()
+                        !crate::manage::crypto::is_encrypted(raw)
                             && !raw.windows(27).any(|w| w == b"-----BEGIN PGP MESSAGE-----")
                     })
                     .and_then(|raw| {
@@ -1330,7 +1332,7 @@ impl Store {
                 }
             }
             if updates.is_empty() {
-                continue;
+                return Ok(());
             }
             let mut db = self.write();
             let tx = db.transaction()?;
@@ -1347,7 +1349,8 @@ impl Store {
             }
             tx.commit()?;
             changed += updates.len();
-        }
+            Ok(())
+        })?;
         Ok(changed)
     }
     /// Reads List-Unsubscribe from the downloaded source of messages cached
@@ -1427,6 +1430,20 @@ impl Store {
             total += found.len();
         }
         Ok(total)
+    }
+    /// The newest message with this Message-ID (`<…>`), in any account.
+    pub fn by_message_id(&self, message_id: &str) -> Result<Option<Mail>> {
+        use rusqlite::OptionalExtension;
+        let json: Option<String> = self
+            .read()
+            .query_row(
+                "SELECT data FROM messages WHERE json_extract(data,'$.message_id')=?1 ORDER BY date DESC LIMIT 1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        json.map(|s| serde_json::from_str(&s).map_err(Into::into))
+            .transpose()
     }
     pub fn message(&self, id: &str) -> Result<Option<Mail>> {
         use rusqlite::OptionalExtension;
@@ -1526,6 +1543,11 @@ impl Store {
     }
     /// Gives free pages back to the system a batch at a time, releasing the
     /// cache in between, in a database that can (`auto_vacuum` incremental).
+    /// Gives the space of deleted rows back to the system, where the cache
+    /// does so when asked (see `free_pages`).
+    pub fn give_back_space(&self) -> Result<()> {
+        self.free_pages()
+    }
     fn free_pages(&self) -> Result<()> {
         let mut left = i64::MAX;
         loop {
@@ -1579,8 +1601,16 @@ impl Store {
             pragma("freelist_count")?,
             pragma("page_size")?,
         );
-        if mode == 2 || free * size < 16 * 1024 * 1024 || free * 10 < pages {
+        if free * size < 16 * 1024 * 1024 || free * 10 < pages {
             return Ok(false);
+        }
+        if mode == 2 {
+            // Gives pages back as it goes, but only when asked: the space
+            // deleted mail (or a removed account) left was otherwise kept
+            // for good, as only the one-time move of sources asked.
+            drop(db);
+            self.free_pages()?;
+            return Ok(true);
         }
         if let Err(e) =
             db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
@@ -1605,6 +1635,75 @@ impl Store {
             Some((raw, source)) => unpack(raw, source),
             None => Ok(None),
         }
+    }
+    /// Adds a change made offline to the end of `account`'s queue: `data`
+    /// (JSON), for `messages` messages.
+    pub fn queue_change(&self, account: &str, messages: usize, data: &str) -> Result<()> {
+        self.write().execute(
+            "INSERT INTO offline_changes (account, messages, data) VALUES (?1, ?2, ?3)",
+            params![account, messages, data],
+        )?;
+        Ok(())
+    }
+    /// Puts changes queued before this table (an earlier version's) at the
+    /// front of `account`'s queue, in their order: they were made before
+    /// any queued since. (data, messages) each.
+    pub fn queue_changes_first(&self, account: &str, older: &[(String, usize)]) -> Result<()> {
+        if older.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        let lowest: i64 = tx.query_row("SELECT COALESCE(MIN(seq), 1) FROM offline_changes", [], |r| r.get(0))?;
+        // Numbers below every row's, in order (`seq` may go below 1).
+        let first = lowest - older.len() as i64;
+        for (i, (data, messages)) in older.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO offline_changes (seq, account, messages, data) VALUES (?1, ?2, ?3, ?4)",
+                params![first + i as i64, account, messages, data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// `account`'s queued changes, oldest first: (its number, JSON).
+    pub fn queued_changes(&self, account: &str) -> Result<Vec<(i64, String)>> {
+        let db = self.read();
+        let mut q = db.prepare_cached("SELECT seq, data FROM offline_changes WHERE account=?1 ORDER BY seq")?;
+        let rows = q
+            .query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+    /// How many messages `account`'s queued changes are for, without
+    /// reading them (the account list shows it).
+    pub fn queued_messages(&self, account: &str) -> usize {
+        self.read()
+            .query_row(
+                "SELECT COALESCE(SUM(messages),0) FROM offline_changes WHERE account=?1",
+                [account],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_or(0, |n| n as usize)
+    }
+    /// Takes a queued change off the queue (sent, or let go).
+    pub fn dequeue_change(&self, seq: i64) -> Result<()> {
+        self.write().execute("DELETE FROM offline_changes WHERE seq=?1", [seq])?;
+        Ok(())
+    }
+    /// Whether message `id`'s source is saved here, without reading it (a
+    /// source read whole, and inflated, only to say that it's there).
+    pub fn has_raw(&self, id: &str) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .read()
+            .query_row(
+                &format!("SELECT 1 FROM messages WHERE id=?1 AND {DOWNLOADED}"),
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
     pub fn save_raw(&self, id: &str, raw: &[u8]) -> Result<()> {
         let source = pack(raw)?;
@@ -1676,44 +1775,48 @@ impl Store {
     /// Copies already-downloaded content to other copies of the same Gmail
     /// message (one per label). Returns how many copies were filled.
     pub fn share_gmail_raw(&self, account: &str) -> Result<usize> {
-        // Two passes over the account rather than a correlated subquery: that
-        // re-read every message's JSON once per missing copy, which held the
-        // database for seconds on a few thousand messages and stalled the UI.
-        let mut db = self.write();
-        let tx = db.transaction()?;
-        let mut downloaded: HashMap<i64, String> = HashMap::new();
-        let mut missing: Vec<(String, i64)> = Vec::new();
-        {
-            let mut q = tx.prepare(&format!(
-                "SELECT id, json_extract(data,'$.gmail_id'), {DOWNLOADED} FROM messages
-                 WHERE account=?1 AND json_extract(data,'$.gmail_id') > 0"
+        // Only the copies not downloaded are visited (on a reading
+        // connection, so the cache stays free for writes meanwhile), and the
+        // downloaded copy of each is looked up by the `gmail` index. Before,
+        // every Gmail row of the account was read, under the write lock, on
+        // every download batch, even one with nothing to fill.
+        let pairs: Vec<(String, String)> = {
+            let db = self.read();
+            let mut missing = db.prepare_cached(&format!(
+                "SELECT id, json_extract(data,'$.gmail_id') FROM messages
+                 WHERE account=?1 AND {NOT_DOWNLOADED} AND {GMAIL_ID} > 0"
             ))?;
-            let rows = q.query_map([account], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, bool>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (id, gmail_id, has_raw) = row?;
-                if has_raw {
-                    downloaded.entry(gmail_id).or_insert(id);
-                } else {
-                    missing.push((id, gmail_id));
+            let mut donor = db.prepare_cached(&format!(
+                "SELECT id FROM messages WHERE account=?1 AND {GMAIL_ID} > 0
+                 AND {GMAIL_ID}=?2 AND {DOWNLOADED} LIMIT 1"
+            ))?;
+            let wanted = missing
+                .query_map([account], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut pairs = Vec::new();
+            for (id, gmail_id) in wanted {
+                if let Some(from) = donor
+                    .query_map(params![account, gmail_id], |r| r.get::<_, String>(0))?
+                    .next()
+                {
+                    pairs.push((id, from?));
                 }
             }
+            pairs
+        };
+        if pairs.is_empty() {
+            return Ok(0);
         }
+        let mut db = self.write();
+        let tx = db.transaction()?;
         let mut filled = 0;
         {
             let mut copy = tx.prepare(&format!(
                 "UPDATE messages SET (raw, source)=(SELECT raw, source FROM messages WHERE id=?2)
                  WHERE id=?1 AND {NOT_DOWNLOADED}"
             ))?;
-            for (id, gmail_id) in &missing {
-                if let Some(source) = downloaded.get(gmail_id) {
-                    filled += copy.execute(params![id, source])?;
-                }
+            for (id, from) in &pairs {
+                filled += copy.execute(params![id, from])?;
             }
         }
         tx.commit()?;
@@ -1730,7 +1833,7 @@ impl Store {
             .query_row(
                 &format!(
                     "SELECT {SOURCE_COLUMNS} FROM messages WHERE account=?1 AND {DOWNLOADED}
-                     AND json_extract(data,'$.gmail_id')=?2 LIMIT 1"
+                     AND {GMAIL_ID} > 0 AND {GMAIL_ID}=?2 LIMIT 1"
                 ),
                 params![account, gmail_id as i64],
                 |r| source_columns(r, 0),
@@ -2039,6 +2142,12 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Removes a preference, after any set to be written soon.
+    pub fn remove_preference(&self, key: &str) -> Result<()> {
+        self.flush();
+        self.write().execute("DELETE FROM preferences WHERE key=?1", [key])?;
+        Ok(())
+    }
     /// Sets a preference without waiting for the cache, which a long
     /// synchronization can hold for a while: for the interface, which must
     /// not stall. It reads back at once and is written in the background;
@@ -2215,6 +2324,10 @@ impl ScanRow {
 
 /// Downloaded messages read for parcels at a time (see `Store::parcels`).
 const PARCEL_BATCH: usize = 400;
+/// The most saved data (kept JSON and compressed sources) read into one
+/// batch of `Store::source_batches`: a count alone let 400 large
+/// messages be held at once.
+const SOURCE_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// The most of a message's text the Summary's package search looks
 /// through (`Store::parcel_search_texts`): a long newsletter's tail says
 /// nothing of a parcel.
@@ -2301,7 +2414,7 @@ fn fill_from(mail: &mut Mail, raw: Option<&[u8]>) {
     if mail.body.is_none()
         && mail.html.is_none()
         && let Some(raw) = raw.filter(|raw| {
-            crate::manage::crypto::encrypted_part(raw).is_none()
+            !crate::manage::crypto::is_encrypted(raw)
                 && !raw.windows(27).any(|w| w == b"-----BEGIN PGP MESSAGE-----")
         })
     {
@@ -2323,12 +2436,31 @@ fn fill_from(mail: &mut Mail, raw: Option<&[u8]>) {
 /// The rows whose source hasn't been. Written exactly as the `downloaded`
 /// index has it, so that the download counts are read from the index.
 const NOT_DOWNLOADED: &str = "(raw IS NULL AND source IS NULL)";
+/// A row's Gmail message id, written exactly as the `gmail` index has it.
+/// Queries also ask for it `> 0`, the index's condition, so SQLite uses it.
+const GMAIL_ID: &str = "json_extract(data,'$.gmail_id')";
+
+/// Which rows a virtual mailbox (Starred, All Mail) gathers, as SQL with
+/// the account `?1` and the mailbox's key `?2`; `None` for a real one.
+fn virtual_rows(folder: Folder) -> Option<&'static str> {
+    match folder {
+        Folder::Starred => Some("(folder=?2 OR json_extract(data,'$.starred'))"),
+        Folder::All => Some("(folder=?2 OR folder<>'drafts')"),
+        _ => None,
+    }
+}
 /// What earlier builds of this change put before a compressed source they
 /// kept in `raw`. No downloaded message starts with a NUL.
 const LEGACY_PACKED: &[u8] = b"\0PZ1";
-/// No source is larger than a download may be: one that inflates past
-/// this is damaged.
-const MAX_SOURCE: u64 = 2 * crate::sync::transport::MAX_MESSAGE as u64;
+/// No source is larger than a download may be (`large::MAX_DOWNLOAD` is
+/// this): one that inflates past it is damaged. Before they agreed, a
+/// message downloaded whole could be saved and then not read back.
+pub(crate) const MAX_SOURCE: u64 = 200 * 1024 * 1024;
+/// The most of a source the background scans (parcels, receipts, codes,
+/// previews) inflate: a larger one is read by its cached text, as one
+/// not downloaded is, rather than holding hundreds of megabytes on each
+/// of several threads.
+const MAX_SCAN_SOURCE: u64 = 2 * crate::sync::transport::MAX_MESSAGE as u64;
 
 /// A message source compressed, as it is saved in `source`.
 fn pack(raw: &[u8]) -> Result<Vec<u8>> {
@@ -2381,6 +2513,11 @@ fn read_source(
 /// A row's whole saved source, from its `SOURCE_COLUMNS`.
 fn unpack(raw: Option<Vec<u8>>, source: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
     read_source(raw, source, MAX_SOURCE, true)
+}
+/// A row's whole saved source for a background scan, or `None` when it
+/// can't be read or is larger than `MAX_SCAN_SOURCE`.
+fn unpack_scan(raw: Option<Vec<u8>>, source: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    read_source(raw, source, MAX_SCAN_SOURCE, true).ok().flatten()
 }
 /// The first `limit` bytes of a row's saved source (its headers come first).
 fn unpack_head(raw: Option<Vec<u8>>, source: Option<Vec<u8>>, limit: u64) -> Result<Option<Vec<u8>>> {
@@ -2487,6 +2624,23 @@ use keyring::Error as KeychainError;
 use keyring_core::Error as KeychainError;
 /// A keychain entry's text as stored, or `None` when there is none.
 pub fn read_secret_text(id: &str) -> Result<Option<String>> {
+    let Some(first) = read_one_secret(id)? else {
+        return Ok(None);
+    };
+    // Kept in parts (see `write_secret_text`): the rest are `id#1`, `id#2`…
+    let Some(parts) = first.strip_prefix(SPLIT).and_then(|n| n.parse::<usize>().ok()) else {
+        return Ok(Some(first));
+    };
+    let mut text = String::new();
+    for i in 1..=parts {
+        text.push_str(
+            &read_one_secret(&format!("{id}#{i}"))?
+                .context("A part of a keychain entry is missing")?,
+        );
+    }
+    Ok(Some(text))
+}
+fn read_one_secret(id: &str) -> Result<Option<String>> {
     match secret_entry(id)?.get_password() {
         Ok(text) => Ok(Some(text)),
         Err(KeychainError::NoEntry) => Ok(None),
@@ -2494,11 +2648,56 @@ pub fn read_secret_text(id: &str) -> Result<Option<String>> {
             .context("The keychain entry is locked, or access was denied")),
     }
 }
-/// Saves text to a keychain entry, replacing what it had.
+/// What begins an entry kept in parts, followed by how many there are.
+const SPLIT: &str = "\u{0}picacho-parts:";
+/// The most text kept in one entry: Windows' Credential Manager takes at most
+/// 2,560 bytes, stored as UTF-16 (two bytes each for ASCII), and the OpenPGP
+/// keyring, with an RSA key and a few people's keys, is larger. Elsewhere
+/// entries take far more, but parts work there too.
+const PART: usize = 1200;
+/// Saves text to a keychain entry, replacing what it had. Text too long for
+/// one entry (see `PART`) is kept in several.
 pub fn write_secret_text(id: &str, text: &str) -> Result<()> {
-    secret_entry(id)?
-        .set_password(text)
-        .context("Could not securely save to the system keychain")
+    let entry = |name: &str, value: &str| {
+        secret_entry(name)?
+            .set_password(value)
+            .context("Could not securely save to the system keychain")
+    };
+    if text.len() <= PART && !text.starts_with(SPLIT) {
+        entry(id, text)?;
+        // Parts of what was kept before, now unused.
+        remove_parts_after(id, 0);
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut at = rest.len().min(PART);
+        while !rest.is_char_boundary(at) {
+            at -= 1;
+        }
+        parts.push(&rest[..at]);
+        rest = &rest[at..];
+    }
+    // The parts first, then the entry naming them: a save cut short leaves
+    // what was there before readable.
+    for (i, part) in parts.iter().enumerate() {
+        entry(&format!("{id}#{}", i + 1), part)?;
+    }
+    entry(id, &format!("{SPLIT}{}", parts.len()))?;
+    remove_parts_after(id, parts.len());
+    Ok(())
+}
+/// Removes `id`'s parts numbered past `kept`, until one is missing.
+fn remove_parts_after(id: &str, kept: usize) {
+    for i in kept + 1.. {
+        let Ok(entry) = secret_entry(&format!("{id}#{i}")) else {
+            return;
+        };
+        if entry.delete_credential().is_err() {
+            return;
+        }
+    }
 }
 /// Removes a keychain entry; one that isn't there is already removed.
 pub fn delete_secret(id: &str) -> Result<()> {
@@ -2516,6 +2715,110 @@ pub fn write_secret(id: &str, s: &Secret) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn temp_store() -> Result<(std::path::PathBuf, Store)> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        Ok((p, s))
+    }
+    /// Starred and All Mail are marked read in the cache without reading
+    /// their mail whole; only the unread are listed for the server, and
+    /// bodies stay.
+    #[test]
+    fn virtual_mailboxes_are_marked_read_in_place() -> Result<()> {
+        let (p, s) = temp_store()?;
+        let mut ms = demo_mail();
+        for (i, m) in ms.iter_mut().enumerate() {
+            m.unread = i % 2 == 0;
+            m.starred = i < 3;
+            m.folder = Folder::Inbox;
+            m.body = Some(format!("body {i}"));
+        }
+        s.save_messages(&ms)?;
+        let starred = s.unread_summaries("demo", Folder::Starred)?;
+        assert!(starred.iter().all(|m| m.unread && m.starred && m.body.is_none()));
+        assert_eq!(starred.len(), ms.iter().filter(|m| m.unread && m.starred).count());
+        s.mark_mailbox_read("demo", Folder::Starred)?;
+        for m in &ms {
+            let now = s.message(&m.id)?.unwrap();
+            assert_eq!(now.unread, m.unread && !m.starred, "{}", m.id);
+            assert_eq!(now.body, m.body);
+        }
+        s.mark_mailbox_read("demo", Folder::All)?;
+        assert!(s.unread_summaries("demo", Folder::All)?.is_empty());
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    /// Sources are read in batches bounded by their size, not only their
+    /// count, and every row comes once.
+    #[test]
+    fn source_batches_are_bounded_by_bytes() -> Result<()> {
+        let (p, s) = temp_store()?;
+        let ms = demo_mail();
+        s.save_messages(&ms)?;
+        // Incompressible, so each saved source is about this large.
+        let size = SOURCE_BATCH_BYTES / 3 + 1;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let noise: Vec<u8> = (0..size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        for m in &ms {
+            s.save_raw(&m.id, &noise)?;
+        }
+        let mut batches = Vec::new();
+        s.source_batches(ms.iter().map(|m| m.id.as_str()).chain(["gone"]), PARCEL_BATCH, |rows| {
+            batches.push(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>());
+            Ok(())
+        })?;
+        assert!(batches.iter().all(|b| b.len() <= 3), "{batches:?}");
+        let all: Vec<String> = batches.concat();
+        assert_eq!(all, ms.iter().map(|m| m.id.clone()).collect::<Vec<_>>());
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    /// A source as large as a download may be reads back whole; background
+    /// scans pass it over rather than inflating it.
+    #[test]
+    fn large_saved_sources_read_back() -> Result<()> {
+        let (p, s) = temp_store()?;
+        let ms = demo_mail();
+        s.save_messages(&ms[..1])?;
+        let raw = vec![b'a'; MAX_SCAN_SOURCE as usize + 1024];
+        s.save_raw(&ms[0].id, &raw)?;
+        assert_eq!(s.raw(&ms[0].id)?.map(|r| r.len()), Some(raw.len()));
+        let (kept, source) = s.read().query_row("SELECT raw, source FROM messages WHERE id=?1", [&ms[0].id], |r| source_columns(r, 0))?;
+        assert!(unpack_scan(kept, source).is_none());
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    /// Removing an account forgets its preferences, not other accounts'.
+    #[test]
+    fn removing_an_account_forgets_its_preferences() -> Result<()> {
+        let (p, s) = temp_store()?;
+        for id in ["gone", "gone2"] {
+            for key in ["offline_changes", "draft_removals", "avatar", "traffic", "folder_order"] {
+                s.set_preference(&format!("{key}:{id}"), "x")?;
+            }
+            s.set_preference(&format!("jmap_state:{id}:inbox"), "x")?;
+        }
+        s.remove_account("gone")?;
+        for key in ["offline_changes", "draft_removals", "avatar", "traffic", "folder_order"] {
+            assert_eq!(s.preference(&format!("{key}:gone")), None, "{key}");
+            assert!(s.preference(&format!("{key}:gone2")).is_some(), "{key}");
+        }
+        assert_eq!(s.preference("jmap_state:gone:inbox"), None);
+        assert!(s.preference("jmap_state:gone2:inbox").is_some());
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
     #[test]
     fn gmail_copies_share_downloaded_content() -> Result<()> {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
@@ -2877,6 +3180,21 @@ mod snapshot_tests {
         assert!(after < before / 2, "{before} -> {after}");
         assert!(!store.compact_on_quit()?, "once");
         assert_eq!(store.raw(&format!("{}:7", a.id))?.map(|s| s.len()), Some(big_source_len(7)));
+        // Mail deleted later, in a database that gives pages back when
+        // asked: they are given back at quitting too.
+        let noise = |i: u32| -> Vec<u8> {
+            let mut x = 0x9E37_79B9u32 ^ i;
+            (0..1_000_000).map(|_| { x ^= x << 13; x ^= x >> 17; x ^= x << 5; x as u8 }).collect()
+        };
+        for i in 0..30u32 {
+            store.save_raw(&format!("{}:{i}", a.id), &noise(i))?;
+        }
+        store.write().execute("DELETE FROM messages", [])?;
+        let before = std::fs::metadata(path.join("mail.sqlite3"))?.len();
+        assert!(store.compact_on_quit()?);
+        assert_eq!(pragma("freelist_count")?, 0);
+        let after = std::fs::metadata(path.join("mail.sqlite3"))?.len();
+        assert!(after < before / 2, "{before} -> {after}");
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

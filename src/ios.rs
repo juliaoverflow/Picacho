@@ -37,7 +37,8 @@ pub extern "C" fn picacho_ios_start() -> bool {
         default_hook(info);
     }));
 
-    // Accounts and mail live in the app's sandbox, which iOS backs up.
+    // Accounts and mail live in the app's sandbox; main.m keeps this folder
+    // out of backups before it is opened.
     let Some(home) = std::env::var_os("HOME") else {
         log::error!("no home directory");
         return false;

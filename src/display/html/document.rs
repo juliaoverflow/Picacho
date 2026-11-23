@@ -90,6 +90,7 @@ const DARK_PAGE: u32 = 0x1f2023;
 /// Tracking pixels stay invisible.
 const BLOCKED_CSS: &str = "img[data-picacho-remote] { outline: 1px dashed rgba(128, 128, 128, 0.55); outline-offset: -1px; } \
 img[data-picacho-remote]:not([data-picacho-sized]) { min-width: 16px; min-height: 16px; } \
+[data-picacho-remote-background] { outline: 1px dashed rgba(128, 128, 128, 0.35); outline-offset: -1px; } \
 [data-picacho-tracker] { outline: none !important; min-width: 0 !important; min-height: 0 !important; } \
 [data-picacho-alt] { display: inline-block; box-sizing: border-box; max-width: 100%; overflow: hidden; vertical-align: bottom; \
 outline: 1px dashed rgba(128, 128, 128, 0.55); outline-offset: -1px; padding: 2px 4px; \
@@ -119,7 +120,7 @@ pub enum Tone {
 }
 impl Tone {
     pub fn for_email(html: &str, dark: bool) -> Self {
-        if !dark {
+        if !dark || light_only(html) {
             Tone::Light
         } else if has_dark_backgrounds(html) {
             Tone::NativeDark
@@ -127,6 +128,29 @@ impl Tone {
             Tone::InvertedDark
         }
     }
+}
+
+/// Whether the email says it is made only for light pages: a
+/// `<meta name="color-scheme" content="light">` (or `only light`), as
+/// mail apps that respect it leave such an email uncolored.
+fn light_only(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(at) = rest.find("<meta") {
+        rest = &rest[at + 5..];
+        let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+        if !(tag.contains("name=\"color-scheme\"") || tag.contains("name='color-scheme'")
+            || tag.contains("name=color-scheme"))
+        {
+            continue;
+        }
+        let Some(at) = tag.find("content=") else { continue };
+        let value = tag[at + 8..].trim_start_matches(['"', '\'']);
+        let value = &value[..value.find(['"', '\'']).unwrap_or(value.len())];
+        let words: Vec<&str> = value.split_whitespace().collect();
+        return words.contains(&"light") && !words.contains(&"dark");
+    }
+    false
 }
 
 /// Whether the email has `prefers-color-scheme: dark` rules that set
@@ -271,6 +295,9 @@ pub(super) struct EmailDocument {
     /// content is (see `layout`).
     width: u32,
     laid_width: u32,
+    /// The person's text zoom (WCAG 1.4.4): the email laid out this much
+    /// narrower and shown this much larger. 1 is the email's own size.
+    text_zoom: f32,
     /// The height of the window, which `vh` and height media queries see,
     /// and its scale, which resolution media queries see.
     screen_height: u32,
@@ -343,6 +370,7 @@ impl EmailDocument {
             clock: 0.,
             width: 0,
             laid_width: 0,
+            text_zoom: 1.,
             screen_height: 600,
             screen_scale: 1.,
         };
@@ -449,9 +477,21 @@ impl EmailDocument {
             if &*element.name.local != "img" {
                 continue;
             }
+            let remote = |v: &str| {
+                let lower = v.trim().to_ascii_lowercase();
+                lower.starts_with("http:") || lower.starts_with("https:") || lower.starts_with("//")
+            };
             let src = element.attr(LocalName::from("src")).unwrap_or("").trim();
-            let lower = src.to_ascii_lowercase();
-            if !(lower.starts_with("http:") || lower.starts_with("https:") || lower.starts_with("//")) {
+            // Its other sources too: `srcset`, and a `<picture>`'s `<source>`s.
+            let srcset = element.attr(LocalName::from("srcset")).unwrap_or("");
+            let in_picture = self
+                .doc
+                .get_node(id)
+                .and_then(|n| n.parent)
+                .and_then(|p| self.doc.get_node(p))
+                .and_then(|p| p.element_data())
+                .is_some_and(|p| &*p.name.local == "picture");
+            if !(remote(src) || srcset.split(',').any(remote) || (src.is_empty() && in_picture)) {
                 continue;
             }
             let attr = |name: &str| element.attr(LocalName::from(name));
@@ -470,6 +510,33 @@ impl EmailDocument {
                 tracker,
                 alt,
             });
+        }
+        // Boxes painted with a remote picture (`background=`, or a style's
+        // `background-image: url(…)`) keep an outline, so a blocked banner
+        // reads as one.
+        let backgrounds: Vec<NodeId> = self
+            .elements()
+            .into_iter()
+            .filter(|&id| {
+                let Some(e) = self.doc.get_node(id).and_then(|n| n.element_data()) else {
+                    return false;
+                };
+                let remote = |v: &str| {
+                    let lower = v.to_ascii_lowercase();
+                    lower.contains("http:") || lower.contains("https:") || lower.contains("url(//")
+                };
+                e.attr(LocalName::from("background")).is_some_and(|b| remote(b.trim()))
+                    || e.attr(LocalName::from("style")).is_some_and(|st| {
+                        let lower = st.to_ascii_lowercase();
+                        lower.contains("background") && lower.contains("url(") && remote(&lower)
+                    })
+            })
+            .collect();
+        if !backgrounds.is_empty() {
+            let mut mutator = self.doc.mutate();
+            for id in backgrounds {
+                mutator.set_attribute(id, attr_name("data-picacho-remote-background"), "");
+            }
         }
         if found.is_empty() {
             return;
@@ -644,13 +711,15 @@ impl EmailDocument {
     pub(super) fn layout(&mut self, width: u32) -> f32 {
         let width = width.max(1);
         self.width = width;
-        self.set_viewport(width);
+        // Zoomed in: laid out narrower in CSS pixels, then shown larger.
+        let css = ((width as f32 / self.text_zoom).round() as u32).max(1);
+        self.set_viewport(css);
         self.resolve();
-        self.laid_width = width;
+        self.laid_width = css;
         let content = self.content_width();
-        if content > width as f32 + 1. {
-            let wide = (content.ceil() as u32).min(width.saturating_mul(3));
-            if wide > width {
+        if content > css as f32 + 1. {
+            let wide = (content.ceil() as u32).min(css.saturating_mul(3));
+            if wide > css {
                 self.set_viewport(wide);
                 self.resolve();
                 self.laid_width = wide;
@@ -658,7 +727,15 @@ impl EmailDocument {
         }
         self.content_height()
     }
-    /// How much the email is scaled to fit the width asked for (at most 1).
+    /// The person's text zoom, 0.5 to 3 (see `text_zoom`).
+    pub(super) fn set_text_zoom(&mut self, zoom: f32) {
+        self.text_zoom = zoom.clamp(0.5, 3.);
+    }
+    pub(super) fn text_zoom(&self) -> f32 {
+        self.text_zoom
+    }
+    /// How much the email is scaled: down to fit the width asked for, and
+    /// up by the person's text zoom.
     pub(super) fn zoom(&self) -> f32 {
         if self.laid_width == 0 {
             1.
@@ -1011,6 +1088,16 @@ fn darken_scene(scene: &mut anyrender::Scene) {
             .map_or(Some(page), |u| u.lightness)
     };
     let mut under: Vec<Under> = Vec::new();
+    // A surface painted over others entirely hides them from `under_at`
+    // (it looks for the newest that contains a point): they are let go as
+    // it is added, so the search stays short. A newsletter's thousands of
+    // cells, each painted over its row and table, were all searched for
+    // every run of text.
+    let add = |under: &mut Vec<Under>, new: Under| {
+        let r = new.rect;
+        under.retain(|u| !(r.x0 <= u.rect.x0 && r.y0 <= u.rect.y0 && r.x1 >= u.rect.x1 && r.y1 >= u.rect.y1));
+        under.push(new);
+    };
     // Each open layer, and whether it holds an image.
     let mut layers: Vec<bool> = Vec::new();
     let mut images = 0usize;
@@ -1039,7 +1126,7 @@ fn darken_scene(scene: &mut anyrender::Scene) {
             RenderCommand::Fill(fill) => {
                 let rect = fill.transform.transform_rect_bbox(fill.shape.bounding_box());
                 if matches!(fill.brush, Paint::Image(_)) {
-                    under.push(Under {
+                    add(&mut under, Under {
                         rect,
                         lightness: None,
                     });
@@ -1058,7 +1145,7 @@ fn darken_scene(scene: &mut anyrender::Scene) {
                         recolor(&mut fill.brush, Role::Line);
                     }
                 } else if let Some(lightness) = recolor(&mut fill.brush, Role::Surface) {
-                    under.push(Under {
+                    add(&mut under, Under {
                         rect,
                         lightness: Some(lightness),
                     });
@@ -1079,8 +1166,12 @@ fn darken_scene(scene: &mut anyrender::Scene) {
                 let at = run.transform * kurbo::Point::new(glyph.x as f64, glyph.y as f64 - run.font_size as f64 * 0.3);
                 // Over an image, or a surface that stays light, the text
                 // keeps the contrast its sender gave it.
-                if under_at(&under, at).is_some_and(|l| l < 0.6) {
+                if let Some(surface) = under_at(&under, at).filter(|l| *l < 0.6) {
                     recolor(&mut run.brush, Role::Text);
+                    // At least WCAG's 4.5:1 against the surface (1.4.3).
+                    if let Paint::Solid(color) = &mut run.brush {
+                        color.components = readable_on(color.components, surface);
+                    }
                 }
             }
             RenderCommand::BoxShadow(shadow) => {
@@ -1089,6 +1180,38 @@ fn darken_scene(scene: &mut anyrender::Scene) {
             _ => {}
         }
     }
+}
+
+/// WCAG 2.1's relative luminance of a straight sRGB color.
+fn luminance([r, g, b, _]: [f32; 4]) -> f32 {
+    let linear = |c: f32| {
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+/// WCAG's contrast ratio of two luminances.
+fn contrast(a: f32, b: f32) -> f32 {
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+/// `text` made lighter, keeping its hue, until it has 4.5:1 contrast with
+/// a dark surface of OKLab lightness `surface` (WCAG 2.1 §1.4.3).
+pub(super) fn readable_on(text: [f32; 4], surface: f32) -> [f32; 4] {
+    let ground = from_oklab([surface, 0., 0.]);
+    let ground = luminance([ground[0], ground[1], ground[2], 1.]);
+    if contrast(luminance(text), ground) >= 4.5 {
+        return text;
+    }
+    let [mut l, a, b] = to_oklab([text[0], text[1], text[2]]);
+    let mut out = text;
+    for _ in 0..20 {
+        l = (l + 0.05).min(1.);
+        let [r, g, bb] = from_oklab([l, a, b]);
+        out = [r, g, bb, text[3]];
+        if contrast(luminance(out), ground) >= 4.5 || l >= 1. {
+            break;
+        }
+    }
+    out
 }
 
 /// OKLab lightness of a straight sRGB color.
@@ -1334,6 +1457,66 @@ impl EmailDocument {
         true
     }
     /// Selects all of the email's text.
+    /// The email as a screen reader reads it: its text, block by block,
+    /// with images by their alt text, and its links (text, address) in
+    /// order. Hidden content (scripts, styles, `display: none` templates)
+    /// is left out.
+    pub(super) fn accessible_text(&self) -> (String, Vec<(String, String)>) {
+        const SKIP: &[&str] = &["script", "style", "head", "title", "template", "noscript"];
+        const BLOCK: &[&str] = &[
+            "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "table", "blockquote",
+            "section", "article", "header", "footer", "hr",
+        ];
+        let mut text = String::new();
+        let mut links = Vec::new();
+        let mut stack = vec![(self.doc.root_node().id, false)];
+        while let Some((id, after)) = stack.pop() {
+            let Some(node) = self.doc.get_node(id) else { continue };
+            if after {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                continue;
+            }
+            if let Some(t) = node.text_data() {
+                let words = t.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !words.is_empty() {
+                    if !text.is_empty() && !text.ends_with(['\n', ' ']) {
+                        text.push(' ');
+                    }
+                    text.push_str(&words);
+                }
+                continue;
+            }
+            let Some(e) = node.element_data() else {
+                stack.extend(node.children.iter().rev().map(|c| (*c, false)));
+                continue;
+            };
+            let tag: &str = &e.name.local;
+            if SKIP.contains(&tag)
+                || e.attr(LocalName::from("aria-hidden")) == Some("true")
+                || node.primary_styles().is_some_and(|s| s.get_box().display.is_none())
+            {
+                continue;
+            }
+            if tag == "img"
+                && let Some(alt) = e.attr(LocalName::from("alt")).map(str::trim).filter(|a| !a.is_empty())
+            {
+                text.push_str(&format!(" [{alt}] "));
+            }
+            if tag == "a"
+                && let Some(href) = e.attr(LocalName::from("href"))
+            {
+                let label = node.text_content().split_whitespace().collect::<Vec<_>>().join(" ");
+                links.push((if label.is_empty() { href.to_owned() } else { label }, href.to_owned()));
+            }
+            if BLOCK.contains(&tag) {
+                stack.push((id, true));
+            }
+            stack.extend(node.children.iter().rev().map(|c| (*c, false)));
+        }
+        (text.trim().to_owned(), links)
+    }
     pub(super) fn select_all(&mut self) {
         let roots: Vec<NodeId> = self
             .elements()

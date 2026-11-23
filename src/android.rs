@@ -123,6 +123,10 @@ static UI_STARTED: AtomicBool = AtomicBool::new(false);
 /// started; android-activity sets it up itself, once, when an activity is
 /// created, so it is released first (`beforeActivity`).
 static CONTEXT_OURS: AtomicBool = AtomicBool::new(false);
+/// Moves on with each `serviceStarted` and `serviceStopped`: a service start
+/// whose thread runs after the service stopped finds it moved on, and
+/// starts no monitor for a service that's gone.
+static SERVICE_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the activity and the service share in the process.
 struct Process {
@@ -385,8 +389,27 @@ pub fn save_as(bytes: &[u8], name: &str, mime: &str) -> anyhow::Result<bool> {
     // Written whole to the cache first; Java copies it where it was asked.
     let dir = std::env::temp_dir().join("picacho-save");
     std::fs::create_dir_all(&dir)?;
+    // Copies left by a save the app was closed during (it never came back
+    // to remove them). A day old: no picker stays open that long.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(86_400));
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     let source = dir.join(format!("{:016x}", rand_suffix()));
-    std::fs::write(&source, bytes)?;
+    if let Err(e) = std::fs::write(&source, bytes) {
+        // A partly written copy (the disk filled) isn't left behind.
+        let _ = std::fs::remove_file(&source);
+        return Err(e.into());
+    }
     let source_path = source.to_string_lossy().into_owned();
     let outcome = call_java("SaveFile.save", |env, java| {
         let source = env.new_string(&source_path)?;
@@ -822,7 +845,11 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_beforeActivity<'caller>(
     native(env, |_| {
         let mut process = process();
         process.ui = true;
-        process.monitor = None;
+        // Stopped, and waited for (briefly), before the context it may be
+        // using in a keychain call is released under it.
+        if let Some(monitor) = process.monitor.take() {
+            monitor.stop_and_wait(std::time::Duration::from_secs(1));
+        }
         if CONTEXT_OURS.swap(false, Ordering::SeqCst) {
             // Safety: set by `start_service_monitor`, and nothing else
             // released it.
@@ -843,9 +870,10 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStarted<'caller>(
 ) {
     native(env, |_| {
         let path = std::path::PathBuf::from(data_dir.to_string());
+        let run = SERVICE_RUNS.fetch_add(1, Ordering::SeqCst) + 1;
         let spawned = std::thread::Builder::new()
             .name("picacho-service".into())
-            .spawn(move || start_service_monitor(&path));
+            .spawn(move || start_service_monitor(&path, run));
         if let Err(e) = spawned {
             log::error!("could not start checking mail in the background: {e}");
         }
@@ -853,8 +881,12 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStarted<'caller>(
     });
 }
 
-fn start_service_monitor(path: &Path) {
+fn start_service_monitor(path: &Path, run: u64) {
     let mut process = process();
+    if SERVICE_RUNS.load(Ordering::SeqCst) != run {
+        // Stopped (or started again) since: that one decides.
+        return;
+    }
     process.service = true;
     if process.ui {
         // The window checks while it runs; the monitor starts once it's gone.
@@ -892,6 +924,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStopped<'caller>(
     _class: JClass<'caller>,
 ) {
     native(env, |_| {
+        SERVICE_RUNS.fetch_add(1, Ordering::SeqCst);
         let mut process = process();
         process.service = false;
         process.reconcile();

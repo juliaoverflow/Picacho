@@ -18,6 +18,10 @@ pub(super) struct FiltersUi {
     /// The new rule's field and action.
     pub(super) new_field: Field,
     pub(super) new_act: Act,
+    /// How the new rule compares, and whether it applies when it doesn't
+    /// match.
+    pub(super) new_match: crate::sync::sieve::Match,
+    pub(super) new_negate: bool,
     /// The text fields still show another account's (or nothing): fill
     /// them from `draft` at the next chance.
     pub(super) populate: bool,
@@ -28,6 +32,10 @@ pub(super) struct FiltersUi {
 /// shows at a time).
 pub(super) struct FilterInputs {
     pub(super) value: Entity<InputState>,
+    /// A header's name (Header), or an action's text: the address to send
+    /// on to, the refusal's reason, the label.
+    pub(super) extra: Entity<InputState>,
+    pub(super) act_text: Entity<InputState>,
     pub(super) subject: Entity<InputState>,
     pub(super) body: Entity<TextareaState>,
     pub(super) from: Entity<InputState>,
@@ -39,6 +47,8 @@ impl FilterInputs {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             value: input("Text to look for", false, window, cx),
+            extra: input("Header name", false, window, cx),
+            act_text: input("Address, reason or label", false, window, cx),
             subject: input("Out of office", false, window, cx),
             body: textarea(
                 "I'm away until Monday and will reply when I'm back.",
@@ -61,11 +71,15 @@ pub(super) enum FilterAction {
     Remove(String, usize),
     NewField(String, Field),
     NewAct(String, Act),
+    NewMatch(String, crate::sync::sieve::Match),
+    ToggleNegate(String),
     ToggleStop(String, usize),
     ToggleVacation(String),
     VacationDays(String, u32),
     /// Runs the script that was active before Picacho's first.
     ToggleInclude(String),
+    /// Takes the other app's rules into Picacho's, to edit here.
+    AdoptOtherRules(String),
 }
 
 impl MailApp {
@@ -200,15 +214,68 @@ impl MailApp {
                     ui.error = Some("Choose what the filter does.".into());
                     return;
                 }
+                let extra = Self::value(&self.filter_inputs.extra, cx).trim().to_owned();
+                let act_text = Self::value(&self.filter_inputs.act_text, cx).trim().to_owned();
+                let ui = self.filters.get_mut(&id).expect("looked up above");
+                let header = if ui.new_field == Field::Header {
+                    if extra.is_empty() {
+                        ui.error = Some("Name the header the filter looks at.".into());
+                        return;
+                    }
+                    extra.clone()
+                } else {
+                    String::new()
+                };
+                // The action's own text, from the second field.
+                let act = match &ui.new_act {
+                    Act::Redirect(_) | Act::Reject(_) | Act::Label(_) if act_text.is_empty() => {
+                        ui.error = Some(match ui.new_act {
+                            Act::Redirect(_) => "Enter the address mail is sent on to.",
+                            Act::Reject(_) => "Write why mail is refused.",
+                            _ => "Name the label.",
+                        }.into());
+                        return;
+                    }
+                    Act::Redirect(_) => Act::Redirect(act_text.clone()),
+                    Act::Reject(_) => Act::Reject(act_text.clone()),
+                    Act::Label(_) => Act::Label(act_text.clone()),
+                    other => other.clone(),
+                };
                 ui.draft.rules.push(crate::sync::sieve::Rule {
                     field: ui.new_field,
                     value,
-                    act: ui.new_act.clone(),
-                    stop: matches!(ui.new_act, Act::Folder(_) | Act::Discard),
+                    stop: matches!(act, Act::Folder(_) | Act::Discard | Act::Reject(_) | Act::Redirect(_)),
+                    act,
+                    matching: ui.new_match,
+                    negate: ui.new_negate,
+                    header,
+                    ..Default::default()
                 });
                 ui.error = None;
                 ui.changed = true;
                 Self::set(&self.filter_inputs.value, "", w, cx);
+                Self::set(&self.filter_inputs.extra, "", w, cx);
+                Self::set(&self.filter_inputs.act_text, "", w, cx);
+            }
+            FilterAction::AdoptOtherRules(id) => {
+                if let Some(ui) = self.filters.get_mut(&id)
+                    && let Some(read) = ui.state.as_ref().and_then(|s| s.other_rules.clone())
+                {
+                    for rule in read.filters.rules {
+                        if !ui.draft.rules.contains(&rule) {
+                            ui.draft.rules.push(rule);
+                        }
+                    }
+                    if read.filters.vacation.on && !ui.draft.vacation.on {
+                        ui.draft.vacation = read.filters.vacation;
+                    }
+                    // Picacho's now do what that script did: it needn't run too.
+                    if read.left_out == 0 {
+                        ui.draft.include = None;
+                    }
+                    ui.changed = true;
+                    ui.populate = true;
+                }
             }
             FilterAction::Remove(id, i) => {
                 if let Some(ui) = self.filters.get_mut(&id)
@@ -227,6 +294,16 @@ impl MailApp {
                 if let Some(ui) = self.filters.get_mut(&id) {
                     ui.new_act = act;
                     ui.error = None;
+                }
+            }
+            FilterAction::NewMatch(id, m) => {
+                if let Some(ui) = self.filters.get_mut(&id) {
+                    ui.new_match = m;
+                }
+            }
+            FilterAction::ToggleNegate(id) => {
+                if let Some(ui) = self.filters.get_mut(&id) {
+                    ui.new_negate = !ui.new_negate;
                 }
             }
             FilterAction::ToggleStop(id, i) => {
@@ -341,12 +418,9 @@ impl MailApp {
 
     /// Changes made offline that haven't reached the server yet.
     pub(super) fn offline_note(&self, a: &Account) -> Option<Div> {
-        let n: usize = self
-            .backend
-            .queued_changes(&a.id)
-            .iter()
-            .map(|q| q.mails.len())
-            .sum();
+        // Counted by the cache, not by reading every queued change's
+        // messages on each frame.
+        let n = self.backend.queued_messages(&a.id);
         (n > 0)
             .then(|| {
                 div()
@@ -415,7 +489,15 @@ impl MailApp {
                 )
                 .into_any_element();
         };
-        let folders = self.folders.get(&a.id).cloned().unwrap_or_default();
+        let mut folders = self.folders.get(&a.id).cloned().unwrap_or_default();
+        // The standard folders by their role, which filters name so.
+        for (role, label) in [("\\Archive", "Archive"), ("\\Junk", "Spam"), ("\\Trash", "Trash")] {
+            folders.push(crate::manage::model::RemoteFolder {
+                name: role.into(),
+                label: label.into(),
+                ..Default::default()
+            });
+        }
         let folder_label = |name: &str| {
             folders
                 .iter()
@@ -430,10 +512,65 @@ impl MailApp {
                 Act::MarkRead => "mark as read".to_owned(),
                 Act::Star => "star".to_owned(),
                 Act::Discard => "delete".to_owned(),
+                Act::Redirect(to) if r.keep_copy => format!("send a copy to {to}"),
+                Act::Redirect(to) => format!("send on to {to}"),
+                Act::Reject(_) => "refuse".to_owned(),
+                Act::Label(l) => format!("label “{l}”"),
             };
-            format!("{} contains “{}”: {what}", r.field.label(), r.value)
+            let field = if r.field == Field::Header {
+                format!("Header {}", r.header)
+            } else {
+                r.field.label().to_owned()
+            };
+            if r.field == Field::LargerThan {
+                return format!("{}larger than {} KB: {what}", if r.negate { "Not " } else { "" }, r.value);
+            }
+            format!(
+                "{field} {}{} “{}”: {what}",
+                if r.negate { "doesn't " } else { "" },
+                if r.negate {
+                    match r.matching {
+                        crate::sync::sieve::Match::Contains => "contain",
+                        crate::sync::sieve::Match::Is => "equal",
+                        crate::sync::sieve::Match::Matches => "match",
+                        crate::sync::sieve::Match::Regex => "match the pattern",
+                    }
+                } else {
+                    r.matching.label()
+                },
+                r.value
+            )
         };
         let mut page = div().flex().flex_col().gap_4();
+        if let Some(other) = &state.other_active
+            && let Some(read) = state.other_rules.as_ref().filter(|r| !r.filters.rules.is_empty())
+        {
+            let n = read.filters.rules.len();
+            page = page.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .child(div().flex_1().text_color(rgb(c.muted)).child(format!(
+                        "“{other}” has {n} {} Picacho can show{}.",
+                        if n == 1 { "filter" } else { "filters" },
+                        if read.left_out > 0 {
+                            format!(", and {} more it can't", read.left_out)
+                        } else {
+                            String::new()
+                        }
+                    )))
+                    .child(self.button(
+                        format!("filters-adopt-{id}"),
+                        "Edit Them Here",
+                        "filter",
+                        act(FilterAction::AdoptOtherRules(id.clone())),
+                        false,
+                        cx,
+                    )),
+            );
+        }
         if let Some(other) = &state.other_active {
             if state.has("include") {
                 let including = ui.draft.include.is_some();
@@ -515,6 +652,7 @@ impl MailApp {
             &format!("filter-field-{id}"),
             Field::ALL
                 .iter()
+                .filter(|f| f.needs().is_none_or(|e| state.has(e)))
                 .map(|f| {
                     (
                         f.label().to_owned(),
@@ -525,23 +663,49 @@ impl MailApp {
                 .collect(),
             cx,
         );
-        let mut acts: Vec<(String, Action, bool)> = vec![
-            (
-                "Mark read".into(),
-                act(FilterAction::NewAct(id.clone(), Act::MarkRead)),
-                ui.new_act == Act::MarkRead,
-            ),
-            (
-                "Star".into(),
-                act(FilterAction::NewAct(id.clone(), Act::Star)),
-                ui.new_act == Act::Star,
-            ),
-            (
-                "Delete".into(),
-                act(FilterAction::NewAct(id.clone(), Act::Discard)),
-                ui.new_act == Act::Discard,
-            ),
-        ];
+        let mut acts: Vec<(String, Action, bool)> = vec![(
+            "Delete".into(),
+            act(FilterAction::NewAct(id.clone(), Act::Discard)),
+            ui.new_act == Act::Discard,
+        )];
+        // Setting flags needs the server's imap4flags (RFC 5232).
+        if state.has("imap4flags") {
+            acts.insert(
+                0,
+                (
+                    "Star".into(),
+                    act(FilterAction::NewAct(id.clone(), Act::Star)),
+                    ui.new_act == Act::Star,
+                ),
+            );
+            acts.insert(
+                0,
+                (
+                    "Mark read".into(),
+                    act(FilterAction::NewAct(id.clone(), Act::MarkRead)),
+                    ui.new_act == Act::MarkRead,
+                ),
+            );
+        }
+        if state.has("imap4flags") {
+            acts.push((
+                "Label".into(),
+                act(FilterAction::NewAct(id.clone(), Act::Label(String::new()))),
+                matches!(ui.new_act, Act::Label(_)),
+            ));
+        }
+        acts.push((
+            "Send on".into(),
+            act(FilterAction::NewAct(id.clone(), Act::Redirect(String::new()))),
+            matches!(ui.new_act, Act::Redirect(_)),
+        ));
+        if state.has("reject") {
+            acts.push((
+                "Refuse".into(),
+                act(FilterAction::NewAct(id.clone(), Act::Reject(String::new()))),
+                matches!(ui.new_act, Act::Reject(_)),
+            ));
+        }
         if state.has("fileinto") {
             acts.insert(
                 0,
@@ -575,12 +739,32 @@ impl MailApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child("contains"),
-                    )
+                    .when(ui.new_field == Field::Header, |d| {
+                        d.child(div().w(px(140.)).child(field(Input::new(&self.filter_inputs.extra), c, false)))
+                    })
+                    .child(self.link(
+                        &format!("filter-negate-{id}"),
+                        if ui.new_negate { "doesn't" } else { "does" },
+                        act(FilterAction::ToggleNegate(id.clone())),
+                        cx,
+                    ))
+                    .when(ui.new_field != Field::LargerThan, |d| {
+                        d.child(self.segmented(
+                            &format!("filter-match-{id}"),
+                            crate::sync::sieve::Match::ALL
+                                .iter()
+                                .filter(|m| **m != crate::sync::sieve::Match::Regex || state.has("regex"))
+                                .map(|m| {
+                                    (
+                                        m.label().to_owned(),
+                                        act(FilterAction::NewMatch(id.clone(), *m)),
+                                        ui.new_match == *m,
+                                    )
+                                })
+                                .collect(),
+                            cx,
+                        ))
+                    })
                     .child(div().flex_1().child(field(
                         Input::new(&self.filter_inputs.value),
                         c,
@@ -594,6 +778,10 @@ impl MailApp {
                     .child("then"),
             )
             .child(self.segmented(&format!("filter-act-{id}"), acts, cx));
+        // The action's own text.
+        if matches!(ui.new_act, Act::Redirect(_) | Act::Reject(_) | Act::Label(_)) {
+            form = form.child(div().max_w(px(360.)).child(field(Input::new(&self.filter_inputs.act_text), c, false)));
+        }
         if let Act::Folder(chosen) = &ui.new_act {
             if folders.is_empty() {
                 form = form.child(

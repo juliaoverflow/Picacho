@@ -113,8 +113,11 @@ impl MailApp {
                 .into_any_element()
         } else {
             div()
+                .id("openpgp-keys")
                 .flex()
                 .flex_col()
+                .role(Role::List)
+                .aria_label("OpenPGP keys")
                 .children(keys.iter().map(row))
                 .into_any_element()
         };
@@ -151,12 +154,19 @@ impl MailApp {
                             .id("openpgp-passphrase")
                             .child(field(Input::new(&self.key_passphrase), c, false)),
                     )
-                    .child(div().flex().child(self.button(
+                    .child(div().flex().gap_2().child(self.button(
                         "openpgp-import",
                         "Import Keys…",
                         "upload",
                         Action::ImportKeys,
                         true,
+                        cx,
+                    )).child(self.button(
+                        "openpgp-create",
+                        "Create a Key",
+                        "lock",
+                        Action::CreateKey,
+                        false,
                         cx,
                     ))),
             ))
@@ -216,12 +226,59 @@ impl MailApp {
                 page.child(
                     div()
                         .id("openpgp-error")
+                        .role(Role::Alert)
                         .text_size(px(12.))
                         .text_color(rgb(c.danger))
                         .child(e),
                 )
             })
             .into_any_element()
+    }
+
+    /// Above an Autocrypt Setup Message (your key, sent by another of your
+    /// mail apps): the setup code to type, and a button to take the key in.
+    pub(super) fn setup_message_card(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
+        if !m.subject.trim().eq_ignore_ascii_case("Autocrypt Setup Message") || !m.has_attachments {
+            return None;
+        }
+        let c = self.colors();
+        Some(
+            div()
+                .id("autocrypt-setup")
+                .role(Role::Region)
+                .aria_label("Autocrypt setup message")
+                .m_3()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
+                .child(div().font_weight(FontWeight::MEDIUM).child("Your encryption key, from another mail app"))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Type the setup code that app showed you (36 digits) to use the same key here."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().w(px(320.)).child(field(Input::new(&self.key_passphrase), c, false)))
+                        .child(self.button(
+                            "autocrypt-setup-import",
+                            "Import Key",
+                            "lock",
+                            Action::ImportSetupMessage(m.id.clone()),
+                            true,
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+        )
     }
 
     pub(super) fn encryption_action(
@@ -275,6 +332,54 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::ImportSetupMessage(id) => {
+                let code = self.key_passphrase.read(cx).value().to_string();
+                self.key_passphrase.update(cx, |i, cx| i.set_text("", w, cx));
+                let Some(m) = self.messages.iter().find(|m| m.id == id).cloned() else {
+                    return;
+                };
+                let Some(a) = self.account_of(&m) else { return };
+                self.key_error = None;
+                self.task(
+                    cx,
+                    move |b| {
+                        let raw = b.original(&a, &m)?;
+                        let mut ring = Keyring::clone(&b.keyring());
+                        let n = ring.import_setup_message(&raw, &code)?;
+                        b.set_keyring(ring)?;
+                        Ok(n)
+                    },
+                    |this, result, cx| match result {
+                        Ok(_) => this.notice("Your key from the other app is ready to use", false, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
+            Action::CreateKey => {
+                let Some(a) = self.current_account() else {
+                    self.key_error = Some("Add an account first: the key is for its address.".into());
+                    return;
+                };
+                self.key_error = None;
+                let (name, email) = (a.name.clone(), a.email.clone());
+                self.task(
+                    cx,
+                    move |b| {
+                        let mut ring = Keyring::clone(&b.keyring());
+                        anyhow::ensure!(
+                            ring.own_key(&email).is_none(),
+                            "You already have a key for {email}."
+                        );
+                        let fp = ring.create(&name, &email)?;
+                        b.set_keyring(ring)?;
+                        Ok(fp)
+                    },
+                    |this, result, cx| match result {
+                        Ok(_) => this.notice("Your new key is ready. Save your public key to share it.", false, cx),
+                        Err(e) => this.key_error = Some(format!("{e:#}")),
+                    },
+                );
+            }
             Action::CheckKey(fp) => {
                 self.key_checking = (self.key_checking.as_ref() != Some(&fp)).then_some(fp);
                 self.key_check_input
@@ -315,7 +420,7 @@ impl MailApp {
             Action::ExportPublicKeys => {
                 let ring = self.backend.keyring();
                 let picker =
-                    cx.prompt_for_new_path(&self.backend.store.path, Some("public-key.asc"));
+                    cx.prompt_for_new_path(&self.save_start(), Some("public-key.asc"));
                 cx.spawn(async move |this, cx| {
                     let Ok(Ok(Some(path))) = picker.await else {
                         return;
@@ -338,8 +443,37 @@ impl MailApp {
             }
             Action::FindKey => {
                 let email = self.key_lookup.read(cx).value().trim().to_owned();
+                // A fingerprint (40 or 64 hex digits, spaces allowed): by
+                // HKP, as the key is imported by hand.
+                let hex: String = email.chars().filter(|c| !c.is_whitespace()).collect();
+                let hex = hex.trim_start_matches("0x").trim_start_matches("openpgp4fpr:").to_owned();
+                if (hex.len() == 40 || hex.len() == 64) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    self.key_busy = true;
+                    self.key_error = None;
+                    self.task(
+                        cx,
+                        move |b| {
+                            let tls = b.tls_connector_pub()?;
+                            let data = crate::sync::keys::lookup_fingerprint(&hex, tls)?
+                                .context("No key with that fingerprint was found.")?;
+                            let mut ring = Keyring::clone(&b.keyring());
+                            let text = String::from_utf8(data).context("The key found couldn't be read.")?;
+                            ring.import(&text, "")?;
+                            b.set_keyring(ring)?;
+                            Ok("Found the key on keys.openpgp.org".to_owned())
+                        },
+                        |this, result, cx| {
+                            this.key_busy = false;
+                            match result {
+                                Ok(done) => this.notice(done, false, cx),
+                                Err(e) => this.key_error = Some(format!("{e:#}")),
+                            }
+                        },
+                    );
+                    return;
+                }
                 if !email.contains('@') {
-                    self.key_error = Some("Enter an email address to look its key up.".into());
+                    self.key_error = Some("Enter an email address or a key's fingerprint to look it up.".into());
                     cx.notify();
                     return;
                 }
@@ -504,6 +638,8 @@ impl MailApp {
                             .gap_y_1()
                             .font_family("monospace")
                             .text_size(px(15.))
+                            .id("openpgp-fingerprint")
+                            .aria_label(format!("Fingerprint {}", groups.join(" ")))
                             .children(groups.iter().map(|g| div().child(g.clone()))),
                     )
                     .child(
@@ -512,6 +648,9 @@ impl MailApp {
                             .rounded(px(8.))
                             .bg(rgb(0xffffff))
                             .size(px(140.))
+                            .id("openpgp-fingerprint-qr")
+                            .role(Role::Image)
+                            .aria_label("QR code of this key's fingerprint")
                             .child(super::proton_login::qr_code(&format!("OPENPGP4FPR:{fp}"), 124.)),
                     ),
             )

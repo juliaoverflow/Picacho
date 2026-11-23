@@ -199,6 +199,14 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
     #[cfg(not(target_os = "android"))]
     std::thread::spawn(move || {
         let _ = key;
+        // Each notification waiting for a click holds this thread (and, on
+        // Linux, a D-Bus connection) until it is clicked or dismissed, which
+        // a notification center can put off for days. At most `WAITING` wait;
+        // past them a notification still shows, without opening on a click.
+        #[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+        let waiting = Waiting::take();
+        #[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+        let target = if waiting.is_some() { target } else { String::new() };
         #[cfg(target_os = "macos")]
         {
             static APP: std::sync::Once = std::sync::Once::new();
@@ -256,4 +264,27 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
         #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
         let _ = (shown, target);
     });
+}
+
+/// A place among the notifications waiting for a click (see `show`).
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+struct Waiting;
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+static WAITING_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+impl Waiting {
+    const MOST: usize = 32;
+    fn take() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        WAITING_NOW
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < Self::MOST).then_some(n + 1))
+            .ok()
+            .map(|_| Waiting)
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        WAITING_NOW.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }

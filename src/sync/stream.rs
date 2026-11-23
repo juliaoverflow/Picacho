@@ -91,6 +91,9 @@ pub(crate) struct ImapStream {
     /// A line read while sending literals that wasn't a go-ahead: the
     /// imap crate reads it next.
     unread: Vec<u8>,
+    /// The end of the last read, so a `[INPROGRESS` split between two
+    /// reads is still seen.
+    tail: Vec<u8>,
 }
 
 /// Commands with literals of any bytes, through the imap crate's text
@@ -157,6 +160,7 @@ impl ImapStream {
             compressing: Arc::new(AtomicBool::new(false)),
             literals,
             unread: Vec::new(),
+            tail: Vec::new(),
         }
     }
     /// Reads one line from below the imap crate's buffer, which is empty
@@ -180,17 +184,47 @@ impl ImapStream {
     /// instead) is left for the imap crate to read; nothing more is sent.
     fn send_literals(&mut self) -> io::Result<()> {
         let queued = Literals(self.literals.clone()).take();
-        for piece in queued {
-            let line = self.line_below()?;
-            if !line.starts_with(b"+") {
-                // Give the answer back to the imap crate's reader.
-                self.unread = line;
-                return Ok(());
+        // Untagged lines may come before the go-ahead (RFC 3501 §5.5:
+        // EXISTS, FETCH…); they are kept for the imap crate, in order.
+        let mut held = Vec::new();
+        let result = (|| {
+            for piece in queued {
+                loop {
+                    let line = self.line_below()?;
+                    if line.starts_with(b"+") {
+                        break;
+                    }
+                    let untagged = line.starts_with(b"* ");
+                    held.extend_from_slice(&line);
+                    if untagged {
+                        // Its own literal, if it ends with one, is read
+                        // whole before the next line.
+                        if let Some(n) = trailing_literal(&line) {
+                            for _ in 0..n {
+                                let mut byte = [0u8];
+                                if self.read(&mut byte)? == 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "The server closed the connection during a command.",
+                                    ));
+                                }
+                                held.push(byte[0]);
+                            }
+                        }
+                        continue;
+                    }
+                    // A refusal (tagged NO or BAD): nothing more is sent.
+                    return Ok(());
+                }
+                self.write_plain(&piece)?;
+                self.tls.flush()?;
             }
-            self.write_plain(&piece)?;
-            self.tls.flush()?;
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Give what was read back to the imap crate's reader.
+        held.append(&mut self.unread);
+        self.unread = held;
+        result
     }
     /// The TLS channel binding, for SCRAM-PLUS.
     pub(crate) fn binding(&self) -> Vec<u8> {
@@ -214,6 +248,15 @@ impl ImapStream {
         }
         self.deflate.as_deref_mut()
     }
+}
+/// `{n}` (or `{n+}`) ending a line: a literal of `n` bytes follows.
+fn trailing_literal(line: &[u8]) -> Option<usize> {
+    let line = line.strip_suffix(b"\r\n").or_else(|| line.strip_suffix(b"\n"))?;
+    let line = line.strip_suffix(b"}")?;
+    let open = line.iter().rposition(|b| *b == b'{')?;
+    let digits = &line[open + 1..];
+    let digits = digits.strip_suffix(b"+").unwrap_or(digits);
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
@@ -248,8 +291,14 @@ impl Read for ImapStream {
         // servers listing INPROGRESS send it unasked). A mention elsewhere
         // (inside a message) only extends the time by one more budget,
         // still bounded by the byte limit.
-        if read > 0 && contains(&buf[..read], b"[INPROGRESS") {
-            self.tls.get_mut().progressed();
+        if read > 0 {
+            let mut seen = std::mem::take(&mut self.tail);
+            seen.extend_from_slice(&buf[..read]);
+            if contains(&seen, b"[INPROGRESS") {
+                self.tls.get_mut().progressed();
+            }
+            let keep = seen.len().min(b"[INPROGRESS".len() - 1);
+            self.tail = seen[seen.len() - keep..].to_vec();
         }
         Ok(read)
     }
@@ -288,9 +337,11 @@ impl ImapStream {
                 d.spend(made)?;
                 out.truncate(made);
                 d.output = out;
-                if status == Status::StreamEnd {
+                if status == Status::StreamEnd && made == 0 {
                     return Err(invalid("the server ended compression"));
                 }
+                // An end of the stream with its last bytes: those are
+                // handed out first; the end is reported on the next read.
                 if made > 0 {
                     continue;
                 }
@@ -364,6 +415,12 @@ impl imap::extensions::idle::SetReadTimeout for ImapStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn literals_ending_lines_are_found() {
+        assert_eq!(trailing_literal(b"* 1 FETCH (BODY[] {12}\r\n"), Some(12));
+        assert_eq!(trailing_literal(b"* LIST () \"/\" {4+}\r\n"), Some(4));
+        assert_eq!(trailing_literal(b"* 1 EXISTS\r\n"), None);
+    }
     use super::*;
     /// What a response inflates to is bounded, not just what it costs on
     /// the wire: a few compressed megabytes can inflate to gigabytes.

@@ -380,11 +380,19 @@ impl Backend {
     pub fn import_contacts(&self, paths: &[std::path::PathBuf]) -> Result<usize> {
         let mut added = Vec::new();
         for path in paths {
+            // Address books are megabytes at most (photos included): a file
+            // past this isn't one, and isn't read into memory whole.
+            ensure!(
+                std::fs::metadata(path)?.len() <= 256 * 1024 * 1024,
+                "{} is too large to be an address book.",
+                path.display()
+            );
             let bytes = std::fs::read(path)?;
             added.extend(
                 carddav::parse_vcards(&String::from_utf8_lossy(&bytes))
                     .into_iter()
-                    .filter(|c| !c.emails.is_empty())
+                    // People with an address or number, and groups.
+                    .filter(|c| !c.emails.is_empty() || !c.phones.is_empty() || c.group)
                     .map(|mut c| {
                         // Imported cards are this computer's, not the server's.
                         c.href.clear();
@@ -395,7 +403,7 @@ impl Backend {
         }
         ensure!(
             !added.is_empty(),
-            "No contacts with email addresses were found in that file."
+            "No contacts were found in that file."
         );
         let count = added.len();
         let mut all = self.contacts();

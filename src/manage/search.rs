@@ -182,7 +182,8 @@ impl Search {
         let mut parts = Vec::new();
         for t in &self.terms {
             let v = || string(&t.value);
-            let seconds = || t.value.parse::<i64>().unwrap_or(0);
+            // WITHIN's interval is a positive nz-number (RFC 5032 §3).
+            let seconds = || t.value.parse::<i64>().unwrap_or(0).clamp(1, i64::from(u32::MAX));
             let part = match t.field {
                 Field::Any if can.fuzzy => format!("FUZZY (TEXT {})", v()?),
                 Field::Any => format!("TEXT {}", v()?),
@@ -299,7 +300,15 @@ fn any_subject(
 
 impl Term {
     fn matches(&self, m: &Mail, kinds: Option<&Kinds>) -> bool {
-        let has = |s: &str| s.to_lowercase().contains(&self.value);
+        // Most text is ASCII: compared without a lowercase copy of each
+        // field, for each term, of every message searched.
+        let has = |s: &str| {
+            if s.is_ascii() && self.value.is_ascii() {
+                contains_ignoring_ascii_case(s, &self.value)
+            } else {
+                s.to_lowercase().contains(&self.value)
+            }
+        };
         match self.field {
             Field::Any => [&m.sender, &m.from, &m.subject, &m.snippet]
                 .iter()
@@ -331,6 +340,15 @@ impl Term {
             }
         }
     }
+}
+
+/// Whether `text` has `lower` (lowercase) in it, ignoring ASCII case.
+fn contains_ignoring_ascii_case(text: &str, lower: &str) -> bool {
+    let (text, lower) = (text.as_bytes(), lower.as_bytes());
+    lower.is_empty()
+        || text
+            .windows(lower.len())
+            .any(|w| w.iter().zip(lower).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
 /// Splits on whitespace outside double quotes. Each token comes with

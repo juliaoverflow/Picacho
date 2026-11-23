@@ -28,18 +28,46 @@ impl Backend {
         format!("offline_changes:{account}")
     }
     /// The changes waiting for a connection, oldest first.
+    #[cfg(test)]
     pub fn queued_changes(&self, account: &str) -> Vec<QueuedChange> {
-        self.store
-            .preference(&Self::offline_key(account))
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        self.queued_rows(account).into_iter().map(|(_, c)| c).collect()
     }
-    fn save_queue(&self, account: &str, queue: &[QueuedChange]) -> Result<()> {
-        if queue.is_empty() {
-            return self.store.set_preference(&Self::offline_key(account), "[]");
+    /// How many messages changes waiting for a connection are for.
+    pub fn queued_messages(&self, account: &str) -> usize {
+        self.adopt_saved_queue(account);
+        self.store.queued_messages(account)
+    }
+    /// The queued changes with their numbers in the queue, oldest first. A
+    /// change that can't be read (from another version) is let go.
+    fn queued_rows(&self, account: &str) -> Vec<(i64, QueuedChange)> {
+        self.adopt_saved_queue(account);
+        let mut out = Vec::new();
+        for (seq, data) in self.store.queued_changes(account).unwrap_or_default() {
+            match serde_json::from_str(&data) {
+                Ok(change) => out.push((seq, change)),
+                Err(_) => {
+                    let _ = self.store.dequeue_change(seq);
+                }
+            }
         }
-        self.store
-            .set_preference(&Self::offline_key(account), &serde_json::to_string(queue)?)
+        out
+    }
+    /// Moves a queue saved the earlier way (one preference holding them all,
+    /// written again whole for every change) into the queue's table, once.
+    fn adopt_saved_queue(&self, account: &str) {
+        let key = Self::offline_key(account);
+        let Some(saved) = self.store.preference(&key) else {
+            return;
+        };
+        let queue: Vec<QueuedChange> = serde_json::from_str(&saved).unwrap_or_default();
+        let older: Vec<(String, usize)> = queue
+            .iter()
+            .filter_map(|c| Some((serde_json::to_string(c).ok()?, c.mails.len())))
+            .collect();
+        // Ahead of anything queued since: they were made first.
+        if self.store.queue_changes_first(account, &older).is_ok() {
+            let _ = self.store.remove_preference(&key);
+        }
     }
     /// Shows a change that couldn't reach the server in the cache, and
     /// queues what of it the server hasn't confirmed. Callers hold the
@@ -65,8 +93,10 @@ impl Backend {
             return Ok(());
         }
         self.commit_change(&pending, change.clone(), false)?;
-        let mut queue = self.queued_changes(&a.id);
-        queue.push(QueuedChange {
+        self.adopt_saved_queue(&a.id);
+        // Added as a row of its own: the queue isn't read and written again
+        // whole for each change.
+        let queued = QueuedChange {
             mails: pending
                 .into_iter()
                 .map(|mut m| {
@@ -79,8 +109,9 @@ impl Backend {
                 .collect(),
             change: change.clone(),
             at: chrono::Utc::now().timestamp(),
-        });
-        self.save_queue(&a.id, &queue)
+        };
+        self.store
+            .queue_change(&a.id, queued.mails.len(), &serde_json::to_string(&queued)?)
     }
     /// Sends queued changes to Proton, oldest first, as `replay_offline`
     /// does for IMAP. Callers hold the lock.
@@ -94,31 +125,25 @@ impl Backend {
         a: &Account,
         apply: impl Fn(&[Mail], &Change) -> Result<()>,
     ) -> Result<()> {
-        let mut queue = self.queued_changes(&a.id);
-        if queue.is_empty() {
-            return Ok(());
-        }
+        self.replay_queue(a, |mails, change| apply(mails, change))
+    }
+    /// Sends `a`'s queued changes with `apply`, oldest first, taking each off
+    /// the queue once sent (or once it can't be: too old, or the server
+    /// refused it). Stops, keeping it and the rest, at one that fails for
+    /// now (the connection).
+    fn replay_queue(&self, a: &Account, mut apply: impl FnMut(&[Mail], &Change) -> Result<()>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        while let Some(next) = queue.first().cloned() {
-            if now - next.at > KEEP_FOR {
-                queue.remove(0);
-                continue;
-            }
-            match apply(&next.mails, &next.change) {
-                Ok(()) => {
-                    queue.remove(0);
-                }
-                Err(e) if crate::sync::retry::later(&e) => {
-                    self.save_queue(&a.id, &queue)?;
-                    return Err(e);
-                }
-                // A message or folder that's gone: the change can't be made
-                // as it was. The next sync shows the server's state.
-                Err(_) => {
-                    queue.remove(0);
+        for (seq, next) in self.queued_rows(&a.id) {
+            if now - next.at <= KEEP_FOR {
+                match apply(&next.mails, &next.change) {
+                    Ok(()) => {}
+                    Err(e) if crate::sync::retry::later(&e) => return Err(e),
+                    // A message or folder that's gone: the change can't be
+                    // made as it was. The next sync shows the server's state.
+                    Err(_) => {}
                 }
             }
-            self.save_queue(&a.id, &queue)?;
+            self.store.dequeue_change(seq)?;
         }
         Ok(())
     }
@@ -126,33 +151,51 @@ impl Backend {
     /// Stops (keeping the rest) if the connection fails again; drops
     /// changes the server can't take any more. Callers hold the lock.
     pub(super) fn replay_offline(&self, c: &mut Connection, a: &Account) -> Result<()> {
-        let mut queue = self.queued_changes(&a.id);
-        if queue.is_empty() {
-            return Ok(());
-        }
-        let now = chrono::Utc::now().timestamp();
-        while let Some(next) = queue.first().cloned() {
-            if now - next.at > KEEP_FOR {
-                queue.remove(0);
-                continue;
-            }
-            match self.change_remote(c, a, &next.mails, next.change.clone(), false) {
-                Ok(()) => {
-                    queue.remove(0);
-                }
-                Err(e) if crate::sync::retry::later(&e) => {
-                    self.save_queue(&a.id, &queue)?;
-                    return Err(e);
-                }
-                // Reset mailbox, removed folder, refused command: it can't
-                // be applied as it was made. The next sync shows the
-                // server's state.
-                Err(_) => {
-                    queue.remove(0);
-                }
-            }
-            self.save_queue(&a.id, &queue)?;
-        }
+        self.replay_queue(a, |mails, change| {
+            self.change_remote(c, a, mails, change.clone(), false)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manage::store::Store;
+
+    /// Changes are kept a row each, sent oldest first, and taken off as sent;
+    /// one that fails for now stays with those after it. A queue saved the
+    /// earlier way (one preference) is moved over.
+    #[test]
+    fn queued_changes_are_kept_and_sent_in_order() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-offline-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(Store::open(&path)?));
+        let a = Account::new(Provider::Imap);
+        let mails = crate::manage::model::demo_mail();
+        let change = |n: usize| QueuedChange {
+            mails: mails[..n].to_vec(),
+            change: Change::Read(true),
+            at: chrono::Utc::now().timestamp(),
+        };
+        // Saved by an earlier version: one preference with the whole queue.
+        b.store.set_preference(&Backend::offline_key(&a.id), &serde_json::to_string(&vec![change(1)])?)?;
+        b.store.queue_change(&a.id, 2, &serde_json::to_string(&change(2))?)?;
+        b.store.queue_change(&a.id, 3, &serde_json::to_string(&change(3))?)?;
+        assert_eq!(b.queued_messages(&a.id), 6);
+        assert!(b.store.preference(&Backend::offline_key(&a.id)).is_none(), "moved");
+        // The first goes; the second fails for now: it and the third stay.
+        let mut sent = Vec::new();
+        let result = b.replay_queue(&a, |m, _| {
+            sent.push(m.len());
+            if m.len() == 3 { Err(anyhow::anyhow!(std::io::Error::from(std::io::ErrorKind::TimedOut))) } else { Ok(()) }
+        });
+        assert!(result.is_err());
+        assert_eq!(sent, [1, 2, 3], "oldest (the moved one) first, stopping at the failure");
+        assert_eq!(b.queued_changes(&a.id).iter().map(|c| c.mails.len()).collect::<Vec<_>>(), [3]);
+        // Then the rest go.
+        b.replay_queue(&a, |_, _| Ok(()))?;
+        assert_eq!(b.queued_messages(&a.id), 0);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
         Ok(())
     }
 }

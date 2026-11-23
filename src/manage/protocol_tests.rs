@@ -480,6 +480,7 @@ fn openpgp_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
         body: "Only Rae reads this.".into(),
         sign: true,
         encrypt: true,
+        encrypt_subject: true,
         ..Default::default()
     };
     b.store.save_draft(&d)?;
@@ -487,7 +488,7 @@ fn openpgp_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
     let raw = server.join().unwrap();
     result?;
     let text = String::from_utf8_lossy(&raw);
-    assert!(text.contains("Subject: Sealed") && text.contains("multipart/encrypted"));
+    assert!(text.contains("Subject: ...") && !text.contains("Sealed") && text.contains("multipart/encrypted"));
     assert!(!text.contains("Only Rae reads this"));
     // Rae's keys open it, and find it signed by QA.
     let mut raes = Keyring::default();
@@ -504,6 +505,13 @@ fn openpgp_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
     let read = b.read(&a, &sent[0])?;
     assert!(read.body.unwrap_or_default().contains("Only Rae reads this."));
     assert!(b.store.message(&sent[0].id)?.unwrap().body.is_none(), "kept out of the cache");
+    // The hidden subject too: the cache keeps the envelope's, which is
+    // what snoozing would tell the server; lists get the real one back
+    // while the message is in memory.
+    assert_eq!(read.subject, "Sealed");
+    let kept = b.store.message(&sent[0].id)?.unwrap();
+    assert_eq!(kept.subject, "...");
+    assert_eq!(b.with_readable_previews(vec![kept])[0].subject, "Sealed");
     assert!(b.verdict(&sent[0].id).unwrap().decrypted);
     drop(b);
     std::fs::remove_dir_all(path)?;
@@ -608,6 +616,8 @@ fn pop3_tls_download_is_deduplicated_and_local_moves_survive_sync() -> Result<()
                     b"+OK password\r\n".to_vec()
                 } else if line == "UIDL\r\n" {
                     b"+OK ids\r\n1 stable-uid\r\n.\r\n".to_vec()
+                } else if line == "LIST\r\n" {
+                    b"+OK sizes\r\n1 100\r\n.\r\n".to_vec()
                 } else if line == "RETR 1\r\n" {
                     downloads += 1;
                     [b"+OK message\r\n".as_slice(), MESSAGE, b".\r\n".as_slice()].concat()
@@ -964,7 +974,7 @@ fn imap_folder_delete_follows_the_servers_rights() -> Result<()> {
                 let (tag, command) = line.trim_end().split_once(' ').unwrap();
                 let upper = command.to_ascii_uppercase();
                 let mut out = String::new();
-                if upper.starts_with("LOGIN") {
+                if upper.starts_with("LOGIN") || upper.starts_with("UNSUBSCRIBE") {
                 } else if upper == "CAPABILITY" {
                     out.push_str("* CAPABILITY IMAP4rev1\r\n");
                 } else if upper.starts_with("LIST") {
@@ -1054,7 +1064,7 @@ fn imap_folder_create_and_rename() -> Result<()> {
                 let upper = command.to_ascii_uppercase();
                 let mut out = String::new();
                 let unquote = |s: &str| s.trim_matches('"').to_owned();
-                if upper.starts_with("LOGIN") || upper.starts_with("SUBSCRIBE") {
+                if upper.starts_with("LOGIN") || upper.starts_with("SUBSCRIBE") || upper.starts_with("UNSUBSCRIBE") {
                 } else if upper == "CAPABILITY" {
                     out.push_str("* CAPABILITY IMAP4rev1\r\n");
                 } else if upper.starts_with("LIST") {

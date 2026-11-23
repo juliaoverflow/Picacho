@@ -432,9 +432,12 @@ fn status_among(text: &str, table: &[(Status, &[&str])], news_only: bool) -> Opt
                     // Only the phrase's own sentence and line: "If you have
                     // questions, reply.\nDelivered" is news.
                     let window = &lower[start..at];
+                    // Past the separator's own bytes: '•' is three.
                     let window = window
-                        .rfind(['\n', '.', '!', '?', '|', '•'])
-                        .map_or(window, |i| &window[i + 1..]);
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| matches!(c, '\n' | '.' | '!' | '?' | '|' | '•'))
+                        .map_or(window, |(i, c)| &window[i + c.len_utf8()..]);
                     if NOT_YET.iter().any(|w| window.contains(w)) {
                         continue;
                     }

@@ -19,16 +19,18 @@ impl MailApp {
         let n = picked.len();
         let unread = picked.iter().filter(|m| m.unread).count();
         let all_starred = n > 0 && picked.iter().all(|m| m.starred);
-        // The senders, most frequent first.
-        let mut senders: Vec<(String, usize)> = Vec::new();
-        for m in &picked {
+        // The senders, most frequent first (counted in a map: a list
+        // searched for each message was slow with thousands selected).
+        let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+        for (i, m) in picked.iter().enumerate() {
             let name = if m.sender.trim().is_empty() { &m.from } else { &m.sender };
-            match senders.iter_mut().find(|(s, _)| s == name) {
-                Some((_, count)) => *count += 1,
-                None => senders.push((name.clone(), 1)),
-            }
+            counts.entry(name.as_str()).or_insert((0, i)).0 += 1;
         }
-        senders.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        // Ties keep the order they were first seen in, as before.
+        let mut senders: Vec<(String, usize, usize)> =
+            counts.into_iter().map(|(name, (n, first))| (name.to_owned(), n, first)).collect();
+        senders.sort_by_key(|(_, count, first)| (std::cmp::Reverse(*count), *first));
+        let senders: Vec<(String, usize)> = senders.into_iter().map(|(s, n, _)| (s, n)).collect();
         let shown = senders.len().min(3);
         let mut who = senders[..shown]
             .iter()
@@ -223,9 +225,22 @@ impl MailApp {
         }
         let max = f32::from(self.reader_scroll.max_offset().y);
         let viewport = f32::from(self.reader_scroll.bounds().size.height);
-        if max <= 0. || self.html_view.read(cx).is_loading() {
+        if self.html_view.read(cx).is_loading() {
             // Laid out on a later frame.
             window.request_animation_frame();
+            return;
+        }
+        if max <= 0. {
+            // Its height can reach the scroll a frame or two after it's laid
+            // out. A message that never scrolls (it fits) gives up after a
+            // second: it asked for a frame on every frame, for as long as it
+            // stayed open.
+            self.reveal_waited += 1;
+            if self.reveal_waited > 60 {
+                self.reveal = None;
+            } else {
+                window.request_animation_frame();
+            }
             return;
         }
         self.reveal = None;
@@ -559,7 +574,8 @@ impl MailApp {
             .child(div().h(px(1.)).bg(rgb(c.border)).mb_6())
             .children((!locked).then(|| self.codes_banner(m, cx)).flatten())
             .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) })
-            .children((!locked).then(|| self.invitation_card(m, cx)).flatten());
+            .children((!locked).then(|| self.invitation_card(m, cx)).flatten())
+            .children((!locked).then(|| self.setup_message_card(m, cx)).flatten());
         if !locked && !self.invitations.contains_key(&m.id) {
             let m = m.clone();
             let view = cx.entity().downgrade();
@@ -1604,11 +1620,22 @@ impl MailApp {
                             .child(fact("Message ID", d.message_id.clone()))
                             .child(fact("Created at", d.date.clone()))
                             .child(fact("From", d.from.clone()))
+                            .when(!d.sender.is_empty(), |e| e.child(fact("Sent by", d.sender.clone())))
                             .child(fact("To", d.to.clone()))
                             .child(fact("Subject", d.subject.clone()))
                             .child(fact("SPF", verdict(&d.spf, d.mailed_by.as_ref())))
                             .child(fact("DKIM", verdict(&d.dkim, d.signed_by.first())))
-                            .child(fact("DMARC", verdict(&d.dmarc, None)))
+                            .child(fact(
+                                "DMARC",
+                                match &d.dmarc_policy {
+                                    Some(p) if p != "none" => format!("{} (domain asks to {p} failures)", verdict(&d.dmarc, None)),
+                                    _ => verdict(&d.dmarc, None),
+                                },
+                            ))
+                            .when_some(d.arc.clone(), |e, arc| e.child(fact("ARC", arc)))
+                            .when(d.partly_signed, |e| {
+                                e.child(fact("Note", "Only the start of the message is signed; text after it could have been added.".into()))
+                            })
                             .child(fact("Security", d.security.label().into()))
                             .child(
                                 div()

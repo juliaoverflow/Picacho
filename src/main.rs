@@ -16,8 +16,10 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
     if first.as_deref() == Some(std::ffi::OsStr::new(sync::proton::VERIFY_FLAG)) {
-        let url = args.next().unwrap_or_default();
-        display::verify::run(&url.to_string_lossy());
+        // On standard input, not in the arguments (see `proton::verify_human`).
+        let mut url = String::new();
+        let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut url);
+        display::verify::run(url.trim());
     }
     // Started by the window's process as it quits, to check mail in the
     // background with a small process of its own (`display::resident`).

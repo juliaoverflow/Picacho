@@ -68,6 +68,33 @@ pub(crate) mod imp {
         }
     }
 
+    /// `gss_OID_desc` (`OM_uint32 length; void *elements`, aligned as C
+    /// lays it out on the systems other than macOS).
+    #[repr(C)]
+    struct OidDesc {
+        length: OmUint32,
+        elements: *const c_void,
+    }
+    // A pointer to static bytes, read only.
+    unsafe impl Sync for OidDesc {}
+    /// Kerberos 5's mechanism, 1.2.840.113554.1.2.2 (RFC 4752 §3.1 asks for
+    /// it by name, not the library's default).
+    static KRB5_OID_BYTES: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+    static KRB5_OID: OidDesc = OidDesc {
+        length: 9,
+        elements: KRB5_OID_BYTES.as_ptr() as *const c_void,
+    };
+    /// The mechanism to ask for: Kerberos 5 by its OID, except where the
+    /// library packs its structures differently (Apple's), whose default
+    /// is Kerberos anyway.
+    fn mechanism() -> *mut c_void {
+        if cfg!(target_os = "macos") {
+            std::ptr::null_mut()
+        } else {
+            &KRB5_OID as *const OidDesc as *mut c_void
+        }
+    }
+
     const COMPLETE: OmUint32 = 0;
     const CONTINUE_NEEDED: OmUint32 = 1;
     /// GSS_ERROR(): the calling and routine error fields.
@@ -338,7 +365,7 @@ pub(crate) mod imp {
                     std::ptr::null_mut(),
                     &mut self.context,
                     self.target,
-                    std::ptr::null_mut(),
+                    mechanism(),
                     MUTUAL | SEQUENCE | INTEG | CONF,
                     0,
                     std::ptr::null_mut(),
@@ -357,11 +384,24 @@ pub(crate) mod imp {
             if major & ERROR_MASK != 0 {
                 bail!(explain(&self.library.describe(major, minor)));
             }
+            // Supplementary bits besides "continue" (a duplicate, old or out
+            // of order token: the server's answer replayed) were taken to
+            // mean "continue".
+            ensure!(
+                major & 0xffff & !CONTINUE_NEEDED == 0,
+                "The server's Kerberos answer was replayed or out of order; not signed in."
+            );
             let done = major & 0xffff == COMPLETE && major & CONTINUE_NEEDED == 0;
             if done {
                 ensure!(
                     flags & MUTUAL != 0,
                     "The server didn't prove it is the service it claims to be (no Kerberos mutual authentication); not signed in."
+                );
+                // The security-layer exchange is wrapped (RFC 4752 §3.1):
+                // integrity must be on.
+                ensure!(
+                    flags & INTEG != 0,
+                    "The Kerberos sign-in has no integrity protection; not signed in."
                 );
                 self.established = true;
             }
@@ -583,7 +623,8 @@ mod imp {
     use windows_sys::Win32::Security::Authentication::Identity::{
         AcquireCredentialsHandleW, DecryptMessage, DeleteSecurityContext, EncryptMessage,
         FreeContextBuffer, FreeCredentialsHandle, ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY,
-        ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH, ISC_REQ_SEQUENCE_DETECT, ISC_RET_MUTUAL_AUTH,
+        ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH, ISC_REQ_SEQUENCE_DETECT, ISC_RET_INTEGRITY,
+        ISC_RET_MUTUAL_AUTH,
         InitializeSecurityContextW, QueryContextAttributesW, SECBUFFER_DATA, SECBUFFER_PADDING,
         SECBUFFER_STREAM, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_SIZES,
         SECPKG_CRED_OUTBOUND, SECQOP_WRAP_NO_ENCRYPT, SECURITY_NATIVE_DREP, SecBuffer,
@@ -718,6 +759,10 @@ mod imp {
                 ensure!(
                     attributes & ISC_RET_MUTUAL_AUTH != 0,
                     "The server didn't prove it is the service it claims to be (no Kerberos mutual authentication); not signed in."
+                );
+                ensure!(
+                    attributes & ISC_RET_INTEGRITY != 0,
+                    "The Kerberos sign-in has no integrity protection; not signed in."
                 );
                 self.established = true;
             }

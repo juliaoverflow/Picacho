@@ -387,6 +387,20 @@ fn fields_ask_for_the_keyboard_they_need(cx: &mut TestAppContext) {
         assert_eq!(keys(&this.form[TOTP]), Some(Keys::Number));
         assert_eq!(keys(&this.form[SMTP_HOST]), Some(Keys::Url));
         assert_eq!(keys(&this.search), Some(Keys::Search));
+        // Passwords, PINs, keys and passphrases: the password keyboard.
+        for state in [
+            &this.form[PASSWORD],
+            &this.form[MAILBOX_PASSWORD],
+            &this.form[KEY_PIN],
+            &this.unlock_input,
+            &this.fwd_key,
+            &this.calendar_password,
+            &this.contacts_password,
+            &this.key_passphrase,
+            &this.identity_inputs[6],
+        ] {
+            assert_eq!(keys(state), Some(Keys::Password));
+        }
     });
     // Focusing a field is followed; scrolling away lets go of it.
     act(&view, Action::OpenSearch, cx);

@@ -314,6 +314,28 @@ pub(super) fn detached_titlebar(
     bar
 }
 
+/// Sets `window`'s title, only when it differs from the one set last: each
+/// set is a request to the window system, and views call this as they draw,
+/// on every frame.
+pub(super) fn set_title(window: &mut gpui::Window, title: &str) {
+    thread_local! {
+        static SET: std::cell::RefCell<std::collections::HashMap<gpui::WindowId, String>> =
+            Default::default();
+    }
+    let id = window.window_handle().window_id();
+    let changed = SET.with(|set| {
+        let mut set = set.borrow_mut();
+        if set.get(&id).is_some_and(|t| t == title) {
+            return false;
+        }
+        set.insert(id, title.to_owned());
+        true
+    });
+    if changed {
+        window.set_window_title(title);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

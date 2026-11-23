@@ -25,6 +25,8 @@ const MAX_ITERATIONS: u32 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mechanism {
+    ScramSha512Plus,
+    ScramSha512,
     ScramSha256Plus,
     ScramSha1Plus,
     ScramSha256,
@@ -39,9 +41,11 @@ pub(crate) enum Mechanism {
 
 /// For a password, best first: SCRAM proves both sides without sending the
 /// password; PLAIN and LOGIN send it inside TLS; CRAM-MD5 last.
-pub(crate) const PASSWORD_ORDER: [Mechanism; 7] = [
+pub(crate) const PASSWORD_ORDER: [Mechanism; 9] = [
+    Mechanism::ScramSha512Plus,
     Mechanism::ScramSha256Plus,
     Mechanism::ScramSha1Plus,
+    Mechanism::ScramSha512,
     Mechanism::ScramSha256,
     Mechanism::ScramSha1,
     Mechanism::Plain,
@@ -49,9 +53,11 @@ pub(crate) const PASSWORD_ORDER: [Mechanism; 7] = [
     Mechanism::CramMd5,
 ];
 /// SCRAM alone, best first (IMAP and POP3 prefer it to plain LOGIN/USER).
-pub(crate) const SCRAM_ORDER: [Mechanism; 4] = [
+pub(crate) const SCRAM_ORDER: [Mechanism; 6] = [
+    Mechanism::ScramSha512Plus,
     Mechanism::ScramSha256Plus,
     Mechanism::ScramSha1Plus,
+    Mechanism::ScramSha512,
     Mechanism::ScramSha256,
     Mechanism::ScramSha1,
 ];
@@ -64,6 +70,8 @@ pub(crate) const KERBEROS_ORDER: [Mechanism; 1] = [Mechanism::Gssapi];
 impl Mechanism {
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::ScramSha512Plus => "SCRAM-SHA-512-PLUS",
+            Self::ScramSha512 => "SCRAM-SHA-512",
             Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
             Self::ScramSha1Plus => "SCRAM-SHA-1-PLUS",
             Self::ScramSha256 => "SCRAM-SHA-256",
@@ -100,10 +108,11 @@ impl Mechanism {
     }
     /// SCRAM with channel binding.
     pub(crate) fn plus(self) -> bool {
-        matches!(self, Self::ScramSha256Plus | Self::ScramSha1Plus)
+        matches!(self, Self::ScramSha512Plus | Self::ScramSha256Plus | Self::ScramSha1Plus)
     }
     fn scram(self) -> Option<Hash> {
         match self {
+            Self::ScramSha512 | Self::ScramSha512Plus => Some(Hash::Sha512),
             Self::ScramSha256 | Self::ScramSha256Plus => Some(Hash::Sha256),
             Self::ScramSha1 | Self::ScramSha1Plus => Some(Hash::Sha1),
             _ => None,
@@ -159,6 +168,8 @@ enum State {
     Refused(String),
     /// GSSAPI: the security context is being established.
     GssContext(Box<dyn crate::sync::gss::Context>),
+    /// GSSAPI: an empty challenge was answered; only the offer may follow.
+    GssOffer(Box<dyn crate::sync::gss::Context>),
     /// GSSAPI: established; the server's security-layer offer is next.
     GssLayer(Box<dyn crate::sync::gss::Context>),
     Done,
@@ -173,7 +184,16 @@ pub(crate) struct Exchange {
     nonce: Option<String>,
     /// GSSAPI's context, given in tests instead of the system's Kerberos.
     gss: Option<Box<dyn crate::sync::gss::Context>>,
+    /// Challenges answered so far (see `MAX_STEPS`).
+    steps: u32,
 }
+
+/// The most challenges one sign-in answers. Every mechanism here finishes
+/// in a few (Kerberos in the most, a handful of context tokens); a server
+/// that kept sending them (empty ones, which GSSAPI answers with nothing)
+/// held the sign-in, each reply restarting the connection's time and size
+/// budgets, for good.
+const MAX_STEPS: u32 = 16;
 
 impl Exchange {
     pub(crate) fn new(mechanism: Mechanism, credentials: Credentials) -> Self {
@@ -183,6 +203,7 @@ impl Exchange {
             state: State::Start,
             nonce: None,
             gss: None,
+            steps: 0,
         }
     }
     pub(crate) fn mechanism(&self) -> Mechanism {
@@ -197,6 +218,11 @@ impl Exchange {
     }
     /// The answer to a server challenge (already base64-decoded).
     pub(crate) fn step(&mut self, challenge: &[u8]) -> Result<Vec<u8>> {
+        self.steps += 1;
+        ensure!(
+            self.steps <= MAX_STEPS,
+            "The server kept asking for more during sign-in."
+        );
         let Credentials {
             user,
             secret,
@@ -269,11 +295,15 @@ impl Exchange {
             // RFC 4752 \u{a7}3.1: the server offers security layers and its
             // largest message, wrapped; Picacho takes none (TLS protects the
             // connection) and answers with the user to act as.
-            (Mechanism::Gssapi, State::GssLayer(mut context)) => {
+            (Mechanism::Gssapi, State::GssOffer(_)) if challenge.is_empty() => {
+                bail!("The server's Kerberos sign-in didn't offer its security layers.")
+            }
+            (Mechanism::Gssapi, State::GssLayer(mut context) | State::GssOffer(mut context)) => {
                 if challenge.is_empty() {
                     // The context's last token was ours; the server sends
-                    // nothing, and is answered with nothing.
-                    (Vec::new(), State::GssLayer(context))
+                    // nothing, and is answered with nothing (once: the
+                    // offer comes next).
+                    (Vec::new(), State::GssOffer(context))
                 } else {
                     let offer = context.unwrap(challenge)?;
                     ensure!(
@@ -286,8 +316,9 @@ impl Exchange {
                     );
                     let mut answer = vec![0x01, 0, 0, 0];
                     // The user to sign in as: the ticket's own unless a
-                    // different sign-in name is set (authorization identity).
-                    answer.extend_from_slice(user.as_bytes());
+                    // different sign-in name is set (authorization identity):
+                    // empty asks for the ticket's own (RFC 4752 §3.1).
+                    answer.extend_from_slice(user.trim().as_bytes());
                     (context.wrap(&answer)?, State::Done)
                 }
             }
@@ -337,8 +368,12 @@ impl Exchange {
                 let theirs = STANDARD
                     .decode(v.1)
                     .context("The server's SCRAM signature isn't base64.")?;
+                // Compared in constant time: how long it takes says nothing
+                // about how much of a forged signature matched.
+                let same = theirs.len() == signature.len()
+                    && theirs.iter().zip(&signature).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
                 ensure!(
-                    theirs == signature,
+                    same,
                     "The server couldn't prove it knows your password (SCRAM signature mismatch); not signed in."
                 );
                 (Vec::new(), State::Done)
@@ -358,7 +393,7 @@ impl Exchange {
     /// GSSAPI must have finished its security-layer exchange, which is
     /// what proves the server holds the service's key.
     fn unfinished_gss(&self) -> bool {
-        matches!(self.state, State::GssContext(_) | State::GssLayer(_))
+        matches!(self.state, State::GssContext(_) | State::GssLayer(_) | State::GssOffer(_))
     }
     /// After the server accepted: for SCRAM, that it also proved itself.
     /// Servers may send their signature with the success reply instead of
@@ -390,6 +425,7 @@ impl Exchange {
 enum Hash {
     Sha1,
     Sha256,
+    Sha512,
 }
 impl Hash {
     fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -406,6 +442,12 @@ impl Hash {
                 m.update(data);
                 m.finalize().into_bytes().to_vec()
             }
+            Hash::Sha512 => {
+                let mut m =
+                    <Hmac<sha2::Sha512> as KeyInit>::new_from_slice(key).expect("any key length");
+                m.update(data);
+                m.finalize().into_bytes().to_vec()
+            }
         }
     }
     fn digest(self, data: &[u8]) -> Vec<u8> {
@@ -413,6 +455,7 @@ impl Hash {
         match self {
             Hash::Sha1 => sha1::Sha1::digest(data).to_vec(),
             Hash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+            Hash::Sha512 => sha2::Sha512::digest(data).to_vec(),
         }
     }
     /// PBKDF2 with one output block, as SCRAM's Hi() is.
@@ -497,9 +540,10 @@ fn scram_proof(
         (1..=MAX_ITERATIONS).contains(&iterations),
         "The server asked for {iterations} SCRAM iterations; Picacho allows up to {MAX_ITERATIONS}."
     );
-    use unicode_normalization::UnicodeNormalization as _;
-    // SASLprep, as far as it matters for passwords people type: NFKC.
-    let password: String = password.nfkc().collect();
+    // SASLprep (RFC 4013): non-ASCII spaces as a space, characters mapped
+    // to nothing (soft hyphens, joiners) left out, then NFKC; prohibited
+    // characters (controls) refused.
+    let password: String = saslprep(password)?;
     let salted = hash.hi(password.as_bytes(), &salt, iterations);
     let client_key = hash.hmac(&salted, b"Client Key");
     let stored_key = hash.digest(&client_key);
@@ -520,13 +564,38 @@ fn scram_proof(
     ))
 }
 
+/// SASLprep (RFC 4013 §2) of a password: mapping, NFKC, and the
+/// prohibited characters refused.
+fn saslprep(text: &str) -> Result<String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let mapped: String = text
+        .chars()
+        // B.1: mapped to nothing.
+        .filter(|c| !matches!(*c, '\u{00AD}' | '\u{034F}' | '\u{1806}' | '\u{180B}'..='\u{180D}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'))
+        // C.1.2: non-ASCII spaces as a space.
+        .map(|c| if c != ' ' && c.is_whitespace() && !c.is_ascii() { ' ' } else { c })
+        .collect();
+    let normalized: String = mapped.nfkc().collect();
+    ensure!(
+        !normalized.chars().any(|c| c.is_control() || ('\u{E000}'..='\u{F8FF}').contains(&c) || ('\u{FFF9}'..='\u{FFFD}').contains(&c)),
+        "The password has a character SCRAM sign-in can't use."
+    );
+    Ok(normalized)
+}
+
 /// The reason in an OAUTHBEARER/XOAUTH2 error challenge, which is JSON
 /// like `{"status":"invalid_token"}`.
 fn token_error(challenge: &[u8]) -> String {
-    serde_json::from_slice::<serde_json::Value>(challenge)
-        .ok()
-        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_owned))
-        .unwrap_or_default()
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(challenge) else {
+        return String::new();
+    };
+    let status = v["status"].as_str().unwrap_or_default().to_owned();
+    // RFC 7628 §3.2.2: the scope the token needs, said with the status
+    // (`insufficient_scope`), is worth telling.
+    match v["scope"].as_str().filter(|s| !s.is_empty()) {
+        Some(scope) => format!("{status}; it needs: {scope}"),
+        None => status,
+    }
 }
 
 /// Base64 for the wire.
@@ -780,6 +849,18 @@ mod tests {
         x.initial();
         x.step(b"ap-rep")?;
         assert!(x.finish(None).is_err());
+        // One empty challenge is answered; the offer must come next, not
+        // empty challenges without end.
+        let mut x = kerberos_exchange("ana", true);
+        x.initial();
+        x.step(b"ap-rep")?;
+        assert!(x.step(b"")?.is_empty());
+        assert!(x.step(b"").is_err());
+        let mut x = kerberos_exchange("ana", true);
+        x.initial();
+        x.step(b"ap-rep")?;
+        x.step(b"")?;
+        assert_eq!(x.step(b"W\x01\x00\x10\x00")?, b"W\x01\x00\x00\x00ana");
         Ok(())
     }
 }

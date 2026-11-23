@@ -17,6 +17,8 @@ const MOST: u64 = 1 << 20;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Incoming {
     Text(String),
+    /// The answer to a ping: the link is alive.
+    Pong,
     /// Nothing within the read timeout.
     Idle,
     Closed,
@@ -102,6 +104,12 @@ pub(crate) fn handshake<S: Read + Write>(
     protocol: &str,
     authorization: &str,
 ) -> Result<Socket<S>> {
+    // Each is put on a line of its own: a line break in one (the session
+    // names the address) would add headers of its own.
+    ensure!(
+        ![authority, path, protocol, authorization].iter().any(|v| v.contains(['\r', '\n'])),
+        "The JMAP server's WebSocket address isn't valid."
+    );
     let key = STANDARD.encode(rand::random::<[u8; 16]>());
     let mut stream = BufReader::new(stream);
     let request = format!(
@@ -126,11 +134,16 @@ pub(crate) fn handshake<S: Read + Write>(
     );
     let mut accept = None;
     let mut chosen = None;
+    let mut upgrade = false;
+    let mut connection = false;
+    let mut extensions = false;
+    let mut ended = false;
     for _ in 0..100 {
         let mut line = String::new();
         stream.by_ref().take(8192).read_line(&mut line)?;
         let line = line.trim_end();
         if line.is_empty() {
+            ended = true;
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
@@ -138,10 +151,31 @@ pub(crate) fn handshake<S: Read + Write>(
             match name.trim().to_ascii_lowercase().as_str() {
                 "sec-websocket-accept" => accept = Some(value),
                 "sec-websocket-protocol" => chosen = Some(value),
+                "upgrade" => upgrade |= value.eq_ignore_ascii_case("websocket"),
+                "connection" => {
+                    connection |= value
+                        .split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+                }
+                // None were asked for (RFC 6455 §4.1: the client must fail
+                // a connection using an extension it didn't ask for).
+                "sec-websocket-extensions" => extensions |= !value.is_empty(),
                 _ => {}
             }
         }
     }
+    // More headers than that, or the connection's end: the rest would have
+    // been read as frames.
+    ensure!(ended, "The JMAP server's WebSocket answer is too long.");
+    // RFC 6455 §4.1: the answer must upgrade to WebSocket.
+    ensure!(
+        upgrade && connection,
+        "The JMAP server's answer didn't upgrade to a WebSocket."
+    );
+    ensure!(
+        !extensions,
+        "The JMAP server turned on a WebSocket extension that wasn't asked for."
+    );
     ensure!(
         accept.as_deref() == Some(accept_for(&key).as_str()),
         "The JMAP server's WebSocket answer doesn't match the request."
@@ -157,6 +191,12 @@ impl<S: Read + Write> Socket<S> {
     /// Sends a ping, keeping the connection open through quiet times.
     pub(crate) fn ping(&mut self) -> Result<()> {
         self.send_frame(0x9, b"")
+    }
+
+    /// Closes the WebSocket from this side (RFC 6455 §5.5.1): a normal
+    /// closure (1000).
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.send_frame(0x8, &1000u16.to_be_bytes())
     }
 
     /// Sends a text message, masked as RFC 6455 asks of clients.
@@ -188,6 +228,8 @@ impl<S: Read + Write> Socket<S> {
     /// before a frame starts is `Idle`.
     pub(crate) fn receive(&mut self) -> Result<Incoming> {
         let mut message = Vec::new();
+        // The opcode of the message being put together from fragments.
+        let mut started: Option<u8> = None;
         loop {
             let mut head = [0u8; 2];
             match self.stream.read_exact(&mut head[..1]) {
@@ -209,6 +251,12 @@ impl<S: Read + Write> Socket<S> {
             self.stream.read_exact(&mut head[1..])?;
             let fin = head[0] & 0x80 != 0;
             let opcode = head[0] & 0x0f;
+            // No extensions were agreed, so the RSV bits must be clear
+            // (RFC 6455 §5.2).
+            ensure!(
+                head[0] & 0x70 == 0,
+                "The JMAP server sent a WebSocket frame with reserved bits set."
+            );
             ensure!(
                 head[1] & 0x80 == 0,
                 "The JMAP server sent a masked WebSocket frame."
@@ -230,22 +278,43 @@ impl<S: Read + Write> Socket<S> {
                 len <= MOST && message.len() as u64 + len <= MOST,
                 "The JMAP server sent too large a WebSocket message."
             );
+            // Control frames (close, ping, pong) are short and whole (RFC 6455
+            // §5.5): one claiming a megabyte is held, and echoed, otherwise.
+            ensure!(
+                opcode < 0x8 || (len <= 125 && fin),
+                "The JMAP server sent an invalid WebSocket control frame."
+            );
             let mut payload = vec![0u8; len as usize];
             self.stream.read_exact(&mut payload)?;
             match opcode {
                 // A ping is answered with its payload.
                 0x9 => self.send_frame(0xA, &payload)?,
+                0xA if message.is_empty() => return Ok(Incoming::Pong),
                 0xA => {}
                 0x8 => {
-                    let _ = self.send_frame(0x8, &payload);
+                    // A close's body is a status code and UTF-8 reason
+                    // (RFC 6455 §5.5.1); one of a single byte is invalid.
+                    let valid = payload.is_empty()
+                        || (payload.len() >= 2 && std::str::from_utf8(&payload[2..]).is_ok());
+                    let answer: &[u8] = if valid { &payload[..payload.len().min(2)] } else { &[0x03, 0xEA] };
+                    let _ = self.send_frame(0x8, answer);
                     return Ok(Incoming::Closed);
                 }
                 0x0..=0x2 => {
+                    // A continuation only within a message; a new message
+                    // only after the last ended (RFC 6455 §5.4).
+                    let kind = match (opcode, started) {
+                        (0x0, Some(kind)) => kind,
+                        (0x0, None) => bail!("The JMAP server sent a WebSocket continuation without a message."),
+                        (_, Some(_)) => bail!("The JMAP server started a WebSocket message inside another."),
+                        (kind, None) => kind,
+                    };
+                    if kind == 0x2 {
+                        bail!("The JMAP server sent a binary WebSocket message.");
+                    }
+                    started = Some(kind);
                     message.extend_from_slice(&payload);
                     if fin {
-                        if opcode == 0x2 {
-                            bail!("The JMAP server sent a binary WebSocket message.");
-                        }
                         return Ok(Incoming::Text(
                             String::from_utf8(message)
                                 .context("The JMAP server sent text that isn't UTF-8.")?,

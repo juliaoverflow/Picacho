@@ -253,6 +253,9 @@ fn write_duration(seconds: i64) -> String {
 /// A JSCalendar LocalDateTime in `zone` (or UTC, or floating as UTC) as a
 /// Unix time.
 fn local_to_utc(local: &str, zone: Option<&str>) -> Option<i64> {
+    // Fractional seconds are allowed (RFC 8984 §1.4.4); only whole ones
+    // matter here.
+    let local = local.split('.').next().unwrap_or(local);
     let naive = NaiveDateTime::parse_from_str(local, "%Y-%m-%dT%H:%M:%S").ok()?;
     match zone.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
         Some(tz) => tz.from_local_datetime(&naive).earliest().map(|t| t.timestamp()),
@@ -271,7 +274,9 @@ fn utc_to_local(t: i64, zone: &str) -> String {
 
 /// JSCalendar's recurrence rule (an object) as an RRULE, for the
 /// properties the RRULE has.
-fn rrule(rule: &Value) -> Option<String> {
+/// `zone` is the event's: a rule's `until` is a LocalDateTime in it (RFC
+/// 8984 §4.3.3), and iCalendar's UNTIL is in UTC.
+fn rrule(rule: &Value, zone: Option<&str>) -> Option<String> {
     let freq = rule["frequency"].as_str()?.to_ascii_uppercase();
     let mut parts = vec![format!("FREQ={freq}")];
     if let Some(n) = rule["interval"].as_u64().filter(|n| *n > 1) {
@@ -281,7 +286,7 @@ fn rrule(rule: &Value) -> Option<String> {
         parts.push(format!("COUNT={n}"));
     }
     if let Some(until) = rule["until"].as_str()
-        && let Some(t) = local_to_utc(until, None)
+        && let Some(t) = local_to_utc(until, zone)
     {
         parts.push(format!(
             "UNTIL={}",
@@ -335,7 +340,8 @@ fn rrule(rule: &Value) -> Option<String> {
 }
 
 /// An RRULE as JSCalendar's recurrence rule.
-fn write_rrule(text: &str) -> Option<Value> {
+/// `zone` is the event's: a UTC UNTIL becomes a LocalDateTime in it.
+fn write_rrule(text: &str, zone: &str) -> Option<Value> {
     let mut rule = Map::new();
     rule.insert("@type".into(), json!("RecurrenceRule"));
     for part in text.split(';') {
@@ -358,12 +364,22 @@ fn write_rrule(text: &str) -> Option<Value> {
                             .ok()?
                             .and_hms_opt(23, 59, 59)
                     })?;
-                rule.insert("until".into(), json!(t.format("%Y-%m-%dT%H:%M:%S").to_string()));
+                // A UTC UNTIL, in the event's own zone.
+                let local = if v.ends_with('Z') && !zone.is_empty() {
+                    utc_to_local(t.and_utc().timestamp(), zone)
+                } else {
+                    t.format("%Y-%m-%dT%H:%M:%S").to_string()
+                };
+                rule.insert("until".into(), json!(local));
             }
             "BYDAY" => {
                 let days: Vec<Value> = v
                     .split(',')
                     .filter_map(|d| {
+                        // Byte offsets below; a day is two ASCII letters.
+                        if !d.is_ascii() {
+                            return None;
+                        }
                         let split = d.len().checked_sub(2)?;
                         let (n, day) = d.split_at(split);
                         let mut o = json!({ "@type": "NDay", "day": day.to_ascii_lowercase() });
@@ -436,7 +452,7 @@ pub fn from_jscalendar(v: &Value) -> Option<ical::Event> {
         .find_map(|(_, l)| l["name"].as_str().map(str::to_owned))
         .unwrap_or_default();
     if let Some(rule) = v["recurrenceRules"].as_array().and_then(|r| r.first()) {
-        e.recurrence = rrule(rule).unwrap_or_default();
+        e.recurrence = rrule(rule, if all_day { None } else { zone }).unwrap_or_default();
     }
     for (_, p) in v["participants"].as_object().into_iter().flatten() {
         let roles = &p["roles"];
@@ -446,6 +462,7 @@ pub fn from_jscalendar(v: &Value) -> Option<ical::Event> {
             status: p["participationStatus"]
                 .as_str()
                 .map(ical::PartStat::parse),
+            ..Default::default()
         };
         if person.email.is_empty() {
             continue;
@@ -478,10 +495,10 @@ fn overrides(v: &Value, series: &ical::Event) -> (Vec<ical::Event>, Vec<i64>) {
             w.remove("recurrenceRules");
             w.remove("recurrenceOverrides");
             for (k, val) in p {
-                // Patches name properties by path; top-level ones suffice.
-                if !k.contains('/') {
-                    w.insert(k.clone(), val.clone());
-                }
+                // Patches name properties by JSON pointer (RFC 8984
+                // §4.3.5): top-level ones replace, deeper ones are set in
+                // place (`locations/l1/name`).
+                apply_patch(w, k, val);
             }
             if !p.contains_key("start") {
                 w.insert("start".into(), json!(at));
@@ -494,6 +511,31 @@ fn overrides(v: &Value, series: &ical::Event) -> (Vec<ical::Event>, Vec<i64>) {
         }
     }
     (changed, excluded)
+}
+
+/// Sets `value` at `path` (a JSON pointer without the leading `/`, its
+/// `~1` and `~0` escapes undone) in `object`; `null` removes it.
+fn apply_patch(object: &mut Map<String, Value>, path: &str, value: &Value) {
+    let keys: Vec<String> = path
+        .split('/')
+        .map(|k| k.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    let Some((last, parents)) = keys.split_last() else {
+        return;
+    };
+    let mut at = object;
+    for key in parents {
+        let next = at.entry(key.clone()).or_insert_with(|| json!({}));
+        if !next.is_object() {
+            *next = json!({});
+        }
+        at = next.as_object_mut().expect("just made an object");
+    }
+    if value.is_null() {
+        at.remove(last);
+    } else {
+        at.insert(last.clone(), value.clone());
+    }
 }
 
 /// An event as JSCalendar properties (those Picacho edits), to create it
@@ -533,7 +575,7 @@ pub fn to_jscalendar(e: &ical::Event, overrides: &[ical::Event]) -> Map<String, 
     );
     p.insert(
         "recurrenceRules".into(),
-        match write_rrule(&e.recurrence).filter(|_| !e.recurrence.is_empty()) {
+        match write_rrule(&e.recurrence, zone).filter(|_| !e.recurrence.is_empty()) {
             Some(rule) => json!([rule]),
             None => Value::Null,
         },
@@ -712,6 +754,27 @@ pub fn save_event_in(
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
     let mut props = to_jscalendar(event, overrides);
     props.insert("calendarIds".into(), json!({ calendar: true }));
+    // An edit keeps what Picacho doesn't model in the server's copy: the
+    // other properties of each location and participant (their links,
+    // roles, invitedBy…), and the rest of the event isn't sent at all.
+    let current = match id {
+        Some(id) => get_all(s, "CalendarEvent/get", account, &[id.to_owned()])
+            .ok()
+            .and_then(|(list, _)| list.into_iter().next()),
+        None => None,
+    };
+    if let Some(current) = &current {
+        merge_entries(&mut props, current, "participants", &["sendTo", "roles", "name", "participationStatus", "scheduleAgent", "@type"]);
+        if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("locations"), current["locations"].as_object())
+            && let Some((_, mine)) = new.iter_mut().next()
+            && let Some((_, theirs)) = old.iter().next()
+            && let (Some(mine), Some(theirs)) = (mine.as_object_mut(), theirs.as_object())
+        {
+            for (k, v) in theirs {
+                mine.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
     let args = match id {
         Some(id) => {
             // Moving to another calendar replaces the set.
@@ -751,6 +814,38 @@ pub fn save_event_in(
         .as_str()
         .context("The server didn't say which event it added.")?
         .to_owned())
+}
+
+/// Each entry of `key` in `props` (as Picacho wrote it) takes the other
+/// fields of its entry in `current` (the server's): matched by the same
+/// address for participants. Fields in `ours` are Picacho's to set.
+fn merge_entries(props: &mut Map<String, Value>, current: &Value, key: &str, ours: &[&str]) {
+    let (Some(Value::Object(new)), Some(old)) = (props.get_mut(key), current[key].as_object()) else {
+        return;
+    };
+    let mut merged = Map::new();
+    for (k, mine) in new.iter() {
+        let email = participant_email(mine).to_ascii_lowercase();
+        let theirs = old
+            .iter()
+            .find(|(_, t)| !email.is_empty() && participant_email(t).eq_ignore_ascii_case(&email));
+        match (theirs, mine.as_object()) {
+            (Some((their_key, t)), Some(m)) => {
+                let mut entry = t.as_object().cloned().unwrap_or_default();
+                for field in ours {
+                    match m.get(*field) {
+                        Some(v) => entry.insert((*field).to_owned(), v.clone()),
+                        None => entry.remove(*field),
+                    };
+                }
+                merged.insert(their_key.clone(), Value::Object(entry));
+            }
+            _ => {
+                merged.insert(k.clone(), mine.clone());
+            }
+        }
+    }
+    *new = merged;
 }
 
 /// Removes an event.
@@ -908,12 +1003,14 @@ pub fn from_jscontact(v: &Value) -> Card {
         .and_then(|(_, m)| m["uri"].as_str().map(str::to_owned))
         .unwrap_or_default();
     let group = v["kind"].as_str() == Some("group");
+    // Members by their uid as written: `urn:uuid:` ones without it (as
+    // vCard's MEMBER has them), others (`mailto:`…) whole.
     let members = v["members"]
         .as_object()
         .into_iter()
         .flatten()
         .filter(|(_, on)| on.as_bool().unwrap_or(false))
-        .map(|(m, _)| m.trim_start_matches("urn:uuid:").to_owned())
+        .map(|(m, _)| m.strip_prefix("urn:uuid:").unwrap_or(m).to_owned())
         .collect();
     Card {
         addresses,
@@ -995,17 +1092,37 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
             if card.org.is_empty() {
                 Value::Null
             } else {
-                json!({ "o1": { "@type": "Organization", "name": card.org } })
+                // The first organization changed; others stay.
+                let mut all: Map<String, Value> = before
+                    .and_then(|b| b["organizations"].as_object().cloned())
+                    .unwrap_or_default();
+                let first = all.keys().next().cloned().unwrap_or_else(|| "o1".into());
+                all.insert(first, json!({ "@type": "Organization", "name": card.org }));
+                Value::Object(all)
             },
         );
     }
     let old = before.map(from_jscontact).unwrap_or_default();
     if old.addresses != card.addresses {
+        // Each address that is as it was keeps its entry (its parts,
+        // labels and coordinates); new ones are written in full.
+        let old_entries: Vec<(String, Value, String)> = before
+            .and_then(|b| b["addresses"].as_object())
+            .into_iter()
+            .flatten()
+            .map(|(k, e)| {
+                let one = from_jscontact(&json!({ "addresses": { k.clone(): e.clone() } }));
+                (k.clone(), e.clone(), one.addresses.first().cloned().unwrap_or_default())
+            })
+            .collect();
         let list: Map<String, Value> = card
             .addresses
             .iter()
             .enumerate()
-            .map(|(i, a)| (format!("a{}", i + 1), json!({ "@type": "Address", "full": a })))
+            .map(|(i, a)| match old_entries.iter().find(|(_, _, line)| line == a) {
+                Some((k, e, _)) => (k.clone(), e.clone()),
+                None => (format!("a{}", i + 1), json!({ "@type": "Address", "full": a })),
+            })
             .collect();
         p.insert(
             "addresses".into(),
@@ -1025,29 +1142,60 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
         };
         p.insert(
             "anniversaries".into(),
-            if card.birthday.is_empty() {
-                Value::Null
-            } else {
-                json!({ "b": { "@type": "Anniversary", "kind": "birth", "date": date } })
+            {
+                // Only the birthday changes; weddings and other dates stay.
+                let mut all: Map<String, Value> = before
+                    .and_then(|b| b["anniversaries"].as_object().cloned())
+                    .unwrap_or_default();
+                let birth = all
+                    .iter()
+                    .find(|(_, a)| a["kind"].as_str() == Some("birth"))
+                    .map(|(k, _)| k.clone());
+                match (card.birthday.is_empty(), birth) {
+                    (true, Some(k)) => {
+                        all.remove(&k);
+                    }
+                    (true, None) => {}
+                    (false, k) => {
+                        all.insert(
+                            k.unwrap_or_else(|| "b".into()),
+                            json!({ "@type": "Anniversary", "kind": "birth", "date": date }),
+                        );
+                    }
+                }
+                if all.is_empty() { Value::Null } else { Value::Object(all) }
             },
         );
     }
-    if old.photo != card.photo {
+    // A photo kept as a blob and shown inlined is unchanged.
+    let unchanged_blob = !card.photo_blob.is_empty() && card.photo == card.photo_read;
+    if old.photo != card.photo && !unchanged_blob {
         p.insert(
             "media".into(),
-            if card.photo.is_empty() {
-                Value::Null
-            } else {
-                json!({ "p": { "@type": "Media", "kind": "photo", "uri": card.photo } })
+            {
+                // Only the photo changes; logos and sounds stay.
+                let mut all: Map<String, Value> = before
+                    .and_then(|b| b["media"].as_object().cloned())
+                    .unwrap_or_default();
+                all.retain(|_, m| m["kind"].as_str() != Some("photo"));
+                if !card.photo.is_empty() {
+                    all.insert("p".into(), json!({ "@type": "Media", "kind": "photo", "uri": card.photo }));
+                }
+                if all.is_empty() { Value::Null } else { Value::Object(all) }
             },
         );
     }
     if card.group {
         p.insert("kind".into(), json!("group"));
+        // A uid that isn't a bare UUID (a `mailto:` or other URI) is kept
+        // as it is (RFC 9553 §2.1.6: members are by uid).
         let members: Map<String, Value> = card
             .members
             .iter()
-            .map(|m| (format!("urn:uuid:{m}"), json!(true)))
+            .map(|m| {
+                let uri = if m.contains(':') { m.clone() } else { format!("urn:uuid:{m}") };
+                (uri, json!(true))
+            })
             .collect();
         p.insert("members".into(), Value::Object(members));
     }
@@ -1058,7 +1206,16 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
             if card.note.is_empty() {
                 Value::Null
             } else {
-                json!({ "n1": { "@type": "Note", "note": card.note } })
+                // The first note changed, keeping its author and date
+                // fields; others stay.
+                let mut all: Map<String, Value> = before
+                    .and_then(|b| b["notes"].as_object().cloned())
+                    .unwrap_or_default();
+                let first = all.keys().next().cloned().unwrap_or_else(|| "n1".into());
+                let mut entry = all.get(&first).cloned().unwrap_or_else(|| json!({ "@type": "Note" }));
+                entry["note"] = json!(card.note);
+                all.insert(first, entry);
+                Value::Object(all)
             },
         );
     }
@@ -1089,7 +1246,33 @@ pub fn cards_in(s: &Session) -> Result<(Vec<Card>, String, String)> {
         let v = s.call_one("ContactCard/get", json!({ "accountId": account, "ids": [] }))?;
         state = v["state"].as_str().unwrap_or_default().to_owned();
     }
-    let out = list.iter().map(jmap_card).collect();
+    let mut out: Vec<Card> = list.iter().map(jmap_card).collect();
+    // Photos the server keeps as blobs (RFC 9610 §2.2: `media`'s `blobId`),
+    // inlined as the vCard path has them; a few hundred at most per read.
+    let mut fetched = 0;
+    for (card, raw) in out.iter_mut().zip(&list) {
+        if !card.photo.is_empty() || fetched >= 200 {
+            continue;
+        }
+        let Some((blob, kind)) = raw["media"].as_object().into_iter().flatten().find_map(|(_, m)| {
+            (m["kind"].as_str() == Some("photo"))
+                .then(|| Some((m["blobId"].as_str()?.to_owned(), m["mediaType"].as_str().unwrap_or("image/jpeg").to_owned())))
+                .flatten()
+        }) else {
+            continue;
+        };
+        fetched += 1;
+        if let Ok(bytes) = s.download_in(account, &blob, "photo", &kind, 1 << 20) {
+            use base64::Engine as _;
+            card.photo = format!(
+                "data:{kind};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            // Not a change of the photo: the card still came with a blob.
+            card.photo_blob = blob;
+            card.photo_read = card.photo.clone();
+        }
+    }
     let book = books
         .iter()
         .find(|b| b.writable)
@@ -1438,6 +1621,13 @@ pub fn ensure_contacts(s: &Session) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A day that isn't ASCII is left out, not cut inside a character.
+    #[test]
+    fn non_ascii_days_do_not_panic() {
+        let _ = write_rrule("FREQ=WEEKLY;BYDAY=€,MO", "");
+        let _ = write_rrule("FREQ=WEEKLY;BYDAY=1€", "");
+    }
 
     #[test]
     fn durations_both_ways() {

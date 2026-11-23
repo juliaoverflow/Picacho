@@ -65,6 +65,23 @@ fn standard_by_name(name: &str) -> Option<Folder> {
 pub(super) fn places(mailboxes: &[jmap::Mailbox]) -> Vec<Place> {
     let by_id: HashMap<&str, &jmap::Mailbox> =
         mailboxes.iter().map(|m| (m.id.as_str(), m)).collect();
+    // The order a person set (sortOrder, RFC 8621 §2), then by name, at
+    // each level: a folder's children stay right under it.
+    let order_of = |m: &jmap::Mailbox| -> Vec<(u32, String)> {
+        let mut key = vec![(m.sort_order, m.name.to_lowercase())];
+        let mut parent = m.parent_id.as_deref();
+        while let Some(p) = parent.and_then(|p| by_id.get(p)) {
+            if key.len() > 32 {
+                break;
+            }
+            key.push((p.sort_order, p.name.to_lowercase()));
+            parent = p.parent_id.as_deref();
+        }
+        key.reverse();
+        key
+    };
+    let orders: HashMap<&str, Vec<(u32, String)>> =
+        mailboxes.iter().map(|m| (m.id.as_str(), order_of(m))).collect();
     let path_of = |m: &jmap::Mailbox| -> (String, usize) {
         let mut names = vec![m.name.clone()];
         let mut parent = m.parent_id.as_deref();
@@ -118,7 +135,12 @@ pub(super) fn places(mailboxes: &[jmap::Mailbox]) -> Vec<Place> {
             p.folder = Some(f);
         }
     }
-    out.sort_by_key(|a| a.path.to_lowercase());
+    out.sort_by(|a, b| {
+        orders
+            .get(a.id.as_str())
+            .cmp(&orders.get(b.id.as_str()))
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
     out
 }
 
@@ -173,7 +195,12 @@ pub(super) fn filter_for(
         _ => json!({ "inMailbox": mailbox_id(places, mailbox)? }),
     };
     Ok(if days > 0 {
-        let after = jmap::utc_date(now - i64::from(days) * 86_400);
+        // From the start of a day: the same filter all day long, which
+        // Email/queryChanges needs (RFC 8620 §5.6: the query's state is
+        // for one filter). It moves on once a day, and the listing is read
+        // again then.
+        let start = (now - i64::from(days) * 86_400).div_euclid(86_400) * 86_400;
+        let after = jmap::utc_date(start);
         json!({ "operator": "AND", "conditions": [condition, { "after": after }] })
     } else {
         condition
@@ -230,6 +257,7 @@ fn vacation_state(reply: &jmap::VacationResponse) -> sieve::State {
         other_active: None,
         active: reply.is_enabled,
         vacation_only: true,
+        ..Default::default()
     }
 }
 /// JMAP's automatic reply for the away reply in the settings: from the
@@ -1309,16 +1337,19 @@ impl Backend {
             .iter()
             .filter_map(|m| jmap_id(from, m).map(str::to_owned))
             .collect();
-        let lock = self.account_lock(&a.id);
-        let _operation = lock.lock().unwrap();
-        let from_account = from.jmap_account.clone();
-        // Where the sources' contents are, in case the copy goes by blob.
+        // Where the sources' contents are, in case the copy goes by blob:
+        // asked under `from`'s lock alone, before `a`'s is taken. Holding one
+        // while waiting for the other let two copies the opposite ways wait
+        // for each other for good (and one into the same account, itself).
         let from_blobs: HashMap<String, String> = {
             let ids = ids.clone();
             let flock = self.account_lock(&from.id);
             let _from = flock.lock().unwrap();
             self.with_jmap(from, |s| s.blob_ids(&ids)).unwrap_or_default()
         };
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let from_account = from.jmap_account.clone();
         ensure!(!from_account.is_empty() || from.credentials_of.is_empty(), "The account to copy from isn't known.");
         let copied = self.with_jmap(a, |s| {
             let from_account = if from_account.is_empty() {
@@ -1329,7 +1360,7 @@ impl Backend {
             };
             let places = self.jmap_places(a, s, false)?;
             let target = mailbox_id(&places, mailbox)?;
-            match s.copy_from(&from_account, &ids, &target, &["$seen"]) {
+            match s.copy_from(&from_account, &ids, &target, &[]) {
                 Ok(copied) => Ok(copied),
                 // A server without Email/copy: the sources' blobs copied
                 // across (Blob/copy), then imported as messages.
@@ -1658,7 +1689,14 @@ impl Backend {
                 None => None,
             };
             let extensions = s.sieve_extensions().unwrap_or_default().to_vec();
-            Ok(sieve::loaded(extensions, &listed, own.as_deref()))
+            let mut state = sieve::loaded(extensions, &listed, own.as_deref());
+            // The other app's active script, to offer its rules.
+            state.other_rules = scripts
+                .iter()
+                .find(|x| x.is_active && x.name.as_deref() != Some(sieve::SCRIPT))
+                .and_then(|x| s.sieve_text(x).ok())
+                .and_then(|text| crate::sync::sieve_parse::read(&text).ok());
+            Ok(state)
         })
     }
     /// Saves Picacho's script and makes it the active one; without rules
@@ -1716,6 +1754,7 @@ impl Backend {
                 other_active: other,
                 active: !empty,
                 vacation_only: false,
+                ..Default::default()
             })
         })
     }

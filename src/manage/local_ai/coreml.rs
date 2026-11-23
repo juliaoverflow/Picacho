@@ -129,6 +129,9 @@ impl CoreMlModel {
                 .featureValueForName(&NSString::from_str("probability"))
                 .and_then(|v| v.multiArrayValue())
                 .context("Core ML gave no probability")?;
+            // Indexing an empty array raises an Objective-C exception, which
+            // can't be caught here: it would end the app.
+            ensure!(probability.count() > 0, "Core ML gave no probability");
             Ok(probability.objectAtIndexedSubscript(0).floatValue())
         }
     }

@@ -15,12 +15,13 @@ export RCLONE_CONFIG_R2_ACL=private
 r2_publish() {
     src=$1 dest=$2
     shift 2
-    excludes=""
+    # The patterns become rclone's own arguments, unexpanded: split from an
+    # unquoted string, `index*` was matched against files here by the shell.
     for pattern in "$@"; do
-        excludes="$excludes --exclude $pattern"
+        set -- "$@" --exclude "$pattern"
+        shift
     done
-    # shellcheck disable=SC2086
-    rclone copy --checksum --transfers 16 $excludes "$src" "r2:$dest"
+    rclone copy --checksum --transfers 16 "$@" "$src" "r2:$dest"
     rclone copy --checksum "$src" "r2:$dest"
     rclone sync --checksum "$src" "r2:$dest"
 }

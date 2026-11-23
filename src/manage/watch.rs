@@ -102,14 +102,14 @@ impl Backend {
                 return;
             }
             if let Some(w) = self.spawn_proton_watch(a, Arc::new(changed)) {
-                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+                self.keep_watcher(&self.watchers, &a.id, w);
             }
             return;
         }
         if a.provider == Provider::Jmap {
             self.stop_watching(&a.id);
             if let Some(w) = self.spawn_jmap_watch(a, Arc::new(changed)) {
-                self.watchers.lock().unwrap().insert(a.id.clone(), w);
+                self.keep_watcher(&self.watchers, &a.id, w);
             }
             return;
         }
@@ -120,7 +120,7 @@ impl Backend {
         self.stop_watching(&a.id);
         let watcher = self.spawn_watch(a, Mailbox::Standard(Folder::Inbox), Arc::new(changed));
         if let Some(w) = watcher {
-            self.watchers.lock().unwrap().insert(a.id.clone(), w);
+            self.keep_watcher(&self.watchers, &a.id, w);
         }
     }
     /// Also watches `mailbox` (the one open in the window) with IDLE, when
@@ -159,7 +159,7 @@ impl Backend {
             return;
         };
         if let Some(w) = self.spawn_watch(a, mailbox, Arc::new(changed)) {
-            self.folder_watchers.lock().unwrap().insert(a.id.clone(), w);
+            self.keep_watcher(&self.folder_watchers, &a.id, w);
         }
     }
     /// Proton: its event stream stands in for IDLE, as it does inside
@@ -473,6 +473,15 @@ impl Backend {
         spawned.ok().map(|handle| watcher.on(handle.thread()))
     }
     /// Ends the account's watches, if any; their connections close.
+    /// Keeps `w` as `id`'s watcher in `watchers`, stopping the one it
+    /// replaces: two watches started at once each stopped the old one and
+    /// then put theirs in, the first one's thread and connection left
+    /// running with nothing to stop them.
+    fn keep_watcher(&self, watchers: &Mutex<HashMap<String, Watcher>>, id: &str, w: Watcher) {
+        if let Some(old) = watchers.lock().unwrap().insert(id.to_owned(), w) {
+            old.stop();
+        }
+    }
     pub fn stop_watching(&self, id: &str) {
         if let Some(w) = self.watchers.lock().unwrap().remove(id) {
             w.stop();
@@ -546,7 +555,7 @@ impl Backend {
         c.session.examine(&wire)?;
         // The inbox's watcher hears about every mailbox where it can.
         let inbox = *mailbox == Mailbox::Standard(Folder::Inbox);
-        if inbox && ext.notify && notify_personal(&mut c.session)? {
+        if inbox && ext.notify && notify_personal(&mut c.session, ext.condstore)? {
             notifying.store(true, Ordering::Release);
         }
         let utf8 = c.enabled.utf8;
@@ -568,6 +577,18 @@ impl Backend {
                 continue;
             }
             // NOTIFY's STATUS lines name other mailboxes that changed.
+            // After an overflow the server has stopped notifying: every
+            // mailbox may have changed, and NOTIFY is set again.
+            if let Some(heard) = &heard
+                && notification_overflow(heard)
+            {
+                for n in &names {
+                    if !n.has("Noselect") && !n.has("NonExistent") {
+                        changed(mailbox_of(&names, a.provider, &n.name));
+                    }
+                }
+                let _ = notify_personal(&mut c.session, ext.condstore);
+            }
             if let Some(heard) = &heard {
                 for name in status_mailboxes(heard, utf8) {
                     if name != remote {

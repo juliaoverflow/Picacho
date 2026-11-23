@@ -18,6 +18,8 @@ mkdir -p "$work"
 
 export GNUPGHOME="$PWD/$work/gnupg"
 mkdir -m 700 "$GNUPGHOME"
+# The imported private key goes however the script ends.
+trap 'gpgconf --kill gpg-agent 2>/dev/null; rm -rf "$GNUPGHOME"' EXIT
 printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
 sign="--gpg-sign=$FLATPAK_GPG_KEY_ID --gpg-homedir=$GNUPGHOME"
 

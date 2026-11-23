@@ -90,6 +90,7 @@ pub fn discover(email: &str) -> Option<Settings> {
         ]
         .map(|url| s.spawn(move || fetch_config(&url, domain)));
         let mx = s.spawn(|| mx_host(domain));
+        let mail_srv = s.spawn(|| mail_srv(domain));
         // The domain names its JMAP server, in the domain: that is what it
         // wants used. One elsewhere waits until the HTTPS sources are asked.
         let srv = srv.join().ok().flatten();
@@ -103,6 +104,10 @@ pub fn discover(email: &str) -> Option<Settings> {
             if let Ok(Some(found)) = job.join() {
                 return Some(found);
             }
+        }
+        // The domain's own SRV records for mail (RFC 6186).
+        if let Ok(Some(found)) = mail_srv.join() {
+            return Some(found);
         }
         if let Ok(Some(mx)) = mx.join() {
             if let Some(found) = known_mx(&mx) {
@@ -139,6 +144,43 @@ fn jmap_srv(domain: &str) -> Option<Settings> {
         .into_iter()
         .next()?;
     Some(Settings::jmap(&host, port))
+}
+
+/// The mail servers a domain's SRV records name (RFC 6186): IMAP or POP3,
+/// TLS from the start preferred (RFC 8314 §5.1), and submission. As for
+/// JMAP, only targets in the domain itself are used, since DNS answers
+/// aren't authenticated (RFC 6186 §6).
+fn mail_srv(domain: &str) -> Option<Settings> {
+    let first = |service: &str| {
+        crate::sync::auth::srv(&format!("_{service}._tcp.{domain}"))
+            .ok()?
+            .into_iter()
+            .find(|(host, _)| in_domain(host, domain))
+    };
+    let (provider, (incoming_host, incoming_port), incoming_starttls) =
+        if let Some(found) = first("imaps") {
+            (Provider::Imap, found, false)
+        } else if let Some(found) = first("pop3s") {
+            (Provider::Pop3, found, false)
+        } else if let Some(found) = first("imap") {
+            (Provider::Imap, found, true)
+        } else {
+            (Provider::Pop3, first("pop3")?, true)
+        };
+    let ((smtp_host, smtp_port), smtp_tls) = match first("submissions") {
+        Some(found) => (found, true),
+        None => (first("submission")?, false),
+    };
+    Some(Settings {
+        provider,
+        incoming_host,
+        incoming_port,
+        smtp_host,
+        smtp_port,
+        smtp_tls: Some(smtp_tls),
+        incoming_starttls,
+        sso: None,
+    })
 }
 
 /// Whether the domain's web server answers as a JMAP server would, before
@@ -301,6 +343,11 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         let (Some(host), Some(port)) = (tag(inner, "hostname"), port(inner)) else {
             continue;
         };
+        // A host name, nothing else: the document (from the web) names the
+        // servers the password is sent to.
+        if !crate::sync::mta_sts::is_domain(&substitute(host, domain)) {
+            continue;
+        }
         // Rank: TLS from the start first, then IMAP.
         let rank = |kind: Provider, starttls: bool| (!starttls, kind == Provider::Imap);
         let better = match &incoming {
@@ -313,7 +360,8 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
                 && !authentications(inner).is_empty();
         }
     }
-    let mut smtp = None;
+    // TLS from the start preferred over STARTTLS (RFC 8314 §3.3).
+    let mut smtp: Option<(String, u16, bool)> = None;
     for (attrs, inner) in blocks(xml, "outgoingServer") {
         if attr(attrs, "type") != Some("smtp") {
             continue;
@@ -321,13 +369,17 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         let (Some(host), Some(port)) = (tag(inner, "hostname"), port(inner)) else {
             continue;
         };
+        if !crate::sync::mta_sts::is_domain(&substitute(host, domain)) {
+            continue;
+        }
         let tls = match tag(inner, "socketType") {
             Some("STARTTLS") => false,
             Some("SSL") => true,
             _ => continue,
         };
-        smtp = Some((substitute(host, domain), port, tls));
-        break;
+        if smtp.as_ref().is_none_or(|(.., existing)| tls && !*existing) {
+            smtp = Some((substitute(host, domain), port, tls));
+        }
     }
     let ((kind, incoming_host, incoming_port, incoming_starttls), (smtp_host, smtp_port, smtp_tls)) =
         (incoming?, smtp?);
@@ -431,8 +483,9 @@ fn substitute(host: &str, domain: &str) -> String {
     host.replace("%EMAILDOMAIN%", domain).to_ascii_lowercase()
 }
 
-/// Uses the system resolver through `dig`, which ships with macOS, so no
-/// third-party DNS service learns the address being configured.
+/// The domain's most preferred mail server, through the system's DNS
+/// resolver, so no third-party DNS service learns the address being
+/// configured.
 fn mx_host(domain: &str) -> Option<String> {
     // A plain DNS name only (international ones in their ASCII form): one
     // starting with `-` would be read as one of dig's options.
@@ -440,12 +493,14 @@ fn mx_host(domain: &str) -> Option<String> {
         url::Host::Domain(d) if super::mta_sts::is_domain(&d) => d,
         _ => return None,
     };
-    let output = std::process::Command::new("/usr/bin/dig")
-        .args(["+short", "+time=3", "+tries=1", "MX", &domain])
-        .output()
-        .ok()?;
-    parse_mx(&String::from_utf8_lossy(&output.stdout))
+    // The resolver Picacho already uses for its DNS checks: on every
+    // platform, not only where a `dig` program is installed.
+    crate::sync::auth::mx_hosts(&domain)
+        .ok()?
+        .into_iter()
+        .find(|h| !h.is_empty())
 }
+#[cfg(test)]
 fn parse_mx(output: &str) -> Option<String> {
     output
         .lines()
@@ -499,12 +554,17 @@ fn probe(domain: &str) -> Option<Settings> {
             })
         });
         let smtp = s.spawn(|| {
+            // TLS from the start first (RFC 8314 §3.3), then STARTTLS.
             first_open(vec![
-                (format!("smtp.{domain}"), 587),
-                (format!("mail.{domain}"), 587),
                 (format!("smtp.{domain}"), 465),
                 (format!("mail.{domain}"), 465),
             ])
+            .or_else(|| {
+                first_open(vec![
+                    (format!("smtp.{domain}"), 587),
+                    (format!("mail.{domain}"), 587),
+                ])
+            })
         });
         (incoming.join().ok().flatten(), smtp.join().ok().flatten())
     });

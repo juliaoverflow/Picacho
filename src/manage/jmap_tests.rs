@@ -1099,6 +1099,7 @@ fn jmap_sieve_filters_and_vacation() -> Result<()> {
         value: "news@shop.example".into(),
         act: crate::sync::sieve::Act::Folder("Work".into()),
         stop: true,
+        ..Default::default()
     });
     let saved = b.save_filters(&a, &filters)?;
     assert!(saved.active);
@@ -1108,7 +1109,7 @@ fn jmap_sieve_filters_and_vacation() -> Result<()> {
         assert!(ours.3, "Picacho's script is the active one");
         let text = String::from_utf8_lossy(&s.blobs[&ours.2]).into_owned();
         assert!(text.contains("fileinto \"Work\";"), "{text}");
-        assert!(text.contains("include :personal \"vendor\";"));
+        assert!(text.contains("include :personal :optional \"vendor\";"));
     }
     // Read back as saved.
     let again = b.filters(&a)?;
@@ -1328,6 +1329,7 @@ fn jmap_away_reply_without_sieve() -> Result<()> {
         value: "x".into(),
         act: crate::sync::sieve::Act::Star,
         stop: false,
+        ..Default::default()
     });
     assert!(b.save_filters(&a, &filters).is_err());
     Ok(())

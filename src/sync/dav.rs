@@ -15,6 +15,9 @@ pub struct Resource {
     pub href: url::Url,
     pub etag: String,
     pub data: String,
+    /// CalDAV scheduling's Schedule-Tag (RFC 6638 §3.2.10), where asked
+    /// for and given.
+    pub schedule_tag: String,
 }
 
 /// A collection (address book or calendar) and its name.
@@ -139,8 +142,13 @@ pub fn read_collection(
     };
     let all_kept = || known.iter().map(|(h, _)| h.clone()).collect();
     if let Some(previous) = previous {
-        let same = (!state.sync_token.is_empty() && state.sync_token == previous.sync_token)
-            || (!state.ctag.is_empty() && state.ctag == previous.ctag);
+        // The sync token decides where there is one: a ctag the server
+        // forgot to bump mustn't hide a change the token shows.
+        let same = if !state.sync_token.is_empty() && !previous.sync_token.is_empty() {
+            state.sync_token == previous.sync_token
+        } else {
+            !state.ctag.is_empty() && state.ctag == previous.ctag
+        };
         if same {
             return Ok(Read {
                 fetched: Vec::new(),
@@ -235,20 +243,42 @@ fn responses<'a>(
         })
 }
 
+/// Whether a property element is in a `propstat` whose status isn't a
+/// success (RFC 4918 §14.22: a 404 propstat lists the properties the
+/// resource doesn't have, often as empty elements).
+fn failed_propstat(node: roxmltree::Node) -> bool {
+    node.ancestors()
+        .find(|a| a.tag_name().name() == "propstat")
+        .and_then(|p| p.children().find(|c| c.tag_name().name() == "status"))
+        .and_then(|s| s.text())
+        .is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2')))
+}
+/// The first `name` element under `node` that a propstat says is there.
+fn property<'a>(node: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
+    node.descendants()
+        .find(|n| n.tag_name().name() == name && !failed_propstat(*n))
+}
+
 /// The href inside the first `name` element under `node`.
 fn href_in(node: roxmltree::Node, name: &str) -> Option<String> {
-    node.descendants()
-        .find(|n| n.tag_name().name() == name)?
-        .descendants()
-        .find(|n| n.tag_name().name() == "href")?
-        .text()
-        .map(|t| t.trim().to_owned())
+    hrefs_in(node, name).into_iter().next()
+}
+/// Every href inside the first `name` element under `node` (a home set
+/// may list several, RFC 4791 §6.2.1).
+fn hrefs_in(node: roxmltree::Node, name: &str) -> Vec<String> {
+    property(node, name)
+        .map(|p| {
+            p.descendants()
+                .filter(|n| n.tag_name().name() == "href")
+                .filter_map(|n| n.text().map(|t| t.trim().to_owned()))
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn text_of(node: roxmltree::Node, name: &str) -> Option<String> {
-    node.descendants()
-        .find(|n| n.tag_name().name() == name)
-        .map(|n| n.text().unwrap_or_default().trim().to_owned())
+    property(node, name).map(|n| n.text().unwrap_or_default().trim().to_owned())
 }
 
 fn parse(text: &str) -> Result<roxmltree::Document<'_>> {
@@ -470,6 +500,7 @@ impl Client {
                 href,
                 etag: text_of(response, "getetag").unwrap_or_default(),
                 data: content.to_owned(),
+                schedule_tag: text_of(response, "schedule-tag").unwrap_or_default(),
             });
         }
         Ok(out)
@@ -478,6 +509,26 @@ impl Client {
     /// What changed in a collection since `token` (RFC 6578 sync-collection),
     /// as hrefs and ETags only. An empty token lists everything.
     pub fn changes(&self, collection: &url::Url, token: &str) -> Result<Changes> {
+        // A server may answer in parts (RFC 6578 §3.6: 507 on the
+        // collection itself): ask again from its new token until whole.
+        let mut all = Changes::default();
+        let mut token = token.to_owned();
+        for _ in 0..100 {
+            let (part, truncated) = self.changes_once(collection, &token)?;
+            all.removed.retain(|r| !part.changed.iter().any(|(h, _)| h == r));
+            all.changed.retain(|(h, _)| !part.removed.contains(h));
+            all.changed.extend(part.changed);
+            all.removed.extend(part.removed);
+            let moved = part.token != token;
+            token = part.token;
+            all.token = token.clone();
+            if !truncated || !moved {
+                break;
+            }
+        }
+        Ok(all)
+    }
+    fn changes_once(&self, collection: &url::Url, token: &str) -> Result<(Changes, bool)> {
         let body = format!(
             "<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>",
             xml_escape(token)
@@ -518,8 +569,11 @@ impl Client {
                 .iter()
                 .map(|h| format!("<d:href>{}</d:href>", xml_escape(h.path())))
                 .collect();
+            // CalDAV's Schedule-Tag with each (RFC 6638 §3.2.10), so an
+            // edit can be conditional on it.
+            let tag = if namespace == CALDAV { "<c:schedule-tag/>" } else { "" };
             let body = format!(
-                "<?xml version=\"1.0\"?><c:{report} xmlns:d=\"DAV:\" xmlns:c=\"{namespace}\"><d:prop><d:getetag/><c:{data}/></d:prop>{refs}</c:{report}>"
+                "<?xml version=\"1.0\"?><c:{report} xmlns:d=\"DAV:\" xmlns:c=\"{namespace}\"><d:prop><d:getetag/>{tag}<c:{data}/></d:prop>{refs}</c:{report}>"
             );
             out.extend(self.list(collection, &body, data)?);
         }
@@ -620,7 +674,7 @@ impl Client {
             (
                 "MKCALENDAR",
                 format!(
-                    "<?xml version=\"1.0\"?><c:mkcalendar xmlns:d=\"DAV:\" xmlns:c=\"{CALDAV}\" xmlns:a=\"http://apple.com/ns/ical/\"><d:set><d:prop><d:displayname>{name}</d:displayname>{color}<c:supported-calendar-component-set><c:comp name=\"VEVENT\"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"
+                    "<?xml version=\"1.0\"?><c:mkcalendar xmlns:d=\"DAV:\" xmlns:c=\"{CALDAV}\" xmlns:a=\"http://apple.com/ns/ical/\"><d:set><d:prop><d:displayname>{name}</d:displayname>{color}<c:supported-calendar-component-set><c:comp name=\"VEVENT\"/><c:comp name=\"VTODO\"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"
                 ),
             )
         } else {
@@ -669,7 +723,9 @@ impl Client {
             headers.push(("If-Schedule-Tag-Match", schedule_tag));
         } else if etag.is_empty() {
             headers.push(("If-None-Match", "*"));
-        } else {
+        } else if !etag.starts_with("W/") {
+            // A weak ETag never matches If-Match's strong comparison (RFC
+            // 9110 §13.1.1): with one, the write goes without a condition.
             headers.push(("If-Match", etag));
         }
         let response = self.send("PUT", href, &headers, data)?;
@@ -681,7 +737,33 @@ impl Client {
                 .unwrap_or_default()
                 .to_owned()
         };
-        Ok((header("ETag"), header("Schedule-Tag")))
+        let (mut etag, mut tag) = (header("ETag"), header("Schedule-Tag"));
+        // A strong ETag only (RFC 4918 §8.6 lets a server change the data
+        // as it stores it, then sending none or a weak one): the stored
+        // version's own is asked for, so the next edit isn't taken for a
+        // new resource (If-None-Match: *) and refused.
+        if (etag.is_empty() || etag.starts_with("W/"))
+            && let Ok((fresh, fresh_tag)) = self.etag_of(href)
+        {
+            etag = fresh;
+            if tag.is_empty() {
+                tag = fresh_tag;
+            }
+        }
+        Ok((etag, tag))
+    }
+    /// A resource's current ETag and Schedule-Tag (PROPFIND, depth 0).
+    fn etag_of(&self, href: &url::Url) -> Result<(String, String)> {
+        let body = "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:schedule-tag/></d:prop></d:propfind>";
+        let text = self.xml("PROPFIND", href, "0", body)?;
+        let doc = parse(&text)?;
+        let found = responses(&doc).into_iter().next().map(|(_, r)| {
+            (
+                text_of(r, "getetag").unwrap_or_default(),
+                text_of(r, "schedule-tag").unwrap_or_default(),
+            )
+        });
+        found.context("The server didn't say the saved version's ETag.")
     }
     /// Changes a collection's name and (a calendar's) colour (PROPPATCH,
     /// RFC 4918 §9.2). An empty `color` leaves it as it is.
@@ -696,13 +778,17 @@ impl Client {
             xml_escape(name)
         );
         let text = self.xml("PROPPATCH", href, "0", &body)?;
+        // 200 or 204 without a body: done.
+        if text.trim().is_empty() {
+            return Ok(());
+        }
         // A 207 whose propstat refuses a property: say so.
         let doc = parse(&text)?;
         let refused = doc
             .descendants()
             .filter(|n| n.tag_name().name() == "propstat")
-            .filter_map(|p| text_of(p, "status"))
-            .any(|s| !s.contains(" 200 "));
+            .filter_map(|p| p.children().find(|c| c.tag_name().name() == "status").and_then(|s| s.text()))
+            .any(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')));
         ensure!(!refused, "The server didn't accept the new name or colour.");
         Ok(())
     }
@@ -718,8 +804,11 @@ impl Client {
         let text = self.xml("PROPFIND", url, "0", body)?;
         let doc = parse(&text)?;
         let number = |name: &str| text_of(doc.root(), name).and_then(|t| t.parse::<u64>().ok());
+        // quota-used-bytes is a SHOULD (RFC 4331 §4): without it, what's
+        // left is known and none counted as used.
         Ok(match (number("quota-used-bytes"), number("quota-available-bytes")) {
             (Some(used), Some(left)) => Some((used, left)),
+            (None, Some(left)) => Some((0, left)),
             _ => None,
         })
     }
@@ -766,7 +855,7 @@ impl Client {
             .header("Content-Type", content_type)
             .header("Content-Disposition", disposition)
             .body(data);
-        if !etag.is_empty() {
+        if !etag.is_empty() && !etag.starts_with("W/") {
             request = request.header("If-Match", etag);
         }
         let response = request.send().with_context(|| {
@@ -800,7 +889,7 @@ impl Client {
 
     /// Removes a resource, if it is still the version with `etag`.
     pub fn delete(&self, href: &url::Url, etag: &str) -> Result<()> {
-        let headers: Vec<(&str, &str)> = if etag.is_empty() {
+        let headers: Vec<(&str, &str)> = if etag.is_empty() || etag.starts_with("W/") {
             Vec::new()
         } else {
             vec![("If-Match", etag)]
@@ -845,15 +934,22 @@ fn xml_escape(text: &str) -> String {
 
 /// A sync-collection answer: changed resources (with an ETag), removed ones
 /// (a 404 status), and the new token.
-fn parse_changes(collection: &url::Url, text: &str) -> Result<Changes> {
+fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
     let doc = parse(text)?;
     let mut out = Changes::default();
+    let mut truncated = false;
     for (href, response) in responses(&doc) {
         let Ok(url) = collection.join(&href) else {
             continue;
         };
-        // The collection itself may be listed; it isn't one of its items.
+        // The collection itself may be listed; it isn't one of its items,
+        // but its 507 says the answer was cut short.
         if url.path().trim_end_matches('/') == collection.path().trim_end_matches('/') {
+            truncated |= response
+                .children()
+                .find(|c| c.tag_name().name() == "status")
+                .and_then(|s| s.text())
+                .is_some_and(|s| s.contains(" 507 "));
             continue;
         }
         let status = response
@@ -876,7 +972,7 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<Changes> {
         .trim()
         .to_owned();
     ensure!(!out.token.is_empty(), "The server's changes came without a sync token.");
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// The server refused a request (403), with its body: a precondition

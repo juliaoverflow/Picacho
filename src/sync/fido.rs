@@ -158,7 +158,10 @@ fn bytes(v: Option<&Value>) -> Option<Vec<u8>> {
 
 /// Whether `rp_id` is one of Proton's sites (or a site under one).
 fn proton_rp(rp_id: &str) -> bool {
-    ["proton.me", "protonmail.com", "protonmail.ch"]
+    // A host name, nothing else: "evil.example/.proton.me" ends the same,
+    // but as an origin it is evil.example's.
+    crate::sync::mta_sts::is_domain(rp_id)
+        && ["proton.me", "protonmail.com", "protonmail.ch"]
         .iter()
         .any(|d| rp_id == *d || rp_id.ends_with(&format!(".{d}")))
 }
@@ -189,10 +192,18 @@ pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOpti
         .map(|list| {
             list.iter()
                 .filter_map(|c| {
+                    // The ways each key is reached, as the server knows
+                    // them, so the platform asks the right one first.
+                    let transports = c.get("transports").and_then(Value::as_array).map(|t| {
+                        t.iter()
+                            .filter_map(Value::as_str)
+                            .filter_map(|t| serde_json::from_value(Value::String(t.into())).ok())
+                            .collect()
+                    });
                     Some(AllowCredentials {
                         type_: "public-key".into(),
                         id: bytes(c.get("id"))?,
-                        transports: None,
+                        transports,
                     })
                 })
                 .collect()
@@ -213,7 +224,18 @@ pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOpti
         allow_credentials,
         user_verification,
         hints: None,
-        extensions: None,
+        // The `appid` extension (FIDO U2F keys registered under the old
+        // AppID), where Proton asks for it: such keys sign only for it.
+        extensions: pk
+            .get("extensions")
+            .and_then(|e| e.get("appid"))
+            .and_then(Value::as_str)
+            .filter(|a| a.starts_with("https://") && url::Url::parse(a).ok().and_then(|u| u.host_str().map(proton_rp)).unwrap_or(false))
+            .map(|appid| webauthn_rs_proto::extensions::RequestAuthenticationExtensions {
+                appid: Some(appid.to_owned()),
+                uvm: None,
+                hmac_get_secret: None,
+            }),
     })
 }
 
@@ -541,6 +563,8 @@ mod tests {
         assert!(proton_rp("account.proton.me"));
         assert!(!proton_rp("evilproton.me"));
         assert!(!proton_rp("proton.me.evil.com"));
+        assert!(!proton_rp("victim.example/.proton.me"));
+        assert!(!proton_rp("victim.example:443/x.proton.me"));
         assert!(!usable(Some(&serde_json::json!({}))));
         assert!(!usable(None));
     }

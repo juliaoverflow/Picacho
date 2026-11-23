@@ -2207,7 +2207,7 @@ fn close_settings_window(app: &WeakEntity<MailApp>, w: &mut Window, cx: &mut App
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors;
-        window.set_window_title("Settings");
+        super::window::set_title(window, "Settings");
         let id = window.window_handle().window_id();
         let (content, menu, status, error) = self.app.update(cx, |app, cx| {
             app.sync_nickname_input(window, cx);

@@ -400,6 +400,18 @@ fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// The armored payload of a PGP/MIME message, and the headers kept outside it.
 pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
+    // Its type is read from the headers alone first: nearly all mail isn't
+    // PGP/MIME, and turning a whole source (attachments and all) into text
+    // only to find that cost a copy of it, on every message read.
+    let end = memchr::memmem::find(raw, b"\n\n")
+        .into_iter()
+        .chain(memchr::memmem::find(raw, b"\r\n\r\n"))
+        .min()
+        .map_or(raw.len(), |at| (at + 4).min(raw.len()));
+    let (kind, _) = content_type(&parse_headers(split_message(&latin1(&raw[..end])).0));
+    if kind != "multipart/encrypted" {
+        return None;
+    }
     let text = latin1(raw);
     let (head, body) = split_message(&text);
     let headers = parse_headers(head);
@@ -413,11 +425,12 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
         return None;
     }
     let delimiter = format!("--{boundary}");
+    let closing = format!("{delimiter}--");
     let mut parts: Vec<Vec<&str>> = Vec::new();
     for line in body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) {
         if line.trim_end() == delimiter {
             parts.push(Vec::new());
-        } else if line.trim_end() == format!("{delimiter}--") {
+        } else if line.trim_end() == closing {
             break;
         } else if let Some(part) = parts.last_mut() {
             part.push(line);
@@ -431,9 +444,16 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
         let (head, body) = split_message(&joined);
         (content_type(&parse_headers(head)).0, body.to_owned())
     });
-    let (control, _) = decoded.next()?;
+    let (control, version) = decoded.next()?;
     let (payload, armored) = decoded.next()?;
     if control != "application/pgp-encrypted" || payload != "application/octet-stream" {
+        return None;
+    }
+    // RFC 3156 §4: the control part says `Version: 1`.
+    if !version
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("version: 1") || l.trim().eq_ignore_ascii_case("version:1"))
+    {
         return None;
     }
     let armored = armored.trim().to_owned();
@@ -442,7 +462,10 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
     }
     let outer = headers
         .iter()
-        .filter(|h| h.name != "content-type")
+        // All Content-* headers stay with the encrypted part: the outer
+        // Content-Transfer-Encoding came first in the decrypted message and
+        // was used to decode its inner part's body.
+        .filter(|h| !h.name.starts_with("content-"))
         .map(|h| {
             if h.raw.ends_with('\n') {
                 h.raw.clone()
@@ -452,6 +475,12 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
         })
         .collect::<String>();
     Some((armored, outer))
+}
+
+/// Whether `raw` is encrypted in any form Picacho knows (PGP/MIME, S/MIME,
+/// inline PGP): its text is ciphertext, read only when opened.
+pub fn is_encrypted(raw: &[u8]) -> bool {
+    sender_encrypted(raw) || encrypted_part(raw).is_some()
 }
 
 /// Mirrors Stalwart's test for mail its sender already encrypted.
@@ -481,11 +510,10 @@ pub const MAX_MESSAGE: usize = 40 * 1024 * 1024;
 /// without a modification detection code, and compressed data (which
 /// Stalwart never writes) is refused rather than inflated.
 pub fn open_message(raw: &[u8], keys: &[SignedSecretKey]) -> Result<(Protection, Vec<u8>)> {
-    ensure!(
-        raw.len() <= MAX_MESSAGE,
-        "This message is too large to open."
-    );
     let Some((armored, outer)) = encrypted_part(raw) else {
+        // Nothing to decrypt: as large as a download may be, which the
+        // cache read it back at (a limit of its own here refused mail
+        // that downloaded and saved).
         let p = if sender_encrypted(raw) {
             Protection::Foreign
         } else {
@@ -493,6 +521,10 @@ pub fn open_message(raw: &[u8], keys: &[SignedSecretKey]) -> Result<(Protection,
         };
         return Ok((p, raw.to_vec()));
     };
+    ensure!(
+        raw.len() <= MAX_MESSAGE,
+        "This message is too large to open."
+    );
     let decrypt = || -> Result<Vec<u8>> {
         let (message, _) = Message::from_string(&armored)?;
         let passwords: Vec<Password> = keys.iter().map(|_| Password::empty()).collect();

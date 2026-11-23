@@ -256,8 +256,13 @@ public final class VerifyActivity extends Activity {
             answer(null);
         }
         if (web != null) {
+            // Its pages and images from the check too, not only cookies and
+            // storage (the cache is shared by the app's web views).
+            web.clearCache(true);
+            web.clearHistory();
             web.destroy();
             forget();
+            CookieManager.getInstance().flush();
         }
         super.onDestroy();
     }

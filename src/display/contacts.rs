@@ -281,7 +281,7 @@ impl MailApp {
                 .detach();
             }
             Action::ExportContacts => {
-                let start = self.backend.store.path.clone();
+                let start = self.save_start();
                 let picker = cx.prompt_for_new_path(&start, Some("Contacts.vcf"));
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(path))) = picker.await {

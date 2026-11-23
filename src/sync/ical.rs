@@ -14,6 +14,11 @@ pub enum PartStat {
     Tentative,
     Declined,
     NeedsAction,
+    /// Passed on to someone else (RFC 5545 §3.2.12).
+    Delegated,
+    /// For tasks: done, or under way.
+    Completed,
+    InProcess,
 }
 
 impl PartStat {
@@ -23,6 +28,9 @@ impl PartStat {
             Self::Tentative => "TENTATIVE",
             Self::Declined => "DECLINED",
             Self::NeedsAction => "NEEDS-ACTION",
+            Self::Delegated => "DELEGATED",
+            Self::Completed => "COMPLETED",
+            Self::InProcess => "IN-PROCESS",
         }
     }
     pub fn parse(text: &str) -> Self {
@@ -30,6 +38,9 @@ impl PartStat {
             "ACCEPTED" => Self::Accepted,
             "TENTATIVE" => Self::Tentative,
             "DECLINED" => Self::Declined,
+            "DELEGATED" => Self::Delegated,
+            "COMPLETED" => Self::Completed,
+            "IN-PROCESS" => Self::InProcess,
             _ => Self::NeedsAction,
         }
     }
@@ -40,6 +51,9 @@ impl PartStat {
             Self::Tentative => "Tentatively accepted",
             Self::Declined => "Declined",
             Self::NeedsAction => "Invitation",
+            Self::Delegated => "Delegated",
+            Self::Completed => "Completed",
+            Self::InProcess => "In progress",
         }
     }
 }
@@ -49,6 +63,11 @@ pub struct Attendee {
     pub email: String,
     pub name: String,
     pub status: Option<PartStat>,
+    /// The attendee's other parameters as written (ROLE, RSVP, CUTYPE,
+    /// DELEGATED-TO/-FROM, SENT-BY, X-…), `;`-joined, kept so that
+    /// rewriting an event doesn't lose them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra: String,
 }
 
 /// One event.
@@ -100,6 +119,86 @@ pub struct Event {
     pub task: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub completed: bool,
+    /// The component's properties and sub-components Picacho doesn't edit
+    /// (CATEGORIES, CLASS, TRANSP, GEO, URL, ATTACH, PRIORITY, RESOURCES,
+    /// COMMENT, CONTACT, RELATED-TO, COLOR, CONFERENCE, IMAGE, X-…, and
+    /// alarms with more than a trigger), as written: put back whenever
+    /// the event is written from its fields, so editing it loses none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kept: String,
+    /// A changed occurrence that changes the later ones too
+    /// (RECURRENCE-ID;RANGE=THISANDFUTURE, RFC 5545 §3.8.4.4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub this_and_future: bool,
+    /// Its times are floating (no zone, no Z: the same wall time in every
+    /// zone), and are written back so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub floating: bool,
+    /// COMMENT: a note with an iTIP message (a proposed time's reason).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
+/// Properties `write_event` writes from an event's fields; others are
+/// kept as they came (`Event::kept`).
+const MODELLED: [&str; 25] = [
+    "COMMENT", "BEGIN", "END", "UID", "DTSTAMP", "SEQUENCE", "DTSTART", "DTEND", "DUE", "DURATION",
+    "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "SUMMARY", "LOCATION", "DESCRIPTION",
+    "RRULE", "ORGANIZER", "ATTENDEE", "COMPLETED", "PERCENT-COMPLETE", "LAST-MODIFIED",
+    "CREATED", "X-PICACHO",
+];
+
+/// The lines of a component (unfolded, BEGIN and END included) that
+/// `write_event` doesn't write: unmodelled properties, and sub-components
+/// other than plain reminders, which `alarms` holds.
+fn kept_lines(lines: &[String]) -> String {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i + 1 < lines.len() {
+        let line = &lines[i];
+        let upper = line.to_ascii_uppercase();
+        if let Some(kind) = upper.strip_prefix("BEGIN:") {
+            // A whole sub-component: to its END.
+            let end = format!("END:{kind}");
+            let mut depth = 0;
+            let mut j = i;
+            while j < lines.len() - 1 {
+                let u = lines[j].to_ascii_uppercase();
+                if u.starts_with("BEGIN:") {
+                    depth += 1;
+                } else if u.starts_with("END:") {
+                    depth -= 1;
+                    if depth == 0 && u == end {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            let block = &lines[i..=j.min(lines.len() - 1)];
+            // A display reminder with only a trigger is in `alarms`.
+            let simple = kind == "VALARM"
+                && block.iter().all(|l| {
+                    let n = split_line(l).map(|(n, ..)| n).unwrap_or_default();
+                    matches!(n.as_str(), "BEGIN" | "END" | "TRIGGER" | "DESCRIPTION" | "UID" | "X-WR-ALARMUID")
+                        || (n == "ACTION" && l.to_ascii_uppercase().ends_with(":DISPLAY"))
+                });
+            if !simple {
+                out.extend(block.iter().cloned());
+            }
+            i = j + 1;
+            continue;
+        }
+        let name = split_line(line).map(|(n, ..)| n).unwrap_or_default();
+        if !MODELLED.contains(&name.as_str()) {
+            out.push(line.clone());
+        }
+        i += 1;
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        out.join("\r\n") + "\r\n"
+    }
 }
 
 /// When someone is busy (a VFREEBUSY reply, RFC 5545 §3.6.4): their
@@ -215,15 +314,130 @@ fn split_line(line: &str) -> Option<Line> {
     }
     let colon = colon?;
     let (head, value) = (&line[..colon], &line[colon + 1..]);
-    let mut parts = head.split(';');
+    // Semicolons inside quoted values (`CN="Doe; Jane"`) don't end one.
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (i, c) in head.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                parts.push(&head[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&head[start..]);
+    let mut parts = parts.into_iter();
     let name = parts.next()?.to_ascii_uppercase();
     let params = parts
         .filter_map(|p| {
             let (k, v) = p.split_once('=')?;
-            Some((k.to_ascii_uppercase(), v.trim_matches('"').to_owned()))
+            Some((k.to_ascii_uppercase(), caret_decode(v.trim_matches('"'))))
         })
         .collect();
     Some((name, params, value.to_owned()))
+}
+/// A parameter value with RFC 6868's escapes undone: `^n` a line break,
+/// `^'` a double quote, `^^` a caret.
+fn caret_decode(value: &str) -> String {
+    if !value.contains('^') {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '^' {
+            match chars.peek() {
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('\'') => {
+                    chars.next();
+                    out.push('"');
+                }
+                Some('^') => {
+                    chars.next();
+                    out.push('^');
+                }
+                _ => out.push('^'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+/// `source` (a component as it came) with the PARTSTAT of the attendee
+/// `email` set to `status`, everything else as it was; RSVP is dropped
+/// once answered. `None` where it doesn't name that attendee.
+pub fn set_partstat_in_source(source: &str, email: &str, status: PartStat) -> Option<String> {
+    let mut found = false;
+    let mut out = String::with_capacity(source.len() + 32);
+    // Only the first component's own attendees, not those in its alarms.
+    let mut depth = 0usize;
+    for line in unfold(source) {
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("BEGIN:") {
+            depth += 1;
+        } else if upper.starts_with("END:") {
+            depth = depth.saturating_sub(1);
+        }
+        let mine = depth == 1
+            && upper.starts_with("ATTENDEE")
+            && split_line(&line).is_some_and(|(_, _, v)| {
+                v.trim()
+                    .strip_prefix("mailto:")
+                    .or_else(|| v.trim().strip_prefix("MAILTO:"))
+                    .unwrap_or(v.trim())
+                    .eq_ignore_ascii_case(email)
+            });
+        if !mine {
+            out.push_str(&fold(&line));
+            continue;
+        }
+        found = true;
+        let colon = quote_aware_colon(&line).unwrap_or(line.len());
+        let (head, value) = (&line[..colon], &line[colon..]);
+        let mut kept: Vec<String> = Vec::new();
+        let mut quoted = false;
+        let mut start = 0;
+        let mut pieces = Vec::new();
+        for (i, c) in head.char_indices() {
+            match c {
+                '"' => quoted = !quoted,
+                ';' if !quoted => {
+                    pieces.push(&head[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        pieces.push(&head[start..]);
+        for (i, piece) in pieces.iter().enumerate() {
+            let key = piece.split('=').next().unwrap_or("").to_ascii_uppercase();
+            if i > 0 && (key == "PARTSTAT" || key == "RSVP") {
+                continue;
+            }
+            kept.push((*piece).to_owned());
+        }
+        kept.push(format!("PARTSTAT={}", status.as_str()));
+        out.push_str(&fold(&format!("{}{value}", kept.join(";"))));
+    }
+    found.then_some(out)
+}
+fn quote_aware_colon(line: &str) -> Option<usize> {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ':' if !quoted => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -304,6 +518,188 @@ fn zone_name(params: &[(String, String)]) -> Option<String> {
     windows_zone(tzid).map(str::to_owned)
 }
 
+/// One observance of a calendar's own VTIMEZONE (STANDARD or DAYLIGHT):
+/// from its start (local wall time), the offset in force, repeating
+/// yearly where its RRULE says (`BYMONTH`, `BYDAY` such as `-1SU` or
+/// `2SU`, or `BYMONTHDAY`), else once (and at its RDATEs).
+#[derive(Clone, Debug, Default)]
+struct Observance {
+    start: NaiveDateTime,
+    offset_to: i32,
+    offset_from: i32,
+    month: Option<u32>,
+    /// (nth, weekday): -1 the last.
+    day: Option<(i32, chrono::Weekday)>,
+    month_day: Option<i32>,
+    until: Option<NaiveDateTime>,
+    rdates: Vec<NaiveDateTime>,
+}
+impl Observance {
+    /// When it begins in `year`, as local wall time (by the offset before).
+    fn onset_in(&self, year: i32) -> Option<NaiveDateTime> {
+        use chrono::Datelike;
+        if year < self.start.year() {
+            return None;
+        }
+        let time = self.start.time();
+        let at = match (self.month, self.day, self.month_day) {
+            (Some(month), Some((nth, weekday)), _) => {
+                let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+                let days = first
+                    .with_month(month % 12 + 1)
+                    .and_then(|d| if month == 12 { d.with_year(year + 1) } else { Some(d) })
+                    .map_or(31, |next| (next - first).num_days() as u32);
+                let matching: Vec<NaiveDate> = (0..days)
+                    .filter_map(|d| first.checked_add_days(chrono::Days::new(d.into())))
+                    .filter(|d| d.weekday() == weekday)
+                    .collect();
+                let pick = if nth < 0 {
+                    matching.len().checked_sub(nth.unsigned_abs() as usize)?
+                } else {
+                    (nth as usize).checked_sub(1)?
+                };
+                matching.get(pick)?.and_time(time)
+            }
+            (Some(month), None, Some(day)) => NaiveDate::from_ymd_opt(year, month, day as u32)?.and_time(time),
+            _ if year == self.start.year() => self.start,
+            _ => return None,
+        };
+        (at >= self.start && self.until.is_none_or(|u| at <= u)).then_some(at)
+    }
+    /// Its onsets around `year`, as UTC instants.
+    fn onsets(&self, year: i32) -> Vec<(i64, i32)> {
+        let mut out = Vec::new();
+        for y in [year - 1, year] {
+            if let Some(at) = self.onset_in(y) {
+                out.push((at.and_utc().timestamp() - i64::from(self.offset_from), self.offset_to));
+            }
+        }
+        for r in &self.rdates {
+            out.push((r.and_utc().timestamp() - i64::from(self.offset_from), self.offset_to));
+        }
+        out
+    }
+}
+
+/// `+0130`/`-05` style UTC offset in seconds.
+fn parse_offset(text: &str) -> Option<i32> {
+    let text = text.trim();
+    let (sign, digits) = match text.as_bytes().first()? {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let n = |r: std::ops::Range<usize>| digits.get(r).map_or(Some(0), |d| d.parse::<i32>().ok());
+    Some(sign * (n(0..2)? * 3600 + n(2..4)? * 60 + n(4..6)?))
+}
+
+/// A calendar's own time zones (VTIMEZONE, RFC 5545 §3.6.5), by TZID.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Zones(std::collections::HashMap<String, Vec<Observance>>);
+impl Zones {
+    fn read(lines: &[String]) -> Self {
+        let mut zones: std::collections::HashMap<String, Vec<Observance>> = Default::default();
+        let mut tzid = None;
+        let mut current: Option<Observance> = None;
+        for line in lines {
+            let Some((name, _, value)) = split_line(line) else { continue };
+            let upper = value.trim().to_ascii_uppercase();
+            match name.as_str() {
+                "BEGIN" if upper == "VTIMEZONE" => tzid = Some(String::new()),
+                "END" if upper == "VTIMEZONE" => tzid = None,
+                "TZID" if current.is_none() => {
+                    if let Some(t) = tzid.as_mut() {
+                        *t = value.trim().trim_start_matches('/').to_owned();
+                    }
+                }
+                "BEGIN" if tzid.is_some() && (upper == "STANDARD" || upper == "DAYLIGHT") => {
+                    current = Some(Observance::default())
+                }
+                "END" if upper == "STANDARD" || upper == "DAYLIGHT" => {
+                    if let (Some(o), Some(t)) = (current.take(), tzid.as_ref()) {
+                        zones.entry(t.clone()).or_default().push(o);
+                    }
+                }
+                _ => {
+                    let Some(o) = current.as_mut() else { continue };
+                    match name.as_str() {
+                        "DTSTART" => {
+                            if let Ok(t) = NaiveDateTime::parse_from_str(value.trim(), "%Y%m%dT%H%M%S") {
+                                o.start = t;
+                            }
+                        }
+                        "TZOFFSETTO" => o.offset_to = parse_offset(&value).unwrap_or(0),
+                        "TZOFFSETFROM" => o.offset_from = parse_offset(&value).unwrap_or(0),
+                        "RDATE" => o.rdates.extend(
+                            value
+                                .split(',')
+                                .filter_map(|v| NaiveDateTime::parse_from_str(v.trim(), "%Y%m%dT%H%M%S").ok()),
+                        ),
+                        "RRULE" => {
+                            for part in value.split(';') {
+                                let Some((k, v)) = part.split_once('=') else { continue };
+                                match k.to_ascii_uppercase().as_str() {
+                                    "BYMONTH" => o.month = v.parse().ok(),
+                                    "BYMONTHDAY" => o.month_day = v.parse().ok(),
+                                    "UNTIL" => {
+                                        o.until = NaiveDateTime::parse_from_str(
+                                            v.trim_end_matches('Z'),
+                                            "%Y%m%dT%H%M%S",
+                                        )
+                                        .ok()
+                                    }
+                                    "BYDAY" => {
+                                        let v = v.split(',').next().unwrap_or(v);
+                                        if v.len() >= 2 && v.is_ascii() {
+                                            let (n, d) = v.split_at(v.len() - 2);
+                                            let n = if n.is_empty() { 1 } else { n.parse().unwrap_or(1) };
+                                            o.day = weekday(&d.to_ascii_uppercase()).map(|w| (n, w));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Self(zones)
+    }
+    /// The UTC instant of local time `t` in the zone `tzid`, if this
+    /// calendar defines it.
+    fn to_utc(&self, tzid: &str, t: NaiveDateTime) -> Option<i64> {
+        use chrono::Datelike;
+        let observances = self.0.get(tzid)?;
+        let year = t.year();
+        let mut onsets: Vec<(i64, i32)> = observances.iter().flat_map(|o| o.onsets(year)).collect();
+        onsets.sort();
+        let wall = t.and_utc().timestamp();
+        // The offset in force: the last onset before, tried with each
+        // candidate offset (the result must agree with it).
+        let mut offset = observances.first().map_or(0, |o| o.offset_from);
+        for (at, to) in &onsets {
+            if wall - i64::from(*to) >= *at {
+                offset = *to;
+            }
+        }
+        Some(wall - i64::from(offset))
+    }
+}
+thread_local! {
+    /// The VTIMEZONEs of the calendar being read, for `parse_time`.
+    static ZONES: std::cell::RefCell<Zones> = Default::default();
+}
+/// Runs `f` with the time zones `lines` define in force for `parse_time`.
+fn with_zones<T>(lines: &[String], f: impl FnOnce() -> T) -> T {
+    let zones = Zones::read(lines);
+    let before = ZONES.with(|z| std::mem::replace(&mut *z.borrow_mut(), zones));
+    let out = f();
+    ZONES.with(|z| *z.borrow_mut() = before);
+    out
+}
+
 /// A DATE or DATE-TIME value as Unix seconds, and whether it is a date.
 fn parse_time(value: &str, params: &[(String, String)]) -> Option<(i64, bool)> {
     let value = value.trim();
@@ -327,6 +723,11 @@ fn parse_time(value: &str, params: &[(String, String)]) -> Option<(i64, bool)> {
         {
             return Some((local.with_timezone(&Utc).timestamp(), false));
         }
+        // A zone the calendar defines itself (VTIMEZONE): by its rules,
+        // not the reader's own zone.
+        if let Some(at) = ZONES.with(|z| z.borrow().to_utc(tzid, t)) {
+            return Some((at, false));
+        }
     }
     // Floating time: the reader's own zone.
     let local = chrono::Local.from_local_datetime(&t).earliest()?;
@@ -339,23 +740,53 @@ fn attendee(value: &str, params: &[(String, String)]) -> Attendee {
         .trim_start_matches("mailto:")
         .trim_start_matches("MAILTO:")
         .to_owned();
+    // The parameters Picacho doesn't edit, as written (RFC 6868 escapes
+    // put back).
+    let extra = params
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT"))
+        .map(|(k, v)| format!("{k}={}", param_value(v)))
+        .collect::<Vec<_>>()
+        .join(";");
     Attendee {
         name: param(params, "CN").unwrap_or_default().to_owned(),
         status: param(params, "PARTSTAT").map(PartStat::parse),
         email,
+        extra,
     }
+}
+/// A parameter value as written: RFC 6868's escapes put in, quoted where
+/// it holds `;`, `:` or `,`.
+pub(crate) fn param_value(value: &str) -> String {
+    let escaped = value
+        .replace('^', "^^")
+        .replace('\n', "^n")
+        .replace('"', "^'");
+    if escaped.contains([';', ':', ',']) {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+/// A parameter's value by name in an attendee's other parameters.
+pub fn extra_param(extra: &str, name: &str) -> Option<String> {
+    split_line(&format!("X;{extra}:x"))
+        .and_then(|(_, params, _)| param(&params, &name.to_ascii_uppercase()).map(str::to_owned))
 }
 
 /// The tasks (VTODO) in an iCalendar object, those without a due date
 /// too (`start` 0). A task's DUE is when it's due even where it also has
 /// a DTSTART (when work on it starts).
 pub fn parse_tasks(text: &str) -> Vec<Event> {
+    let lines = unfold(text);
+    with_zones(&lines, || parse_task_lines(&lines))
+}
+fn parse_task_lines(lines: &[String]) -> Vec<Event> {
     // Each VTODO alone, so `parse`'s rules for events don't apply: it
     // leaves out what has no start.
     let mut out = Vec::new();
-    let lines = unfold(text);
     let mut inside: Option<Vec<String>> = None;
-    for line in &lines {
+    for line in lines {
         let upper = line.to_ascii_uppercase();
         if upper == "BEGIN:VTODO" {
             inside = Some(vec![line.clone()]);
@@ -507,6 +938,9 @@ pub fn task_to_store(e: &Event) -> String {
 /// Reads an iCalendar object. Events without a start are left out.
 pub fn parse(text: &str) -> Calendar {
     let lines = unfold(text);
+    with_zones(&lines, || parse_lines(lines.clone()))
+}
+fn parse_lines(lines: Vec<String>) -> Calendar {
     let mut cal = Calendar {
         text: lines.join("\r\n") + "\r\n",
         ..Default::default()
@@ -515,8 +949,13 @@ pub fn parse(text: &str) -> Calendar {
     let mut event: Option<Event> = None;
     let mut source: Vec<String> = Vec::new();
     let mut end_duration: Option<i64> = None;
-    // Inside a VALARM: its trigger (seconds before the start) once read.
-    let mut alarm: Option<Option<i64>> = None;
+    // Inside a VALARM: its trigger once read, as it was written; it is
+    // made relative to the start only once the event's times are known
+    // (a VALARM may come before DTSTART and DTEND).
+    let mut alarm: Option<Option<Trigger>> = None;
+    let mut triggers: Vec<Trigger> = Vec::new();
+    // Where the current alarm's lines start in `source`.
+    let mut alarm_at = 0;
     for line in &lines {
         let Some((name, params, value)) = split_line(line) else {
             continue;
@@ -533,21 +972,30 @@ pub fn parse(text: &str) -> Calendar {
                     });
                     source.clear();
                     end_duration = None;
+                    triggers.clear();
                 }
                 // A reminder: when, relative to the start.
                 if kind == "VALARM" {
                     alarm = Some(None);
+                    alarm_at = source.len();
                 }
                 depth.push(kind);
             }
             "END" => {
                 let kind = value.to_ascii_uppercase();
+                // Only plain reminders are edited as `alarms`; others (an
+                // email or sound alarm, repeats) are kept whole.
+                let block = source.get(alarm_at..).unwrap_or_default();
+                let simple = kept_lines(
+                    &[vec![String::new()], block.to_vec(), vec![line.clone(), String::new()]].concat(),
+                )
+                .is_empty();
                 if kind == "VALARM"
-                    && let Some(Some(before)) = alarm.take()
-                    && let Some(e) = event.as_mut()
-                    && !e.alarms.contains(&before)
+                    && let Some(Some(t)) = alarm.take()
+                    && event.is_some()
+                    && simple
                 {
-                    e.alarms.push(before);
+                    triggers.push(t);
                 }
                 if (kind == "VEVENT" || kind == "VTODO")
                     && depth.len() == 2
@@ -555,6 +1003,7 @@ pub fn parse(text: &str) -> Calendar {
                 {
                     source.push(line.clone());
                     e.source = source.join("\r\n") + "\r\n";
+                    e.kept = kept_lines(&source);
                     // A task without a due date is due when it starts.
                     if e.task && e.start == 0 {
                         e.start = e.end;
@@ -566,7 +1015,24 @@ pub fn parse(text: &str) -> Calendar {
                             None => e.start,
                         };
                     }
-                    if e.start != 0 {
+                    let length = (e.end - e.start).max(0);
+                    for t in triggers.drain(..) {
+                        let before = match t {
+                            Trigger::At(at) => e.start - at,
+                            Trigger::FromStart(d) => -d,
+                            Trigger::FromEnd(d) => -(d + length),
+                        };
+                        if !e.alarms.contains(&before) {
+                            e.alarms.push(before);
+                        }
+                    }
+                    // Without a start it isn't an event to show; an iTIP
+                    // message may still name one so (CANCEL, REFRESH:
+                    // RFC 5546 lets DTSTART out), and those are kept.
+                    if e.start != 0
+                        || (matches!(cal.method.as_str(), "CANCEL" | "REFRESH" | "DECLINECOUNTER")
+                            && !e.uid.is_empty())
+                    {
                         cal.events.push(e);
                     }
                 }
@@ -587,11 +1053,10 @@ pub fn parse(text: &str) -> Calendar {
             let from_end = param(&params, "RELATED").is_some_and(|r| r.eq_ignore_ascii_case("END"));
             // An absolute trigger (VALUE=DATE-TIME) is kept as relative.
             *slot = if param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
-                parse_time(&value, &[]).and_then(|(t, _)| event.as_ref().map(|e| e.start - t))
+                parse_time(&value, &[]).map(|(t, _)| Trigger::At(t))
             } else {
                 parse_duration(&value).map(|d| {
-                    let length = event.as_ref().map_or(0, |e| (e.end - e.start).max(0));
-                    if from_end { -(d + length) } else { -d }
+                    if from_end { Trigger::FromEnd(d) } else { Trigger::FromStart(d) }
                 })
             };
         }
@@ -603,12 +1068,14 @@ pub fn parse(text: &str) -> Calendar {
                 "SUMMARY" => e.summary = unescape(&value),
                 "LOCATION" => e.location = unescape(&value),
                 "DESCRIPTION" => e.description = unescape(&value),
+                "COMMENT" => e.comment = unescape(&value),
                 "DTSTART" => {
                     if let Some((t, all_day)) = parse_time(&value, &params) {
                         e.start = t;
                         e.all_day = all_day;
                         e.tzid = zone_name(&params).unwrap_or_default();
                         e.utc = value.trim().ends_with('Z');
+                        e.floating = !all_day && !e.utc && param(&params, "TZID").is_none();
                     }
                 }
                 "EXDATE" => {
@@ -618,18 +1085,25 @@ pub fn parse(text: &str) -> Calendar {
                         }
                     }
                 }
-                "RDATE"
-                    if !param(&params, "VALUE")
-                        .is_some_and(|v| v.eq_ignore_ascii_case("PERIOD")) =>
-                {
+                "RDATE" => {
+                    // A PERIOD (start/end or start/duration): its start;
+                    // its length is the series'.
                     for v in value.split(',') {
-                        if let Some((t, _)) = parse_time(v, &params) {
+                        let v = v.split('/').next().unwrap_or(v);
+                        let plain: Vec<(String, String)> = params
+                            .iter()
+                            .filter(|(k, _)| k != "VALUE")
+                            .cloned()
+                            .collect();
+                        if let Some((t, _)) = parse_time(v, &plain) {
                             e.rdates.push(t);
                         }
                     }
                 }
                 "RECURRENCE-ID" => {
                     e.recurrence_id = parse_time(&value, &params).map(|(t, _)| t);
+                    e.this_and_future = param(&params, "RANGE")
+                        .is_some_and(|r| r.eq_ignore_ascii_case("THISANDFUTURE"));
                 }
                 "DTEND" | "DUE" => {
                     if let Some((t, _)) = parse_time(&value, &params) {
@@ -742,11 +1216,14 @@ fn when(t: i64, all_day: bool) -> String {
     }
 }
 
-/// Folds a content line at 75 octets (RFC 5545 §3.1).
+/// Folds a content line at 75 octets (RFC 5545 §3.1). A line break or NUL
+/// inside it (a UID, organizer or attendee as an invitation gave it, which
+/// isn't escaped as text is) is left out: it would end the line and start
+/// a property of the sender's choosing.
 fn fold(line: &str) -> String {
     let mut out = String::new();
     let mut count = 0;
-    for c in line.chars() {
+    for c in line.chars().filter(|c| !matches!(c, '\r' | '\n' | '\0')) {
         let len = c.len_utf8();
         if count + len > 75 {
             out.push_str("\r\n ");
@@ -806,6 +1283,10 @@ impl Rule {
                 "BYDAY" => {
                     for d in v.split(',') {
                         let d = d.trim().to_ascii_uppercase();
+                        // Byte offsets below; a day is two ASCII letters.
+                        if !d.is_ascii() {
+                            return None;
+                        }
                         let (n, code) = d.split_at(d.len().saturating_sub(2));
                         rule.by_day.push((
                             if n.is_empty() { 0 } else { n.parse().ok()? },
@@ -1057,19 +1538,46 @@ pub fn occurrences(series: &Event, overrides: &[Event], from: i64, to: i64) -> V
     let starts = full_starts(series, from - length.max(0), to)
         .or_else(|| simple_starts(series, to))
         .unwrap_or_else(|| vec![series.start]);
+    // The series without its source text, to copy for each repeat: each had
+    // a copy of it (thousands, for a large invitation), and an occurrence is
+    // shown, never saved from (saving reads the series).
+    let bare = Event {
+        source: String::new(),
+        ..series.clone()
+    };
     let mut out = Vec::new();
     for start in starts {
         if series.exdates.contains(&start) {
             continue;
         }
+        // The latest THISANDFUTURE change at or before this one applies
+        // to it: its fields, its time moved by as much as that one's.
+        let future = overrides
+            .iter()
+            .filter(|o| o.this_and_future && o.recurrence_id.is_some_and(|r| r <= start))
+            .max_by_key(|o| o.recurrence_id);
         let occurrence = match overrides.iter().find(|o| o.recurrence_id == Some(start)) {
             Some(changed) if changed.cancelled => continue,
             Some(changed) => changed.clone(),
-            None => Event {
-                start,
-                end: start + length,
-                recurrence_id: Some(start),
-                ..series.clone()
+            None => match future {
+                Some(f) if f.cancelled => continue,
+                Some(f) => {
+                    let shift = f.start - f.recurrence_id.unwrap_or(f.start);
+                    Event {
+                        start: start + shift,
+                        end: start + shift + (f.end - f.start),
+                        recurrence_id: Some(start),
+                        this_and_future: false,
+                        source: String::new(),
+                        ..f.clone()
+                    }
+                }
+                None => Event {
+                    start,
+                    end: start + length,
+                    recurrence_id: Some(start),
+                    ..bare.clone()
+                },
             },
         };
         if overlaps(&occurrence) {
@@ -1111,9 +1619,27 @@ fn full_starts(series: &Event, from: i64, to: i64) -> Option<Vec<i64>> {
     }
     // The first time counts, as RFC 5545 says (DTSTART is an occurrence).
     let to = to.min(series.start + 100 * 366 * 86_400);
-    let set = set.after(at(from.max(series.start) - 1)?).before(at(to)?);
-    let found = set.all(5000);
-    let mut starts: Vec<i64> = found.dates.iter().map(|d| d.timestamp()).collect();
+    let after = from.max(series.start) - 1;
+    // Walked here with a budget of steps: the expander's own limit counts
+    // the times it returns, not those before `from` it passes over, so an
+    // invitation repeating every second since 1970 had it count through
+    // billions of them first.
+    const STEPS: usize = 500_000;
+    let mut starts: Vec<i64> = Vec::new();
+    // `limit` keeps the expander's own guard for rules that never match
+    // (February 31st), which looked without end.
+    for d in set.limit().into_iter().take(STEPS) {
+        let t = d.timestamp();
+        if t > to {
+            break;
+        }
+        if t >= after {
+            starts.push(t);
+            if starts.len() >= 5000 {
+                break;
+            }
+        }
+    }
     if series.start >= from && series.start < to && !starts.contains(&series.start) {
         starts.insert(0, series.start);
     }
@@ -1273,13 +1799,21 @@ pub fn reply(event: &Event, me: &str, my_name: &str, status: PartStat) -> Result
             "DTSTART;{}",
             when(event.start, event.all_day).trim_start_matches(';')
         ),
+        // An answer for one occurrence names it (RFC 5546 §3.2.3).
+        match event.recurrence_id {
+            Some(id) => format!(
+                "RECURRENCE-ID;{}",
+                when(id, event.all_day).trim_start_matches(';')
+            ),
+            None => String::new(),
+        },
         format!("SUMMARY:{}", escape(&event.summary)),
         format!(
             "ORGANIZER{}:mailto:{}",
             if organizer.name.is_empty() {
                 String::new()
             } else {
-                format!(";CN=\"{}\"", organizer.name.replace('"', "'"))
+                format!(";CN=\"{}\"", organizer.name.replace('^', "^^").replace('"', "^'").replace('\n', "^n"))
             },
             organizer.email
         ),
@@ -1289,14 +1823,19 @@ pub fn reply(event: &Event, me: &str, my_name: &str, status: PartStat) -> Result
             if my_name.is_empty() {
                 String::new()
             } else {
-                format!(";CN=\"{}\"", my_name.replace('"', "'"))
+                format!(";CN=\"{}\"", my_name.replace('^', "^^").replace('"', "^'").replace('\n', "^n"))
             }
         ),
         "END:VEVENT".to_owned(),
         "END:VCALENDAR".to_owned(),
     ] {
+        if line.is_empty() {
+            continue;
+        }
         // DTSTART with a date value is written `DTSTART;VALUE=DATE:…`.
-        let line = line.replace("DTSTART;:", "DTSTART:");
+        let line = line
+            .replace("DTSTART;:", "DTSTART:")
+            .replace("RECURRENCE-ID;:", "RECURRENCE-ID:");
         out.push_str(&fold(&line));
     }
     Ok(out)
@@ -1331,8 +1870,11 @@ pub fn counter(
             email: me.to_owned(),
             name: my_name.to_owned(),
             status: Some(PartStat::Tentative),
+            ..Default::default()
         }],
-        description: note.to_owned(),
+        // The guest's note is a COMMENT (RFC 5546 §3.2.7); the event's
+        // description stays the organizer's.
+        comment: note.to_owned(),
         recurrence: String::new(),
         exdates: Vec::new(),
         source: String::new(),
@@ -1349,6 +1891,12 @@ pub fn decline_counter(event: &Event, guest: &str) -> String {
         format!("UID:{}", event.uid),
         format!("DTSTAMP:{}", stamp(Utc::now().timestamp())),
         format!("SEQUENCE:{}", event.sequence),
+        // DTSTART, so the guest's app can match it (and reads the event).
+        format!(
+            "DTSTART;{}",
+            when(event.start, event.all_day).trim_start_matches(';')
+        )
+        .replace("DTSTART;:", "DTSTART:"),
     ];
     if let Some(o) = event.organizer.as_ref() {
         lines.push(format!("ORGANIZER:mailto:{}", o.email));
@@ -1508,16 +2056,48 @@ pub fn vtimezone(tzid: &str, years: std::ops::RangeInclusive<i32>) -> Option<Str
         ]);
     } else {
         // What held before the first change, so earlier times are covered.
-        let (first, before, _) = changes[0];
+        // In summer time where the first change lowers the offset (the
+        // southern hemisphere's January).
+        let (first, before, after_first) = changes[0];
+        let opening = if after_first < before { "DAYLIGHT" } else { "STANDARD" };
         lines.extend([
-            "BEGIN:STANDARD".to_owned(),
+            format!("BEGIN:{opening}"),
             "DTSTART:19700101T000000".to_owned(),
             format!("TZOFFSETFROM:{}", utc_offset(before)),
             format!("TZOFFSETTO:{}", utc_offset(before)),
             format!("TZNAME:{}", abbreviation(first - 1)),
-            "END:STANDARD".to_owned(),
+            format!("END:{opening}"),
         ]);
-        for (at, before, after) in &changes {
+        // The last year's changes also as yearly rules (by month and
+        // weekday) from the end of the range, so repeats past it keep
+        // their local time where the rules haven't changed.
+        let last_year: Vec<&(i64, i32, i32)> = changes
+            .iter()
+            .filter(|(at, ..)| *at >= to - 366 * 86_400)
+            .collect();
+        for (at, before, after) in &last_year {
+            use chrono::Datelike;
+            let wall = DateTime::from_timestamp(at + i64::from(*before), 0).unwrap_or_default();
+            let nth = (wall.day() as i32 - 1) / 7 + 1;
+            let days_in_month = wall
+                .date_naive()
+                .with_day(1)
+                .and_then(|d| d.checked_add_months(chrono::Months::new(1)))
+                .map_or(31, |n| n.pred_opt().map_or(31, |p| p.day()));
+            let nth = if wall.day() + 7 > days_in_month { -1 } else { nth };
+            let day = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"][wall.weekday().num_days_from_monday() as usize];
+            let kind = if after > before { "DAYLIGHT" } else { "STANDARD" };
+            lines.extend([
+                format!("BEGIN:{kind}"),
+                format!("DTSTART:{}", local(*at, *before)),
+                format!("RRULE:FREQ=YEARLY;BYMONTH={};BYDAY={nth}{day}", wall.month()),
+                format!("TZOFFSETFROM:{}", utc_offset(*before)),
+                format!("TZOFFSETTO:{}", utc_offset(*after)),
+                format!("TZNAME:{}", abbreviation(*at)),
+                format!("END:{kind}"),
+            ]);
+        }
+        for (at, before, after) in changes.iter().filter(|c| !last_year.contains(c)) {
             // The later offset of a pair is summer time (DAYLIGHT).
             let kind = if after > before { "DAYLIGHT" } else { "STANDARD" };
             lines.extend([
@@ -1619,12 +2199,23 @@ pub fn write_event(e: &Event) -> String {
                 .unwrap_or_default()
                 .with_timezone(&zone);
             format!("{name};TZID={}:{}", e.tzid, local.format("%Y%m%dT%H%M%S"))
+        } else if e.floating {
+            // In the reader's wall time, as it was read, without a zone.
+            let local = DateTime::from_timestamp(t, 0)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Local);
+            format!("{name}:{}", local.format("%Y%m%dT%H%M%S"))
         } else {
             format!("{name}{}", when(t, false))
         }
     };
     if let Some(id) = e.recurrence_id.filter(|_| e.recurrence.is_empty()) {
-        lines.push(at("RECURRENCE-ID", id));
+        let line = at("RECURRENCE-ID", id);
+        lines.push(if e.this_and_future {
+            line.replacen("RECURRENCE-ID", "RECURRENCE-ID;RANGE=THISANDFUTURE", 1)
+        } else {
+            line
+        });
     }
     if e.task {
         // A task is due then (0: no due date); done or not.
@@ -1664,6 +2255,9 @@ pub fn write_event(e: &Event) -> String {
     if !e.description.is_empty() {
         lines.push(format!("DESCRIPTION:{}", escape(&e.description)));
     }
+    if !e.comment.is_empty() {
+        lines.push(format!("COMMENT:{}", escape(&e.comment)));
+    }
     if !e.recurrence.is_empty() {
         lines.push(format!("RRULE:{}", e.recurrence));
     }
@@ -1671,15 +2265,23 @@ pub fn write_event(e: &Event) -> String {
         if p.name.is_empty() {
             String::new()
         } else {
-            format!(";CN=\"{}\"", p.name.replace('"', "'"))
+            format!(";CN=\"{}\"", p.name.replace('^', "^^").replace('"', "^'").replace('\n', "^n"))
         }
     };
     if let Some(o) = e.organizer.as_ref().filter(|o| !o.email.is_empty()) {
-        lines.push(format!("ORGANIZER{}:mailto:{}", person(o), o.email));
+        let extra = if o.extra.is_empty() { String::new() } else { format!(";{}", o.extra) };
+        lines.push(format!("ORGANIZER{extra}{}:mailto:{}", person(o), o.email));
     }
     for at in &e.attendees {
+        // Its own parameters where it came with them; a new guest is a
+        // required one asked to answer.
+        let extra = if at.extra.is_empty() {
+            "ROLE=REQ-PARTICIPANT;RSVP=TRUE".to_owned()
+        } else {
+            at.extra.clone()
+        };
         lines.push(format!(
-            "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT={};RSVP=TRUE{}:mailto:{}",
+            "ATTENDEE;{extra};PARTSTAT={}{}:mailto:{}",
             at.status.unwrap_or(PartStat::NeedsAction).as_str(),
             person(at),
             at.email
@@ -1692,33 +2294,117 @@ pub fn write_event(e: &Event) -> String {
         lines.push(format!("TRIGGER:{}", trigger(*before)));
         lines.push("END:VALARM".to_owned());
     }
+    // What Picacho doesn't edit, as it came.
+    lines.extend(e.kept.split("\r\n").filter(|l| !l.is_empty()).map(str::to_owned));
     lines.push(format!("END:{kind}"));
     lines.iter().map(|l| fold(l)).collect()
 }
 
-/// A reminder's TRIGGER: seconds before the start as `-PT15M`, `-P1D`.
+/// A VALARM's TRIGGER as written, before the event's times are known.
+#[derive(Clone, Copy)]
+enum Trigger {
+    /// At that moment (Unix seconds).
+    At(i64),
+    /// That long after the start (negative: before).
+    FromStart(i64),
+    /// That long after the end.
+    FromEnd(i64),
+}
+
+/// A reminder's TRIGGER: seconds before the start as `-PT15M`, `-P1D`
+/// (and `-PT90S` where it isn't whole minutes).
 fn trigger(before: i64) -> String {
     let (sign, s) = if before >= 0 { ("-", before) } else { ("", -before) };
     if s % 86_400 == 0 && s > 0 {
         format!("{sign}P{}D", s / 86_400)
     } else if s % 3600 == 0 && s > 0 {
         format!("{sign}PT{}H", s / 3600)
-    } else {
+    } else if s % 60 == 0 {
         format!("{sign}PT{}M", s / 60)
+    } else {
+        format!("{sign}PT{s}S")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edits_keep_what_picacho_doesnt_read() {
+        let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:k\r\nDTSTART:20261124T090000Z\r\nDTEND:20261124T100000Z\r\nSUMMARY:Review\r\nCATEGORIES:Work,Q4\r\nCLASS:PRIVATE\r\nATTACH:https://x.example/agenda.pdf\r\nCOLOR:teal\r\nATTENDEE;ROLE=OPT-PARTICIPANT;CUTYPE=ROOM;PARTSTAT=ACCEPTED;CN=Room 4:mailto:room@x.example\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT1H\r\nATTENDEE:mailto:me@x.example\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut e = parse(text).events.remove(0);
+        assert_eq!(e.alarms, vec![600], "only the plain reminder is edited");
+        e.summary = "Review (moved)".into();
+        e.source.clear();
+        let written = unfold(&to_store(&e)).join("\n");
+        for kept in ["CATEGORIES:Work,Q4", "CLASS:PRIVATE", "ATTACH:https://x.example/agenda.pdf", "COLOR:teal", "ACTION:EMAIL"] {
+            assert!(written.contains(kept), "{kept} in {written}");
+        }
+        assert!(written.contains("ROLE=OPT-PARTICIPANT") && written.contains("CUTYPE=ROOM"));
+        assert_eq!(written.matches("BEGIN:VALARM").count(), 2);
+        assert_eq!(extra_param(&e.attendees[0].extra, "role").as_deref(), Some("OPT-PARTICIPANT"));
+    }
+    #[test]
+    fn quoted_parameters_and_answers_in_source() {
+        let (_, params, value) =
+            split_line("ATTENDEE;CN=\"Doe; Jane\";X-NOTE=say ^'hi^';PARTSTAT=NEEDS-ACTION:mailto:j@x.org").unwrap();
+        assert_eq!(param(&params, "CN"), Some("Doe; Jane"));
+        assert_eq!(param(&params, "X-NOTE"), Some("say \"hi\""));
+        assert_eq!(value, "mailto:j@x.org");
+        let source = "BEGIN:VEVENT\r\nUID:a\r\nX-OTHER:kept\r\nATTENDEE;RSVP=TRUE;PARTSTAT=NEEDS-ACTION;CN=\"Doe; J\":mailto:j@x.org\r\nEND:VEVENT\r\n";
+        let changed = set_partstat_in_source(source, "J@x.org", PartStat::Accepted).unwrap();
+        assert!(changed.contains("X-OTHER:kept"));
+        assert!(changed.contains("ATTENDEE;CN=\"Doe; J\";PARTSTAT=ACCEPTED:mailto:j@x.org"));
+        assert!(set_partstat_in_source(source, "other@x.org", PartStat::Accepted).is_none());
+        // An alarm before the start, and one from the end.
+        let cal = parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:b\r\nBEGIN:VALARM\r\nTRIGGER;RELATED=END:-PT30S\r\nEND:VALARM\r\nDTSTART:20261124T090000Z\r\nDTEND:20261124T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        assert_eq!(cal.events[0].alarms, vec![-3570]);
+        assert_eq!(trigger(90), "-PT90S");
+    }
     use super::*;
+
+    /// A rule repeating every second for decades is expanded in bounded
+    /// time, not counted through from its start.
+    #[test]
+    fn rapid_rules_from_long_ago_are_bounded() {
+        let started = std::time::Instant::now();
+        let now = chrono::Utc::now().timestamp();
+        let rapid = rrule_event("DTSTART:19700102T000000Z\nDTEND:19700102T000001Z\nRRULE:FREQ=SECONDLY");
+        let _ = occurrences(&rapid[0], &[], now, now + 86_400);
+        // One that never happens ends too.
+        let never = rrule_event("DTSTART:19700102T000000Z\nRRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=31");
+        let _ = occurrences(&never[0], &[], now, now + 86_400);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    /// A value an invitation gave can't break its line and add a property.
+    #[test]
+    fn written_lines_carry_no_line_breaks() {
+        assert_eq!(fold("UID:abc\rATTACH:http://x\n"), "UID:abcATTACH:http://x\r\n");
+    }
+
+    /// A day that isn't ASCII is refused, not cut inside a character.
+    #[test]
+    fn non_ascii_days_are_refused() {
+        assert!(Rule::parse("FREQ=WEEKLY;BYDAY=€").is_none());
+        assert!(Rule::parse("FREQ=WEEKLY;BYDAY=1€").is_none());
+        assert!(Rule::parse("FREQ=WEEKLY;BYDAY=MO").is_some());
+    }
 
     #[test]
     fn zoned_events_carry_their_vtimezone() {
         let tz = vtimezone("Europe/Berlin", 2026..=2026).unwrap();
         assert!(tz.contains("TZID:Europe/Berlin"));
         // 2026: summer time from 29 March 02:00, back on 25 October 03:00.
-        assert!(tz.contains("BEGIN:DAYLIGHT\r\nDTSTART:20260329T020000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200"), "{tz}");
-        assert!(tz.contains("DTSTART:20261025T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100"), "{tz}");
+        assert!(tz.contains("BEGIN:DAYLIGHT\r\nDTSTART:20260329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200"), "{tz}");
+        assert!(tz.contains("DTSTART:20261025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100"), "{tz}");
+        // Read back by Picacho's own VTIMEZONE reading: 1 July 2030 12:00
+        // in Berlin is 10:00 UTC, past the range given.
+        let custom = tz.replace("Europe/Berlin", "Custom Berlin");
+        let cal = parse(&format!("BEGIN:VCALENDAR\r\n{custom}BEGIN:VEVENT\r\nUID:c\r\nDTSTART;TZID=Custom Berlin:20300701T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"));
+        assert_eq!(cal.events[0].start, 1_909_130_400);
+        // Sydney starts the year in summer time.
+        let sydney = vtimezone("Australia/Sydney", 2026..=2026).unwrap();
+        assert!(sydney.starts_with("BEGIN:VTIMEZONE\r\nTZID:Australia/Sydney\r\nBEGIN:DAYLIGHT"), "{sydney}");
         let fixed = vtimezone("Asia/Kolkata", 2026..=2026).unwrap();
         assert!(fixed.contains("TZOFFSETTO:+0530") && !fixed.contains("DAYLIGHT"));
         assert!(vtimezone("Not/AZone", 2026..=2026).is_none());
@@ -1975,11 +2661,13 @@ mod tests {
             (e.uid.as_str(), e.start + 3600, e.end + 3600)
         );
         assert_eq!(p.attendees[0].email, "qa@example.com");
-        assert_eq!(p.description, "Later?");
+        assert_eq!(p.comment, "Later?");
         assert_eq!(p.organizer.as_ref().unwrap().email, "ana@example.org");
         let no = parse(&decline_counter(&e, "qa@example.com"));
         assert_eq!(no.method, "DECLINECOUNTER");
-        assert_eq!(no.events.len(), 0, "no start: not an event to show");
+        // With its DTSTART, the guest's app can show which event it was.
+        assert_eq!(no.events.len(), 1);
+        assert_eq!(no.events[0].start, e.start);
         assert!(decline_counter(&e, "qa@example.com").contains("ATTENDEE:mailto:qa@example.com"));
     }
 

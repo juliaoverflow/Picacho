@@ -44,6 +44,14 @@ pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
 /// Who an account belongs to and shares with (JMAP Sharing, RFC 9670).
 pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
+/// RFC 9670 §2.2: a principal's busy times (Principal/getAvailability).
+pub const PRINCIPALS_AVAILABILITY: &str = "urn:ietf:params:jmap:principals:availability";
+/// Whether a method belongs to JMAP Mail (RFC 8621).
+fn mail_method(name: &str) -> bool {
+    ["Mailbox/", "Thread/", "Email/", "SearchSnippet/", "Identity/", "EmailSubmission/", "VacationResponse/"]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
 
 /// What a listing asks of each message: what the message list shows, and
 /// the headers Picacho keeps from a source it hasn't downloaded.
@@ -300,6 +308,9 @@ pub struct Session {
     download_url: String,
     upload_url: String,
     event_source_url: String,
+    /// The last event's id from the event source, sent back when it is
+    /// opened again.
+    last_event_id: std::sync::Mutex<String>,
     account_id: String,
     /// Capabilities the server and the mail account have.
     submission: bool,
@@ -374,6 +385,15 @@ pub fn session_url(host: &str, port: u16) -> String {
 
 /// A transport failure in the terms Picacho's retries understand: nothing
 /// reached (try later), or the connection broke (a read may be repeated).
+/// The most read of a JMAP session document or upload answer: a few
+/// kilobytes are usual.
+const SESSION_LIMIT: u64 = 16 * 1024 * 1024;
+/// The most read of a method call's reply: a page of messages' properties,
+/// which is far less however many it lists.
+const REPLY_LIMIT: u64 = 256 * 1024 * 1024;
+/// The most read of an error's text.
+const ERROR_LIMIT: u64 = 64 * 1024;
+
 fn transport(e: reqwest::Error, what: &str) -> anyhow::Error {
     let kind = if e.is_timeout() {
         Some(std::io::ErrorKind::TimedOut)
@@ -536,7 +556,8 @@ impl Session {
             if status == reqwest::StatusCode::NOT_FOUND {
                 bail!("{} doesn't offer JMAP (no /.well-known/jmap).", host);
             }
-            let body = response.text().map_err(|e| transport(e, "sign-in"))?;
+            let body = crate::sync::public_net::bounded_text(response, SESSION_LIMIT)
+                .context("Couldn't read the JMAP server's session.")?;
             if !status.is_success() {
                 return Err(problem(status, &body));
             }
@@ -627,6 +648,7 @@ impl Session {
             download_url: url("downloadUrl")?,
             upload_url: url("uploadUrl")?,
             event_source_url: url("eventSourceUrl").unwrap_or_default(),
+            last_event_id: Default::default(),
             submission: caps.get(SUBMISSION).is_some()
                 && (account.get(SUBMISSION).is_some() || account.is_null()),
             submission_extensions,
@@ -803,6 +825,15 @@ impl Session {
         {
             using.push(PRINCIPALS);
         }
+        // Principal/getAvailability is its own capability (RFC 9670 §2.2).
+        if calls.iter().any(|(n, _)| *n == "Principal/getAvailability") {
+            using.push(PRINCIPALS_AVAILABILITY);
+        }
+        // Mail only where the server has it: a contacts- or calendars-
+        // only server would refuse a request naming it.
+        if !self.has(MAIL) && !calls.iter().any(|(n, _)| mail_method(n)) {
+            using.retain(|c| *c != MAIL);
+        }
         let method_calls: Vec<Value> = calls
             .iter()
             .enumerate()
@@ -826,7 +857,8 @@ impl Session {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
                 .context("The JMAP server no longer accepts the sign-in."));
         }
-        let text = response.text().map_err(|e| transport(e, "request"))?;
+        let text = crate::sync::public_net::bounded_text(response, REPLY_LIMIT)
+            .context("Couldn't read the JMAP server's reply.")?;
         if !status.is_success() {
             return Err(problem(status, &text));
         }
@@ -1174,11 +1206,22 @@ impl Session {
                 "Email/set",
                 json!({ "accountId": self.account_id, "update": update }),
             )?;
-            if let Some((id, e)) = v["notUpdated"].as_object().and_then(|m| m.iter().next()) {
-                // A message that's gone has nothing left to change.
-                if e["type"] != "notFound" {
-                    bail!("The server didn't change message {id}: {}", set_error(e));
-                }
+            // Every refusal counts, not the first alone; a message that's
+            // gone has nothing left to change.
+            let failed: Vec<String> = v["notUpdated"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, e)| e["type"] != "notFound")
+                .map(|(id, e)| format!("{id}: {}", set_error(e)))
+                .collect();
+            if !failed.is_empty() {
+                bail!(
+                    "The server didn't change {} {}: {}",
+                    failed.len(),
+                    if failed.len() == 1 { "message" } else { "messages" },
+                    failed.join("; ")
+                );
             }
         }
         Ok(())
@@ -1190,10 +1233,20 @@ impl Session {
                 "Email/set",
                 json!({ "accountId": self.account_id, "destroy": chunk }),
             )?;
-            if let Some((id, e)) = v["notDestroyed"].as_object().and_then(|m| m.iter().next())
-                && e["type"] != "notFound"
-            {
-                bail!("The server didn't delete message {id}: {}", set_error(e));
+            let failed: Vec<String> = v["notDestroyed"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, e)| e["type"] != "notFound")
+                .map(|(id, e)| format!("{id}: {}", set_error(e)))
+                .collect();
+            if !failed.is_empty() {
+                bail!(
+                    "The server didn't delete {} {}: {}",
+                    failed.len(),
+                    if failed.len() == 1 { "message" } else { "messages" },
+                    failed.join("; ")
+                );
             }
         }
         Ok(())
@@ -1243,10 +1296,15 @@ impl Session {
     }
     /// Downloads a blob, refusing one larger than `limit`.
     pub fn download(&self, blob: &str, name: &str, kind: &str, limit: usize) -> Result<Vec<u8>> {
+        self.download_in(&self.account_id.clone(), blob, name, kind, limit)
+    }
+    /// As `download`, from another of the sign-in's accounts (contacts'
+    /// or calendars', which may not be the mail account).
+    pub fn download_in(&self, account: &str, blob: &str, name: &str, kind: &str, limit: usize) -> Result<Vec<u8>> {
         let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
         let url = self
             .download_url
-            .replace("{accountId}", &enc(&self.account_id))
+            .replace("{accountId}", &enc(account))
             .replace("{blobId}", &enc(blob))
             .replace("{name}", &enc(name))
             .replace("{type}", &enc(kind));
@@ -1264,7 +1322,7 @@ impl Session {
             bail!("Message no longer exists on the server");
         }
         if !status.is_success() {
-            let body = response.text().unwrap_or_default();
+            let body = crate::sync::public_net::bounded_text(response, ERROR_LIMIT).unwrap_or_default();
             return Err(problem(status, &body));
         }
         if response
@@ -1304,7 +1362,8 @@ impl Session {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
                 .context("The JMAP server no longer accepts the sign-in."));
         }
-        let text = response.text().map_err(|e| transport(e, "upload"))?;
+        let text = crate::sync::public_net::bounded_text(response, SESSION_LIMIT)
+            .context("Couldn't read the JMAP server's answer to the upload.")?;
         if !status.is_success() {
             return Err(problem(status, &text));
         }
@@ -1835,10 +1894,13 @@ impl Session {
         let create: Map<String, Value> = ids
             .iter()
             .map(|id| {
-                (
-                    id.clone(),
-                    json!({ "id": id, "mailboxIds": { mailbox: true }, "keywords": kw }),
-                )
+                // Without keywords, a copy keeps the original's (RFC 8621
+                // §4.7: read, starred and labels stay as they were).
+                let mut o = json!({ "id": id, "mailboxIds": { mailbox: true } });
+                if !kw.is_empty() {
+                    o["keywords"] = Value::Object(kw.clone());
+                }
+                (id.clone(), o)
             })
             .collect();
         let v = self.one(
@@ -2018,6 +2080,9 @@ impl Session {
                     "toDate": reply.to_date,
                     "subject": reply.subject,
                     "textBody": reply.text_body,
+                    // The text is the reply: an HTML one set elsewhere
+                    // would be sent instead of it (RFC 8621 §8.1).
+                    "htmlBody": null,
                 } },
             }),
         )?;
@@ -2066,6 +2131,13 @@ impl Session {
             .flatten()
             .filter(|q| q["resourceType"] == "octets")
             .filter(|q| q["scope"] != "global")
+            // Mail's quota (RFC 9425 §4.1: `types` names what it counts),
+            // not a calendar's or contacts' alone.
+            .filter(|q| {
+                q["types"].as_array().is_none_or(|t| {
+                    t.is_empty() || t.iter().any(|v| v == "Mail" || v == "Email")
+                })
+            })
             .find_map(|q| Some((q["used"].as_u64()?, q["hardLimit"].as_u64()?))))
     }
 
@@ -2085,9 +2157,20 @@ impl Session {
             .replace("{types}", "Email,Mailbox")
             .replace("{closeafter}", "no")
             .replace("{ping}", &PING_SECONDS.to_string());
-        let response = self
+        let last_id = self
+            .last_event_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut request = self
             .signed(self.http.get(&url))
-            .header("Accept", "text/event-stream")
+            .header("Accept", "text/event-stream");
+        // Where the last stream left off (HTML's event source, which RFC
+        // 8620 §7.3 follows), so the server can send what was missed.
+        if !last_id.is_empty() {
+            request = request.header("Last-Event-ID", last_id);
+        }
+        let response = request
             // Reconnected now and then, as servers and proxies end long
             // streams anyway.
             .timeout(Duration::from_secs(10 * 60))
@@ -2102,7 +2185,7 @@ impl Session {
             status.is_success(),
             "The JMAP event stream answered {status}."
         );
-        read_events(BufReader::new(response), stop, &self.account_id, heard)
+        read_events(BufReader::new(response), stop, &self.account_id, &self.last_event_id, heard)
     }
 }
 
@@ -2112,6 +2195,7 @@ fn read_events(
     mut reader: impl BufRead,
     stop: &std::sync::atomic::AtomicBool,
     account: &str,
+    last_id: &std::sync::Mutex<String>,
     heard: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     use std::io::Read as _;
@@ -2145,6 +2229,12 @@ fn read_events(
             data.clear();
         } else if let Some(v) = line.strip_prefix("event:") {
             event = v.trim().to_owned();
+        } else if let Some(v) = line.strip_prefix("id:") {
+            // Kept for the next stream's Last-Event-ID.
+            let v = v.strip_prefix(' ').unwrap_or(v);
+            if !v.contains('\0') && v.len() < 1024 {
+                *last_id.lock().unwrap_or_else(|e| e.into_inner()) = v.to_owned();
+            }
         } else if let Some(v) = line.strip_prefix("data:") {
             // A field's lines are one value, joined by line feeds.
             if !data.is_empty() {
@@ -2274,20 +2364,33 @@ impl Session {
         // Reconnected now and then, as servers and proxies end long
         // connections anyway.
         let until = std::time::Instant::now() + Duration::from_secs(10 * 60);
+        // Pings unanswered in a row: past a few, the link is taken for dead.
+        let mut unanswered = 0;
         while std::time::Instant::now() < until {
             if stop.load(Ordering::Acquire) {
+                let _ = socket.close();
                 return Ok(());
             }
             match socket.receive()? {
                 super::websocket::Incoming::Text(text) => {
+                    unanswered = 0;
                     if state_change_for(&text, &self.account_id) {
                         heard()?;
                     }
                 }
-                super::websocket::Incoming::Idle => socket.ping()?,
+                super::websocket::Incoming::Pong => unanswered = 0,
+                super::websocket::Incoming::Idle => {
+                    unanswered += 1;
+                    if unanswered > 2 {
+                        let _ = socket.close();
+                        return Ok(());
+                    }
+                    socket.ping()?
+                }
                 super::websocket::Incoming::Closed => return Ok(()),
             }
         }
+        let _ = socket.close();
         Ok(())
     }
 }
@@ -2303,9 +2406,18 @@ fn state_change_for(data: &str, account: &str) -> bool {
 
 /// Whether a method call's arguments use an earlier call's result (a
 /// back-reference, `#name`).
+/// Whether a call uses another's result: a back-reference (`#ids`), or a
+/// creation id another call made (`"#m"` as a value, RFC 8620 §5.3).
 fn uses_results(args: &Value) -> bool {
-    args.as_object()
-        .is_some_and(|m| m.keys().any(|k| k.starts_with('#')))
+    fn refers(v: &Value) -> bool {
+        match v {
+            Value::String(s) => s.starts_with('#') && s.len() > 1,
+            Value::Array(a) => a.iter().any(refers),
+            Value::Object(m) => m.iter().any(|(k, v)| k.starts_with('#') || refers(v)),
+            _ => false,
+        }
+    }
+    refers(args)
 }
 
 /// A search snippet as plain text: its `<mark>` tags gone and its
@@ -2491,16 +2603,16 @@ mod tests {
         let change = r#"{"@type":"StateChange","changed":{"A1":{"Email":"s2"}}}"#;
         let stream = format!(": ping\r\n\r\nevent: state\r\ndata: {change}\r\n\r\ndata: {change}\n\n");
         let mut heard = 0;
-        read_events(stream.as_bytes(), &stop, "A1", &mut || {
+        read_events(stream.as_bytes(), &stop, "A1", &Default::default(), &mut || {
             heard += 1;
             Ok(())
         })
         .unwrap();
         assert_eq!(heard, 2);
         let endless = "data: x\n".repeat(600_000);
-        assert!(read_events(endless.as_bytes(), &stop, "A1", &mut || Ok(())).is_err());
+        assert!(read_events(endless.as_bytes(), &stop, "A1", &Default::default(), &mut || Ok(())).is_err());
         let long_line = format!("data: {}", "x".repeat(2 << 20));
-        assert!(read_events(long_line.as_bytes(), &stop, "A1", &mut || Ok(())).is_err());
+        assert!(read_events(long_line.as_bytes(), &stop, "A1", &Default::default(), &mut || Ok(())).is_err());
     }
 
     #[test]

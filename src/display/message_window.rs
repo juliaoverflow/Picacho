@@ -19,6 +19,10 @@ pub(super) struct MessageWindow {
     focus: FocusHandle,
     /// The link under the pointer, shown at the bottom left.
     hovered: Option<String>,
+    /// The HTML as shown (quotes hidden, alias and codes masked), with what
+    /// it was made from: made again on every frame, it was the whole body
+    /// read and copied several times over for each move of the pointer.
+    shown_html: Option<(u64, String, bool)>,
     _links: Subscription,
     _reveals: Subscription,
 }
@@ -73,6 +77,7 @@ impl MessageWindow {
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             hovered: None,
+            shown_html: None,
             _links: links,
             _reveals: reveals,
         }
@@ -132,7 +137,7 @@ impl Render for MessageWindow {
             .map(|app| app.read(cx).hidden_codes(m))
             .unwrap_or_default();
         let subject = crate::manage::local_ai::otp::mask(&m.subject, &codes).into_owned();
-        window.set_window_title(&subject);
+        super::window::set_title(window, &subject);
         // A mailbox kept to its aliases shows the alias used in its place.
         let mask = self.app.upgrade().and_then(|app| app.read(cx).mask_for(m));
         let (sender, from) = match &mask {
@@ -165,16 +170,30 @@ impl Render for MessageWindow {
         } else if self.options.html
             && let Some(html) = &m.html
         {
-            let hidden = super::thread::hide_html_quotes(html);
-            has_quotes = hidden.is_some();
-            let shown = match &hidden {
-                Some(h) if !self.quotes_open => h.as_str(),
-                _ => html.as_str(),
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // The window's message is fixed (its HTML with it): what it
+                // is shown with is what can change. The length too, should it
+                // be filled in (downloaded) later.
+                (html.len(), &m.id, self.quotes_open, codes.as_slice(), mask.is_some()).hash(&mut h);
+                h.finish()
             };
-            let masked = mask.as_ref().map(|k| k.apply(shown));
-            let shown = masked.as_deref().unwrap_or(shown);
-            let shown = crate::manage::local_ai::otp::mask_html(shown, &codes);
-            let shown = shown.as_ref();
+            if self.shown_html.as_ref().is_none_or(|(k, ..)| *k != key) {
+                let hidden = super::thread::hide_html_quotes(html);
+                let quotes = hidden.is_some();
+                let shown = match &hidden {
+                    Some(h) if !self.quotes_open => h.as_str(),
+                    _ => html.as_str(),
+                };
+                let masked = mask.as_ref().map(|k| k.apply(shown));
+                let shown = masked.as_deref().unwrap_or(shown);
+                let shown = crate::manage::local_ai::otp::mask_html(shown, &codes).into_owned();
+                self.shown_html = Some((key, shown, quotes));
+            }
+            let (_, shown, quotes) = self.shown_html.as_ref().expect("made above");
+            has_quotes = *quotes;
+            let shown = shown.as_str();
             let blocked = self.options.block_remote;
             let clean = self.clean_links(cx);
             self.html.update(cx, |view, cx| {

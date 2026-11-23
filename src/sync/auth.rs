@@ -189,6 +189,9 @@ struct Verdicts {
     spf: Option<String>,
     mailed_by: Option<String>,
     dmarc: Option<String>,
+    dmarc_policy: Option<String>,
+    arc: Option<String>,
+    partly_signed: bool,
 }
 /// Whether a signature's result could come from its signing key having
 /// been replaced or withdrawn since: it no longer verifies, or its key
@@ -218,14 +221,29 @@ async fn verify(
     let dkim = authenticator
         .verify_dkim(Parameters::new(message).with_cache(cache))
         .await;
+    // Forwarders' seals (ARC, RFC 8617): a list or forwarder that changed
+    // the message can still say what it got.
+    let arc = authenticator
+        .verify_arc(Parameters::new(message).with_cache(cache))
+        .await;
+    let arc_verdict = match arc.result() {
+        DkimResult::None => None,
+        result => Some(dkim_name(result).to_owned()),
+    };
+    // A passing signature with a body length (`l=`) covers only part.
+    let partly_signed = dkim.iter().any(|o| {
+        *o.result() == DkimResult::Pass && o.signature().is_some_and(|s| s.l > 0)
+    });
     // SPF needs the address the provider received the message from.
     let spf = match arrival.and_then(|a| a.ip.map(|ip| (a, ip))) {
         Some((a, ip)) => {
             let helo = if a.helo.is_empty() { "unknown" } else { a.helo.as_str() };
             Some(
                 authenticator
+                    // HELO checked too (RFC 7208 §2.3): its failure counts,
+                    // and with a null sender it is the identity.
                     .verify_spf(
-                        Parameters::new(SpfParameters::mail_from(ip, helo, &a.by, return_path))
+                        Parameters::new(SpfParameters::helo_and_mail_from(ip, helo, &a.by, return_path))
                             .with_cache(cache),
                     )
                     .await,
@@ -260,7 +278,19 @@ async fn verify(
     } else if unverifiable {
         Some(UNVERIFIABLE.into())
     } else {
-        dkim.first().map(|o| dkim_name(o.result()).to_owned())
+        // None verified: the worst result says most (one forged and one
+        // broken signature read as a failure, not "neutral").
+        dkim.iter()
+            .map(|o| o.result())
+            .max_by_key(|r| match r {
+                DkimResult::Fail(_) => 5,
+                DkimResult::PermError(_) => 4,
+                DkimResult::TempError(_) => 3,
+                DkimResult::Neutral(_) => 2,
+                DkimResult::None => 1,
+                DkimResult::Pass => 0,
+            })
+            .map(|r| dkim_name(r).to_owned())
     };
     let dmarc_verdict = match dmarc.result() {
         // DMARC failed only for want of the signature that couldn't be checked.
@@ -276,6 +306,9 @@ async fn verify(
             .map(|s| s.domain().to_ascii_lowercase()),
         spf: spf.map(|s| s.result().to_string()),
         dmarc: Some(dmarc_verdict.into()),
+        dmarc_policy: (dmarc.result() != DmarcResult::None).then(|| dmarc.policy().to_string()),
+        arc: arc_verdict,
+        partly_signed,
     }
 }
 
@@ -322,6 +355,9 @@ pub fn check(raw: &[u8], details: &mut Details) {
     details.spf = v.spf;
     details.mailed_by = v.mailed_by;
     details.dmarc = v.dmarc;
+    details.dmarc_policy = v.dmarc_policy;
+    details.arc = v.arc;
+    details.partly_signed = v.partly_signed;
 }
 
 /// The id of a domain's MTA-STS record (`_mta-sts` TXT, RFC 8461): `None`
@@ -349,6 +385,34 @@ pub(crate) fn mta_sts_id(domain: &str) -> anyhow::Result<Option<String>> {
         Ok(Err(Error::Dns(DnsError::RecordNotFound(_) | DnsError::InvalidRecordType))) => Ok(None),
         Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
     }
+}
+
+/// A domain's mail servers (MX), most preferred first; none where it has
+/// no MX records.
+pub(crate) fn mx_hosts(domain: &str) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context as _;
+    use mail_auth::{DnsError, Error};
+    let checker = checker().context("DNS isn't available")?;
+    checker.runtime.block_on(async {
+        tokio::time::timeout(TIMEOUT, async {
+            match checker
+                .authenticator
+                .mx_lookup(domain, Some(&checker.cache.mx))
+                .await
+            {
+                Ok(mx) => Ok(mx
+                    .records
+                    .iter()
+                    .flat_map(|r| r.exchanges.iter())
+                    .map(|e| e.trim_end_matches('.').to_ascii_lowercase())
+                    .collect()),
+                Err(Error::Dns(DnsError::RecordNotFound(_))) => Ok(Vec::new()),
+                Err(e) => anyhow::bail!("{e}"),
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+    })
 }
 
 /// Whether a domain's most preferred mail servers publish DANE records
@@ -397,7 +461,48 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
 /// A service's SRV records (RFC 2782), such as `_jmap._tcp.<domain>`:
 /// (target, port), the most preferred first. Empty when there are none or
 /// the record says the service isn't offered (a target of ".").
-/// The strings of a name's TXT records, each record's pieces joined.
+/// The strings of a name's TXT records, each record's pieces joined by a
+/// space: RFC 6763 §6 key/value pairs are separate character-strings, and
+/// joined without one they would run together.
+/// The OpenPGP keys a domain publishes for an address in DNS
+/// (OPENPGPKEY, RFC 7929): at `<sha256(local part) first 28 bytes, hex>.
+/// _openpgpkey.<domain>`. Without DNSSEC (not checked here) such a key is
+/// as good as a key server's: one to compare with its owner.
+pub(crate) fn openpgpkey(email: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+    use anyhow::Context as _;
+    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
+    use sha2::Digest as _;
+    let (local, domain) = email.trim().rsplit_once('@').context("Not an address")?;
+    let hash = sha2::Sha256::digest(local.as_bytes());
+    let label: String = hash[..28].iter().map(|b| format!("{b:02x}")).collect();
+    let name = format!("{label}._openpgpkey.{}.", domain.trim_end_matches('.'));
+    let checker = checker().context("DNS isn't available")?;
+    checker.runtime.block_on(async {
+        tokio::time::timeout(TIMEOUT, async {
+            let found = match checker
+                .authenticator
+                .resolver()
+                .lookup(name.as_str(), RecordType::OPENPGPKEY)
+                .await
+            {
+                Ok(found) => found,
+                Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(vec![]),
+                Err(e) => anyhow::bail!("{e}"),
+            };
+            Ok(found
+                .answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::OPENPGPKEY(k) => Some(k.public_key.clone()),
+                    _ => None,
+                })
+                .collect())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+    })
+}
+
 pub(crate) fn txt(name: &str) -> anyhow::Result<Vec<String>> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
@@ -422,7 +527,8 @@ pub(crate) fn txt(name: &str) -> anyhow::Result<Vec<String>> {
                         t.txt_data
                             .iter()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
-                            .collect::<String>(),
+                            .collect::<Vec<String>>()
+                            .join(" "),
                     ),
                     _ => None,
                 })
@@ -449,13 +555,13 @@ pub(crate) fn srv(name: &str) -> anyhow::Result<Vec<(String, u16)>> {
                 Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(vec![]),
                 Err(e) => anyhow::bail!("{e}"),
             };
-            let mut records: Vec<(u16, u16, String, u16)> = found
+            let records: Vec<(u16, u16, String, u16)> = found
                 .answers()
                 .iter()
                 .filter_map(|r| match &r.data {
                     RData::SRV(s) => Some((
                         s.priority,
-                        u16::MAX - s.weight,
+                        s.weight,
                         s.target
                             .to_ascii()
                             .trim_end_matches('.')
@@ -464,21 +570,67 @@ pub(crate) fn srv(name: &str) -> anyhow::Result<Vec<(String, u16)>> {
                     )),
                     _ => None,
                 })
+                .collect();
+            // A single record with target "." says the service isn't
+            // offered at all (RFC 2782).
+            if records.len() == 1 && records[0].2.is_empty() {
+                return Ok(vec![]);
+            }
+            let records: Vec<_> = records
+                .into_iter()
                 .filter(|(.., target, port)| !target.is_empty() && *port > 0)
                 .collect();
-            records.sort();
-            Ok(records.into_iter().map(|(.., t, p)| (t, p)).collect())
+            Ok(srv_order(records, &mut rand::rng()))
         })
         .await
         .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
     })
 }
 
-/// How long ago, in seconds, a message says it was written.
+/// SRV records in the order to try them (RFC 2782): by priority, and
+/// within one priority by weighted random choice, so the weights share the
+/// load. Each target is kept, as a fallback.
+fn srv_order(
+    mut records: Vec<(u16, u16, String, u16)>,
+    rng: &mut impl rand::RngExt,
+) -> Vec<(String, u16)> {
+    records.sort_by_key(|r| r.0);
+    let mut out = Vec::with_capacity(records.len());
+    while !records.is_empty() {
+        let priority = records[0].0;
+        let end = records.iter().position(|r| r.0 != priority).unwrap_or(records.len());
+        let mut group: Vec<_> = records.drain(..end).collect();
+        // Zero weights first, so they have a small chance (RFC 2782).
+        group.sort_by_key(|r| r.1 != 0);
+        while !group.is_empty() {
+            let total: u32 = group.iter().map(|r| u32::from(r.1)).sum();
+            let pick = rng.random_range(0..=total);
+            let mut running = 0;
+            let at = group
+                .iter()
+                .position(|r| {
+                    running += u32::from(r.1);
+                    running >= pick
+                })
+                .unwrap_or(0);
+            let (_, _, target, port) = group.remove(at);
+            out.push((target, port));
+        }
+    }
+    out
+}
+
+/// How long ago, in seconds, the mailbox's provider received a message: the
+/// date its topmost `Received` header ends with, which the provider writes.
+/// Not the `Date` header, which the sender writes: a forgery dated years
+/// back, with a signature that can't be checked, was called unverifiable
+/// rather than failed. `None` (not old) without one.
 fn age(raw: &[u8]) -> Option<i64> {
     use mailparse::MailHeaderMap;
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
-    let date = mailparse::dateparse(&headers.get_first_value("Date")?).ok()?;
+    let received = headers.get_first_value("Received")?;
+    let (_, when) = received.rsplit_once(';')?;
+    let date = mailparse::dateparse(when.trim()).ok()?;
     Some(chrono::Utc::now().timestamp() - date)
 }
 
@@ -528,6 +680,11 @@ async fn unsubscribe_signature(
     let [header] = &headers.get_all_values("List-Unsubscribe")[..] else {
         return None;
     };
+    // One From only (as DMARC asks, RFC 7489 §6.6.1): with two, the one
+    // signed and the one shown could differ.
+    if headers.get_all_headers("From").len() != 1 {
+        return None;
+    }
     let from = mailparse::addrparse_header(headers.get_first_header("From")?).ok()?;
     let [mailparse::MailAddr::Single(from)] = &from[..] else {
         return None;
@@ -561,6 +718,23 @@ async fn unsubscribe_signature(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn srv_records_go_by_priority_then_weight() {
+        let mut rng = rand::rng();
+        for _ in 0..50 {
+            let order = srv_order(
+                vec![
+                    (20, 0, "c".into(), 1),
+                    (10, 5, "a".into(), 1),
+                    (10, 60, "b".into(), 1),
+                ],
+                &mut rng,
+            );
+            // Every target is kept; the higher priority's come first.
+            assert_eq!(order.len(), 3);
+            assert_eq!(order[2].0, "c");
+        }
+    }
     use super::*;
     use base64::Engine as _;
     use mail_auth::{
@@ -731,6 +905,21 @@ mod tests {
         let v = runtime.block_on(verify(&authenticator, &bank_dns(), &parsed, None, "", true));
         assert_ne!(v.dkim.as_deref(), Some(UNVERIFIABLE));
         assert_ne!(v.dkim.as_deref(), Some("pass"));
+    }
+
+    /// A message's age is when its provider received it, not the date its
+    /// sender wrote: a forgery can't make itself old.
+    #[test]
+    fn age_comes_from_the_provider_not_the_sender() {
+        let now = chrono::Utc::now();
+        let received = (now - chrono::Duration::hours(1)).to_rfc2822();
+        let backdated = format!(
+            "Received: from mx.example by mx.provider.example; {received}\r\nDate: Mon, 1 Jan 2001 00:00:00 +0000\r\nFrom: a@bank.example\r\n\r\nHi\r\n"
+        );
+        let a = age(backdated.as_bytes()).unwrap();
+        assert!((3500..3700).contains(&a), "{a}");
+        // Only a Date: nothing says how old it is.
+        assert_eq!(age(b"Date: Mon, 1 Jan 2001 00:00:00 +0000\r\nFrom: a@b.example\r\n\r\nHi\r\n"), None);
     }
 
     #[test]

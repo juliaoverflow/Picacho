@@ -129,7 +129,7 @@ fn stamp(t: i64) -> String {
 /// The query for the events overlapping `from`..`to`.
 fn range_query(from: i64, to: i64) -> String {
     format!(
-        "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VEVENT\"><c:time-range start=\"{}\" end=\"{}\"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>",
+        "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:schedule-tag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VEVENT\"><c:time-range start=\"{}\" end=\"{}\"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>",
         stamp(from),
         stamp(to)
     )
@@ -137,7 +137,7 @@ fn range_query(from: i64, to: i64) -> String {
 
 /// The query for tasks: all of them that aren't done (a calendar query
 /// filters one component kind at a time, RFC 4791 §9.7.1).
-const TASK_QUERY: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VTODO\"><c:prop-filter name=\"COMPLETED\"><c:is-not-defined/></c:prop-filter></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>";
+const TASK_QUERY: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:schedule-tag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VTODO\"><c:prop-filter name=\"COMPLETED\"><c:is-not-defined/></c:prop-filter></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>";
 
 /// The open tasks in `calendars` (VTODO without COMPLETED), soonest due
 /// first, then those with no due date.
@@ -205,7 +205,7 @@ fn stored_task(cal: &str, resource: dav::Resource) -> Option<Stored> {
         calendar: cal.to_owned(),
         href: resource.href.to_string(),
         etag: resource.etag,
-        schedule_tag: String::new(),
+        schedule_tag: resource.schedule_tag,
     })
 }
 
@@ -256,7 +256,7 @@ fn stored(cal: &str, resource: dav::Resource) -> Option<Stored> {
         calendar: cal.to_owned(),
         href: resource.href.to_string(),
         etag: resource.etag,
-        schedule_tag: String::new(),
+        schedule_tag: resource.schedule_tag,
     })
 }
 
@@ -308,6 +308,12 @@ pub fn sync(
     let mut out = Vec::new();
     let mut cals = Vec::with_capacity(calendars.len());
     for cal in calendars {
+        // A calendar only for tasks has no events to ask about (its tasks
+        // are read by `tasks`).
+        if !cal.components.is_empty() && !cal.components.iter().any(|k| k == "VEVENT") {
+            cals.push(cal.clone());
+            continue;
+        }
         let href = url::Url::parse(&cal.href)?;
         let before = previous
             .iter()
@@ -486,7 +492,7 @@ pub fn inbox(
 ) -> Result<Vec<dav::Resource>> {
     let c = client(server, password, tls)?;
     let inbox = c.inbox(&server.url)?;
-    const ALL: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"/></c:filter></c:calendar-query>";
+    const ALL: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:schedule-tag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"/></c:filter></c:calendar-query>";
     c.list(&inbox, ALL, "calendar-data")
 }
 
@@ -743,12 +749,14 @@ mod tests {
             href: url::Url::parse("https://x/e.ics")?,
             etag: String::new(),
             data: both,
+            schedule_tag: String::new(),
         };
         assert!(!stored("c", r).unwrap().event.task);
         let r = dav::Resource {
             href: url::Url::parse("https://x/t.ics")?,
             etag: String::new(),
             data: todo.into(),
+            schedule_tag: String::new(),
         };
         assert!(stored("c", r).is_none());
         Ok(())

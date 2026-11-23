@@ -4568,7 +4568,6 @@ dependencies = [
 [[package]]
 name = "gpui-mobile"
 version = "0.1.0"
-source = "git+https://github.com/pinaltech/Picacho-Patches?branch=vendor-split-dev#a401a037feb31244ec62e68117ba111b1f0f04c0"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -9119,6 +9118,7 @@ dependencies = [
  "data-url",
  "directories",
  "embed-resource",
+ "encoding_rs",
  "flate2",
  "fontique",
  "futures",
@@ -9135,6 +9135,7 @@ dependencies = [
  "hyper-util",
  "iana-time-zone",
  "icu_segmenter",
+ "idna",
  "image",
  "imap",
  "imap-proto",
@@ -9152,6 +9153,7 @@ dependencies = [
  "mailparse",
  "markdown",
  "md-5 0.11.0",
+ "memchr",
  "mime_guess",
  "native-tls",
  "ndk-context",
@@ -9175,6 +9177,7 @@ dependencies = [
  "roxmltree 0.21.2",
  "rrule",
  "rusqlite",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha1 0.11.0",

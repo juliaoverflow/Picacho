@@ -26,17 +26,29 @@ extern void gpui_ios_handle_open_url(void *url);
 @property(nonatomic, strong) UIWindow *window;
 @property(nonatomic, strong) CADisplayLink *link;
 @property(nonatomic) void *gpuiWindow;
+- (void)tick:(CADisplayLink *)link;
 @end
+
+// The scene showing GPUI's window, if any. GPUI keeps one window for the
+// process; a scene iOS disconnects (and later connects again) hands it on.
+// Weak: the waker below is given no reference of its own to keep alive.
+static __weak PicachoScene *current;
 
 // GPUI wants a frame (a view changed, an animation, typed text).
 static void wake(void *context) {
-    PicachoScene *scene = (__bridge PicachoScene *)context;
+    (void)context;
     if ([NSThread isMainThread]) {
-        scene.link.paused = NO;
+        current.link.paused = NO;
     } else {
-        dispatch_async(dispatch_get_main_queue(), ^{ scene.link.paused = NO; });
+        dispatch_async(dispatch_get_main_queue(), ^{ current.link.paused = NO; });
     }
 }
+
+// Forwards the display link's ticks without keeping the scene alive (the
+// link retains its target; the scene retains the link).
+@interface PicachoTicker : NSObject
+@property(nonatomic, weak) PicachoScene *scene;
+@end
 
 @implementation PicachoScene
 
@@ -45,32 +57,68 @@ static void wake(void *context) {
                  options:(UISceneConnectionOptions *)options {
     static BOOL started = NO;
     if (started) {
-        return; // Picacho shows one window.
+        // A scene connected again (iOS let the earlier one go): it shows the
+        // same window.
+        [self attachToScene:(UIWindowScene *)scene];
+        return;
     }
     started = YES;
     gpui_ios_set_embedded();
+    // The mail cache (mail.sqlite3, readable mail) stays out of iCloud and
+    // computer backups, as Android's does: it downloads again, and backups
+    // would otherwise keep a copy of the mail outside this device.
+    NSURL *support = [[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory
+                                                           inDomains:NSUserDomainMask] firstObject];
+    NSURL *data = [support URLByAppendingPathComponent:@"picacho" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:data
+                           withIntermediateDirectories:YES
+                                            attributes:nil
+                                                 error:nil];
+    NSError *excluded = nil;
+    if (![data setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&excluded]) {
+        NSLog(@"Couldn't keep the mail cache out of backups: %@", excluded);
+    }
     if (!picacho_ios_start()) {
         NSLog(@"Picacho did not start; see the log above.");
         return;
     }
-    self.gpuiWindow = gpui_ios_get_window();
-    UIViewController *controller =
-        (__bridge UIViewController *)gpui_ios_view_controller(self.gpuiWindow);
-
-    self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-    self.window.rootViewController = controller;
-    [self.window makeKeyAndVisible];
-    gpui_ios_layout_view(self.gpuiWindow);
-
-    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-    // Up to the screen's rate (120 Hz on ProMotion); iOS lowers it when idle.
-    self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
-    [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-    gpui_ios_set_frame_waker(self.gpuiWindow, wake, (__bridge void *)self);
+    gpui_ios_set_frame_waker(gpui_ios_get_window(), wake, NULL);
+    [self attachToScene:(UIWindowScene *)scene];
 
     for (UIOpenURLContext *context in options.URLContexts) {
         gpui_ios_handle_open_url((__bridge void *)context.URL.absoluteString);
     }
+}
+
+// Shows GPUI's window in `scene`, with a display link of its own.
+- (void)attachToScene:(UIWindowScene *)scene {
+    self.gpuiWindow = gpui_ios_get_window();
+    UIViewController *controller =
+        (__bridge UIViewController *)gpui_ios_view_controller(self.gpuiWindow);
+    self.window = [[UIWindow alloc] initWithWindowScene:scene];
+    self.window.rootViewController = controller;
+    [self.window makeKeyAndVisible];
+    gpui_ios_layout_view(self.gpuiWindow);
+
+    PicachoTicker *ticker = [PicachoTicker new];
+    ticker.scene = self;
+    self.link = [CADisplayLink displayLinkWithTarget:ticker selector:@selector(tick:)];
+    // Up to the screen's rate (120 Hz on ProMotion); iOS lowers it when idle.
+    self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
+    [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    current = self;
+}
+
+// iOS let the scene go (it may connect a new one later): its display link
+// stops, and nothing calls into it any more.
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    [self.link invalidate];
+    self.link = nil;
+    if (current == self) {
+        current = nil;
+    }
+    self.window.rootViewController = nil;
+    self.window = nil;
 }
 
 - (void)tick:(CADisplayLink *)link {
@@ -104,6 +152,17 @@ static void wake(void *context) {
     self.link.paused = YES;
 }
 
+@end
+
+@implementation PicachoTicker
+- (void)tick:(CADisplayLink *)link {
+    PicachoScene *scene = self.scene;
+    if (scene == nil) {
+        [link invalidate];
+        return;
+    }
+    [scene tick:link];
+}
 @end
 
 @interface PicachoApp : UIResponder <UIApplicationDelegate>

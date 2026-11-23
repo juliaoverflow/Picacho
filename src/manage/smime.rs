@@ -57,6 +57,9 @@ pub enum Signature {
     Good(String),
     /// The signature matches, but no trusted authority vouches for the certificate.
     Untrusted(String),
+    /// The signature matches, but the certificate isn't for the address the
+    /// message says it is from: someone else signed it.
+    OtherSender(String),
     /// The signature doesn't match: the message was changed, or forged.
     Bad,
 }
@@ -70,6 +73,9 @@ impl Signature {
                 format!(
                     "Signed by {who} (S/MIME), with a certificate no trusted authority vouches for"
                 )
+            }
+            Self::OtherSender(who) => {
+                format!("Signed by {who} (S/MIME), who isn't the sender shown")
             }
             Self::Bad => {
                 "The S/MIME signature doesn't match: the message may have been changed".into()
@@ -126,6 +132,32 @@ fn expires(cert: &X509) -> i64 {
         .and_then(|e| e.diff(cert.not_after()).ok())
         .map(|d| d.days as i64 * 86_400 + d.secs as i64)
         .unwrap_or(0)
+}
+
+/// Whether `cert` may sign mail now: within its dates, and, where it lists
+/// what its key is for, for signing (digitalSignature or nonRepudiation)
+/// and for email (emailProtection). One that lists nothing may sign.
+fn usable_for_mail(cert: &X509) -> bool {
+    let Ok(now) = openssl::asn1::Asn1Time::days_from_now(0) else {
+        return false;
+    };
+    if cert.not_before() > now || cert.not_after() < now {
+        return false;
+    }
+    // X509v3 Key Usage and Extended Key Usage, as OpenSSL prints them.
+    let Ok(text) = cert.to_text() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&text);
+    let listed = |name: &str| {
+        let mut lines = text.lines();
+        lines.find(|l| l.trim_start().starts_with(name)).map(|_| lines.next().unwrap_or_default().to_owned())
+    };
+    let signs = listed("X509v3 Key Usage")
+        .is_none_or(|v| v.contains("Digital Signature") || v.contains("Non Repudiation"));
+    let mail = listed("X509v3 Extended Key Usage")
+        .is_none_or(|v| v.contains("E-mail Protection") || v.contains("Any Extended Key Usage"));
+    signs && mail
 }
 
 fn expired(cert: &X509) -> bool {
@@ -189,10 +221,17 @@ impl Certificates {
     }
     /// Imports a PKCS#12 file (your certificate and key) with its password.
     pub fn import_identity(&mut self, der: &[u8], password: &str) -> Result<CertInfo> {
-        let parsed = openssl::pkcs12::Pkcs12::from_der(der)
-            .context("That isn't a PKCS#12 file (.p12 or .pfx).")?
-            .parse2(password)
-            .map_err(|_| anyhow::anyhow!("The password is wrong, or the file is damaged."))?;
+        let pkcs12 = openssl::pkcs12::Pkcs12::from_der(der)
+            .context("That isn't a PKCS#12 file (.p12 or .pfx).")?;
+        let parsed = match pkcs12.parse2(password) {
+            Ok(parsed) => parsed,
+            // Older files use RC2 or triple DES, which OpenSSL 3 keeps in
+            // its legacy provider: loaded, and tried again.
+            Err(_) if legacy_provider() => pkcs12
+                .parse2(password)
+                .map_err(|_| anyhow::anyhow!("The password is wrong, or the file is damaged."))?,
+            Err(_) => bail!("The password is wrong, or the file is damaged."),
+        };
         let cert = parsed.cert.context("The file has no certificate.")?;
         let key = parsed.pkey.context("The file has no private key.")?;
         ensure!(
@@ -279,12 +318,22 @@ impl Certificates {
 /// The message's body part (Content-* headers and body) and the other headers.
 fn split(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let text: String = raw.iter().map(|&b| b as char).collect();
-    let at = text.find("\r\n\r\n").map_or(text.len(), |i| i + 2);
+    // The blank line ending the headers, CRLF or (mail saved with bare
+    // line feeds) LF: with only CRLF looked for, such mail was all header.
+    let at = match (text.find("\r\n\r\n"), text.find("\n\n")) {
+        (Some(c), l) if l.is_none_or(|l| c <= l) => c + 2,
+        (_, Some(l)) => l + 1,
+        _ => text.len(),
+    };
     let (head, body) = text.split_at(at);
     let mut outer = String::new();
     let mut part = String::new();
     let mut into_part = false;
-    for line in head.split("\r\n").filter(|l| !l.is_empty()) {
+    for line in head
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .filter(|l| !l.is_empty())
+    {
         if !line.starts_with([' ', '\t']) {
             let name = line.split(':').next().unwrap_or("").to_ascii_lowercase();
             into_part = name.starts_with("content-");
@@ -304,14 +353,18 @@ fn split(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// `to_smime`'s output with CRLF line ends, without its MIME-Version line
 /// (the message keeps its own).
 fn as_part(smime: Vec<u8>) -> Vec<u8> {
-    let text = String::from_utf8_lossy(&smime)
-        .replace("\r\n", "\n")
-        .replace('\n', "\r\n");
+    // One char per byte (Latin-1), so every byte comes back as it was: as
+    // UTF-8, signed text in another charset was changed after signing, and
+    // its signature then failed for everyone.
+    let text: String = smime.iter().map(|&b| b as char).collect();
+    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
     text.lines()
         .skip_while(|l| l.starts_with("MIME-Version"))
         .collect::<Vec<_>>()
         .join("\r\n")
-        .into_bytes()
+        .chars()
+        .map(|c| c as u8)
+        .collect()
 }
 
 /// Signs and/or encrypts a finished message with S/MIME. Encrypted mail is
@@ -400,11 +453,45 @@ fn kind(raw: &[u8]) -> Option<(String, String)> {
     ))
 }
 
+/// Loads OpenSSL 3's legacy provider (RC2, triple DES… for old .p12
+/// files), with the default one kept. Whether it is loaded now.
+fn legacy_provider() -> bool {
+    static LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOADED.get_or_init(|| {
+        // Loading `legacy` explicitly would otherwise drop the implicit
+        // default provider: both are loaded, and kept for the process.
+        let default = openssl::provider::Provider::try_load(None, "default", true);
+        let legacy = openssl::provider::Provider::try_load(None, "legacy", true);
+        match (default, legacy) {
+            (Ok(d), Ok(l)) => {
+                std::mem::forget(d);
+                std::mem::forget(l);
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 fn trusted_store() -> Result<openssl::x509::store::X509Store> {
+    static ROOTS: std::sync::OnceLock<Vec<X509>> = std::sync::OnceLock::new();
     let mut builder = X509StoreBuilder::new()?;
-    // The system's trusted authorities; on systems where OpenSSL has none
-    // configured, nothing is trusted and signatures show as unvouched for.
+    // OpenSSL's own configured authorities, where it has some.
     let _ = builder.set_default_paths();
+    // And the system's (Windows' certificate store, macOS' keychain,
+    // Linux' bundle): a vendored OpenSSL knows none of these, and every
+    // signature showed as unvouched for. Read once.
+    let roots = ROOTS.get_or_init(|| {
+        rustls_native_certs::load_native_certs()
+            .certs
+            .iter()
+            .filter_map(|der| X509::from_der(der.as_ref()).ok())
+            .collect()
+    });
+    for root in roots {
+        // Duplicates of a default path's are refused; that's fine.
+        let _ = builder.add_cert(root.clone());
+    }
     Ok(builder.build())
 }
 
@@ -414,6 +501,11 @@ fn trusted_store() -> Result<openssl::x509::store::X509Store> {
 /// them encrypted). `None` when it has no S/MIME protection, or can't be
 /// opened.
 pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Option<X509>)> {
+    // As OpenPGP's: past this, the copies made opening it (decoded,
+    // decrypted, each layer's) would be several times its size.
+    if raw.len() > crate::manage::crypto::MAX_MESSAGE {
+        return None;
+    }
     let (outer_kind, _) = kind(raw)?;
     let is_enveloped = matches!(
         outer_kind.as_str(),
@@ -436,10 +528,18 @@ pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Optio
             "application/pkcs7-mime" | "application/x-pkcs7-mime"
         ) {
             let (p7, _) = Pkcs7::from_smime(&current).ok()?;
-            if smime_type == "signed-data" {
+            // smime-type is optional (RFC 8551 §3.2.2): without it, the
+            // structure itself says whether it's signed.
+            let signed = smime_type == "signed-data"
+                || (smime_type.is_empty() && p7.signed().is_some());
+            if signed {
                 // Opaque signing: the content is inside the signature.
                 let (out, verified, who) = verify(&p7, None)?;
-                verdict.signature = verified;
+                // A layer that failed stays failed: an inner signature that
+                // checks out doesn't hide that an outer one didn't.
+                if verdict.signature != Signature::Bad {
+                    verdict.signature = verified;
+                }
                 signer = who;
                 current = out;
                 continue;
@@ -454,19 +554,54 @@ pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Optio
             let (p7, content) = Pkcs7::from_smime(&current).ok()?;
             let content = content?;
             let (_, verified, who) = verify(&p7, Some(&content))?;
-            verdict.signature = verified;
+            if verdict.signature != Signature::Bad {
+                verdict.signature = verified;
+            }
             signer = who;
             current = content;
         } else {
             break;
         }
     }
+    // A signature is the sender's only with a certificate for the address
+    // the message is from: a message signed by one person can be sent on,
+    // re-encrypted, as from another.
+    if let (Some(cert), Signature::Good(_) | Signature::Untrusted(_)) = (&signer, &verdict.signature) {
+        let from = {
+            use mailparse::MailHeaderMap as _;
+            mailparse::parse_headers(raw)
+                .ok()
+                .and_then(|(h, _)| h.get_first_value("From"))
+                .map(|v| crate::sync::mime::receipt_address(&v).to_lowercase())
+                .unwrap_or_default()
+        };
+        if !from.is_empty() && !emails(cert).contains(&from) {
+            let who = emails(cert).into_iter().next().unwrap_or_else(|| "an unknown sender".into());
+            verdict.signature = Signature::OtherSender(who);
+        }
+    }
     let mut readable = outer;
     readable.extend_from_slice(b"MIME-Version: 1.0\r\n");
-    let current = String::from_utf8_lossy(&current)
-        .replace("\r\n", "\n")
-        .replace('\n', "\r\n");
-    readable.extend_from_slice(current.as_bytes());
+    // Line ends made CRLF byte by byte: through a UTF-8 string, text in
+    // another charset (and binary parts) came out as replacement marks.
+    // Only where the content has bare LF line ends throughout (written
+    // on a system that uses them): content already using CRLF is kept
+    // byte for byte, so a binary part's LF bytes aren't changed.
+    let bare = current.windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r')
+        || current.first() == Some(&b'\n');
+    let crlf = current.windows(2).any(|w| w == b"\r\n");
+    if bare && !crlf {
+        let mut previous = 0u8;
+        for &b in &current {
+            if b == b'\n' && previous != b'\r' {
+                readable.push(b'\r');
+            }
+            readable.push(b);
+            previous = b;
+        }
+    } else {
+        readable.extend_from_slice(&current);
+    }
     Some((readable, verdict, signer))
 }
 
@@ -492,9 +627,13 @@ fn verify(p7: &Pkcs7, content: Option<&[u8]>) -> Option<(Vec<u8>, Signature, Opt
     }
     out.clear();
     let unchecked = Pkcs7Flags::BINARY | Pkcs7Flags::NOVERIFY;
+    // Checked without its chain (NOVERIFY), so the certificate itself is
+    // checked here: in its dates (OpenSSL checks them with the chain, for
+    // Good), and meant for signing mail where it says what it's for.
     if p7
         .verify(&empty, &store, content, Some(&mut out), unchecked)
         .is_ok()
+        && signer.as_ref().is_some_and(usable_for_mail)
     {
         return Some((out, Signature::Untrusted(who), signer));
     }
@@ -538,6 +677,12 @@ pub fn learn(certs: &mut Certificates, signer: &X509, verdict: &Signature, from:
             Ok(true)
         }
         _ => {
+            // Unvouched, it speaks only for the address that sent it: one
+            // also naming another address (victim@ beside attacker@) would
+            // have mail to that other person encrypted to the sender.
+            if addresses.iter().any(|a| *a != from) {
+                return Ok(false);
+            }
             let known = certs
                 .identities()
                 .into_iter()
@@ -641,12 +786,91 @@ mod tests {
         let (_, spoofed_verdict, spoofed_signer) = open(&spoofed, &bo).unwrap();
         assert!(!learn(&mut bo, &spoofed_signer.unwrap(), &spoofed_verdict.signature, "ana@example.org").unwrap());
         assert_eq!(bo.cert_for("ana@example.org").map(|c| fingerprint(&c)), Some(fingerprint(&signer)));
+        // Ana's signature on a message that says it is from someone else.
+        let resent = text.replacen("From: Ana <ana@example.org>", "From: Bank <alerts@bank.example>", 1);
+        assert_eq!(
+            open(resent.as_bytes(), &bo).unwrap().1.signature,
+            Signature::OtherSender("ana@example.org".into())
+        );
         let forged = text.replace("Meet at noon.", "Meet at nine.");
         assert_eq!(
             open(forged.as_bytes(), &bo).unwrap().1.signature,
             Signature::Bad
         );
         assert!(open(MESSAGE, &bo).is_none());
+    }
+
+    /// A certificate for something other than signing mail (a web server's)
+    /// or not valid now doesn't vouch for a message, even unvouched.
+    #[test]
+    fn only_certificates_for_mail_sign_it() {
+        use openssl::{asn1::Asn1Time, hash::MessageDigest, rsa::Rsa, x509::extension::{ExtendedKeyUsage, KeyUsage, SubjectAlternativeName}};
+        let make = |extended: Option<ExtendedKeyUsage>, from: i32, to: i32| {
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let mut b = X509::builder().unwrap();
+            b.set_version(2).unwrap();
+            b.set_pubkey(&key).unwrap();
+            let at = |d: i32| if d >= 0 { Asn1Time::days_from_now(d as u32).unwrap() } else {
+                Asn1Time::from_unix(chrono::Utc::now().timestamp() + i64::from(d) * 86_400).unwrap()
+            };
+            b.set_not_before(&at(from)).unwrap();
+            b.set_not_after(&at(to)).unwrap();
+            let san = SubjectAlternativeName::new().email("ana@example.org").build(&b.x509v3_context(None, None)).unwrap();
+            b.append_extension(san).unwrap();
+            b.append_extension(KeyUsage::new().digital_signature().build().unwrap()).unwrap();
+            if let Some(e) = extended {
+                b.append_extension(e.build().unwrap()).unwrap();
+            }
+            b.sign(&key, MessageDigest::sha256()).unwrap();
+            b.build()
+        };
+        let mut mail = ExtendedKeyUsage::new();
+        mail.email_protection();
+        let mut web = ExtendedKeyUsage::new();
+        web.server_auth();
+        assert!(usable_for_mail(&make(Some(mail), 0, 30)));
+        assert!(usable_for_mail(&make(None, 0, 30)));
+        assert!(!usable_for_mail(&make(Some(web), 0, 30)));
+        assert!(!usable_for_mail(&make(None, -60, -30)), "expired");
+        assert!(!usable_for_mail(&make(None, 10, 30)), "not yet valid");
+    }
+
+    /// Text in a charset other than UTF-8 comes out byte for byte.
+    #[test]
+    fn signed_latin1_text_keeps_its_bytes() {
+        let (ana, bo) = people();
+        let latin1 = b"From: ana@example.org\r\nTo: bo@example.se\r\nSubject: Caf\xe9\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: 8bit\r\n\r\nUn caf\xe9.\r\n";
+        let signed = protect_with(&ana, latin1, "ana@example.org", &[], true, false).unwrap();
+        let (readable, verdict, _) = open(&signed, &bo).unwrap();
+        // Unchanged after signing, so the signature still matches.
+        assert_eq!(verdict.signature, Signature::Untrusted("ana@example.org".into()));
+        assert!(readable.windows(8).any(|w| w == b"Un caf\xe9."), "{}", String::from_utf8_lossy(&readable));
+    }
+
+    /// A self-signed certificate naming the sender's address and another's
+    /// isn't kept: mail to the other would be encrypted to the sender.
+    #[test]
+    fn unvouched_certificates_speak_only_for_their_sender() {
+        use openssl::{asn1::Asn1Time, hash::MessageDigest, rsa::Rsa, x509::extension::SubjectAlternativeName};
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(30).unwrap()).unwrap();
+        let san = SubjectAlternativeName::new()
+            .email("eve@example.net")
+            .email("ana@example.org")
+            .build(&b.x509v3_context(None, None))
+            .unwrap();
+        b.append_extension(san).unwrap();
+        b.sign(&key, MessageDigest::sha256()).unwrap();
+        let both = b.build();
+        let mut bo = Certificates::default();
+        let untrusted = Signature::Untrusted("eve@example.net".into());
+        assert!(!learn(&mut bo, &both, &untrusted, "eve@example.net").unwrap());
+        assert!(!bo.has_cert("ana@example.org"));
+        assert!(!bo.has_cert("eve@example.net"));
     }
 
     #[test]

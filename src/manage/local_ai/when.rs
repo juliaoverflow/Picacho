@@ -181,6 +181,10 @@ fn digit(c: char) -> Option<char> {
 static MARK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\p{M}$").expect("pattern"));
 
 fn is_mark(c: char) -> bool {
+    // No ASCII character is a mark: most text needs no regex.
+    if c.is_ascii() {
+        return false;
+    }
     let mut buf = [0u8; 4];
     MARK.is_match(c.encode_utf8(&mut buf))
 }

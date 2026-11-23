@@ -31,7 +31,7 @@ use protected_email_bridge::{
         registration::{
             ApiConnectivity, RegistrationObserver, SessionContext, SessionProvider, StoredSession,
         },
-        seen::SeenNotifications,
+        seen::{SEEN_ENTRY, SeenNotifications},
     },
 };
 use std::sync::{Arc, Mutex, OnceLock};
@@ -115,13 +115,27 @@ pub(crate) fn note(message: &str) {
 }
 
 /// The push client's secrets, each its own keychain entry beside the
-/// accounts' (`proton-push:<name>`).
+/// accounts' (`proton-push:<name>`): the device key. What isn't secret, the
+/// list of pushes already handled (`SEEN_ENTRY`: hashes and expiry times,
+/// written again whole for every push), is kept with the app's other
+/// settings instead (see `Keychain::cache`), once the app's cache is open.
 struct Keychain;
 impl Keychain {
     fn entry(name: &str) -> String {
         format!("proton-push:{name}")
     }
+    /// The settings preference an entry kept outside the keychain goes to,
+    /// if `name` is one.
+    fn preference(name: &str) -> Option<String> {
+        (name == SEEN_ENTRY).then(|| format!("proton_push:{name}"))
+    }
+    /// The app's cache, where entries that aren't secret are kept: set by
+    /// `start`, before any push can arrive.
+    fn cache() -> Option<Arc<crate::manage::store::Store>> {
+        CACHE.get().cloned()
+    }
 }
+static CACHE: OnceLock<Arc<crate::manage::store::Store>> = OnceLock::new();
 fn store_error(e: anyhow::Error) -> protected_email_bridge::Error {
     protected_email_bridge::Error::Other(format!("{e:#}"))
 }
@@ -146,15 +160,41 @@ fn off_runtime<T: Send>(work: impl FnOnce() -> T + Send) -> T {
 impl SecureStore for Keychain {
     fn get(&self, name: &str) -> protected_email_bridge::Result<Option<Zeroizing<String>>> {
         let entry = Self::entry(name);
+        if let (Some(key), Some(store)) = (Self::preference(name), Self::cache()) {
+            match store.preference(&key) {
+                // Removed ("") is as never kept.
+                Some(value) if value.is_empty() => return Ok(None),
+                Some(value) => return Ok(Some(Zeroizing::new(value))),
+                None => {}
+            }
+            // Kept in the keychain by an earlier version: moved, once. Asked
+            // of the keychain only while the setting was never written.
+            let old = off_runtime(|| crate::manage::store::read_secret_text(&entry)).map_err(store_error)?;
+            store.set_preference_soon(&key, old.as_deref().unwrap_or_default());
+            if old.is_some() {
+                let _ = off_runtime(|| crate::manage::store::delete_secret(&entry));
+            }
+            return Ok(old.map(Zeroizing::new));
+        }
         off_runtime(|| crate::manage::store::read_secret_text(&entry))
             .map(|v| v.map(Zeroizing::new))
             .map_err(store_error)
     }
     fn put(&self, name: &str, value: &str) -> protected_email_bridge::Result<()> {
+        if let (Some(key), Some(store)) = (Self::preference(name), Self::cache()) {
+            // Written in the background with other settings: no keychain
+            // call (and no thread for one) for each push.
+            store.set_preference_soon(&key, value);
+            return Ok(());
+        }
         let entry = Self::entry(name);
         off_runtime(|| crate::manage::store::write_secret_text(&entry, value)).map_err(store_error)
     }
     fn delete(&self, name: &str) -> protected_email_bridge::Result<()> {
+        if let (Some(key), Some(store)) = (Self::preference(name), Self::cache()) {
+            store.set_preference_soon(&key, "");
+            return Ok(());
+        }
         let entry = Self::entry(name);
         off_runtime(|| crate::manage::store::delete_secret(&entry)).map_err(store_error)
     }
@@ -312,7 +352,10 @@ fn client() -> &'static Client {
 /// afterwards) and registers the sessions `set_sessions` names with Proton.
 /// What arrives goes to `deliver` once `set_ready` is called; each
 /// session's registration is reported to `status`.
-pub fn start(deliver: Deliver, status: Status) -> Result<()> {
+pub fn start(store: Arc<crate::manage::store::Store>, deliver: Deliver, status: Status) -> Result<()> {
+    // Where the handled pushes are kept (see `Keychain`); before anything
+    // reads them. One store for the process's life.
+    let _ = CACHE.set(store);
     let c = client();
     *c.deliver.lock().unwrap() = Some(deliver);
     *c.status.lock().unwrap() = Some(status);
@@ -464,6 +507,39 @@ fn process(envelope: &PushEnvelope) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handled pushes are kept with the app's settings, written for each
+    /// push without the keychain; a list removed reads as none, and isn't
+    /// looked for in the keychain again.
+    #[test]
+    fn handled_pushes_are_kept_outside_the_keychain() {
+        let path = std::env::temp_dir().join(format!("picacho-push-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(crate::manage::store::Store::open(&path).unwrap());
+        let _ = CACHE.set(store.clone());
+        let store = Keychain::cache().unwrap();
+        let key = Keychain::preference(SEEN_ENTRY).unwrap();
+        // Written, then read back, never asking the keychain (which tests
+        // here don't have: a keychain call would fail).
+        Keychain.put(SEEN_ENTRY, "{\"entries\":[]}").unwrap();
+        assert_eq!(store.preference(&key).as_deref(), Some("{\"entries\":[]}"));
+        assert_eq!(Keychain.get(SEEN_ENTRY).unwrap().as_deref().map(String::as_str), Some("{\"entries\":[]}"));
+        Keychain.delete(SEEN_ENTRY).unwrap();
+        assert!(Keychain.get(SEEN_ENTRY).unwrap().is_none());
+        // Through the library, as pushes arrive: each remembered.
+        let seen = SeenNotifications::new(Arc::new(Keychain));
+        let push = PushEnvelope {
+            uid: "session".into(),
+            encrypted_message: "abc".into(),
+        };
+        assert!(!seen.contains(&push));
+        seen.insert(&push).unwrap();
+        assert!(SeenNotifications::new(Arc::new(Keychain)).contains(&push), "kept for the next run");
+        // The device key isn't one of them: it stays in the keychain.
+        assert!(Keychain::preference(protected_email_bridge::push::device_key::DEVICE_KEY_ENTRY).is_none());
+        store.flush();
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+    }
 
     #[test]
     fn sender_comes_from_the_app_id() {

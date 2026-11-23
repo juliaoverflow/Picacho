@@ -90,22 +90,42 @@ fn socket_path(dir: &Path) -> PathBuf {
 /// Hands over to a Picacho already using `dir`, or becomes the one others
 /// hand over to. `None` when neither works (an unusable data directory, a
 /// path too long for a socket); Picacho then just runs.
+/// Makes the data directory readable by this user alone from the start:
+/// made with the usual permissions, it was open to others until the store
+/// restricted it, after the lock and socket were already made inside it.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
 pub fn claim(dir: &Path) -> Option<Claim> {
     let path = socket_path(dir);
     if forward(&path, SHOW).is_ok() {
         return Some(Claim::Forwarded);
     }
-    std::fs::create_dir_all(dir).ok()?;
+    private_dir(dir).ok()?;
     match lock(dir) {
         Ok(Some(held)) => listen(path, Some(held)).ok().map(Claim::Primary),
         // Another launch got here first and is starting: show its window
         // once it listens.
+        // Or one is ending: the background process that started this one
+        // (to show its window) lets go of the lock as it exits. The lock is
+        // asked for again meanwhile; asked for only once, this launch said
+        // Picacho wasn't responding after the moment it took to exit.
         Ok(None) => {
             let start = std::time::Instant::now();
             while start.elapsed() < STARTING {
                 std::thread::sleep(Duration::from_millis(100));
                 if forward(&path, SHOW).is_ok() {
                     return Some(Claim::Forwarded);
+                }
+                if let Ok(Some(held)) = lock(dir) {
+                    return listen(path, Some(held)).ok().map(Claim::Primary);
                 }
             }
             Some(Claim::Busy)
@@ -123,7 +143,7 @@ pub fn claim_resident(dir: &Path) -> Option<Listener> {
     if forward(&path, PING).is_ok() {
         return None;
     }
-    std::fs::create_dir_all(dir).ok()?;
+    private_dir(dir).ok()?;
     match lock(dir) {
         Ok(Some(held)) => listen(path, Some(held)).ok(),
         // A Picacho is starting on `dir`: it is left to run.

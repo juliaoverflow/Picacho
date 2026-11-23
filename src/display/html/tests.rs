@@ -770,3 +770,21 @@ fn a_long_press_selects_the_word_and_dragging_extends_it_both_ways() {
     assert!(email.select_word_at(at(2.), y + 200.).is_none());
     assert_eq!(email.doc.get_selected_text(), None);
 }
+
+#[test]
+fn dark_reading_keeps_text_readable() {
+    use super::document::{Role, dark_color, readable_on};
+    // Mid-grey text on the dark page: lifted to 4.5:1.
+    let page = 0.3;
+    let grey = dark_color([0.45, 0.45, 0.45, 1.], Role::Text);
+    let lifted = readable_on(grey, page);
+    let lum = |c: [f32; 4]| {
+        let l = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        0.2126 * l(c[0]) + 0.7152 * l(c[1]) + 0.0722 * l(c[2])
+    };
+    // The page at OKLab 0.3 is about 0.027 luminance.
+    assert!((lum(lifted) + 0.05) / (0.027 + 0.05) >= 4.4, "{lifted:?}");
+    // Already readable: unchanged.
+    let white = [1., 1., 1., 1.];
+    assert_eq!(readable_on(white, page), white);
+}
