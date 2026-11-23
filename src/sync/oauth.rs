@@ -724,44 +724,113 @@ fn identity_of(claims: &serde_json::Value) -> Identity {
     }
 }
 
+/// Who may have issued a sign-in's ID token (its `iss`).
+#[derive(Clone, Copy, Debug)]
+enum Issuer<'a> {
+    /// Exactly this issuer identifier (OpenID Connect Core §3.1.3.7 step
+    /// 2): a JMAP server's or an organization's, from its own metadata.
+    Exact(&'a str),
+    /// Google, which writes its issuer both with and without the scheme
+    /// (its OpenID Connect documentation, "Validating an ID token").
+    Google,
+    /// Microsoft's `common` endpoint, whose metadata names
+    /// `https://login.microsoftonline.com/{tenantid}/v2.0`: the token's
+    /// own tenant (its `tid` claim) stands for `{tenantid}`.
+    Microsoft,
+    /// None known (metadata that names no issuer): not checked.
+    Unknown,
+}
+impl Issuer<'_> {
+    fn accepts(self, claims: &serde_json::Value) -> bool {
+        let Some(iss) = claims["iss"].as_str() else {
+            return matches!(self, Self::Unknown);
+        };
+        match self {
+            Self::Exact(expected) => iss == expected,
+            Self::Google => matches!(iss, "https://accounts.google.com" | "accounts.google.com"),
+            Self::Microsoft => {
+                // A tenant is a GUID: one with a `/` would make another
+                // issuer's address of the template.
+                let tid = claims["tid"].as_str().unwrap_or_default();
+                !tid.is_empty()
+                    && tid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+                    && iss == format!("https://login.microsoftonline.com/{tid}/v2.0")
+            }
+            Self::Unknown => true,
+        }
+    }
+}
+/// How far another clock may be off: OpenID Connect Core §3.1.3.7 step 9
+/// allows "some small leeway, usually no more than a few minutes".
+const CLOCK_SKEW: i64 = 300;
+
 /// The ID token's claims checked as OpenID Connect Core §3.1.3.7 asks of
-/// a token straight from the token endpoint: issued to this client (`aud`,
-/// and `azp` with several audiences), not expired, with the `nonce` this
+/// a token straight from the token endpoint: from the expected issuer
+/// (`iss`), issued to this client (`aud`, and `azp` with several
+/// audiences or wherever it is given), not expired, with the `nonce` this
 /// sign-in sent (where one was), and naming a subject. Returns who signed
 /// in and the subject. No ID token at all is no identity, not an error.
 fn checked_identity(
     id_token: &str,
     client_id: &str,
+    issuer: Issuer<'_>,
     nonce: Option<&str>,
+) -> Result<(Identity, String)> {
+    checked_identity_at(id_token, client_id, issuer, nonce, chrono::Utc::now().timestamp())
+}
+fn checked_identity_at(
+    id_token: &str,
+    client_id: &str,
+    issuer: Issuer<'_>,
+    nonce: Option<&str>,
+    now: i64,
 ) -> Result<(Identity, String)> {
     if id_token.is_empty() {
         return Ok((Identity::default(), String::new()));
     }
     let claims = claims_of(id_token);
     ensure!(claims.is_object(), "The sign-in's ID token couldn't be read.");
+    // Step 2: the issuer must be the one signed in with, so a token from
+    // another server (a mix-up) isn't taken for this one's.
+    ensure!(
+        issuer.accepts(&claims),
+        "The sign-in's ID token came from another server ({}).",
+        claims["iss"].as_str().unwrap_or("none named")
+    );
     let audiences: Vec<&str> = match &claims["aud"] {
         serde_json::Value::String(a) => vec![a.as_str()],
         serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
         _ => Vec::new(),
     };
     if !client_id.is_empty() {
+        // Step 3: this client among the audiences.
         ensure!(
             audiences.contains(&client_id),
             "The sign-in's ID token was issued to another app."
         );
-        if audiences.len() > 1
-            && let Some(azp) = claims["azp"].as_str()
-        {
-            ensure!(azp == client_id, "The sign-in's ID token was issued to another app.");
-        }
-    }
-    if let Some(exp) = claims["exp"].as_i64() {
-        // A few minutes' leeway for clocks that disagree.
+        // Steps 4 and 5: with several audiences, the one it was given to
+        // (`azp`) must be said, and wherever it is said, be this client.
+        let azp = claims["azp"].as_str();
         ensure!(
-            exp + 300 >= chrono::Utc::now().timestamp(),
-            "The sign-in's ID token has expired. Check this device's clock."
+            audiences.len() == 1 || azp.is_some(),
+            "The sign-in's ID token doesn't say which of its apps it was issued to."
+        );
+        ensure!(
+            azp.is_none_or(|azp| azp == client_id),
+            "The sign-in's ID token was issued to another app."
         );
     }
+    // Step 9: `exp` is required, and must not have passed (give or take
+    // `CLOCK_SKEW`). `iat` isn't checked: step 10 leaves that to the client,
+    // and a clock that runs behind would only refuse good tokens.
+    let exp = claims["exp"]
+        .as_i64()
+        .or_else(|| claims["exp"].as_f64().map(|f| f as i64))
+        .context("The sign-in's ID token has no expiry.")?;
+    ensure!(
+        exp + CLOCK_SKEW >= now,
+        "The sign-in's ID token has expired. Check this device's clock."
+    );
     if let Some(nonce) = nonce {
         ensure!(
             claims["nonce"].as_str() == Some(nonce),
@@ -784,6 +853,20 @@ pub struct Grant {
     /// sign-in, or the app's own), and where the code is redeemed.
     pub client_id: String,
     token: String,
+    /// The issuer the ID token must name: the server's own (from its
+    /// metadata), or Google's or Microsoft's.
+    issuer: Option<String>,
+}
+impl Grant {
+    fn issuer(&self, provider: Provider, own_endpoints: bool) -> Issuer<'_> {
+        match (&self.issuer, provider) {
+            (Some(issuer), _) => Issuer::Exact(issuer),
+            (None, _) if own_endpoints => Issuer::Unknown,
+            (None, Provider::Gmail) => Issuer::Google,
+            (None, Provider::Outlook) => Issuer::Microsoft,
+            (None, _) => Issuer::Unknown,
+        }
+    }
 }
 impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -831,6 +914,7 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         verifier: browser.verifier.clone(),
         client_id: account.client_id.clone(),
         token: String::new(),
+        issuer: None,
     })
 }
 
@@ -878,6 +962,7 @@ fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         verifier: browser.verifier.clone(),
         client_id,
         token: metadata.token,
+        issuer: metadata.issuer,
     })
 }
 
@@ -922,6 +1007,7 @@ fn authorize_sso(
         verifier: browser.verifier.clone(),
         client_id,
         token: metadata.token,
+        issuer: metadata.issuer,
     })
 }
 
@@ -954,7 +1040,12 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     }
     let (mut secret, value) = exchange(token, &fields)?;
     secret.client_secret = account.client_secret.clone();
-    let (who, _) = checked_identity(value["id_token"].as_str().unwrap_or_default(), client_id, None)?;
+    let (who, _) = checked_identity(
+        value["id_token"].as_str().unwrap_or_default(),
+        client_id,
+        grant.issuer(account.provider, jmap),
+        None,
+    )?;
     Ok((secret, who))
 }
 
@@ -971,6 +1062,8 @@ struct PinalEndpoints {
     authorize: url::Url,
     token: url::Url,
     userinfo: url::Url,
+    /// The issuer its ID tokens name (OpenID Connect Discovery §3).
+    issuer: Option<String>,
 }
 fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
     static FOUND: Mutex<Option<(String, PinalEndpoints)>> = Mutex::new(None);
@@ -1016,6 +1109,7 @@ fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
         authorize: endpoint("authorization_endpoint")?,
         token: endpoint("token_endpoint")?,
         userinfo: endpoint("userinfo_endpoint")?,
+        issuer: config["issuer"].as_str().map(str::to_owned),
     };
     *FOUND.lock().unwrap() = Some((origin, found.clone()));
     Ok(found)
@@ -1125,6 +1219,11 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
     let (mut who, subject) = checked_identity(
         value["id_token"].as_str().unwrap_or_default(),
         &client_id,
+        request
+            .endpoints
+            .issuer
+            .as_deref()
+            .map_or(Issuer::Unknown, Issuer::Exact),
         Some(&request.nonce),
     )?;
     if who.email.is_empty() {
@@ -1457,6 +1556,139 @@ mod tests {
         );
         assert_eq!(identity("garbage"), Identity::default());
     }
+    /// An unsigned ID token carrying `claims` (only its claims are read).
+    fn id_token(claims: serde_json::Value) -> String {
+        format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()))
+    }
+    const NOW: i64 = 1_800_000_000;
+
+    /// OpenID Connect Core §3.1.3.7, with tokens as Google issues them.
+    #[test]
+    fn id_tokens_from_google_are_checked() {
+        let google = |iss: &str| {
+            id_token(serde_json::json!({
+                "iss": iss, "aud": "picacho.apps.googleusercontent.com",
+                "azp": "picacho.apps.googleusercontent.com", "sub": "1093",
+                "email": "ana@gmail.com", "exp": NOW + 3600, "iat": NOW,
+            }))
+        };
+        let check = |token: &str| {
+            checked_identity_at(token, "picacho.apps.googleusercontent.com", Issuer::Google, None, NOW)
+        };
+        // Both of Google's issuer forms.
+        for iss in ["https://accounts.google.com", "accounts.google.com"] {
+            let (who, sub) = check(&google(iss)).unwrap();
+            assert_eq!((who.email.as_str(), sub.as_str()), ("ana@gmail.com", "1093"));
+        }
+        // Another issuer, or none, is refused.
+        assert!(check(&google("https://accounts.google.com.evil.example")).is_err());
+        let mut none: serde_json::Value = claims_of(&google("x"));
+        none.as_object_mut().unwrap().remove("iss");
+        assert!(check(&id_token(none)).is_err());
+    }
+
+    /// Microsoft's `common` endpoint: the issuer has the token's own tenant.
+    #[test]
+    fn id_tokens_from_microsoft_name_their_tenant() {
+        let microsoft = |iss: &str, tid: &str| {
+            id_token(serde_json::json!({
+                "iss": iss, "tid": tid, "aud": "client-guid", "sub": "AAAA",
+                "preferred_username": "ana@outlook.com", "exp": NOW + 3600,
+            }))
+        };
+        let check = |token: &str| checked_identity_at(token, "client-guid", Issuer::Microsoft, None, NOW);
+        // A personal account's tenant, and an organization's.
+        for tid in ["9188040d-6c67-4c5b-b112-36a304b66dad", "72f988bf-86f1-41af-91ab-2d7cd011db47"] {
+            let iss = format!("https://login.microsoftonline.com/{tid}/v2.0");
+            assert_eq!(check(&microsoft(&iss, tid)).unwrap().0.email, "ana@outlook.com");
+        }
+        let tid = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+        // The issuer of another tenant than the token's.
+        assert!(check(&microsoft("https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0", tid)).is_err());
+        // The template itself, or a tenant that isn't a tenant id.
+        assert!(check(&microsoft("https://login.microsoftonline.com/{tenantid}/v2.0", "{tenantid}")).is_err());
+        assert!(check(&microsoft("https://login.microsoftonline.com/x/y/v2.0", "x/y")).is_err());
+        // The v1 issuer (sts.windows.net) isn't the v2 endpoint's.
+        assert!(check(&microsoft(&format!("https://sts.windows.net/{tid}/"), tid)).is_err());
+    }
+
+    /// A JMAP server's (Fastmail) and an organization's (Keycloak) tokens:
+    /// the issuer their metadata names, exactly.
+    #[test]
+    fn id_tokens_from_jmap_servers_and_organizations_name_their_issuer() {
+        for (issuer, client) in [
+            ("https://api.fastmail.com", "35c941ae"),
+            ("https://login.example.edu/realms/staff", "picacho"),
+        ] {
+            let token = |iss: &str| {
+                id_token(serde_json::json!({
+                    "iss": iss, "aud": client, "sub": "u1",
+                    "email": "ana@example.edu", "exp": NOW + 60,
+                }))
+            };
+            assert!(checked_identity_at(&token(issuer), client, Issuer::Exact(issuer), None, NOW).is_ok());
+            assert!(checked_identity_at(&token("https://other.example"), client, Issuer::Exact(issuer), None, NOW).is_err());
+            // A grant from such a server checks against its metadata's
+            // issuer; metadata without one can't be checked against.
+            let grant = Grant {
+                code: String::new(),
+                redirect: String::new(),
+                verifier: String::new(),
+                client_id: client.into(),
+                token: String::new(),
+                issuer: Some(issuer.into()),
+            };
+            assert!(matches!(grant.issuer(Provider::Jmap, true), Issuer::Exact(i) if i == issuer));
+            let grant = Grant { issuer: None, ..grant };
+            assert!(matches!(grant.issuer(Provider::Imap, true), Issuer::Unknown));
+            assert!(matches!(grant.issuer(Provider::Gmail, false), Issuer::Google));
+            assert!(matches!(grant.issuer(Provider::Outlook, false), Issuer::Microsoft));
+        }
+    }
+
+    /// Audiences, `azp`, expiry with leeway, the nonce and the subject.
+    #[test]
+    fn id_token_audience_expiry_nonce_and_subject_are_enforced() {
+        let base = serde_json::json!({
+            "iss": "https://id.example", "aud": "me", "sub": "u1", "exp": NOW, "nonce": "n1",
+        });
+        let with = |changes: serde_json::Value| {
+            let mut claims = base.clone();
+            for (k, v) in changes.as_object().unwrap() {
+                if v.is_null() {
+                    claims.as_object_mut().unwrap().remove(k);
+                } else {
+                    claims[k] = v.clone();
+                }
+            }
+            id_token(claims)
+        };
+        let check = |token: &str, now: i64| {
+            checked_identity_at(token, "me", Issuer::Exact("https://id.example"), Some("n1"), now)
+        };
+        assert!(check(&with(serde_json::json!({})), NOW).is_ok());
+        // Clock skew: up to CLOCK_SKEW past `exp`, not beyond.
+        assert!(check(&with(serde_json::json!({})), NOW + CLOCK_SKEW).is_ok());
+        assert!(check(&with(serde_json::json!({})), NOW + CLOCK_SKEW + 1).is_err());
+        // No `exp` at all.
+        assert!(check(&with(serde_json::json!({"exp": null})), NOW).is_err());
+        // Another app's token.
+        assert!(check(&with(serde_json::json!({"aud": "other"})), NOW).is_err());
+        // Several audiences: `azp` must say this app.
+        assert!(check(&with(serde_json::json!({"aud": ["other", "me"]})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"aud": ["other", "me"], "azp": "other"})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"aud": ["other", "me"], "azp": "me"})), NOW).is_ok());
+        // One audience, with an `azp` for someone else.
+        assert!(check(&with(serde_json::json!({"azp": "other"})), NOW).is_err());
+        // The nonce sent, and a subject.
+        assert!(check(&with(serde_json::json!({"nonce": "n2"})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"nonce": null})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"sub": ""})), NOW).is_err());
+        // No ID token: no identity, and no error.
+        assert_eq!(check("", NOW).unwrap(), (Identity::default(), String::new()));
+        assert!(check("garbage", NOW).is_err());
+    }
+
     #[test]
     fn loopback_callback_ignores_forged_state() {
         let browser = Browser::new("127.0.0.1", "/callback").unwrap();
