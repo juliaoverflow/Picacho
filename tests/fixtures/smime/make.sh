@@ -80,6 +80,18 @@ rm -f compressed-part.txt
     -md sha256 -binary; } > pkcs7-signed.eml
 rm -f ext.cnf
 
+# Encrypted to Ana with RSA-OAEP (RFC 8017 §7.1, RFC 3560), to Bo with
+# ECDH (RFC 5753), and with AES-GCM as AuthEnvelopedData (RFC 5083/5084).
+# The old PKCS#7 form, from openssl smime, with RSA PKCS#1 v1.5.
+{ printf "$headers"; openssl cms -encrypt -in content.txt -aes-256-cbc -recip ana.pem \
+    -keyopt rsa_padding_mode:oaep -binary; } > encrypted-rsa-oaep.eml
+{ printf "$headers"; openssl cms -encrypt -in content.txt -aes-256-cbc -recip bo.pem \
+    -binary; } > encrypted-ecdh.eml
+{ printf "$headers"; openssl cms -encrypt -in content.txt -aes-256-gcm -recip ana.pem \
+    -recip bo.pem -binary; } > encrypted-aes-gcm.eml
+{ printf "$headers"; openssl smime -encrypt -in content.txt -aes-256-cbc -binary ana.pem; } \
+    > pkcs7-encrypted.eml
+
 # Mail travels with CRLF line ends (RFC 5322 §2.1); openssl writes LF
 # outside the signed content, which already has CRLF.
 for f in *.eml; do

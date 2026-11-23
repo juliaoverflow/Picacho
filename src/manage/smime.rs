@@ -621,11 +621,7 @@ fn open_with(
                 compressed = true;
                 (inflate(der::compressed_content(&der).ok()?, crate::manage::crypto::MAX_MESSAGE)?, None)
             } else {
-                let p7 = Pkcs7::from_der(&der).ok()?;
-                let opened = certs
-                    .identities()
-                    .into_iter()
-                    .find_map(|(cert, _, key)| p7.decrypt(&key, &cert, Pkcs7Flags::BINARY).ok())?;
+                let opened = decrypt(&der, certs)?;
                 verdict.decrypted = true;
                 (opened, None)
             }
@@ -675,6 +671,20 @@ fn open_with(
         readable.extend_from_slice(&current);
     }
     Some((readable, verdict, signer))
+}
+
+/// Decrypts a DER EnvelopedData (RFC 5652 §6) or AuthEnvelopedData (RFC
+/// 5083) with whichever of your keys it was encrypted to. CMS_decrypt
+/// handles RSA (PKCS#1 v1.5 and OAEP, RFC 3560) and ECDH (RFC 5753)
+/// recipients, and AES-GCM (RFC 5084), whose tag it checks before giving
+/// back any content. With the certificate given, only the recipient info
+/// naming it is tried (OpenSSL's guard against Bleichenbacher's attack).
+fn decrypt(der: &[u8], certs: &Certificates) -> Option<Vec<u8>> {
+    let cms = CmsContentInfo::from_der(der).ok()?;
+    certs
+        .identities()
+        .into_iter()
+        .find_map(|(cert, _, key)| cms.decrypt(&key, &cert).ok())
 }
 
 /// RFC 1847 §2.1: a multipart/signed's first part, byte for byte as it was
@@ -1111,6 +1121,17 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
+    /// A fixture identity: its certificate and key, as `import_identity`
+    /// keeps them.
+    fn fixture_identity(name: &str) -> Certificates {
+        let key = PKey::private_key_from_pem(&fixture(&format!("{name}.key"))).unwrap();
+        let pem = String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        Certificates {
+            own: vec![(String::from_utf8(fixture(&format!("{name}.pem"))).unwrap(), pem)],
+            others: Vec::new(),
+        }
+    }
+
     /// The fixtures' test authority, as the only one trusted.
     fn test_authority() -> openssl::x509::store::X509Store {
         let mut builder = X509StoreBuilder::new().unwrap();
@@ -1320,6 +1341,61 @@ mod tests {
         let (readable, verdict, _) =
             open_with(&fixture("pkcs7-signed.eml"), &Certificates::default(), &test_authority()).unwrap();
         assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+    }
+
+    /// RSA-OAEP recipients (RFC 3560), as recent Outlook writes them.
+    #[test]
+    fn rsa_oaep_encrypted_mail_decrypts() {
+        let (readable, verdict, _) =
+            open_with(&fixture("encrypted-rsa-oaep.eml"), &fixture_identity("ana"), &test_authority()).unwrap();
+        assert!(verdict.decrypted);
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+        assert!(open_with(&fixture("encrypted-rsa-oaep.eml"), &fixture_identity("bo"), &test_authority()).is_none());
+    }
+
+    /// ECDH recipients (RFC 5753), for EC certificates.
+    #[test]
+    fn ecdh_encrypted_mail_decrypts() {
+        let (readable, verdict, _) =
+            open_with(&fixture("encrypted-ecdh.eml"), &fixture_identity("bo"), &test_authority()).unwrap();
+        assert!(verdict.decrypted);
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+    }
+
+    /// AES-GCM as AuthEnvelopedData (RFC 5083, RFC 5084), for an RSA and
+    /// an ECDH recipient; a changed ciphertext fails its tag.
+    #[test]
+    fn aes_gcm_auth_enveloped_mail_decrypts_and_is_authenticated() {
+        let raw = fixture("encrypted-aes-gcm.eml");
+        for who in ["ana", "bo"] {
+            let (readable, verdict, _) = open_with(&raw, &fixture_identity(who), &test_authority()).unwrap();
+            assert!(verdict.decrypted, "{who}");
+            assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."), "{who}");
+        }
+        // One byte of the encrypted content changed: the DER's last
+        // value is the GCM tag (RFC 5083 §2.1 mac), and before it the
+        // ciphertext.
+        let der = CmsContentInfo::smime_read_cms(&raw).unwrap().to_der().unwrap();
+        let mut changed = der.clone();
+        let at = changed.len() - 40;
+        changed[at] ^= 1;
+        assert!(decrypt(&der, &fixture_identity("ana")).is_some());
+        assert!(decrypt(&changed, &fixture_identity("ana")).is_none());
+        let mut tag = der.clone();
+        if let Some(last) = tag.last_mut() {
+            *last ^= 1;
+        }
+        assert!(decrypt(&tag, &fixture_identity("ana")).is_none());
+    }
+
+    /// Old PKCS#7 encrypted mail (application/x-pkcs7-mime, RSA PKCS#1
+    /// v1.5) still reads.
+    #[test]
+    fn old_pkcs7_encrypted_mail_still_reads() {
+        let (readable, verdict, _) =
+            open_with(&fixture("pkcs7-encrypted.eml"), &fixture_identity("ana"), &test_authority()).unwrap();
+        assert!(verdict.decrypted);
         assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
     }
 }
