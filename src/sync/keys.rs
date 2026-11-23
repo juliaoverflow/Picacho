@@ -81,8 +81,10 @@ fn limited(response: reqwest::blocking::Response) -> Result<Vec<u8>> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Wkd,
-    /// DNS (OPENPGPKEY, RFC 7929).
-    Dane,
+    /// DNS (OPENPGPKEY, RFC 7929). `dnssec_validated`: the answer was
+    /// signed and validated to the root, so the domain itself published
+    /// the key; otherwise it is unverified, as a key server's is.
+    Dane { dnssec_validated: bool },
     KeysOpenpgpOrg,
 }
 
@@ -90,7 +92,8 @@ impl Source {
     pub fn label(self) -> &'static str {
         match self {
             Self::Wkd => "the address's own domain (WKD)",
-            Self::Dane => "the address's domain's DNS (OPENPGPKEY)",
+            Self::Dane { dnssec_validated: true } => "the address's domain's DNSSEC-signed DNS (OPENPGPKEY)",
+            Self::Dane { dnssec_validated: false } => "the address's domain's DNS (OPENPGPKEY, unverified)",
             Self::KeysOpenpgpOrg => "keys.openpgp.org",
         }
     }
@@ -125,11 +128,17 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
             }
         }
     }
-    // The domain's DNS (RFC 7929), where it publishes keys there.
-    if let Ok(keys) = super::auth::openpgpkey(email)
-        && let Some(key) = keys.into_iter().find(|k| !k.is_empty())
+    // The domain's DNS (RFC 7929), where it publishes keys there; none
+    // from an answer DNSSEC found bogus.
+    if let Ok(found) = super::auth::openpgpkey(email)
+        && let Some(key) = found.keys.into_iter().find(|k| !k.is_empty())
     {
-        return Ok(Some((key, Source::Dane)));
+        return Ok(Some((
+            key,
+            Source::Dane {
+                dnssec_validated: found.dnssec_validated,
+            },
+        )));
     }
     let url = format!(
         "https://keys.openpgp.org/vks/v1/by-email/{}",
