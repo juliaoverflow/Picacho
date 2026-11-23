@@ -705,6 +705,10 @@ enum Action {
     ImportKeys,
     /// Makes a new OpenPGP key for the current account's address.
     CreateKey,
+    /// Chooses how long new and renewed OpenPGP keys last.
+    SetKeyExpiry(encryption::KeyExpiry),
+    /// Renews your OpenPGP key with this fingerprint for the chosen time.
+    RenewKey(String),
     /// Takes in the key an Autocrypt Setup Message carries, with the code typed.
     ImportSetupMessage(String),
     /// Forgets the OpenPGP key with this fingerprint.
@@ -1761,6 +1765,8 @@ pub struct MailApp {
     /// The key whose fingerprint check is open, and the fingerprint given.
     key_checking: Option<String>,
     key_check_input: Entity<InputState>,
+    /// How long new and renewed OpenPGP keys last.
+    key_expiry: encryption::KeyExpiry,
     /// Invitations found in messages, by message id (None: none found, or
     /// still looking).
     invitations: HashMap<String, Option<calendar::Invitation>>,
@@ -2762,6 +2768,7 @@ impl MailApp {
             key_busy: false,
             key_checking: None,
             key_check_input,
+            key_expiry: encryption::KeyExpiry::default(),
             invitations: HashMap::new(),
             delivery_reports: HashMap::new(),
             invitation_busy: None,
@@ -6462,6 +6469,8 @@ impl MailApp {
             | Action::AddServerIdentity(_)) => self.server_identity_action(action, w, cx),
             action @ (Action::ImportKeys
             | Action::CreateKey
+            | Action::SetKeyExpiry(_)
+            | Action::RenewKey(_)
             | Action::ImportSetupMessage(_)
             | Action::RemoveKey(_)
             | Action::VerifyKey(_)

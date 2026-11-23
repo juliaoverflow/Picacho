@@ -5,6 +5,45 @@ use super::*;
 use crate::manage::openpgp::Keyring;
 use anyhow::Context as _;
 
+/// How long a new or renewed OpenPGP key lasts (RFC 9580 §5.2.3.13).
+/// Keys don't expire unless you choose so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum KeyExpiry {
+    #[default]
+    Never,
+    Years(u32),
+}
+
+impl KeyExpiry {
+    const CHOICES: [Self; 4] = [Self::Never, Self::Years(1), Self::Years(2), Self::Years(5)];
+    fn label(self) -> String {
+        match self {
+            Self::Never => "Never".into(),
+            Self::Years(1) => "1 year".into(),
+            Self::Years(n) => format!("{n} years"),
+        }
+    }
+    /// How long from now: `None` for never.
+    pub(super) fn lasts(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Never => None,
+            // A year of 365 days and a quarter, as GnuPG counts "1y".
+            Self::Years(n) => Some(std::time::Duration::from_secs(u64::from(n) * 31_557_600)),
+        }
+    }
+}
+
+/// "expires Mar 3, 2027" or "expired Mar 3, 2025", for a key that does.
+fn expiry_text(expires: Option<i64>) -> Option<String> {
+    let at = expires?;
+    let date = chrono::DateTime::from_timestamp(at, 0)?.format("%b %-d, %Y").to_string();
+    Some(if at <= chrono::Utc::now().timestamp() {
+        format!("expired {date}")
+    } else {
+        format!("expires {date}")
+    })
+}
+
 impl MailApp {
     pub(super) fn encryption_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -63,7 +102,8 @@ impl MailApp {
                                 .text_color(rgb(c.muted))
                                 .truncate()
                                 .child(format!(
-                                    "{} · {short}",
+                                    "{}{} · {short}",
+                                    expiry_text(key.expires).map(|e| format!("{e} · ")).unwrap_or_default(),
                                     if key.secret {
                                         "Your key"
                                     } else if key.found && key.verified {
@@ -76,6 +116,24 @@ impl MailApp {
                                 )),
                         ),
                 )
+                .when(key.secret, |row| {
+                    // Renewing for "Never" takes the end date away.
+                    let label = if self.key_expiry == KeyExpiry::Never {
+                        "Remove Expiry"
+                    } else {
+                        "Renew…"
+                    };
+                    row.when(key.expires.is_some() || self.key_expiry != KeyExpiry::Never, |row| {
+                        row.child(self.button(
+                            format!("openpgp-renew-{fp}"),
+                            label,
+                            "",
+                            Action::RenewKey(fp.clone()),
+                            false,
+                            cx,
+                        ))
+                    })
+                })
                 .child(self.button(
                     format!("openpgp-check-{fp}"),
                     if key.secret {
@@ -153,6 +211,27 @@ impl MailApp {
                         div()
                             .id("openpgp-passphrase")
                             .child(field(Input::new(&self.key_passphrase), c, false)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(c.muted))
+                                    .flex_shrink_0()
+                                    .child("New and renewed keys expire:"),
+                            )
+                            .child(self.segmented(
+                                "openpgp-expiry",
+                                KeyExpiry::CHOICES
+                                    .into_iter()
+                                    .map(|e| (e.label(), Action::SetKeyExpiry(e), self.key_expiry == e))
+                                    .collect(),
+                                cx,
+                            )),
                     )
                     .child(div().flex().gap_2().child(self.button(
                         "openpgp-import",
@@ -373,6 +452,7 @@ impl MailApp {
                 };
                 self.key_error = None;
                 let (name, email) = (a.name.clone(), a.email.clone());
+                let lasts = self.key_expiry.lasts();
                 self.task(
                     cx,
                     move |b| {
@@ -381,7 +461,7 @@ impl MailApp {
                             ring.own_key(&email).is_none(),
                             "You already have a key for {email}."
                         );
-                        let fp = ring.create(&name, &email)?;
+                        let fp = ring.create(&name, &email, lasts)?;
                         b.set_keyring(ring)?;
                         Ok(fp)
                     },
@@ -390,6 +470,23 @@ impl MailApp {
                         Err(e) => this.key_error = Some(format!("{e:#}")),
                     },
                 );
+            }
+            Action::SetKeyExpiry(choice) => self.key_expiry = choice,
+            Action::RenewKey(fp) => {
+                self.key_error = None;
+                let mut ring = Keyring::clone(&self.backend.keyring());
+                match ring
+                    .renew(&fp, self.key_expiry.lasts())
+                    .and_then(|()| self.backend.set_keyring(ring))
+                {
+                    // Others have the key as it was until they get it again.
+                    Ok(()) => self.notice(
+                        "Renewed. Share your public key again so others see the new date.",
+                        false,
+                        cx,
+                    ),
+                    Err(e) => self.key_error = Some(format!("{e:#}")),
+                }
             }
             Action::CheckKey(fp) => {
                 self.key_checking = (self.key_checking.as_ref() != Some(&fp)).then_some(fp);
@@ -795,5 +892,73 @@ impl MailApp {
             .overflow_hidden()
             .child(body)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{act, frame, two_accounts};
+    use super::*;
+    use std::prelude::v1::test;
+
+    /// Settings → Encryption: the expiry choice (Never by default) makes a
+    /// key that expires, shown in its row; Renew… extends it for the
+    /// chosen time, and with Never chosen Remove Expiry takes the date away.
+    #[gpui::test]
+    fn keys_are_made_and_renewed_with_the_chosen_expiry(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Encryption), cx);
+        frame(cx);
+        assert!(view.read_with(cx, |this, _| this.key_expiry == KeyExpiry::Never));
+        assert!(cx.debug_bounds("openpgp-expiry-0").is_some(), "the expiry choice is shown");
+        assert!(cx.debug_bounds("openpgp-expiry-3").is_some());
+
+        act(&view, Action::SetKeyExpiry(KeyExpiry::Years(2)), cx);
+        act(&view, Action::CreateKey, cx);
+        cx.run_until_parked();
+        let key = view.read_with(cx, |this, _| this.backend.keyring().list());
+        let [key] = key.as_slice() else { panic!("one key: {key:?}") };
+        assert!(key.secret);
+        let two_years = KeyExpiry::Years(2).lasts().unwrap().as_secs() as i64;
+        let made = key.expires.unwrap();
+        assert!((made - chrono::Utc::now().timestamp() - two_years).abs() <= 5);
+        assert!(expiry_text(key.expires).unwrap().starts_with("expires "));
+        let fp = key.fingerprint.clone();
+        // Debug selectors are looked up by a 'static name.
+        let renew: &'static str = format!("openpgp-renew-{fp}").leak();
+        frame(cx);
+        assert!(cx.debug_bounds(renew).is_some(), "Renew… on your key");
+
+        // Renewed for five years from now.
+        act(&view, Action::SetKeyExpiry(KeyExpiry::Years(5)), cx);
+        act(&view, Action::RenewKey(fp.clone()), cx);
+        let (renewed, status) = view.read_with(cx, |this, _| (this.backend.keyring().list()[0].expires, this.status.clone()));
+        let five_years = KeyExpiry::Years(5).lasts().unwrap().as_secs() as i64;
+        assert!((renewed.unwrap() - chrono::Utc::now().timestamp() - five_years).abs() <= 5);
+        assert!(status.contains("Share your public key again"), "{status}");
+
+        // Never chosen: Remove Expiry clears it.
+        act(&view, Action::SetKeyExpiry(KeyExpiry::Never), cx);
+        frame(cx);
+        assert!(cx.debug_bounds(renew).is_some(), "Remove Expiry on a key that expires");
+        act(&view, Action::RenewKey(fp.clone()), cx);
+        assert_eq!(view.read_with(cx, |this, _| this.backend.keyring().list()[0].expires), None);
+        frame(cx);
+        assert!(
+            cx.debug_bounds(renew).is_none(),
+            "nothing to remove on a key that never expires"
+        );
+    }
+
+    #[test]
+    fn expiry_dates_say_whether_they_are_past() {
+        assert_eq!(expiry_text(None), None);
+        assert_eq!(expiry_text(Some(0)).unwrap(), "expired Jan 1, 1970");
+        let later = chrono::Utc::now().timestamp() + 86_400 * 400;
+        assert!(expiry_text(Some(later)).unwrap().starts_with("expires "));
+        assert_eq!(KeyExpiry::Never.lasts(), None);
+        assert_eq!(KeyExpiry::Years(1).label(), "1 year");
+        assert_eq!(KeyExpiry::Years(5).label(), "5 years");
     }
 }

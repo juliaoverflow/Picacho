@@ -19,9 +19,13 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
+pub mod keys;
 mod autocrypt;
 mod legacy_display;
+mod nested;
 mod protected;
+mod signers;
+mod v6;
 pub use autocrypt::{Peer, Recommendation, key_fingerprint, peer_preference_key};
 
 /// The keychain entry holding the keyring.
@@ -73,6 +77,9 @@ pub struct KeyInfo {
     pub found: bool,
     /// A found key you compared and marked as checked.
     pub verified: bool,
+    /// When the key expires (or expired), as seconds since 1970; `None`
+    /// when it never does (see `keys::expires`).
+    pub expires: Option<i64>,
 }
 
 /// What a message's OpenPGP protection turned out to be when read.
@@ -225,6 +232,7 @@ impl Keyring {
                     secret: true,
                     found: false,
                     verified: true,
+                    expires: keys::expires(&public),
                 }
             })
             .collect();
@@ -235,6 +243,7 @@ impl Keyring {
         {
             let fp = fingerprint(&k);
             out.push(KeyInfo {
+                expires: keys::expires(&k),
                 found: self.found.contains(&fp),
                 verified: !self.found.contains(&fp) || self.checked(&fp),
                 fingerprint: fp,
@@ -670,18 +679,6 @@ fn primary_expired(key: &SignedPublicKey) -> bool {
     newest.is_some_and(|s| past(key.primary_key.created_at().as_secs(), s.key_expiration_time()))
 }
 
-/// The keys a signature may be checked against (see `unrevoked`).
-fn verifiers(public: &[SignedPublicKey]) -> Vec<(&SignedPublicKey, &dyn pgp::types::VerifyingKey)> {
-    let mut out: Vec<(&SignedPublicKey, &dyn pgp::types::VerifyingKey)> = Vec::new();
-    for key in unrevoked(public) {
-        out.push((key, &key.primary_key));
-        for sub in usable_subkeys(key) {
-            out.push((key, &sub.key));
-        }
-    }
-    out
-}
-
 /// The verdict for a good signature by `key` on a message from `from`
 /// (its From address): Good when the key is for that address, else
 /// OtherSender. Without a From to compare (none given), Good.
@@ -708,45 +705,32 @@ fn signer_name(key: &SignedPublicKey) -> String {
         .unwrap_or_else(|| fingerprint(key))
 }
 
-/// Checks a detached signature over `content` against your keyring.
+/// Checks a detached signature over `content` against your keyring, with
+/// the key it names (see `signers`).
 fn check(signature: &str, content: &[u8], keys: &[SignedPublicKey], from: Option<&str>) -> Signature {
     let Ok((signature, _)) = DetachedSignature::from_string(signature) else {
         return Signature::Bad;
     };
-    let issuers: Vec<pgp::types::KeyId> = signature
-        .signature
-        .issuer_key_id()
-        .into_iter()
-        .cloned()
-        .collect();
-    let mut known = false;
-    // Only keys still good (see `unrevoked`): one revoked is unknown, not a
-    // failure, as what it signed may well predate the revocation.
-    for key in unrevoked(keys) {
-        let primary = &key.primary_key;
-        if signature.signature.verify(primary, content).is_ok() {
-            return good_from(key, from);
-        }
-        known |= issuers.contains(&primary.legacy_key_id());
-        for sub in usable_subkeys(key) {
-            if signature.signature.verify(&sub.key, content).is_ok() {
-                return good_from(key, from);
-            }
-            known |= issuers.contains(&sub.key.legacy_key_id());
-        }
-    }
-    if known {
-        Signature::Bad
-    } else {
-        Signature::UnknownKey
-    }
+    let signature = signature.signature;
+    signers::verdict(&signature, keys, from, |v| v.verifies(&signature, content))
 }
 
 /// Opens a PGP/MIME message with your keys: decrypts it (and checks a
-/// signature inside), or checks a multipart/signed one. Returns the
-/// readable message, with its outer headers, and what was found; `None`
-/// when the message has no OpenPGP protection, or can't be decrypted.
+/// signature inside), or checks a multipart/signed one, layer by layer
+/// where one is inside another (see `nested`). Returns the readable
+/// message, with its outer headers, and what was found; `None` when the
+/// message has no OpenPGP protection, can't be decrypted, or has more
+/// layers than `nested::MAX_NESTING`.
 pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
+    nested::open_layers(raw, ring, &mut 0)
+}
+
+/// One PGP/MIME layer of `open`: the OpenPGP message inside it unwrapped
+/// whole (RFC 9580 §10.3.1), `depth` counting the layers on the way.
+fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
+    if !nested::descend(depth) {
+        return None;
+    }
     // A signature counts as the sender's only from a key for the address
     // the message is from (see `good_from`).
     let from = from_address(raw);
@@ -756,15 +740,8 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             return None;
         }
         let (message, _) = Message::from_string(&armored).ok()?;
-        let passwords: Vec<Password> = secret.iter().map(|_| Password::empty()).collect();
-        let mut opened = message
-            .decrypt_with_keys(passwords.iter().collect(), secret.iter().collect())
-            .ok()?;
-        if opened.is_compressed() {
-            opened = opened.decompress().ok()?;
-        }
+        let mut opened = nested::unwrap_message(message, &secret, depth)?;
         let public = ring.public_keys();
-        let signed_inline = opened.is_signed();
         // The signature is checked once the data has been read. Read up to
         // what a message may be: compressed data a few kilobytes long can
         // inflate to gigabytes, and was read whole.
@@ -778,26 +755,21 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             }
             inner
         };
-        let mut signature = Signature::None;
-        // The keys whose signature checked out, for RFC 9788 §4.4.1.2.
-        let mut signers: Vec<&SignedPublicKey> = Vec::new();
-        if signed_inline {
-            signature = Signature::UnknownKey;
-            for (key, verifier) in verifiers(&public) {
-                if opened.verify(verifier).is_ok() {
-                    if signers.is_empty() {
-                        signature = good_from(key, from.as_deref());
-                    }
-                    signers.push(key);
-                }
-            }
-        }
+        // Every signed layer's signatures, each checked against the key it
+        // names (see `nested::message_signature`); and, for RFC 9788
+        // §4.4.1.2, the keys whose signature checked out.
+        let mut signature = nested::message_signature(&opened, &public, from.as_deref());
+        let signers = nested::message_signers(&opened, &public);
         let outer = from_latin1(&outer);
         let mut full = outer.clone();
         full.extend_from_slice(&inner);
         // A multipart/signed message inside the encryption (sign, then encrypt).
         if let Some((content, sig)) = signed_parts(&full) {
-            signature = check(&sig, &content, &public, from.as_deref());
+            signature = nested::combine(
+                Verdict { decrypted: true, signature, ..Default::default() },
+                Verdict { decrypted: true, signature: check(&sig, &content, &public, from.as_deref()), ..Default::default() },
+            )
+            .signature;
             let from_mismatch =
                 protected::from_mismatch(&outer, &content, |a| signed_by_key_for(&sig, &content, &public, a));
             // RFC 9788 §4.5: the Cryptographic Payload is the signed part,
@@ -838,7 +810,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             ))
         }
         // Not PGP/MIME: inline PGP, or PGP/MIME a list wrapped in a part.
-        None => open_inline(raw, ring, from.as_deref()).or_else(|| open_nested(raw, ring)),
+        None => open_inline(raw, ring, from.as_deref(), depth).or_else(|| open_nested(raw, ring, depth)),
     }
 }
 
@@ -875,7 +847,7 @@ fn shown_payload(payload: &[u8]) -> Vec<u8> {
 /// Inline PGP (RFC 4880 §7, the old way): a plain-text body that is a
 /// cleartext-signed message or an armored encrypted one. The readable
 /// message is its headers with the text as a plain UTF-8 body.
-fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8>, Verdict)> {
+fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
     let parsed = mailparse::parse_mail(raw).ok()?;
     let text_part = if parsed.subparts.is_empty() {
         &parsed
@@ -900,16 +872,18 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
         let (message, _) = CleartextSignedMessage::from_string(&body[start..end]).ok()?;
         let public = ring.public_keys();
         let signed = message.signed_text();
-        let mut signature = Signature::UnknownKey;
-        'keys: for key in unrevoked(&public) {
-            for sig in message.signatures() {
-                let by_sub = usable_subkeys(key).any(|sub| sig.verify(&sub.key, signed.as_bytes()).is_ok());
-                if by_sub || sig.verify(&key.primary_key, signed.as_bytes()).is_ok() {
-                    signature = good_from(key, from);
-                    break 'keys;
-                }
-            }
-        }
+        // Good when one of its signatures is good, else what the first says.
+        let verdicts: Vec<Signature> = message
+            .signatures()
+            .iter()
+            .map(|sig| signers::verdict(sig, &public, from, |v| v.verifies(sig, signed.as_bytes())))
+            .collect();
+        let signature = verdicts
+            .iter()
+            .find(|s| matches!(s, Signature::Good(_) | Signature::OtherSender(_)))
+            .or(verdicts.first())
+            .cloned()
+            .unwrap_or(Signature::UnknownKey);
         // Text around the signed block isn't covered by it: left out.
         return Some((
             readable(&signed),
@@ -927,14 +901,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
             return None;
         }
         let (message, _) = Message::from_string(&body[start..end]).ok()?;
-        let passwords: Vec<Password> = secret.iter().map(|_| Password::empty()).collect();
-        let mut opened = message
-            .decrypt_with_keys(passwords.iter().collect(), secret.iter().collect())
-            .ok()?;
-        if opened.is_compressed() {
-            opened = opened.decompress().ok()?;
-        }
-        let signed = opened.is_signed();
+        let mut opened = nested::unwrap_message(message, &secret, depth)?;
         let inner = {
             use std::io::Read as _;
             let limit = crate::manage::store::MAX_SOURCE;
@@ -945,17 +912,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
             }
             inner
         };
-        let mut signature = Signature::None;
-        if signed {
-            signature = Signature::UnknownKey;
-            let public = ring.public_keys();
-            for (key, verifier) in verifiers(&public) {
-                if opened.verify(verifier).is_ok() {
-                    signature = good_from(key, from);
-                    break;
-                }
-            }
-        }
+        let signature = nested::message_signature(&opened, &ring.public_keys(), from);
         return Some((
             readable(&String::from_utf8_lossy(&inner)),
             Verdict {
@@ -971,7 +928,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
 /// PGP/MIME one level down: a mailing list's multipart/mixed wrapping the
 /// signed or encrypted message with its footer. The message is opened as
 /// its own; the footer, not covered by the signature, is left out.
-fn open_nested(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
+fn open_nested(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
     let parsed = mailparse::parse_mail(raw).ok()?;
     if !parsed.ctype.mimetype.eq_ignore_ascii_case("multipart/mixed") {
         return None;
@@ -986,7 +943,7 @@ fn open_nested(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
     let mut inner = outer_headers(raw);
     inner.truncate(inner.len().saturating_sub(b"MIME-Version: 1.0\r\n".len()));
     inner.extend_from_slice(part);
-    open(&inner, ring)
+    nested::open_layers(&inner, ring, depth)
 }
 
 // --- Sending -----------------------------------------------------------------
@@ -1247,9 +1204,9 @@ fn encryption_subkey(key: &SignedPublicKey) -> Option<&pgp::composed::SignedPubl
 
 /// A new key of yours for `name <email>`, as GnuPG makes them (Ed25519
 /// certifying primary, Ed25519 signing and Curve25519 encryption subkeys;
-/// version 4, which every OpenPGP app reads). It doesn't expire: the
-/// library makes keys without an end date.
-pub fn generate_key(name: &str, email: &str) -> Result<SignedSecretKey> {
+/// version 4, which every OpenPGP app reads). It expires `lasts` from now
+/// (RFC 9580 §5.2.3.13, see `keys::set_expiry`), or never with `None`.
+pub fn generate_key(name: &str, email: &str, lasts: Option<std::time::Duration>) -> Result<SignedSecretKey> {
     use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
     use pgp::crypto::ecc_curve::ECCCurve;
     ensure!(email.contains('@'), "Enter the address the key is for.");
@@ -1282,11 +1239,12 @@ pub fn generate_key(name: &str, email: &str) -> Result<SignedSecretKey> {
             sign.build().context("The key couldn't be made.")?,
             encrypt.build().context("The key couldn't be made.")?,
         ]);
-    params
+    let key = params
         .build()
         .context("The key couldn't be made.")?
         .generate(rand08::thread_rng())
-        .context("The key couldn't be made.")
+        .context("The key couldn't be made.")?;
+    keys::expiring(key, lasts)
 }
 /// The armored, password-encrypted key an Autocrypt Setup Message
 /// carries (Autocrypt 1.1 §4.4: a message with `Autocrypt-Setup-Message:
@@ -1340,10 +1298,10 @@ impl Keyring {
         }
         self.import(&text, "")
     }
-    /// Makes a new key of yours for `email` and keeps it (see
-    /// `generate_key`). Returns its fingerprint.
-    pub fn create(&mut self, name: &str, email: &str) -> Result<String> {
-        let key = generate_key(name, email)?;
+    /// Makes a new key of yours for `email`, expiring `lasts` from now or
+    /// never, and keeps it (see `generate_key`). Returns its fingerprint.
+    pub fn create(&mut self, name: &str, email: &str, lasts: Option<std::time::Duration>) -> Result<String> {
+        let key = generate_key(name, email, lasts)?;
         let fp = fingerprint(&SignedPublicKey::from(key.clone()));
         self.secret.push(key.to_armored_string(ArmorOptions::default())?);
         Ok(fp)
