@@ -101,6 +101,8 @@ struct Server {
     quota_state: u64,
     /// Blob/get answers with a digest that doesn't match.
     bad_digest: bool,
+    /// Calendar/set shareWith and Principal/set patches, as sent.
+    shared_with: Vec<Value>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -140,6 +142,7 @@ impl Server {
                 "urn:ietf:params:jmap:contacts": {},
                 "urn:ietf:params:jmap:mdn": {},
                 "urn:ietf:params:jmap:blob": {},
+                "urn:ietf:params:jmap:principals": {},
             },
             "accounts": {
                 "u1": { "name": "qa@example.com", "isPersonal": true, "accountCapabilities": account },
@@ -150,6 +153,7 @@ impl Server {
                 "urn:ietf:params:jmap:mail": "u1",
                 "urn:ietf:params:jmap:calendars": "u1",
                 "urn:ietf:params:jmap:contacts": "u1",
+                "urn:ietf:params:jmap:principals": "u1",
             },
             "username": "qa@example.com",
             "apiUrl": format!("{base}/api"),
@@ -617,6 +621,51 @@ impl Server {
                     self.events.retain(|e| e["id"] != *id);
                 }
                 vec![(name.into(), out)]
+            }
+            "Calendar/changes" | "AddressBook/changes" | "ShareNotification/changes" => vec![(
+                name.into(),
+                json!({ "oldState": args["sinceState"], "newState": "c2", "hasMoreChanges": false,
+                        "created": ["c9"], "updated": [], "destroyed": ["c1"] }),
+            )],
+            "CalendarEvent/queryChanges" | "ContactCard/queryChanges" => vec![(
+                name.into(),
+                json!({ "oldQueryState": args["sinceQueryState"], "newQueryState": "q2", "total": 1,
+                        "removed": ["E0"], "added": [{ "id": "E9", "index": 0 }] }),
+            )],
+            "CalendarEvent/copy" | "ContactCard/copy" => {
+                assert_eq!(args["fromAccountId"], "u2");
+                let created: serde_json::Map<String, Value> = args["create"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|k| (k.clone(), json!({ "id": format!("copy-{k}") })))
+                    .collect();
+                vec![(name.into(), json!({ "created": created }))]
+            }
+            "CalendarEvent/parse" => {
+                let parsed: serde_json::Map<String, Value> = args["blobIds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| (b.as_str().unwrap().to_owned(), json!([{ "@type": "Event", "uid": "p@x", "title": "Parsed",
+                        "start": "2026-12-01T09:00:00", "timeZone": "Etc/UTC", "duration": "PT30M" }])))
+                    .collect();
+                vec![(name.into(), json!({ "parsed": parsed, "notParsable": [], "notFound": [] }))]
+            }
+            "Calendar/set" if args["update"].as_object().is_some_and(|u| u.values().any(|p| p.get("shareWith").is_some())) => {
+                self.shared_with.push(args["update"].clone());
+                let updated: serde_json::Map<String, Value> =
+                    args["update"].as_object().unwrap().keys().map(|k| (k.clone(), Value::Null)).collect();
+                vec![(name.into(), json!({ "updated": updated }))]
+            }
+            "Principal/get" => vec![(
+                name.into(),
+                json!({ "list": [{ "id": "P1", "type": "individual", "name": "Bo Lindqvist", "email": "bo@example.se",
+                                   "accounts": { "u2": {} } }], "state": "p1" }),
+            )],
+            "Principal/set" => {
+                self.shared_with.push(args["update"].clone());
+                vec![(name.into(), json!({ "updated": { "P1": null } }))]
             }
             "AddressBook/get" => vec![(
                 name.into(),
@@ -2780,5 +2829,53 @@ fn jmap_blob_digests_lookup_and_limits() -> Result<()> {
         assert!(!server.lock().unwrap().calls[before..].contains(&"Blob/upload".to_owned()));
         Ok(())
     })?;
+    Ok(())
+}
+
+/// Calendars and contacts over JMAP beyond events and cards: the lists'
+/// own /changes, /queryChanges, copies from a shared account,
+/// CalendarEvent/parse, account limits, sharing, and the directory of
+/// people (RFC 9670).
+#[test]
+fn jmap_calendars_and_contacts_changes_copy_parse_and_sharing() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    use crate::sync::jscal;
+    b.with_jmap(&a, |s| {
+        let c = jscal::collection_changes(s, "Calendar", "c1")?.unwrap();
+        assert_eq!((c.changed, c.destroyed, c.state), (vec!["c9".to_owned()], vec!["c1".to_owned()], "c2".to_owned()));
+        assert!(jscal::collection_changes(s, "AddressBook", "b1")?.is_some());
+        assert!(jscal::collection_changes(s, "ShareNotification", "n1")?.is_some());
+        // A server without ParticipantIdentity/changes: read again.
+        assert!(jscal::collection_changes(s, "ParticipantIdentity", "x")?.is_none());
+        let q = jscal::query_changes(s, "CalendarEvent", json!({}), "q1")?.unwrap();
+        assert_eq!((q.removed, q.added), (vec!["E0".to_owned()], vec![("E9".to_owned(), 0)]));
+        let copied = jscal::copy_from(s, "ContactCard", "u2", &["K5".to_owned()], "b1")?;
+        assert_eq!(copied["K5"], "copy-K5");
+        let parsed = jscal::parse_events(s, &["ics1".to_owned()])?;
+        assert_eq!(parsed["ics1"][0].summary, "Parsed");
+        let mut with = serde_json::Map::new();
+        with.insert("P1".into(), json!({ "mayReadItems": true, "mayWriteAll": false }));
+        jscal::share_with(s, "Calendar", "c1", &with)?;
+        let people = jscal::principals(s, None)?;
+        assert_eq!((people[0].name.as_str(), people[0].email.as_str()), ("Bo Lindqvist", "bo@example.se"));
+        assert_eq!(people[0].accounts, ["u2"]);
+        let mut patch = serde_json::Map::new();
+        patch.insert("description".into(), json!("On leave in December"));
+        jscal::update_principal(s, "P1", &patch)?;
+        Ok(())
+    })?;
+    let shared = server.lock().unwrap().shared_with.clone();
+    assert_eq!(shared[0]["c1"]["shareWith"]["P1"]["mayReadItems"], true);
+    assert_eq!(shared[1]["P1"]["description"], "On leave in December");
+    let limits = jscal::collection_limits(&json!({ "maxCalendarsPerEvent": 1, "mayCreateCalendar": false }), "Calendar");
+    assert_eq!(limits, jscal::CollectionLimits { max_per_item: Some(1), may_create: false });
+    assert_eq!(jscal::collection_limits(&json!({}), "AddressBook"), jscal::CollectionLimits { max_per_item: None, may_create: true });
     Ok(())
 }

@@ -170,12 +170,225 @@ pub fn calendars(s: &Session) -> Result<Vec<JmapCalendar>> {
                 id: c["id"].as_str()?.to_owned(),
                 name: c["name"].as_str().unwrap_or("Calendar").to_owned(),
                 color: c["color"].as_str().unwrap_or_default().to_owned(),
-                // Without rights listed, assume it can be written.
-                writable: c["myRights"]["mayWriteAll"].as_bool().unwrap_or(true)
-                    || c["myRights"]["mayWriteOwn"].as_bool().unwrap_or(false),
+                // Without rights listed, assume it can be written; with
+                // them, as they say.
+                writable: if c["myRights"].is_object() {
+                    c["myRights"]["mayWriteAll"].as_bool().unwrap_or(false)
+                        || c["myRights"]["mayWriteOwn"].as_bool().unwrap_or(false)
+                } else {
+                    true
+                },
             })
         })
         .collect())
+}
+
+/// The calendars and the address books changed since `since`
+/// (`Calendar/changes`, `AddressBook/changes`, RFC 8620 §5.2): what to
+/// read again, and what is gone. `None` where the server can't say.
+// Backend-only until the UI calls it: following calendar and address-book
+// lists by /changes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn collection_changes(s: &Session, kind: &str, since: &str) -> Result<Option<Changed>> {
+    let account = match kind {
+        "Calendar" | "ParticipantIdentity" | "CalendarEventNotification" => s.calendars_account(),
+        "AddressBook" => s.contacts_account(),
+        "Principal" | "ShareNotification" => s.principals_account(),
+        _ => bail!("Not a kind with /changes here: {kind}"),
+    }
+    .context("This JMAP server doesn't keep those.")?
+    .to_owned();
+    changes(s, &format!("{kind}/changes"), &account, since)
+}
+
+/// What changed in a /query's results since `since` (`Foo/queryChanges`,
+/// RFC 8620 §5.6) for calendars' events or contact cards; `None` where the
+/// server can't say.
+// Backend-only until the UI calls it: following event and card queries by
+// /queryChanges.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn query_changes(s: &Session, kind: &str, filter: Value, since: &str) -> Result<Option<crate::sync::jmap::QueryChanges>> {
+    let account = match kind {
+        "CalendarEvent" => s.calendars_account(),
+        "ContactCard" => s.contacts_account(),
+        _ => bail!("Not a kind with /queryChanges here: {kind}"),
+    }
+    .context("This JMAP server doesn't keep those.")?
+    .to_owned();
+    let v = match s.call_one(
+        &format!("{kind}/queryChanges"),
+        json!({ "accountId": account, "filter": filter, "sinceQueryState": since }),
+    ) {
+        Ok(v) => v,
+        Err(e) if crate::sync::jmap::must_resync(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let ids = |k: &str| -> Vec<String> {
+        v[k].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect()
+    };
+    Ok(Some(crate::sync::jmap::QueryChanges {
+        removed: ids("removed"),
+        added: v["added"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| Some((a["id"].as_str()?.to_owned(), a["index"].as_u64()? as usize)))
+            .collect(),
+        total: v["total"].as_u64().map(|n| n as usize),
+        new_state: v["newQueryState"].as_str().unwrap_or_default().to_owned(),
+    }))
+}
+
+/// Copies events or cards from another account this sign-in reaches into
+/// its own (`CalendarEvent/copy`, `ContactCard/copy`, RFC 8620 §5.4), into
+/// `into` (a calendar or address book id): the new ids, by old id.
+// Backend-only until the UI calls it: copying events and cards between
+// accounts.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn copy_from(s: &Session, kind: &str, from_account: &str, ids: &[String], into: &str) -> Result<std::collections::HashMap<String, String>> {
+    let (account, key) = match kind {
+        "CalendarEvent" => (s.calendars_account(), "calendarIds"),
+        "ContactCard" => (s.contacts_account(), "addressBookIds"),
+        _ => bail!("Not a kind with /copy here: {kind}"),
+    };
+    let account = account.context("This JMAP server doesn't keep those.")?.to_owned();
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(s.max_set()) {
+        let create: Map<String, Value> = chunk
+            .iter()
+            .map(|id| (id.clone(), json!({ "id": id, key: { into: true } })))
+            .collect();
+        let mut args = json!({ "fromAccountId": from_account, "accountId": account, "create": create });
+        if kind == "CalendarEvent" {
+            args["sendSchedulingMessages"] = json!(false);
+        }
+        let v = s.call_one(&format!("{kind}/copy"), args)?;
+        if let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next()) {
+            bail!("The server didn't copy {id}: {}", e["type"].as_str().unwrap_or("refused"));
+        }
+        out.extend(
+            v["created"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, c)| Some((k.clone(), c["id"].as_str()?.to_owned()))),
+        );
+    }
+    Ok(out)
+}
+
+/// Reads iCalendar data kept as blobs as events (CalendarEvent/parse, JMAP
+/// for Calendars): the server's reading, by blob id, of each it can read.
+// Backend-only until the UI calls it: reading an attached .ics on the
+// server.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_events(s: &Session, blobs: &[String]) -> Result<std::collections::HashMap<String, Vec<ical::Event>>> {
+    let account = s.calendars_account().context("This JMAP server has no calendars.")?.to_owned();
+    let v = s.call_one("CalendarEvent/parse", json!({ "accountId": account, "blobIds": blobs }))?;
+    Ok(v["parsed"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(blob, events)| {
+            // A blob may hold one event or several.
+            let list: Vec<ical::Event> = match events {
+                Value::Array(a) => a.iter().filter_map(from_jscalendar).collect(),
+                one => from_jscalendar(one).into_iter().collect(),
+            };
+            (blob.clone(), list)
+        })
+        .collect())
+}
+
+/// A calendars or contacts account's limits (JMAP for Calendars and RFC
+/// 9610 §1.3): how many calendars or books an event or card may be in, and
+/// whether new ones may be made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectionLimits {
+    pub max_per_item: Option<usize>,
+    pub may_create: bool,
+}
+/// The limits of the sign-in's calendars (`Calendar`) or contacts
+/// (`AddressBook`) account, from the session.
+// Backend-only until the UI calls it: calendars' and contacts' account
+// limits.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn collection_limits(caps: &Value, kind: &str) -> CollectionLimits {
+    let (per, create) = match kind {
+        "Calendar" => ("maxCalendarsPerEvent", "mayCreateCalendar"),
+        _ => ("maxAddressBooksPerCard", "mayCreateAddressBook"),
+    };
+    CollectionLimits {
+        max_per_item: caps[per].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0),
+        may_create: caps[create].as_bool().unwrap_or(true),
+    }
+}
+
+/// Who a calendar or address book is shared with, and what each may do
+/// (`shareWith`, RFC 9670 §3): by principal id, the rights given.
+// Backend-only until the UI calls it: sharing a calendar or address book.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn share_with(s: &Session, kind: &str, id: &str, with: &Map<String, Value>) -> Result<()> {
+    let account = match kind {
+        "Calendar" => s.calendars_account(),
+        "AddressBook" => s.contacts_account(),
+        _ => bail!("Only calendars and address books are shared this way."),
+    }
+    .context("This JMAP server doesn't keep those.")?
+    .to_owned();
+    let v = s.call_one(
+        &format!("{kind}/set"),
+        json!({ "accountId": account, "update": { id: { "shareWith": with } } }),
+    )?;
+    if let Some(e) = v["notUpdated"].get(id) {
+        bail!("The server didn't share it: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+    }
+    Ok(())
+}
+
+/// A principal in the server's directory (RFC 9670 §2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Principal {
+    pub id: String,
+    /// `individual`, `group`, `resource`, `location` or `other`.
+    pub kind: String,
+    pub name: String,
+    pub email: String,
+    /// The accounts it has that the sign-in may reach, by id.
+    pub accounts: Vec<String>,
+}
+/// Principals by id (Principal/get, RFC 9670 §2.1), or all (`None`).
+// Backend-only until the UI calls it: the directory of people.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn principals(s: &Session, ids: Option<&[String]>) -> Result<Vec<Principal>> {
+    let account = s.principals_account().context("This JMAP server has no directory of people.")?.to_owned();
+    let v = s.call_one("Principal/get", json!({ "accountId": account, "ids": ids }))?;
+    Ok(v["list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some(Principal {
+                id: p["id"].as_str()?.to_owned(),
+                kind: p["type"].as_str().unwrap_or("individual").to_owned(),
+                name: p["name"].as_str().unwrap_or_default().to_owned(),
+                email: p["email"].as_str().unwrap_or_default().to_owned(),
+                accounts: p["accounts"].as_object().into_iter().flatten().map(|(k, _)| k.clone()).collect(),
+            })
+        })
+        .collect())
+}
+/// Changes the sign-in's own principal: its name and description (RFC
+/// 9670 §2.3; the server decides what else may change).
+// Backend-only until the UI calls it: editing one's own directory entry.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn update_principal(s: &Session, id: &str, patch: &Map<String, Value>) -> Result<()> {
+    let account = s.principals_account().context("This JMAP server has no directory of people.")?.to_owned();
+    let v = s.call_one("Principal/set", json!({ "accountId": account, "update": { id: patch } }))?;
+    if let Some(e) = v["notUpdated"].get(id) {
+        bail!("The server didn't change it: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+    }
+    Ok(())
 }
 
 /// An event as kept here, with where it is on the JMAP server.
