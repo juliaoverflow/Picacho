@@ -1825,7 +1825,10 @@ impl Session {
                         "emailId": "#m",
                         "envelope": { "mailFrom": mail_from, "rcptTo": rcpt_to },
                     } },
-                    "onSuccessUpdateEmail": { "#s": after },
+                    // RFC 8621 §7.5: once sent, the copy is filed in Sent,
+                    // or (`keep_no_copy`) removed.
+                    "onSuccessUpdateEmail": if options.keep_no_copy { Value::Null } else { json!({ "#s": after }) },
+                    "onSuccessDestroyEmail": if options.keep_no_copy { json!(["#s"]) } else { Value::Null },
                 }),
             ),
         ])?;
@@ -1929,9 +1932,18 @@ impl Session {
             })
             .collect();
         delivery.sort();
+        let mut displayed: Vec<String> = s["deliveryStatus"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, d)| d["displayed"] == "yes")
+            .map(|(to, _)| to.clone())
+            .collect();
+        displayed.sort();
         Ok(Some(SubmissionStatus {
             undo: s["undoStatus"].as_str().unwrap_or("final").to_owned(),
             delivery,
+            displayed,
         }))
     }
     /// The submissions changed since `since` (ids), and the new state, for
@@ -1970,6 +1982,52 @@ impl Session {
             .flatten()
             .filter_map(|i| i.as_str().map(str::to_owned))
             .collect())
+    }
+    /// What changed among the submissions not yet final since
+    /// `since_query_state` (EmailSubmission/queryChanges, RFC 8620 §5.6);
+    /// `None` where the server can't say, and they are listed again.
+    // Backend-only until the UI calls it: following held submissions by
+    // EmailSubmission/queryChanges.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn pending_submission_changes(&self, since_query_state: &str) -> Result<Option<QueryChanges>> {
+        let v = match self.one(
+            "EmailSubmission/queryChanges",
+            json!({
+                "accountId": self.account_id,
+                "filter": { "undoStatus": "pending" },
+                "sort": [{ "property": "sendAt", "isAscending": false }],
+                "sinceQueryState": since_query_state,
+            }),
+        ) {
+            Ok(v) => v,
+            Err(e) if must_resync(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(read_query_changes(&v)))
+    }
+    /// Removes the server's record of submissions (EmailSubmission/set
+    /// destroy, RFC 8621 §7.5): those `final` or `canceled`, whose
+    /// record is no longer needed. Their messages stay.
+    // Backend-only until the UI calls it: forgetting finished submissions
+    // (EmailSubmission/set destroy).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn forget_submissions(&self, ids: &[String]) -> Result<()> {
+        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        for chunk in ids.chunks(self.max_set()) {
+            let v = self.one(
+                "EmailSubmission/set",
+                json!({ "accountId": self.account_id, "destroy": chunk }),
+            )?;
+            let failed: Vec<String> = v["notDestroyed"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, e)| e["type"] != "notFound")
+                .map(|(id, e)| format!("{id}: {}", set_error(e)))
+                .collect();
+            ensure!(failed.is_empty(), "The server kept its record of sending: {}", failed.join("; "));
+        }
+        Ok(())
     }
     /// Takes back a submission the server still holds (`undoStatus`
     /// `pending`: held for later with HOLDUNTIL, or in the server's own
@@ -3066,6 +3124,10 @@ pub struct SendOptions {
     /// Held at the server and sent then (FUTURERELEASE `HOLDUNTIL`), a
     /// Unix time.
     pub hold_until: Option<i64>,
+    /// No copy is kept: the message is removed once sent (RFC 8621 §7.5:
+    /// `onSuccessDestroyEmail`), rather than filed in Sent. Backend-only
+    /// until the UI calls it: no setting asks for this yet.
+    pub keep_no_copy: bool,
 }
 
 /// A submission the server took.
@@ -3087,6 +3149,9 @@ pub struct SubmissionStatus {
     /// Each recipient's delivery: (address, `queued`/`yes`/`no`/`unknown`,
     /// the server's last SMTP reply).
     pub delivery: Vec<(String, String, String)>,
+    /// The recipients whose read receipt says they displayed it (RFC 8621
+    /// §7: `deliveryStatus`'s `displayed`, `yes`).
+    pub displayed: Vec<String>,
 }
 
 /// A sending identity (RFC 8621 §6) as it can be changed.

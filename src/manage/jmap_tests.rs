@@ -635,10 +635,32 @@ impl Server {
                         let undo = self.undo.get(id)?;
                         Some(json!({ "id": id, "emailId": "M1", "undoStatus": undo,
                                      "sendAt": "2026-12-01T09:00:00Z",
-                                     "deliveryStatus": { "bo@example.se": { "delivered": "queued", "smtpReply": "250 OK" } } }))
+                                     "deliveryStatus": {
+                                         "bo@example.se": { "delivered": "queued", "smtpReply": "250 OK", "displayed": "unknown" },
+                                         "cy@example.net": { "delivered": "yes", "smtpReply": "250 OK", "displayed": "yes" },
+                                     } }))
                     })
                     .collect();
                 vec![(name.into(), json!({ "list": list, "state": "sub" }))]
+            }
+            "EmailSubmission/set" if args.get("destroy").is_some() => {
+                let mut out = json!({ "destroyed": [] });
+                for id in args["destroy"].as_array().unwrap() {
+                    let id = id.as_str().unwrap();
+                    match self.undo.get(id).map(String::as_str) {
+                        Some("pending") => out["notDestroyed"][id] = json!({ "type": "forbidden" }),
+                        Some(_) => {
+                            self.undo.remove(id);
+                            out["destroyed"].as_array_mut().unwrap().push(json!(id));
+                        }
+                        None => out["notDestroyed"][id] = json!({ "type": "notFound" }),
+                    }
+                }
+                vec![(name.into(), out)]
+            }
+            "EmailSubmission/queryChanges" => {
+                vec![(name.into(), json!({ "oldQueryState": args["sinceQueryState"], "newQueryState": "sq2",
+                    "removed": ["held0"], "added": [{ "id": "held9", "index": 0 }] }))]
             }
             "EmailSubmission/set" if args.get("update").is_some() => {
                 let mut out = json!({ "updated": {} });
@@ -684,10 +706,15 @@ impl Server {
                     name.to_owned(),
                     json!({ "created": { "s": { "id": "sub1" } } }),
                 )];
-                // onSuccessUpdateEmail runs as an implicit Email/set.
+                // onSuccessUpdateEmail and onSuccessDestroyEmail run as an
+                // implicit Email/set.
                 if let Some(patch) = args["onSuccessUpdateEmail"]["#s"].as_object() {
-                    let update = json!({ "update": { email_id: patch } });
+                    let update = json!({ "update": { email_id.clone(): patch } });
                     out.extend(self.method("Email/set", &update, earlier));
+                }
+                if args["onSuccessDestroyEmail"] == json!(["#s"]) {
+                    let destroy = json!({ "destroy": [email_id] });
+                    out.extend(self.method("Email/set", &destroy, earlier));
                 }
                 out
             }
@@ -1838,6 +1865,20 @@ fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
     let status = b.submission_status(&a, "held1")?.unwrap();
     assert_eq!(status.undo, "canceled");
     assert_eq!(status.delivery[0].1, "queued");
+    // RFC 8621 §7: a read receipt's `displayed`.
+    assert_eq!(status.displayed, ["cy@example.net"]);
+    // Its record goes once no longer needed; a pending one stays.
+    b.with_jmap(&a, |s| s.forget_submissions(&["held1".to_owned()]))?;
+    assert!(!server.lock().unwrap().undo.contains_key("held1"));
+    server.lock().unwrap().undo.insert("held2".into(), "pending".into());
+    assert!(b.with_jmap(&a, |s| s.forget_submissions(&["held2".to_owned()])).is_err());
+    let changes = b.with_jmap(&a, |s| s.pending_submission_changes("sq1"))?.unwrap();
+    assert_eq!((changes.removed, changes.added), (vec!["held0".to_owned()], vec![("held9".to_owned(), 0)]));
+    // Sent without keeping a copy: the message is gone once sent.
+    let before = server.lock().unwrap().emails.len();
+    let options = crate::sync::jmap::SendOptions { keep_no_copy: true, ..Default::default() };
+    b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &options)?;
+    assert_eq!(server.lock().unwrap().emails.len(), before);
     Ok(())
 }
 
