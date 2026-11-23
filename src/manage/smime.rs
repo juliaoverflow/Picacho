@@ -8,6 +8,9 @@
 //! authorities; one that checks out, but by a certificate they don't vouch
 //! for, is shown as such rather than as good.
 use crate::manage::store;
+// Used by per-signer verification, which follows in the next commit.
+#[allow(dead_code)]
+mod der;
 use anyhow::{Context, Result, bail, ensure};
 use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
 use openssl::pkey::{PKey, Private};
