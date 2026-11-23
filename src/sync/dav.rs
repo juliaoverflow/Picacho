@@ -245,6 +245,10 @@ pub fn read_collection(
     })
 }
 
+/// The most changes a sync-collection answer is asked to hold (RFC 6578
+/// §3.7), so a collection with many doesn't come in one huge answer.
+const SYNC_LIMIT: u32 = 1000;
+
 /// Seconds from a Retry-After header (seconds, or an HTTP date), at most a
 /// day; a minute where it is missing or unreadable.
 pub fn retry_after(value: Option<&str>, now: i64) -> u64 {
@@ -266,17 +270,55 @@ pub struct Client {
     password: String,
 }
 
+/// The namespace an element Picacho reads belongs in (RFC 4918 §14,
+/// RFC 4791 §9, RFC 6352 §10, RFC 6578 §6, RFC 6638 §9, RFC 4331 §3,
+/// RFC 5397 §3): a `calendar-data` or `href` in some other namespace is
+/// another vocabulary's and isn't read as this one's. `None` for names
+/// from vendor namespaces (Apple's colour, CalendarServer's ctag), which
+/// servers write in more than one.
+fn namespace_of(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "multistatus" | "response" | "href" | "propstat" | "prop" | "status" | "resourcetype"
+        | "collection" | "displayname" | "getetag" | "sync-token" | "current-user-principal"
+        | "current-user-privilege-set" | "privilege" | "quota-used-bytes"
+        | "quota-available-bytes" | "error" | "valid-sync-token" | "mkcol-response"
+        | "owner" | "lockdiscovery" | "activelock" | "locktoken" | "supportedlock" => DAV,
+        "calendar" | "calendar-data" | "calendar-home-set" | "schedule-inbox-URL"
+        | "schedule-outbox-URL" | "schedule-tag" | "supported-calendar-component-set"
+        | "supported-calendar-data" | "min-date-time" | "max-date-time" | "max-instances"
+        | "max-attendees-per-instance" | "calendar-description" | "calendar-timezone"
+        | "mkcalendar-response" | "schedule-response" | "recipient" | "request-status"
+        | "calendar-user-address-set" | "schedule-default-calendar-URL" => CALDAV,
+        "addressbook" | "address-data" | "addressbook-home-set" | "supported-address-data"
+        | "address-data-type" | "addressbook-description" => CARDDAV,
+        _ => return None,
+    })
+}
+/// Whether `node` is the element `name` in the namespace it belongs in.
+/// `comp` and `max-resource-size` are CalDAV's and CardDAV's alike.
+fn is(node: &roxmltree::Node, name: &str) -> bool {
+    let tag = node.tag_name();
+    if tag.name() != name {
+        return false;
+    }
+    match (name, tag.namespace()) {
+        ("max-resource-size", Some(ns)) => ns == CALDAV || ns == CARDDAV,
+        ("comp", Some(ns)) => ns == CALDAV,
+        (_, ns) => namespace_of(name).is_none_or(|want| ns == Some(want)),
+    }
+}
+
 /// The `href`s of the responses in a multistatus answer, with each
 /// response's node.
 fn responses<'a>(
     doc: &'a roxmltree::Document<'a>,
 ) -> impl Iterator<Item = (String, roxmltree::Node<'a, 'a>)> + 'a {
     doc.descendants()
-        .filter(|n| n.tag_name().name() == "response")
+        .filter(|n| is(n, "response"))
         .filter_map(|response| {
             let href = response
                 .children()
-                .find(|c| c.tag_name().name() == "href")?
+                .find(|c| is(c, "href"))?
                 .text()?
                 .trim()
                 .to_owned();
@@ -289,15 +331,15 @@ fn responses<'a>(
 /// resource doesn't have, often as empty elements).
 fn failed_propstat(node: roxmltree::Node) -> bool {
     node.ancestors()
-        .find(|a| a.tag_name().name() == "propstat")
-        .and_then(|p| p.children().find(|c| c.tag_name().name() == "status"))
+        .find(|a| is(a, "propstat"))
+        .and_then(|p| p.children().find(|c| is(c, "status")))
         .and_then(|s| s.text())
         .is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2')))
 }
 /// The first `name` element under `node` that a propstat says is there.
 fn property<'a>(node: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
     node.descendants()
-        .find(|n| n.tag_name().name() == name && !failed_propstat(*n))
+        .find(|n| is(n, name) && !failed_propstat(*n))
 }
 
 /// Every href inside the first `name` element under `node` (a home set
@@ -306,7 +348,7 @@ fn hrefs_in(node: roxmltree::Node, name: &str) -> Vec<String> {
     property(node, name)
         .map(|p| {
             p.descendants()
-                .filter(|n| n.tag_name().name() == "href")
+                .filter(|n| is(n, "href"))
                 .filter_map(|n| n.text().map(|t| t.trim().to_owned()))
                 .filter(|t| !t.is_empty())
                 .collect()
@@ -511,9 +553,9 @@ impl Client {
         let mut out = Vec::new();
         for (href, response) in responses(&doc) {
             let is_kind = response.descendants().any(|n| {
-                n.tag_name().name() == kind
+                is(&n, kind)
                     && n.parent()
-                        .is_some_and(|p| p.tag_name().name() == "resourcetype")
+                        .is_some_and(|p| is(&p, "resourcetype"))
             });
             if !is_kind {
                 continue;
@@ -522,7 +564,7 @@ impl Client {
             // Without a privilege set, assume it can be written.
             let privileges: Vec<&str> = response
                 .descendants()
-                .filter(|n| n.tag_name().name() == "privilege")
+                .filter(|n| is(n, "privilege"))
                 .flat_map(|p| {
                     p.children()
                         .filter(|c| c.is_element())
@@ -545,7 +587,7 @@ impl Client {
             let found = |name: &str| {
                 response
                     .children()
-                    .filter(|p| p.tag_name().name() == "propstat")
+                    .filter(|p| is(p, "propstat"))
                     .filter(|p| {
                         text_of(*p, "status").is_none_or(|s| s.contains(" 200 "))
                     })
@@ -554,15 +596,15 @@ impl Client {
             };
             let components = response
                 .descendants()
-                .filter(|n| n.tag_name().name() == "supported-calendar-component-set")
-                .flat_map(|set| set.children().filter(|c| c.tag_name().name() == "comp"))
+                .filter(|n| is(n, "supported-calendar-component-set"))
+                .flat_map(|set| set.children().filter(|c| is(c, "comp")))
                 .filter_map(|c| c.attribute("name"))
                 .map(str::to_ascii_uppercase)
                 .collect();
             let vcard_versions = response
                 .descendants()
-                .filter(|n| n.tag_name().name() == "supported-address-data")
-                .flat_map(|set| set.children().filter(|c| c.tag_name().name() == "address-data-type"))
+                .filter(|n| is(n, "supported-address-data"))
+                .flat_map(|set| set.children().filter(|c| is(c, "address-data-type")))
                 .filter_map(|c| c.attribute("version"))
                 .map(str::to_owned)
                 .collect();
@@ -574,8 +616,8 @@ impl Client {
             let limits = CalendarLimits {
                 data: response
                     .descendants()
-                    .filter(|n| n.tag_name().name() == "supported-calendar-data" && !failed_propstat(*n))
-                    .flat_map(|set| set.children().filter(|c| c.tag_name().name() == "calendar-data"))
+                    .filter(|n| is(n, "supported-calendar-data") && !failed_propstat(*n))
+                    .flat_map(|set| set.children().filter(|c| is(c, "calendar-data")))
                     .map(|c| {
                         let kind = c.attribute("content-type").unwrap_or("text/calendar");
                         match c.attribute("version") {
@@ -615,7 +657,7 @@ impl Client {
         for (href, response) in responses(&doc) {
             let Some(content) = response
                 .descendants()
-                .find(|n| n.tag_name().name() == data)
+                .find(|n| is(n, data))
                 .and_then(|n| n.text())
             else {
                 continue;
@@ -646,8 +688,17 @@ impl Client {
         // collection itself): ask again from its new token until whole.
         let mut all = Changes::default();
         let mut token = token.to_owned();
+        let mut limit = Some(SYNC_LIMIT);
         for _ in 0..100 {
-            let (part, truncated) = self.changes_once(collection, &token)?;
+            let (part, truncated) = match self.changes_once(collection, &token, limit) {
+                // RFC 6578 §3.7: a server that won't limit its answer
+                // refuses the limit; asked again without it.
+                Err(e) if limit.is_some() && e.downcast_ref::<Forbidden>().is_some_and(|f| f.0.contains("number-of-matches-within-limits")) => {
+                    limit = None;
+                    self.changes_once(collection, &token, None)?
+                }
+                other => other?,
+            };
             all.removed.retain(|r| !part.changed.iter().any(|(h, _)| h == r));
             all.changed.retain(|(h, _)| !part.removed.contains(h));
             all.changed.extend(part.changed);
@@ -661,9 +712,13 @@ impl Client {
         }
         Ok(all)
     }
-    fn changes_once(&self, collection: &url::Url, token: &str) -> Result<(Changes, bool)> {
+    fn changes_once(&self, collection: &url::Url, token: &str, limit: Option<u32>) -> Result<(Changes, bool)> {
+        // RFC 6578 §3.7: at most `limit` changes at a time; the server
+        // marks a cut-short answer with a 507 on the collection, and the
+        // rest are asked for from its new token.
+        let limit = limit.map_or(String::new(), |n| format!("<d:limit><d:nresults>{n}</d:nresults></d:limit>"));
         let body = format!(
-            "<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>",
+            "<?xml version=\"1.0\"?><d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{}</d:sync-token><d:sync-level>1</d:sync-level>{limit}<d:prop><d:getetag/></d:prop></d:sync-collection>",
             xml_escape(token)
         );
         let response = self.send(
@@ -941,8 +996,8 @@ impl Client {
         let doc = parse(&text)?;
         let refused = doc
             .descendants()
-            .filter(|n| n.tag_name().name() == "propstat")
-            .filter_map(|p| p.children().find(|c| c.tag_name().name() == "status").and_then(|s| s.text()))
+            .filter(|n| is(n, "propstat"))
+            .filter_map(|p| p.children().find(|c| is(c, "status")).and_then(|s| s.text()))
             .any(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')));
         ensure!(!refused, "The server didn't accept the new name or colour.");
         Ok(())
@@ -1090,14 +1145,14 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
         if url.path().trim_end_matches('/') == collection.path().trim_end_matches('/') {
             truncated |= response
                 .children()
-                .find(|c| c.tag_name().name() == "status")
+                .find(|c| is(c, "status"))
                 .and_then(|s| s.text())
                 .is_some_and(|s| s.contains(" 507 "));
             continue;
         }
         let status = response
             .children()
-            .find(|c| c.tag_name().name() == "status")
+            .find(|c| is(c, "status"))
             .and_then(|s| s.text())
             .unwrap_or_default();
         if status.contains(" 404 ") {
@@ -1109,7 +1164,7 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
     out.token = doc
         .root_element()
         .children()
-        .find(|n| n.tag_name().name() == "sync-token")
+        .find(|n| is(n, "sync-token"))
         .and_then(|n| n.text())
         .unwrap_or_default()
         .trim()
@@ -1124,14 +1179,14 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
 fn refused_properties(text: &str) -> Vec<String> {
     let Ok(doc) = roxmltree::Document::parse(text) else { return Vec::new() };
     doc.descendants()
-        .filter(|n| n.tag_name().name() == "propstat")
+        .filter(|n| is(n, "propstat"))
         .filter(|p| {
             p.children()
-                .find(|c| c.tag_name().name() == "status")
+                .find(|c| is(c, "status"))
                 .and_then(|s| s.text())
                 .is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')))
         })
-        .flat_map(|p| p.children().filter(|c| c.tag_name().name() == "prop"))
+        .flat_map(|p| p.children().filter(|c| is(c, "prop")))
         .flat_map(|prop| prop.children().filter(|c| c.is_element()).map(|c| c.tag_name().name().to_owned()))
         .collect()
 }
@@ -1340,10 +1395,30 @@ pub fn test_server(
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    // A deadline for each request: a test expecting more requests than the
+    // client makes fails, naming what came, instead of waiting forever.
+    listener.set_nonblocking(true).unwrap();
     let handle = std::thread::spawn(move || {
-        let mut seen = Vec::new();
-        for stream in listener.incoming().take(count) {
-            let mut stream = stream.unwrap();
+        let mut seen: Seen = Vec::new();
+        for _ in 0..count {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        let requests: Vec<String> = seen.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the test server waited for request {} of {count}; it had {requests:?}",
+                            seen.len() + 1
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut first = String::new();
             reader.read_line(&mut first).unwrap();
@@ -1500,6 +1575,50 @@ mod tests {
         assert!(read.whole);
         assert_eq!(server.join().unwrap().len(), 3);
         Ok(())
+    }
+
+    /// RFC 6578 §3.6–§3.7: changes are asked for with a limit; an answer
+    /// cut short (507 on the collection) continues from its token; a server
+    /// refusing the limit is asked without one.
+    #[test]
+    fn sync_collection_asks_with_a_limit_and_continues() -> Result<()> {
+        let item = |h: &str, e: &str| format!("<d:response><d:href>/c/{h}</d:href><d:propstat><d:prop><d:getetag>\"{e}\"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
+        let (port, server) = test_server(3, move |_, path, body| {
+            assert_eq!(path, "/c/");
+            let limited = body.contains("<d:limit><d:nresults>1000</d:nresults></d:limit>");
+            if body.contains("<d:sync-token>t0</d:sync-token>") {
+                assert!(limited, "{body}");
+                ("207 Multi-Status", format!("<d:multistatus xmlns:d=\"DAV:\">{}<d:response><d:href>/c/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response><d:sync-token>t1</d:sync-token></d:multistatus>", item("a", "1")))
+            } else if body.contains("<d:sync-token>t1</d:sync-token>") && limited {
+                ("403 Forbidden", "<d:error xmlns:d=\"DAV:\"><d:number-of-matches-within-limits/></d:error>".into())
+            } else {
+                assert!(!limited);
+                ("207 Multi-Status", format!("<d:multistatus xmlns:d=\"DAV:\">{}<d:sync-token>t2</d:sync-token></d:multistatus>", item("b", "2")))
+            }
+        });
+        let client = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?;
+        let href = url::Url::parse(&format!("http://127.0.0.1:{port}/c/"))?;
+        let changes = client.changes(&href, "t0")?;
+        assert_eq!(changes.token, "t2");
+        assert_eq!(changes.changed.iter().map(|(h, _)| h.path()).collect::<Vec<_>>(), ["/c/a", "/c/b"]);
+        assert_eq!(server.join().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// Elements are read in the namespace they belong in: a `response` or
+    /// `getetag` in another vocabulary isn't WebDAV's.
+    #[test]
+    fn elements_are_read_in_their_namespace() {
+        let text = "<d:multistatus xmlns:d=\"DAV:\" xmlns:x=\"urn:example\"><x:response><x:href>/fake</x:href></x:response><d:response><d:href>/real</d:href><d:propstat><d:prop><x:getetag>\"no\"</x:getetag><d:getetag>\"yes\"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+        let doc = parse(text).unwrap();
+        let found: Vec<(String, Option<String>)> = responses(&doc).map(|(h, r)| (h, text_of(r, "getetag"))).collect();
+        assert_eq!(found, [("/real".to_owned(), Some("\"yes\"".to_owned()))]);
+        // A default namespace counts as well as a prefix.
+        let plain = parse("<multistatus xmlns=\"DAV:\"><response><href>/a</href></response></multistatus>").unwrap();
+        assert_eq!(responses(&plain).count(), 1);
+        // Elements with no namespace at all aren't WebDAV's.
+        let none = parse("<multistatus><response><href>/a</href></response></multistatus>").unwrap();
+        assert_eq!(responses(&none).count(), 0);
     }
 
     /// RFC 6764 §5: `.well-known` redirecting to another host in the same
