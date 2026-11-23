@@ -266,6 +266,75 @@ mod tests {
         assert_eq!(outer, OUTER);
     }
 
+    /// A keyring with `who`'s secret key, and one with only its public key.
+    fn rings(who: &str) -> (super::super::Keyring, super::super::Keyring) {
+        use pgp::composed::SignedPublicKey;
+        let key = super::super::test_key(who, "");
+        let mut own = super::super::Keyring::default();
+        own.import(&key.to_armored_string(Default::default()).unwrap(), "").unwrap();
+        let mut theirs = super::super::Keyring::default();
+        let public = SignedPublicKey::from(key).to_armored_string(Default::default()).unwrap();
+        theirs.import(&public, "").unwrap();
+        (own, theirs)
+    }
+
+    const MESSAGE: &str = "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nSubject: Plans\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\nMessage-ID: <1@example.org>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nMeet at noon.\r\n";
+
+    /// RFC 9788 §5.2.1 step 4 with RFC 3156 §5: signed only, the outer
+    /// headers are as they were, the signed part carries the inner ones
+    /// with hp="clear", and the signature covers them: it verifies, and a
+    /// changed inner Subject breaks it.
+    #[test]
+    fn signed_only_mail_signs_its_inner_headers() {
+        use super::super::{Protect, Signature, open, protect, signed_parts};
+        let (anas, bos) = rings("Ana <ana@example.org>");
+        let how = Protect { sign: true, ..Default::default() };
+        let sent = protect(MESSAGE.as_bytes(), "ana@example.org", &[], how, &anas).unwrap();
+        let text = String::from_utf8(sent.clone()).unwrap();
+        let outer = text.split("Content-Type: multipart/signed").next().unwrap();
+        assert_eq!(
+            outer,
+            "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nSubject: Plans\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\nMessage-ID: <1@example.org>\r\nMIME-Version: 1.0\r\n"
+        );
+        let (signed, _) = signed_parts(&sent).unwrap();
+        let signed = String::from_utf8(signed).unwrap();
+        let parsed = mailparse::parse_mail(signed.as_bytes()).unwrap();
+        assert_eq!(parsed.ctype.params.get("hp").map(String::as_str), Some("clear"));
+        assert_eq!(values(&signed, "Subject"), ["Plans"]);
+        assert_eq!(values(&signed, "From"), ["Ana <ana@example.org>"]);
+        assert!(values(&signed, "HP-Outer").is_empty(), "{signed}");
+        let (readable, verdict) = open(&sent, &bos).unwrap();
+        assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+        // Only the inner Subject changed: the outer one is as sent.
+        let at = text.find("multipart/signed").unwrap();
+        let forged = format!("{}{}", &text[..at], text[at..].replacen("Subject: Plans", "Subject: Pay now", 1));
+        assert_ne!(forged, text);
+        assert_eq!(open(forged.as_bytes(), &bos).unwrap().1.signature, Signature::Bad);
+    }
+
+    /// RFC 9788 §5.2.1 step 5: signed and encrypted, the inner headers
+    /// with hp="cipher" and HP-Outer are inside the signature, inside the
+    /// encryption; the outside is unchanged without hide-subject.
+    #[test]
+    fn signed_and_encrypted_mail_carries_hp_cipher_inside_the_signature() {
+        use super::super::{Protect, Signature, open, protect};
+        let (mut anas, mut bos) = rings("Ana <ana@example.org>");
+        let (bos_own, bos_public) = rings("Bo <bo@example.se>");
+        anas.public.extend(bos_public.public);
+        bos.secret.extend(bos_own.secret);
+        let how = Protect { sign: true, encrypt: true, subject: false };
+        let sent = protect(MESSAGE.as_bytes(), "ana@example.org", &["bo@example.se".into()], how, &anas).unwrap();
+        let text = String::from_utf8_lossy(&sent);
+        assert!(text.contains("\r\nSubject: Plans\r\n") && !text.contains("Meet at noon"), "{text}");
+        let (readable, verdict) = open(&sent, &bos).unwrap();
+        assert!(verdict.decrypted);
+        assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+        let readable = String::from_utf8_lossy(&readable);
+        assert!(readable.contains("hp=\"cipher\""), "{readable}");
+        assert!(readable.contains("HP-Outer: Subject: Plans\r\n"), "{readable}");
+    }
+
     /// The parameters go at the end of a folded Content-Type, so a
     /// multipart's boundary stays its own; a part without a Content-Type
     /// is marked as the text/plain it is.

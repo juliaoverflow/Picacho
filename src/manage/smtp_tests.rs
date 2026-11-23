@@ -302,6 +302,17 @@ fn encrypted_bcc_recipients_each_get_their_own_copy() -> Result<()> {
         assert!(opens(&t.message, key), "{address}");
         assert!(!opens(&t.message, ana) && !opens(&t.message, other), "{address}");
     }
+    // RFC 9788 §5.2.1: every copy, each Bcc one too, carries the inner
+    // headers with hp="cipher", and none names a Bcc recipient inside.
+    for (t, key) in seen.transactions.iter().zip([ana, bo, di]) {
+        let mut ring = crate::manage::openpgp::Keyring::default();
+        ring.import(&key.to_armored_string(Default::default())?, "")?;
+        let (inner, _) = crate::manage::openpgp::open(&t.message, &ring).context("opens")?;
+        let inner = String::from_utf8_lossy(&inner);
+        assert!(inner.contains("hp=\"cipher\""), "{inner}");
+        assert!(inner.contains("HP-Outer: To: Ana <ana@example.com>"), "{inner}");
+        assert!(!inner.to_ascii_lowercase().contains("bcc:"), "{inner}");
+    }
     for t in &seen.transactions {
         let headers = t.headers();
         assert!(headers.contains("To: Ana <ana@example.com>"), "{headers}");

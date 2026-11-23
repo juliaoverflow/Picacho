@@ -19,8 +19,6 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
-// Not sent with yet: wired into `protect` next.
-#[allow(dead_code)]
 mod protected;
 
 /// The keychain entry holding the keyring.
@@ -630,10 +628,6 @@ const PROTECTED: [&str; 5] = [
     "keywords",
 ];
 
-/// Headers copied inside the encryption as well as left outside (RFC
-/// 9788 §2.1), so a reader can tell they weren't changed on the way.
-const COPIED: [&str; 5] = ["from", "to", "cc", "date", "message-id"];
-
 /// What a protected message's Subject says outside the encryption.
 pub const HIDDEN_SUBJECT: &str = "...";
 
@@ -1009,82 +1003,6 @@ fn split_body(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (from_latin1(&part), from_latin1(&outer))
 }
 
-/// Moves the message's Subject inside the part to be encrypted (marking
-/// its Content-Type `protected-headers="v1"`), and leaves "..." outside.
-fn hide_subject(part: Vec<u8>, outer: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
-    let outer_text = latin1(&outer);
-    let mut subject_lines = String::new();
-    let mut rest = String::new();
-    let mut inside = false;
-    let mut copied = false;
-    let mut has_subject = false;
-    for line in outer_text.split_inclusive('\n') {
-        if !line.starts_with([' ', '\t']) {
-            let name = line
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            inside = PROTECTED.contains(&name.as_str());
-            // RFC 9788 §2.1: the routing headers are protected too, by a
-            // copy inside; they stay outside, as delivery needs them.
-            copied = COPIED.contains(&name.as_str());
-            has_subject |= name == "subject";
-        }
-        if inside {
-            subject_lines.push_str(line);
-        } else {
-            if copied {
-                subject_lines.push_str(line);
-            }
-            rest.push_str(line);
-        }
-    }
-    if !has_subject {
-        return (part, outer);
-    }
-    rest.push_str(&format!("Subject: {HIDDEN_SUBJECT}\r\n"));
-    // The part's own header: its Content-Type marked, then the Subject.
-    let part_text = latin1(&part);
-    let split = part_text
-        .find("\r\n\r\n")
-        .map_or(part_text.len(), |i| i + 2);
-    let (head, body) = part_text.split_at(split);
-    // The Content-Type header, with its folded lines, gets the parameter
-    // at its end.
-    let mut new_head = String::new();
-    let mut in_type = false;
-    let mut marked = false;
-    let mark = |out: &mut String| {
-        while out.ends_with(['\r', '\n']) {
-            out.pop();
-        }
-        // The older draft's marker and RFC 9788's (§2.1.1), for readers
-        // of either.
-        out.push_str("; protected-headers=\"v1\"; hp=\"cipher\"\r\n");
-    };
-    for line in head.split_inclusive('\n') {
-        let continuation = line.starts_with([' ', '\t']);
-        if in_type && !continuation {
-            mark(&mut new_head);
-            in_type = false;
-            marked = true;
-        }
-        if !continuation && !marked && line.to_ascii_lowercase().starts_with("content-type:") {
-            in_type = true;
-        }
-        new_head.push_str(line);
-    }
-    if in_type {
-        mark(&mut new_head);
-    }
-    new_head.push_str(&subject_lines);
-    let mut new_part = from_latin1(&new_head);
-    new_part.extend_from_slice(&from_latin1(body));
-    (new_part, from_latin1(&rest))
-}
-
 fn boundary() -> String {
     format!("=-picacho-{}", uuid::Uuid::new_v4().simple())
 }
@@ -1110,11 +1028,10 @@ pub fn protect(
     if part.ends_with(b"\r\n") {
         part.truncate(part.len() - 2);
     }
-    let (part, outer) = if how.encrypt && how.subject {
-        hide_subject(part, outer)
-    } else {
-        (part, outer)
-    };
+    // RFC 9788 §5.2.1: the inner headers on the Cryptographic Payload,
+    // hp="cipher" when encrypted and hp="clear" when signed only. The
+    // outside changes only when the subject is hidden.
+    let (part, outer) = protected::compose(&part, &outer, how.encrypt, how.subject);
     // Encrypted to several people: each one's key goes inside, so they can
     // write to the others encrypted too (Autocrypt-Gossip, Autocrypt 1.1
     // §3.6).
