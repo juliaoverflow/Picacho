@@ -45,6 +45,12 @@ pub struct Calendar {
     /// where it doesn't say.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_size: u64,
+    /// What else the calendar takes (RFC 4791 §5.2.4–§5.2.9).
+    #[serde(default, skip_serializing_if = "is_unlimited")]
+    pub limits: dav::CalendarLimits,
+}
+fn is_unlimited(l: &dav::CalendarLimits) -> bool {
+    *l == dav::CalendarLimits::default()
 }
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -99,9 +105,11 @@ pub fn calendars(
         dav::CALDAV,
     )?
     .into_iter()
-    // Calendars for tasks or notes only have no events to show or take.
+    // Calendars for tasks or notes only have no events to show or take,
+    // nor those that don't take iCalendar 2.0 (RFC 4791 §5.2.4).
     .filter(|c| {
-        c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT" || k == "VTODO")
+        (c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT" || k == "VTODO"))
+            && c.limits.takes_icalendar()
     })
     .map(|c| Calendar {
         href: c.href.to_string(),
@@ -115,6 +123,7 @@ pub fn calendars(
         read_until: 0,
         components: c.components,
         max_size: c.max_size,
+        limits: c.limits,
     })
     .collect())
 }
@@ -367,8 +376,12 @@ pub fn sync(
             ctag: cal.state.ctag.clone(),
             max_size: 0,
             vcard_versions: Vec::new(),
+            limits: cal.limits.clone(),
         };
-        let query = range_query(from, to + MARGIN);
+        // RFC 4791 §5.2.6–§5.2.7: a time range outside the calendar's
+        // dates is refused (min-date-time, max-date-time).
+        let (q_from, q_to) = cal.limits.clamp(from, to + MARGIN);
+        let query = range_query(q_from, q_to);
         let read = dav::read_collection(
             &c,
             &collection,
@@ -402,20 +415,22 @@ pub fn sync(
     Ok((cals, out))
 }
 
-/// Makes a calendar named `name` in the account's calendar home.
+/// Makes a calendar named `name` in the account's calendar home, with
+/// `setup`'s description and time zone (RFC 4791 §5.3.1).
 pub fn create_calendar(
     server: &Server,
     password: &str,
     tls: native_tls::TlsConnector,
     name: &str,
     color: &str,
+    setup: &dav::CollectionSetup,
 ) -> Result<Calendar> {
     let c = client(server, password, tls)?;
     let home = c.home(&server.url, "caldav", "calendar-home-set", dav::CALDAV)?;
     let href = dav::new_href(&home, &uuid::Uuid::new_v4().to_string(), "x")?;
     // A collection: the path without the extension, ending in '/'.
     let href = url::Url::parse(&format!("{}/", href.as_str().trim_end_matches(".x")))?;
-    c.make_collection(&href, true, name, color)?;
+    c.make_collection_with(&href, true, name, color, setup)?;
     Ok(Calendar {
         href: href.to_string(),
         name: name.to_owned(),
@@ -423,6 +438,39 @@ pub fn create_calendar(
         color: color.to_owned(),
         ..Default::default()
     })
+}
+
+/// Whether `stored` fits `limits` (RFC 4791 §5.2.6–§5.2.9), checked
+/// before it is sent: the server would refuse it with a precondition
+/// (`min-date-time`, `max-instances`, `max-attendees-per-instance`) that
+/// says less.
+pub fn check_limits(limits: &dav::CalendarLimits, stored: &Stored) -> Result<()> {
+    let events = std::iter::once(&stored.event).chain(&stored.overrides);
+    if let Some(most) = limits.max_attendees {
+        let guests = events.clone().map(|e| e.attendees.len()).max().unwrap_or(0) as u64;
+        ensure!(guests <= most, "This calendar takes at most {most} guests an event.");
+    }
+    for e in events.filter(|e| e.start != 0) {
+        let (from, to) = limits.clamp(e.start, e.end.max(e.start));
+        ensure!(
+            from == e.start && to == e.end.max(e.start),
+            "This calendar doesn't take events at that date."
+        );
+    }
+    if let Some(most) = limits.max_instances
+        && (!stored.event.recurrence.is_empty() || !stored.event.rdates.is_empty())
+    {
+        // Counted over the calendar's dates, or a century: a rule without
+        // an end is past any limit.
+        let to = limits.max_time.unwrap_or(stored.event.start + 100 * 366 * 86_400);
+        let count = ical::occurrences(&stored.event, &[], stored.event.start, to).len() as u64
+            + stored.event.exdates.len() as u64;
+        ensure!(
+            count <= most,
+            "This calendar takes at most {most} repeats of an event. Give the repeats an end."
+        );
+    }
+    Ok(())
 }
 
 /// Saves an event: new in `calendar`, or a change to the one at its href.
@@ -645,6 +693,61 @@ mod tests {
         remove_from_inbox(&srv, "secret", tls(), &items[0])?;
         let seen = server.join().unwrap();
         assert_eq!(seen.iter().filter(|(m, ..)| m == "PUT").count(), 1);
+        Ok(())
+    }
+
+    /// RFC 4791 §5.2.4–§5.2.9: a calendar's limits are read with it, and
+    /// an event past them is refused before it is sent. MKCALENDAR sends
+    /// a description and time zone (§5.3.1) and reads what was refused.
+    #[test]
+    fn calendar_limits_and_new_calendars() -> Result<()> {
+        let (port, server) = dav::test_server(7, |method, path, body| match (method, path) {
+            ("PROPFIND", "/.well-known/caldav") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/.well-known/caldav</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/a/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-data><c:calendar-data content-type=\"text/calendar\" version=\"2.0\"/></c:supported-calendar-data><c:min-date-time>19000101T000000Z</c:min-date-time><c:max-date-time>20491231T235959Z</c:max-date-time><c:max-instances>100</c:max-instances><c:max-attendees-per-instance>2</c:max-attendees-per-instance></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/json/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-data><c:calendar-data content-type=\"application/calendar+json\"/></c:supported-calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/cal/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("MKCALENDAR", _) => {
+                assert!(body.contains("<c:calendar-timezone>BEGIN:VCALENDAR") && body.contains("TZID:Europe/Vienna"), "{body}");
+                assert!(body.contains("<c:calendar-description>Kids &amp; school</c:calendar-description>"), "{body}");
+                if body.contains("refuse-me") {
+                    ("403 Forbidden", "<c:mkcalendar-response xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:propstat><d:prop><c:calendar-timezone/></d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat><d:propstat><d:prop><d:displayname/></d:prop><d:status>HTTP/1.1 424 Failed Dependency</d:status></d:propstat></c:mkcalendar-response>".into())
+                } else {
+                    ("201 Created", String::new())
+                }
+            }
+            _ => ("404 Not Found", String::new()),
+        });
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let cals = calendars(&srv, "secret", tls())?;
+        // The jCal-only calendar can't take Picacho's events.
+        assert_eq!(cals.len(), 1);
+        let l = &cals[0].limits;
+        assert_eq!((l.max_instances, l.max_attendees), (Some(100), Some(2)));
+        assert_eq!(l.max_time, Some(2_524_607_999));
+        assert_eq!(l.clamp(-3_000_000_000, 3_000_000_000), (-2_208_988_800, 2_524_607_999));
+        let setup = dav::CollectionSetup { description: "Kids & school".into(), timezone: Some("Europe/Vienna".into()) };
+        create_calendar(&srv, "secret", tls(), "School", "", &setup)?;
+        let refused = create_calendar(&srv, "secret", tls(), "refuse-me", "", &setup).unwrap_err();
+        assert!(refused.to_string().contains("calendar-timezone"), "{refused}");
+        // Discovery, then for each new calendar the principal, its home
+        // and MKCALENDAR.
+        assert_eq!(server.join().unwrap().len(), 7);
+        // An event within them goes; too many guests, too late, or
+        // repeating without end don't.
+        let guest = |e: &str| ical::Attendee { email: e.into(), ..Default::default() };
+        let ok = Stored { event: ical::Event { uid: "e".into(), start: 1_800_000_000, end: 1_800_003_600, attendees: vec![guest("a@x"), guest("b@x")], ..Default::default() }, ..Default::default() };
+        check_limits(l, &ok)?;
+        let mut crowded = ok.clone();
+        crowded.event.attendees.push(guest("c@x"));
+        assert!(check_limits(l, &crowded).unwrap_err().to_string().contains("2 guests"));
+        let mut late = ok.clone();
+        late.event.start = 2_600_000_000;
+        late.event.end = 2_600_003_600;
+        assert!(check_limits(l, &late).is_err());
+        let mut endless = ok.clone();
+        endless.event.recurrence = "FREQ=WEEKLY".into();
+        assert!(check_limits(l, &endless).unwrap_err().to_string().contains("100 repeats"));
+        endless.event.recurrence = "FREQ=WEEKLY;COUNT=10".into();
+        check_limits(l, &endless)?;
         Ok(())
     }
 

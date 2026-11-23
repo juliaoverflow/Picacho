@@ -224,11 +224,11 @@ impl Backend {
     fn calendar_save(&self, server: &caldav::Server, calendar: &str, stored: &Stored) -> Result<Stored> {
         let Some(a) = self.calendar_jmap(server)? else {
             let organized_here = self.organized_here(&stored.event);
-            let max_size = self
-                .calendars()
-                .iter()
-                .find(|c| c.href == calendar)
-                .map(|c| c.max_size);
+            let target = self.calendars().into_iter().find(|c| c.href == calendar);
+            if let Some(c) = &target {
+                caldav::check_limits(&c.limits, stored)?;
+            }
+            let max_size = target.map(|c| c.max_size);
             return caldav::save(
                 server,
                 &self.calendar_password()?,
@@ -300,6 +300,9 @@ impl Backend {
                 self.tls_connector()?,
                 name.trim(),
                 color,
+                // RFC 4791 §5.2.2: the calendar's floating times and
+                // time-range queries are in this computer's zone.
+                &crate::sync::dav::CollectionSetup { timezone: local_zone(), ..Default::default() },
             )?,
         };
         let mut cals = self.calendars();

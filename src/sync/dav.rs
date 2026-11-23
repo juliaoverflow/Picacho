@@ -43,6 +43,47 @@ pub struct Collection {
     /// An address book's vCard versions (`supported-address-data`, RFC
     /// 6352 §6.2.2): `3.0`, `4.0`; empty where it doesn't say (3.0).
     pub vcard_versions: Vec<String>,
+    /// A calendar's limits (RFC 4791 §5.2.4–§5.2.9), where it says.
+    pub limits: CalendarLimits,
+}
+
+/// What a calendar collection takes (RFC 4791 §5.2.4–§5.2.9); each
+/// field empty or `None` where the server doesn't say.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CalendarLimits {
+    /// `supported-calendar-data`: media types and versions, as
+    /// `text/calendar 2.0`; empty: iCalendar 2.0 (§5.2.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<String>,
+    /// `min-date-time` and `max-date-time` (§5.2.6–§5.2.7), Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_time: Option<i64>,
+    /// `max-instances` (§5.2.8): most occurrences of one repeating event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u64>,
+    /// `max-attendees-per-instance` (§5.2.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attendees: Option<u64>,
+}
+impl CalendarLimits {
+    /// Whether the calendar takes iCalendar 2.0 (RFC 4791 §5.2.4: the
+    /// default where it lists nothing).
+    pub fn takes_icalendar(&self) -> bool {
+        self.data.is_empty()
+            || self.data.iter().any(|d| {
+                let mut w = d.split_whitespace();
+                w.next().is_some_and(|t| t.eq_ignore_ascii_case("text/calendar")) && w.next().is_none_or(|v| v == "2.0")
+            })
+    }
+    /// `from`..`to` within the calendar's dates (§5.2.6–§5.2.7), so a
+    /// query doesn't ask for times it refuses.
+    pub fn clamp(&self, from: i64, to: i64) -> (i64, i64) {
+        let from = self.min_time.map_or(from, |m| from.max(m));
+        let to = self.max_time.map_or(to, |m| to.min(m));
+        (from, to.max(from))
+    }
 }
 
 /// What changed in a collection since a sync token (RFC 6578).
@@ -410,7 +451,7 @@ impl Client {
     /// The collections of kind `kind` (`addressbook` or `calendar`) at
     /// `home` (Depth 1), or `home` itself if it is one.
     fn collections(&self, home: &url::Url, kind: &str) -> Result<Vec<Collection>> {
-        let body = "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\" xmlns:a=\"http://apple.com/ns/ical/\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype/><d:displayname/><d:current-user-privilege-set/><c:supported-calendar-component-set/><a:calendar-color/><d:sync-token/><cs:getctag/><c:max-resource-size/><r:max-resource-size/><r:supported-address-data/></d:prop></d:propfind>";
+        let body = "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\" xmlns:a=\"http://apple.com/ns/ical/\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype/><d:displayname/><d:current-user-privilege-set/><c:supported-calendar-component-set/><a:calendar-color/><d:sync-token/><cs:getctag/><c:max-resource-size/><r:max-resource-size/><r:supported-address-data/><c:supported-calendar-data/><c:min-date-time/><c:max-date-time/><c:max-instances/><c:max-attendees-per-instance/></d:prop></d:propfind>";
         let text = self.xml("PROPFIND", home, "1", body)?;
         let doc = parse(&text)?;
         let mut out = Vec::new();
@@ -471,6 +512,29 @@ impl Client {
                 .filter_map(|c| c.attribute("version"))
                 .map(str::to_owned)
                 .collect();
+            let time = |name: &str| {
+                chrono::NaiveDateTime::parse_from_str(found(name).trim_end_matches('Z'), "%Y%m%dT%H%M%S")
+                    .ok()
+                    .map(|t| t.and_utc().timestamp())
+            };
+            let limits = CalendarLimits {
+                data: response
+                    .descendants()
+                    .filter(|n| n.tag_name().name() == "supported-calendar-data" && !failed_propstat(*n))
+                    .flat_map(|set| set.children().filter(|c| c.tag_name().name() == "calendar-data"))
+                    .map(|c| {
+                        let kind = c.attribute("content-type").unwrap_or("text/calendar");
+                        match c.attribute("version") {
+                            Some(v) => format!("{kind} {v}"),
+                            None => kind.to_owned(),
+                        }
+                    })
+                    .collect(),
+                min_time: time("min-date-time"),
+                max_time: time("max-date-time"),
+                max_instances: found("max-instances").parse().ok(),
+                max_attendees: found("max-attendees-per-instance").parse().ok(),
+            };
             out.push(Collection {
                 href: url,
                 name,
@@ -481,6 +545,7 @@ impl Client {
                 ctag: found("getctag"),
                 max_size: found("max-resource-size").parse().unwrap_or(0),
                 vcard_versions,
+                limits,
             });
         }
         Ok(out)
@@ -678,33 +743,79 @@ impl Client {
     /// §5.3.1) for events, or an address book (extended MKCOL, RFC 5689),
     /// named `name`, with a calendar's colour where given.
     pub fn make_collection(&self, href: &url::Url, calendar: bool, name: &str, color: &str) -> Result<()> {
+        self.make_collection_with(href, calendar, name, color, &CollectionSetup::default())
+    }
+    /// As `make_collection`, with a calendar's description and time zone
+    /// (RFC 4791 §5.2.1–§5.2.2) set as it is made. The server's answer is
+    /// read (RFC 4791 §5.3.1.2, RFC 5689 §3.2: a `mkcol-response` or
+    /// `mkcalendar-response` saying which properties it refused); one it
+    /// refuses means the collection wasn't made.
+    pub fn make_collection_with(
+        &self,
+        href: &url::Url,
+        calendar: bool,
+        name: &str,
+        color: &str,
+        setup: &CollectionSetup,
+    ) -> Result<()> {
         let name = xml_escape(name);
+        let description = if setup.description.trim().is_empty() {
+            String::new()
+        } else if calendar {
+            format!("<c:calendar-description>{}</c:calendar-description>", xml_escape(setup.description.trim()))
+        } else {
+            format!("<c:addressbook-description>{}</c:addressbook-description>", xml_escape(setup.description.trim()))
+        };
         let (method, body) = if calendar {
             let color = if color.is_empty() {
                 String::new()
             } else {
                 format!("<a:calendar-color>{}</a:calendar-color>", xml_escape(color))
             };
+            // RFC 4791 §5.2.2: a VCALENDAR holding one VTIMEZONE.
+            let zone = match setup.timezone.as_deref().and_then(|z| crate::sync::ical::vtimezone(z, 2020..=2040)) {
+                Some(tz) => format!(
+                    "<c:calendar-timezone>{}</c:calendar-timezone>",
+                    xml_escape(&format!(
+                        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Pinal Technologies//Picacho//EN\r\n{tz}END:VCALENDAR\r\n"
+                    ))
+                ),
+                None => String::new(),
+            };
             (
                 "MKCALENDAR",
                 format!(
-                    "<?xml version=\"1.0\"?><c:mkcalendar xmlns:d=\"DAV:\" xmlns:c=\"{CALDAV}\" xmlns:a=\"http://apple.com/ns/ical/\"><d:set><d:prop><d:displayname>{name}</d:displayname>{color}<c:supported-calendar-component-set><c:comp name=\"VEVENT\"/><c:comp name=\"VTODO\"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"
+                    "<?xml version=\"1.0\"?><c:mkcalendar xmlns:d=\"DAV:\" xmlns:c=\"{CALDAV}\" xmlns:a=\"http://apple.com/ns/ical/\"><d:set><d:prop><d:displayname>{name}</d:displayname>{description}{color}{zone}<c:supported-calendar-component-set><c:comp name=\"VEVENT\"/><c:comp name=\"VTODO\"/></c:supported-calendar-component-set></d:prop></d:set></c:mkcalendar>"
                 ),
             )
         } else {
             (
                 "MKCOL",
                 format!(
-                    "<?xml version=\"1.0\"?><d:mkcol xmlns:d=\"DAV:\" xmlns:c=\"{CARDDAV}\"><d:set><d:prop><d:resourcetype><d:collection/><c:addressbook/></d:resourcetype><d:displayname>{name}</d:displayname></d:prop></d:set></d:mkcol>"
+                    "<?xml version=\"1.0\"?><d:mkcol xmlns:d=\"DAV:\" xmlns:c=\"{CARDDAV}\"><d:set><d:prop><d:resourcetype><d:collection/><c:addressbook/></d:resourcetype><d:displayname>{name}</d:displayname>{description}</d:prop></d:set></d:mkcol>"
                 ),
             )
         };
-        self.send(
+        let response = self.send(
             method,
             href,
             &[("Content-Type", "application/xml; charset=utf-8")],
             body,
-        )?;
+        );
+        let text = match response {
+            Ok(r) => body_text(r)?,
+            // RFC 5689 §3.2, RFC 4791 §5.3.1.2: refused with a 403 whose
+            // body names the properties it wouldn't set.
+            Err(e) => {
+                let refused = e.downcast_ref::<Forbidden>().map(|f| refused_properties(&f.0)).unwrap_or_default();
+                if refused.is_empty() {
+                    return Err(e);
+                }
+                bail!("The server refused {}.", refused.join(", "));
+            }
+        };
+        let refused = refused_properties(&text);
+        ensure!(refused.is_empty(), "The server refused {}.", refused.join(", "));
         Ok(())
     }
     /// Writes a resource: a new one (`etag` empty, which must not exist
@@ -989,6 +1100,34 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
     Ok((out, truncated))
 }
 
+/// The properties a `mkcol-response` or `mkcalendar-response` (RFC 5689
+/// §3.2, RFC 4791 §5.3.1.2), or any propstat answer, says weren't set: a
+/// non-2xx propstat's property names. Empty for an empty or plain body.
+fn refused_properties(text: &str) -> Vec<String> {
+    let Ok(doc) = roxmltree::Document::parse(text) else { return Vec::new() };
+    doc.descendants()
+        .filter(|n| n.tag_name().name() == "propstat")
+        .filter(|p| {
+            p.children()
+                .find(|c| c.tag_name().name() == "status")
+                .and_then(|s| s.text())
+                .is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')))
+        })
+        .flat_map(|p| p.children().filter(|c| c.tag_name().name() == "prop"))
+        .flat_map(|prop| prop.children().filter(|c| c.is_element()).map(|c| c.tag_name().name().to_owned()))
+        .collect()
+}
+
+/// What a new collection is made with besides its name and colour.
+#[derive(Clone, Debug, Default)]
+pub struct CollectionSetup {
+    /// `calendar-description` or `addressbook-description`.
+    pub description: String,
+    /// A calendar's time zone (an IANA name), for its floating times and
+    /// time-range queries (RFC 4791 §5.2.2).
+    pub timezone: Option<String>,
+}
+
 /// The server refused a request (403), with its body: a precondition
 /// element such as `valid-sync-token` says why.
 #[derive(Debug)]
@@ -1267,6 +1406,7 @@ mod tests {
             ctag: String::new(),
             max_size: 0,
             vcard_versions: Vec::new(),
+            limits: Default::default(),
         };
         let known = vec![
             (at("a.ics"), "\"a1\"".to_owned()),
