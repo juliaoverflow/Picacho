@@ -2239,3 +2239,142 @@ mod token_tests {
         assert_eq!(tokens("{x}"), vec![Token::Text("{x}".into())]);
     }
 }
+
+#[cfg(test)]
+mod scram_tests {
+    use super::*;
+    use crate::sync::sasl::ScramServer;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::io::{BufRead, BufReader, Write};
+
+    /// How the mock server ends a SCRAM exchange that checked out.
+    #[derive(Clone, Copy)]
+    enum Ending {
+        /// RFC 9051 §6.2.2: the server-final message as a `+` challenge,
+        /// answered with an empty line, then the tagged OK.
+        Challenge,
+        /// RFC 4959 §4 lets protocols carry the success data in the OK
+        /// itself; IMAP does not (RFC 9051 §6.2.2 has it sent as a
+        /// challenge), so a client may refuse this.
+        OkOnly,
+    }
+    /// A loopback IMAP server speaking SCRAM-SHA-256 as `server` does.
+    fn imap_server(mut server: ScramServer, sasl_ir: bool, ending: Ending) -> (u16, Vec<u8>, std::thread::JoinHandle<Vec<String>>) {
+        let (cert, acceptor) = crate::manage::backend::protocol_tests_tls().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+            let ir = if sasl_ir { " SASL-IR" } else { "" };
+            write!(r.get_mut(), "* OK [CAPABILITY IMAP4rev1{ir} AUTH=SCRAM-SHA-256 LOGINDISABLED] ready\r\n").unwrap();
+            let read = |r: &mut BufReader<_>| {
+                let mut line = String::new();
+                // A client that hung up reads as an empty line.
+                let _ = r.read_line(&mut line);
+                line.trim_end().to_owned()
+            };
+            let command = read(&mut r);
+            seen.push(command.clone());
+            let mut words = command.split(' ');
+            let tag = words.next().unwrap().to_owned();
+            assert_eq!(words.next(), Some("AUTHENTICATE"));
+            assert_eq!(words.next(), Some("SCRAM-SHA-256"));
+            let client_first = match words.next() {
+                Some(initial) => STANDARD.decode(initial).unwrap(),
+                None => {
+                    write!(r.get_mut(), "+ \r\n").unwrap();
+                    STANDARD.decode(read(&mut r)).unwrap()
+                }
+            };
+            let first = server.first(&client_first);
+            write!(r.get_mut(), "+ {}\r\n", STANDARD.encode(first)).unwrap();
+            let client_final = STANDARD.decode(read(&mut r)).unwrap();
+            let Some(last) = server.last(&client_final) else {
+                write!(r.get_mut(), "{tag} NO [AUTHENTICATIONFAILED] wrong\r\n").unwrap();
+                return seen;
+            };
+            match ending {
+                Ending::Challenge => {
+                    write!(r.get_mut(), "+ {}\r\n", STANDARD.encode(last)).unwrap();
+                    let empty = read(&mut r);
+                    assert_eq!(empty, "", "the server-final challenge is answered with nothing");
+                    write!(r.get_mut(), "{tag} OK signed in\r\n").unwrap();
+                }
+                Ending::OkOnly => {
+                    write!(r.get_mut(), "{tag} OK signed in\r\n").unwrap();
+                }
+            }
+            // ID, COMPRESS, LOGOUT…: whatever follows signing in.
+            loop {
+                let line = read(&mut r);
+                if line.is_empty() {
+                    return seen;
+                }
+                seen.push(line.clone());
+                let (tag, command) = line.split_once(' ').unwrap();
+                if command.eq_ignore_ascii_case("CAPABILITY") {
+                    write!(r.get_mut(), "* CAPABILITY IMAP4rev1\r\n").unwrap();
+                }
+                let _ = write!(r.get_mut(), "{tag} OK done\r\n");
+                if command.eq_ignore_ascii_case("LOGOUT") {
+                    return seen;
+                }
+            }
+        });
+        (port, cert, handle)
+    }
+    fn sign_in(port: u16, cert: &[u8], password: &str) -> Result<ImapSession> {
+        let mut a = Account::new(Provider::Imap);
+        a.email = "user@example.com".into();
+        a.incoming_host = "localhost".into();
+        a.incoming_port = port;
+        let tls = native_tls::TlsConnector::builder()
+            .add_root_certificate(native_tls::Certificate::from_pem(cert)?)
+            .build()?;
+        let secret = Secret {
+            password: password.into(),
+            ..Default::default()
+        };
+        imap_login(&a, &secret, &tls)
+    }
+
+    /// RFC 5802 §5 and RFC 9051 §6.2.2: the server's signature, sent as the
+    /// last challenge, reaches the exchange and is checked, with SASL-IR
+    /// (RFC 4959) and without it.
+    #[test]
+    fn scram_server_signature_is_checked_over_imap() {
+        for sasl_ir in [true, false] {
+            let (port, cert, server) = imap_server(ScramServer::new("pencil"), sasl_ir, Ending::Challenge);
+            let mut session = sign_in(port, &cert, "pencil").unwrap_or_else(|e| panic!("{e:#}"));
+            session.logout().unwrap();
+            let seen = server.join().unwrap();
+            assert_eq!(
+                seen[0].split(' ').count(),
+                if sasl_ir { 4 } else { 3 },
+                "the first message goes with the command only with SASL-IR: {}",
+                seen[0]
+            );
+            // A server that doesn't know the password can't sign: not signed
+            // in, though it said OK.
+            let mut forged = ScramServer::new("pencil");
+            forged.forged = Some("guess".into());
+            let (port, cert, server) = imap_server(forged, sasl_ir, Ending::Challenge);
+            let Err(error) = sign_in(port, &cert, "pencil") else { panic!("signed in") };
+            assert!(format!("{error:#}").contains("SCRAM signature mismatch"), "{error:#}");
+            assert!(error.downcast_ref::<crate::manage::status::AccessFailure>().is_some());
+            server.join().unwrap();
+        }
+        // A server that says OK without ever signing isn't trusted either.
+        let (port, cert, server) = imap_server(ScramServer::new("pencil"), true, Ending::OkOnly);
+        let Err(error) = sign_in(port, &cert, "pencil") else { panic!("signed in") };
+        assert!(format!("{error:#}").contains("no SCRAM signature"), "{error:#}");
+        server.join().unwrap();
+        // A wrong password is the server's refusal.
+        let (port, cert, server) = imap_server(ScramServer::new("pencil"), true, Ending::Challenge);
+        assert!(sign_in(port, &cert, "wrong").is_err());
+        server.join().unwrap();
+    }
+}

@@ -613,6 +613,62 @@ pub(crate) fn decode(text: &str) -> Result<Vec<u8>> {
         .context("The server's sign-in challenge isn't base64.")
 }
 
+/// The server's side of SCRAM-SHA-256 (RFC 5802 §5), for mock servers in
+/// tests: it checks the client's proof and signs as a real server would.
+#[cfg(test)]
+pub(crate) struct ScramServer {
+    pub(crate) password: String,
+    /// The server's signature is made with this password instead, where
+    /// set: a server that doesn't know the password.
+    pub(crate) forged: Option<String>,
+    first_bare: String,
+    server_first: String,
+}
+#[cfg(test)]
+impl ScramServer {
+    const SALT: &'static [u8] = b"mock-salt";
+    const ITERATIONS: u32 = 4096;
+    pub(crate) fn new(password: &str) -> Self {
+        Self {
+            password: password.into(),
+            forged: None,
+            first_bare: String::new(),
+            server_first: String::new(),
+        }
+    }
+    /// The server-first-message for the client's first message.
+    pub(crate) fn first(&mut self, client_first: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8(client_first.to_vec()).unwrap();
+        let bare = text.strip_prefix("n,,").expect("a GS2 header without binding");
+        let nonce = scram_fields(bare).into_iter().find(|(k, _)| *k == 'r').unwrap().1;
+        self.first_bare = bare.to_owned();
+        self.server_first = format!(
+            "r={nonce}server,s={},i={}",
+            STANDARD.encode(Self::SALT),
+            Self::ITERATIONS
+        );
+        self.server_first.clone().into_bytes()
+    }
+    /// The server-final-message (`v=`) for the client's final one, or
+    /// `None` where its proof is wrong.
+    pub(crate) fn last(&self, client_final: &[u8]) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(client_final).ok()?;
+        let (without_proof, proof) = text.rsplit_once(",p=")?;
+        let auth = format!("{},{},{without_proof}", self.first_bare, self.server_first);
+        let hash = Hash::Sha256;
+        let salted = |password: &str| hash.hi(password.as_bytes(), Self::SALT, Self::ITERATIONS);
+        let client_key = hash.hmac(&salted(&self.password), b"Client Key");
+        let signature = hash.hmac(&hash.digest(&client_key), auth.as_bytes());
+        let expected: Vec<u8> = client_key.iter().zip(&signature).map(|(k, s)| k ^ s).collect();
+        if STANDARD.decode(proof).ok()? != expected {
+            return None;
+        }
+        let signer = self.forged.as_deref().unwrap_or(&self.password);
+        let server_key = hash.hmac(&salted(signer), b"Server Key");
+        Some(format!("v={}", STANDARD.encode(hash.hmac(&server_key, auth.as_bytes()))).into_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
