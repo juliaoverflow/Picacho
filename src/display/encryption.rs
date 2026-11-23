@@ -184,6 +184,17 @@ impl MailApp {
                     )),
                 ))
             })
+            // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.
+            .children(self.accounts.iter().filter(|a| ring.own_key(&a.email).is_some()).map(|a| {
+                self.switch_setting(
+                    &format!("Ask for encrypted replies ({})", a.email),
+                    "Tells people's mail apps (in the Autocrypt header of mail you send) that you'd like them to encrypt to you by default. Their app decides; apps that don't use Autocrypt ignore it.",
+                    format!("autocrypt-mutual-{}", a.id),
+                    ring.prefers_mutual(&a.email),
+                    Action::ToggleAutocryptMutual(a.email.clone()),
+                    cx,
+                )
+            }))
             .children(checking.map(|k| self.key_check_panel(k, cx)))
             .child(self.setting(
                 "Find keys",
@@ -409,6 +420,14 @@ impl MailApp {
                     Err(e) => self.key_error = Some(format!("{e:#}")),
                 }
             }
+            Action::ToggleAutocryptMutual(email) => {
+                let mut ring = Keyring::clone(&self.backend.keyring());
+                let on = !ring.prefers_mutual(&email);
+                ring.set_prefers_mutual(&email, on);
+                if let Err(e) = self.backend.set_keyring(ring) {
+                    self.key_error = Some(format!("{e:#}"));
+                }
+            }
             Action::RemoveKey(fp) => {
                 let mut ring = Keyring::clone(&self.backend.keyring());
                 ring.remove(&fp);
@@ -487,7 +506,7 @@ impl MailApp {
                             .with_context(|| format!("No key was found for {email}."))?;
                         let mut ring = Keyring::clone(&b.keyring());
                         anyhow::ensure!(
-                            ring.add_found(&email, &found.0)?,
+                            ring.add_found_from(&email, &found.0, found.1)?,
                             "You already have a key for {email} that you imported yourself."
                         );
                         b.set_keyring(ring)?;

@@ -1631,11 +1631,7 @@ pub(crate) fn protected(message: &Message, d: &Draft, keys: &Keys) -> Result<Vec
     {
         let envelope = message.envelope();
         let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
-        if let Some(public) = ring.own_public_bytes(&from) {
-            let header = format!(
-                "Autocrypt: {}\r\n",
-                crate::sync::keys::autocrypt_header(&from, &public)
-            );
+        if let Some(header) = ring.autocrypt_header_line(&from) {
             raw = [header.as_bytes(), &raw].concat();
         }
     }
@@ -2334,6 +2330,33 @@ mod tests {
         };
         let sent = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
         assert!(!sent.contains("\r\nBcc:"), "{sent}");
+        Ok(())
+    }
+
+    /// Autocrypt 1.1 §2.1–§2.2: mail from an address with a key carries
+    /// its Autocrypt header, with prefer-encrypt=mutual only once chosen.
+    #[test]
+    fn sent_mail_carries_the_autocrypt_header_and_preference() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let d = Draft { to: "ana@example.com".into(), subject: "Hi".into(), ..Draft::default() };
+        let message = build(&a, &d, false)?;
+        let mut ring = crate::manage::openpgp::Keyring::default();
+        let certs = crate::manage::smime::Certificates::default();
+        let sent = |ring: &crate::manage::openpgp::Keyring| {
+            let raw = protected(&message, &d, &Keys { ring, certs: &certs }).unwrap();
+            String::from_utf8_lossy(&raw).into_owned()
+        };
+        assert!(!sent(&ring).contains("Autocrypt:"));
+        ring.secret.push(
+            crate::manage::openpgp::test_key("Me <me@example.com>", "")
+                .to_armored_string(Default::default())?,
+        );
+        let plain = sent(&ring);
+        assert!(plain.starts_with("Autocrypt: addr=me@example.com; keydata="), "{plain}");
+        ring.set_prefers_mutual("me@example.com", true);
+        let mutual = sent(&ring);
+        assert!(mutual.starts_with("Autocrypt: addr=me@example.com; prefer-encrypt=mutual; keydata="), "{mutual}");
         Ok(())
     }
 

@@ -2558,5 +2558,26 @@ mod tests {
         });
         act(&view, Action::MatchFingerprint(fp.clone()), cx);
         assert!(view.read_with(cx, |this, _| this.backend.keyring().list()[0].verified));
+        // Autocrypt's prefer-encrypt=mutual: a switch per account with a
+        // key, off until turned on (Autocrypt 1.1 §2.2).
+        let (id, me) = view.update(cx, |this, _| {
+            let a = this.accounts[0].clone();
+            let mut ring = crate::manage::openpgp::Keyring::clone(&this.backend.keyring());
+            ring.secret.push(
+                crate::manage::openpgp::test_key(&format!("Me <{}>", a.email), "")
+                    .to_armored_string(Default::default())
+                    .unwrap(),
+            );
+            this.backend.set_keyring(ring).unwrap();
+            (a.id, a.email)
+        });
+        frame(cx);
+        let switch: &'static str = format!("autocrypt-mutual-{id}").leak();
+        assert!(cx.debug_bounds(switch).is_some());
+        assert!(!view.read_with(cx, |this, _| this.backend.keyring().prefers_mutual(&me)));
+        act(&view, Action::ToggleAutocryptMutual(me.clone()), cx);
+        assert!(view.read_with(cx, |this, _| this.backend.keyring().prefers_mutual(&me)));
+        act(&view, Action::ToggleAutocryptMutual(me.clone()), cx);
+        assert!(!view.read_with(cx, |this, _| this.backend.keyring().prefers_mutual(&me)));
     }
 }
