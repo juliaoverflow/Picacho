@@ -34,6 +34,12 @@ pub struct Collection {
     pub sync_token: String,
     /// The older `getctag` (CalendarServer), which changes with any change.
     pub ctag: String,
+    /// The largest resource it takes, in octets (`max-resource-size`, RFC
+    /// 4791 §5.2.5, RFC 6352 §6.2.3); 0 where it doesn't say.
+    pub max_size: u64,
+    /// An address book's vCard versions (`supported-address-data`, RFC
+    /// 6352 §6.2.2): `3.0`, `4.0`; empty where it doesn't say (3.0).
+    pub vcard_versions: Vec<String>,
 }
 
 /// What changed in a collection since a sync token (RFC 6578).
@@ -319,7 +325,10 @@ impl Client {
             bail!("This was changed on the server meanwhile. Read it again and retry.");
         }
         if status == reqwest::StatusCode::FORBIDDEN {
-            let body = response.text().unwrap_or_default();
+            // Only the start: the reason (a precondition element) is there.
+            let mut body = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(response, 64 * 1024), &mut body);
+            let body = String::from_utf8_lossy(&body);
             bail!(Forbidden(body.chars().take(4096).collect()));
         }
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -333,7 +342,7 @@ impl Client {
     }
 
     fn xml(&self, method: &str, url: &url::Url, depth: &str, body: &str) -> Result<String> {
-        Ok(self
+        body_text(self
             .send(
                 method,
                 url,
@@ -342,8 +351,7 @@ impl Client {
                     ("Content-Type", "application/xml; charset=utf-8"),
                 ],
                 body.to_owned(),
-            )?
-            .text()?)
+            )?)
     }
 
     /// A property's href at `url` (Depth 0).
@@ -364,7 +372,7 @@ impl Client {
     /// The collections of kind `kind` (`addressbook` or `calendar`) at
     /// `home` (Depth 1), or `home` itself if it is one.
     fn collections(&self, home: &url::Url, kind: &str) -> Result<Vec<Collection>> {
-        let body = "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"http://apple.com/ns/ical/\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype/><d:displayname/><d:current-user-privilege-set/><c:supported-calendar-component-set/><a:calendar-color/><d:sync-token/><cs:getctag/></d:prop></d:propfind>";
+        let body = "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\" xmlns:a=\"http://apple.com/ns/ical/\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype/><d:displayname/><d:current-user-privilege-set/><c:supported-calendar-component-set/><a:calendar-color/><d:sync-token/><cs:getctag/><c:max-resource-size/><r:max-resource-size/><r:supported-address-data/></d:prop></d:propfind>";
         let text = self.xml("PROPFIND", home, "1", body)?;
         let doc = parse(&text)?;
         let mut out = Vec::new();
@@ -418,6 +426,13 @@ impl Client {
                 .filter_map(|c| c.attribute("name"))
                 .map(str::to_ascii_uppercase)
                 .collect();
+            let vcard_versions = response
+                .descendants()
+                .filter(|n| n.tag_name().name() == "supported-address-data")
+                .flat_map(|set| set.children().filter(|c| c.tag_name().name() == "address-data-type"))
+                .filter_map(|c| c.attribute("version"))
+                .map(str::to_owned)
+                .collect();
             out.push(Collection {
                 href: url,
                 name,
@@ -426,6 +441,8 @@ impl Client {
                 color: found("calendar-color"),
                 sync_token: found("sync-token"),
                 ctag: found("getctag"),
+                max_size: found("max-resource-size").parse().unwrap_or(0),
+                vcard_versions,
             });
         }
         Ok(out)
@@ -472,7 +489,7 @@ impl Client {
             body,
         );
         let text = match response {
-            Ok(r) => r.text()?,
+            Ok(r) => body_text(r)?,
             Err(e) => {
                 if let Some(Forbidden(body)) = e.downcast_ref::<Forbidden>()
                     && body.contains("valid-sync-token")
@@ -529,6 +546,21 @@ impl Client {
         self.find_href(&principal, home_set, namespace)?
             .context("This server doesn't say where your collections go.")
     }
+    /// The compliance classes in a resource's `DAV:` header (OPTIONS),
+    /// lowercase: `calendar-auto-schedule` says the server schedules
+    /// (RFC 6638 §2).
+    pub fn compliance(&self, url: &url::Url) -> Result<Vec<String>> {
+        let response = self.send("OPTIONS", url, &[], String::new())?;
+        Ok(response
+            .headers()
+            .get_all("DAV")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect())
+    }
     /// The account's scheduling outbox (`schedule-outbox-URL`, RFC 6638).
     pub fn outbox(&self, given: &str) -> Result<url::Url> {
         let given = given.trim();
@@ -562,7 +594,7 @@ impl Client {
             .map(|r| format!("mailto:{r}"))
             .collect::<Vec<_>>()
             .join(", ");
-        Ok(self
+        body_text(self
             .send(
                 "POST",
                 outbox,
@@ -572,8 +604,7 @@ impl Client {
                     ("Recipient", &recipients),
                 ],
                 body,
-            )?
-            .text()?)
+            )?)
     }
     /// Makes a collection at `href`: a calendar (MKCALENDAR, RFC 4791
     /// §5.3.1) for events, or an address book (extended MKCOL, RFC 5689),
@@ -618,19 +649,153 @@ impl Client {
         etag: &str,
         data: String,
     ) -> Result<String> {
+        Ok(self.put_scheduled(href, content_type, etag, "", data)?.0)
+    }
+    /// As `put`; with `schedule_tag` (RFC 6638 §3.2), only over that
+    /// scheduling version (If-Schedule-Tag-Match), which a guest's answer
+    /// arriving on the server doesn't change, so an attendee's own change
+    /// isn't refused because the organizer's copy merely took a reply.
+    /// Returns the new ETag and Schedule-Tag, where the server says.
+    pub fn put_scheduled(
+        &self,
+        href: &url::Url,
+        content_type: &str,
+        etag: &str,
+        schedule_tag: &str,
+        data: String,
+    ) -> Result<(String, String)> {
         let mut headers = vec![("Content-Type", content_type)];
-        if etag.is_empty() {
+        if !schedule_tag.is_empty() {
+            headers.push(("If-Schedule-Tag-Match", schedule_tag));
+        } else if etag.is_empty() {
             headers.push(("If-None-Match", "*"));
         } else {
             headers.push(("If-Match", etag));
         }
         let response = self.send("PUT", href, &headers, data)?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Ok((header("ETag"), header("Schedule-Tag")))
+    }
+    /// Changes a collection's name and (a calendar's) colour (PROPPATCH,
+    /// RFC 4918 §9.2). An empty `color` leaves it as it is.
+    pub fn rename_collection(&self, href: &url::Url, name: &str, color: &str) -> Result<()> {
+        let color = if color.is_empty() {
+            String::new()
+        } else {
+            format!("<a:calendar-color>{}</a:calendar-color>", xml_escape(color))
+        };
+        let body = format!(
+            "<?xml version=\"1.0\"?><d:propertyupdate xmlns:d=\"DAV:\" xmlns:a=\"http://apple.com/ns/ical/\"><d:set><d:prop><d:displayname>{}</d:displayname>{color}</d:prop></d:set></d:propertyupdate>",
+            xml_escape(name)
+        );
+        let text = self.xml("PROPPATCH", href, "0", &body)?;
+        // A 207 whose propstat refuses a property: say so.
+        let doc = parse(&text)?;
+        let refused = doc
+            .descendants()
+            .filter(|n| n.tag_name().name() == "propstat")
+            .filter_map(|p| text_of(p, "status"))
+            .any(|s| !s.contains(" 200 "));
+        ensure!(!refused, "The server didn't accept the new name or colour.");
+        Ok(())
+    }
+    /// Removes a whole collection (a calendar or address book) and what is
+    /// in it (DELETE, RFC 4918 §9.6.1).
+    pub fn delete_collection(&self, href: &url::Url) -> Result<()> {
+        self.delete(href, "")
+    }
+    /// The account's storage used and left (RFC 4331), in octets, at
+    /// `url`; `None` where the server doesn't say.
+    pub fn quota(&self, url: &url::Url) -> Result<Option<(u64, u64)>> {
+        let body = "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:quota-used-bytes/><d:quota-available-bytes/></d:prop></d:propfind>";
+        let text = self.xml("PROPFIND", url, "0", body)?;
+        let doc = parse(&text)?;
+        let number = |name: &str| text_of(doc.root(), name).and_then(|t| t.parse::<u64>().ok());
+        Ok(match (number("quota-used-bytes"), number("quota-available-bytes")) {
+            (Some(used), Some(left)) => Some((used, left)),
+            _ => None,
+        })
+    }
+    /// The account's scheduling inbox (`schedule-inbox-URL`, RFC 6638
+    /// §2.2), where a scheduling server delivers invitations and answers.
+    pub fn inbox(&self, given: &str) -> Result<url::Url> {
+        let given = given.trim();
+        let given = if given.contains("://") {
+            given.to_owned()
+        } else {
+            format!("https://{given}")
+        };
+        let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
+        if start.path() == "/" || start.path().is_empty() {
+            start.set_path("/.well-known/caldav");
+        }
+        let principal = self
+            .find_href(&start, "current-user-principal", DAV)?
+            .unwrap_or_else(|| start.clone());
+        self.find_href(&principal, "schedule-inbox-URL", CALDAV)?
+            .context("This server has no scheduling inbox.")
+    }
+    /// Adds a file to a calendar resource (managed attachments, RFC 8607
+    /// §3.4: POST `?action=attachment-add`), returning the resource's new
+    /// ETag. The server keeps the file and puts an ATTACH in the event.
+    pub fn add_attachment(
+        &self,
+        href: &url::Url,
+        etag: &str,
+        name: &str,
+        content_type: &str,
+        data: Vec<u8>,
+    ) -> Result<String> {
+        let mut url = href.clone();
+        url.query_pairs_mut().append_pair("action", "attachment-add");
+        let disposition = format!(
+            "attachment;filename=\"{}\"",
+            name.replace(['"', '\\', '\r', '\n'], "_")
+        );
+        let mut request = self
+            .http
+            .post(url.clone())
+            .basic_auth(&self.user, Some(&self.password))
+            .header("Content-Type", content_type)
+            .header("Content-Disposition", disposition)
+            .body(data);
+        if !etag.is_empty() {
+            request = request.header("If-Match", etag);
+        }
+        let response = request.send().with_context(|| {
+            format!("Couldn't reach {}", url.host_str().unwrap_or("the server"))
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            bail!("This was changed on the server meanwhile. Read it again and retry.");
+        }
+        if status == reqwest::StatusCode::INSUFFICIENT_STORAGE
+            || status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        {
+            bail!("The server has no room for this attachment.");
+        }
+        ensure!(status.is_success(), "The server didn't add the attachment ({status}).");
         Ok(response
             .headers()
             .get("ETag")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned())
+    }
+    /// Whether a calendar collection keeps attachments itself (RFC 8607
+    /// `calendar-managed-attachments` in its DAV header).
+    pub fn manages_attachments(&self, url: &url::Url) -> Result<bool> {
+        Ok(self
+            .compliance(url)?
+            .iter()
+            .any(|c| c == "calendar-managed-attachments"))
     }
 
     /// Removes a resource, if it is still the version with `etag`.
@@ -650,6 +815,28 @@ impl Client {
 }
 
 /// Text escaped for an XML element.
+/// The most a server's answer may be: a whole calendar or address book
+/// read at once is large, but past this it is a fault or an attack, and
+/// would be parsed (and kept) in memory whole.
+const MOST_BODY: u64 = 256 * 1024 * 1024;
+/// A response's body as text, refusing one larger than `MOST_BODY`.
+fn body_text(response: reqwest::blocking::Response) -> Result<String> {
+    use std::io::Read;
+    if response.content_length().is_some_and(|n| n > MOST_BODY) {
+        bail!("The server's answer is too large.");
+    }
+    let mut data = Vec::new();
+    response.take(MOST_BODY + 1).read_to_end(&mut data)?;
+    ensure!(
+        data.len() as u64 <= MOST_BODY,
+        "The server's answer is too large."
+    );
+    Ok(match String::from_utf8(data) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -840,11 +1027,16 @@ pub fn test_server(
             reader.read_line(&mut first).unwrap();
             let mut length = 0;
             let mut auth = false;
+            let mut conditions = String::new();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                     length = v.trim().parse().unwrap();
+                }
+                // Conditional headers, for tests to check: kept before the body.
+                if line.to_ascii_lowercase().starts_with("if-schedule-tag-match:") {
+                    conditions.push_str(&line);
                 }
                 // "ana:secret", base64.
                 auth |= line.contains("Basic YW5hOnNlY3JldA==");
@@ -855,15 +1047,23 @@ pub fn test_server(
             assert!(auth, "every request signs in");
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            let body = String::from_utf8_lossy(&body).into_owned();
+            let body = conditions + &String::from_utf8_lossy(&body);
             let mut parts = first.split(' ');
             let method = parts.next().unwrap().to_owned();
             let path = parts.next().unwrap().to_owned();
             let (status, text) = respond(&method, &path, &body);
             write!(
                 stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nETag: \"e-{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nETag: \"e-{}\"\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
                 seen.len(),
+                // OPTIONS: a scheduling server's compliance classes.
+                if method == "OPTIONS" {
+                    "DAV: 1, 3, calendar-access, calendar-auto-schedule, calendar-managed-attachments\r\n"
+                } else if method == "PUT" {
+                    "Schedule-Tag: \"s-1\"\r\n"
+                } else {
+                    ""
+                },
                 text.len()
             )
             .unwrap();
@@ -936,6 +1136,8 @@ mod tests {
             color: String::new(),
             sync_token: "t2".into(),
             ctag: String::new(),
+            max_size: 0,
+            vcard_versions: Vec::new(),
         };
         let known = vec![
             (at("a.ics"), "\"a1\"".to_owned()),

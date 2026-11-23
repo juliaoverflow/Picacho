@@ -108,6 +108,18 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
             ),
         ));
     }
+    // Urgency for the recipients' apps: Importance (RFC 2156) and the
+    // X-Priority most apps read. Normal says nothing.
+    let (importance, x_priority) = match d.priority {
+        crate::manage::model::Priority::High => (Some("high"), Some("1 (Highest)")),
+        crate::manage::model::Priority::Low => (Some("low"), Some("5 (Lowest)")),
+        crate::manage::model::Priority::Normal => (None, None),
+    };
+    if let (Some(i), Some(x)) = (importance, x_priority) {
+        builder = builder
+            .raw_header(raw_header("Importance", i.into()))
+            .raw_header(raw_header("X-Priority", x.into()));
+    }
     if !d.reply_id.is_empty() {
         // Both come from the message replied to, written by its sender:
         // kept to one line so they can't add headers of their own.
@@ -209,6 +221,11 @@ pub(crate) struct ServerLimits {
     /// FUTURERELEASE (RFC 4865): how far ahead it holds a message for
     /// release, in seconds (0 where it doesn't).
     pub(crate) future_release: u64,
+    /// MT-PRIORITY (RFC 6710): it takes a message's priority.
+    pub(crate) mt_priority: bool,
+    /// DELIVERBY (RFC 2852): the shortest time it accepts for BY=, in
+    /// seconds (0: any); `None` where it doesn't.
+    pub(crate) deliver_by: Option<u64>,
 }
 
 /// The outgoing server can't hold a message for sending later (no
@@ -241,6 +258,12 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
                 limits.future_release = words.next().and_then(|n| n.parse().ok()).unwrap_or(0)
             }
             Some("ENHANCEDSTATUSCODES") => limits.enhanced = true,
+            // "MT-PRIORITY MIXER" (a profile, or none).
+            Some("MT-PRIORITY") => limits.mt_priority = true,
+            // "DELIVERBY 240" (or no minimum).
+            Some("DELIVERBY") => {
+                limits.deliver_by = Some(words.next().and_then(|n| n.parse().ok()).unwrap_or(0))
+            }
             Some("BINARYMIME") => limits.binary_mime = true,
             // "BURL imap" (or a bare BURL, which fetches from URLs it is given).
             Some("BURL") => {
@@ -301,6 +324,8 @@ pub(crate) struct Endpoint {
     pub(crate) oauth: bool,
     /// TLS from the first byte, rather than STARTTLS.
     pub(crate) implicit_tls: bool,
+    /// Signs in with Kerberos (SASL GSSAPI) rather than a password.
+    pub(crate) kerberos: bool,
 }
 impl Endpoint {
     /// The account's own outgoing server.
@@ -308,13 +333,14 @@ impl Endpoint {
         Self {
             host: a.smtp_host.clone(),
             port: a.smtp_port,
-            user: if a.oauth {
+            user: if a.oauth && a.sso.is_none() {
                 a.email.clone()
             } else {
                 a.login().to_owned()
             },
             oauth: a.oauth,
             implicit_tls: crate::manage::model::smtp_implicit_tls(a.smtp_tls, a.smtp_port),
+            kerberos: a.kerberos,
         }
     }
     /// A sending address's own outgoing server.
@@ -326,6 +352,8 @@ impl Endpoint {
             user: i.login().to_owned(),
             oauth: false,
             implicit_tls: crate::manage::model::smtp_implicit_tls(s.tls, s.port),
+            // A sending address's own server signs in with its password.
+            kerberos: false,
         })
     }
 }
@@ -524,7 +552,9 @@ impl<S: Read + Write + Patience> Session<S> {
         limits: &ServerLimits,
         secret: &str,
     ) -> Result<()> {
-        let order: &[sasl::Mechanism] = if endpoint.oauth {
+        let order: &[sasl::Mechanism] = if endpoint.kerberos {
+            &sasl::KERBEROS_ORDER
+        } else if endpoint.oauth {
             &sasl::TOKEN_ORDER
         } else {
             &sasl::PASSWORD_ORDER
@@ -550,6 +580,7 @@ impl<S: Read + Write + Patience> Session<S> {
                 host: endpoint.host.clone(),
                 port: endpoint.port,
                 binding: self.reader.get_ref().binding(),
+                service: "smtp",
             },
         );
         // RFC 4954: the first message may go with the command.
@@ -884,6 +915,20 @@ pub(crate) fn deliver_bytes(
     }
     if let Some(seconds) = hold_for {
         mail.push_str(&format!(" HOLDFOR={seconds}"));
+    }
+    // Priority (RFC 6710): only where it isn't the default, since a server
+    // may lower it for senders it doesn't trust; that's the server's to do.
+    if limits.mt_priority && !d.priority.is_normal() {
+        mail.push_str(&format!(" MT-PRIORITY={}", d.priority.mt_priority()));
+    }
+    // A time limit (RFC 2852): returned rather than delivered late. Not
+    // with a held message, whose release would count against it.
+    if a.deliver_within_hours > 0
+        && hold_for.is_none()
+        && let Some(minimum) = limits.deliver_by
+    {
+        let seconds = (u64::from(a.deliver_within_hours) * 3600).max(minimum);
+        mail.push_str(&format!(" BY={seconds};R"));
     }
     let rcpt = |to: &lettre::Address| {
         let mut line = format!("RCPT TO:<{to}>");

@@ -101,6 +101,7 @@ impl MailApp {
                         cx,
                     )),
             ))
+            .child(self.address_books_list(&server, cx))
         } else {
             page.child(
                 div()
@@ -303,6 +304,47 @@ impl MailApp {
                     Ok(format!("Read {n} contacts from {}", a.email))
                 });
             }
+            Action::ListAddressBooks => {
+                if self.contacts_busy {
+                    return;
+                }
+                self.contacts_busy = true;
+                self.task(cx, |b| b.address_books(), |this, result, cx| {
+                    this.contacts_busy = false;
+                    match result {
+                        Ok(books) => this.address_books = Some(books),
+                        Err(e) => this.contacts_error = Some(format!("{e:#}")),
+                    }
+                    cx.notify();
+                });
+            }
+            Action::RenameAddressBook(href) => {
+                let name = self.collection_name.read(cx).value().trim().to_owned();
+                if name.is_empty() {
+                    self.contacts_error = Some("Write the new name in the field first.".into());
+                    cx.notify();
+                    return;
+                }
+                self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
+                if let Some(books) = &mut self.address_books {
+                    for b in books.iter_mut().filter(|b| b.0 == href) {
+                        b.1 = name.clone();
+                    }
+                }
+                self.contacts_run(cx, move |b| {
+                    b.rename_address_book(&href, &name)?;
+                    Ok(format!("Renamed the address book {name}"))
+                });
+            }
+            Action::DeleteAddressBook(href) => {
+                if let Some(books) = &mut self.address_books {
+                    books.retain(|b| b.0 != href);
+                }
+                self.contacts_run(cx, move |b| {
+                    b.delete_address_book(&href)?;
+                    Ok("Deleted the address book".into())
+                });
+            }
             Action::CreateAddressBook => {
                 let name = self.collection_name.read(cx).value().trim().to_owned();
                 self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
@@ -375,6 +417,69 @@ impl MailApp {
         }
     }
 
+    /// The server's address books, with Rename (to the name in the field
+    /// above) and Delete; listed when asked.
+    fn address_books_list(&self, server: &crate::sync::carddav::Server, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let Some(books) = &self.address_books else {
+            return self
+                .setting(
+                    "Address books",
+                    "Rename or delete the server's address books.",
+                    self.button("address-books-list", "Show", "list", Action::ListAddressBooks, false, cx),
+                )
+                .into_any_element();
+        };
+        let mut list = div().id("address-books").flex().flex_col().gap_2();
+        for (href, name, writable) in books {
+            let default = server.book == *href;
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.))
+                            .child(if default {
+                                format!("{name} (new contacts go here)")
+                            } else {
+                                name.clone()
+                            }),
+                    )
+                    .when(*writable, |d| {
+                        d.child(self.button(
+                            format!("address-book-rename-{href}"),
+                            "Rename",
+                            "",
+                            Action::RenameAddressBook(href.clone()),
+                            false,
+                            cx,
+                        ))
+                        .child(
+                            self.button(
+                                format!("address-book-delete-{href}"),
+                                "Delete",
+                                "",
+                                Action::DeleteAddressBook(href.clone()),
+                                false,
+                                cx,
+                            )
+                            .text_color(rgb(c.danger)),
+                        )
+                    }),
+            );
+        }
+        self.setting(
+            "Address books",
+            "Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.",
+            list,
+        )
+        .into_any_element()
+    }
     fn contacts_run(
         &mut self,
         cx: &mut Context<Self>,

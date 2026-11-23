@@ -285,6 +285,9 @@ impl Connection {
         c.tap = tap;
         let ext = c.extensions()?;
         c.enabled = crate::sync::transport::enable(&mut c.session, &ext)?;
+        if c.enabled.rev2 {
+            c.extensions = Some(ext.as_rev2());
+        }
         Ok(c)
     }
     /// A mailbox name (as the cache keeps it) as this session takes it, quoted.

@@ -383,3 +383,42 @@ fn closing_the_window_frees_the_app(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(weak.upgrade().is_none(), "MailApp outlives its window");
 }
+
+#[gpui::test]
+fn setup_offers_an_organizations_single_sign_on(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    act(&view, Action::ChooseService(Service::Other), cx);
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.form[EMAIL], "ana@example.edu", w, cx);
+        this.step = Step::Credentials;
+    });
+    act(&view, Action::Manual, cx);
+    frame(cx);
+    // form-1: the password; form-10: the sign-in service (SSO_ISSUER).
+    assert_eq!((PASSWORD, SSO_ISSUER), (1, 10));
+    assert!(cx.debug_bounds("form-1").is_some());
+    act(&view, Action::ToggleSetupSso, cx);
+    frame(cx);
+    // The password gives way to the sign-in service's fields.
+    assert!(cx.debug_bounds("form-1").is_none());
+    assert!(cx.debug_bounds("form-10").is_some());
+    view.update_in(cx, |this, w, cx| {
+        for (i, text) in [
+            (IMAP_HOST, "imap.example.edu"),
+            (IMAP_PORT, "993"),
+            (SMTP_HOST, "smtp.example.edu"),
+            (SMTP_PORT, "587"),
+            (SSO_ISSUER, "https://login.example.edu/realms/mail/"),
+        ] {
+            MailApp::set(&this.form[i], text, w, cx);
+        }
+    });
+    let a = view.read_with(cx, |this, cx| this.setup_account(cx));
+    assert!(a.oauth && !a.kerberos);
+    assert_eq!(a.sso.as_ref().unwrap().issuer, "https://login.example.edu/realms/mail");
+    assert!(a.validate().is_ok(), "{:?}", a.validate());
+    // Kerberos and single sign-on exclude each other.
+    act(&view, Action::ToggleSetupKerberos, cx);
+    view.read_with(cx, |this, _| assert!(this.setup_kerberos && !this.setup_sso));
+}

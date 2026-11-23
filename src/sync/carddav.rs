@@ -8,7 +8,7 @@
 //! its original text, and an edit replaces only those properties in it,
 //! so what other apps keep stays as it was.
 use crate::sync::dav;
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 
 /// Someone in an address book.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -522,6 +522,46 @@ pub struct Server {
     /// only what changed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub states: std::collections::BTreeMap<String, dav::State>,
+    /// The book new cards go to takes only vCard 4.0
+    /// (`supported-address-data`): new cards are written that way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vcard4: bool,
+    /// The largest card that book takes, in octets (`max-resource-size`);
+    /// 0 where it doesn't say.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_size: u64,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A card written as vCard 3.0, as vCard 4.0 (RFC 6350) for a book that
+/// takes nothing else: VERSION, a photo as a data URI, a group's
+/// KIND/MEMBER instead of Apple's X-ADDRESSBOOKSERVER ones, and no N
+/// requirement (kept anyway; it is allowed).
+pub fn to_vcard4(text: &str) -> String {
+    let mut out = String::new();
+    for line in unfold(text) {
+        let upper = line.to_ascii_uppercase();
+        let line = if upper.starts_with("VERSION:") {
+            "VERSION:4.0".to_owned()
+        } else if let Some(rest) = upper.strip_prefix("X-ADDRESSBOOKSERVER-KIND:") {
+            format!("KIND:{}", rest.to_ascii_lowercase())
+        } else if upper.starts_with("X-ADDRESSBOOKSERVER-MEMBER:") {
+            format!("MEMBER:{}", &line["X-ADDRESSBOOKSERVER-MEMBER:".len()..])
+        } else if upper.starts_with("PHOTO;ENCODING=B;TYPE=") {
+            // PHOTO;ENCODING=b;TYPE=JPEG:<data> → PHOTO:data:image/jpeg;base64,<data>
+            let (head, data) = line.split_once(':').unwrap_or((&line, ""));
+            let kind = head.rsplit('=').next().unwrap_or("jpeg").to_ascii_lowercase();
+            format!("PHOTO:data:image/{kind};base64,{data}")
+        } else if upper.starts_with("PHOTO;VALUE=URI:") {
+            format!("PHOTO:{}", &line["PHOTO;VALUE=uri:".len()..])
+        } else {
+            line
+        };
+        out.push_str(&fold(&line));
+    }
+    out
 }
 
 const QUERY: &str = "<?xml version=\"1.0\"?><c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag/><c:address-data/></d:prop></c:addressbook-query>";
@@ -547,6 +587,9 @@ pub struct Fetched {
     pub book: String,
     /// Each address book's state now, for the next sync.
     pub states: std::collections::BTreeMap<String, dav::State>,
+    /// What that book takes (`Server::vcard4`, `Server::max_size`).
+    pub vcard4: bool,
+    pub max_size: u64,
 }
 
 /// Reads the address books, downloading only what changed since `known`
@@ -611,15 +654,16 @@ pub fn fetch_changes(
         }
         states.insert(key, read.state);
     }
-    let book = books
-        .iter()
-        .find(|b| b.writable)
-        .map(|b| b.href.to_string())
-        .unwrap_or_default();
+    let writable = books.iter().find(|b| b.writable);
+    let book = writable.map(|b| b.href.to_string()).unwrap_or_default();
     Ok(Fetched {
         cards,
         book,
         states,
+        vcard4: writable.is_some_and(|b| {
+            !b.vcard_versions.is_empty() && !b.vcard_versions.iter().any(|v| v == "3.0")
+        }),
+        max_size: writable.map_or(0, |b| b.max_size),
     })
 }
 
@@ -632,6 +676,31 @@ pub fn create_book(server: &Server, password: &str, tls: native_tls::TlsConnecto
     let href = url::Url::parse(&format!("{}/", href.as_str().trim_end_matches(".x")))?;
     client.make_collection(&href, false, name, "")?;
     Ok(href.to_string())
+}
+
+/// The address books, by href and name, for choosing among them.
+pub fn books(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<Vec<(String, String, bool)>> {
+    let client = dav::Client::new(&server.user, password, tls)?;
+    Ok(dav::discover(
+        &client,
+        &server.url,
+        "carddav",
+        "addressbook",
+        "addressbook-home-set",
+        dav::CARDDAV,
+    )?
+    .into_iter()
+    .map(|b| (b.href.to_string(), b.name, b.writable))
+    .collect())
+}
+/// Renames an address book (PROPPATCH).
+pub fn rename_book(server: &Server, password: &str, tls: native_tls::TlsConnector, href: &str, name: &str) -> Result<()> {
+    ensure!(!name.trim().is_empty(), "Give the address book a name.");
+    dav::Client::new(&server.user, password, tls)?.rename_collection(&url::Url::parse(href)?, name.trim(), "")
+}
+/// Deletes an address book and its cards.
+pub fn delete_book(server: &Server, password: &str, tls: native_tls::TlsConnector, href: &str) -> Result<()> {
+    dav::Client::new(&server.user, password, tls)?.delete_collection(&url::Url::parse(href)?)
 }
 
 /// Saves a card on the server: a new one in `book`, or a change to the
@@ -654,7 +723,18 @@ pub fn save(
     } else {
         url::Url::parse(&card.href)?
     };
-    let text = write_vcard(card);
+    let mut text = write_vcard(card);
+    // A new card for a book that only takes vCard 4.0; edited ones keep
+    // the version they came in.
+    if card.href.is_empty() && server.vcard4 {
+        text = to_vcard4(&text);
+    }
+    if server.max_size > 0 && text.len() as u64 > server.max_size {
+        bail!(
+            "This contact is too large for the address book ({} KB at most). Use a smaller photo.",
+            server.max_size / 1024
+        );
+    }
     saved.etag = client.put(&href, "text/vcard; charset=utf-8", &card.etag, text.clone())?;
     saved.href = href.to_string();
     saved.vcard = text;
@@ -678,6 +758,24 @@ pub fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_cards_go_as_vcard4_where_only_that_is_taken() {
+        let card = Card {
+            uid: "g".into(),
+            name: "Friends".into(),
+            group: true,
+            members: vec!["bo".into()],
+            photo: "data:image/png;base64,aGVsbG8=".into(),
+            ..Default::default()
+        };
+        let v4 = to_vcard4(&write_vcard(&card));
+        assert!(v4.contains("VERSION:4.0\r\n") && !v4.contains("VERSION:3.0"), "{v4}");
+        assert!(v4.contains("KIND:group") && v4.contains("MEMBER:urn:uuid:bo"), "{v4}");
+        assert!(v4.contains("PHOTO:data:image/png;base64,aGVsbG8="), "{v4}");
+        let back = parse_vcards(&v4).remove(0);
+        assert!(back.group && back.members == ["bo"]);
+    }
 
     #[test]
     fn vcards_of_both_versions_are_read() {

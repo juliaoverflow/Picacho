@@ -24,6 +24,9 @@ pub fn from_server(card: &Card) -> bool {
     !card.href.is_empty()
 }
 
+/// Where a JMAP server's ContactCard state is kept in `Server::states`.
+const JMAP_STATE_KEY: &str = "jmap";
+
 impl Backend {
     /// Every card, the server's and this computer's.
     pub fn contacts(&self) -> Vec<Card> {
@@ -62,6 +65,8 @@ impl Backend {
         let cards = fetched.cards;
         server.book = fetched.book;
         server.states = fetched.states;
+        server.vcard4 = fetched.vcard4;
+        server.max_size = fetched.max_size;
         #[cfg(not(test))]
         store::write_secret_text(PASSWORD, password)?;
         self.store
@@ -127,15 +132,119 @@ impl Backend {
         self.store
             .set_preference(SERVER, &serde_json::to_string(&server)?)
     }
+    /// The server's address books: (href, name, whether it can be written).
+    pub fn address_books(&self) -> Result<Vec<(String, String, bool)>> {
+        let server = self
+            .contacts_server()
+            .context("No contacts server is set up.")?;
+        if let Some(a) = self.contacts_jmap(&server)? {
+            return self.with_jmap_contacts(&a, |s| {
+                Ok(crate::sync::jscal::address_books(s)?
+                    .into_iter()
+                    .map(|b| (format!("jmap:{}", b.id), b.name, b.writable))
+                    .collect())
+            });
+        }
+        carddav::books(&server, &self.contacts_password()?, self.tls_connector()?)
+    }
+    /// Renames an address book on the server.
+    pub fn rename_address_book(&self, href: &str, name: &str) -> Result<()> {
+        ensure!(!name.trim().is_empty(), "Give the address book a name.");
+        let server = self
+            .contacts_server()
+            .context("No contacts server is set up.")?;
+        match self.contacts_jmap(&server)? {
+            Some(a) => {
+                let id = href.strip_prefix("jmap:").context("Not a JMAP address book.")?;
+                self.with_jmap_contacts(&a, |s| {
+                    crate::sync::jscal::rename_address_book(s, id, name.trim())
+                })
+            }
+            None => carddav::rename_book(
+                &server,
+                &self.contacts_password()?,
+                self.tls_connector()?,
+                href,
+                name,
+            ),
+        }
+    }
+    /// Deletes an address book and its cards from the server, then reads
+    /// what's left.
+    pub fn delete_address_book(&self, href: &str) -> Result<usize> {
+        let mut server = self
+            .contacts_server()
+            .context("No contacts server is set up.")?;
+        match self.contacts_jmap(&server)? {
+            Some(a) => {
+                let id = href.strip_prefix("jmap:").context("Not a JMAP address book.")?;
+                self.with_jmap_contacts(&a, |s| crate::sync::jscal::delete_address_book(s, id))?;
+                server.states.remove(JMAP_STATE_KEY);
+            }
+            None => {
+                carddav::delete_book(
+                    &server,
+                    &self.contacts_password()?,
+                    self.tls_connector()?,
+                    href,
+                )?;
+                server.states.remove(href);
+            }
+        }
+        if server.book == href {
+            server.book.clear();
+        }
+        self.store
+            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        // Its cards go from here too.
+        let kept: Vec<Card> = self
+            .contacts()
+            .into_iter()
+            .filter(|c| !(c.href.starts_with(href.trim_end_matches('/')) && !href.starts_with("jmap:")))
+            .collect();
+        self.save_contacts(&kept)?;
+        self.sync_contacts()
+    }
     /// Reads the address books again from the server set up before.
     pub fn sync_contacts(&self) -> Result<usize> {
         let mut server = self
             .contacts_server()
             .context("No contacts server is set up.")?;
         if let Some(a) = self.contacts_jmap(&server)? {
-            let (cards, book) = self.with_jmap_contacts(&a, crate::sync::jscal::cards)?;
-            if server.book.is_empty() || !server.book.starts_with("jmap:") {
+            // Once read, only what changed since (ContactCard/changes).
+            let since = server
+                .states
+                .get(JMAP_STATE_KEY)
+                .map(|s| s.sync_token.clone())
+                .filter(|t| !t.is_empty());
+            let known: Vec<Card> = self.contacts().into_iter().filter(from_server).collect();
+            let (cards, book, state) = self.with_jmap_contacts(&a, |s| {
+                if let Some(since) = &since
+                    && let Some((changed, gone, state)) = crate::sync::jscal::card_changes(s, since)?
+                {
+                    let gone: std::collections::HashSet<&str> = gone.iter().map(String::as_str).collect();
+                    let replaced: std::collections::HashSet<&str> =
+                        changed.iter().map(|c| c.href.as_str()).collect();
+                    let mut cards: Vec<Card> = known
+                        .into_iter()
+                        .filter(|k| !gone.contains(k.href.as_str()) && !replaced.contains(k.href.as_str()))
+                        .collect();
+                    cards.extend(changed);
+                    return Ok((cards, String::new(), state));
+                }
+                crate::sync::jscal::cards_in(s)
+            })?;
+            let mut changed = false;
+            if !book.is_empty() && (server.book.is_empty() || !server.book.starts_with("jmap:")) {
                 server.book = book;
+                changed = true;
+            }
+            let entry = server.states.entry(JMAP_STATE_KEY.to_owned()).or_default();
+            if entry.sync_token != state {
+                entry.sync_token = state;
+                changed = true;
+            }
+            if changed {
                 self.store
                     .set_preference(SERVER, &serde_json::to_string(&server)?)?;
             }
@@ -150,9 +259,15 @@ impl Backend {
             self.tls_connector()?,
             &known,
         )?;
-        if server.book != fetched.book || server.states != fetched.states {
+        if server.book != fetched.book
+            || server.states != fetched.states
+            || server.vcard4 != fetched.vcard4
+            || server.max_size != fetched.max_size
+        {
             server.book = fetched.book;
             server.states = fetched.states;
+            server.vcard4 = fetched.vcard4;
+            server.max_size = fetched.max_size;
             self.store
                 .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         }

@@ -36,6 +36,14 @@ impl Wire {
         self.patience = wait;
         self.deadline = Instant::now() + wait.unwrap_or(COMMAND_TIMEOUT);
     }
+    /// The server reported progress on a long command (INPROGRESS, RFC
+    /// 9585): its response gets a fresh time budget, since it is working
+    /// rather than gone. Only time: the byte budget stays.
+    pub(crate) fn progressed(&mut self) {
+        if self.patience.is_none() {
+            self.deadline = Instant::now() + COMMAND_TIMEOUT;
+        }
+    }
     /// A handle that can close the connection from another thread, ending
     /// a read that is waiting on it.
     pub(crate) fn interrupter(&self) -> io::Result<TcpStream> {

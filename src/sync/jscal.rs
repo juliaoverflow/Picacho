@@ -14,6 +14,136 @@ use serde_json::{Map, Value, json};
 // Calendars.
 
 /// A calendar on a JMAP server.
+/// A method refused for a reason worth handling: `cannotCalculateChanges`
+/// (the state is too old), `stateMismatch` (`ifInState` no longer holds).
+fn refused(e: &anyhow::Error, kind: &str) -> bool {
+    e.downcast_ref::<crate::sync::jmap::MethodError>()
+        .is_some_and(|m| m.is(kind))
+}
+/// What `Foo/changes` said since a state: created, updated and destroyed
+/// ids, and the new state. `None` when the server can't say (too old a
+/// state, or more changes than asked for at once), and everything is to
+/// be read again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changed {
+    pub changed: Vec<String>,
+    pub destroyed: Vec<String>,
+    pub state: String,
+}
+fn changes(s: &Session, method: &str, account: &str, since: &str) -> Result<Option<Changed>> {
+    let mut out = Changed::default();
+    let mut since = since.to_owned();
+    // Several pages where there is more (hasMoreChanges), up to a bound:
+    // past it, reading whole is cheaper.
+    for _ in 0..20 {
+        let v = match s.call_one(
+            method,
+            json!({ "accountId": account, "sinceState": since, "maxChanges": 500 }),
+        ) {
+            Ok(v) => v,
+            Err(e) if refused(&e, "cannotCalculateChanges") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let ids = |key: &str| -> Vec<String> {
+            v[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| i.as_str().map(str::to_owned))
+                .collect()
+        };
+        out.changed.extend(ids("created"));
+        out.changed.extend(ids("updated"));
+        out.destroyed.extend(ids("destroyed"));
+        since = v["newState"].as_str().unwrap_or_default().to_owned();
+        out.state = since.clone();
+        if !v["hasMoreChanges"].as_bool().unwrap_or(false) {
+            let destroyed: std::collections::HashSet<&String> = out.destroyed.iter().collect();
+            out.changed.retain(|id| !destroyed.contains(id));
+            out.changed.sort();
+            out.changed.dedup();
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
+}
+/// `Foo/get` of `ids` in pieces the server takes (`maxObjectsInGet`):
+/// the objects and the state they were read in.
+fn get_all(s: &Session, method: &str, account: &str, ids: &[String]) -> Result<(Vec<Value>, String)> {
+    let mut list = Vec::new();
+    let mut state = String::new();
+    for chunk in ids.chunks(s.max_get()) {
+        let v = s.call_one(method, json!({ "accountId": account, "ids": chunk }))?;
+        list.extend(v["list"].as_array().cloned().unwrap_or_default());
+        state = v["state"].as_str().unwrap_or_default().to_owned();
+    }
+    Ok((list, state))
+}
+/// Every id `Foo/query` lists for `filter`, a page (`position`) at a time,
+/// so a server's own limit on results doesn't cut the list short.
+fn query_all(s: &Session, method: &str, account: &str, filter: Value) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let page = s.max_get().min(500);
+    loop {
+        let v = s.call_one(
+            method,
+            json!({ "accountId": account, "filter": filter, "position": ids.len(), "limit": page, "calculateTotal": true }),
+        )?;
+        let got: Vec<String> = v["ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect();
+        let n = got.len();
+        ids.extend(got);
+        let total = v["total"].as_u64().map(|t| t as usize);
+        // Done: all listed, or a short page from a server without totals.
+        if n == 0 || total.is_some_and(|t| ids.len() >= t) || (total.is_none() && n < page) {
+            break;
+        }
+        // A bound against a server that never says it's done.
+        if ids.len() > 200_000 {
+            break;
+        }
+    }
+    Ok(ids)
+}
+/// An event's version on the server now (`event_version`), by id.
+pub fn version_of(s: &Session, id: &str) -> Result<String> {
+    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let (list, _) = get_all(s, "CalendarEvent/get", account, &[id.to_owned()])?;
+    Ok(list.first().map(event_version).unwrap_or_default())
+}
+/// An event's version for `Stored::etag`: as a card's.
+pub fn event_version(v: &Value) -> String {
+    card_version(v)
+}
+/// Events created or changed, ids gone, and the new state.
+pub type EventChanges = (Vec<JmapEvent>, Vec<String>, String);
+/// Cards created or changed, hrefs gone, and the new state.
+pub type CardChanges = (Vec<Card>, Vec<String>, String);
+/// A card's version for `Card::etag`: JSContact's `updated` where the
+/// server keeps it, else a hash of the card as given (any change changes it).
+fn card_version(v: &Value) -> String {
+    if let Some(u) = v["updated"].as_str().filter(|u| !u.is_empty()) {
+        return u.to_owned();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(v.to_string().as_bytes());
+    digest.iter().take(12).map(|b| format!("{b:02x}")).collect()
+}
+/// A write refused because the server's copy changed since it was read
+/// (`stateMismatch`): read it again rather than overwrite what changed.
+#[derive(Debug)]
+pub struct Conflict(pub &'static str);
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for Conflict {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JmapCalendar {
     pub id: String,
@@ -482,60 +612,102 @@ pub fn to_jscalendar(e: &ical::Event, overrides: &[ical::Event]) -> Map<String, 
 
 /// The events of `calendars` (ids) overlapping `from`..`to`, with
 /// repeating ones as series (the server's `expandRecurrences` left off).
-pub fn events(s: &Session, calendars: &[String], from: i64, to: i64) -> Result<Vec<JmapEvent>> {
+fn stamp_utc(t: i64) -> String {
+    DateTime::from_timestamp(t, 0)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+/// As `events`, with the CalendarEvent state they were read in, for
+/// `event_changes` later.
+pub fn events_in(
+    s: &Session,
+    calendars: &[String],
+    from: i64,
+    to: i64,
+) -> Result<(Vec<JmapEvent>, String)> {
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
-    let stamp = |t: i64| {
-        DateTime::from_timestamp(t, 0)
-            .unwrap_or_default()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
-    };
     let mut out = Vec::new();
+    let mut state = String::new();
     for calendar in calendars {
-        let responses = s.call_many(&[
-            (
-                "CalendarEvent/query",
-                json!({
-                    "accountId": account,
-                    "filter": { "inCalendar": calendar, "after": stamp(from), "before": stamp(to) },
-                }),
-            ),
-            (
-                "CalendarEvent/get",
-                json!({
-                    "accountId": account,
-                    "#ids": { "resultOf": "c0", "name": "CalendarEvent/query", "path": "/ids" },
-                }),
-            ),
-        ])?;
-        let get = responses
-            .iter()
-            .find(|(n, _)| n == "CalendarEvent/get")
-            .map(|(_, v)| v)
-            .context("The JMAP server didn't answer for its events.")?;
-        for v in get["list"].as_array().into_iter().flatten() {
-            let Some(mut event) = from_jscalendar(v) else { continue };
-            let (changed, excluded) = overrides(v, &event);
-            event.exdates = excluded;
-            out.push(JmapEvent {
-                id: v["id"].as_str().unwrap_or_default().to_owned(),
-                calendar: calendar.clone(),
-                event,
-                overrides: changed,
-                json: v.clone(),
-            });
+        // Every page of the query, then the events in pieces.
+        let ids = query_all(
+            s,
+            "CalendarEvent/query",
+            account,
+            json!({ "inCalendar": calendar, "after": stamp_utc(from), "before": stamp_utc(to) }),
+        )?;
+        let (list, read_in) = get_all(s, "CalendarEvent/get", account, &ids)?;
+        if !read_in.is_empty() {
+            state = read_in;
+        }
+        for v in &list {
+            if let Some(e) = jmap_event(v, calendar) {
+                out.push(e);
+            }
         }
     }
-    Ok(out)
+    if state.is_empty() {
+        // No events: the state now, so changes can be asked for later.
+        let v = s.call_one("CalendarEvent/get", json!({ "accountId": account, "ids": [] }))?;
+        state = v["state"].as_str().unwrap_or_default().to_owned();
+    }
+    Ok((out, state))
+}
+/// One event from its JSON, in `calendar`.
+fn jmap_event(v: &Value, calendar: &str) -> Option<JmapEvent> {
+    let mut event = from_jscalendar(v)?;
+    let (changed, excluded) = overrides(v, &event);
+    event.exdates = excluded;
+    Some(JmapEvent {
+        id: v["id"].as_str().unwrap_or_default().to_owned(),
+        calendar: calendar.to_owned(),
+        event,
+        overrides: changed,
+        json: v.clone(),
+    })
+}
+/// What changed among the account's events since `since`
+/// (CalendarEvent/changes): the events created or changed (in any of
+/// `calendars`, whichever they're in now), the ids gone, and the new
+/// state. `None` when the server can't say; then read them whole.
+pub fn event_changes(
+    s: &Session,
+    calendars: &[String],
+    since: &str,
+) -> Result<Option<EventChanges>> {
+    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let Some(changed) = changes(s, "CalendarEvent/changes", account, since)? else {
+        return Ok(None);
+    };
+    let (list, _) = get_all(s, "CalendarEvent/get", account, &changed.changed)?;
+    let mut events = Vec::new();
+    let mut gone = changed.destroyed;
+    for v in &list {
+        // The first of its calendars that is shown.
+        let calendar = v["calendarIds"]
+            .as_object()
+            .and_then(|ids| ids.keys().find(|k| calendars.contains(k)).cloned());
+        match calendar.and_then(|c| jmap_event(v, &c)) {
+            Some(e) => events.push(e),
+            // Moved out of every shown calendar: gone from here.
+            None => gone.extend(v["id"].as_str().map(str::to_owned)),
+        }
+    }
+    Ok(Some((events, gone, changed.state)))
 }
 
-/// Creates or changes an event in `calendar`. Returns its id.
-pub fn save_event(
+/// Creates or changes an event in `calendar`; returns its id. With
+/// `in_state` (its version when read), only if the event is still as it
+/// was read: a change made elsewhere meanwhile is reported (`Conflict`)
+/// rather than overwritten.
+pub fn save_event_in(
     s: &Session,
     id: Option<&str>,
     calendar: &str,
     event: &ical::Event,
     overrides: &[ical::Event],
+    in_state: Option<&str>,
 ) -> Result<String> {
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
     let mut props = to_jscalendar(event, overrides);
@@ -547,7 +719,25 @@ pub fn save_event(
         }
         None => json!({ "accountId": account, "create": { "e": props }, "sendSchedulingMessages": false }),
     };
-    let v = s.call_one("CalendarEvent/set", args)?;
+    // Only over the version it was read in (`in_state`: the event's
+    // version, `event_version`): one changed elsewhere meanwhile isn't
+    // overwritten. Compared per event, since JMAP's ifInState would refuse
+    // for any change to any event.
+    if let (Some(version), Some(id)) = (in_state.filter(|s| !s.is_empty()), id) {
+        let (now, _) = get_all(s, "CalendarEvent/get", account, &[id.to_owned()])?;
+        if let Some(current) = now.first()
+            && event_version(current) != version
+        {
+            bail!(Conflict("This event was changed elsewhere since it was read. Refresh the calendar and make the change again."));
+        }
+    }
+    let v = match s.call_one("CalendarEvent/set", args) {
+        Ok(v) => v,
+        Err(e) if refused(&e, "stateMismatch") => {
+            bail!(Conflict("This event was changed elsewhere since it was read. Refresh the calendar and make the change again."))
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(id) = id {
         if let Some(e) = v["notUpdated"].get(id) {
             bail!("The server didn't change the event: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
@@ -876,26 +1066,60 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
 }
 
 /// Every card in the account's address books, each with its id (in
-/// `href`, as `jmap:<id>`) and the book it is in.
-pub fn cards(s: &Session) -> Result<(Vec<Card>, String)> {
+/// `href`, as `jmap:<id>`) and its own version (`etag`). Read in pieces
+/// the server takes (`maxObjectsInGet`). Returns the cards, the book new
+/// cards go to, and the ContactCard state they were read in.
+pub fn cards_in(s: &Session) -> Result<(Vec<Card>, String, String)> {
     let account = s.contacts_account().context("This JMAP server has no contacts.")?;
     let books = address_books(s)?;
-    let v = s.call_one("ContactCard/get", json!({ "accountId": account, "ids": null }))?;
-    let mut out = Vec::new();
-    for c in v["list"].as_array().into_iter().flatten() {
-        let mut card = from_jscontact(c);
-        card.href = format!("jmap:{}", c["id"].as_str().unwrap_or_default());
-        // The JSON as it came, so an edit keeps what Picacho doesn't show.
-        card.vcard = c.to_string();
-        card.etag = v["state"].as_str().unwrap_or_default().to_owned();
-        out.push(card);
+    // Every id by query, then the cards in pieces; a server without
+    // ContactCard/query is asked for them all at once, as before.
+    let (list, mut state) = match query_all(s, "ContactCard/query", account, json!({})) {
+        Ok(ids) => get_all(s, "ContactCard/get", account, &ids)?,
+        Err(e) if refused(&e, "unknownMethod") => {
+            let v = s.call_one("ContactCard/get", json!({ "accountId": account, "ids": null }))?;
+            (
+                v["list"].as_array().cloned().unwrap_or_default(),
+                v["state"].as_str().unwrap_or_default().to_owned(),
+            )
+        }
+        Err(e) => return Err(e),
+    };
+    if state.is_empty() {
+        let v = s.call_one("ContactCard/get", json!({ "accountId": account, "ids": [] }))?;
+        state = v["state"].as_str().unwrap_or_default().to_owned();
     }
+    let out = list.iter().map(jmap_card).collect();
     let book = books
         .iter()
         .find(|b| b.writable)
         .map(|b| format!("jmap:{}", b.id))
         .unwrap_or_default();
-    Ok((out, book))
+    Ok((out, book, state))
+}
+fn jmap_card(c: &Value) -> Card {
+    let mut card = from_jscontact(c);
+    card.href = format!("jmap:{}", c["id"].as_str().unwrap_or_default());
+    // The JSON as it came, so an edit keeps what Picacho doesn't show.
+    card.vcard = c.to_string();
+    card.etag = card_version(c);
+    card
+}
+/// What changed among the cards since `since` (ContactCard/changes): the
+/// cards created or changed, the hrefs (`jmap:<id>`) of those gone, and the
+/// new state. `None` when the server can't say.
+pub fn card_changes(s: &Session, since: &str) -> Result<Option<CardChanges>> {
+    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let Some(changed) = changes(s, "ContactCard/changes", account, since)? else {
+        return Ok(None);
+    };
+    let (list, _) = get_all(s, "ContactCard/get", account, &changed.changed)?;
+    let gone = changed
+        .destroyed
+        .iter()
+        .map(|id| format!("jmap:{id}"))
+        .collect();
+    Ok(Some((list.iter().map(jmap_card).collect(), gone, changed.state)))
 }
 
 /// Creates or changes a card; returns it as saved.
@@ -907,6 +1131,18 @@ pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
     let mut saved = card.clone();
     match existing {
         Some(id) => {
+            // Only over the version it was read in: a card changed
+            // elsewhere meanwhile isn't overwritten. JMAP has no per-object
+            // condition, so this reads it first and compares (ifInState
+            // would also refuse for any other card's change).
+            if !card.etag.is_empty() {
+                let (now, _) = get_all(s, "ContactCard/get", account, &[id.to_owned()])?;
+                if let Some(current) = now.first()
+                    && card_version(current) != card.etag
+                {
+                    bail!(Conflict("This contact was changed elsewhere since it was read. Refresh contacts and make the change again."));
+                }
+            }
             let v = s.call_one(
                 "ContactCard/set",
                 json!({ "accountId": account, "update": { id: props } }),
@@ -935,7 +1171,7 @@ pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
     let v = s.call_one("ContactCard/get", json!({ "accountId": account, "ids": [id] }))?;
     if let Some(c) = v["list"].as_array().and_then(|l| l.first()) {
         saved.vcard = c.to_string();
-        saved.etag = v["state"].as_str().unwrap_or_default().to_owned();
+        saved.etag = card_version(c);
     }
     Ok(saved)
 }
@@ -967,6 +1203,220 @@ pub fn create_address_book(s: &Session, name: &str) -> Result<String> {
         bail!("The server didn't make the address book: {}", e["type"].as_str().unwrap_or("refused"));
     }
     Ok(v["created"]["b"]["id"].as_str().context("No address book id.")?.to_owned())
+}
+
+/// When `attendees` are busy over `from..to`, from the server's directory
+/// of people (JMAP Principals, RFC 9670): each attendee's principal is
+/// found by address (`Principal/query`), and its busy times asked
+/// (`Principal/getAvailability`). People the server doesn't know are left
+/// out.
+pub fn free_busy(
+    s: &Session,
+    attendees: &[String],
+    from: i64,
+    to: i64,
+) -> Result<Vec<ical::FreeBusy>> {
+    ensure!(
+        s.has(crate::sync::jmap::PRINCIPALS),
+        "Your calendar server can't say when others are free."
+    );
+    let account = s
+        .principals_account()
+        .or_else(|| s.calendars_account())
+        .context("Your calendar server can't say when others are free.")?
+        .to_owned();
+    let mut out = Vec::new();
+    for email in attendees {
+        let v = s.call_one(
+            "Principal/query",
+            json!({ "accountId": account, "filter": { "email": email }, "limit": 1 }),
+        )?;
+        let Some(id) = v["ids"].as_array().and_then(|i| i.first()).and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let v = match s.call_one(
+            "Principal/getAvailability",
+            json!({ "accountId": account, "id": id, "utcStart": stamp_utc(from), "utcEnd": stamp_utc(to) }),
+        ) {
+            Ok(v) => v,
+            // One person's calendar not shared: the others still show.
+            Err(e) if refused(&e, "forbidden") || refused(&e, "notFound") => continue,
+            Err(e) => return Err(e),
+        };
+        let parse = |t: &Value| {
+            t.as_str()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp())
+        };
+        let busy = v["list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            // "unavailable", "confirmed" and "tentative" all count as busy.
+            .filter_map(|b| Some((parse(&b["utcStart"])?, parse(&b["utcEnd"])?)))
+            .collect();
+        out.push(ical::FreeBusy {
+            attendee: email.clone(),
+            busy,
+        });
+    }
+    Ok(out)
+}
+
+/// The addresses the server sends and answers invitations as for this
+/// sign-in (ParticipantIdentity/get), so an event's organizer or attendee
+/// is recognized as you. Empty where the server has none.
+pub fn participant_identities(s: &Session) -> Result<Vec<String>> {
+    let Some(account) = s.calendars_account() else {
+        return Ok(Vec::new());
+    };
+    let v = match s.call_one("ParticipantIdentity/get", json!({ "accountId": account, "ids": null })) {
+        Ok(v) => v,
+        Err(e) if refused(&e, "unknownMethod") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(v["list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| participant_email(p).into())
+        .filter(|e: &String| !e.is_empty())
+        .collect())
+}
+
+/// What happened to shared calendars and events, as the server tells
+/// (CalendarEventNotification and ShareNotification, RFC 9670 and JMAP for
+/// Calendars): one line each, for showing, and their ids to dismiss.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Notice {
+    pub id: String,
+    /// "CalendarEventNotification" or "ShareNotification".
+    pub kind: String,
+    pub text: String,
+}
+pub fn notices(s: &Session) -> Result<Vec<Notice>> {
+    let mut out = Vec::new();
+    let account = s.calendars_account().map(str::to_owned);
+    let principals = s.principals_account().map(str::to_owned);
+    for (method, account) in [
+        ("CalendarEventNotification/get", account.as_deref()),
+        ("ShareNotification/get", principals.as_deref()),
+    ] {
+        let Some(account) = account else { continue };
+        let v = match s.call_one(method, json!({ "accountId": account, "ids": null })) {
+            Ok(v) => v,
+            Err(e) if refused(&e, "unknownMethod") => continue,
+            Err(e) => return Err(e),
+        };
+        let kind = method.trim_end_matches("/get");
+        for n in v["list"].as_array().into_iter().flatten() {
+            let who = n["changedBy"]["name"]
+                .as_str()
+                .or(n["changedBy"]["email"].as_str())
+                .filter(|w| !w.is_empty())
+                .unwrap_or("Someone");
+            let text = if kind == "ShareNotification" {
+                let name = n["name"].as_str().unwrap_or("a calendar");
+                if n["newRights"].is_null() {
+                    format!("{who} stopped sharing {name} with you.")
+                } else if n["oldRights"].is_null() {
+                    format!("{who} shared {name} with you.")
+                } else {
+                    format!("{who} changed what you may do with {name}.")
+                }
+            } else {
+                let title = n["event"]["title"]
+                    .as_str()
+                    .or(n["eventPatch"]["title"].as_str())
+                    .unwrap_or("an event");
+                match n["type"].as_str() {
+                    Some("created") => format!("{who} added {title}."),
+                    Some("destroyed") => format!("{who} removed {title}."),
+                    _ => format!("{who} changed {title}."),
+                }
+            };
+            out.push(Notice {
+                id: n["id"].as_str().unwrap_or_default().to_owned(),
+                kind: kind.to_owned(),
+                text,
+            });
+        }
+    }
+    Ok(out)
+}
+/// Dismisses notices once shown (`Foo/set destroy`).
+pub fn dismiss_notices(s: &Session, notices: &[Notice]) -> Result<()> {
+    for (kind, account) in [
+        ("CalendarEventNotification", s.calendars_account()),
+        ("ShareNotification", s.principals_account()),
+    ] {
+        let ids: Vec<&str> = notices
+            .iter()
+            .filter(|n| n.kind == kind)
+            .map(|n| n.id.as_str())
+            .collect();
+        if let (Some(account), false) = (account, ids.is_empty()) {
+            s.call_one(&format!("{kind}/set"), json!({ "accountId": account, "destroy": ids }))?;
+        }
+    }
+    Ok(())
+}
+
+/// Renames a calendar (and changes its colour; empty: as it is).
+pub fn update_calendar(s: &Session, id: &str, name: &str, color: &str) -> Result<()> {
+    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let mut patch = json!({ "name": name });
+    if !color.is_empty() {
+        patch["color"] = json!(color);
+    }
+    let v = s.call_one(
+        "Calendar/set",
+        json!({ "accountId": account, "update": { id: patch } }),
+    )?;
+    if let Some(e) = v["notUpdated"].get(id) {
+        bail!("The server didn't rename the calendar: {}", e["type"].as_str().unwrap_or("refused"));
+    }
+    Ok(())
+}
+/// Deletes a calendar with its events (`onDestroyRemoveEvents`).
+pub fn delete_calendar(s: &Session, id: &str) -> Result<()> {
+    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let v = s.call_one(
+        "Calendar/set",
+        json!({ "accountId": account, "destroy": [id], "onDestroyRemoveEvents": true }),
+    )?;
+    if let Some(e) = v["notDestroyed"].get(id)
+        && e["type"] != "notFound"
+    {
+        bail!("The server didn't delete the calendar: {}", e["type"].as_str().unwrap_or("refused"));
+    }
+    Ok(())
+}
+/// Renames an address book.
+pub fn rename_address_book(s: &Session, id: &str, name: &str) -> Result<()> {
+    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let v = s.call_one(
+        "AddressBook/set",
+        json!({ "accountId": account, "update": { id: { "name": name } } }),
+    )?;
+    if let Some(e) = v["notUpdated"].get(id) {
+        bail!("The server didn't rename the address book: {}", e["type"].as_str().unwrap_or("refused"));
+    }
+    Ok(())
+}
+/// Deletes an address book with its cards (`onDestroyRemoveContents`).
+pub fn delete_address_book(s: &Session, id: &str) -> Result<()> {
+    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let v = s.call_one(
+        "AddressBook/set",
+        json!({ "accountId": account, "destroy": [id], "onDestroyRemoveContents": true }),
+    )?;
+    if let Some(e) = v["notDestroyed"].get(id)
+        && e["type"] != "notFound"
+    {
+        bail!("The server didn't delete the address book: {}", e["type"].as_str().unwrap_or("refused"));
+    }
+    Ok(())
 }
 
 /// Whether a session can be used for calendars or contacts at all.

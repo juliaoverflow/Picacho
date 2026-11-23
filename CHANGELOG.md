@@ -13,6 +13,60 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- IMAP and POP3 servers that only offer STARTTLS (ports 143 and 110): the
+  connection is upgraded before anything is sent, and never used plain.
+  Found by autoconfig and port probing, or chosen in manual setup.
+- POP3: older mail is listed by its headers (TOP) and downloads whole when
+  opened; servers asking to wait (LOGIN-DELAY, IN-USE, SYS/TEMP) pause
+  background checks instead of being taken for a wrong password; UTF-8
+  (RFC 6856) where offered.
+- Filters (ManageSieve): room is checked first (HAVESPACE), Picacho's
+  inactive script is replaced whole (RENAMESCRIPT), and QUOTA, TRYLATER and
+  REFERRAL refusals say what they mean.
+- SMTP: a message's priority (composer button; MT-PRIORITY, Importance and
+  X-Priority), and **Give up on delivery after** a few hours (DELIVERBY).
+- IMAP: IMAP4rev2 is turned on where offered beside rev1; searches use
+  `newer:`/`older:` (WITHIN), approximate words (SEARCH=FUZZY), one sorted
+  page (ESORT), one search across All Mail (MULTISEARCH); long commands
+  reporting progress (INPROGRESS) aren't timed out; Storage shows the
+  fullest quota root, and suggests JMAP where the server offers it
+  (JMAPACCESS).
+- Calendars and contacts over JMAP sync only what changed
+  (CalendarEvent/changes, ContactCard/changes), page through every event and
+  card, and refuse to overwrite one changed elsewhere. Free/busy and your
+  invitation addresses come from JMAP Principals, and shared-calendar
+  notices show in Settings → Calendar.
+- CalDAV and CardDAV: calendars and address books can be renamed and
+  deleted; edits use Schedule-Tag where the server schedules, and its
+  scheduling inbox is read; events and cards too large for the server are
+  refused before sending; files can be attached to events where the
+  calendar keeps them (RFC 8607); new cards go as vCard 4.0 to books that
+  take only that; the calendar server's storage is shown.
+- Events in a time zone carry its VTIMEZONE, so Outlook and Exchange show
+  them at the right time.
+
+- Single sign-on for IMAP and POP3 accounts with an organization's
+  identity provider (OpenID Connect / OAuth 2.0: Okta, Entra ID, Keycloak,
+  Authentik, ADFS…), including those that sign people in with SAML 2.0
+  behind it. Found from the domain's autoconfig file where it says so, or
+  set up under Server settings with the sign-in service's address. Picacho
+  registers itself where the provider allows, or uses a client id from the
+  administrator; the mail servers get the token with OAUTHBEARER or XOAUTH2.
+- Kerberos sign-in (SASL GSSAPI, RFC 4752) for IMAP and POP3 accounts, and
+  their outgoing and filter servers, with the ticket the computer already
+  has. Uses the system's Kerberos (GSS-API on Linux, the BSDs and macOS,
+  SSPI on Windows); no password is kept or sent, and a server without
+  GSSAPI is never tried with a password.
+- POP3: **Remove from the server** after download, after a week or after a
+  month, and **Delete on the server too** for mail deleted here for good.
+  Both off by default; only mail saved here completely is removed, once
+  the server confirms.
+- Tasks can be edited and deleted, have no due date, and keep what other
+  apps set on them (priority, categories, alarms).
+- **Let the server send invitations**: a CalDAV server that schedules (RFC
+  6638) can send the invitations, updates and cancellations for events you
+  organize, instead of Picacho mailing them.
+
 - Calendars and address books read only what changed since the last sync
   (WebDAV sync-collection, RFC 6578; else the collection's ctag), rather
   than everything each time. Calendars for tasks only are left out, and
@@ -204,6 +258,11 @@ same version in `Cargo.toml`.
 
 ### Fixed
 
+- Tasks no longer show as events in calendars that hold both, tasks
+  without a due date are no longer dropped, and a task's due date is its
+  DUE rather than its start.
+- Usage notes no longer describe a "Load more" step the message list
+  doesn't have.
 - Saving an event with guests to iCloud, Fastmail, Nextcloud or Google no
   longer has the server email them a second invitation: Picacho sends
   invitations itself, and now tells the server so (SCHEDULE-AGENT=CLIENT).

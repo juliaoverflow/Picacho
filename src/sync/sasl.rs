@@ -12,6 +12,9 @@
 //! - CRAM-MD5 (RFC 2195): a keyed hash of a challenge; only where nothing
 //!   better is offered, since it needs the server to keep the password.
 //! - OAUTHBEARER (RFC 7628) and Google/Microsoft's XOAUTH2: an access token.
+//! - GSSAPI (RFC 4752): Kerberos, with the ticket the system already has
+//!   (`sync::gss`); no password is used or sent. Only for accounts set to
+//!   sign in with Kerberos (`Account::kerberos`), never chosen otherwise.
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
@@ -31,6 +34,7 @@ pub(crate) enum Mechanism {
     CramMd5,
     OAuthBearer,
     XOAuth2,
+    Gssapi,
 }
 
 /// For a password, best first: SCRAM proves both sides without sending the
@@ -53,6 +57,9 @@ pub(crate) const SCRAM_ORDER: [Mechanism; 4] = [
 ];
 /// For an access token: the standard mechanism, then the older one.
 pub(crate) const TOKEN_ORDER: [Mechanism; 2] = [Mechanism::OAuthBearer, Mechanism::XOAuth2];
+/// For a Kerberos ticket: GSSAPI alone. An account set to Kerberos never
+/// falls back to a password.
+pub(crate) const KERBEROS_ORDER: [Mechanism; 1] = [Mechanism::Gssapi];
 
 impl Mechanism {
     pub(crate) fn name(self) -> &'static str {
@@ -66,6 +73,7 @@ impl Mechanism {
             Self::CramMd5 => "CRAM-MD5",
             Self::OAuthBearer => "OAUTHBEARER",
             Self::XOAuth2 => "XOAUTH2",
+            Self::Gssapi => "GSSAPI",
         }
     }
     /// The best of `order` among the mechanisms a server offers (names in
@@ -119,6 +127,9 @@ pub(crate) struct Credentials {
     /// The TLS connection's tls-server-end-point binding (RFC 5929), for
     /// SCRAM-PLUS; empty where unknown.
     pub(crate) binding: Vec<u8>,
+    /// The service's GSS-API name (`imap`, `pop`, `smtp`, `sieve`), for
+    /// GSSAPI's `service@host`.
+    pub(crate) service: &'static str,
 }
 
 /// The tls-server-end-point binding of a TLS stream, or empty.
@@ -146,6 +157,10 @@ enum State {
     /// A token mechanism answered an error challenge; the server will
     /// refuse the sign-in next, with this reason.
     Refused(String),
+    /// GSSAPI: the security context is being established.
+    GssContext(Box<dyn crate::sync::gss::Context>),
+    /// GSSAPI: established; the server's security-layer offer is next.
+    GssLayer(Box<dyn crate::sync::gss::Context>),
     Done,
 }
 
@@ -156,6 +171,8 @@ pub(crate) struct Exchange {
     state: State,
     /// SCRAM's client nonce, fixed in tests.
     nonce: Option<String>,
+    /// GSSAPI's context, given in tests instead of the system's Kerberos.
+    gss: Option<Box<dyn crate::sync::gss::Context>>,
 }
 
 impl Exchange {
@@ -165,6 +182,7 @@ impl Exchange {
             credentials,
             state: State::Start,
             nonce: None,
+            gss: None,
         }
     }
     pub(crate) fn mechanism(&self) -> Mechanism {
@@ -185,6 +203,7 @@ impl Exchange {
             host,
             port,
             binding: _,
+            service,
         } = &self.credentials;
         let state = std::mem::replace(&mut self.state, State::Done);
         let (answer, next) = match (self.mechanism, state) {
@@ -220,6 +239,57 @@ impl Exchange {
                     Vec::new()
                 };
                 (answer, State::Refused(reason))
+            }
+            (Mechanism::Gssapi, State::Start) => {
+                let mut context = match self.gss.take() {
+                    Some(context) => context,
+                    None => crate::sync::gss::start(&format!("{service}@{host}"))?,
+                };
+                let (token, done) = context.step(&[])?;
+                (
+                    token,
+                    if done {
+                        State::GssLayer(context)
+                    } else {
+                        State::GssContext(context)
+                    },
+                )
+            }
+            (Mechanism::Gssapi, State::GssContext(mut context)) => {
+                let (token, done) = context.step(challenge)?;
+                (
+                    token,
+                    if done {
+                        State::GssLayer(context)
+                    } else {
+                        State::GssContext(context)
+                    },
+                )
+            }
+            // RFC 4752 \u{a7}3.1: the server offers security layers and its
+            // largest message, wrapped; Picacho takes none (TLS protects the
+            // connection) and answers with the user to act as.
+            (Mechanism::Gssapi, State::GssLayer(mut context)) => {
+                if challenge.is_empty() {
+                    // The context's last token was ours; the server sends
+                    // nothing, and is answered with nothing.
+                    (Vec::new(), State::GssLayer(context))
+                } else {
+                    let offer = context.unwrap(challenge)?;
+                    ensure!(
+                        offer.len() == 4,
+                        "The server's Kerberos security-layer offer is malformed."
+                    );
+                    ensure!(
+                        offer[0] & 0x01 != 0,
+                        "The server requires a Kerberos security layer Picacho doesn't use (it offers none without one)."
+                    );
+                    let mut answer = vec![0x01, 0, 0, 0];
+                    // The user to sign in as: the ticket's own unless a
+                    // different sign-in name is set (authorization identity).
+                    answer.extend_from_slice(user.as_bytes());
+                    (context.wrap(&answer)?, State::Done)
+                }
             }
             (m, State::Start) if m.scram().is_some() => {
                 let nonce = self
@@ -284,6 +354,12 @@ impl Exchange {
         self.state = next;
         Ok(answer)
     }
+    /// Whether the exchange is somewhere the server can rightly accept it.
+    /// GSSAPI must have finished its security-layer exchange, which is
+    /// what proves the server holds the service's key.
+    fn unfinished_gss(&self) -> bool {
+        matches!(self.state, State::GssContext(_) | State::GssLayer(_))
+    }
     /// After the server accepted: for SCRAM, that it also proved itself.
     /// Servers may send their signature with the success reply instead of
     /// as a challenge; `success` is that reply's data, if any.
@@ -294,6 +370,9 @@ impl Exchange {
         match &self.state {
             State::ScramFinal { .. } => bail!(
                 "The server didn't prove it knows your password (no SCRAM signature); not signed in."
+            ),
+            _ if self.unfinished_gss() => bail!(
+                "The server accepted the Kerberos sign-in before proving who it is; not signed in."
             ),
             _ => Ok(()),
         }
@@ -476,6 +555,7 @@ mod tests {
             host: "mail.example.com".into(),
             port: 993,
             binding: Vec::new(),
+            service: "imap",
         }
     }
 
@@ -623,6 +703,83 @@ mod tests {
             b"user=ana@example.com\x01auth=Bearer tok\x01\x01"
         );
         assert_eq!(saslname("a=b,c"), "a=3Db=2Cc");
+        Ok(())
+    }
+
+    /// A GSS-API context standing in for Kerberos: two round trips, then
+    /// "wrapping" is a marker byte in front.
+    pub(crate) struct FakeGss {
+        pub(crate) steps: usize,
+        pub(crate) mutual: bool,
+    }
+    impl crate::sync::gss::Context for FakeGss {
+        fn step(&mut self, input: &[u8]) -> Result<(Vec<u8>, bool)> {
+            self.steps += 1;
+            match self.steps {
+                1 => {
+                    assert!(input.is_empty());
+                    Ok((b"ap-req".to_vec(), false))
+                }
+                _ => {
+                    assert_eq!(input, b"ap-rep");
+                    ensure!(self.mutual, "no mutual authentication");
+                    Ok((Vec::new(), true))
+                }
+            }
+        }
+        fn unwrap(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+            Ok(message.strip_prefix(b"W").context("not wrapped")?.to_vec())
+        }
+        fn wrap(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+            Ok([b"W".as_slice(), message].concat())
+        }
+    }
+    pub(crate) fn kerberos_exchange(user: &str, mutual: bool) -> Exchange {
+        let mut x = Exchange::new(Mechanism::Gssapi, credentials(user, ""));
+        x.gss = Some(Box::new(FakeGss { steps: 0, mutual }));
+        x
+    }
+
+    #[test]
+    fn gssapi_follows_rfc_4752() -> Result<()> {
+        // Chosen only when asked for, never among passwords' mechanisms.
+        assert_eq!(
+            Mechanism::choose(&PASSWORD_ORDER, ["GSSAPI", "PLAIN"]),
+            Some(Mechanism::Plain)
+        );
+        assert_eq!(
+            Mechanism::choose(&KERBEROS_ORDER, ["PLAIN", "gssapi"]),
+            Some(Mechanism::Gssapi)
+        );
+        assert_eq!(
+            Mechanism::choose(&KERBEROS_ORDER, ["PLAIN", "SCRAM-SHA-256"]),
+            None
+        );
+        let mut x = kerberos_exchange("ana", true);
+        // The context's first token goes with the command.
+        assert_eq!(x.initial().unwrap(), b"ap-req");
+        // The server's reply completes the context; the client sends nothing.
+        assert!(x.step(b"ap-rep")?.is_empty());
+        // Accepting now would be too early: the layer exchange is unfinished.
+        assert!(x.unfinished_gss());
+        // The server offers "no security layer" (bit 1) and a 64 KiB maximum.
+        let answer = x.step(b"W\x01\x00\x10\x00")?;
+        assert_eq!(answer, b"W\x01\x00\x00\x00ana");
+        x.finish(None)?;
+        // A server that only offers integrity or privacy layers is refused.
+        let mut x = kerberos_exchange("ana", true);
+        x.initial();
+        x.step(b"ap-rep")?;
+        assert!(x.step(b"W\x06\x00\x10\x00").is_err());
+        // A server that can't prove itself (no mutual authentication) fails.
+        let mut x = kerberos_exchange("ana", false);
+        x.initial();
+        assert!(x.step(b"ap-rep").is_err());
+        // A server accepting before the layer exchange isn't trusted.
+        let mut x = kerberos_exchange("ana", true);
+        x.initial();
+        x.step(b"ap-rep")?;
+        assert!(x.finish(None).is_err());
         Ok(())
     }
 }

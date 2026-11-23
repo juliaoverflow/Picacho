@@ -324,6 +324,21 @@ impl MailApp {
         )
     }
 
+    /// The server says the same mail is reachable over JMAP (RFC 9698):
+    /// worth knowing, since JMAP syncs faster and pushes changes.
+    pub(super) fn jmap_access_note(&self, a: &Account) -> Option<Div> {
+        let url = self.jmap_access.get(&a.id)?;
+        let host = url::Url::parse(url).ok()?.host_str()?.to_owned();
+        Some(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(self.colors().muted))
+                .child(format!(
+                    "This server also offers this mailbox over JMAP ({host}), which syncs faster and gets changes pushed. Add it again choosing JMAP to use it."
+                )),
+        )
+    }
+
     /// Changes made offline that haven't reached the server yet.
     pub(super) fn offline_note(&self, a: &Account) -> Option<Div> {
         let n: usize = self

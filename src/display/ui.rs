@@ -206,6 +206,11 @@ const TOTP: usize = 7;
 const MAILBOX_PASSWORD: usize = 8;
 /// Proton: a security key's PIN, once the key asks for it.
 const KEY_PIN: usize = 9;
+/// Single sign-on: the organization's sign-in service (its issuer URL).
+const SSO_ISSUER: usize = 10;
+/// Single sign-on: the client id an administrator registered for Picacho,
+/// where the sign-in service doesn't let apps register themselves.
+const SSO_CLIENT: usize = 11;
 
 #[derive(Clone, Copy)]
 struct Colors {
@@ -705,6 +710,8 @@ enum Action {
     ConnectCalendar,
     SyncCalendar,
     DisconnectCalendar,
+    /// Clears what the JMAP calendar server said about shared calendars.
+    DismissCalendarNotices,
     /// The calendar new events go to.
     DefaultCalendar(String),
     NewEvent,
@@ -722,9 +729,24 @@ enum Action {
     ConnectJmapCalendar(String),
     /// Makes a calendar named as in the form on the server.
     CreateCalendar,
+    /// Renames a calendar (its href) as in the form, or deletes it.
+    RenameCalendar(String),
+    DeleteCalendar(String),
+    /// Attaches a file to an event (its UID) where the calendar keeps
+    /// attachments itself (RFC 8607).
+    AttachToEvent(String),
     /// Adds the task in the form; marks a task (its UID) done.
     AddTask,
     CompleteTask(String),
+    /// Opens a task (its UID) in the task editor; saves or cancels the
+    /// editor; deletes a task (its UID) from the server.
+    EditTask(String),
+    SaveTask,
+    CancelTaskEdit,
+    DeleteTask(String),
+    /// Calendar settings: the server sends invitations for events you
+    /// organize (on), or Picacho emails them (off).
+    ServerScheduling(bool),
     /// Looks up when the event's guests are busy around its time.
     CheckFreeBusy,
     /// Messages a JMAP server holds to send later: lists them (account
@@ -741,6 +763,11 @@ enum Action {
     ConnectJmapContacts(String),
     /// Makes an address book named as in the form on the server.
     CreateAddressBook,
+    /// Lists the server's address books; renames one (its href) as in the
+    /// form, deletes one, or makes it where new contacts go.
+    ListAddressBooks,
+    RenameAddressBook(String),
+    DeleteAddressBook(String),
     RefreshAccount(String),
     ToggleAccount(String),
     ToggleSubfolders(String),
@@ -921,6 +948,14 @@ enum Action {
     ToggleDeliveryReceipts(String),
     /// Turns requiring encryption all the way (REQUIRETLS) on or off.
     ToggleRequireTls(String),
+    /// An account's delivery time limit (`Account::deliver_within_hours`).
+    SetDeliverWithin(String, u32),
+    /// Signs this account (its id) in with Kerberos, or with its password again.
+    ToggleKerberos(String),
+    /// The account being set up signs in with Kerberos instead of a password.
+    ToggleSetupKerberos,
+    /// The account being set up signs in with its organization's sign-in.
+    ToggleSetupSso,
     /// Turns handing scheduled messages to the server on or off.
     ToggleServerSendLater(String),
     /// Starts adding a sending address to an account.
@@ -943,6 +978,7 @@ enum Action {
     /// Switches the outgoing server being set up between TLS from the
     /// start and STARTTLS.
     ToggleSmtpTls,
+    ToggleIncomingStarttls,
     SaveIdentity,
     CancelIdentity,
     /// Asks before deleting messages for good.
@@ -1239,6 +1275,16 @@ pub struct MailApp {
     /// The outgoing server being set up takes TLS from the first byte
     /// (true) or STARTTLS (false); `None` goes by its port.
     smtp_tls: Option<bool>,
+    /// The incoming server being set up starts plain and upgrades with
+    /// STARTTLS (IMAP) or STLS (POP3).
+    incoming_starttls: bool,
+    /// The account being set up signs in with Kerberos.
+    setup_kerberos: bool,
+    /// The account being set up signs in with its organization's single
+    /// sign-on (OpenID Connect), and the scopes the domain's configuration
+    /// asks for.
+    setup_sso: bool,
+    sso_scope: String,
     setup_generation: u64,
     notice_generation: u64,
     drafts: Vec<Draft>,
@@ -1273,6 +1319,9 @@ pub struct MailApp {
     login_revision: u64,
     /// Storage use by account, once asked (None: no quota).
     quotas: HashMap<String, Option<crate::sync::transport::Quota>>,
+    /// Where an IMAP account's mail is over JMAP too, where its server says
+    /// (JMAPACCESS), by account.
+    jmap_access: HashMap<String, String>,
     nickname_for: Option<String>,
     /// The account whose preset pictures are shown over Settings: the
     /// picker was opened from Settings, which it returns to.
@@ -1586,6 +1635,11 @@ pub struct MailApp {
     contacts_user: Entity<InputState>,
     contacts_password: Entity<InputState>,
     contacts_busy: bool,
+    /// The contacts server's address books, once listed: (href, name,
+    /// writable).
+    address_books: Option<Vec<(String, String, bool)>>,
+    /// The calendar server's storage (used, left), once asked.
+    calendar_quota: Option<(u64, u64)>,
     contacts_error: Option<String>,
     /// Contacts settings: the contact being added or edited (its UID; empty
     /// for a new one), its form, and the list's filter.
@@ -1640,6 +1694,11 @@ pub struct MailApp {
     /// book or task, what the free/busy lookup found, and messages a JMAP
     /// server holds to send later (account id, and what it holds).
     collection_name: Entity<InputState>,
+    /// The task editor: the UID of the task open in it, and its fields.
+    task_editing: Option<String>,
+    task_title: Entity<InputState>,
+    task_due: Entity<InputState>,
+    task_notes: Entity<InputState>,
     /// The event editor's reminder: seconds before the start, if any.
     event_alarm: Option<i64>,
     free_busy: Option<String>,
@@ -1807,6 +1866,8 @@ impl MailApp {
             "123456",
             "Mailbox password",
             "PIN",
+            "https://login.example.com/realms/mail",
+            "Registered by Picacho when allowed",
         ];
         let form: Vec<_> = placeholders
             .iter()
@@ -2373,6 +2434,10 @@ impl MailApp {
             discovering: false,
             manual: false,
             smtp_tls: None,
+            incoming_starttls: false,
+            setup_kerberos: false,
+            setup_sso: false,
+            sso_scope: String::new(),
             setup_generation: 0,
             notice_generation: 0,
             drafts: vec![],
@@ -2392,6 +2457,7 @@ impl MailApp {
             login_pending: None,
             login_revision: 0,
             quotas: HashMap::new(),
+            jmap_access: HashMap::new(),
             nickname_for: None,
             presets_for: None,
             settings_place: SettingsPlace::Dialog,
@@ -2551,6 +2617,8 @@ impl MailApp {
             contacts_user,
             contacts_password,
             contacts_busy: false,
+            address_books: None,
+            calendar_quota: None,
             contacts_error: None,
             contact_editing: None,
             contact_name,
@@ -2587,6 +2655,10 @@ impl MailApp {
             event_notes,
             event_guests,
             collection_name: input("Name", false, window, cx),
+            task_editing: None,
+            task_title: input("Task", false, window, cx),
+            task_due: input("2026-11-24 17:00, a date, or empty", false, window, cx),
+            task_notes: input("Notes", false, window, cx),
             event_alarm: None,
             free_busy: None,
             held: None,
@@ -5420,7 +5492,7 @@ impl MailApp {
     }
     fn begin_setup(&mut self, step: Step, w: &mut Window, cx: &mut Context<Self>) {
         self.drop_proton_login(cx);
-        for i in [EMAIL, PASSWORD, LOGIN, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
+        for i in [EMAIL, PASSWORD, LOGIN, TOTP, MAILBOX_PASSWORD, KEY_PIN, SSO_ISSUER, SSO_CLIENT] {
             Self::set(&self.form[i], "", w, cx);
         }
         self.cancel.store(true, Ordering::Relaxed);
@@ -5434,6 +5506,9 @@ impl MailApp {
         self.service = Service::Other;
         self.provider = Provider::Imap;
         self.oauth = false;
+        self.setup_kerberos = false;
+        self.setup_sso = false;
+        self.sso_scope.clear();
         self.status.clear();
         self.anim += 1;
         if step == Step::Email {
@@ -5475,6 +5550,8 @@ impl MailApp {
                     smtp_host: a.smtp_host,
                     smtp_port: a.smtp_port,
                     smtp_tls: a.smtp_tls,
+                    incoming_starttls: a.incoming_starttls,
+                    sso: None,
                 },
                 w,
                 cx,
@@ -5503,6 +5580,16 @@ impl MailApp {
         Self::set(&self.form[SMTP_HOST], settings.smtp_host.clone(), w, cx);
         Self::set(&self.form[SMTP_PORT], settings.smtp_port.to_string(), w, cx);
         self.smtp_tls = settings.smtp_tls;
+        self.incoming_starttls = settings.incoming_starttls;
+        // The domain says its servers take its single sign-on.
+        self.setup_sso = settings.sso.is_some();
+        let (issuer, scope) = settings
+            .sso
+            .as_ref()
+            .map(|s| (s.issuer.clone(), s.scope.clone()))
+            .unwrap_or_default();
+        Self::set(&self.form[SSO_ISSUER], issuer, w, cx);
+        self.sso_scope = scope;
     }
     fn discover(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.discovering {
@@ -5563,6 +5650,8 @@ impl MailApp {
                         smtp_host: format!("smtp.{domain}"),
                         smtp_port: 587,
                         smtp_tls: None,
+                        incoming_starttls: false,
+                        sso: None,
                     }
                 });
                 this.apply_settings(&settings, w, cx);
@@ -5584,8 +5673,9 @@ impl MailApp {
         };
         // The usual port follows the protocol, unless one was typed.
         let current = Self::value(&self.form[IMAP_PORT], cx);
-        if current.trim().is_empty() || ["993", "995", "443"].contains(&current.trim()) {
+        if current.trim().is_empty() || ["993", "995", "443", "143", "110"].contains(&current.trim()) {
             Self::set(&self.form[IMAP_PORT], port(p), w, cx);
+            self.incoming_starttls = false;
         }
         self.provider = p;
         self.oauth = false;
@@ -5626,7 +5716,29 @@ impl MailApp {
                     a.smtp_host = value(SMTP_HOST);
                     a.smtp_port = value(SMTP_PORT).parse().unwrap_or(0);
                     a.smtp_tls = self.smtp_tls;
+                    a.incoming_starttls = self.incoming_starttls
+                        && matches!(a.provider, Provider::Imap | Provider::Pop3);
                     a.username = value(LOGIN);
+                    a.kerberos = self.setup_kerberos
+                        && matches!(a.provider, Provider::Imap | Provider::Pop3);
+                }
+                // The organization's single sign-on, found or chosen.
+                if self.setup_sso && matches!(a.provider, Provider::Imap | Provider::Pop3) {
+                    a.provider = self.provider;
+                    a.incoming_host = value(IMAP_HOST);
+                    a.incoming_port = value(IMAP_PORT).parse().unwrap_or(0);
+                    a.smtp_host = value(SMTP_HOST);
+                    a.smtp_port = value(SMTP_PORT).parse().unwrap_or(0);
+                    a.smtp_tls = self.smtp_tls;
+                    a.incoming_starttls = self.incoming_starttls;
+                    a.username = value(LOGIN);
+                    a.kerberos = false;
+                    a.oauth = true;
+                    a.client_id = value(SSO_CLIENT);
+                    a.sso = Some(crate::manage::model::Sso {
+                        issuer: value(SSO_ISSUER).trim_end_matches('/').to_owned(),
+                        scope: self.sso_scope.clone(),
+                    });
                     // JMAP sends through the server it reads from.
                     if a.provider == Provider::Jmap {
                         a.smtp_host = a.incoming_host.clone();
@@ -5669,7 +5781,7 @@ impl MailApp {
                 self.notice(e.to_string(), true, cx);
                 return;
             }
-            if password.is_empty() && !a.oauth {
+            if password.is_empty() && !a.oauth && !a.kerberos && a.sso.is_none() {
                 self.notice(
                     format!(
                         "Enter your {}.",
@@ -6171,7 +6283,10 @@ impl MailApp {
             | Action::CancelContactEdit
             | Action::RemoveContact(_)
             | Action::ConnectJmapContacts(_)
-            | Action::CreateAddressBook) => self.contacts_action(action, w, cx),
+            | Action::CreateAddressBook
+            | Action::ListAddressBooks
+            | Action::RenameAddressBook(_)
+            | Action::DeleteAddressBook(_)) => self.contacts_action(action, w, cx),
             action @ (Action::LoadServerIdentities(_)
             | Action::RenameServerIdentity(..)
             | Action::RemoveServerIdentity(..)
@@ -6199,6 +6314,7 @@ impl MailApp {
             | Action::TakeInvitationUpdate(_)
             | Action::ConnectCalendar
             | Action::SyncCalendar
+            | Action::DismissCalendarNotices
             | Action::DisconnectCalendar
             | Action::DefaultCalendar(_)
             | Action::NewEvent
@@ -6211,8 +6327,16 @@ impl MailApp {
             | Action::EventAlarm(_)
             | Action::ConnectJmapCalendar(_)
             | Action::CreateCalendar
+            | Action::RenameCalendar(_)
+            | Action::DeleteCalendar(_)
+            | Action::AttachToEvent(_)
             | Action::AddTask
             | Action::CompleteTask(_)
+            | Action::EditTask(_)
+            | Action::SaveTask
+            | Action::CancelTaskEdit
+            | Action::DeleteTask(_)
+            | Action::ServerScheduling(_)
             | Action::CheckFreeBusy
             | Action::ListHeld(_)
             | Action::CancelHeld(..)) => self.calendar_action(action, w, cx),
@@ -6440,6 +6564,44 @@ impl MailApp {
             Action::ToggleRequireTls(id) => {
                 self.edit_account(&id, |a| a.require_tls = !a.require_tls, cx)
             }
+            Action::SetDeliverWithin(id, hours) => {
+                self.edit_account(&id, |a| a.deliver_within_hours = hours, cx)
+            }
+            Action::ToggleSetupKerberos => {
+                self.setup_kerberos = !self.setup_kerberos;
+                self.setup_sso &= !self.setup_kerberos;
+            }
+            Action::ToggleSetupSso => {
+                self.setup_sso = !self.setup_sso;
+                self.setup_kerberos &= !self.setup_sso;
+            }
+            Action::ToggleKerberos(id) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                let on = !a.kerberos;
+                self.task(
+                    cx,
+                    move |b| b.set_kerberos(&a, on),
+                    move |this, result, cx| match result {
+                        Ok(next) => {
+                            if let Some(a) = this.accounts.iter_mut().find(|a| a.id == next.id) {
+                                *a = next;
+                            }
+                            this.notice(
+                                if on {
+                                    "Signed in with Kerberos"
+                                } else {
+                                    "Signing in with your password again"
+                                },
+                                false,
+                                cx,
+                            );
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
             Action::AddIdentity(account) => self.start_identity(account, None, w, cx),
             Action::EditIdentity(account, id) => self.start_identity(account, Some(id), w, cx),
             Action::RemoveIdentity(account, id) => self.remove_identity(account, id, cx),
@@ -6457,6 +6619,20 @@ impl MailApp {
                 }
             }
             Action::ToggleSmtpTls => self.smtp_tls = Some(!self.setup_smtp_tls(cx)),
+            Action::ToggleIncomingStarttls => {
+                self.incoming_starttls = !self.incoming_starttls;
+                // The usual port goes with it, unless another was typed.
+                let current = Self::value(&self.form[IMAP_PORT], cx);
+                let (tls, plain) = if self.provider == Provider::Pop3 {
+                    ("995", "110")
+                } else {
+                    ("993", "143")
+                };
+                let next = if self.incoming_starttls { plain } else { tls };
+                if [tls, plain, ""].contains(&current.trim()) {
+                    Self::set(&self.form[IMAP_PORT], next, w, cx);
+                }
+            }
             Action::SaveIdentity => self.save_identity(cx),
             Action::CancelIdentity => self.identity_edit = None,
             Action::DeleteForever(ids) => {
@@ -7495,10 +7671,18 @@ impl MailApp {
         let id = id.to_owned();
         self.task(
             cx,
-            move |b| b.quota(&a),
+            move |b| {
+                let quota = b.quota(&a);
+                // Not worth failing Storage over.
+                let jmap = b.jmap_access(&a).ok().flatten();
+                quota.map(|q| (q, jmap))
+            },
             move |this, result, cx| {
-                if let Ok(quota) = result {
-                    this.quotas.insert(id, quota);
+                if let Ok((quota, jmap)) = result {
+                    this.quotas.insert(id.clone(), quota);
+                    if let Some(url) = jmap {
+                        this.jmap_access.insert(id, url);
+                    }
                     cx.notify();
                 }
             },
@@ -9126,6 +9310,7 @@ impl MailApp {
     fn field(&self, label: &str, index: usize) -> impl IntoElement {
         let c = self.colors();
         div()
+            .debug_selector(move || format!("form-{index}"))
             .flex()
             .flex_col()
             .gap_2()
@@ -9397,6 +9582,16 @@ impl MailApp {
                         ))
                         .child(div().w(px(80.)).child(self.field("Port", IMAP_PORT))),
                 )
+                .when(matches!(self.provider, Provider::Imap | Provider::Pop3), |d| {
+                    d.child(self.switch_setting(
+                        "Incoming: STARTTLS",
+                        "On for servers that start plain and upgrade to encryption (usually port 143 for IMAP, 110 for POP3). Picacho never signs in without encryption.",
+                        "setup-incoming-starttls".into(),
+                        self.incoming_starttls,
+                        Action::ToggleIncomingStarttls,
+                        cx,
+                    ))
+                })
                 // JMAP sends through the same server.
                 .when(self.provider != Provider::Jmap, |d| {
                     d.child(
@@ -9416,6 +9611,34 @@ impl MailApp {
                     ))
                 })
                 .child(self.field("Sign-in name, if not the email address", LOGIN))
+                .when(matches!(self.provider, Provider::Imap | Provider::Pop3), |d| {
+                    d.child(self.switch_setting(
+                        "Sign in with your organization",
+                        "Single sign-on in the browser (OpenID Connect or OAuth 2.0), for organizations using Okta, Microsoft Entra ID, Keycloak, Authentik, ADFS and the like, also where they sign people in with SAML. The mail servers take its tokens instead of a password.",
+                        "setup-sso".into(),
+                        self.setup_sso,
+                        Action::ToggleSetupSso,
+                        cx,
+                    ))
+                    .when(self.setup_sso, |d| {
+                        d.child(self.field("Sign-in service (issuer URL)", SSO_ISSUER))
+                            .child(self.field("Client ID, if your administrator gave you one", SSO_CLIENT))
+                    })
+                })
+                .when(
+                    matches!(self.provider, Provider::Imap | Provider::Pop3)
+                        && !cfg!(any(target_os = "android", target_os = "ios")),
+                    |d| {
+                        d.child(self.switch_setting(
+                            "Sign in with Kerberos",
+                            "For organizations whose mail servers use Kerberos: Picacho uses the ticket this computer already has (kinit, or your domain sign-in) and no password.",
+                            "setup-kerberos".into(),
+                            self.setup_kerberos,
+                            Action::ToggleSetupKerberos,
+                            cx,
+                        ))
+                    },
+                )
                 .when(self.provider == Provider::Jmap, |d| {
                     d.child(notice_box(
                         "Some JMAP services, such as Fastmail, want an API token with mail access as the password.",
@@ -9432,7 +9655,20 @@ impl MailApp {
         if let Some(why) = self.service.browser_unavailable() {
             content = content.child(notice_box(why, c));
         }
-        content = content.child(self.field(self.service.password_label(), PASSWORD));
+        let imap_or_pop = matches!(self.provider, Provider::Imap | Provider::Pop3);
+        let kerberos = self.manual && self.setup_kerberos && imap_or_pop;
+        let sso = self.setup_sso && imap_or_pop && self.service == Service::Other;
+        if sso && !self.manual {
+            // Found from the domain: say so, with the service it uses.
+            let issuer = Self::value(&self.form[SSO_ISSUER], cx);
+            content = content.child(notice_box(
+                format!("Your organization signs you in to mail in the browser, with {issuer}. Choose Connect to continue there."),
+                c,
+            ));
+        }
+        if !kerberos && !sso {
+            content = content.child(self.field(self.service.password_label(), PASSWORD));
+        }
         if let Some((help, url)) = self.service.password_help() {
             content = content.child(
                 div()
@@ -11363,7 +11599,8 @@ fn placeholder_row(id: &str, c: Colors) -> Stateful<Div> {
 }
 /// A quiet, tinted note that explains a limitation before the form asks
 /// for something, e.g. why only an app password is offered.
-fn notice_box(text: &'static str, c: Colors) -> Div {
+fn notice_box(text: impl Into<SharedString>, c: Colors) -> Div {
+    let text: SharedString = text.into();
     div()
         .flex()
         .items_start()
@@ -12162,6 +12399,8 @@ mod tests {
             proton_events_seconds: 60,
             proton_push: true,
             subscribed_only: true,
+            pop_delete_after_days: Some(14),
+            pop_delete_with_local: true,
         };
         act(&view, Action::SetSync(first.clone(), sync), cx);
         let saved = store.accounts().unwrap();

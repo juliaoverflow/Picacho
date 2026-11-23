@@ -7,6 +7,7 @@ pub mod dav;
 pub mod discover;
 pub mod ical;
 pub mod keys;
+pub(crate) mod gss;
 pub(crate) mod fido;
 pub mod forwarding;
 mod imap;

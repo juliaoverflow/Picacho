@@ -12,6 +12,9 @@
 //! - `has:receipt` — a receipt or a refund's (`has:receipts`,
 //!   `has:invoice`, `has:purchase`). Which mail is which kind is in
 //!   `mail_kinds`.
+//! - `newer:7d`, `older:1y` — received within, or longer ago than, so many
+//!   days (`d`), weeks (`w`), months (`m`) or years (`y`) (`newer_than:`,
+//!   `older_than:` too).
 //! - A leading `-` excludes (`-from:noreply`); quotes keep spaces in a value
 //!   or phrase (`from:"Ana López"`, `"weekly report"`).
 //!
@@ -43,6 +46,10 @@ enum Field {
     Package,
     /// A receipt, or a refund's.
     Receipt,
+    /// Received within the last `value` seconds.
+    Newer,
+    /// Received longer ago than `value` seconds.
+    Older,
 }
 
 impl Field {
@@ -84,7 +91,43 @@ pub const OPERATORS: &[(&str, &str)] = &[
     ("has:otp", "Sign-in and verification codes"),
     ("has:package-update", "News of where a package is"),
     ("has:receipt", "Receipts and refunds"),
+    ("newer:", "Received within a time (7d, 2w, 3m, 1y)"),
+    ("older:", "Received longer ago (7d, 2w, 3m, 1y)"),
 ];
+/// What a server's search can do beyond IMAP4rev1's, for `imap_criteria`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImapSearch {
+    /// WITHIN (RFC 5032): YOUNGER and OLDER, in seconds, by the server's
+    /// clock; otherwise SINCE and BEFORE by date.
+    pub within: bool,
+    /// SEARCH=FUZZY (RFC 6203): words match approximately (typos, word
+    /// forms), as people expect of a search box.
+    pub fuzzy: bool,
+}
+/// A length of time such as `7d`, `2w`, `3m`, `1y` (or `7`, days), in
+/// seconds.
+fn age(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => (&text[..i], &text[i..]),
+        None => (text, "d"),
+    };
+    let n: i64 = number.parse().ok().filter(|n| *n > 0 && *n < 100_000)?;
+    let day = 86_400;
+    Some(n * match unit {
+        "h" => 3600,
+        "d" => day,
+        "w" => 7 * day,
+        "m" => 30 * day,
+        "y" => 365 * day,
+        _ => return None,
+    })
+}
+/// IMAP's date (`7-Nov-2026`) of `seconds` ago.
+fn imap_date(seconds_ago: i64) -> String {
+    let t = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+    t.format("%-d-%b-%Y").to_string()
+}
 
 impl Search {
     pub fn parse(query: &str) -> Self {
@@ -123,15 +166,31 @@ impl Search {
     /// the whole mailbox. `string` makes a search string (quoted, or a
     /// literal for text the session can't quote). Words search the whole
     /// message (TEXT), as server-side search does.
+    #[cfg(test)]
     pub fn imap_criteria(
         &self,
         string: &dyn Fn(&str) -> anyhow::Result<String>,
     ) -> anyhow::Result<String> {
+        self.imap_criteria_with(string, ImapSearch::default())
+    }
+    /// As `imap_criteria`, with what the server can do beyond IMAP4rev1.
+    pub fn imap_criteria_with(
+        &self,
+        string: &dyn Fn(&str) -> anyhow::Result<String>,
+        can: ImapSearch,
+    ) -> anyhow::Result<String> {
         let mut parts = Vec::new();
         for t in &self.terms {
             let v = || string(&t.value);
+            let seconds = || t.value.parse::<i64>().unwrap_or(0);
             let part = match t.field {
+                Field::Any if can.fuzzy => format!("FUZZY (TEXT {})", v()?),
                 Field::Any => format!("TEXT {}", v()?),
+                Field::Newer if can.within => format!("YOUNGER {}", seconds()),
+                Field::Older if can.within => format!("OLDER {}", seconds()),
+                // By date: SINCE takes the whole day, BEFORE excludes it.
+                Field::Newer => format!("SINCE {}", imap_date(seconds())),
+                Field::Older => format!("BEFORE {}", imap_date(seconds())),
                 Field::From => format!("FROM {}", v()?),
                 Field::ReplyTo => format!("HEADER Reply-To {}", v()?),
                 Field::To => format!("OR TO {} CC {}", v()?, v()?),
@@ -180,6 +239,16 @@ impl Search {
                     Field::Starred => json!({ "hasKeyword": "$flagged" }),
                     Field::Unstarred => json!({ "notKeyword": "$flagged" }),
                     Field::Attachment => json!({ "hasAttachment": true }),
+                    Field::Newer | Field::Older => {
+                        let at = chrono::Utc::now()
+                            - chrono::Duration::seconds(v.parse::<i64>().unwrap_or(0));
+                        let at = at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                        if t.field == Field::Newer {
+                            json!({ "after": at })
+                        } else {
+                            json!({ "before": at })
+                        }
+                    }
                     Field::Code | Field::Package | Field::Receipt => {
                         let words = match t.field {
                             Field::Code => CODE_SUBJECT_WORDS,
@@ -252,6 +321,14 @@ impl Term {
             Field::Code => Kinds::code(kinds, m),
             Field::Package => Kinds::package(kinds, m),
             Field::Receipt => Kinds::receipt(kinds, m),
+            Field::Newer | Field::Older => {
+                let cutoff = chrono::Utc::now().timestamp() - self.value.parse::<i64>().unwrap_or(0);
+                if self.field == Field::Newer {
+                    m.date >= cutoff
+                } else {
+                    m.date < cutoff
+                }
+            }
         }
     }
 }
@@ -330,6 +407,16 @@ fn term(raw: &str, phrase: bool) -> Option<Term> {
         "cc" => Field::Cc,
         "subject" => Field::Subject,
         "label" | "tag" | "keyword" => Field::Label,
+        "newer" | "newer_than" | "older" | "older_than" => {
+            let Some(seconds) = age(value) else {
+                return any(lower);
+            };
+            return Some(Term {
+                field: if key.starts_with("newer") { Field::Newer } else { Field::Older },
+                value: seconds.to_string(),
+                negated,
+            });
+        }
         "is" => {
             return match value {
                 "unread" => flag(Field::Unread),
@@ -369,6 +456,22 @@ fn term(raw: &str, phrase: bool) -> Option<Term> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ages_search_by_the_servers_clock_where_it_can() {
+        let quote = |s: &str| Ok(format!("\"{s}\""));
+        let s = Search::parse("newer:2d report");
+        assert_eq!(
+            s.imap_criteria_with(&quote, ImapSearch { within: true, fuzzy: true }).unwrap(),
+            "YOUNGER 172800 FUZZY (TEXT \"report\")"
+        );
+        assert!(Search::parse("older:1y").imap_criteria(&quote).unwrap().starts_with("BEFORE "));
+        assert!(Search::parse("newer:1w").imap_criteria(&quote).unwrap().starts_with("SINCE "));
+        assert_eq!(Search::parse("newer:soon").terms[0].field, Field::Any);
+        let mut m = mail();
+        m.date = chrono::Utc::now().timestamp() - 3 * 86_400;
+        assert!(Search::parse("newer:1w").matches(&m) && !Search::parse("older:1w").matches(&m));
+    }
 
     fn mail() -> Mail {
         let mut m = Mail {

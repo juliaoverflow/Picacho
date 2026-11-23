@@ -10,7 +10,7 @@ SEARCH describes the entire retention window. Only the newest requested headers 
 
 One mailbox's header updates, old-generation removal, flag clearing and reconciliation commit in one SQLite transaction. Failure rolls the transaction back. Starred synchronization clears stale stars in that source mailbox, rather than deleting unrelated non-starred messages. Database failure tests deliberately abort writes after reconciliation has started.
 
-POP3 uses `(account, UIDL)`, never the session's message number. Validate the entire UIDL response before retrieving mail: numbers must be positive and unique; identities must be unique, printable ASCII and 1–70 bytes. Sort by message number, since response row order is not guaranteed. Save the summary and raw bytes atomically. A cached identity without raw bytes is repaired by downloading again while preserving local folders/read/star flags. Interrupted downloads never create a completed identity. Originals remain on the server; Picacho never sends DELE.
+POP3 uses `(account, UIDL)`, never the session's message number. Validate the entire UIDL response before retrieving mail: numbers must be positive and unique; identities must be unique, printable ASCII and 1–70 bytes. Sort by message number, since response row order is not guaranteed. Save the summary and raw bytes atomically. A cached identity without raw bytes is repaired by downloading again while preserving local folders/read/star flags. Interrupted downloads never create a completed identity. Originals remain on the server unless the account removes them (`SyncSettings::pop_delete_after_days`, `pop_delete_with_local`; both off by default). Then `DELE` is sent only for messages whose summary and raw source are committed, after the check's downloads are saved, and the deletion counts only once `QUIT` is confirmed (RFC 1939's UPDATE state); a failure before that leaves every message on the server, and the next check decides again. DELE is never replayed within a session. Ages count from when a message was first seen downloaded here (`pop_downloaded:<account>`), not from its date, so turning the setting on never removes older mail at once.
 
 ## Failure and retry boundaries
 
@@ -161,8 +161,9 @@ reusing the layout rather than searching again; if no layout matches it
 searches once and reconciles the cache with the result. Listed messages
 replace their placeholders in place; a changed layout reloads the list.
 Placeholders cannot be opened or selected, and filters and searches show only
-listed mail. POP3 has no header-only listing, so older messages are
-downloaded whole, 25 at a time.
+listed mail. POP3 lists older messages by their headers (TOP) where the
+server has it, 200 at a time; otherwise they are downloaded whole, 25 at
+a time.
 
 Headers are fetched as `BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE
 MESSAGE-ID CONTENT-TYPE)]` with FLAGS, RFC822.SIZE and INTERNALDATE. Full
@@ -224,7 +225,7 @@ SMTP is Picacho's own client (`sync/smtp.rs`); lettre only builds the MIME messa
 - `PIPELINING`: `MAIL FROM` and every `RCPT TO` are sent together and their replies read in order. The message waits for those replies, so a refused recipient stops the send before any data goes.
 - `CHUNKING`: the message goes in `BDAT` chunks of 1 MiB, without dot-stuffing (pipelined where allowed); otherwise `DATA`.
 - `REQUIRETLS`: added to `MAIL FROM` when the account requires encryption in transit. Without it, nothing is sent.
-- `AUTH`: the best mechanism Picacho speaks (`sync/sasl.rs`). For passwords: SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, LOGIN, then CRAM-MD5. For tokens: OAUTHBEARER, then XOAUTH2. The first message goes with the command (RFC 4954). SCRAM checks the server's signature, so a server that can't prove it knows the password fails the sign-in.
+- `AUTH`: the best mechanism Picacho speaks (`sync/sasl.rs`). For passwords: SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, LOGIN, then CRAM-MD5. For tokens: OAUTHBEARER, then XOAUTH2. For accounts set to Kerberos: GSSAPI only (see below). The first message goes with the command (RFC 4954). SCRAM checks the server's signature, so a server that can't prove it knows the password fails the sign-in.
 
 - `ENHANCEDSTATUSCODES`: refusals say what the code means (5.1.1: the mailbox doesn't exist) before the server's text.
 - `LIMITS` (RFC 9422): at most `RCPTMAX` recipients per transaction. Recipients refused with 452 or 4.5.3 (too many) go in the next one, after `RSET`. Once a transaction has been accepted, a later refusal says the message reached only some recipients. `MAILMAX` caps the transactions.
@@ -241,6 +242,28 @@ OpenSSL 3 reports a connection closed without TLS's goodbye as an error. IMAP an
 A sent copy that couldn't be appended is queued as a file under `sent-copies/<account>/` in the data directory. It is filed by the next draft sync, after a `UID SEARCH HEADER Message-ID` in Sent finds no copy already there. Removing the account removes its queue.
 
 MTA-STS checks (`sync/mta_sts.rs`) only run when encryption in transit is required. The `_mta-sts` TXT record goes through the resolver used for sender checks. The policy is fetched from `https://mta-sts.<domain>/.well-known/mta-sts.txt` without redirects (at most 64 KB, `text/plain`) and kept until its max_age or a new record id, for at most a day. A policy in `testing` counts, since REQUIRETLS treats it as enforce. DANE means a TLSA record at `_25._tcp.<mx>` for the most preferred MX; the sending servers check its DNSSEC signatures. These checks only inform: delivery is the outgoing server's.
+
+## Single sign-on (OpenID Connect)
+
+IMAP and POP3 accounts can sign in with an organization's identity provider (`Account::sso`: its issuer and extra scopes; with `oauth`). The mail protocols have no browser step, so SAML 2.0 isn't spoken to the mail servers: SASL `SAML20` (RFC 6595) is unsupported by Dovecot, Exchange, Microsoft 365, Gmail and Cyrus. Organizations that use SAML put OpenID Connect or OAuth 2.0 in front of mail instead, and the identity provider follows its SAML redirect in the browser. That is the flow Picacho takes:
+
+- Metadata comes from the issuer: `<issuer>/.well-known/openid-configuration`, else RFC 8414's `/.well-known/oauth-authorization-server<path>` (and OpenID's in that form). A document must name exactly the issuer asked for, so a redirect or another host can't redirect the sign-in or the tokens. Redirects aren't followed, and only https endpoints are taken.
+- Client: the id an administrator gave, else one the provider registers for this sign-in (RFC 7591, a public native client for the loopback redirect). The id is kept with the account for renewing tokens.
+- The browser step is the same as for Gmail and JMAP: PKCE (S256), a random state, a loopback redirect on `127.0.0.1`, and a `login_hint`. Scopes: `openid email profile offline_access` where listed, plus those the account or the domain's configuration names, always.
+- Mail servers get the access token with OAUTHBEARER, else XOAUTH2 (IMAP, POP3 AUTH, SMTP, ManageSieve), as the sign-in name if one is set, else the address. POP3 never sends the token as a password. Tokens renew at the issuer's token endpoint.
+- Discovery: an autoconfig file whose incoming server lists only `OAuth2` authentication, with an `<oAuth2>` block, sets single sign-on up. Its `<issuer>` (a host, in Thunderbird's files) and `<authURL>` give the issuer, for example `https://login.example.edu/realms/staff` from Keycloak's `…/realms/staff/protocol/openid-connect/auth`. Its endpoint URLs are not used: the file may have come over a redirect, and the issuer's own metadata is authoritative. Gmail and Outlook keep their own sign-in.
+
+`sh scripts/keycloak-sso.sh` (with `KEYCLOAK_HOME` set to an unpacked Keycloak 26) sets up a local Keycloak with two realms. `mail` is what Picacho signs in to, and it sends everyone to `corp`, a SAML 2.0 identity provider. `cargo test -- --ignored sso` then signs in through both: `scripts/sso-browser.py` fills in the SAML side's form and posts its assertion back. It checks the token at loopback IMAP, POP3 and SMTP servers against Keycloak's userinfo, renews it, and checks that a forged token is refused.
+
+## Kerberos (GSSAPI)
+
+IMAP and POP3 accounts can sign in with Kerberos instead of a password (`Account::kerberos`, Settings → account, or **Sign in with Kerberos** in manual setup; off by default, not offered on Android and iOS). The incoming, outgoing and filter servers all use SASL GSSAPI (RFC 4752) with the ticket the computer already has (`kinit`, or a Windows domain sign-in). There is no password, so none is kept in the keychain or sent. An account set to Kerberos never falls back to another mechanism: a server that doesn't offer GSSAPI is reported, not tried with a password. A sending address with its own outgoing server keeps its own password.
+
+`sync/gss.rs` speaks to the system's Kerberos. On Linux, the BSDs and macOS it loads the GSS-API library when first needed (MIT `libgssapi_krb5`, Heimdal `libgssapi`, Apple's GSS.framework), so builds need no Kerberos headers and computers without Kerberos run as before. On Windows it uses SSPI's Kerberos package. The service name is `imap@host`, `pop@host`, `smtp@host` or `sieve@host` (SSPI: `imap/host`). The context requires mutual authentication: a server that can't prove it holds the service's key fails the sign-in. After the context comes the security-layer exchange: Picacho takes no layer (TLS protects the connection), refuses servers that require one, and names the sign-in name, if set, as the user to act as. A server that accepts before that exchange is finished isn't trusted.
+
+Switching an existing account to Kerberos signs in with the ticket first and changes nothing if that fails. Switching back needs the password still saved from before.
+
+`cargo test -- --ignored kerberos` starts a throwaway realm with MIT's `krb5kdc`, `kdb5_util`, `kadmin.local` and `kinit`. It signs in through the real GSS-API to loopback IMAP, POP3 and SMTP servers that accept with the services' keytab.
 
 ## JMAP
 
@@ -330,11 +353,13 @@ this keep using IMAP.
 `sync/dav.rs` is the WebDAV client both use. Passwords go only over HTTPS and only to the host entered (same-host redirects).
 
 - Discovery: an address that is just a domain uses its `_caldavs._tcp` or `_carddavs._tcp` SRV record and TXT `path=` (RFC 6764), but only if the target is in the domain. DNS isn't authenticated, so this keeps the password with a host that has the domain's certificate. Otherwise discovery uses `/.well-known/caldav` or `/.well-known/carddav`, the principal, and its home set.
-- Each collection's `sync-token` and `getctag` are read with its name, privileges, `supported-calendar-component-set` and `calendar-color`. Calendars without VEVENT (task lists) are left out.
+- Each collection's `sync-token` and `getctag` are read with its name, privileges, `supported-calendar-component-set` and `calendar-color`. Calendars for neither events nor tasks are left out.
+- Tasks (VTODO) are read with a `calendar-query` for those without COMPLETED, apart from events: a resource's VTODO never shows as an event. A task's due date is its DUE, also where it has a DTSTART; tasks without one are kept, listed last. Edits rewrite only SUMMARY, DESCRIPTION, DUE, STATUS, COMPLETED, PERCENT-COMPLETE, SEQUENCE and the timestamps, so other apps' properties (PRIORITY, CATEGORIES, alarms, X- properties) stay. New tasks go to the default calendar where it takes VTODO, else the first writable one that does.
 - Sync: an unchanged token or ctag costs one PROPFIND. With a token, `sync-collection` lists changed and removed hrefs with ETags. Only resources whose ETag differs from the one kept are fetched, by `calendar-multiget` or `addressbook-multiget` (100 per request). A token the server no longer knows (403 `valid-sync-token`) reads the collection whole. Address books keep their states in the server's settings, and calendars keep theirs on each calendar.
 - Calendars read whole cover a month back to a year ahead plus 30 days. Change-only syncs continue until that end is reached, then the window is read whole again.
 - Writes use `If-Match`, and new resources use `If-None-Match: *`. 412 is "changed elsewhere", 429 and 503 are `Busy` with the Retry-After time, and 507 is out of storage.
 - Events saved to the server mark every ORGANIZER and ATTENDEE `SCHEDULE-AGENT=CLIENT` (RFC 6638). Picacho sends invitations, answers and cancellations by email (iMIP), so a scheduling server must not send its own. An agent already named is kept.
+- **Let the server send invitations** (Settings → Calendar, CalDAV only, off by default) hands events you organize to the server instead: they are saved without `SCHEDULE-AGENT=CLIENT`, and Picacho sends no invitation or cancellation mail for them. Turning it on first checks the calendar home's `DAV:` header for `calendar-auto-schedule` (RFC 6638 §2) and is refused without it, so invitations are never silently lost. Invitations from others are still answered by mail and saved with `SCHEDULE-AGENT=CLIENT`, so their organizers aren't answered twice.
 - Cards: editing replaces only the lines whose value changed. The lines of unchanged addresses, numbers, names, organization and note keep their parameters and groups. An address removed takes its `itemN.X-AB*` label with it.
 
 ## Newer extensions
@@ -365,6 +390,17 @@ JMAP:
 - The Blob extension (RFC 9404): small uploads (Sieve scripts) go inline with `Blob/upload`, and the header block of a message too large to keep is read with `Blob/get`'s offset and length, for Check sender.
 - `MDN/send` (RFC 9007) sends read receipts where the account has it, marking `$mdnsent`.
 - JMAP for Calendars and Contacts (`sync/jscal.rs`): JSCalendar events and JSContact cards become the same events and cards CalDAV and CardDAV give. Events are created with `sendSchedulingMessages: false`, and participants are given `scheduleAgent: client`. A card edit patches only what changed, keeping each unchanged address's and number's entry (and labels). The calendar or contacts "server" is then the account (`jmap_account`), and hrefs are `jmap:<id>`.
+
+Later additions:
+
+- STARTTLS for incoming mail (`Account::incoming_starttls`): IMAP's STARTTLS and POP3's STLS (RFC 2595) upgrade before any other command; a server not listing STLS, or refusing it, is left without signing in, and bytes sent before the handshake are refused.
+- POP3: `TOP n 0` lists older mail by headers (sizes from `LIST`); `Backend::read` downloads one whole by its UIDL. RFC 2449/3206 response codes are read (`pop::Rejected`): `LOGIN-DELAY`, `IN-USE` and `SYS/TEMP` pause background work as `[THROTTLED]` does, and aren't access failures. `UTF8` is sent before signing in where listed.
+- ManageSieve: `NOOP` after signing in (RFC 5804 servers), `HAVESPACE` before uploading, an inactive script replaced by `PUTSCRIPT` under another name then `RENAMESCRIPT`, and response codes (`QUOTA`, `TRYLATER`, `REFERRAL` within the same domain only, `WARNINGS`).
+- SMTP: `MT-PRIORITY=-4|4` for low/high priority (`Draft::priority`, also as Importance and X-Priority headers), `BY=<seconds>;R` from `Account::deliver_within_hours` where `DELIVERBY` is listed, never below the server's minimum.
+- IMAP: `ENABLE IMAP4rev2` where both revisions are listed (then `Extensions::as_rev2`); `WITHIN` (YOUNGER/OLDER) and `SEARCH=FUZZY` in server searches; `ESORT` with `PARTIAL` for one sorted page and a count; `MULTISEARCH` (`ESEARCH IN (mailboxes …)`) for All Mail and Starred, falling back to folder by folder; `INPROGRESS` lines renew the 90-second response budget; quota is the fullest of the inbox's and Archive's and Sent's roots; `GETJMAPACCESS` names a JMAP server for Settings.
+- JMAP calendars and contacts: `CalendarEvent/changes` and `ContactCard/changes` from the state last read (`calendar_jmap_state`; the contacts server's `states["jmap"]`), whole reads paged with `position`/`limit` and gets split by `maxObjectsInGet`. Each event and card keeps its own version (`updated`, else a hash) and is read again before an update; a different one is a `jscal::Conflict`, not an overwrite (ifInState would refuse for any other object's change). `Principal/query` and `Principal/getAvailability` give free/busy; `ParticipantIdentity/get` adds your invitation addresses; `CalendarEventNotification` and `ShareNotification` are shown once and destroyed. PushSubscription isn't used: a desktop app has no URL a server can push to, so the event source and WebSocket stay.
+- CalDAV/CardDAV: `PROPPATCH` renames (and recolours), `DELETE` of a collection removes it; `max-resource-size` and `supported-address-data` are read; `Schedule-Tag` is kept and sent as `If-Schedule-Tag-Match`; with server scheduling, the `schedule-inbox-URL` is read after each sync, noted and emptied; RFC 4331 quota; RFC 8607 `?action=attachment-add` where the calendar lists `calendar-managed-attachments`.
+- iCalendar: every object written gets a VTIMEZONE for each TZID it uses (`ical::with_timezones`), built from the time zone database's offset changes over the years its times cover.
 
 CalDAV and CardDAV also make calendars (MKCALENDAR) and address books (extended MKCOL) in the user's home set. They read open tasks with a VTODO query (`COMPLETED` not defined), keep VALARM reminders (shown as notifications once, up to a day late), and ask free/busy of the scheduling outbox (a VFREEBUSY POST, RFC 6638 §5). Cards keep ADR, BDAY, PHOTO and groups (vCard 4's KIND/MEMBER, written as Apple's X-ADDRESSBOOKSERVER-KIND/-MEMBER, which vCard 3 servers keep).
 

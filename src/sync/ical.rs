@@ -346,6 +346,164 @@ fn attendee(value: &str, params: &[(String, String)]) -> Attendee {
     }
 }
 
+/// The tasks (VTODO) in an iCalendar object, those without a due date
+/// too (`start` 0). A task's DUE is when it's due even where it also has
+/// a DTSTART (when work on it starts).
+pub fn parse_tasks(text: &str) -> Vec<Event> {
+    // Each VTODO alone, so `parse`'s rules for events don't apply: it
+    // leaves out what has no start.
+    let mut out = Vec::new();
+    let lines = unfold(text);
+    let mut inside: Option<Vec<String>> = None;
+    for line in &lines {
+        let upper = line.to_ascii_uppercase();
+        if upper == "BEGIN:VTODO" {
+            inside = Some(vec![line.clone()]);
+            continue;
+        }
+        if let Some(todo) = inside.as_mut() {
+            todo.push(line.clone());
+            if upper == "END:VTODO" {
+                let todo = inside.take().unwrap_or_default();
+                let source = todo.join("\r\n") + "\r\n";
+                let mut due = None;
+                let mut nested = 0;
+                for l in &todo[1..todo.len() - 1] {
+                    let u = l.to_ascii_uppercase();
+                    if u.starts_with("BEGIN:") {
+                        nested += 1;
+                    } else if u.starts_with("END:") {
+                        nested -= 1;
+                    } else if nested == 0
+                        && let Some((name, params, value)) = split_line(l)
+                        && name == "DUE"
+                    {
+                        due = parse_time(&value, &params);
+                    }
+                }
+                // Parsed with a stand-in start, so `parse` keeps it.
+                let mut wrapped = vec!["BEGIN:VCALENDAR".to_owned()];
+                wrapped.extend(
+                    todo.iter()
+                        .filter(|l| {
+                            let u = l.to_ascii_uppercase();
+                            !u.starts_with("DTSTART") && !u.starts_with("DUE")
+                        })
+                        .cloned(),
+                );
+                wrapped.insert(2, "DTSTART:19700101T000001Z".to_owned());
+                wrapped.push("END:VCALENDAR".to_owned());
+                let Some(mut e) = parse(&wrapped.join("\r\n")).events.pop() else {
+                    continue;
+                };
+                let (start, all_day) = due.unwrap_or((0, false));
+                e.start = start;
+                e.end = start;
+                e.all_day = all_day;
+                let due_params = todo
+                    .iter()
+                    .filter_map(|l| split_line(l))
+                    .find(|(n, ..)| n == "DUE");
+                e.tzid = due_params
+                    .as_ref()
+                    .and_then(|(_, p, _)| zone_name(p))
+                    .unwrap_or_default();
+                e.utc = due_params.is_some_and(|(.., v)| v.trim().ends_with('Z'));
+                e.task = true;
+                e.source = source;
+                if !e.uid.is_empty() {
+                    out.push(e);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A task's VTODO with what's edited here changed (summary, notes, due,
+/// done) and everything else kept as the server had it: priority,
+/// categories, alarms, other apps' properties. Without a source, it is
+/// written from its fields.
+pub fn update_task(e: &Event) -> String {
+    if e.source.is_empty() {
+        return write_event(e);
+    }
+    let edited = [
+        "SUMMARY",
+        "DESCRIPTION",
+        "DUE",
+        "STATUS",
+        "COMPLETED",
+        "PERCENT-COMPLETE",
+        "SEQUENCE",
+        "DTSTAMP",
+        "LAST-MODIFIED",
+    ];
+    let lines = unfold(&e.source);
+    let mut out = Vec::new();
+    let mut nested = 0;
+    for line in &lines {
+        let upper = line.to_ascii_uppercase();
+        if upper == "END:VTODO" && nested == 0 {
+            break;
+        }
+        if upper.starts_with("BEGIN:") && upper != "BEGIN:VTODO" {
+            nested += 1;
+        } else if upper.starts_with("END:") {
+            nested -= 1;
+        }
+        let name = split_line(line).map(|(n, ..)| n).unwrap_or_default();
+        if nested == 0 && upper != "BEGIN:VTODO" && edited.contains(&name.as_str()) {
+            continue;
+        }
+        out.push(line.clone());
+        if upper == "BEGIN:VTODO" {
+            let now = stamp(Utc::now().timestamp());
+            out.push(format!("DTSTAMP:{now}"));
+            out.push(format!("LAST-MODIFIED:{now}"));
+            out.push(format!("SEQUENCE:{}", e.sequence));
+            out.push(format!("SUMMARY:{}", escape(&e.summary)));
+            if !e.description.is_empty() {
+                out.push(format!("DESCRIPTION:{}", escape(&e.description)));
+            }
+            if e.start != 0 {
+                out.push(if e.all_day {
+                    format!("DUE;{}", when(e.start, true))
+                } else if let Ok(zone) = e.tzid.parse::<chrono_tz::Tz>() {
+                    let local = DateTime::from_timestamp(e.start, 0)
+                        .unwrap_or_default()
+                        .with_timezone(&zone);
+                    format!("DUE;TZID={}:{}", e.tzid, local.format("%Y%m%dT%H%M%S"))
+                } else {
+                    format!("DUE{}", when(e.start, false))
+                });
+            }
+            if e.completed {
+                out.push("STATUS:COMPLETED".to_owned());
+                out.push(format!("COMPLETED:{now}"));
+                out.push("PERCENT-COMPLETE:100".to_owned());
+            } else {
+                out.push("STATUS:NEEDS-ACTION".to_owned());
+            }
+        }
+    }
+    out.push("END:VTODO".to_owned());
+    out.iter().map(|l| fold(l)).collect()
+}
+
+/// A task as a whole calendar object for its server.
+pub fn task_to_store(e: &Event) -> String {
+    let mut out = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\n");
+    out.push_str(concat!(
+        "PRODID:-//Pinal Technologies//Picacho ",
+        env!("CARGO_PKG_VERSION"),
+        "//EN\r\n"
+    ));
+    out.push_str(&update_task(e));
+    out.push_str("END:VCALENDAR\r\n");
+    with_timezones(&out)
+}
+
 /// Reads an iCalendar object. Events without a start are left out.
 pub fn parse(text: &str) -> Calendar {
     let lines = unfold(text);
@@ -1030,7 +1188,7 @@ pub fn to_store_all(series: &Event, overrides: &[Event]) -> String {
         out.push_str(&write_event(o));
     }
     out.push_str("END:VCALENDAR\r\n");
-    out
+    with_timezones(&out)
 }
 
 /// When an event is, for an invitation's text: in the event's own zone
@@ -1082,7 +1240,7 @@ pub fn request(series: &Event, overrides: &[Event], cancel: bool) -> String {
         }
     }
     out.push_str("END:VCALENDAR\r\n");
-    out
+    with_timezones(&out)
 }
 
 /// The iMIP REPLY to an invitation: `me` answers `status` (RFC 5546 §3.2.3).
@@ -1213,7 +1371,7 @@ fn method_object(method: &str, events: &str) -> String {
     out.push_str(&format!("METHOD:{method}\r\n"));
     out.push_str(events);
     out.push_str("END:VCALENDAR\r\n");
-    out
+    with_timezones(&out)
 }
 
 /// A calendar object holding `event` as it came (METHOD left out), for
@@ -1233,7 +1391,7 @@ pub fn to_store(event: &Event) -> String {
         }
     }
     out.push_str("END:VCALENDAR\r\n");
-    out
+    with_timezones(&out)
 }
 
 /// A calendar object for a CalDAV server that Picacho does the inviting
@@ -1264,6 +1422,185 @@ pub fn scheduled_by_client(text: &str) -> String {
     out
 }
 
+/// The UTC offset (seconds east) of `zone` at `t`.
+fn offset_at(zone: chrono_tz::Tz, t: i64) -> i32 {
+    use chrono::Offset;
+    let utc = DateTime::from_timestamp(t, 0).unwrap_or_default();
+    utc.with_timezone(&zone).offset().fix().local_minus_utc()
+}
+/// `+0130`-style offset for iCalendar.
+fn utc_offset(seconds: i32) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let s = seconds.unsigned_abs();
+    let (h, m, sec) = (s / 3600, s / 60 % 60, s % 60);
+    if sec == 0 {
+        format!("{sign}{h:02}{m:02}")
+    } else {
+        format!("{sign}{h:02}{m:02}{sec:02}")
+    }
+}
+/// The zone's changes of offset in `from..to` (Unix seconds), each as
+/// (instant, offset before, offset after), found by searching each day
+/// for a change and then the second.
+fn transitions(zone: chrono_tz::Tz, from: i64, to: i64) -> Vec<(i64, i32, i32)> {
+    const DAY: i64 = 86_400;
+    let mut out = Vec::new();
+    let mut t = from;
+    let mut before = offset_at(zone, t);
+    while t < to {
+        let next = (t + DAY).min(to);
+        let after = offset_at(zone, next);
+        if after != before {
+            // The second it changes, within this day.
+            let (mut lo, mut hi) = (t, next);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if offset_at(zone, mid) == before {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            out.push((hi, before, after));
+            before = after;
+        }
+        t = next;
+    }
+    out
+}
+/// A VTIMEZONE for `tzid` (an IANA name) covering `years` (RFC 5545
+/// §3.6.5): its offset changes in those years as dated STANDARD and
+/// DAYLIGHT observances, or one STANDARD where it doesn't change. `None`
+/// for a name the time zone database doesn't know.
+pub fn vtimezone(tzid: &str, years: std::ops::RangeInclusive<i32>) -> Option<String> {
+    let zone: chrono_tz::Tz = tzid.parse().ok()?;
+    let start = |y: i32| {
+        chrono::NaiveDate::from_ymd_opt(y, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc().timestamp())
+    };
+    let (from, to) = (start(*years.start())?, start(years.end() + 1)?);
+    let mut lines = vec!["BEGIN:VTIMEZONE".to_owned(), format!("TZID:{tzid}")];
+    let changes = transitions(zone, from, to);
+    let local = |t: i64, offset: i32| {
+        DateTime::from_timestamp(t + i64::from(offset), 0)
+            .unwrap_or_default()
+            .format("%Y%m%dT%H%M%S")
+            .to_string()
+    };
+    let abbreviation = |t: i64| {
+        DateTime::from_timestamp(t, 0)
+            .unwrap_or_default()
+            .with_timezone(&zone)
+            .format("%Z")
+            .to_string()
+    };
+    if changes.is_empty() {
+        let offset = utc_offset(offset_at(zone, from));
+        lines.extend([
+            "BEGIN:STANDARD".to_owned(),
+            // Any start before the events will do.
+            "DTSTART:19700101T000000".to_owned(),
+            format!("TZOFFSETFROM:{offset}"),
+            format!("TZOFFSETTO:{offset}"),
+            format!("TZNAME:{}", abbreviation(from)),
+            "END:STANDARD".to_owned(),
+        ]);
+    } else {
+        // What held before the first change, so earlier times are covered.
+        let (first, before, _) = changes[0];
+        lines.extend([
+            "BEGIN:STANDARD".to_owned(),
+            "DTSTART:19700101T000000".to_owned(),
+            format!("TZOFFSETFROM:{}", utc_offset(before)),
+            format!("TZOFFSETTO:{}", utc_offset(before)),
+            format!("TZNAME:{}", abbreviation(first - 1)),
+            "END:STANDARD".to_owned(),
+        ]);
+        for (at, before, after) in &changes {
+            // The later offset of a pair is summer time (DAYLIGHT).
+            let kind = if after > before { "DAYLIGHT" } else { "STANDARD" };
+            lines.extend([
+                format!("BEGIN:{kind}"),
+                // DTSTART is in the local time before the change.
+                format!("DTSTART:{}", local(*at, *before)),
+                format!("TZOFFSETFROM:{}", utc_offset(*before)),
+                format!("TZOFFSETTO:{}", utc_offset(*after)),
+                format!("TZNAME:{}", abbreviation(*at)),
+                format!("END:{kind}"),
+            ]);
+        }
+    }
+    lines.push("END:VTIMEZONE".to_owned());
+    Some(lines.iter().map(|l| fold(l)).collect())
+}
+/// `text` (a whole VCALENDAR) with a VTIMEZONE for each TZID its
+/// components use that it doesn't define (RFC 5545 §3.2.19 requires one),
+/// placed before the first component. Covers the years of the times it
+/// has, from a year before to a few after (repeating events go on), so
+/// Outlook and Exchange, which go by the VTIMEZONE rather than the name,
+/// show the right times.
+pub fn with_timezones(text: &str) -> String {
+    let lines = unfold(text);
+    let mut defined = std::collections::HashSet::new();
+    let mut used: Vec<String> = Vec::new();
+    let mut years: Vec<i32> = Vec::new();
+    for line in &lines {
+        let upper = line.to_ascii_uppercase();
+        if let Some(id) = upper.strip_prefix("TZID:") {
+            defined.insert(id.trim().to_owned());
+            continue;
+        }
+        let Some((_, params, value)) = split_line(line) else {
+            continue;
+        };
+        if let Some((_, tzid)) = params.iter().find(|(k, _)| k.eq_ignore_ascii_case("TZID")) {
+            let tzid = tzid.trim_matches('"').to_owned();
+            if !used.contains(&tzid) {
+                used.push(tzid);
+            }
+            // Only plausible years: a server's or sender's far-off date
+            // mustn't make the time zone search cover millennia.
+            if let Some(y) = value
+                .get(..4)
+                .and_then(|y| y.parse::<i32>().ok())
+                .filter(|y| (1900..=2200).contains(y))
+            {
+                years.push(y);
+            }
+        }
+    }
+    let missing: Vec<&String> = used
+        .iter()
+        .filter(|t| !defined.contains(&t.to_ascii_uppercase()))
+        .collect();
+    if missing.is_empty() {
+        return text.to_owned();
+    }
+    // Bounded work however the object is made: at most this many zones,
+    // over at most this many years.
+    const MOST_ZONES: usize = 16;
+    const MOST_YEARS: i32 = 40;
+    let first = years.iter().min().copied().unwrap_or(1970) - 1;
+    let last = (years.iter().max().copied().unwrap_or(first) + 5)
+        .max(first)
+        .min(first + MOST_YEARS);
+    let blocks: String = missing
+        .iter()
+        .take(MOST_ZONES)
+        .filter_map(|t| vtimezone(t, first..=last))
+        .collect();
+    // Before the first component, after the calendar's own properties.
+    let at = ["\r\nBEGIN:VEVENT", "\r\nBEGIN:VTODO", "\r\nBEGIN:VFREEBUSY", "\r\nEND:VCALENDAR"]
+        .iter()
+        .filter_map(|m| text.find(m))
+        .min();
+    match at {
+        Some(i) => format!("{}\r\n{}{}", &text[..i], blocks.trim_end_matches("\r\n"), &text[i..]),
+        None => text.to_owned(),
+    }
+}
+
 /// A VEVENT written from its fields, for events made or edited here.
 pub fn write_event(e: &Event) -> String {
     let kind = if e.task { "VTODO" } else { "VEVENT" };
@@ -1290,8 +1627,10 @@ pub fn write_event(e: &Event) -> String {
         lines.push(at("RECURRENCE-ID", id));
     }
     if e.task {
-        // A task is due then; done or not.
-        lines.push(at("DUE", e.start));
+        // A task is due then (0: no due date); done or not.
+        if e.start != 0 {
+            lines.push(at("DUE", e.start));
+        }
         if e.completed {
             lines.push("STATUS:COMPLETED".to_owned());
             lines.push(format!("COMPLETED:{}", stamp(Utc::now().timestamp())));
@@ -1372,6 +1711,32 @@ fn trigger(before: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoned_events_carry_their_vtimezone() {
+        let tz = vtimezone("Europe/Berlin", 2026..=2026).unwrap();
+        assert!(tz.contains("TZID:Europe/Berlin"));
+        // 2026: summer time from 29 March 02:00, back on 25 October 03:00.
+        assert!(tz.contains("BEGIN:DAYLIGHT\r\nDTSTART:20260329T020000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200"), "{tz}");
+        assert!(tz.contains("DTSTART:20261025T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100"), "{tz}");
+        let fixed = vtimezone("Asia/Kolkata", 2026..=2026).unwrap();
+        assert!(fixed.contains("TZOFFSETTO:+0530") && !fixed.contains("DAYLIGHT"));
+        assert!(vtimezone("Not/AZone", 2026..=2026).is_none());
+        let e = Event {
+            uid: "z".into(),
+            summary: "Call".into(),
+            start: 1_795_000_000,
+            end: 1_795_003_600,
+            tzid: "America/New_York".into(),
+            ..Event::default()
+        };
+        let text = to_store(&e);
+        assert_eq!(text.matches("BEGIN:VTIMEZONE").count(), 1);
+        assert!(text.find("BEGIN:VTIMEZONE").unwrap() < text.find("BEGIN:VEVENT").unwrap());
+        // One already there isn't added twice; the object still parses.
+        assert_eq!(with_timezones(&text), text);
+        assert_eq!(parse(&text).events.len(), 1);
+    }
 
     const INVITE: &str = "BEGIN:VCALENDAR\r\nPRODID:-//Google Inc//Google Calendar 70.9054//EN\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nDTSTART;TZID=Europe/Berlin:20261124T100000\r\nDTEND;TZID=Europe/Berlin:20261124T110000\r\nDTSTAMP:20261120T090000Z\r\nORGANIZER;CN=Ana López:mailto:ana@example.org\r\nUID:abc123@google.com\r\nATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=qa\r\n @example.com:mailto:qa@example.com\r\nSUMMARY:Planning\\, Q1\r\nLOCATION:Room 4\r\nDESCRIPTION:Agenda:\\n1. Budget\r\nSEQUENCE:2\r\nBEGIN:VALARM\r\nTRIGGER:-P0DT0H10M0S\r\nDESCRIPTION:Alarm\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 

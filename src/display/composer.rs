@@ -2378,6 +2378,22 @@ impl Composer {
                     },
                 ))
                 .child(self.icon_button(
+                    "priority",
+                    "warning",
+                    match self.draft.priority {
+                        crate::manage::model::Priority::Normal => "Normal priority: mark as important",
+                        crate::manage::model::Priority::High => "High priority: mark as low priority",
+                        crate::manage::model::Priority::Low => "Low priority: back to normal",
+                    },
+                    !self.draft.priority.is_normal(),
+                    cx,
+                    |t, _, cx| {
+                        t.draft.priority = t.draft.priority.next();
+                        t.changed(cx);
+                        cx.notify();
+                    },
+                ))
+                .child(self.icon_button(
                     "encrypt",
                     "lock",
                     match (self.draft.encrypt, smime) {

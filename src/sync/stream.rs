@@ -215,6 +215,9 @@ impl ImapStream {
         self.deflate.as_deref_mut()
     }
 }
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
 fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -241,6 +244,13 @@ impl Read for ImapStream {
             other => other?,
         };
         self.tap.record(&buf[..read]);
+        // `* OK [INPROGRESS ("tag" n total)]`: still working (RFC 9585;
+        // servers listing INPROGRESS send it unasked). A mention elsewhere
+        // (inside a message) only extends the time by one more budget,
+        // still bounded by the byte limit.
+        if read > 0 && contains(&buf[..read], b"[INPROGRESS") {
+            self.tls.get_mut().progressed();
+        }
         Ok(read)
     }
 }

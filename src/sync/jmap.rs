@@ -340,6 +340,8 @@ pub struct Session {
     contacts_account: Option<String>,
     primary_mail: String,
     calendars_account: Option<String>,
+    /// The sign-in's principals account (JMAP Principals, RFC 9670).
+    principals_account: Option<String>,
     /// The Mailbox state `mailboxes` was read in, for Mailbox/changes.
     mailbox_state: Mutex<String>,
     /// The account's name for itself (the session's `username`).
@@ -675,6 +677,7 @@ impl Session {
             contacts_account: v["primaryAccounts"][CONTACTS].as_str().map(str::to_owned),
             primary_mail: v["primaryAccounts"][MAIL].as_str().unwrap_or_default().to_owned(),
             calendars_account: v["primaryAccounts"][CALENDARS].as_str().map(str::to_owned),
+            principals_account: v["primaryAccounts"][PRINCIPALS].as_str().map(str::to_owned),
             mailbox_state: Mutex::new(String::new()),
         })
     }
@@ -791,7 +794,13 @@ impl Session {
         }) {
             using.push(CALENDARS);
         }
-        if calls.iter().any(|(n, _)| n.starts_with("Principal/")) {
+        if calls.iter().any(|(n, _)| n.starts_with("CalendarEventNotification/")) {
+            using.push(CALENDARS);
+        }
+        if calls
+            .iter()
+            .any(|(n, _)| n.starts_with("Principal/") || n.starts_with("ShareNotification/"))
+        {
             using.push(PRINCIPALS);
         }
         let method_calls: Vec<Value> = calls
@@ -1513,15 +1522,20 @@ impl Session {
     pub fn call_one(&self, name: &str, args: Value) -> Result<Value> {
         self.one(name, args)
     }
-    /// Several method calls in one request (back-references allowed).
-    pub fn call_many(&self, calls: &[(&str, Value)]) -> Result<Vec<(String, Value)>> {
-        self.call(calls)
+    /// The most ids one /get may name (`maxObjectsInGet`).
+    pub fn max_get(&self) -> usize {
+        self.max_get.max(1)
     }
     /// The sign-in's calendar account, where the server has calendars.
     pub fn calendars_account(&self) -> Option<&str> {
         self.calendars_account
             .as_deref()
             .filter(|_| self.has(CALENDARS))
+    }
+    /// The sign-in's principals account, where the server has a directory
+    /// of people (JMAP Principals).
+    pub fn principals_account(&self) -> Option<&str> {
+        self.principals_account.as_deref().filter(|_| self.has(PRINCIPALS))
     }
     /// The sign-in's contacts account, where the server has contacts.
     pub fn contacts_account(&self) -> Option<&str> {

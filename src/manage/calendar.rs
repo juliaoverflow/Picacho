@@ -14,6 +14,24 @@ const SERVER: &str = "calendar_server";
 const CALENDARS: &str = "calendars";
 const EVENTS: &str = "calendar_events";
 const SYNCED: &str = "calendar_synced";
+/// A JMAP server's CalendarEvent state when its events were last read,
+/// and the end of the time range read then ("state@until").
+const JMAP_STATE: &str = "calendar_jmap_state";
+/// What a JMAP server said about shared calendars and events since the
+/// last sync, not yet shown (`calendar_notices`).
+const NOTICES: &str = "calendar_notices";
+/// The addresses a JMAP server knows as yours for invitations
+/// (ParticipantIdentity), beside the accounts' own.
+const PARTICIPANTS: &str = "calendar_participants";
+/// The most notices kept until shown: the newest, so one busy shared
+/// calendar can't grow the saved list (and each sync's rewrite of it)
+/// without end.
+const MOST_NOTICES: usize = 200;
+fn keep_recent(notices: &mut Vec<String>) {
+    if notices.len() > MOST_NOTICES {
+        notices.drain(..notices.len() - MOST_NOTICES);
+    }
+}
 /// The calendar new events go to (its href).
 const DEFAULT: &str = "calendar_default";
 /// Invitations answered here: event UID → answer.
@@ -67,6 +85,17 @@ impl Backend {
             .or_else(|| cals.iter().find(|c| c.writable))
             .cloned()
     }
+    /// The calendar new tasks go to: the default one where it takes tasks,
+    /// else the first writable one that does. Calendars whose kinds aren't
+    /// known are taken to take both.
+    pub fn task_calendar(&self) -> Option<caldav::Calendar> {
+        let takes = |c: &caldav::Calendar| {
+            c.writable && (c.components.is_empty() || c.components.iter().any(|k| k == "VTODO"))
+        };
+        self.default_calendar()
+            .filter(takes)
+            .or_else(|| self.calendars().into_iter().find(takes))
+    }
     pub fn set_default_calendar(&self, href: &str) -> Result<()> {
         self.store.set_preference(DEFAULT, href)
     }
@@ -89,6 +118,53 @@ impl Backend {
             .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
         self.sync_calendar()
     }
+    /// Lets the CalDAV server send invitations, updates and cancellations
+    /// for events you organize (RFC 6638), or has Picacho email them
+    /// again. Turning it on asks the server first: one that doesn't
+    /// schedule is refused, so invitations aren't silently lost.
+    pub fn set_server_scheduling(&self, on: bool) -> Result<()> {
+        let mut server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        ensure!(
+            server.jmap_account.is_empty() || !on,
+            "Calendars on a JMAP server are scheduled by Picacho."
+        );
+        if on {
+            ensure!(
+                caldav::schedules(&server, &self.calendar_password()?, self.tls_connector()?)?,
+                "This calendar server doesn't send invitations itself (it doesn't offer calendar-auto-schedule), so Picacho keeps emailing them."
+            );
+        }
+        server.server_schedules = on;
+        self.store
+            .set_preference(SERVER, &serde_json::to_string(&server)?)
+    }
+    /// Whether an event is one you organize (or has no organizer): with
+    /// server scheduling, the server sends its invitations. Invitations
+    /// from others are still answered by mail, so the organizer isn't
+    /// answered twice.
+    fn organized_here(&self, e: &Event) -> bool {
+        let Some(o) = &e.organizer else { return true };
+        let known: Vec<String> = self
+            .store
+            .preference(PARTICIPANTS)
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        if known.iter().any(|k| k.eq_ignore_ascii_case(&o.email)) {
+            return true;
+        }
+        self.store.accounts().unwrap_or_default().iter().any(|a| {
+            a.email.eq_ignore_ascii_case(&o.email)
+                || a.identities
+                    .iter()
+                    .any(|i| i.email.trim().eq_ignore_ascii_case(&o.email))
+        })
+    }
+    /// Whether invitations for events you organize are the server's to send.
+    pub fn server_schedules(&self) -> bool {
+        self.calendar_server().is_some_and(|s| s.server_schedules)
+    }
     /// Uses the calendars of a JMAP account's server (JMAP for Calendars)
     /// instead of a CalDAV server: its sign-in is the account's own.
     pub fn connect_jmap_calendar(&self, a: &Account) -> Result<usize> {
@@ -98,10 +174,12 @@ impl Backend {
             url: a.incoming_host.clone(),
             user: a.email.clone(),
             jmap_account: a.id.clone(),
+            server_schedules: false,
         };
         self.store
             .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         self.store.set_preference(CALENDARS, "[]")?;
+        self.store.set_preference(JMAP_STATE, "")?;
         self.sync_calendar()
     }
     /// Runs `work` on the JMAP session of the account calendars come from.
@@ -130,23 +208,39 @@ impl Backend {
     /// Saves an event where the calendars are: CalDAV, or a JMAP server.
     fn calendar_save(&self, server: &caldav::Server, calendar: &str, stored: &Stored) -> Result<Stored> {
         let Some(a) = self.calendar_jmap(server)? else {
+            let organized_here = self.organized_here(&stored.event);
+            let max_size = self
+                .calendars()
+                .iter()
+                .find(|c| c.href == calendar)
+                .map(|c| c.max_size);
             return caldav::save(
                 server,
                 &self.calendar_password()?,
                 self.tls_connector()?,
                 calendar,
                 stored,
+                organized_here,
+                max_size,
             );
         };
         let calendar_id = calendar.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
         let event_id = stored.href.strip_prefix("jmap:").filter(|i| !i.is_empty());
-        let id = self.with_jmap_calendars(&a, |s| {
-            crate::sync::jscal::save_event(s, event_id, calendar_id, &stored.event, &stored.overrides)
+        let (id, version) = self.with_jmap_calendars(&a, |s| {
+            let id = crate::sync::jscal::save_event_in(
+                s,
+                event_id,
+                calendar_id,
+                &stored.event,
+                &stored.overrides,
+                Some(&stored.etag),
+            )?;
+            Ok((id.clone(), crate::sync::jscal::version_of(s, &id).unwrap_or_default()))
         })?;
         Ok(Stored {
             calendar: calendar.to_owned(),
             href: format!("jmap:{id}"),
-            etag: String::new(),
+            etag: version,
             ..stored.clone()
         })
     }
@@ -199,15 +293,61 @@ impl Backend {
             .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
         Ok(made)
     }
-    /// Reads a JMAP server's calendars and their events.
+    /// Reads a JMAP server's calendars and their events: once read, only
+    /// the events changed since (CalendarEvent/changes), until the time
+    /// range has to move on or the server can't say; then all again.
     fn sync_jmap_calendar(&self, a: &Account) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
-        let (cals, events) = self.with_jmap_calendars(a, |s| {
+        let (saved_state, until) = self
+            .store
+            .preference(JMAP_STATE)
+            .and_then(|p| {
+                let (state, until) = p.rsplit_once('@')?;
+                Some((state.to_owned(), until.parse::<i64>().ok()?))
+            })
+            .unwrap_or_default();
+        let mut known = self.calendar_events();
+        let in_range = until > now + AHEAD / 2 && !saved_state.is_empty();
+        let (cals, changed) = self.with_jmap_calendars(a, |s| {
             let cals = crate::sync::jscal::calendars(s)?;
             let ids: Vec<String> = cals.iter().map(|c| c.id.clone()).collect();
-            let events = crate::sync::jscal::events(s, &ids, now - BEHIND, now + AHEAD)?;
-            Ok((cals, events))
+            let changed = if in_range {
+                crate::sync::jscal::event_changes(s, &ids, &saved_state)?
+            } else {
+                None
+            };
+            // Neither is worth failing the sync over.
+            if let Ok(people) = crate::sync::jscal::participant_identities(s) {
+                let _ = self
+                    .store
+                    .set_preference(PARTICIPANTS, &serde_json::to_string(&people).unwrap_or_default());
+            }
+            if let Ok(found) = crate::sync::jscal::notices(s)
+                && !found.is_empty()
+            {
+                let mut kept = self.calendar_notices();
+                kept.extend(found.iter().map(|n| n.text.clone()));
+                keep_recent(&mut kept);
+                // Shown here from now on; the server's copies go.
+                if self
+                    .store
+                    .set_preference(NOTICES, &serde_json::to_string(&kept).unwrap_or_default())
+                    .is_ok()
+                {
+                    let _ = crate::sync::jscal::dismiss_notices(s, &found);
+                }
+            }
+            let read = match changed {
+                Some((events, gone, state)) => (events, Some(gone), state, until),
+                None => {
+                    let (events, state) =
+                        crate::sync::jscal::events_in(s, &ids, now - BEHIND, now + AHEAD)?;
+                    (events, None, state, now + AHEAD)
+                }
+            };
+            Ok((cals, read))
         })?;
+        let (events, gone, state, read_until) = changed;
         let cals: Vec<caldav::Calendar> = cals
             .into_iter()
             .map(|c| caldav::Calendar {
@@ -221,19 +361,49 @@ impl Backend {
         let events: Vec<Stored> = events
             .into_iter()
             .map(|e| Stored {
+                etag: crate::sync::jscal::event_version(&e.json),
                 event: e.event,
                 overrides: e.overrides,
                 calendar: format!("jmap:{}", e.calendar),
                 href: format!("jmap:{}", e.id),
-                etag: String::new(),
+                schedule_tag: String::new(),
             })
             .collect();
         let count = events.len();
-        self.save_events(events)?;
+        let all = match gone {
+            // Only changes: those replace or remove what was kept.
+            Some(gone) => {
+                let gone: std::collections::HashSet<&str> = gone.iter().map(String::as_str).collect();
+                let replaced: std::collections::HashSet<&str> =
+                    events.iter().map(|e| e.href.as_str()).collect();
+                known.retain(|k| {
+                    let id = k.href.strip_prefix("jmap:").unwrap_or_default();
+                    !gone.contains(id) && !replaced.contains(k.href.as_str())
+                });
+                known.extend(events);
+                known
+            }
+            None => events,
+        };
+        self.save_events(all)?;
         self.store
             .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        self.store
+            .set_preference(JMAP_STATE, &format!("{state}@{read_until}"))?;
         self.store.set_preference(SYNCED, &now.to_string())?;
         Ok(count)
+    }
+    /// What a JMAP server said about shared calendars and events (shared
+    /// with you, changed by someone else…), not yet dismissed.
+    pub fn calendar_notices(&self) -> Vec<String> {
+        self.store
+            .preference(NOTICES)
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+    /// Forgets the notices once read.
+    pub fn dismiss_calendar_notices(&self) -> Result<()> {
+        self.store.set_preference(NOTICES, "[]")
     }
     /// Open tasks from the calendar server, soonest due first.
     pub fn calendar_tasks(&self) -> Vec<Stored> {
@@ -273,7 +443,7 @@ impl Backend {
             .find(|t| t.event.uid == uid)
             .context("This task is no longer on your list. Read it again.")?;
         task.event.completed = done;
-        task.event.source.clear();
+        // The source is kept: only what changed is rewritten (`ical::update_task`).
         task.event.sequence += 1;
         let calendar = task.calendar.clone();
         *task = self.calendar_save(&server, &calendar, task)?;
@@ -283,14 +453,61 @@ impl Backend {
         self.store
             .set_preference(TASKS, &serde_json::to_string(&tasks)?)
     }
-    /// Adds a task due at `due`, in the calendar new events go to.
+    /// Changes a task's name, notes and due date (`due` 0: none), keeping
+    /// the rest of it as the server has it.
+    pub fn edit_task(
+        &self,
+        uid: &str,
+        summary: &str,
+        notes: &str,
+        due: i64,
+        all_day: bool,
+    ) -> Result<Stored> {
+        ensure!(!summary.trim().is_empty(), "Give the task a name.");
+        let server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        let mut tasks = self.calendar_tasks();
+        let task = tasks
+            .iter_mut()
+            .find(|t| t.event.uid == uid)
+            .context("This task is no longer on your list. Read it again.")?;
+        task.event.summary = summary.trim().to_owned();
+        task.event.description = notes.trim().to_owned();
+        task.event.start = due;
+        task.event.end = due;
+        task.event.all_day = all_day && due != 0;
+        task.event.sequence += 1;
+        let calendar = task.calendar.clone();
+        *task = self.calendar_save(&server, &calendar, task)?;
+        let saved = task.clone();
+        caldav::sort_tasks(&mut tasks);
+        self.store
+            .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
+        Ok(saved)
+    }
+    /// Deletes a task from the server.
+    pub fn delete_task(&self, uid: &str) -> Result<()> {
+        let server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        let mut tasks = self.calendar_tasks();
+        if let Some(task) = tasks.iter().find(|t| t.event.uid == uid) {
+            self.calendar_delete(&server, task)?;
+        }
+        tasks.retain(|t| t.event.uid != uid);
+        self.store
+            .set_preference(TASKS, &serde_json::to_string(&tasks)?)
+    }
+    /// Adds a task due at `due` (0: no due date), in the calendar new
+    /// events go to.
     pub fn add_task(&self, summary: &str, due: i64) -> Result<Stored> {
         ensure!(!summary.trim().is_empty(), "Give the task a name.");
         let server = self
             .calendar_server()
             .context("Set up a calendar server in Settings → Calendar first.")?;
         let calendar = self
-            .default_calendar()
+            .task_calendar()
             .context("None of your calendars can take new tasks.")?
             .href;
         let stored = Stored {
@@ -309,7 +526,7 @@ impl Backend {
         let saved = self.calendar_save(&server, &calendar, &stored)?;
         let mut tasks = self.calendar_tasks();
         tasks.push(saved.clone());
-        tasks.sort_by_key(|t| t.event.start);
+        caldav::sort_tasks(&mut tasks);
         self.store
             .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
         Ok(saved)
@@ -360,10 +577,11 @@ impl Backend {
         let server = self
             .calendar_server()
             .context("Set up a calendar server in Settings → Calendar first.")?;
-        ensure!(
-            self.calendar_jmap(&server)?.is_none(),
-            "Your calendar server can't say when others are free."
-        );
+        if let Some(a) = self.calendar_jmap(&server)? {
+            return self.with_jmap_calendars(&a, |s| {
+                crate::sync::jscal::free_busy(s, attendees, from, to)
+            });
+        }
         caldav::free_busy(
             &server,
             &self.calendar_password()?,
@@ -402,10 +620,152 @@ impl Backend {
         self.store
             .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
         self.store.set_preference(SYNCED, &now.to_string())?;
+        // With the server scheduling, what it delivered: not worth failing
+        // the sync over.
+        if server.server_schedules {
+            let _ = self.read_schedule_inbox(&server, &password);
+        }
         Ok(count)
     }
+    /// The scheduling inbox (RFC 6638 §4) when the server sends invitations:
+    /// guests' answers to your events and invitations to you arrive there,
+    /// not by mail. The server has already applied answers to your events
+    /// (and put invitations in your calendar, which the sync just read), so
+    /// each is noted for showing, then removed from the inbox as handled.
+    fn read_schedule_inbox(&self, server: &caldav::Server, password: &str) -> Result<usize> {
+        let items = caldav::inbox(server, password, self.tls_connector()?)?;
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let mut notes = self.calendar_notices();
+        for item in &items {
+            let cal = ical::parse(&item.data);
+            for e in &cal.events {
+                let who = |a: &ical::Attendee| {
+                    if a.name.is_empty() { a.email.clone() } else { a.name.clone() }
+                };
+                let note = match cal.method.to_ascii_uppercase().as_str() {
+                    "REPLY" => e.attendees.first().map(|a| {
+                        let answer = match a.status {
+                            Some(PartStat::Accepted) => "accepted",
+                            Some(PartStat::Declined) => "declined",
+                            Some(PartStat::Tentative) => "may come to",
+                            _ => "answered",
+                        };
+                        format!("{} {answer} {}.", who(a), e.summary)
+                    }),
+                    "REQUEST" => Some(format!(
+                        "{} invited you to {}.",
+                        e.organizer.as_ref().map(who).unwrap_or_else(|| "Someone".into()),
+                        e.summary
+                    )),
+                    "CANCEL" => Some(format!("{} was cancelled.", e.summary)),
+                    _ => None,
+                };
+                notes.extend(note);
+            }
+        }
+        keep_recent(&mut notes);
+        self.store
+            .set_preference(NOTICES, &serde_json::to_string(&notes)?)?;
+        let tls = self.tls_connector()?;
+        for item in &items {
+            let _ = caldav::remove_from_inbox(server, password, tls.clone(), item);
+        }
+        Ok(items.len())
+    }
+    /// Renames a calendar (and changes its colour; empty: as it is), on its
+    /// server: PROPPATCH, or Calendar/set.
+    pub fn rename_calendar(&self, href: &str, name: &str, color: &str) -> Result<()> {
+        ensure!(!name.trim().is_empty(), "Give the calendar a name.");
+        let server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        match self.calendar_jmap(&server)? {
+            Some(a) => {
+                let id = href.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
+                self.with_jmap_calendars(&a, |s| {
+                    crate::sync::jscal::update_calendar(s, id, name.trim(), color)
+                })?
+            }
+            None => caldav::rename_calendar(
+                &server,
+                &self.calendar_password()?,
+                self.tls_connector()?,
+                href,
+                name,
+                color,
+            )?,
+        }
+        let mut cals = self.calendars();
+        for c in cals.iter_mut().filter(|c| c.href == href) {
+            c.name = name.trim().to_owned();
+            if !color.is_empty() {
+                c.color = color.to_owned();
+            }
+        }
+        self.store
+            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)
+    }
+    /// Deletes a calendar and its events from the server.
+    pub fn delete_calendar(&self, href: &str) -> Result<()> {
+        let server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        match self.calendar_jmap(&server)? {
+            Some(a) => {
+                let id = href.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
+                self.with_jmap_calendars(&a, |s| crate::sync::jscal::delete_calendar(s, id))?
+            }
+            None => caldav::delete_calendar(
+                &server,
+                &self.calendar_password()?,
+                self.tls_connector()?,
+                href,
+            )?,
+        }
+        let mut cals = self.calendars();
+        cals.retain(|c| c.href != href);
+        self.store
+            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        let mut events = self.calendar_events();
+        events.retain(|e| e.calendar != href);
+        self.save_events(events)?;
+        if self.store.preference(DEFAULT).as_deref() == Some(href) {
+            self.store.set_preference(DEFAULT, "")?;
+        }
+        Ok(())
+    }
+    /// The calendar server's storage, used and left in octets, where it
+    /// says (CalDAV's RFC 4331 quota).
+    pub fn calendar_quota(&self) -> Result<Option<(u64, u64)>> {
+        let server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        if self.calendar_jmap(&server)?.is_some() {
+            return Ok(None);
+        }
+        caldav::quota(&server, &self.calendar_password()?, self.tls_connector()?)
+    }
+    /// Attaches a file to an event on a calendar that keeps attachments
+    /// itself (RFC 8607), then reads the calendar again to show it.
+    pub fn attach_to_event(&self, uid: &str, path: &std::path::Path) -> Result<()> {
+        let server = self
+            .calendar_server()
+            .context("No calendar server is set up.")?;
+        ensure!(
+            self.calendar_jmap(&server)?.is_none(),
+            "Attach files to events on a CalDAV calendar."
+        );
+        let stored = self
+            .stored_event(uid)
+            .context("This event is no longer in your calendar. Read it again.")?;
+        caldav::attach(&server, &self.calendar_password()?, self.tls_connector()?, &stored, path)?;
+        self.sync_calendar()?;
+        Ok(())
+    }
     pub fn disconnect_calendar(&self) -> Result<()> {
-        for key in [SERVER, CALENDARS, EVENTS, SYNCED, DEFAULT, TASKS] {
+        for key in [SERVER, CALENDARS, EVENTS, SYNCED, DEFAULT, TASKS, JMAP_STATE, NOTICES, PARTICIPANTS] {
             self.store.set_preference(key, "")?;
         }
         #[cfg(not(test))]
@@ -971,6 +1331,12 @@ impl Backend {
     /// REQUEST to all of them, from `a` as the organizer. Returns how many
     /// were told.
     pub fn send_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if self.server_schedules() {
+            // Saving it told the server, which invites the guests.
+            return Ok(self
+                .stored_event(uid)
+                .map_or(0, |s| s.event.attendees.len()));
+        }
         let stored = self
             .calendar_events()
             .into_iter()
@@ -980,6 +1346,12 @@ impl Backend {
     }
     /// Tells an event's guests it's cancelled (before deleting it).
     pub fn cancel_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if self.server_schedules() {
+            // Deleting it tells the server, which tells the guests.
+            return Ok(self
+                .stored_event(uid)
+                .map_or(0, |s| s.event.attendees.len()));
+        }
         let stored = self
             .calendar_events()
             .into_iter()
@@ -1232,6 +1604,72 @@ fn wrap(b64: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scheduling_server_sends_invitations_instead_of_mail() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("pinal-cal-{}", uuid::Uuid::new_v4()));
+        let backend = Backend::new(std::sync::Arc::new(Store::open(&path)?));
+        let mut a = Account::new(Provider::Imap);
+        a.email = "qa@example.com".into();
+        backend.store.save_account(&a)?;
+        // No SMTP server: mailing an invitation would fail.
+        a.smtp_host = "127.0.0.1".into();
+        a.smtp_port = 9;
+        let event = Stored {
+            event: Event {
+                uid: "lunch".into(),
+                summary: "Lunch".into(),
+                start: 1_800_000_000,
+                end: 1_800_003_600,
+                organizer: Some(ical::Attendee {
+                    email: a.email.clone(),
+                    ..Default::default()
+                }),
+                attendees: vec![ical::Attendee {
+                    email: "bo@example.se".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            calendar: "https://dav.example/cal/".into(),
+            href: "https://dav.example/cal/lunch.ics".into(),
+            ..Default::default()
+        };
+        backend.save_events(vec![event.clone()])?;
+        let server = |schedules: bool| {
+            serde_json::to_string(&caldav::Server {
+                url: "https://dav.example".into(),
+                user: "qa".into(),
+                server_schedules: schedules,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        backend.store.set_preference(SERVER, &server(true))?;
+        assert!(backend.server_schedules());
+        assert_eq!(backend.send_invitations(&a, "lunch")?, 1);
+        assert_eq!(backend.cancel_invitations(&a, "lunch")?, 1);
+        // Your own events are the server's; others' invitations aren't.
+        assert!(backend.organized_here(&event.event));
+        let mut theirs = event.event.clone();
+        theirs.organizer = Some(ical::Attendee {
+            email: "ana@example.org".into(),
+            ..Default::default()
+        });
+        assert!(!backend.organized_here(&theirs));
+        // Off (the default): Picacho mails them, which needs the SMTP server.
+        backend.store.set_preference(SERVER, &server(false))?;
+        assert!(!backend.server_schedules());
+        assert!(backend.send_invitations(&a, "lunch").is_err());
+        // JMAP calendars can't be handed to the server.
+        backend
+            .store
+            .set_preference(SERVER, r#"{"url":"x","user":"y","jmap_account":"z"}"#)?;
+        assert!(backend.set_server_scheduling(true).is_err());
+        drop(backend);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
 
     #[test]
     fn replies_are_imip_messages_to_the_organizer() {

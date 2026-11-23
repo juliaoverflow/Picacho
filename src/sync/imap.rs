@@ -148,15 +148,27 @@ pub(crate) fn imap_login_interruptible(
         host: a.incoming_host.clone(),
         port: a.incoming_port,
         binding: binding.clone(),
+        service: "imap",
     };
     let authenticate = |client, mechanism, credentials| {
         authenticate(client, mechanism, credentials, initial_response)
     };
-    let session = if a.oauth {
+    let session = if a.kerberos {
+        // Kerberos only: never a password, and never another mechanism.
+        match Mechanism::choose(&sasl::KERBEROS_ORDER, offered.iter().map(String::as_str)) {
+            Some(mechanism) => authenticate(client, mechanism, credentials(a.login(), "")),
+            None => bail!(
+                "{} doesn't offer Kerberos sign-in (AUTH=GSSAPI). Turn off Kerberos for this account to use a password.",
+                a.incoming_host
+            ),
+        }
+    } else if a.oauth {
         // XOAUTH2 when the server lists neither: Gmail and Outlook take it.
         let mechanism = Mechanism::choose(&sasl::TOKEN_ORDER, offered.iter().map(String::as_str))
             .unwrap_or(Mechanism::XOAuth2);
-        authenticate(client, mechanism, credentials(&a.email, &s.access_token))
+        // An organization's servers may know people by a user name.
+        let user = if a.sso.is_some() { a.login() } else { &a.email };
+        authenticate(client, mechanism, credentials(user, &s.access_token))
     } else if let Some(mechanism) = Mechanism::choose_bound(
         &sasl::SCRAM_ORDER,
         offered.iter().map(String::as_str),
@@ -1108,6 +1120,24 @@ pub(crate) struct Extensions {
     /// RFC 7889's APPENDLIMIT and others aside: Gmail's own search language
     /// (X-GM-RAW), from X-GM-EXT-1.
     pub(crate) gmail_raw: bool,
+    /// The server lists IMAP4rev2 beside IMAP4rev1: a session may ENABLE
+    /// rev2 (RFC 9051 §6.3.1), and then has its folded-in extensions.
+    pub(crate) offers_rev2: bool,
+    /// RFC 5032: YOUNGER and OLDER search keys (WITHIN).
+    pub(crate) within: bool,
+    /// RFC 6203: approximate matching (SEARCH=FUZZY).
+    pub(crate) fuzzy: bool,
+    /// RFC 5267: SORT with ESEARCH's RETURN (ESORT), so a sorted search can
+    /// ask for one page (PARTIAL) and a count.
+    pub(crate) esort: bool,
+    /// RFC 7377: one ESEARCH across several mailboxes (MULTISEARCH).
+    pub(crate) multisearch: bool,
+    /// RFC 9585: progress reports for long commands (INPROGRESS), kept
+    /// alive rather than timed out.
+    pub(crate) inprogress: bool,
+    /// RFC 9698: the server says which JMAP server has the same mail
+    /// (JMAPACCESS).
+    pub(crate) jmapaccess: bool,
 }
 /// Whether the IMAP parser reads STATUS=SIZE replies (Picacho-Patches'
 /// imap-proto 0007). Without it, such a reply ends the session in a way
@@ -1144,8 +1174,10 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
     let append_limit = with("APPENDLIMIT=").and_then(|n| n.parse::<u64>().ok());
     // A server that speaks only IMAP4rev2 runs its sessions as rev2 from
     // the start, with its folded-in extensions. One offering IMAP4rev1 too
-    // stays rev1 (Picacho doesn't ENABLE rev2), with what it lists.
+    // starts rev1, with what it lists, until ENABLE IMAP4rev2 (`enable`,
+    // then `Extensions::as_rev2`).
     let rev2 = caps.has_str("IMAP4rev2") && !caps.has_str("IMAP4rev1");
+    let offers_rev2 = caps.has_str("IMAP4rev2") && caps.has_str("IMAP4rev1");
     Ok(Extensions {
         condstore: caps.has_str("CONDSTORE"),
         gmail: caps.has_str("X-GM-EXT-1"),
@@ -1183,7 +1215,35 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         gmail_raw: caps.has_str("X-GM-EXT-1"),
         partial: caps.has_str("PARTIAL"),
         uidonly: caps.has_str("UIDONLY"),
+        offers_rev2,
+        within: caps.has_str("WITHIN"),
+        fuzzy: caps.has_str("SEARCH=FUZZY"),
+        esort: caps.has_str("ESORT"),
+        multisearch: caps.has_str("MULTISEARCH"),
+        inprogress: caps.has_str("INPROGRESS"),
+        jmapaccess: caps.has_str("JMAPACCESS"),
     })
+}
+impl Extensions {
+    /// What a session has once ENABLE IMAP4rev2 succeeded: rev2's base
+    /// protocol folds these in (RFC 9051 Appendix E).
+    pub(crate) fn as_rev2(mut self) -> Self {
+        self.rev2 = true;
+        self.moves = true;
+        self.uidplus = true;
+        self.idle = true;
+        self.namespace = true;
+        self.special_use = true;
+        self.esearch = true;
+        self.enable = true;
+        self.binary = true;
+        self.literal_plus = true;
+        self.list_status = true;
+        self.unselect = true;
+        self.status_size = true;
+        self.searchres = true;
+        self
+    }
 }
 
 /// The untagged lines of an extension's reply that start with `name`, as
@@ -1342,14 +1402,51 @@ fn storage_quota(line: &str) -> Option<Quota> {
         _ => None,
     })
 }
-/// The inbox's storage quota, if the server limits it (GETQUOTAROOT).
-pub(crate) fn quota(session: &mut ImapSession) -> Result<Option<Quota>> {
+/// The account's storage quota, if the server limits it. The inbox's
+/// quota roots (GETQUOTAROOT) come first; other roots whose STORAGE the
+/// server reports for `mailboxes` (a separate archive's limit, say) count
+/// too, and the fullest is shown, since that is the one about to refuse
+/// mail.
+/// `mailboxes` are quoted as the session takes them.
+pub(crate) fn quota_of(session: &mut ImapSession, mailboxes: &[String]) -> Result<Option<Quota>> {
     let data = session.run_command_and_read_response("GETQUOTAROOT INBOX")?;
-    Ok(other_lines(&data, "QUOTA")?
+    let mut found: Vec<Quota> = quotas_in(&data)?;
+    for mailbox in mailboxes {
+        match session.run_command_and_read_response(format!("GETQUOTAROOT {mailbox}")) {
+            Ok(data) => found.extend(quotas_in(&data)?),
+            // A folder without quotas of its own, or not allowed.
+            Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    found.dedup();
+    Ok(found.into_iter().max_by(|a, b| {
+        let share = |q: &Quota| q.used_kib as f64 / q.limit_kib.max(1) as f64;
+        share(a).total_cmp(&share(b))
+    }))
+}
+fn quotas_in(data: &[u8]) -> Result<Vec<Quota>> {
+    Ok(other_lines(data, "QUOTA")?
         .into_iter()
         // QUOTAROOT lines start with "QUOTA" too; they have no list.
         .filter(|line| !line.to_ascii_uppercase().starts_with("ROOT"))
-        .find_map(storage_quota))
+        .filter_map(storage_quota)
+        .collect())
+}
+/// Where the same mail is over JMAP (GETJMAPACCESS, RFC 9698): the
+/// session URL, if the server says.
+pub(crate) fn jmap_access(session: &mut ImapSession) -> Result<Option<String>> {
+    let data = match session.run_command_and_read_response("GETJMAPACCESS") {
+        Ok(data) => data,
+        Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(other_lines(&data, "JMAPACCESS")?
+        .into_iter()
+        .find_map(|line| match tokens(line).first() {
+            Some(Token::Text(url)) if url.starts_with("https://") => Some(url.clone()),
+            _ => None,
+        }))
 }
 /// What this sign-in may do in a mailbox (MYRIGHTS), as RFC 4314 letters.
 pub(crate) fn my_rights(session: &mut ImapSession, mailbox: &str) -> Result<Option<String>> {

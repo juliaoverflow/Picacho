@@ -9146,6 +9146,7 @@ dependencies = [
  "kurbo 0.13.1",
  "lettre",
  "libc",
+ "libloading",
  "log",
  "mail-auth",
  "mailparse",

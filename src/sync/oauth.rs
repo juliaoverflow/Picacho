@@ -182,6 +182,89 @@ pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
         last.map(|e| format!(" ({e:#})")).unwrap_or_default()
     ))
 }
+/// An organization's identity provider's metadata (OpenID Connect
+/// Discovery, else RFC 8414), from its issuer: `issuer` +
+/// `/.well-known/openid-configuration`, or the RFC 8414 form with the
+/// issuer's path after the well-known part. The document must name that
+/// same issuer, so a redirect or a lookalike can't send the sign-in, and
+/// the tokens, elsewhere. Kept for the session.
+pub fn sso_metadata(issuer: &str) -> Result<Metadata> {
+    static KNOWN: Mutex<Vec<(String, Metadata)>> = Mutex::new(Vec::new());
+    let issuer = issuer.trim().trim_end_matches('/').to_owned();
+    if let Some((_, m)) = KNOWN.lock().unwrap().iter().find(|(i, _)| *i == issuer) {
+        return Ok(m.clone());
+    }
+    let parsed = url::Url::parse(&issuer).context("The sign-in service's address isn't valid.")?;
+    ensure!(
+        parsed.scheme() == "https" || cfg!(test),
+        "The sign-in service's address must start with https://."
+    );
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/');
+    let http = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut last = None;
+    for url in [
+        format!("{issuer}/.well-known/openid-configuration"),
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/openid-configuration{path}"),
+    ] {
+        let found = http
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<serde_json::Value>());
+        match found.map_err(anyhow::Error::from).and_then(|v| {
+            // OpenID Connect Discovery §4.3: exactly the issuer asked for.
+            let named = v["issuer"].as_str().unwrap_or_default().trim_end_matches('/');
+            ensure!(
+                named == issuer,
+                "its sign-in settings are for {}, not {issuer}",
+                if named.is_empty() { "no issuer" } else { named }
+            );
+            parse_metadata(&v)
+        }) {
+            Ok(m) => {
+                KNOWN.lock().unwrap().push((issuer, m.clone()));
+                return Ok(m);
+            }
+            // A document that answered says more than a missing one.
+            Err(e) if last.is_none() || e.downcast_ref::<reqwest::Error>().is_none() => {
+                if last.as_ref().is_none_or(|l: &anyhow::Error| l.downcast_ref::<reqwest::Error>().is_some()) {
+                    last = Some(e);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    Err(anyhow::anyhow!(
+        "{issuer} isn't a sign-in service Picacho can use{}. Check the address with your organization.",
+        last.map(|e| format!(" ({e:#})")).unwrap_or_default()
+    ))
+}
+/// What to ask an organization's sign-in for: who you are and a refresh
+/// token, plus `extra` (the scopes its mail servers want, from the mail
+/// domain's configuration or the account), each only where the provider
+/// lists it, when it lists any.
+pub fn sso_scopes(supported: &[String], extra: &str) -> String {
+    let mut wanted: Vec<&str> = vec!["openid", "email", "profile", "offline_access"];
+    wanted.extend(extra.split_whitespace());
+    let mut out: Vec<&str> = Vec::new();
+    for s in wanted {
+        let listed = supported.is_empty() || supported.iter().any(|x| x == s);
+        // Scopes the account names were asked for on purpose: always sent.
+        let asked = extra.split_whitespace().any(|x| x == s);
+        if (listed || asked) && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.join(" ")
+}
+
 /// Checks that a metadata document fetched from `origin` is that server's
 /// own (RFC 8414 §3.3): its `issuer`, where it names one, is `origin`.
 fn issued_by(v: &serde_json::Value, origin: &str) -> Result<()> {
@@ -332,6 +415,9 @@ pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// Tests: what plays the person in the browser, instead of opening one.
+#[cfg(test)]
+pub(crate) static TEST_BROWSER: Mutex<Option<fn(url::Url)>> = Mutex::new(None);
 /// `picacho://` URLs macOS handed the app, waiting for a sign-in to claim them.
 static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub fn opened(urls: Vec<String>) {
@@ -390,6 +476,14 @@ impl Browser {
     /// Opens `url` in the system browser and waits for the authorization code.
     #[cfg(not(target_os = "android"))]
     fn code(&self, url: &url::Url, cancel: &AtomicBool) -> Result<String> {
+        #[cfg(test)]
+        if let Some(visit) = *TEST_BROWSER.lock().unwrap() {
+            let url = url.clone();
+            let visitor = std::thread::spawn(move || visit(url));
+            let code = self.wait(cancel);
+            let _ = visitor.join();
+            return code;
+        }
         open::that(url.as_str()).context("Could not open the system browser")?;
         self.wait(cancel)
     }
@@ -572,6 +666,9 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     if account.provider == Provider::Jmap {
         return authorize_jmap(account, cancel);
     }
+    if let Some(sso) = &account.sso {
+        return authorize_sso(account, sso, cancel);
+    }
     let microsoft = account.provider == Provider::Outlook;
     let browser = Browser::new(if microsoft { "localhost" } else { "127.0.0.1" }, "/")?;
     let (auth, _, scope) = endpoints(account.provider);
@@ -652,11 +749,56 @@ fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     })
 }
 
+/// Signs in with an organization's identity provider in the browser: the
+/// client id given (an administrator's registration), else one the
+/// provider registers for this sign-in (RFC 7591), where it allows that.
+fn authorize_sso(
+    account: &Account,
+    sso: &crate::manage::model::Sso,
+    cancel: Arc<AtomicBool>,
+) -> Result<Grant> {
+    let metadata = sso_metadata(&sso.issuer)?;
+    let browser = Browser::new("127.0.0.1", "/callback")?;
+    let client_id = if !account.client_id.is_empty() {
+        account.client_id.clone()
+    } else if let Some(endpoint) = &metadata.registration {
+        register(endpoint, &browser.redirect)?
+    } else {
+        bail!(
+            "Your organization's sign-in doesn't let mail apps register themselves. Ask your administrator for a client id for Picacho (a public client with a http://127.0.0.1 redirect) and enter it under Server settings."
+        );
+    };
+    let mut url = url::Url::parse(&metadata.authorization)?;
+    url.query_pairs_mut().extend_pairs([
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", &browser.redirect),
+        ("response_type", "code"),
+        ("scope", &sso_scopes(&metadata.scopes, &sso.scope)),
+        ("state", &browser.state),
+        ("code_challenge", &browser.challenge),
+        ("code_challenge_method", "S256"),
+    ]);
+    if !account.email.is_empty() {
+        url.query_pairs_mut()
+            .append_pair("login_hint", &account.email);
+    }
+    let code = browser.code(&url, &cancel)?;
+    Ok(Grant {
+        code,
+        redirect: browser.redirect.clone(),
+        verifier: browser.verifier.clone(),
+        client_id,
+        token: metadata.token,
+    })
+}
+
 /// Exchanges the browser's code for tokens and says who signed in. A
 /// provider rejection (`AccessFailure::Authentication`) means the code is
 /// spent; any other failure may be retried with the same grant.
 pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
-    let jmap = account.provider == Provider::Jmap;
+    // JMAP servers and organizations' sign-ins name their own endpoints,
+    // and may have registered Picacho for this sign-in.
+    let jmap = account.provider == Provider::Jmap || account.sso.is_some();
     let token = if jmap {
         grant.token.as_str()
     } else {
@@ -975,6 +1117,9 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
             .token
             .to_string();
         (found_token.as_str(), "")
+    } else if let Some(sso) = &account.sso {
+        found_token = sso_metadata(&sso.issuer)?.token;
+        (found_token.as_str(), "")
     } else {
         let (_, token, scope) = endpoints(account.provider);
         (token, scope)
@@ -1043,6 +1188,107 @@ mod tests {
         a.incoming_host = "mail.example.com".into();
         assert!(jmap_client(&a).id.is_empty());
     }
+    /// A small HTTP server answering `respond(method, path, body)` for each
+    /// of `count` requests.
+    fn http_server(
+        count: usize,
+        respond: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for mut s in listener.incoming().take(count).flatten() {
+                let mut buf = vec![0; 16384];
+                let n = s.read(&mut buf).unwrap();
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let mut first = text.lines().next().unwrap_or("").split(' ');
+                let (method, path) = (first.next().unwrap_or("").to_owned(), first.next().unwrap_or("").to_owned());
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+                let (status, reply) = respond(&method, &path, &body);
+                write!(
+                    s,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+                seen.push(format!("{method} {path} {body}"));
+            }
+            seen
+        });
+        (origin, handle)
+    }
+
+    #[test]
+    fn sso_metadata_comes_from_the_issuer_itself() {
+        // A document naming another issuer is passed over at every
+        // discovery location, and the sign-in refused.
+        let (origin, server) = http_server(3, |_, path, _| {
+            if path == "/realms/mail/.well-known/openid-configuration" {
+                (200, r#"{"issuer":"https://evil.example","authorization_endpoint":"https://evil.example/a","token_endpoint":"https://evil.example/t"}"#.into())
+            } else {
+                (404, "{}".into())
+            }
+        });
+        let error = sso_metadata(&format!("{origin}/realms/mail")).unwrap_err();
+        assert!(format!("{error:#}").contains("evil.example"), "{error:#}");
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 3, "every discovery location was tried: {seen:?}");
+        assert!(seen[1].starts_with("GET /.well-known/oauth-authorization-server/realms/mail"));
+        // RFC 8414's form (the path after the well-known part) is found,
+        // and its endpoints and registration kept.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        let doc = format!(
+            r#"{{"issuer":"{origin}/tenant","authorization_endpoint":"{origin}/auth","token_endpoint":"{origin}/token","registration_endpoint":"{origin}/register","scopes_supported":["openid","offline_access"]}}"#
+        );
+        let port: u16 = origin.rsplit(':').next().unwrap().parse().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let server = std::thread::spawn(move || {
+            for mut s in listener.incoming().take(2).flatten() {
+                let mut buf = [0; 4096];
+                let n = s.read(&mut buf).unwrap();
+                let path = String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).unwrap_or("").to_owned();
+                let (status, body) = if path == "/.well-known/oauth-authorization-server/tenant" {
+                    (200, doc.clone())
+                } else {
+                    (404, "{}".to_owned())
+                };
+                write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let m = sso_metadata(&format!("{origin}/tenant/")).unwrap();
+        assert_eq!(m.token, format!("{origin}/token"));
+        assert_eq!(m.registration, Some(format!("{origin}/register")));
+        server.join().unwrap();
+        // Kept for the session: no second fetch.
+        assert_eq!(sso_metadata(&format!("{origin}/tenant")).unwrap(), m);
+    }
+
+    #[test]
+    fn sso_registers_picacho_where_allowed_and_asks_for_what_mail_needs() {
+        assert_eq!(
+            sso_scopes(&[], "mail.imap"),
+            "openid email profile offline_access mail.imap"
+        );
+        // Only listed ones, but always those the configuration names.
+        let listed: Vec<String> = ["openid", "email", "offline_access"].map(String::from).into();
+        assert_eq!(sso_scopes(&listed, "https://mail.example.edu/imap"), "openid email offline_access https://mail.example.edu/imap");
+        // Registration: a public native client for the loopback redirect.
+        let (origin, server) = http_server(1, |method, path, body| {
+            assert_eq!((method, path), ("POST", "/register"));
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["token_endpoint_auth_method"], "none");
+            assert_eq!(v["application_type"], "native");
+            assert_eq!(v["redirect_uris"][0], "http://127.0.0.1:5555/callback");
+            (201, r#"{"client_id":"registered-1"}"#.into())
+        });
+        let id = register(&format!("{origin}/register"), "http://127.0.0.1:5555/callback").unwrap();
+        assert_eq!(id, "registered-1");
+        server.join().unwrap();
+    }
+
     #[test]
     fn pkce_is_url_safe_and_correct_length() {
         let v = random_url_token();

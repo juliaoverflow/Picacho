@@ -261,12 +261,72 @@ pub struct Endpoint {
     pub user: String,
     /// An access token rather than a password.
     pub oauth: bool,
+    /// Kerberos (SASL GSSAPI) rather than a password.
+    pub kerberos: bool,
 }
 
-/// One ManageSieve reply: OK, NO or BYE, with its text.
+/// One ManageSieve reply: OK, NO or BYE, with its text and its response
+/// code (RFC 5804 §1.3), uppercase: `QUOTA`, `QUOTA/MAXSIZE`, `TRYLATER`,
+/// `REFERRAL`, `WARNINGS`, `NONEXISTENT`, `ALREADYEXISTS`, `ACTIVE`…
 struct Reply {
     ok: bool,
     text: String,
+    code: Option<String>,
+    /// REFERRAL's `sieve://host[:port]` URL.
+    referral: Option<String>,
+}
+impl Reply {
+    fn new(ok: bool, rest: String) -> Self {
+        let (mut code, mut referral) = (None, None);
+        let mut text = rest.trim().to_owned();
+        if let Some(inner) = text.strip_prefix('(')
+            && let Some(end) = inner.find(')')
+        {
+            let w = words(&inner[..end]);
+            code = w.first().map(|c| c.to_ascii_uppercase());
+            if code.as_deref() == Some("REFERRAL") {
+                referral = w.get(1).cloned();
+            }
+            text = inner[end + 1..].trim().to_owned();
+        }
+        // The human-readable text is a quoted string (or a literal, read
+        // in by `response`).
+        if text.starts_with('"') {
+            text = words(&text).into_iter().next().unwrap_or_default();
+        }
+        Self { ok, text, code, referral }
+    }
+    fn is(&self, code: &str) -> bool {
+        self.code
+            .as_deref()
+            .is_some_and(|c| c == code || c.starts_with(&format!("{code}/")))
+    }
+    /// What went wrong, in words, for refusals with a known code.
+    fn explain(&self) -> String {
+        let why = if self.is("QUOTA") {
+            "the account has no room for more filters"
+        } else if self.is("TRYLATER") {
+            "the server is busy; try again later"
+        } else if self.is("NONEXISTENT") {
+            "the script doesn't exist"
+        } else if self.is("ALREADYEXISTS") {
+            "a script by that name already exists"
+        } else if self.is("ACTIVE") {
+            "the script is in use"
+        } else if self.is("REFERRAL") {
+            return format!(
+                "the account's filters are kept on another server ({})",
+                self.referral.as_deref().unwrap_or("not named")
+            );
+        } else {
+            return self.text.clone();
+        };
+        if self.text.is_empty() {
+            why.to_owned()
+        } else {
+            format!("{why} ({})", self.text)
+        }
+    }
 }
 
 struct Session<S: Read + Write> {
@@ -310,10 +370,13 @@ impl<S: Read + Write> Session<S> {
                 if upper == word || upper.starts_with(&format!("{word} ")) {
                     let mut text = line[word.len()..].trim().to_owned();
                     if let Some(len) = literal_len(&text) {
-                        text = self.literal(len)?;
+                        // The code stays; the literal is its text.
+                        let head = text[..text.rfind('{').unwrap_or(0)].trim().to_owned();
+                        let body = self.literal(len)?;
                         self.line()?;
+                        text = format!("{head} \"{}\"", body.replace('\\', "\\\\").replace('"', "\\\""));
                     }
-                    return Ok((data, Reply { ok, text }));
+                    return Ok((data, Reply::new(ok, text)));
                 }
             }
             if let Some(len) = literal_len(&line) {
@@ -336,7 +399,7 @@ impl<S: Read + Write> Session<S> {
         ensure!(
             reply.ok,
             "The filter server refused to {what}: {}",
-            reply.text
+            reply.explain()
         );
         Ok(data)
     }
@@ -384,6 +447,9 @@ struct Capabilities {
     sasl: Vec<String>,
     sieve: Vec<String>,
     starttls: bool,
+    /// `VERSION "1.0"`: RFC 5804 itself, so CHECKSCRIPT, RENAMESCRIPT and
+    /// NOOP are there (servers from before it lack them).
+    rfc5804: bool,
 }
 fn capabilities(lines: &[String]) -> Capabilities {
     let mut caps = Capabilities::default();
@@ -397,6 +463,7 @@ fn capabilities(lines: &[String]) -> Capabilities {
                 caps.sieve = v.split_whitespace().map(str::to_owned).collect()
             }
             (Some(k), _) if k == "STARTTLS" => caps.starttls = true,
+            (Some(k), Some(_)) if k == "VERSION" => caps.rfc5804 = true,
             _ => {}
         }
     }
@@ -409,7 +476,7 @@ fn open(
     endpoint: &Endpoint,
     secret: &str,
     tls: &native_tls::TlsConnector,
-) -> Result<(Secured, Vec<String>)> {
+) -> Result<(Secured, Opened)> {
     let socket = crate::sync::transport::tcp(&endpoint.host, endpoint.port).with_context(|| {
         format!(
             "{} offers no filter server (ManageSieve) on port {}",
@@ -450,7 +517,9 @@ fn open(
         reply.text
     );
     let caps = capabilities(&lines);
-    let order: &[sasl::Mechanism] = if endpoint.oauth {
+    let order: &[sasl::Mechanism] = if endpoint.kerberos {
+        &sasl::KERBEROS_ORDER
+    } else if endpoint.oauth {
         &sasl::TOKEN_ORDER
     } else {
         &sasl::PASSWORD_ORDER
@@ -466,6 +535,7 @@ fn open(
             host: endpoint.host.clone(),
             port: endpoint.port,
             binding,
+            service: "sieve",
         },
     );
     let mut line = format!("AUTHENTICATE \"{}\"", mechanism.name());
@@ -489,6 +559,13 @@ fn open(
             break;
         }
         if upper.starts_with("NO") || upper.starts_with("BYE") {
+            let parsed = Reply::new(false, reply[if upper.starts_with("NO") { 2 } else { 3 }..].to_owned());
+            if let Some(e) = referral(&parsed, endpoint) {
+                return Err(e);
+            }
+            if parsed.is("TRYLATER") {
+                bail!("The filter server is busy; try again later.");
+            }
             return Err(
                 anyhow::anyhow!("The filter server refused the sign-in: {reply}")
                     .context(crate::manage::status::AccessFailure::Authentication),
@@ -513,7 +590,61 @@ fn open(
         };
         session.send(&format!("\"{}\"\r\n", sasl::encode(&answer)))?;
     }
-    Ok((session, caps.sieve))
+    // RFC 5804's capabilities after AUTHENTICATE (and SCRAM) are
+    // unchanged here; a NOOP confirms the session works before scripts
+    // are touched, where the server has it.
+    if caps.rfc5804 {
+        let (_, reply) = session.command("NOOP")?;
+        ensure!(reply.ok, "The filter server isn't answering: {}", reply.explain());
+    }
+    Ok((
+        session,
+        Opened {
+            extensions: caps.sieve,
+            rfc5804: caps.rfc5804,
+        },
+    ))
+}
+/// What `open` learned of the server.
+struct Opened {
+    extensions: Vec<String>,
+    rfc5804: bool,
+}
+/// A refusal that is a REFERRAL: where the account's filters are.
+fn referral(reply: &Reply, endpoint: &Endpoint) -> Option<anyhow::Error> {
+    let url = reply.referral.as_deref().filter(|_| reply.is("REFERRAL"))?;
+    let rest = url.strip_prefix("sieve://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    // Only within the same domain: following another host would send the
+    // password to whoever answered.
+    // "Same domain" is the endpoint's parent domain (`example.co.uk` for
+    // `imap.example.co.uk`), not the last two labels, which would let
+    // anyone under `co.uk` pass.
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or(authority)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let own = endpoint.host.trim_end_matches('.').to_ascii_lowercase();
+    let parent = own.split_once('.').map(|(_, p)| p).filter(|p| p.contains('.'));
+    let valid = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    let same = valid
+        && (host == own || parent.is_some_and(|p| host == p || host.ends_with(&format!(".{p}"))));
+    if !same {
+        let host: String = host.chars().filter(|c| !c.is_control()).take(253).collect();
+        return Some(anyhow::anyhow!(
+            "The filter server sends this account to {host}, outside its domain; Picacho won't sign in there."
+        ));
+    }
+    let authority: String = authority.chars().filter(|c| !c.is_control()).take(260).collect();
+    Some(anyhow::anyhow!(
+        "This account's filters are kept on {authority}; set it as the filter server."
+    ))
 }
 
 fn scripts(session: &mut Secured) -> Result<Vec<(String, bool)>> {
@@ -532,7 +663,8 @@ fn scripts(session: &mut Secured) -> Result<Vec<(String, bool)>> {
 /// What the account's filter server has: Picacho's rules, and the script
 /// that runs now if it isn't Picacho's.
 pub fn load(endpoint: &Endpoint, secret: &str, tls: &native_tls::TlsConnector) -> Result<State> {
-    let (mut session, extensions) = open(endpoint, secret, tls)?;
+    let (mut session, opened) = open(endpoint, secret, tls)?;
+    let extensions = opened.extensions;
     let listed = scripts(&mut session)?;
     let own = if listed.iter().any(|(n, _)| n == SCRIPT) {
         let data = session.expect(
@@ -586,7 +718,8 @@ pub fn save(
     filters: &Filters,
     addresses: &[String],
 ) -> Result<State> {
-    let (mut session, extensions) = open(endpoint, secret, tls)?;
+    let (mut session, opened) = open(endpoint, secret, tls)?;
+    let extensions = opened.extensions;
     let text = script(filters, &extensions, addresses)?;
     let listed = scripts(&mut session)?;
     let empty = filters.rules.is_empty() && !filters.vacation.on;
@@ -604,14 +737,47 @@ pub fn save(
         if extensions.is_empty() {
             bail!("The filter server didn't say what its filters can do.");
         }
+        // Room for it first (HAVESPACE), so a full account says so before
+        // anything is uploaded.
+        let (_, space) = session.command(&format!(
+            "HAVESPACE {} {}",
+            string(SCRIPT),
+            text.len()
+        ))?;
+        if !space.ok && (space.is("QUOTA") || !space.text.to_ascii_lowercase().contains("unknown")) {
+            bail!("The filter server can't take the filters: {}", space.explain());
+        }
         let (_, check) = session.command(&format!("CHECKSCRIPT {literal}"))?;
         if !check.ok && !check.text.to_ascii_lowercase().contains("unknown command") {
-            bail!("The filter server rejected the filters: {}", check.text);
+            bail!("The filter server rejected the filters: {}", check.explain());
         }
-        session.expect(
-            &format!("PUTSCRIPT {} {literal}", string(SCRIPT)),
-            "save the filters",
-        )?;
+        let exists = listed.iter().any(|(n, _)| n == SCRIPT);
+        let active = listed.iter().any(|(n, a)| n == SCRIPT && *a);
+        if opened.rfc5804 && exists && !active {
+            // An inactive script is replaced whole: written under another
+            // name, then renamed over it (RENAMESCRIPT), so a failure never
+            // leaves half of one. (The active one can't be deleted; PUTSCRIPT
+            // replaces it in one step anyway.)
+            let staging = format!("{SCRIPT}-new");
+            let _ = session.command(&format!("DELETESCRIPT {}", string(&staging)));
+            session.expect(
+                &format!("PUTSCRIPT {} {literal}", string(&staging)),
+                "save the filters",
+            )?;
+            session.expect(&format!("DELETESCRIPT {}", string(SCRIPT)), "replace the filters")?;
+            session.expect(
+                &format!("RENAMESCRIPT {} {}", string(&staging), string(SCRIPT)),
+                "replace the filters",
+            )?;
+        } else {
+            let (_, put) = session.command(&format!("PUTSCRIPT {} {literal}", string(SCRIPT)))?;
+            ensure!(put.ok, "The filter server refused to save the filters: {}", put.explain());
+            // The script was saved, with warnings (RFC 5804 §1.3): worth
+            // knowing, not a failure.
+            if put.is("WARNINGS") {
+                eprintln!("ManageSieve warnings: {}", put.text);
+            }
+        }
         session.expect(
             &format!("SETACTIVE {}", string(SCRIPT)),
             "turn the filters on",
@@ -635,6 +801,28 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replies_carry_their_codes() {
+        let r = Reply::new(false, "(QUOTA/MAXSIZE) \"Too big\"".into());
+        assert!(r.is("QUOTA") && !r.ok);
+        assert_eq!(r.text, "Too big");
+        assert!(r.explain().contains("no room"));
+        let r = Reply::new(false, "(REFERRAL \"sieve://sieve2.example.com\") \"Elsewhere\"".into());
+        assert_eq!(r.referral.as_deref(), Some("sieve://sieve2.example.com"));
+        let ep = Endpoint {
+            host: "imap.example.com".into(),
+            port: PORT,
+            user: "a".into(),
+            oauth: false,
+            kerberos: false,
+        };
+        assert!(referral(&r, &ep).unwrap().to_string().contains("sieve2.example.com"));
+        let away = Reply::new(false, "(REFERRAL \"sieve://evil.net\")".into());
+        assert!(referral(&away, &ep).unwrap().to_string().contains("outside"));
+        let plain = Reply::new(true, "".into());
+        assert!(plain.ok && plain.code.is_none());
+    }
 
     #[test]
     fn scripts_carry_their_rules_and_escape_text() {

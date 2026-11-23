@@ -27,6 +27,12 @@ pub struct Settings {
     /// STARTTLS (false), where the configuration says; `None` goes by the
     /// port (`model::smtp_implicit_tls`).
     pub smtp_tls: Option<bool>,
+    /// The incoming server starts plain and is upgraded with STARTTLS
+    /// (IMAP on 143, POP3's STLS on 110) rather than TLS from the start.
+    pub incoming_starttls: bool,
+    /// The organization's single sign-on, where the domain's configuration
+    /// says its servers take OAuth2 tokens (Thunderbird's `<oAuth2>`).
+    pub sso: Option<crate::manage::model::Sso>,
 }
 impl Settings {
     /// A JMAP server, which sends mail too.
@@ -38,6 +44,8 @@ impl Settings {
             smtp_host: host.to_owned(),
             smtp_port: port,
             smtp_tls: None,
+            incoming_starttls: false,
+            sso: None,
         }
     }
     fn hosted(provider: Provider) -> Self {
@@ -49,6 +57,8 @@ impl Settings {
             smtp_host: a.smtp_host,
             smtp_port: a.smtp_port,
             smtp_tls: a.smtp_tls,
+            incoming_starttls: a.incoming_starttls,
+            sso: None,
         }
     }
 }
@@ -254,6 +264,9 @@ fn fetch_config(url: &str, domain: &str) -> Option<Settings> {
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::limited(3))
+        // A redirect to plain http would let anyone on the network choose
+        // the servers (and the single sign-on) the account is set up with.
+        .https_only(true)
         .build()
         .ok()?;
     let response = client.get(url).send().ok()?;
@@ -266,28 +279,38 @@ fn fetch_config(url: &str, domain: &str) -> Option<Settings> {
 }
 
 /// Parses a Mozilla autoconfig document. Only transports this client
-/// supports are accepted: implicit TLS for incoming mail, and STARTTLS or
-/// implicit TLS (on any port) for SMTP.
+/// supports are accepted: TLS from the start or STARTTLS, never plain.
+/// Incoming servers with TLS from the start are preferred, then IMAP over
+/// POP3.
 pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
-    let mut incoming: Option<(Provider, String, u16)> = None;
+    // (kind, host, port, STARTTLS)
+    let mut incoming: Option<(Provider, String, u16, bool)> = None;
+    // The incoming server signs in with tokens only (single sign-on).
+    let mut oauth_only = false;
     for (attrs, inner) in blocks(xml, "incomingServer") {
         let kind = match attr(attrs, "type") {
             Some("imap") => Provider::Imap,
             Some("pop3") => Provider::Pop3,
             _ => continue,
         };
-        if tag(inner, "socketType") != Some("SSL") {
-            continue;
-        }
+        let starttls = match tag(inner, "socketType") {
+            Some("SSL") => false,
+            Some("STARTTLS") => true,
+            _ => continue,
+        };
         let (Some(host), Some(port)) = (tag(inner, "hostname"), port(inner)) else {
             continue;
         };
+        // Rank: TLS from the start first, then IMAP.
+        let rank = |kind: Provider, starttls: bool| (!starttls, kind == Provider::Imap);
         let better = match &incoming {
             None => true,
-            Some((existing, ..)) => *existing == Provider::Pop3 && kind == Provider::Imap,
+            Some((existing, _, _, tls)) => rank(kind, starttls) > rank(*existing, *tls),
         };
         if better {
-            incoming = Some((kind, substitute(host, domain), port));
+            incoming = Some((kind, substitute(host, domain), port, starttls));
+            oauth_only = authentications(inner).iter().all(|a| a.eq_ignore_ascii_case("OAuth2"))
+                && !authentications(inner).is_empty();
         }
     }
     let mut smtp = None;
@@ -306,7 +329,7 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         smtp = Some((substitute(host, domain), port, tls));
         break;
     }
-    let ((kind, incoming_host, incoming_port), (smtp_host, smtp_port, smtp_tls)) =
+    let ((kind, incoming_host, incoming_port, incoming_starttls), (smtp_host, smtp_port, smtp_tls)) =
         (incoming?, smtp?);
     let provider = if incoming_host.ends_with(".gmail.com") {
         Provider::Gmail
@@ -315,6 +338,13 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
     } else {
         kind
     };
+    // Gmail and Outlook have their own sign-in; others' OAuth2 is the
+    // organization's.
+    let sso = if matches!(provider, Provider::Imap | Provider::Pop3) && oauth_only {
+        sso_of(xml)
+    } else {
+        None
+    };
     Some(Settings {
         provider,
         incoming_host,
@@ -322,9 +352,47 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         smtp_host,
         smtp_port,
         smtp_tls: Some(smtp_tls),
+        incoming_starttls,
+        sso,
     })
 }
 
+/// A server's `<authentication>` methods.
+fn authentications(server: &str) -> Vec<&str> {
+    blocks(server, "authentication")
+        .into_iter()
+        .map(|(_, inner)| inner.trim())
+        .collect()
+}
+/// The configuration's `<oAuth2>` block (Thunderbird's extension): the
+/// identity provider's issuer and the scopes the mail servers want. Only an
+/// https issuer is taken; its endpoints come from its own metadata, not from
+/// this file, which could have come over a redirect. Thunderbird's files
+/// name the issuer's host only, with `authURL` under it (Keycloak's
+/// `/realms/<name>/protocol/openid-connect/auth`): the issuer is the
+/// authURL's path up to its protocol part, where it has one.
+fn sso_of(xml: &str) -> Option<crate::manage::model::Sso> {
+    let (_, inner) = blocks(xml, "oAuth2").into_iter().next()?;
+    let issuer = tag(inner, "issuer")?.trim();
+    let auth = tag(inner, "authURL").and_then(|u| url::Url::parse(u.trim()).ok());
+    let issuer = if issuer.contains("://") {
+        issuer.to_owned()
+    } else if let Some(auth) = auth.filter(|a| a.host_str() == Some(issuer)) {
+        let path = auth.path();
+        let base = ["/protocol/openid-connect/", "/oauth2/", "/oauth/", "/connect/", "/application/o/"]
+            .iter()
+            .find_map(|marker| path.find(marker).map(|i| &path[..i]))
+            .unwrap_or("");
+        format!("https://{issuer}{base}")
+    } else {
+        format!("https://{issuer}")
+    };
+    let parsed = url::Url::parse(&issuer).ok()?;
+    (parsed.scheme() == "https" && parsed.host_str().is_some()).then(|| crate::manage::model::Sso {
+        issuer: issuer.trim_end_matches('/').to_owned(),
+        scope: tag(inner, "scope").unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" "),
+    })
+}
 fn blocks<'a>(xml: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
     let open = format!("<{name}");
     let close = format!("</{name}>");
@@ -420,6 +488,15 @@ fn probe(domain: &str) -> Option<Settings> {
                 (format!("pop.{domain}"), 995),
                 (format!("pop3.{domain}"), 995),
             ])
+            .or_else(|| {
+                // Only STARTTLS: IMAP on 143, POP3 on 110 (STLS).
+                first_open(vec![
+                    (format!("imap.{domain}"), 143),
+                    (format!("mail.{domain}"), 143),
+                    (format!("pop.{domain}"), 110),
+                    (format!("pop3.{domain}"), 110),
+                ])
+            })
         });
         let smtp = s.spawn(|| {
             first_open(vec![
@@ -433,7 +510,7 @@ fn probe(domain: &str) -> Option<Settings> {
     });
     let ((incoming_host, incoming_port), (smtp_host, smtp_port)) = (incoming?, smtp?);
     Some(Settings {
-        provider: if incoming_port == 995 {
+        provider: if matches!(incoming_port, 995 | 110) {
             Provider::Pop3
         } else {
             Provider::Imap
@@ -443,6 +520,8 @@ fn probe(domain: &str) -> Option<Settings> {
         smtp_host,
         smtp_port,
         smtp_tls: None,
+        incoming_starttls: matches!(incoming_port, 143 | 110),
+        sso: None,
     })
 }
 
@@ -483,9 +562,55 @@ mod tests {
                 smtp_host: "smtp.fastmail.com".into(),
                 smtp_port: 465,
                 smtp_tls: Some(true),
+                incoming_starttls: false,
+                sso: None,
             })
         );
         assert_eq!(parse_config("<html>not found</html>", "x.com"), None);
+        // Only STARTTLS offered: taken, and marked so.
+        let only = FASTMAIL
+            .replace("<port>993</port>\n      <socketType>SSL</socketType>", "<port>143</port><socketType>STARTTLS</socketType>")
+            .replace("<port>995</port><socketType>SSL</socketType>", "<port>110</port><socketType>plain</socketType>");
+        let found = parse_config(&only, "fastmail.com").unwrap();
+        assert_eq!((found.provider, found.incoming_port, found.incoming_starttls), (Provider::Imap, 143, true));
+    }
+
+    #[test]
+    fn finds_an_organizations_single_sign_on() {
+        let config = r#"<clientConfig><emailProvider id="example.edu">
+    <incomingServer type="imap">
+      <hostname>imap.example.edu</hostname><port>993</port><socketType>SSL</socketType>
+      <authentication>OAuth2</authentication>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>smtp.example.edu</hostname><port>587</port><socketType>STARTTLS</socketType>
+      <authentication>OAuth2</authentication>
+    </outgoingServer>
+  </emailProvider>
+  <oAuth2>
+    <issuer>login.example.edu</issuer>
+    <scope>openid email offline_access mail</scope>
+    <authURL>https://login.example.edu/realms/staff/protocol/openid-connect/auth</authURL>
+    <tokenURL>https://login.example.edu/realms/staff/protocol/openid-connect/token</tokenURL>
+  </oAuth2></clientConfig>"#;
+        let found = parse_config(config, "example.edu").unwrap();
+        assert_eq!(found.provider, Provider::Imap);
+        let sso = found.sso.unwrap();
+        assert_eq!(sso.issuer, "https://login.example.edu/realms/staff");
+        assert_eq!(sso.scope, "openid email offline_access mail");
+        // A server that also takes passwords isn't set to single sign-on.
+        let both = config.replace(
+            "<authentication>OAuth2</authentication>\n    </incomingServer>",
+            "<authentication>OAuth2</authentication><authentication>password-cleartext</authentication></incomingServer>",
+        );
+        assert_ne!(both, config);
+        assert!(parse_config(&both, "example.edu").unwrap().sso.is_none());
+        // An issuer over plain http is ignored.
+        let plain = config.replace("<issuer>login.example.edu</issuer>", "<issuer>http://login.example.edu</issuer>");
+        assert!(parse_config(&plain, "example.edu").unwrap().sso.is_none());
+        // Gmail's own sign-in isn't an organization's.
+        let gmail = config.replace("imap.example.edu", "imap.gmail.com");
+        assert!(parse_config(&gmail, "example.edu").unwrap().sso.is_none());
     }
 
     #[test]

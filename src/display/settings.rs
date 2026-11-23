@@ -1154,6 +1154,46 @@ impl MailApp {
                 Action::ToggleDeliveryReceipts(a.id.clone()),
                 cx,
             ))
+            .when_some(a.sso.as_ref(), |page, sso| {
+                let c = self.colors();
+                page.child(
+                    div()
+                        .id(SharedString::from(format!("sso-{}", a.id)))
+                        .debug_selector(|| "account-sso".into())
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Single sign-on"))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(format!(
+                                    "Signed in through {} in the browser. When the sign-in expires, Sign In Again opens it there.",
+                                    sso.issuer
+                                )),
+                        ),
+                )
+            })
+            .when(
+                matches!(a.provider, Provider::Imap | Provider::Pop3)
+                    && !a.oauth
+                    && !cfg!(any(target_os = "android", target_os = "ios")),
+                |page| {
+                    page.child(self.switch_setting(
+                        "Sign in with Kerberos",
+                        if a.kerberos {
+                            "Picacho signs in to this account's servers with this computer's Kerberos ticket, not a password. A server that doesn't take Kerberos is reported, never tried with a password."
+                        } else {
+                            "Use this computer's Kerberos ticket (kinit, or your domain sign-in) instead of the password. Picacho checks it works before switching."
+                        },
+                        format!("kerberos-{}", a.id),
+                        a.kerberos,
+                        Action::ToggleKerberos(a.id.clone()),
+                        cx,
+                    ))
+                },
+            )
             .child(self.switch_setting(
                 "Require encryption in transit",
                 "Messages only go if every server on the way can use encryption (REQUIRETLS); where that can't be promised they bounce instead. Your outgoing server has to support it, and Picacho tells you when a recipient's domain publishes no policy (MTA-STS or DANE) to insist on it by.",
@@ -1162,6 +1202,26 @@ impl MailApp {
                 Action::ToggleRequireTls(a.id.clone()),
                 cx,
             ))
+            .when(!matches!(a.provider, Provider::Proton | Provider::Jmap), |page| {
+                page.child(self.setting(
+                    "Give up on delivery after",
+                    "Where your outgoing server supports it (DELIVERBY), a message that can't be delivered in time comes back to you instead of arriving late. Servers that don't keep trying for days as usual.",
+                    self.segmented(
+                        &format!("deliver-within-{}", a.id),
+                        [(0, "Days, as usual"), (4, "4 hours"), (24, "1 day")]
+                            .into_iter()
+                            .map(|(hours, label)| {
+                                (
+                                    label.to_owned(),
+                                    Action::SetDeliverWithin(a.id.clone(), hours),
+                                    a.deliver_within_hours == hours,
+                                )
+                            })
+                            .collect(),
+                        cx,
+                    ),
+                ))
+            })
             .when(a.provider != Provider::Proton, |page| {
                 page.child(self.switch_setting(
                     "Let the server send scheduled messages",
@@ -1178,6 +1238,7 @@ impl MailApp {
                 page.child(self.section("Storage"))
                     .child(self.storage(a))
                     .children(self.server_notes_view(a))
+                    .children(self.jmap_access_note(a))
                     .children(self.offline_note(a))
             })
             .when(Backend::may_filter(a), |page| {
@@ -1309,6 +1370,49 @@ impl MailApp {
                     cx,
                 ),
             ));
+        }
+        if a.provider == Provider::Pop3 {
+            page = page
+                .child(self.setting(
+                    "Remove from the server",
+                    "Downloaded mail stays on this computer. Only messages saved here completely are removed, when the server confirms at the end of a check.",
+                    self.segmented(
+                        &format!("pop-delete-{}", a.id),
+                        [
+                            (None, "Never"),
+                            (Some(0), "After download"),
+                            (Some(7), "After 1 week"),
+                            (Some(30), "After 1 month"),
+                        ]
+                        .into_iter()
+                        .map(|(days, label)| {
+                            (
+                                label.to_owned(),
+                                set(SyncSettings {
+                                    pop_delete_after_days: days,
+                                    ..sync
+                                }),
+                                sync.pop_delete_after_days == days,
+                            )
+                        })
+                        .collect(),
+                        cx,
+                    ),
+                ))
+                .child(self.switch_setting(
+                    "Delete on the server too",
+                    "Deleting a message for good here also removes it from the server at the next check.",
+                    format!("pop-delete-local-{}", a.id),
+                    sync.pop_delete_with_local,
+                    Action::SetSync(
+                        a.id.clone(),
+                        SyncSettings {
+                            pop_delete_with_local: !sync.pop_delete_with_local,
+                            ..sync
+                        },
+                    ),
+                    cx,
+                ));
         }
         page = page
             .child(self.setting(

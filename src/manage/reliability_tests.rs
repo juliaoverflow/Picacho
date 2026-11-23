@@ -537,3 +537,346 @@ fn rejected_imap_login_is_actionable_and_failed_reconnect_keeps_local_data() -> 
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A POP3 server for the deletion settings: `messages` (UIDL, subject) in
+/// message-number order, recording every DELE and QUIT and applying the
+/// deletions only at a QUIT that `confirm_quit` lets succeed.
+struct PopMailbox {
+    messages: Vec<(String, String)>,
+    deleted_at_quit: Vec<String>,
+    log: Vec<String>,
+    drop_before_quit_reply: bool,
+    interrupt_retr: bool,
+}
+fn deleting_pop_server(mailbox: Arc<std::sync::Mutex<PopMailbox>>) -> Result<(Vec<u8>, Server)> {
+    let (cert, acceptor) = tls_fixture()?;
+    let server = Server::new(move |socket| {
+        let Ok(stream) = acceptor.accept(socket) else {
+            return;
+        };
+        let mut r = BufReader::new(stream);
+        if r.get_mut().write_all(b"+OK ready\r\n").is_err() {
+            return;
+        }
+        // This session's snapshot, and the numbers it marked.
+        let messages = mailbox.lock().unwrap().messages.clone();
+        let mut marked: Vec<u32> = Vec::new();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let command = line.trim_end().to_owned();
+            mailbox.lock().unwrap().log.push(command.clone());
+            let response = if command.starts_with("USER ") || command.starts_with("PASS ") {
+                "+OK\r\n".to_owned()
+            } else if command == "CAPA" {
+                "+OK\r\nUSER\r\nUIDL\r\n.\r\n".to_owned()
+            } else if command == "UIDL" {
+                let mut rows = String::from("+OK\r\n");
+                for (i, (uid, _)) in messages.iter().enumerate() {
+                    rows.push_str(&format!("{} {uid}\r\n", i + 1));
+                }
+                rows + ".\r\n"
+            } else if let Some(n) = command.strip_prefix("RETR ") {
+                let n: usize = n.parse().unwrap();
+                if mailbox.lock().unwrap().interrupt_retr {
+                    let _ = r.get_mut().write_all(b"+OK\r\nSubject: Cut\r\n\r\nPart");
+                    return;
+                }
+                format!("+OK\r\nSubject: {}\r\n\r\nBody\r\n.\r\n", messages[n - 1].1)
+            } else if let Some(n) = command.strip_prefix("DELE ") {
+                let n: u32 = n.parse().unwrap();
+                if marked.contains(&n) {
+                    "-ERR already deleted\r\n".to_owned()
+                } else {
+                    marked.push(n);
+                    "+OK marked\r\n".to_owned()
+                }
+            } else if command == "QUIT" {
+                let mut m = mailbox.lock().unwrap();
+                if m.drop_before_quit_reply {
+                    // The connection ends before UPDATE: nothing is deleted.
+                    return;
+                }
+                let gone: Vec<String> = marked
+                    .iter()
+                    .map(|n| messages[*n as usize - 1].0.clone())
+                    .collect();
+                m.messages.retain(|(uid, _)| !gone.contains(uid));
+                m.deleted_at_quit.extend(gone);
+                drop(m);
+                let _ = r.get_mut().write_all(b"+OK bye\r\n");
+                return;
+            } else {
+                panic!("Unexpected POP3 command: {command}");
+            };
+            if r.get_mut().write_all(response.as_bytes()).is_err() {
+                return;
+            }
+        }
+    })?;
+    Ok((cert, server))
+}
+fn pop_mailbox(uids: &[&str]) -> Arc<std::sync::Mutex<PopMailbox>> {
+    Arc::new(std::sync::Mutex::new(PopMailbox {
+        messages: uids
+            .iter()
+            .map(|u| (u.to_string(), format!("Message {u}")))
+            .collect(),
+        deleted_at_quit: Vec::new(),
+        log: Vec::new(),
+        drop_before_quit_reply: false,
+        interrupt_retr: false,
+    }))
+}
+#[test]
+fn pop3_never_deletes_from_the_server_by_default() -> Result<()> {
+    let mailbox = pop_mailbox(&["a", "b"]);
+    let (cert, server) = deleting_pop_server(mailbox.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    assert_eq!(a.sync.pop_delete_after_days, None);
+    assert!(!a.sync.pop_delete_with_local);
+    assert_eq!(b.sync(&a, Folder::Inbox, 300)?.len(), 2);
+    let mails = b.store.messages(&a.id, Folder::Inbox, 300)?;
+    b.delete_forever(&a, &mails[..1])?;
+    b.sync(&a, Folder::Inbox, 300)?;
+    let m = mailbox.lock().unwrap();
+    assert!(m.log.iter().all(|c| !c.starts_with("DELE")), "{:?}", m.log);
+    assert_eq!(m.messages.len(), 2);
+    drop(m);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+#[test]
+fn pop3_deletes_after_download_only_what_is_saved_here() -> Result<()> {
+    let mailbox = pop_mailbox(&["a", "b"]);
+    let (cert, server) = deleting_pop_server(mailbox.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    a.sync.pop_delete_after_days = Some(0);
+    // An interrupted download saves nothing, so nothing is deleted.
+    mailbox.lock().unwrap().interrupt_retr = true;
+    assert!(b.sync(&a, Folder::Inbox, 300).is_err());
+    assert!(
+        mailbox
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .all(|c| !c.starts_with("DELE"))
+    );
+    mailbox.lock().unwrap().interrupt_retr = false;
+    // Downloaded and saved in this check: deleted at its QUIT.
+    let mails = b.sync(&a, Folder::Inbox, 300)?;
+    assert_eq!(mails.len(), 2);
+    for m in &mails {
+        assert!(b.store.raw(&m.id)?.is_some());
+    }
+    assert_eq!(mailbox.lock().unwrap().deleted_at_quit, vec!["a", "b"]);
+    // The mail stays here, and isn't downloaded or deleted again.
+    let before = mailbox.lock().unwrap().log.len();
+    assert_eq!(b.sync(&a, Folder::Inbox, 300)?.len(), 2);
+    let m = mailbox.lock().unwrap();
+    assert!(
+        m.log[before..]
+            .iter()
+            .all(|c| !c.starts_with("DELE") && !c.starts_with("RETR"))
+    );
+    drop(m);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+#[test]
+fn pop3_deletion_is_unconfirmed_until_quit_succeeds() -> Result<()> {
+    let mailbox = pop_mailbox(&["a"]);
+    let (cert, server) = deleting_pop_server(mailbox.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    a.sync.pop_delete_after_days = Some(0);
+    mailbox.lock().unwrap().drop_before_quit_reply = true;
+    // The mail is saved; the check reports that deleting wasn't confirmed.
+    assert!(b.sync(&a, Folder::Inbox, 300).is_err());
+    let id = format!("{}:pop:a", a.id);
+    assert!(b.store.raw(&id)?.is_some());
+    assert_eq!(mailbox.lock().unwrap().messages.len(), 1);
+    // The next check tries again, without downloading it again.
+    mailbox.lock().unwrap().drop_before_quit_reply = false;
+    b.sync(&a, Folder::Inbox, 300)?;
+    let m = mailbox.lock().unwrap();
+    assert_eq!(m.deleted_at_quit, vec!["a"]);
+    assert_eq!(m.log.iter().filter(|c| c.starts_with("RETR")).count(), 1);
+    drop(m);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+#[test]
+fn pop3_deletes_after_days_counted_from_download() -> Result<()> {
+    let mailbox = pop_mailbox(&["old", "new"]);
+    let (cert, server) = deleting_pop_server(mailbox.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    a.sync.pop_delete_after_days = Some(7);
+    b.sync(&a, Folder::Inbox, 300)?;
+    assert!(mailbox.lock().unwrap().deleted_at_quit.is_empty());
+    // "old" was first seen downloaded eight days ago.
+    let key = format!("pop_downloaded:{}", a.id);
+    let mut seen: std::collections::BTreeMap<String, i64> =
+        serde_json::from_str(&b.store.preference(&key).unwrap())?;
+    assert_eq!(seen.len(), 2);
+    *seen.get_mut("old").unwrap() -= 8 * 86_400;
+    b.store
+        .set_preference(&key, &serde_json::to_string(&seen)?)?;
+    b.sync(&a, Folder::Inbox, 300)?;
+    assert_eq!(mailbox.lock().unwrap().deleted_at_quit, vec!["old"]);
+    // The deleted one's record goes at the next check; the mail stays here.
+    b.sync(&a, Folder::Inbox, 300)?;
+    let seen: std::collections::BTreeMap<String, i64> =
+        serde_json::from_str(&b.store.preference(&key).unwrap())?;
+    assert_eq!(seen.keys().collect::<Vec<_>>(), vec!["new"]);
+    assert!(b.store.raw(&format!("{}:pop:old", a.id))?.is_some());
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+#[test]
+fn pop3_deletes_with_local_deletions_when_asked() -> Result<()> {
+    let mailbox = pop_mailbox(&["a", "b"]);
+    let (cert, server) = deleting_pop_server(mailbox.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    a.sync.pop_delete_with_local = true;
+    b.sync(&a, Folder::Inbox, 300)?;
+    let gone = b.store.message(&format!("{}:pop:a", a.id))?.unwrap();
+    b.delete_forever(&a, &[gone])?;
+    b.sync(&a, Folder::Inbox, 300)?;
+    let m = mailbox.lock().unwrap();
+    assert_eq!(m.deleted_at_quit, vec!["a"]);
+    assert_eq!(m.messages.len(), 1);
+    drop(m);
+    // Its record is forgotten once the server no longer has it.
+    b.sync(&a, Folder::Inbox, 300)?;
+    assert!(
+        b.store
+            .preference(&format!("pop_erased:{}", a.id))
+            .is_none_or(|s| s == "[]")
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// A POP3 server on port 110 style: plain until STLS, then TLS. It lists
+/// TOP, so older mail is listed by headers; opening one downloads it whole.
+/// The third session is refused with LOGIN-DELAY, which pauses background
+/// checks as a server limit rather than as a refused sign-in.
+#[test]
+fn pop3_starttls_top_headers_and_login_delay() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let mut sessions = 0;
+    let server = Server::new(move |socket| {
+        sessions += 1;
+        let mut plain = BufReader::new(socket);
+        let _ = plain.get_mut().write_all(b"+OK ready\r\n");
+        // Before TLS: CAPA, then STLS; nothing else is accepted.
+        loop {
+            let mut line = String::new();
+            if plain.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let command = line.trim_end().to_owned();
+            log.lock().unwrap().push(format!("plain {command}"));
+            match command.as_str() {
+                "CAPA" => {
+                    let _ = plain
+                        .get_mut()
+                        .write_all(b"+OK\r\nSTLS\r\nUSER\r\nTOP\r\nUIDL\r\nRESP-CODES\r\n.\r\n");
+                }
+                "STLS" => {
+                    let _ = plain.get_mut().write_all(b"+OK begin TLS\r\n");
+                    break;
+                }
+                other => panic!("Sent in the clear: {other}"),
+            }
+        }
+        let Ok(stream) = acceptor.accept(plain.into_inner()) else {
+            return;
+        };
+        let mut r = BufReader::new(stream);
+        let third = sessions == 3;
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let command = line.trim_end().to_owned();
+            log.lock().unwrap().push(command.clone());
+            let reply = match command.as_str() {
+                "CAPA" => "+OK\r\nUSER\r\nTOP\r\nUIDL\r\nRESP-CODES\r\n.\r\n".to_owned(),
+                c if c.starts_with("USER ") => "+OK\r\n".to_owned(),
+                c if c.starts_with("PASS ") && third => {
+                    "-ERR [LOGIN-DELAY] wait a few minutes\r\n".to_owned()
+                }
+                c if c.starts_with("PASS ") => "+OK\r\n".to_owned(),
+                "UIDL" => "+OK\r\n1 one\r\n2 two\r\n.\r\n".to_owned(),
+                "LIST" => "+OK\r\n1 120\r\n2 4000\r\n.\r\n".to_owned(),
+                c if c.starts_with("TOP ") => {
+                    let n = c.split(' ').nth(1).unwrap();
+                    format!("+OK\r\nSubject: Message {n}\r\nFrom: a@example.com\r\n\r\n.\r\n")
+                }
+                c if c.starts_with("RETR ") => {
+                    let n = c.split(' ').nth(1).unwrap();
+                    format!("+OK\r\nSubject: Message {n}\r\nFrom: a@example.com\r\n\r\nThe whole text.\r\n.\r\n")
+                }
+                "QUIT" => return,
+                other => panic!("Unexpected POP3 command: {other}"),
+            };
+            if r.get_mut().write_all(reply.as_bytes()).is_err() {
+                return;
+            }
+        }
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    a.incoming_starttls = true;
+    a.validate()?;
+    // Listed by their headers: no RETR.
+    let listed = b.catalog(&a, Folder::Inbox, 50)?;
+    assert_eq!(listed.total, 2);
+    let first = b.store.message(&format!("{}:pop:one", a.id))?.unwrap();
+    assert_eq!(first.subject, "Message 1");
+    assert!(first.body.is_none() && b.store.raw(&first.id)?.is_none());
+    assert_eq!(b.store.message(&format!("{}:pop:two", a.id))?.unwrap().size, 4000);
+    // Opening it downloads it whole, by its UIDL identity.
+    let read = b.read(&a, &first)?;
+    assert!(read.body.unwrap().contains("The whole text."));
+    assert!(b.store.raw(&first.id)?.is_some());
+    // The server asks to wait: background work pauses, the sign-in isn't
+    // called wrong.
+    let error = b.catalog(&a, Folder::Inbox, 50).unwrap_err();
+    assert!(error.downcast_ref::<crate::manage::status::Throttled>().is_some(), "{error:#}");
+    assert!(error.downcast_ref::<AccessFailure>().is_none(), "{error:#}");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|c| c == "TOP 1 0"), "{seen:?}");
+    assert_eq!(seen.iter().filter(|c| c.starts_with("RETR")).count(), 1, "{seen:?}");
+    assert!(
+        seen.iter().filter(|c| c.starts_with("plain ")).all(|c| c == "plain CAPA" || c == "plain STLS"),
+        "{seen:?}"
+    );
+    drop(server);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

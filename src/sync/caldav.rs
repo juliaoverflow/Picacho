@@ -2,7 +2,7 @@
 //! calendars, reading their events in a time range, and saving and
 //! removing single events.
 use crate::sync::{dav, ical};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 /// Where and how to reach a CalDAV server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -13,6 +13,12 @@ pub struct Server {
     /// Calendars) instead of a CalDAV server: that account's id here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jmap_account: String,
+    /// The server sends invitations, updates and cancellations for events
+    /// you organize (RFC 6638 implicit scheduling), instead of Picacho
+    /// emailing them. Only set where the server says it schedules
+    /// (`calendar-auto-schedule`); off unless chosen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_schedules: bool,
 }
 
 /// A calendar on the server.
@@ -31,6 +37,17 @@ pub struct Calendar {
     /// syncs read only changes until the range needs to move on.
     #[serde(default)]
     pub read_until: i64,
+    /// The kinds of item it takes (`VEVENT`, `VTODO`), where the server
+    /// says (supported-calendar-component-set); empty: any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<String>,
+    /// The largest event it takes, in octets (`max-resource-size`); 0
+    /// where it doesn't say.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_size: u64,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// An event as kept here: where it is on the server, and its version.
@@ -45,10 +62,25 @@ pub struct Stored {
     pub calendar: String,
     pub href: String,
     pub etag: String,
+    /// Its scheduling version (`Schedule-Tag`, RFC 6638 §3.2), where the
+    /// server schedules: guests' answers arriving don't change it, so an
+    /// edit is refused only for a change that matters.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schedule_tag: String,
 }
 
 fn client(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<dav::Client> {
     dav::Client::new(&server.user, password, tls)
+}
+
+/// Whether the server schedules (RFC 6638 §2: `calendar-auto-schedule` in
+/// the DAV header of the calendar home), so it can send invitations itself.
+pub fn schedules(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<bool> {
+    let c = client(server, password, tls)?;
+    let home = c.home(&server.url, "caldav", "calendar-home-set", dav::CALDAV)?;
+    Ok(c.compliance(&home)?
+        .iter()
+        .any(|class| class == "calendar-auto-schedule"))
 }
 
 /// The account's calendars.
@@ -81,6 +113,8 @@ pub fn calendars(
             ctag: c.ctag,
         },
         read_until: 0,
+        components: c.components,
+        max_size: c.max_size,
     })
     .collect())
 }
@@ -105,7 +139,8 @@ fn range_query(from: i64, to: i64) -> String {
 /// filters one component kind at a time, RFC 4791 §9.7.1).
 const TASK_QUERY: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VTODO\"><c:prop-filter name=\"COMPLETED\"><c:is-not-defined/></c:prop-filter></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>";
 
-/// The open tasks in `calendars` (VTODO without COMPLETED).
+/// The open tasks in `calendars` (VTODO without COMPLETED), soonest due
+/// first, then those with no due date.
 pub fn tasks(
     server: &Server,
     password: &str,
@@ -114,21 +149,64 @@ pub fn tasks(
 ) -> Result<Vec<Stored>> {
     let c = client(server, password, tls)?;
     let mut out = Vec::new();
+    let mut refused = 0;
+    let mut last_error = None;
     for cal in calendars {
         let href = url::Url::parse(&cal.href)?;
         // A calendar that keeps no tasks may refuse the query; skip it.
-        let Ok(found) = c.list(&href, TASK_QUERY, "calendar-data") else {
-            continue;
+        let found = match c.list(&href, TASK_QUERY, "calendar-data") {
+            Ok(found) => found,
+            Err(e) => {
+                refused += 1;
+                last_error = Some(e);
+                continue;
+            }
         };
         out.extend(
             found
                 .into_iter()
-                .filter_map(|r| stored(&cal.href, r))
-                .filter(|s| s.event.task),
+                .filter_map(|r| stored_task(&cal.href, r))
+                .filter(|s| !s.event.completed),
         );
     }
-    out.sort_by_key(|s| s.event.start);
+    // Every calendar refusing is the server failing, not a lack of tasks.
+    if refused > 0
+        && refused == calendars.len()
+        && let Some(e) = last_error
+    {
+        return Err(e.context("The calendar server didn't list your tasks."));
+    }
+    sort_tasks(&mut out);
     Ok(out)
+}
+
+/// Tasks soonest due first; those with no due date (0) last, by name.
+pub fn sort_tasks(tasks: &mut [Stored]) {
+    tasks.sort_by(|a, b| {
+        let due = |s: &Stored| {
+            if s.event.start == 0 {
+                i64::MAX
+            } else {
+                s.event.start
+            }
+        };
+        due(a)
+            .cmp(&due(b))
+            .then_with(|| a.event.summary.cmp(&b.event.summary))
+    });
+}
+
+/// A resource's task (VTODO), if it holds one.
+fn stored_task(cal: &str, resource: dav::Resource) -> Option<Stored> {
+    let event = ical::parse_tasks(&resource.data).into_iter().next()?;
+    Some(Stored {
+        event,
+        overrides: Vec::new(),
+        calendar: cal.to_owned(),
+        href: resource.href.to_string(),
+        etag: resource.etag,
+        schedule_tag: String::new(),
+    })
 }
 
 /// When `attendees` are busy over `from`..`to`, asked of the account's
@@ -162,6 +240,8 @@ fn stored(cal: &str, resource: dav::Resource) -> Option<Stored> {
     // A repeating event's changed occurrences share its resource:
     // the series is the one without a RECURRENCE-ID.
     let mut events = ical::parse(&resource.data).events;
+    // Tasks are kept apart (`tasks`); a calendar holding both lists events here.
+    events.retain(|e| !e.task);
     let series = events
         .iter()
         .position(|e| e.recurrence_id.is_none())
@@ -176,6 +256,7 @@ fn stored(cal: &str, resource: dav::Resource) -> Option<Stored> {
         calendar: cal.to_owned(),
         href: resource.href.to_string(),
         etag: resource.etag,
+        schedule_tag: String::new(),
     })
 }
 
@@ -241,6 +322,8 @@ pub fn sync(
             color: cal.color.clone(),
             sync_token: cal.state.sync_token.clone(),
             ctag: cal.state.ctag.clone(),
+            max_size: 0,
+            vcard_versions: Vec::new(),
         };
         let query = range_query(from, to + MARGIN);
         let read = dav::read_collection(
@@ -300,12 +383,17 @@ pub fn create_calendar(
 }
 
 /// Saves an event: new in `calendar`, or a change to the one at its href.
+/// `server_schedules_this`: with `Server::server_schedules`, the server
+/// sends this one's invitations (an event organized here); otherwise
+/// every ORGANIZER and ATTENDEE is marked for Picacho to schedule.
 pub fn save(
     server: &Server,
     password: &str,
     tls: native_tls::TlsConnector,
     calendar: &str,
     stored: &Stored,
+    server_schedules_this: bool,
+    max_size: Option<u64>,
 ) -> Result<Stored> {
     ensure!(!stored.event.uid.is_empty(), "The event has no identifier.");
     let c = client(server, password, tls)?;
@@ -314,22 +402,133 @@ pub fn save(
     } else {
         url::Url::parse(&stored.href)?
     };
-    let text = if stored.overrides.is_empty() {
+    let text = if stored.event.task {
+        // Changed in place, keeping what other apps set on it.
+        ical::task_to_store(&stored.event)
+    } else if stored.overrides.is_empty() {
         ical::to_store(&stored.event)
     } else {
         ical::to_store_all(&stored.event, &stored.overrides)
     };
     // Picacho emails invitations and answers itself (iMIP), so the server
-    // mustn't send them again.
-    let text = ical::scheduled_by_client(&text);
-    let etag = c.put(&href, "text/calendar; charset=utf-8", &stored.etag, text)?;
+    // mustn't send them again; unless the server is asked to schedule, in
+    // which case it sends them and Picacho doesn't.
+    let text = if server.server_schedules && server_schedules_this {
+        text
+    } else {
+        ical::scheduled_by_client(&text)
+    };
+    if let Some(max) = max_size.filter(|m| *m > 0)
+        && text.len() as u64 > max
+    {
+        bail!(
+            "This event is too large for the calendar ({} KB at most). Shorten its notes or remove guests.",
+            max / 1024
+        );
+    }
+    // With a Schedule-Tag, only a change that matters stops the write; a
+    // guest's answer arriving meanwhile doesn't (RFC 6638 §3.2.10).
+    let (etag, schedule_tag) = c.put_scheduled(
+        &href,
+        "text/calendar; charset=utf-8",
+        &stored.etag,
+        &stored.schedule_tag,
+        text,
+    )?;
     Ok(Stored {
         event: stored.event.clone(),
         overrides: stored.overrides.clone(),
         calendar: calendar.to_owned(),
         href: href.to_string(),
         etag,
+        schedule_tag,
     })
+}
+
+/// Renames a calendar, and changes its colour (empty: as it is).
+pub fn rename_calendar(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    href: &str,
+    name: &str,
+    color: &str,
+) -> Result<()> {
+    ensure!(!name.trim().is_empty(), "Give the calendar a name.");
+    client(server, password, tls)?.rename_collection(&url::Url::parse(href)?, name.trim(), color)
+}
+
+/// Deletes a calendar and its events from the server.
+pub fn delete_calendar(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    href: &str,
+) -> Result<()> {
+    client(server, password, tls)?.delete_collection(&url::Url::parse(href)?)
+}
+
+/// The account's storage on the calendar server, used and left in
+/// octets, where it says (RFC 4331).
+pub fn quota(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<Option<(u64, u64)>> {
+    let c = client(server, password, tls)?;
+    let home = c.home(&server.url, "caldav", "calendar-home-set", dav::CALDAV)?;
+    c.quota(&home)
+}
+
+/// What the server delivered to the scheduling inbox (RFC 6638 §4): with
+/// the server scheduling, invitations and answers from others arrive
+/// here rather than by mail. Each is (its href and ETag, the iTIP object).
+pub fn inbox(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+) -> Result<Vec<dav::Resource>> {
+    let c = client(server, password, tls)?;
+    let inbox = c.inbox(&server.url)?;
+    const ALL: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"/></c:filter></c:calendar-query>";
+    c.list(&inbox, ALL, "calendar-data")
+}
+
+/// Removes a handled message from the scheduling inbox.
+pub fn remove_from_inbox(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    item: &dav::Resource,
+) -> Result<()> {
+    client(server, password, tls)?.delete(&item.href, &item.etag)
+}
+
+/// Attaches a file to an event where the calendar keeps attachments itself
+/// (managed attachments, RFC 8607). Returns the event's new ETag; the
+/// server adds the ATTACH to it, so read the event again to show it.
+pub fn attach(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    stored: &Stored,
+    path: &std::path::Path,
+) -> Result<String> {
+    ensure!(!stored.href.is_empty(), "Save the event before attaching files.");
+    let c = client(server, password, tls)?;
+    let calendar = url::Url::parse(&stored.calendar)?;
+    ensure!(
+        c.manages_attachments(&calendar)?,
+        "This calendar server can't keep attachments."
+    );
+    // Servers refuse large files anyway; don't read a huge one into memory.
+    const MOST: u64 = 100 * 1024 * 1024;
+    let size = std::fs::metadata(path)?.len();
+    ensure!(size <= MOST, "This file is too large to attach to an event (100 MB at most).");
+    let data = std::fs::read(path)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment")
+        .to_owned();
+    let kind = mime_guess::from_path(path).first_or_octet_stream().to_string();
+    c.add_attachment(&url::Url::parse(&stored.href)?, &stored.etag, &name, &kind, data)
 }
 
 /// Removes an event.
@@ -348,6 +547,63 @@ pub fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendars_renamed_deleted_and_scheduled() -> Result<()> {
+        let (port, server) = dav::test_server(7, |method, path, body| match (method, path) {
+            ("PROPPATCH", "/cal/ana/home/") => {
+                assert!(body.contains("<d:displayname>Family</d:displayname>"));
+                ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/cal/ana/home/</d:href><d:propstat><d:prop><d:displayname/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into())
+            }
+            ("DELETE", "/cal/ana/old/") => ("204 No Content", String::new()),
+            ("PUT", "/cal/ana/home/e.ics") => {
+                // Edited over its scheduling version, not its ETag.
+                assert!(body.to_ascii_lowercase().starts_with("if-schedule-tag-match: \"s-0\""), "{body}");
+                assert!(body.contains("BEGIN:VTIMEZONE"), "{body}");
+                ("204 No Content", String::new())
+            }
+            ("PROPFIND", "/") | ("PROPFIND", "/.well-known/caldav") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/ana/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", "/p/ana/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/ana/</d:href><d:propstat><d:prop><c:schedule-inbox-URL><d:href>/inbox/ana/</d:href></c:schedule-inbox-URL></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("REPORT", "/inbox/ana/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/inbox/ana/r1.ics</d:href><d:propstat><d:prop><d:getetag>\"r1\"</d:getetag><c:calendar-data>BEGIN:VCALENDAR\nMETHOD:REPLY\nBEGIN:VEVENT\nUID:e\nDTSTART:20261124T090000Z\nSUMMARY:Lunch\nATTENDEE;PARTSTAT=ACCEPTED;CN=Bo:mailto:bo@example.se\nEND:VEVENT\nEND:VCALENDAR\n</c:calendar-data></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("DELETE", "/inbox/ana/r1.ics") => ("204 No Content", String::new()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let srv = Server {
+            url: format!("http://127.0.0.1:{port}"),
+            user: "ana".into(),
+            ..Default::default()
+        };
+        let home = format!("http://127.0.0.1:{port}/cal/ana/home/");
+        rename_calendar(&srv, "secret", tls(), &home, "Family", "")?;
+        delete_calendar(&srv, "secret", tls(), &format!("http://127.0.0.1:{port}/cal/ana/old/"))?;
+        let edited = Stored {
+            event: ical::Event {
+                uid: "e".into(),
+                summary: "Lunch".into(),
+                start: 1_795_000_000,
+                end: 1_795_003_600,
+                tzid: "Europe/Berlin".into(),
+                ..Default::default()
+            },
+            calendar: home.clone(),
+            href: format!("{home}e.ics"),
+            etag: "\"e1\"".into(),
+            schedule_tag: "\"s-0\"".into(),
+            ..Default::default()
+        };
+        let saved = save(&srv, "secret", tls(), &home, &edited, false, Some(1_000_000))?;
+        assert_eq!(saved.schedule_tag, "\"s-1\"");
+        // Too large for the calendar: refused before anything is sent.
+        assert!(save(&srv, "secret", tls(), &home, &edited, false, Some(10)).is_err());
+        let items = inbox(&srv, "secret", tls())?;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].data.contains("METHOD:REPLY"));
+        remove_from_inbox(&srv, "secret", tls(), &items[0])?;
+        let seen = server.join().unwrap();
+        assert_eq!(seen.iter().filter(|(m, ..)| m == "PUT").count(), 1);
+        Ok(())
+    }
 
     #[test]
     fn calendars_events_and_changes() -> Result<()> {
@@ -403,11 +659,153 @@ mod tests {
             },
             ..Default::default()
         };
-        let saved = save(&srv, "secret", tls(), &cals[1].href, &new)?;
+        let saved = save(&srv, "secret", tls(), &cals[1].href, &new, false, None)?;
         assert!(saved.href.ends_with("/cal/ana/home/new.ics"));
         delete(&srv, "secret", tls(), &events[0])?;
         let seen = server.join().unwrap();
         assert_eq!(seen.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn tasks_are_listed_kept_apart_from_events_and_edited_in_place() -> Result<()> {
+        let todo = "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t1\nSUMMARY:Taxes\nDTSTART:20261101T090000Z\nDUE:20261130T170000Z\nPRIORITY:1\nCATEGORIES:Home\nX-APPLE-SORT-ORDER:7\nEND:VTODO\nEND:VCALENDAR\n";
+        let undated =
+            "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t2\nSUMMARY:Someday\nEND:VTODO\nEND:VCALENDAR\n";
+        let done = "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t3\nSUMMARY:Old\nSTATUS:COMPLETED\nEND:VTODO\nEND:VCALENDAR\n";
+        let response = move |items: &[(&str, &str)]| {
+            let mut body = String::from(
+                "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">",
+            );
+            for (href, data) in items {
+                body.push_str(&format!("<d:response><d:href>{href}</d:href><d:propstat><d:prop><d:getetag>\"1\"</d:getetag><c:calendar-data>{data}</c:calendar-data></d:prop></d:propstat></d:response>"));
+            }
+            body + "</d:multistatus>"
+        };
+        let (port, server) = dav::test_server(2, move |method, path, body| match (method, path) {
+            ("REPORT", "/cal/ana/home/") => {
+                assert!(body.contains("name=\"VTODO\""));
+                (
+                    "207 Multi-Status",
+                    response(&[
+                        ("/cal/ana/home/t1.ics", todo),
+                        ("/cal/ana/home/t2.ics", undated),
+                        ("/cal/ana/home/t3.ics", done),
+                    ]),
+                )
+            }
+            ("PUT", "/cal/ana/home/t1.ics") => {
+                // What other apps set is kept; what changed is rewritten.
+                assert!(body.contains("PRIORITY:1"), "{body}");
+                assert!(body.contains("CATEGORIES:Home"));
+                assert!(body.contains("X-APPLE-SORT-ORDER:7"));
+                assert!(body.contains("STATUS:COMPLETED"));
+                assert!(body.contains("SUMMARY:Taxes 2026"));
+                assert_eq!(body.matches("SUMMARY:").count(), 1);
+                assert_eq!(body.matches("BEGIN:VTODO").count(), 1);
+                assert!(!body.contains("BEGIN:VEVENT"));
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", String::new()),
+        });
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let srv = Server {
+            url: format!("http://127.0.0.1:{port}"),
+            user: "ana".into(),
+            ..Default::default()
+        };
+        let cal = Calendar {
+            href: format!("http://127.0.0.1:{port}/cal/ana/home/"),
+            writable: true,
+            ..Default::default()
+        };
+        let found = tasks(&srv, "secret", tls(), std::slice::from_ref(&cal))?;
+        // Open ones only; the dated first, the undated last.
+        assert_eq!(
+            found
+                .iter()
+                .map(|t| t.event.uid.as_str())
+                .collect::<Vec<_>>(),
+            ["t1", "t2"]
+        );
+        let t1 = &found[0].event;
+        // DUE is when it's due, though it has a DTSTART too.
+        assert_eq!(t1.start, 1_796_058_000);
+        assert_eq!(found[1].event.start, 0);
+        let mut changed = found[0].clone();
+        changed.event.summary = "Taxes 2026".into();
+        changed.event.completed = true;
+        save(&srv, "secret", tls(), &cal.href, &changed, false, None)?;
+        server.join().unwrap();
+        // A calendar's events don't include its tasks.
+        let both = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:e\nDTSTART:20261124T090000Z\nDTEND:20261124T100000Z\nSUMMARY:Dentist\nEND:VEVENT\nEND:VCALENDAR\n".to_owned();
+        let r = dav::Resource {
+            href: url::Url::parse("https://x/e.ics")?,
+            etag: String::new(),
+            data: both,
+        };
+        assert!(!stored("c", r).unwrap().event.task);
+        let r = dav::Resource {
+            href: url::Url::parse("https://x/t.ics")?,
+            etag: String::new(),
+            data: todo.into(),
+        };
+        assert!(stored("c", r).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn the_server_schedules_only_where_asked_and_only_events_organized_here() -> Result<()> {
+        let (port, server) = dav::test_server(5, |method, path, body| {
+            match (method, path) {
+            ("PROPFIND", "/.well-known/caldav") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/.well-known/caldav</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", "/p/ana/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/ana/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/cal/ana/</d:href></c:calendar-home-set></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("OPTIONS", "/cal/ana/") => ("200 OK", String::new()),
+            ("PUT", "/cal/ana/home/mine.ics") => {
+                // The server is left to schedule this one.
+                assert!(!body.contains("SCHEDULE-AGENT"), "{body}");
+                ("201 Created", String::new())
+            }
+            ("PUT", "/cal/ana/home/theirs.ics") => {
+                assert!(body.contains("ATTENDEE;SCHEDULE-AGENT=CLIENT;"), "{body}");
+                assert!(body.contains("ORGANIZER;SCHEDULE-AGENT=CLIENT"), "{body}");
+                ("201 Created", String::new())
+            }
+            _ => ("404 Not Found", String::new()),
+        }
+        });
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let mut srv = Server {
+            url: format!("http://127.0.0.1:{port}"),
+            user: "ana".into(),
+            ..Default::default()
+        };
+        assert!(schedules(&srv, "secret", tls())?);
+        srv.server_schedules = true;
+        let event = |uid: &str| Stored {
+            event: ical::Event {
+                uid: uid.into(),
+                summary: "Lunch".into(),
+                start: 1_795_000_000,
+                end: 1_795_003_600,
+                organizer: Some(ical::Attendee {
+                    email: "ana@example.org".into(),
+                    ..Default::default()
+                }),
+                attendees: vec![ical::Attendee {
+                    email: "bo@example.se".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let home = format!("http://127.0.0.1:{port}/cal/ana/home/");
+        save(&srv, "secret", tls(), &home, &event("mine"), true, None)?;
+        // An invitation from someone else is still answered by mail.
+        save(&srv, "secret", tls(), &home, &event("theirs"), false, None)?;
+        let seen = server.join().unwrap();
+        assert_eq!(seen[2].0, "OPTIONS");
         Ok(())
     }
 }

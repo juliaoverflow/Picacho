@@ -89,12 +89,69 @@ impl Backend {
             let mut criteria = if ext.gmail && !search.wants_kinds() {
                 format!("X-GM-RAW {}", string(query)?)
             } else {
-                search.imap_criteria(&string)?
+                search.imap_criteria_with(
+                    &string,
+                    crate::manage::search::ImapSearch {
+                        within: ext.within,
+                        fuzzy: ext.fuzzy,
+                    },
+                )?
             };
             if starred {
                 criteria.push_str(" FLAGGED");
             }
             let mut out = ServerResults::default();
+            // All Mail and Starred in one command where the server can
+            // (MULTISEARCH), without selecting each folder; each mailbox's
+            // newest matches are then listed as below.
+            if ext.multisearch && remotes.len() > 1 {
+                let wire: Vec<String> = remotes
+                    .iter()
+                    .map(|(r, _)| c.mailbox(r))
+                    .collect::<Result<_>>()?;
+                // A server refusing it (one mailbox it can't search, say)
+                // is searched folder by folder below instead.
+                let found =
+                    crate::sync::transport::multisearch(&mut c.session, &wire, &criteria, utf8)
+                        .unwrap_or_default();
+                let searched = if found.is_empty() {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut remotes)
+                };
+                for f in found {
+                    let Some((remote, folder)) = searched
+                        .iter()
+                        .find(|(r, _)| c.wire(r) == f.mailbox || *r == f.mailbox)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    out.total += f.count;
+                    let mut newest = f.uids;
+                    newest.sort_unstable_by(|a, b| b.cmp(a));
+                    newest.truncate(limit);
+                    let prefix = format!("{}:{remote}:{}:", a.id, f.validity);
+                    let mut missing = Vec::new();
+                    for uid in &newest {
+                        match self.store.message(&format!("{prefix}{uid}"))? {
+                            Some(m) => out.mails.push(m),
+                            None => missing.push(*uid),
+                        }
+                    }
+                    if !missing.is_empty() {
+                        // Headers come from the mailbox itself.
+                        let selected = c.select(&remote)?;
+                        if selected.validity != f.validity {
+                            continue;
+                        }
+                        let listed =
+                            self.list_uids(c, a, folder, &remote, selected.validity, &missing)?;
+                        self.store.save_messages(&listed)?;
+                        out.mails.extend(listed);
+                    }
+                }
+            }
             for (remote, folder) in remotes {
                 let selected = match c.select(&remote) {
                     Ok(selected) => selected,

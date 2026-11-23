@@ -18,6 +18,8 @@ pub(crate) struct Enabled {
     /// UIDONLY (RFC 9586): the server reports messages by UID (UIDFETCH,
     /// VANISHED) and refuses sequence numbers, which Picacho never sends.
     pub(crate) uidonly: bool,
+    /// IMAP4rev2 (RFC 9051) was turned on for a server offering both.
+    pub(crate) rev2: bool,
 }
 /// Turns on QRESYNC (RFC 7162), UTF8=ACCEPT (RFC 6855) and UIDONLY (RFC
 /// 9586) where offered. Must come before any SELECT. A refusal turns on
@@ -32,10 +34,15 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
         return Ok(base);
     }
     let mut wanted = Vec::new();
+    // rev2 first: its replies (ESEARCH for SEARCH, UTF-8 names, no
+    // \Recent) are those Picacho already reads from rev2-only servers.
+    if ext.offers_rev2 {
+        wanted.push("IMAP4rev2");
+    }
     if ext.qresync {
         wanted.push("QRESYNC");
     }
-    if ext.utf8_accept && !ext.rev2 {
+    if ext.utf8_accept && !ext.rev2 && !ext.offers_rev2 {
         wanted.push("UTF8=ACCEPT");
     }
     // Every command Picacho sends names messages by UID already; UIDONLY
@@ -61,8 +68,11 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
             enabled.qresync |= word.eq_ignore_ascii_case("QRESYNC");
             enabled.utf8 |= word.eq_ignore_ascii_case("UTF8=ACCEPT");
             enabled.uidonly |= word.eq_ignore_ascii_case("UIDONLY");
+            enabled.rev2 |= word.eq_ignore_ascii_case("IMAP4rev2");
         }
     }
+    // rev2's mailbox names are UTF-8 (RFC 9051 §5.1).
+    enabled.utf8 |= enabled.rev2;
     Ok(enabled)
 }
 /// Whether the IMAP parser reads UIDONLY's `UIDFETCH` replies as UID
@@ -129,6 +139,81 @@ fn esearch_uids(data: &[u8]) -> Result<Vec<u32>> {
         {
             out.extend(parse_set(set)?);
         }
+    }
+    Ok(out)
+}
+
+/// One mailbox's part of a MULTISEARCH reply.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Found {
+    /// The mailbox as the session names it (UTF-8 or modified UTF-7).
+    pub(crate) mailbox: String,
+    pub(crate) validity: u32,
+    pub(crate) uids: Vec<u32>,
+    pub(crate) count: usize,
+}
+/// One search across `mailboxes` (MULTISEARCH, RFC 7377): `ESEARCH IN
+/// (mailboxes …) RETURN (COUNT ALL) criteria`, without selecting each.
+/// `names` are as the session takes them, quoted. Each mailbox's UIDs
+/// come with its UIDVALIDITY, so they can name cached mail.
+pub(crate) fn multisearch(
+    session: &mut ImapSession,
+    names: &[String],
+    criteria: &str,
+    utf8: bool,
+) -> Result<Vec<Found>> {
+    ensure!(!criteria.contains(['\r', '\n']) || criteria.contains("}\r\n"), "Invalid IMAP search");
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let charset = search_charset(criteria, utf8);
+    let data = session.run_command_and_read_response(format!(
+        "ESEARCH IN (mailboxes ({})) RETURN (COUNT ALL) {charset}{criteria}",
+        names.join(" ")
+    ))?;
+    parse_multisearch(&data)
+}
+/// `* ESEARCH (TAG "a" MAILBOX "INBOX" UIDVALIDITY 9) UID COUNT 3 ALL 4:6`
+fn parse_multisearch(data: &[u8]) -> Result<Vec<Found>> {
+    let mut out = Vec::new();
+    for line in other_lines(data, "ESEARCH")? {
+        let tokens = tokens(line);
+        let text = |i: usize| match tokens.get(i) {
+            Some(Token::Text(t)) => Some(t.as_str()),
+            _ => None,
+        };
+        let mut found = Found::default();
+        let mut i = 0;
+        // The correlator: (TAG "…" MAILBOX "…" UIDVALIDITY n)
+        if tokens.first() == Some(&Token::Open) {
+            i = 1;
+            while i < tokens.len() && tokens[i] != Token::Close {
+                match text(i).map(str::to_ascii_uppercase).as_deref() {
+                    Some("MAILBOX") => found.mailbox = text(i + 1).unwrap_or_default().to_owned(),
+                    Some("UIDVALIDITY") => {
+                        found.validity = text(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0)
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+        while i < tokens.len() {
+            match (text(i).map(str::to_ascii_uppercase).as_deref(), text(i + 1)) {
+                (Some("COUNT"), Some(n)) => found.count = n.parse().unwrap_or(0),
+                (Some("ALL"), Some(set)) => found.uids = parse_set(set)?,
+                _ => {}
+            }
+            i += 1;
+        }
+        if found.mailbox.is_empty() || found.validity == 0 {
+            continue;
+        }
+        if found.count == 0 {
+            found.count = found.uids.len();
+        }
+        out.push(found);
     }
     Ok(out)
 }
@@ -283,6 +368,24 @@ pub(crate) fn newest_search(
     utf8: bool,
     limit: usize,
 ) -> Result<(Vec<u32>, usize)> {
+    // Sorted by date with one page asked for (ESORT and PARTIAL, RFC 5267
+    // and 9394): the newest `limit` and the count, without every match's
+    // UID. ESORT's set loses the order, so the page is sorted again; it is
+    // only `limit` UIDs.
+    if ext.sort && ext.esort && ext.partial && limit > 0 {
+        let charset = if utf8 || !criteria.is_ascii() { "UTF-8" } else { "US-ASCII" };
+        let data = session.run_command_and_read_response(format!(
+            "UID SORT RETURN (COUNT PARTIAL 1:{limit}) (REVERSE DATE) {charset} {criteria}"
+        ))?;
+        let (page, count) = partial_uids(&data)?;
+        let count = count.unwrap_or(page.len());
+        if page.is_empty() {
+            return Ok((page, count));
+        }
+        let set = super::imap::uid_ranges(&page);
+        let ordered = sorted_search(session, ext, selected, &format!("UID {set}"), utf8)?;
+        return Ok((ordered.into_iter().take(limit).collect(), count));
+    }
     if !ext.sort && ext.partial && ext.esearch && limit > 0 {
         let charset = search_charset(criteria, utf8);
         let data = session.run_command_and_read_response(format!(

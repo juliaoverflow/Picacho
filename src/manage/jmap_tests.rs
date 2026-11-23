@@ -58,6 +58,14 @@ struct Server {
     events: Vec<Value>,
     cards: Vec<Value>,
     undo: HashMap<String, String>,
+    /// Calendars' and contacts' states (`CalendarEvent/changes`,
+    /// `ContactCard/changes`): each change with its state, (kind, id,
+    /// destroyed), kind `e` or `k`. Off: those methods are unknown.
+    dav_changes: bool,
+    dav_state: u64,
+    dav_log: Vec<(u64, char, String, bool)>,
+    /// The most results one /query returns, as a server's own limit.
+    query_limit: usize,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -399,7 +407,28 @@ impl Server {
             )],
             "CalendarEvent/query" => {
                 let ids: Vec<&str> = self.events.iter().filter_map(|e| e["id"].as_str()).collect();
-                vec![(name.into(), json!({ "ids": ids }))]
+                let total = ids.len();
+                // Paged as asked, never more than the server's own limit.
+                let from = args["position"].as_u64().unwrap_or(0) as usize;
+                let mut limit = args["limit"].as_u64().map_or(usize::MAX, |l| l as usize);
+                if self.query_limit > 0 {
+                    limit = limit.min(self.query_limit);
+                }
+                let page: Vec<&str> = ids.into_iter().skip(from).take(limit).collect();
+                vec![(name.into(), json!({ "ids": page, "total": total }))]
+            }
+            "CalendarEvent/changes" | "ContactCard/changes" if self.dav_changes => {
+                let kind = if name.starts_with("Calendar") { 'e' } else { 'k' };
+                let since: u64 = args["sinceState"].as_str().unwrap().trim_start_matches(kind).parse().unwrap_or(0);
+                let mut updated = Vec::new();
+                let mut destroyed = Vec::new();
+                for (state, k, id, gone) in &self.dav_log {
+                    if *k == kind && *state > since {
+                        if *gone { destroyed.push(id.clone()) } else { updated.push(id.clone()) }
+                    }
+                }
+                vec![(name.into(), json!({ "created": [], "updated": updated, "destroyed": destroyed,
+                    "newState": format!("{kind}{}", self.dav_state), "hasMoreChanges": false }))]
             }
             "CalendarEvent/get" => {
                 let wanted = ids_of(args).unwrap_or_default();
@@ -408,7 +437,8 @@ impl Server {
                     .iter()
                     .filter(|e| wanted.iter().any(|w| e["id"] == w.as_str()))
                     .collect();
-                vec![(name.into(), json!({ "list": list, "state": "e" }))]
+                let state = if self.dav_changes { format!("e{}", self.dav_state) } else { "e".into() };
+                vec![(name.into(), json!({ "list": list, "state": state }))]
             }
             "CalendarEvent/set" => {
                 assert_eq!(args["sendSchedulingMessages"], false, "Picacho invites by mail");
@@ -446,7 +476,8 @@ impl Server {
                     .iter()
                     .filter(|c| wanted.as_ref().is_none_or(|w| w.iter().any(|i| c["id"] == i.as_str())))
                     .collect();
-                vec![(name.into(), json!({ "list": list, "state": "k" }))]
+                let state = if self.dav_changes { format!("k{}", self.dav_state) } else { "k".into() };
+                vec![(name.into(), json!({ "list": list, "state": state }))]
             }
             "ContactCard/set" => {
                 let mut out = json!({});
@@ -1598,5 +1629,80 @@ fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
     let status = b.submission_status(&a, "held1")?.unwrap();
     assert_eq!(status.undo, "canceled");
     assert_eq!(status.delivery[0].1, "queued");
+    Ok(())
+}
+
+/// Calendars and contacts over JMAP read only what changed once read
+/// (CalendarEvent/changes, ContactCard/changes), page through a query the
+/// server cuts short, and don't overwrite a card changed elsewhere.
+#[test]
+fn jmap_calendars_and_contacts_sync_by_changes() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        dav_changes: true,
+        query_limit: 2,
+        ..Default::default()
+    };
+    for i in 0..5 {
+        fixture.events.push(json!({
+            "@type": "Event", "id": format!("E{i}"), "uid": format!("u{i}@x"), "title": format!("Event {i}"),
+            "start": "2099-11-24T10:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+            "calendarIds": { "c1": true },
+        }));
+    }
+    fixture.cards.push(json!({
+        "@type": "Card", "id": "K0", "uid": "bo", "name": { "full": "Bo" }, "updated": "2026-11-01T00:00:00Z",
+    }));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    // Every page of five, two at a time.
+    assert_eq!(b.calendar_events().len(), 5);
+    {
+        let mut s = server.lock().unwrap();
+        s.dav_state += 1;
+        let state = s.dav_state;
+        s.events.retain(|e| e["id"] != "E0");
+        s.dav_log.push((state, 'e', "E0".into(), true));
+        s.events[0]["title"] = json!("Renamed");
+        s.dav_log.push((state, 'e', "E1".into(), false));
+        s.calls.clear();
+    }
+    b.sync_calendar()?;
+    let events = b.calendar_events();
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().any(|e| e.event.summary == "Renamed"));
+    {
+        let s = server.lock().unwrap();
+        assert!(s.calls.contains(&"CalendarEvent/changes".to_owned()), "{:?}", s.calls);
+        assert!(!s.calls.contains(&"CalendarEvent/query".to_owned()), "only changes: {:?}", s.calls);
+    }
+    // Contacts: changes only, then a card changed elsewhere isn't overwritten.
+    b.connect_jmap_contacts(&a)?;
+    {
+        let mut s = server.lock().unwrap();
+        s.dav_state += 1;
+        let state = s.dav_state;
+        s.cards.push(json!({ "@type": "Card", "id": "K1", "uid": "cy", "name": { "full": "Cy" } }));
+        s.dav_log.push((state, 'k', "K1".into(), false));
+        s.calls.clear();
+    }
+    b.sync_contacts()?;
+    assert!(b.contacts().iter().any(|c| c.name == "Cy"));
+    assert!(server.lock().unwrap().calls.contains(&"ContactCard/changes".to_owned()));
+    let mut bo = b.contacts().into_iter().find(|c| c.name == "Bo").unwrap();
+    server.lock().unwrap().cards[0]["updated"] = json!("2026-11-02T00:00:00Z");
+    bo.note = "Mine".into();
+    let error = b.save_contact(bo).unwrap_err();
+    assert!(error.downcast_ref::<crate::sync::jscal::Conflict>().is_some(), "{error:#}");
+    {
+        let s = server.lock().unwrap();
+        let sets = s.calls.iter().filter(|c| *c == "ContactCard/set").count();
+        assert_eq!(sets, 0, "not overwritten: {:?}", s.calls);
+    }
     Ok(())
 }

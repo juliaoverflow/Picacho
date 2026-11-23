@@ -53,7 +53,7 @@ impl MailApp {
         } else {
             password
         };
-        if !a.oauth && a.service != Service::Pinal && password.is_empty() {
+        if !a.oauth && !a.kerberos && a.service != Service::Pinal && password.is_empty() {
             self.notice(
                 format!("Enter your {}.", a.service.password_label().to_lowercase()),
                 true,

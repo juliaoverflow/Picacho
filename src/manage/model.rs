@@ -250,6 +250,16 @@ pub struct SyncSettings {
     /// other mail apps show them), unless none of them is.
     #[serde(default)]
     pub subscribed_only: bool,
+    /// POP3: delete a message from the server this many days after it was
+    /// downloaded here (0: at the next check after downloading). None keeps
+    /// everything on the server, the default. Only messages whose whole
+    /// source is saved on this computer are ever deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pop_delete_after_days: Option<u32>,
+    /// POP3: deleting a message for good here also deletes it from the
+    /// server. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pop_delete_with_local: bool,
 }
 /// `SyncSettings::offline_days`: download message contents only when opened.
 pub const OFFLINE_WHEN_OPENED: u32 = u32::MAX;
@@ -280,6 +290,8 @@ impl Default for SyncSettings {
             proton_events_seconds: default_proton_events_seconds(),
             proton_push: false,
             subscribed_only: false,
+            pop_delete_after_days: None,
+            pop_delete_with_local: false,
         }
     }
 }
@@ -301,8 +313,10 @@ pub struct Account {
     pub client_secret: String,
     #[serde(default)]
     pub service: Service,
-    /// Upgrade a plain IMAP connection with STARTTLS instead of connecting
-    /// with TLS. Only Proton Mail Bridge, on this computer, needs it.
+    /// Upgrade a plain incoming connection with STARTTLS (IMAP, RFC 3501
+    /// §6.2.1) or STLS (POP3, RFC 2595) instead of connecting with TLS:
+    /// servers that only offer port 143 or 110, and Proton Mail Bridge on
+    /// this computer. The upgrade is required; nothing is sent in the clear.
     #[serde(default)]
     pub incoming_starttls: bool,
     /// How the outgoing server is secured: TLS from the first byte (true)
@@ -333,6 +347,11 @@ pub struct Account {
     /// go encrypted the whole way bounces rather than going in the clear.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_tls: bool,
+    /// Give up on delivering a message after this many hours rather than
+    /// the servers' usual days (SMTP DELIVERBY, RFC 2852, with return); 0:
+    /// as long as the servers try. Only where the outgoing server has it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub deliver_within_hours: u32,
     /// Other addresses this mailbox sends as, each optionally through its
     /// own outgoing server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -350,6 +369,30 @@ pub struct Account {
     /// HOLDUNTIL), where it can.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub server_send_later: bool,
+    /// Signs in to the incoming, outgoing and filter servers with Kerberos
+    /// (SASL GSSAPI, RFC 4752) using the ticket this computer already has,
+    /// instead of a password. For IMAP and POP3 accounts at organizations
+    /// whose servers use Kerberos. Off by default; never chosen on its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kerberos: bool,
+    /// An organization's own single sign-on (OpenID Connect / OAuth 2.0)
+    /// for an IMAP or POP3 account: the identity provider (Keycloak, Okta,
+    /// Entra ID, ADFS, Authentik…) that issues tokens the mail servers take
+    /// with OAUTHBEARER or XOAUTH2. The provider may itself sign people in
+    /// with SAML; Picacho only sees its browser pages. With `oauth` on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso: Option<Sso>,
+}
+/// Where an account's single sign-on happens and how Picacho is known there.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sso {
+    /// The identity provider's issuer (`https://login.example.com/realms/mail`):
+    /// its endpoints come from the issuer's metadata.
+    pub issuer: String,
+    /// What to ask for; empty: `openid email offline_access`, plus what the
+    /// mail domain's configuration names.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 /// An address a mailbox sends as besides its own (a sending identity): the
 /// name and address recipients see, where replies go, and the outgoing
@@ -481,10 +524,13 @@ impl Account {
             read_receipts: false,
             delivery_receipts: false,
             require_tls: false,
+            deliver_within_hours: 0,
             identities: Vec::new(),
             jmap_account: String::new(),
             credentials_of: String::new(),
             server_send_later: false,
+            kerberos: false,
+            sso: None,
         }
     }
     /// The name shown for the account: its nickname, if it has one.
@@ -519,9 +565,13 @@ impl Account {
             self.incoming_port > 0 && self.smtp_port > 0,
             "Ports must be between 1 and 65535."
         );
-        // A JMAP server may register Picacho as it signs in.
+        // A JMAP server or an organization's sign-in may register Picacho
+        // as it signs in.
         anyhow::ensure!(
-            !self.oauth || !self.client_id.is_empty() || self.provider == Provider::Jmap,
+            !self.oauth
+                || !self.client_id.is_empty()
+                || self.provider == Provider::Jmap
+                || self.sso.is_some(),
             "Browser sign-in isn't set up for {} in this build.",
             self.provider.label()
         );
@@ -531,19 +581,46 @@ impl Account {
                     self.provider,
                     Provider::Gmail | Provider::Outlook | Provider::Jmap
                 )
-                || self.service == Service::Pinal,
-            "OAuth is available for Pinal Mail, Gmail, Outlook and JMAP servers."
+                || self.service == Service::Pinal
+                || (self.sso.is_some() && matches!(self.provider, Provider::Imap | Provider::Pop3)),
+            "OAuth is available for Pinal Mail, Gmail, Outlook, JMAP servers, and IMAP and POP3 servers with an organization's sign-in."
         );
-        // STARTTLS is only accepted from Bridge on this computer, where the
-        // first, unencrypted exchange never leaves the machine.
+        if let Some(sso) = &self.sso {
+            anyhow::ensure!(self.oauth, "Single sign-on needs browser sign-in.");
+            anyhow::ensure!(
+                matches!(self.provider, Provider::Imap | Provider::Pop3),
+                "Single sign-on is for IMAP and POP3 accounts."
+            );
+            anyhow::ensure!(!self.kerberos, "Choose Kerberos or single sign-on, not both.");
+            let issuer = url::Url::parse(sso.issuer.trim())
+                .map_err(|_| anyhow::anyhow!("Enter the sign-in service's address (its issuer URL)."))?;
+            anyhow::ensure!(
+                issuer.scheme() == "https" && issuer.host_str().is_some(),
+                "The sign-in service's address must start with https://."
+            );
+            anyhow::ensure!(
+                !sso.scope.chars().any(char::is_control),
+                "The sign-in scopes can't contain line breaks."
+            );
+        }
+        // STARTTLS is an upgrade of IMAP or POP3; other protocols start
+        // with TLS (JMAP is HTTPS).
         anyhow::ensure!(
-            !self.incoming_starttls
-                || matches!(self.incoming_host.as_str(), "127.0.0.1" | "localhost"),
-            "STARTTLS is only used with Proton Mail Bridge on this computer."
+            !self.incoming_starttls || !matches!(self.provider, Provider::Proton | Provider::Jmap),
+            "STARTTLS is only used for IMAP and POP3."
         );
         anyhow::ensure!(
             !self.username.chars().any(char::is_control),
             "The sign-in name can't contain line breaks."
+        );
+        anyhow::ensure!(
+            !self.kerberos
+                || (matches!(self.provider, Provider::Imap | Provider::Pop3) && !self.oauth),
+            "Kerberos sign-in is for IMAP and POP3 accounts."
+        );
+        anyhow::ensure!(
+            !self.kerberos || !cfg!(any(target_os = "android", target_os = "ios")),
+            "Kerberos sign-in isn't available on phones and tablets."
         );
         anyhow::ensure!(
             self.reply_to.trim().is_empty()
@@ -1039,6 +1116,9 @@ impl<'de> Deserialize<'de> for Mail {
         MailRecord::deserialize(deserializer).map(Mail::from)
     }
 }
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
 fn is_zero(v: &u64) -> bool {
     *v == 0
 }
@@ -1276,6 +1356,41 @@ pub struct Draft {
     /// Sign and encrypt it with S/MIME instead of OpenPGP.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub smime: bool,
+    /// How urgent it is: shown to recipients (Importance, X-Priority) and,
+    /// where the outgoing server has MT-PRIORITY (RFC 6710), given to it.
+    #[serde(default, skip_serializing_if = "Priority::is_normal")]
+    pub priority: Priority,
+}
+/// A message's urgency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+impl Priority {
+    pub fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
+    /// The next one, for a button that cycles them.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::High,
+            Self::High => Self::Low,
+            Self::Low => Self::Normal,
+        }
+    }
+    /// MT-PRIORITY's level (RFC 6710 §3: -9..9; the MIXER profile's -4, 0
+    /// and 4 are used).
+    pub fn mt_priority(self) -> i8 {
+        match self {
+            Self::Low => -4,
+            Self::Normal => 0,
+            Self::High => 4,
+        }
+    }
 }
 /// Where a draft is in the server's Drafts folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1317,6 +1432,11 @@ impl Draft {
         if !self.identity.is_empty() {
             h.update(b"identity\0");
             h.update(self.identity.as_bytes());
+        }
+        // Added later, likewise.
+        if !self.priority.is_normal() {
+            h.update(b"priority\0");
+            h.update([self.priority.mt_priority() as u8]);
         }
         // Added later, likewise: how it is protected changes what's uploaded.
         if self.encrypt || self.sign || self.smime || self.encrypt_subject {
@@ -1465,6 +1585,59 @@ pub fn demo_mail() -> Vec<Mail> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_sign_on_is_for_imap_and_pop3_over_https() {
+        let mut a = Account::new(Provider::Imap);
+        a.email = "ana@example.edu".into();
+        a.incoming_host = "imap.example.edu".into();
+        a.smtp_host = "smtp.example.edu".into();
+        a.oauth = true;
+        // No client id: the identity provider may register Picacho.
+        a.sso = Some(Sso {
+            issuer: "https://login.example.edu/realms/mail".into(),
+            scope: String::new(),
+        });
+        assert!(a.validate().is_ok());
+        a.provider = Provider::Pop3;
+        assert!(a.validate().is_ok());
+        let mut plain = a.clone();
+        plain.sso.as_mut().unwrap().issuer = "http://login.example.edu".into();
+        assert!(plain.validate().is_err());
+        let mut both = a.clone();
+        both.kerberos = true;
+        assert!(both.validate().is_err());
+        let mut no_browser = a.clone();
+        no_browser.oauth = false;
+        assert!(no_browser.validate().is_err());
+        // Without single sign-on, IMAP still can't use browser sign-in.
+        let mut none = a.clone();
+        none.sso = None;
+        assert!(none.validate().is_err());
+    }
+    #[test]
+    fn kerberos_is_only_for_imap_and_pop3_password_accounts() {
+        let mut a = Account::new(Provider::Imap);
+        a.email = "ana@example.com".into();
+        a.incoming_host = "mail.example.com".into();
+        a.smtp_host = "mail.example.com".into();
+        a.kerberos = true;
+        assert!(a.validate().is_ok());
+        a.provider = Provider::Pop3;
+        assert!(a.validate().is_ok());
+        a.provider = Provider::Jmap;
+        assert!(a.validate().is_err());
+        let mut g = Account::new(Provider::Gmail);
+        g.email = "ana@gmail.com".into();
+        g.kerberos = true;
+        assert!(g.validate().is_err());
+        // Saved accounts from before read without it.
+        let old: Account =
+            serde_json::from_str(&serde_json::to_string(&Account::new(Provider::Imap)).unwrap())
+                .unwrap();
+        assert!(!old.kerberos);
+        assert!(!serde_json::to_string(&old).unwrap().contains("kerberos"));
+    }
+
     use super::*;
 
     /// A message with every field set, as the cache stores it.

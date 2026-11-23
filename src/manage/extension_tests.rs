@@ -173,6 +173,13 @@ fn capable_server_extensions_are_used() -> Result<()> {
                 } else if upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
                 } else if upper == "GETQUOTAROOT INBOX" {
                     p.send("* QUOTAROOT INBOX \"\"\r\n* QUOTA \"\" (STORAGE 512 2048)\r\n");
+                } else if upper == "GETQUOTAROOT \"ARCHIVE\"" {
+                    // The archive has a root of its own, fuller than the
+                    // inbox's: that one shows.
+                    p.send("* QUOTAROOT Archive \"archive\"\r\n* QUOTA \"archive\" (STORAGE 900 1000)\r\n");
+                } else if upper == "GETQUOTAROOT \"INBOX.SENT\"" {
+                    p.send(&format!("{tag} NO no quota root\r\n"));
+                    continue;
                 } else if upper == "LOGOUT" {
                     p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
                     break 'connections;
@@ -201,8 +208,8 @@ fn capable_server_extensions_are_used() -> Result<()> {
     assert_eq!(
         b.quota(&a)?,
         Some(Quota {
-            used_kib: 512,
-            limit_kib: 2048
+            used_kib: 900,
+            limit_kib: 1000
         })
     );
     b.disconnect(&a.id);
@@ -1399,10 +1406,8 @@ fn listing_subscriptions_shared_folders_and_new_uids() -> Result<()> {
 }
 
 /// The same from a server speaking only IMAP4rev2, whose base protocol has
-/// all of those without listing them. Needs Picacho-Patches' imap-proto
-/// patch 0005, which reads a CAPABILITY list without IMAP4rev1.
+/// all of those without listing them.
 #[test]
-#[ignore = "needs Picacho-Patches imap-proto 0005 (IMAP4rev2-only CAPABILITY)"]
 fn imap4rev2_only_servers_get_the_same() -> Result<()> {
     listing_fixture("* CAPABILITY IMAP4rev2 CONDSTORE\r\n")
 }
@@ -1537,7 +1542,6 @@ fn uidonly_is_enabled_only_where_uidfetch_is_read() -> Result<()> {
 /// With UIDONLY on, messages come back as UIDFETCH (numbered by UID,
 /// without a UID item) and removals as VANISHED.
 #[test]
-#[ignore = "needs Picacho-Patches imap-proto 0006 (UIDONLY's UIDFETCH)"]
 fn uidonly_servers_report_messages_by_uid() -> Result<()> {
     assert!(crate::sync::transport::reads_uidfetch());
     uidonly_fixture(true)
@@ -1882,3 +1886,101 @@ fn newer_extensions_save_round_trips() -> Result<()> {
     Ok(())
 }
 
+
+/// A high-priority message goes with MT-PRIORITY (RFC 6710) and the
+/// headers recipients' apps read; a delivery time limit with DELIVERBY
+/// (RFC 2852), at least the server's minimum.
+#[test]
+fn smtp_priority_and_delivery_time_limit() -> Result<()> {
+    let draft = Draft {
+        id: "urgent".into(),
+        to: "ana@example.com".into(),
+        subject: "Urgent".into(),
+        body: "Now".into(),
+        priority: crate::manage::model::Priority::High,
+        ..Draft::default()
+    };
+    let (result, commands, message) = smtp_exchange(
+        "250-fixture\r\n250-MT-PRIORITY MIXER\r\n250-DELIVERBY 7200\r\n250 AUTH PLAIN\r\n",
+        |a| a.deliver_within_hours = 1,
+        draft.clone(),
+    )?;
+    assert!(result?.is_empty());
+    let mail = commands.iter().find(|c| c.starts_with("MAIL FROM")).unwrap();
+    assert!(mail.contains(" MT-PRIORITY=4"), "{mail}");
+    // One hour asked; the server takes no less than two.
+    assert!(mail.contains(" BY=7200;R"), "{mail}");
+    assert!(message.contains("Importance: high") && message.contains("X-Priority: 1"), "{message}");
+    // A server without them is told neither; the headers still go.
+    let (result, commands, message) =
+        smtp_exchange("250-fixture\r\n250 AUTH PLAIN\r\n", |a| a.deliver_within_hours = 1, draft)?;
+    assert!(result?.is_empty());
+    let mail = commands.iter().find(|c| c.starts_with("MAIL FROM")).unwrap();
+    assert!(!mail.contains("MT-PRIORITY") && !mail.contains("BY="), "{mail}");
+    assert!(message.contains("Importance: high"), "{message}");
+    Ok(())
+}
+
+/// A server offering IMAP4rev2 beside rev1 is switched to rev2 (ENABLE),
+/// and an All Mail search goes as one MULTISEARCH with WITHIN's YOUNGER
+/// and FUZZY words, its results named by each mailbox's UIDVALIDITY.
+#[test]
+fn rev2_multisearch_within_and_fuzzy() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 IMAP4rev2 ENABLE SPECIAL-USE ESEARCH MULTISEARCH WITHIN SEARCH=FUZZY\r\n");
+                } else if upper.starts_with("ENABLE") {
+                    p.send("* ENABLED IMAP4rev2\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                    p.send("* LIST (\\Archive) \"/\" \"Archive\"\r\n");
+                } else if upper == "NAMESPACE" {
+                    // rev2 has it: asked once ENABLEd.
+                    p.send("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+                } else if upper.starts_with("ESEARCH IN") {
+                    p.send("* ESEARCH (TAG \"x\" MAILBOX \"INBOX\" UIDVALIDITY 7) UID COUNT 2 ALL 3:4\r\n");
+                    p.send("* ESEARCH (TAG \"x\" MAILBOX \"Archive\" UIDVALIDITY 9) UID COUNT 1 ALL 5\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    // What the search finds is already cached, so nothing is fetched.
+    for (remote, validity, uid) in [("INBOX", 7, 3), ("INBOX", 7, 4), ("Archive", 9, 5)] {
+        let id = format!("{}:{remote}:{validity}:{uid}", a.id);
+        let mut m = parse_message(b"Subject: Report\r\n\r\nBody", &a, &id, Folder::Inbox, remote, uid)?;
+        m.date = 1_700_000_000 + i64::from(uid);
+        b.store.save_messages(&[m])?;
+    }
+    let found = b.search_server(&a, &Folder::All.into(), "newer:2d report", 10)?;
+    assert_eq!(found.total, 3);
+    assert_eq!(found.mails.len(), 3);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    let enable = seen.iter().find(|c| c.starts_with("ENABLE")).unwrap();
+    assert!(enable.contains("IMAP4rev2"), "{enable}");
+    let search = seen.iter().find(|c| c.starts_with("ESEARCH IN")).unwrap();
+    assert!(search.contains("(mailboxes (\"INBOX\" \"Archive\"))"), "{search}");
+    assert!(search.contains("YOUNGER 172800") && search.contains("FUZZY (TEXT \"report\")"), "{search}");
+    assert!(!seen.iter().any(|c| c.starts_with("SELECT") || c.starts_with("EXAMINE")), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

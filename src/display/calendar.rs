@@ -675,6 +675,10 @@ impl MailApp {
                     b.sync_calendar().map(|n| format!("Read {n} events"))
                 });
             }
+            Action::DismissCalendarNotices => {
+                let _ = self.backend.dismiss_calendar_notices();
+                cx.notify();
+            }
             Action::DisconnectCalendar => {
                 self.calendar_run(cx, |b| {
                     b.disconnect_calendar()
@@ -995,6 +999,46 @@ impl MailApp {
                     Ok(format!("Read {n} events from {}", a.email))
                 });
             }
+            Action::RenameCalendar(href) => {
+                let name = self.collection_name.read(cx).value().trim().to_owned();
+                if name.is_empty() {
+                    self.calendar_error = Some("Write the new name in the field first.".into());
+                    cx.notify();
+                    return;
+                }
+                self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
+                self.calendar_run(cx, move |b| {
+                    b.rename_calendar(&href, &name, "")?;
+                    Ok(format!("Renamed the calendar {name}"))
+                });
+            }
+            Action::AttachToEvent(uid) => {
+                let picker = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some("Attach".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = picker.await
+                        && let Some(path) = paths.into_iter().next()
+                    {
+                        let _ = this.update(cx, |this, cx| {
+                            this.calendar_run(cx, move |b| {
+                                b.attach_to_event(&uid, &path)?;
+                                Ok("Attached the file to the event".into())
+                            });
+                        });
+                    }
+                })
+                .detach();
+            }
+            Action::DeleteCalendar(href) => {
+                self.calendar_run(cx, move |b| {
+                    b.delete_calendar(&href)?;
+                    Ok("Deleted the calendar".into())
+                });
+            }
             Action::CreateCalendar => {
                 let name = self.collection_name.read(cx).value().trim().to_owned();
                 self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
@@ -1005,22 +1049,105 @@ impl MailApp {
             }
             Action::AddTask => {
                 let name = self.collection_name.read(cx).value().trim().to_owned();
-                // Due as written in the start field, else at the end of today.
-                let due = self
-                    .read_when(self.event_start.read(cx).value().trim())
-                    .map(|(t, ..)| t)
-                    .unwrap_or_else(|| {
-                        let today = chrono::Local::now().date_naive().and_hms_opt(17, 0, 0).unwrap_or_default();
-                        today.and_local_timezone(chrono::Local).earliest().map_or(0, |t| t.timestamp())
-                    });
+                // Due as written in the task editor's Due field; else none.
+                let due_text = self.task_due.read(cx).value().trim().to_owned();
+                let due = if due_text.is_empty() {
+                    0
+                } else {
+                    match self.read_when(&due_text) {
+                        Some((t, ..)) => t,
+                        None => {
+                            self.calendar_error = Some("Write the due date as 2026-11-24 17:00 or 2026-11-24, or leave it empty.".into());
+                            cx.notify();
+                            return;
+                        }
+                    }
+                };
                 self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
+                self.task_due.update(cx, |i, cx| i.set_text("", w, cx));
                 self.calendar_run(cx, move |b| {
                     let t = b.add_task(&name, due)?;
                     Ok(format!("Added the task {}", t.event.summary))
                 });
             }
             Action::CompleteTask(uid) => {
+                if self.task_editing.as_ref() == Some(&uid) {
+                    self.task_editing = None;
+                }
                 self.calendar_run(cx, move |b| b.complete_task(&uid, true).map(|()| "Task done".into()));
+            }
+            Action::EditTask(uid) => {
+                let Some(t) = self.backend.calendar_tasks().into_iter().find(|t| t.event.uid == uid) else {
+                    return;
+                };
+                let zone = find_zone(&t.event.tzid);
+                let due = if t.event.start == 0 {
+                    String::new()
+                } else {
+                    format_in(t.event.start, t.event.all_day, zone)
+                };
+                for (input, text) in [
+                    (&self.task_title, t.event.summary.clone()),
+                    (&self.task_due, due),
+                    (&self.task_notes, t.event.description.clone()),
+                ] {
+                    input.update(cx, |i, cx| i.set_text(text, w, cx));
+                }
+                self.calendar_error = None;
+                self.task_editing = Some(uid);
+            }
+            Action::CancelTaskEdit => {
+                self.task_editing = None;
+                self.task_due.update(cx, |i, cx| i.set_text("", w, cx));
+                cx.notify();
+            }
+            Action::SaveTask => {
+                let Some(uid) = self.task_editing.clone() else {
+                    return;
+                };
+                let title = self.task_title.read(cx).value().trim().to_owned();
+                let notes = self.task_notes.read(cx).value().to_string();
+                let due_text = self.task_due.read(cx).value().trim().to_owned();
+                let (due, all_day) = if due_text.is_empty() {
+                    (0, false)
+                } else {
+                    // In the task's own zone, where it keeps one.
+                    let zone = self
+                        .backend
+                        .calendar_tasks()
+                        .into_iter()
+                        .find(|t| t.event.uid == uid)
+                        .and_then(|t| find_zone(&t.event.tzid));
+                    match parse_in(&due_text, zone).or_else(|| self.read_when(&due_text).map(|(t, d, _)| (t, d))) {
+                        Some(read) => read,
+                        None => {
+                            self.calendar_error = Some("Write the due date as 2026-11-24 17:00 or 2026-11-24, or leave it empty.".into());
+                            cx.notify();
+                            return;
+                        }
+                    }
+                };
+                self.task_editing = None;
+                self.task_due.update(cx, |i, cx| i.set_text("", w, cx));
+                self.calendar_run(cx, move |b| {
+                    b.edit_task(&uid, &title, &notes, due, all_day)
+                        .map(|t| format!("Saved the task {}", t.event.summary))
+                });
+            }
+            Action::DeleteTask(uid) => {
+                self.task_editing = None;
+                self.calendar_run(cx, move |b| b.delete_task(&uid).map(|()| "Task deleted".into()));
+            }
+            Action::ServerScheduling(on) => {
+                self.calendar_run(cx, move |b| {
+                    b.set_server_scheduling(on).map(|()| {
+                        if on {
+                            "The calendar server now sends your invitations".into()
+                        } else {
+                            "Picacho emails your invitations again".into()
+                        }
+                    })
+                });
             }
             Action::CheckFreeBusy => {
                 let guests: Vec<String> = self
@@ -1223,12 +1350,17 @@ impl MailApp {
             self.task(
                 cx,
                 |b| {
-                    let n = b.sync_calendar()?;
-                    // Tasks aren't worth failing the calendar for.
+                    let _ = b.sync_calendar()?;
+                    // Tasks and storage aren't worth failing the calendar for.
                     let _ = b.sync_tasks();
-                    Ok(n)
+                    Ok(b.calendar_quota().ok().flatten())
                 },
-                |_, _, cx| cx.notify(),
+                |this, result, cx| {
+                    if let Ok(quota) = result {
+                        this.calendar_quota = quota;
+                    }
+                    cx.notify()
+                },
             );
         }
     }
@@ -1495,6 +1627,24 @@ impl MailApp {
                     )),
             ),
         );
+        // What the server said about shared calendars (JMAP).
+        let notices = self.backend.calendar_notices();
+        if !notices.is_empty() {
+            page = page.child(
+                self.setting(
+                    "Shared calendars",
+                    &notices.join("\n"),
+                    self.button(
+                        "calendar-notices-dismiss",
+                        "Dismiss",
+                        "close",
+                        Action::DismissCalendarNotices,
+                        false,
+                        cx,
+                    ),
+                ),
+            );
+        }
         let calendars: Vec<_> = self
             .backend
             .calendars()
@@ -1525,6 +1675,20 @@ impl MailApp {
                 ),
             );
         }
+        if !over_jmap {
+            page = page.child(self.switch_setting(
+                "Let the server send invitations",
+                if server.server_schedules {
+                    "The calendar server invites guests to events you organize, and tells them about changes and cancellations. Invitations you receive are still answered by mail."
+                } else {
+                    "Picacho emails invitations, updates and cancellations for events you organize. Turn on to have the calendar server send them, where it can."
+                },
+                "calendar-server-scheduling".into(),
+                server.server_schedules,
+                Action::ServerScheduling(!server.server_schedules),
+                cx,
+            ));
+        }
         page = page.children(self.calendar_error.clone().map(|e| {
             div()
                 .id("calendar-error")
@@ -1536,7 +1700,7 @@ impl MailApp {
         page = page.child(
             self.setting(
                 "New calendar or task",
-                "A calendar is made on the server. A task is added to the calendar new events go to, due as written in an event's Starts field, else this evening.",
+                "A calendar is made on the server. A task goes to the calendar new events go to (or the first that keeps tasks), due when written in Due, else with no due date.",
                 div()
                     .flex()
                     .flex_wrap()
@@ -1548,10 +1712,63 @@ impl MailApp {
                             .w(px(200.))
                             .child(field(Input::new(&self.collection_name), c, busy)),
                     )
+                    .child(
+                        div()
+                            .id("task-new-due")
+                            .w(px(180.))
+                            .when(self.task_editing.is_none(), |d| {
+                                d.child(field(Input::new(&self.task_due), c, busy))
+                            }),
+                    )
                     .child(self.button("calendar-create", "Make Calendar", "plus", Action::CreateCalendar, false, cx))
                     .child(self.button("task-add", "Add Task", "check", Action::AddTask, false, cx)),
             ),
         );
+        // Each calendar, to rename (to the name in the field) or delete.
+        let all = self.backend.calendars();
+        if !all.is_empty() {
+            let mut list = div().id("calendar-list").flex().flex_col().gap_2();
+            for cal in all.iter().filter(|c| c.writable) {
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(cal.name.clone()))
+                        .child(self.button(
+                            format!("calendar-rename-{}", cal.href),
+                            "Rename",
+                            "",
+                            Action::RenameCalendar(cal.href.clone()),
+                            false,
+                            cx,
+                        ))
+                        .child(
+                            self.button(
+                                format!("calendar-delete-{}", cal.href),
+                                "Delete",
+                                "",
+                                Action::DeleteCalendar(cal.href.clone()),
+                                false,
+                                cx,
+                            )
+                            .text_color(rgb(c.danger)),
+                        ),
+                );
+            }
+            let storage = self.calendar_quota.map(|(used, left)| {
+                let mb = |b: u64| b as f64 / 1_048_576.0;
+                format!(" The server keeps {:.0} MB of yours, with {:.0} MB left.", mb(used), mb(left))
+            });
+            page = page.child(self.setting(
+                "Calendars",
+                &format!(
+                    "Rename uses the name written in the field above. Deleting removes the calendar and its events from the server.{}",
+                    storage.unwrap_or_default()
+                ),
+                list,
+            ));
+        }
         // Open tasks.
         let tasks = self.backend.calendar_tasks();
         if !tasks.is_empty() {
@@ -1569,9 +1786,18 @@ impl MailApp {
                     .flex()
                     .flex_col()
                     .children(tasks.into_iter().take(50).enumerate().map(|(i, t)| {
-                        let due = chrono::DateTime::from_timestamp(t.event.start, 0)
-                            .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
-                            .unwrap_or_default();
+                        let due = if t.event.start == 0 {
+                            "no due date".to_owned()
+                        } else if t.event.all_day {
+                            chrono::DateTime::from_timestamp(t.event.start, 0)
+                                .map(|d| d.format("%a %b %-d").to_string())
+                                .unwrap_or_default()
+                        } else {
+                            chrono::DateTime::from_timestamp(t.event.start, 0)
+                                .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
+                                .unwrap_or_default()
+                        };
+                        let overdue = t.event.start != 0 && t.event.start < chrono::Utc::now().timestamp();
                         div()
                             .id(SharedString::from(format!("task-{i}")))
                             .role(Role::ListItem)
@@ -1592,8 +1818,27 @@ impl MailApp {
                                     .flex()
                                     .flex_col()
                                     .child(div().text_size(px(13.)).truncate().child(t.event.summary.clone()))
-                                    .child(div().text_size(px(11.5)).text_color(rgb(c.muted)).child(format!("Due {due}"))),
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(if overdue { c.danger } else { c.muted }))
+                                            .child(if t.event.start == 0 {
+                                                "No due date".to_owned()
+                                            } else if overdue {
+                                                format!("Overdue: {due}")
+                                            } else {
+                                                format!("Due {due}")
+                                            }),
+                                    ),
                             )
+                            .child(div().debug_selector(move || format!("task-edit-{i}")).child(self.button(
+                                SharedString::from(format!("task-edit-{i}")),
+                                "Edit",
+                                "compose",
+                                Action::EditTask(t.event.uid.clone()),
+                                false,
+                                cx,
+                            )))
                             .child(self.button(
                                 SharedString::from(format!("task-done-{i}")),
                                 "Done",
@@ -1603,6 +1848,38 @@ impl MailApp {
                                 cx,
                             ))
                     })),
+            );
+        }
+        // The task being edited.
+        if let Some(uid) = &self.task_editing {
+            page = page.child(
+                div()
+                    .id("task-editor")
+                    .debug_selector(|| "task-editor".into())
+                    .role(Role::Form)
+                    .aria_label("Edit task")
+                    .p_4()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.raised))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(px(480.))
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("Edit Task"))
+                    .child(labelled("Task", "task-title", &self.task_title))
+                    .child(labelled("Due (2026-11-24 17:00, a date, or empty for none)", "task-due", &self.task_due))
+                    .child(labelled("Notes", "task-notes", &self.task_notes))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(self.button("task-save", "Save", "check", Action::SaveTask, true, cx))
+                            .child(self.button("task-cancel", "Cancel", "close", Action::CancelTaskEdit, false, cx))
+                            .child(self.button("task-delete", "Delete", "trash", Action::DeleteTask(uid.clone()), false, cx)),
+                    ),
             );
         }
         // Messages JMAP servers hold to send later.
@@ -1810,6 +2087,18 @@ impl MailApp {
                                     "Delete",
                                     "trash",
                                     Action::DeleteEvent(uid.clone()),
+                                    false,
+                                    cx,
+                                ))
+                            })
+                            // Kept by the calendar server (RFC 8607), on
+                            // CalDAV; the server says whether it can.
+                            .when(!uid.is_empty() && !over_jmap, |d| {
+                                d.child(self.button(
+                                    "event-attach",
+                                    "Attach File",
+                                    "paperclip",
+                                    Action::AttachToEvent(uid.clone()),
                                     false,
                                     cx,
                                 ))
@@ -2075,6 +2364,31 @@ mod tests {
         });
         frame(cx);
         assert!(cx.debug_bounds("event-zone").is_some());
+        // Tasks: listed with Edit, opened in their own editor; the server
+        // scheduling switch is offered for CalDAV.
+        assert!(cx.debug_bounds("calendar-server-scheduling").is_some());
+        view.update(cx, |this, _| {
+            this.backend
+                .store
+                .set_preference(
+                    "calendar_tasks",
+                    r#"[{"event":{"uid":"t1","summary":"File taxes","location":"","description":"Receipts in the drawer","start":0,"end":0,"all_day":false,"organizer":null,"attendees":[],"sequence":0,"recurrence":"","cancelled":false,"task":true},"calendar":"https://dav.example/cal/","href":"https://dav.example/cal/t1.ics","etag":""}]"#,
+                )
+                .unwrap();
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("task-edit-0").is_some());
+        act(&view, Action::EditTask("t1".into()), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("task-editor").is_some());
+        view.read_with(cx, |this, cx| {
+            assert_eq!(this.task_title.read(cx).value().to_string(), "File taxes");
+            assert!(this.task_due.read(cx).value().is_empty(), "no due date");
+            assert_eq!(this.task_notes.read(cx).value().to_string(), "Receipts in the drawer");
+        });
+        act(&view, Action::CancelTaskEdit, cx);
+        frame(cx);
+        assert!(cx.debug_bounds("task-editor").is_none());
         assert!(
             cx.debug_bounds("event-zone-note").is_some(),
             "a zone 14 hours ahead differs from here"

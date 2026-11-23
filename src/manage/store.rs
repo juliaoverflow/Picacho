@@ -308,6 +308,9 @@ impl Store {
             "DELETE FROM preferences WHERE key=?1",
             [format!("folders:{id}")],
         )?;
+        for key in [format!("pop_erased:{id}"), format!("pop_downloaded:{id}")] {
+            tx.execute("DELETE FROM preferences WHERE key=?1", [key])?;
+        }
         tx.execute(
             "DELETE FROM preferences WHERE substr(key,1,8)='reading:' AND json_valid(substr(key,9)) AND json_extract(substr(key,9),'$[0]')=?1", [id],
         )?;
@@ -360,6 +363,22 @@ impl Store {
         let mut q = db.prepare_cached(
             "SELECT id FROM messages WHERE id >= ?2 AND id < ?3 AND account=?1",
         )?;
+        let end = format!("{prefix}\u{10FFFF}");
+        let ids = q
+            .query_map(params![account, prefix, end], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+    /// As `cached_ids`, only those whose whole source is saved here.
+    pub fn downloaded_ids(
+        &self,
+        account: &str,
+        prefix: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let db = self.read();
+        let mut q = db.prepare_cached(&format!(
+            "SELECT id FROM messages WHERE id >= ?2 AND id < ?3 AND account=?1 AND {DOWNLOADED}"
+        ))?;
         let end = format!("{prefix}\u{10FFFF}");
         let ids = q
             .query_map(params![account, prefix, end], |r| r.get(0))?

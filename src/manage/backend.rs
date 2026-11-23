@@ -65,6 +65,16 @@ mod pinal_tests;
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod protocol_tests;
+/// What signs a POP3 account in: its access token with single sign-on,
+/// else its password (empty with Kerberos).
+fn pop_secret<'a>(a: &Account, s: &'a Secret) -> &'a str {
+    if a.oauth { &s.access_token } else { &s.password }
+}
+/// A loopback TLS certificate and acceptor, for tests elsewhere.
+#[cfg(test)]
+pub(crate) fn protocol_tests_tls() -> Result<(Vec<u8>, native_tls::TlsAcceptor)> {
+    protocol_tests::tls_fixture()
+}
 #[cfg(test)]
 #[path = "extension_tests.rs"]
 mod extension_tests;
@@ -74,6 +84,12 @@ mod reliability_tests;
 #[cfg(test)]
 #[path = "jmap_tests.rs"]
 mod jmap_tests;
+#[cfg(all(test, unix, not(any(target_os = "android", target_os = "ios"))))]
+#[path = "kerberos_tests.rs"]
+mod kerberos_tests;
+#[cfg(test)]
+#[path = "sso_tests.rs"]
+mod sso_tests;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     Read(bool),
@@ -469,7 +485,11 @@ impl Backend {
             let grant = crate::sync::oauth::authorize(&account, cancel.clone())?;
             self.redeem(account, grant, taken, &cancel)
         } else {
-            ensure!(!password.is_empty(), "Enter your password or app password.");
+            // Kerberos uses the system's ticket; there is no password.
+            ensure!(
+                account.kerberos || !password.is_empty(),
+                "Enter your password or app password."
+            );
             let secret = Secret {
                 password,
                 ..Default::default()
@@ -537,6 +557,11 @@ impl Backend {
                 return Err(e);
             }
         };
+        if account.sso.is_some() {
+            // The client the organization's sign-in knows Picacho by (given,
+            // or registered for this sign-in), for renewing tokens.
+            account.client_id = grant.client_id.clone();
+        }
         if account.provider == Provider::Jmap {
             // The client the server knows Picacho by, for renewing tokens.
             account.client_id = grant.client_id.clone();
@@ -611,7 +636,7 @@ impl Backend {
     }
     fn check_login(&self, account: &Account, secret: &mut Secret) -> Result<()> {
         if account.provider == Provider::Pop3 {
-            let mut pop = self.pop_login(account, &secret.password)?;
+            let mut pop = self.pop_login(account, pop_secret(account, secret))?;
             let _ = pop.command("QUIT");
             return Ok(());
         }
@@ -665,6 +690,11 @@ impl Backend {
         // renew the same token.
         static RENEWING: Mutex<()> = Mutex::new(());
         let _renewing = RENEWING.lock().unwrap_or_else(|e| e.into_inner());
+        if who.kerberos {
+            // The ticket is the system's; nothing is kept in the keychain
+            // (an entry from before Kerberos was chosen is used if present).
+            return Ok(self.saved_credentials(&who.id).unwrap_or_default());
+        }
         let mut s = self.saved_credentials(&who.id)?;
         if crate::sync::oauth::refresh(who, &mut s)? {
             self.save_credentials(&who.id, &s)?;
@@ -859,6 +889,33 @@ impl Backend {
         Ok(())
     }
     /// Replaces credentials while preserving the account, cache, and preferences.
+    /// Switches an account to signing in with Kerberos (on) or back to its
+    /// password (off). Turning it on signs in with the system's ticket first
+    /// and keeps nothing if that fails; the keychain's password is left as
+    /// it was, for turning it off again.
+    pub fn set_kerberos(&self, account: &Account, on: bool) -> Result<Account> {
+        let mut next = account.clone();
+        next.kerberos = on;
+        next.validate()?;
+        let lock = self.account_lock(&next.id);
+        let _operation = lock.lock().unwrap();
+        if on {
+            let mut secret = Secret::default();
+            self.check_login(&next, &mut secret)?;
+        } else {
+            // A password must be there to go back to.
+            ensure!(
+                self.saved_credentials(&next.id)
+                    .is_ok_and(|s| !s.password.is_empty()),
+                "This account has no saved password. Sign in again with the password to stop using Kerberos."
+            );
+        }
+        // The connections signed in the old way are replaced.
+        self.disconnect(&next.id);
+        self.stop_watching(&next.id);
+        self.store.save_account(&next)?;
+        Ok(next)
+    }
     pub fn reconnect(
         &self,
         account: &Account,
@@ -1223,7 +1280,8 @@ impl Backend {
         let folder = mailbox.folder();
         if a.provider == Provider::Pop3 {
             let secret = self.credentials(a)?;
-            return self.sync_pop(a, folder, limit, &secret.password);
+            let result = self.sync_pop(a, folder, limit, pop_secret(a, &secret));
+            return self.pop_limited(a, result);
         }
         if a.provider == Provider::Proton {
             return self.sync_proton(a, mailbox, limit);
@@ -1515,7 +1573,8 @@ impl Backend {
         self.ensure_background(a)?;
         if a.provider == Provider::Pop3 {
             let secret = self.credentials(a)?;
-            return self.catalog_pop(a, folder, batch, &secret.password);
+            let result = self.catalog_pop(a, folder, batch, pop_secret(a, &secret));
+            return self.pop_limited(a, result);
         }
         if a.provider == Provider::Proton {
             return self.catalog_proton(a, mailbox, batch);
@@ -1783,8 +1842,10 @@ impl Backend {
             self.layouts_changed(&a.id);
         }
     }
-    /// POP3 has no headers-only listing, so older messages are downloaded
-    /// whole, a small batch at a time. Originals stay on the server.
+    /// Older POP3 messages are listed by their headers (TOP n 0) where the
+    /// server has TOP, many at a time, and download whole when opened;
+    /// otherwise they are downloaded whole, a small batch at a time.
+    /// Originals stay on the server.
     fn catalog_pop(
         &self,
         a: &Account,
@@ -1805,14 +1866,38 @@ impl Backend {
             .filter(|(_, uid)| !cached.contains(&format!("{prefix}{uid}")))
             .collect();
         let mut fetched = 0;
-        for (number, uid) in missing.iter().take(batch.min(25)) {
+        // Headers alone where TOP works: a batch costs a few KB each.
+        let sizes = if missing.is_empty() { Default::default() } else { pop.list()? };
+        let mut headers = Vec::new();
+        let mut whole = false;
+        for (number, uid) in missing.iter().take(batch.min(200)) {
+            let Some(top) = pop.top(*number, 256 * 1024)? else {
+                whole = true;
+                break;
+            };
             let id = format!("{prefix}{uid}");
-            pop.command(&format!("RETR {number}"))?;
-            let raw = pop.multiline(MAX_MESSAGE)?;
-            let mut m = parse_message(&raw, a, &id, Folder::Inbox, "INBOX", *number)?;
-            m.size = raw.len() as u32;
-            self.store.save_download(&m, &raw)?;
-            fetched += 1;
+            let mut m = parse_message(&top, a, &id, Folder::Inbox, "INBOX", *number)?;
+            // The header block isn't its text: no snippet or body yet.
+            m.body = None;
+            m.html = None;
+            m.snippet.clear();
+            m.size = sizes.get(number).copied().unwrap_or(top.len() as u64) as u32;
+            headers.push(m);
+        }
+        if !headers.is_empty() {
+            fetched += headers.len();
+            self.store.save_messages(&headers)?;
+        }
+        if whole {
+            for (number, uid) in missing.iter().take(batch.min(25)) {
+                let id = format!("{prefix}{uid}");
+                pop.command(&format!("RETR {number}"))?;
+                let raw = pop.multiline(MAX_MESSAGE)?;
+                let mut m = parse_message(&raw, a, &id, Folder::Inbox, "INBOX", *number)?;
+                m.size = raw.len() as u32;
+                self.store.save_download(&m, &raw)?;
+                fetched += 1;
+            }
         }
         let _ = pop.command("QUIT");
         Ok(Catalog {
@@ -2033,6 +2118,47 @@ impl Backend {
         self.note_traffic(a, bytes);
         Ok(result)
     }
+    /// A POP3 server's LOGIN-DELAY or SYS/TEMP (RFC 2449, 3206) pauses the
+    /// account's background work as IMAP's `[THROTTLED]` does.
+    fn pop_limited<T>(&self, a: &Account, result: Result<T>) -> Result<T> {
+        result.map_err(|e| {
+            let temporary = crate::sync::transport::rejection(&e).is_some_and(|r| r.temporary());
+            if !temporary {
+                return e;
+            }
+            self.note_limit(a, &e);
+            match self.throttled_until(&a.id) {
+                Some(until) => e.context(crate::manage::status::Throttled { until, budget: false }),
+                None => e,
+            }
+        })
+    }
+    /// A POP3 message known by its headers, downloaded whole (RETR) by its
+    /// UIDL identity and saved with them.
+    fn download_pop(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
+        let uidl = m
+            .id
+            .strip_prefix(&format!("{}:pop:", a.id))
+            .context("This message isn't from this POP3 account.")?;
+        let secret = self.credentials(a)?;
+        let mut pop = self.pop_login(a, pop_secret(a, &secret))?;
+        let ids = pop.uidl()?;
+        // Message numbers last only for a session: find it by UIDL.
+        let (number, _) = ids
+            .iter()
+            .find(|(_, u)| u == uidl)
+            .context("This message is no longer on the POP3 server.")?;
+        pop.command(&format!("RETR {number}"))?;
+        let raw = pop.multiline(MAX_MESSAGE)?;
+        let _ = pop.command("QUIT");
+        let mut next = parse_message(&raw, a, &m.id, m.folder, "INBOX", *number)?;
+        next.size = raw.len() as u32;
+        next.folder = m.folder;
+        next.unread = m.unread;
+        next.starred = m.starred;
+        self.store.save_download(&next, &raw)?;
+        Ok(raw)
+    }
     fn sync_pop(
         &self,
         a: &Account,
@@ -2082,7 +2208,13 @@ impl Backend {
             };
             messages.push(mail);
         }
-        let _ = pop.command("QUIT");
+        // Downloads above are committed before anything is deleted.
+        let deleting = self.pop_deletions(a, &ids, &erased)?;
+        if deleting.is_empty() {
+            let _ = pop.command("QUIT");
+        } else {
+            self.pop_delete(&mut pop, &deleting)?;
+        }
         self.store.save_messages(&messages)?;
         // POP3 has no folders. Keep local moves and messages removed from the
         // remote server; UIDL identities prevent duplicate downloads.
@@ -2501,10 +2633,13 @@ impl Backend {
             }
             self.download_jmap(a, m)?
         } else {
-            ensure!(
-                a.provider != Provider::Pop3,
-                "Message is not cached. Refresh the mailbox."
-            );
+            if a.provider == Provider::Pop3 {
+                // Listed by its headers (TOP): download it whole now.
+                let raw = self.download_pop(a, m)?;
+                let (next, kept) = self.parse_read(a, m, &raw)?;
+                self.store.save_messages(&[kept])?;
+                return Ok(next);
+            }
             // Too large to download whole: its text is read from its parts
             // and attachments download when saved.
             if m.size as usize > large::MAX_DOWNLOAD {
@@ -2772,8 +2907,9 @@ impl Backend {
             return Ok(());
         }
         if a.provider == Provider::Pop3 {
-            // Copies stay on the server (Picacho never sends DELE); remember
-            // them so they don't download again.
+            // Copies stay on the server unless the account deletes them with
+            // local deletions (`SyncSettings::pop_delete_with_local`), at the
+            // next check; remember them so they don't download again.
             let mut erased = self.pop_erased(&a.id);
             for m in mails {
                 if let Some(uidl) = m.id.strip_prefix(&format!("{}:pop:", a.id)) {
@@ -2873,7 +3009,89 @@ impl Backend {
         })?;
         Ok(count)
     }
-    /// UIDLs of POP3 mail deleted here for good, which stays on the server.
+    /// Which of the server's messages (`ids`, from UIDL) this check deletes,
+    /// by message number, under the account's POP3 deletion settings; none
+    /// unless one is on. Only messages whose whole source is saved here are
+    /// deleted by age; ones deleted here for good (`erased`) only with
+    /// `pop_delete_with_local`. Also keeps the record of when each message
+    /// was first seen downloaded, which ages count from.
+    fn pop_deletions(
+        &self,
+        a: &Account,
+        ids: &[(u32, String)],
+        erased: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<(u32, String)>> {
+        let key = format!("pop_downloaded:{}", a.id);
+        let after = a.sync.pop_delete_after_days;
+        let mut seen: std::collections::BTreeMap<String, i64> = self
+            .store
+            .preference(&key)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if after.is_none_or(|days| days == 0) && !seen.is_empty() {
+            // Not counting ages: nothing to keep.
+            seen.clear();
+            self.store.set_preference(&key, "{}")?;
+        }
+        let mut deleting = Vec::new();
+        if let Some(days) = after {
+            let prefix = format!("{}:pop:", a.id);
+            let downloaded = self.store.downloaded_ids(&a.id, &prefix)?;
+            let now = chrono::Utc::now().timestamp();
+            let before = seen.clone();
+            let on_server: std::collections::HashSet<&str> =
+                ids.iter().map(|(_, u)| u.as_str()).collect();
+            seen.retain(|uid, _| on_server.contains(uid.as_str()));
+            for (number, uid) in ids {
+                if !downloaded.contains(&format!("{prefix}{uid}")) {
+                    continue;
+                }
+                let since = if days == 0 {
+                    now
+                } else {
+                    // Mail downloaded before this was turned on counts
+                    // from now, not from when it arrived.
+                    *seen.entry(uid.clone()).or_insert(now)
+                };
+                if now - since >= i64::from(days) * 86_400 {
+                    deleting.push((*number, uid.clone()));
+                }
+            }
+            if days > 0 && seen != before {
+                self.store
+                    .set_preference(&key, &serde_json::to_string(&seen)?)?;
+            }
+        }
+        if a.sync.pop_delete_with_local {
+            let mut chosen: std::collections::HashSet<u32> =
+                deleting.iter().map(|(n, _)| *n).collect();
+            for (number, uid) in ids {
+                if erased.contains(uid) && chosen.insert(*number) {
+                    deleting.push((*number, uid.clone()));
+                }
+            }
+        }
+        deleting.sort_unstable();
+        Ok(deleting)
+    }
+    /// Deletes `deleting` (message numbers of this session) from the server:
+    /// DELE each, then QUIT, which is when the server removes them. A
+    /// failure before QUIT's reply deletes nothing for certain, and the
+    /// next check decides again; DELE is never replayed in this session.
+    fn pop_delete(
+        &self,
+        pop: &mut PopSession<native_tls::TlsStream<crate::sync::wire::Wire>>,
+        deleting: &[(u32, String)],
+    ) -> Result<()> {
+        for (number, _) in deleting {
+            // A refused DELE (already marked, say) leaves the rest to go.
+            pop.dele(*number)?;
+        }
+        pop.quit()
+            .context("The POP3 server didn't confirm deleting downloaded mail; it is checked again next time.")
+    }
+    /// UIDLs of POP3 mail deleted here for good, which stays on the server
+    /// unless `pop_delete_with_local` deletes it at the next check.
     fn pop_erased(&self, account: &str) -> std::collections::BTreeSet<String> {
         self.store
             .preference(&format!("pop_erased:{account}"))
@@ -2902,7 +3120,33 @@ impl Backend {
                     limit_kib: 0,
                 }));
             }
-            quota(&mut c.session)
+            // The standard folders' own roots too, where they differ from
+            // the inbox's (archives kept apart, say).
+            let names = c.names(false)?.to_vec();
+            let mut others = Vec::new();
+            for folder in [Folder::Archive, Folder::Sent] {
+                if let Ok(remote) = resolve_in(&names, a.provider, folder)
+                    && !remote.eq_ignore_ascii_case("INBOX")
+                {
+                    others.push(c.mailbox(&remote)?);
+                }
+            }
+            quota_of(&mut c.session, &others)
+        })
+    }
+    /// Where the same mailbox is reachable over JMAP (RFC 9698
+    /// JMAPACCESS), for suggesting it in Settings: the session URL.
+    pub fn jmap_access(&self, a: &Account) -> Result<Option<String>> {
+        if !a.provider.imap() {
+            return Ok(None);
+        }
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            if !c.extensions()?.jmapaccess {
+                return Ok(None);
+            }
+            jmap_access(&mut c.session)
         })
     }
     /// Applies one change to several messages, with one IMAP command per mailbox.

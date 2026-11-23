@@ -245,6 +245,7 @@ impl Backend {
             port: sieve::PORT,
             user: a.login().to_owned(),
             oauth: a.oauth,
+            kerberos: a.kerberos,
         }
     }
     /// Whether the account's provider might have a filter server. Gmail,
