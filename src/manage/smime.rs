@@ -580,7 +580,10 @@ fn sign_part(cert: &X509, chain: &[X509], key: &PKey<Private>, content: &[u8]) -
     for c in chain {
         extra.push(c.clone())?;
     }
-    let flags = CMSOptions::DETACHED | CMSOptions::BINARY;
+    // NOSMIMECAP: OpenSSL's own SMIMECapabilities lists triple DES, DES
+    // and RC2, which we never advertise; with none, a reply falls back to
+    // what the recipient knows of us (RFC 8551 §2.7.1).
+    let flags = CMSOptions::DETACHED | CMSOptions::BINARY | CMSOptions::NOSMIMECAP;
     let signed = CmsContentInfo::sign(Some(cert), Some(key), Some(&extra), Some(content), flags)?;
     Ok(multipart_signed(content, &signed.to_der()?))
 }
@@ -1932,6 +1935,9 @@ mod tests {
         let message = b"From: bo@example.se\r\nTo: ana@example.org\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\nHi.\r\n";
         let signed = protect_with(&bo, message, "bo@example.se", &[], true, false).unwrap();
         assert!(openssl_cli_verifies("cms", &signed));
+        let (_, signature) = signed_parts(&signed).unwrap();
+        let smime_capabilities = der::oid(oids::SMIME_CAPABILITIES);
+        assert!(!signature.windows(smime_capabilities.len()).any(|w| w == smime_capabilities));
         let (_, verdict, _) = open_with(&signed, &Certificates::default(), &test_authority()).unwrap();
         assert_eq!(verdict.signature, Signature::Good("bo@example.se".into()));
     }
