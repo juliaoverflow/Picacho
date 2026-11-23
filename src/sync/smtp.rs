@@ -466,6 +466,45 @@ pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerL
     }
     limits
 }
+/// A delivery time limit (DELIVERBY, RFC 2852) as the account asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeliverBy {
+    /// How long, in seconds.
+    pub(crate) seconds: u64,
+    /// Late, it is delivered and the sender told (N) rather than returned
+    /// (R).
+    pub(crate) notify: bool,
+    /// Each server on the way reports relaying it (T).
+    pub(crate) trace: bool,
+}
+impl DeliverBy {
+    /// The account's limit, if it sets one; N and T mean nothing alone.
+    pub(crate) fn of(a: &Account) -> Option<Self> {
+        (a.deliver_within_hours > 0).then(|| Self {
+            seconds: u64::from(a.deliver_within_hours) * 3600,
+            notify: a.deliver_late_notify,
+            trace: a.deliver_by_trace,
+        })
+    }
+    /// The BY= value (RFC 2852 §4: `by-time;by-mode[trace]`) for a server
+    /// whose least by-time is `minimum` seconds. That minimum is for R mode
+    /// only (§4: a server refuses an R by-time below it); an N by-time is
+    /// as asked. At most nine digits.
+    pub(crate) fn parameter(self, minimum: u64) -> String {
+        let seconds = if self.notify {
+            self.seconds
+        } else {
+            self.seconds.max(minimum)
+        }
+        .min(999_999_999);
+        format!(
+            "{seconds};{}{}",
+            if self.notify { "N" } else { "R" },
+            if self.trace { "T" } else { "" }
+        )
+    }
+}
+
 /// HOLDFOR's seconds (RFC 4865 §4) for a message due at `at` when it is
 /// `now`, where the server can hold it that long: within its
 /// max-future-release-interval and, if it named one, not after its
@@ -1314,15 +1353,13 @@ pub(crate) fn deliver_bytes(
         };
         mail.push_str(&format!(" MT-PRIORITY={level}"));
     }
-    // A time limit (RFC 2852): returned rather than delivered late. Not
-    // with a held message, whose release would count against it.
-    if a.deliver_within_hours > 0
-        && hold_for.is_none()
+    // A time limit (RFC 2852). Not with a held message, whose release
+    // would count against it.
+    if hold_for.is_none()
         && let Some(minimum) = limits.deliver_by
+        && let Some(by) = DeliverBy::of(a)
     {
-        // At most nine digits (RFC 2852 §4); the server's minimum is said.
-        let seconds = (u64::from(a.deliver_within_hours) * 3600).max(minimum).min(999_999_999);
-        mail.push_str(&format!(" BY={seconds};R"));
+        mail.push_str(&format!(" BY={}", by.parameter(minimum)));
     }
     let rcpt = |to: &lettre::Address| {
         let mut line = format!("RCPT TO:<{}>", ascii_domain(to.as_ref()));
@@ -1929,6 +1966,31 @@ mod tests {
     /// RFC 1870 §4: the size declared for DATA counts bare CR and LF as
     /// the CRLF they're sent as, and the unended last line's CRLF; it
     /// matches what the server gets once it undoes the dot-stuffing.
+    /// RFC 2852 §4: BY= in each mode, with trace; the server's minimum
+    /// raises R mode's time only; nothing without a time limit.
+    #[test]
+    fn deliver_by_modes_and_trace() {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        assert_eq!(DeliverBy::of(&a), None);
+        a.deliver_late_notify = true;
+        a.deliver_by_trace = true;
+        assert_eq!(DeliverBy::of(&a), None, "N and T alone ask for nothing");
+        a.deliver_within_hours = 1;
+        let by = |notify, trace| DeliverBy {
+            notify,
+            trace,
+            ..DeliverBy::of(&a).unwrap()
+        };
+        assert_eq!(by(false, false).parameter(0), "3600;R");
+        assert_eq!(by(true, false).parameter(0), "3600;N");
+        assert_eq!(by(false, true).parameter(0), "3600;RT");
+        assert_eq!(by(true, true).parameter(0), "3600;NT");
+        assert_eq!(by(false, false).parameter(7200), "7200;R");
+        assert_eq!(by(true, true).parameter(7200), "3600;NT");
+        let long = DeliverBy { seconds: 10_000_000_000, notify: false, trace: false };
+        assert_eq!(long.parameter(0), "999999999;R");
+    }
+
     /// RFC 4865 §3: both limits FUTURERELEASE names are kept to.
     #[test]
     fn future_release_keeps_to_the_servers_interval_and_date() {

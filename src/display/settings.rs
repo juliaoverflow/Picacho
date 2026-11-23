@@ -1222,6 +1222,39 @@ impl MailApp {
                     ),
                 ))
             })
+            // RFC 2852 §4: what a late message does, and a trace of its
+            // way; only with a time limit.
+            .when(
+                !matches!(a.provider, Provider::Proton | Provider::Jmap) && a.deliver_within_hours > 0,
+                |page| {
+                    page.child(self.setting(
+                        "If it's late",
+                        "Return it to you, or deliver it anyway and tell you it was late.",
+                        self.segmented(
+                            &format!("deliver-late-{}", a.id),
+                            [(false, "Return it"), (true, "Deliver and tell me")]
+                                .into_iter()
+                                .map(|(notify, label)| {
+                                    (
+                                        label.to_owned(),
+                                        Action::SetDeliverLateNotify(a.id.clone(), notify),
+                                        a.deliver_late_notify == notify,
+                                    )
+                                })
+                                .collect(),
+                            cx,
+                        ),
+                    ))
+                    .child(self.switch_setting(
+                        "Trace its delivery",
+                        "Each server on the way reports passing it on, where they support it (DELIVERBY trace).",
+                        format!("deliver-by-trace-{}", a.id),
+                        a.deliver_by_trace,
+                        Action::ToggleDeliverByTrace(a.id.clone()),
+                        cx,
+                    ))
+                },
+            )
             .when(a.provider != Provider::Proton, |page| {
                 page.child(self.switch_setting(
                     "Let the server send scheduled messages",

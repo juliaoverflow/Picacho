@@ -969,6 +969,11 @@ enum Action {
     ToggleRequireTls(String),
     /// An account's delivery time limit (`Account::deliver_within_hours`).
     SetDeliverWithin(String, u32),
+    /// Whether a late message is delivered with a note (DELIVERBY N mode)
+    /// rather than returned: (account, on).
+    SetDeliverLateNotify(String, bool),
+    /// Turns DELIVERBY's trace on or off for an account.
+    ToggleDeliverByTrace(String),
     /// Signs this account (its id) in with Kerberos, or with its password again.
     ToggleKerberos(String),
     /// The account being set up signs in with Kerberos instead of a password.
@@ -6662,6 +6667,12 @@ impl MailApp {
             }
             Action::SetDeliverWithin(id, hours) => {
                 self.edit_account(&id, |a| a.deliver_within_hours = hours, cx)
+            }
+            Action::SetDeliverLateNotify(id, on) => {
+                self.edit_account(&id, |a| a.deliver_late_notify = on, cx)
+            }
+            Action::ToggleDeliverByTrace(id) => {
+                self.edit_account(&id, |a| a.deliver_by_trace = !a.deliver_by_trace, cx)
             }
             Action::ToggleSetupKerberos => {
                 self.setup_kerberos = !self.setup_kerberos;

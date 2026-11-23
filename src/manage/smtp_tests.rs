@@ -633,3 +633,38 @@ fn scheduled_mail_isnt_handed_over_past_the_servers_last_date() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 2852: the account's N mode and trace reach MAIL FROM as BY=…;NT,
+/// a server without DELIVERBY is told nothing.
+#[test]
+fn deliver_by_mode_and_trace_reach_mail_from() -> Result<()> {
+    for (ehlo, expected) in [
+        ("250-fixture\r\n250-DELIVERBY 7200\r\n250 AUTH PLAIN\r\n", Some(" BY=3600;NT")),
+        ("250-fixture\r\n250 AUTH PLAIN\r\n", None),
+    ] {
+        let fixture = SmtpFixture::start(ehlo, no_script())?;
+        let (b, mut a, path) = smtp_account(&fixture)?;
+        a.deliver_within_hours = 1;
+        a.deliver_late_notify = true;
+        a.deliver_by_trace = true;
+        let d = Draft {
+            id: "by".into(),
+            account: a.id.clone(),
+            to: "ana@example.com".into(),
+            subject: "Soon".into(),
+            body: "Hi".into(),
+            ..Draft::default()
+        };
+        b.store.save_draft(&d)?;
+        b.send(&a, &d)?;
+        let seen = fixture.finish();
+        let mail = &seen.transactions[0].mail;
+        match expected {
+            Some(by) => assert!(mail.ends_with(by), "{mail}"),
+            None => assert!(!mail.contains("BY="), "{mail}"),
+        }
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}

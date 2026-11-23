@@ -352,6 +352,15 @@ pub struct Account {
     /// as long as the servers try. Only where the outgoing server has it.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub deliver_within_hours: u32,
+    /// With `deliver_within_hours`: a message not delivered in time is
+    /// delivered anyway and you're told (DELIVERBY's N mode, RFC 2852 §4),
+    /// rather than coming back to you (R mode).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deliver_late_notify: bool,
+    /// With `deliver_within_hours`: each server on the way reports
+    /// relaying it (DELIVERBY's trace, RFC 2852 §4, `T`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deliver_by_trace: bool,
     /// Other addresses this mailbox sends as, each optionally through its
     /// own outgoing server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -525,6 +534,8 @@ impl Account {
             delivery_receipts: false,
             require_tls: false,
             deliver_within_hours: 0,
+            deliver_late_notify: false,
+            deliver_by_trace: false,
             identities: Vec::new(),
             jmap_account: String::new(),
             credentials_of: String::new(),
