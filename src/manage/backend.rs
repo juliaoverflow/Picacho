@@ -1172,19 +1172,17 @@ impl Backend {
         let (email, key) = (header.addr.clone(), header.key.clone());
         // Peer state (Autocrypt 1.1 §2.3): an older message than the one
         // a key was last taken from doesn't replace it.
-        let seen_key = format!("autocrypt_seen:{email}");
-        let last: i64 = self
-            .store
-            .preference(&seen_key)
-            .and_then(|s| s.split(' ').next()?.parse().ok())
-            .unwrap_or(0);
+        use crate::manage::openpgp::{Peer, peer_preference_key};
+        let seen_key = peer_preference_key(&email);
+        let mut peer = Peer::from_preference(&self.store.preference(&seen_key).unwrap_or_default());
+        let last = peer.autocrypt_timestamp;
         if header.date > 0 && header.date < last {
             return;
         }
-        let _ = self.store.set_preference(
-            &seen_key,
-            &format!("{} {}", header.date.max(last), if header.mutual { "mutual" } else { "nopreference" }),
-        );
+        peer.autocrypt_timestamp = header.date.max(last);
+        peer.last_seen = peer.last_seen.max(peer.autocrypt_timestamp);
+        peer.mutual = header.mutual;
+        let _ = self.store.set_preference(&seen_key, &peer.to_preference());
         let ring = self.keyring();
         if ring.key_for(&email).is_some_and(|k| {
             use pgp::ser::Serialize as _;

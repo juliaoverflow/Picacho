@@ -20,6 +20,7 @@ use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
 mod autocrypt;
+pub use autocrypt::{Peer, peer_preference_key};
 
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]
@@ -47,6 +48,11 @@ pub struct Keyring {
     /// so they don't count as unverified either (see `checked`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dnssec: Vec<String>,
+    /// Fingerprints of found keys known only from Autocrypt headers or
+    /// Autocrypt-Gossip (Autocrypt 1.1 §2.3, §2.4), which `reset_peer`
+    /// may forget; a lookup that finds the same key takes it off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub autocrypt: Vec<String>,
 }
 
 /// One key, as Settings lists it.
@@ -305,6 +311,7 @@ impl Keyring {
             .collect();
         self.verified.retain(|f| kept.contains(f));
         self.dnssec.retain(|f| kept.contains(f));
+        self.autocrypt.retain(|f| kept.contains(f));
         Ok(true)
     }
     /// Your public key for `email`, binary, as Autocrypt sends it.
@@ -368,6 +375,7 @@ impl Keyring {
         self.found.retain(|f| f != fp);
         self.verified.retain(|f| f != fp);
         self.dnssec.retain(|f| f != fp);
+        self.autocrypt.retain(|f| f != fp);
         self.secret.retain(|k| {
             SignedSecretKey::from_string(k)
                 .map(|(k, _)| fingerprint(&SignedPublicKey::from(k)) != fp)

@@ -4,6 +4,58 @@
 use super::{Keyring, SignedPublicKey, fingerprint, has_address};
 use anyhow::Result;
 use pgp::composed::Deserializable as _;
+use serde::{Deserialize, Serialize};
+
+/// What Picacho remembers of a person from their mail (Autocrypt 1.1
+/// §2.3, "Communication Peers"): `peers[addr]`. Kept as the preference
+/// `peer_preference_key(addr)`; every field defaults to empty, so state
+/// written by an older Picacho (or a missing field) still reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    /// The newest effective date of any message from them, Unix seconds.
+    #[serde(default)]
+    pub last_seen: i64,
+    /// The newest effective date of a message from them with a valid
+    /// Autocrypt header, Unix seconds.
+    #[serde(default)]
+    pub autocrypt_timestamp: i64,
+    /// That header's `prefer-encrypt=mutual`; `nopreference` otherwise.
+    #[serde(default)]
+    pub mutual: bool,
+    /// The fingerprint of that header's key (`public_key`); empty in state
+    /// from before it was kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+}
+
+/// The preference holding `email`'s peer state.
+pub fn peer_preference_key(email: &str) -> String {
+    format!("autocrypt_seen:{}", email.trim().to_lowercase())
+}
+
+impl Peer {
+    /// Peer state as kept: JSON, or the older `"<date> <mutual|nopreference>"`
+    /// (the date of the newest Autocrypt header taken, which stood for
+    /// both timestamps). Anything unreadable is no state.
+    pub fn from_preference(value: &str) -> Self {
+        if let Ok(peer) = serde_json::from_str(value) {
+            return peer;
+        }
+        let mut words = value.split_whitespace();
+        let Some(date) = words.next().and_then(|d| d.parse::<i64>().ok()) else {
+            return Self::default();
+        };
+        Self {
+            last_seen: date,
+            autocrypt_timestamp: date,
+            mutual: words.next() == Some("mutual"),
+            fingerprint: String::new(),
+        }
+    }
+    pub fn to_preference(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
 
 impl Keyring {
     /// Whether the found key with this fingerprint needs no comparing with
@@ -53,6 +105,41 @@ mod tests {
         SignedPublicKey::from(super::super::test_key(uid, ""))
             .to_bytes()
             .unwrap()
+    }
+
+    /// Peer state and keyrings written before peer state had its fields
+    /// load, with the new fields empty.
+    #[test]
+    fn old_format_peer_state_and_keyring_load() {
+        assert_eq!(
+            Peer::from_preference("1700000000 mutual"),
+            Peer {
+                last_seen: 1_700_000_000,
+                autocrypt_timestamp: 1_700_000_000,
+                mutual: true,
+                fingerprint: String::new(),
+            }
+        );
+        assert!(!Peer::from_preference("1700000000 nopreference").mutual);
+        assert_eq!(Peer::from_preference(""), Peer::default());
+        assert_eq!(Peer::from_preference("{}"), Peer::default());
+        let peer = Peer {
+            last_seen: 2,
+            autocrypt_timestamp: 1,
+            mutual: true,
+            fingerprint: "AB".into(),
+        };
+        assert_eq!(Peer::from_preference(&peer.to_preference()), peer);
+        assert_eq!(peer_preference_key(" Ana@Example.ORG"), "autocrypt_seen:ana@example.org");
+        // A keyring as an older Picacho saved it: no `dnssec` or
+        // `autocrypt` fields.
+        let old = r#"{"secret":[],"public":[],"found":["AB"],"verified":["AB"]}"#;
+        let ring: Keyring = serde_json::from_str(old).unwrap();
+        assert_eq!(ring.found, ["AB"]);
+        assert_eq!(ring.verified, ["AB"]);
+        assert!(ring.dnssec.is_empty() && ring.autocrypt.is_empty());
+        // And saved again, the empty new fields aren't written.
+        assert_eq!(serde_json::to_string(&ring).unwrap(), old);
     }
 
     /// RFC 7929 §7: a key from DNS is checked only when DNSSEC validated
