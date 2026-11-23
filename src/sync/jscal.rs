@@ -1247,7 +1247,11 @@ pub fn from_jscontact(v: &Value) -> Card {
 pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
     let mut p = Map::new();
     p.insert("@type".into(), json!("Card"));
-    p.insert("version".into(), json!("1.0"));
+    // RFC 9553 §2.1.2: the version a card was written in is the card's;
+    // an edit doesn't claim another.
+    if before.is_none_or(|b| b["version"].is_null()) {
+        p.insert("version".into(), json!("1.0"));
+    }
     if !card.uid.is_empty() {
         p.insert("uid".into(), json!(card.uid));
     }
@@ -1288,14 +1292,21 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
         }
         if out.is_empty() { Value::Null } else { Value::Object(out) }
     };
-    p.insert(
-        "emails".into(),
-        keep("emails", "address", &card.emails, &|e| json!({ "@type": "EmailAddress", "address": e })),
-    );
-    p.insert(
-        "phones".into(),
-        keep("phones", "number", &card.phones, &|n| json!({ "@type": "Phone", "number": n })),
-    );
+    // Unchanged lists aren't sent, so the server's copy (its order, and
+    // entries Picacho reads as the same) stays as it is.
+    let old = before.map(from_jscontact).unwrap_or_default();
+    if before.is_none() || old.emails != card.emails {
+        p.insert(
+            "emails".into(),
+            keep("emails", "address", &card.emails, &|e| json!({ "@type": "EmailAddress", "address": e })),
+        );
+    }
+    if before.is_none() || old.phones != card.phones {
+        p.insert(
+            "phones".into(),
+            keep("phones", "number", &card.phones, &|n| json!({ "@type": "Phone", "number": n })),
+        );
+    }
     let old_org = before.map(|b| from_jscontact(b).org).unwrap_or_default();
     if old_org != card.org {
         p.insert(
@@ -1313,7 +1324,6 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
             },
         );
     }
-    let old = before.map(from_jscontact).unwrap_or_default();
     if old.addresses != card.addresses {
         // Each address that is as it was keeps its entry (its parts,
         // labels and coordinates); new ones are written in full.
@@ -1429,6 +1439,35 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
                 Value::Object(all)
             },
         );
+    }
+    // RFC 9553 §2.7.1: `localizations` patch the card by path, per
+    // language. A property replaced here may no longer have what a patch
+    // names, so its patches go; the others (and the rest) stay.
+    if let Some(local) = before.and_then(|b| b["localizations"].as_object()) {
+        let replaced: Vec<&String> = p.keys().filter(|k| !["@type", "version", "uid"].contains(&k.as_str())).collect();
+        let mut kept = Map::new();
+        let mut changed = false;
+        for (lang, patch) in local {
+            let Some(patch) = patch.as_object() else { continue };
+            let still: Map<String, Value> = patch
+                .iter()
+                .filter(|(path, _)| {
+                    let top = path.split('/').next().unwrap_or_default();
+                    !replaced.iter().any(|r| r.as_str() == top)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            changed |= still.len() != patch.len();
+            if !still.is_empty() {
+                kept.insert(lang.clone(), Value::Object(still));
+            }
+        }
+        if changed {
+            p.insert(
+                "localizations".into(),
+                if kept.is_empty() { Value::Null } else { Value::Object(kept) },
+            );
+        }
     }
     p
 }
@@ -2003,6 +2042,42 @@ mod tests {
         assert_eq!(alerts.keys().collect::<Vec<_>>(), ["mail"]);
     }
 
+    /// An edit keeps what it doesn't change (RFC 9553): unknown and
+    /// unmodelled properties aren't sent, unchanged lists stay as they are,
+    /// and localizations go only for what was replaced.
+    #[test]
+    fn jscontact_edits_keep_what_is_not_modelled() {
+        let v = json!({
+            "@type": "Card", "version": "2.0", "uid": "u1",
+            "name": { "full": "Sophie Chen" },
+            "emails": { "b": { "@type": "EmailAddress", "address": "b@example.com" }, "a": { "@type": "EmailAddress", "address": "a@example.com" } },
+            "notes": { "n": { "@type": "Note", "note": "Met in Lyon" } },
+            "localizations": {
+                "fr": { "name/full": "Sophie Chen (fr)", "titles/t/name": "Chercheuse" },
+                "jp": { "name/full": "陳ソフィー" },
+            },
+            "titles": { "t": { "@type": "Title", "name": "Researcher" } },
+            "nicknames": { "k": { "@type": "Nickname", "name": "Soph" } },
+            "example.com:custom": { "x": 1 },
+        });
+        let card = from_jscontact(&v);
+        // Only the note changes.
+        let mut edited = card.clone();
+        edited.note = "Met in Paris".into();
+        let patch = to_jscontact(&edited, Some(&v));
+        assert_eq!(patch["notes"]["n"]["note"], "Met in Paris");
+        for k in ["version", "emails", "phones", "name", "titles", "nicknames", "example.com:custom", "localizations"] {
+            assert!(!patch.contains_key(k), "{k} isn't sent: {patch:?}");
+        }
+        // The name changes: its localizations go, the title's stay.
+        let mut renamed = card.clone();
+        renamed.name = "Sophie Martin".into();
+        let patch = to_jscontact(&renamed, Some(&v));
+        assert_eq!(patch["localizations"], json!({ "fr": { "titles/t/name": "Chercheuse" } }));
+        // A new card says its version.
+        assert_eq!(to_jscontact(&card, None)["version"], "1.0");
+    }
+
     #[test]
     fn jscontact_cards_keep_their_labels() {
         let v = json!({
@@ -2027,6 +2102,11 @@ mod tests {
         assert_eq!(patch["emails"]["work"]["contexts"]["work"], true);
         assert_eq!(patch["emails"]["emails3"]["address"], "new@example.com");
         assert!(!patch.contains_key("name") && !patch.contains_key("organizations"));
+        // The phones didn't change: not sent, so the server keeps them.
+        assert!(!patch.contains_key("phones"));
+        let mut phoned = card.clone();
+        phoned.phones.push("+1 555 0199".into());
+        let patch = to_jscontact(&phoned, Some(&v));
         assert_eq!(patch["phones"]["m"]["features"]["mobile"], true);
     }
 }
