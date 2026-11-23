@@ -74,9 +74,12 @@ pub(crate) mod imp {
         }
     }
 
-    /// `gss_OID_desc` (`OM_uint32 length; void *elements`, aligned as C
-    /// lays it out on the systems other than macOS).
-    #[repr(C)]
+    /// `gss_OID_desc` (`OM_uint32 length; void *elements`), laid out as
+    /// each system's library has it: C's alignment, and on macOS Apple's
+    /// `#pragma pack(push, 2)` in <GSS/gssapi.h>, where the pointer
+    /// follows the length directly (12 bytes, not 16).
+    #[cfg_attr(not(target_os = "macos"), repr(C))]
+    #[cfg_attr(target_os = "macos", repr(C, packed(2)))]
     struct OidDesc {
         length: OmUint32,
         elements: *const c_void,
@@ -90,15 +93,19 @@ pub(crate) mod imp {
         length: 9,
         elements: KRB5_OID_BYTES.as_ptr() as *const c_void,
     };
-    /// The mechanism to ask for: Kerberos 5 by its OID, except where the
-    /// library packs its structures differently (Apple's), whose default
-    /// is Kerberos anyway.
+    // The layouts the libraries expect.
+    #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<OidDesc>() == 12);
+    #[cfg(all(not(target_os = "macos"), target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<OidDesc>() == 16);
+    #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<ChannelBindings>() == 4 + 16 + 4 + 16 + 16);
+    #[cfg(all(not(target_os = "macos"), target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<ChannelBindings>() == 8 + 16 + 8 + 16 + 16);
+    /// The mechanism to ask for: Kerberos 5 by its OID (RFC 4752 §3.1),
+    /// not the library's default, which may be SPNEGO or another.
     fn mechanism() -> *mut c_void {
-        if cfg!(target_os = "macos") {
-            std::ptr::null_mut()
-        } else {
-            &KRB5_OID as *const OidDesc as *mut c_void
-        }
+        &KRB5_OID as *const OidDesc as *mut c_void
     }
 
     const COMPLETE: OmUint32 = 0;
@@ -323,8 +330,10 @@ pub(crate) mod imp {
     }
 
     /// `gss_channel_bindings_struct` (RFC 2744 §3.11): addresses of type
-    /// GSS_C_AF_NULLADDR (0) and empty, and the application data.
-    #[repr(C)]
+    /// GSS_C_AF_NULLADDR (0) and empty, and the application data. Packed
+    /// to 2 on macOS, as Apple's header has it (see `OidDesc`).
+    #[cfg_attr(not(target_os = "macos"), repr(C))]
+    #[cfg_attr(target_os = "macos", repr(C, packed(2)))]
     struct ChannelBindings {
         initiator_addrtype: OmUint32,
         initiator_address: Buffer,
