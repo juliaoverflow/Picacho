@@ -34,6 +34,9 @@ pub(super) struct Place {
     /// Roles of mailboxes that collect others' mail (All Mail, Flagged…):
     /// neither standard folders nor folders of the account's own.
     pub collection: bool,
+    /// Whether folders may be made inside it (RFC 8621 §2: `myRights`'
+    /// `mayCreateChild`).
+    pub nestable: bool,
 }
 
 /// The standard folder a mailbox role stands for.
@@ -111,6 +114,7 @@ pub(super) fn places(mailboxes: &[jmap::Mailbox]) -> Vec<Place> {
                     role.to_ascii_lowercase().as_str(),
                     "all" | "flagged" | "important" | "subscribed"
                 ),
+                nestable: m.may_create_child(),
             }
         })
         .collect();
@@ -153,7 +157,7 @@ pub(super) fn remote_folders(places: &[Place]) -> Vec<RemoteFolder> {
             name: p.path.clone(),
             label: p.path.rsplit('/').next().unwrap_or(&p.path).to_owned(),
             depth: p.depth,
-            nestable: true,
+            nestable: p.nestable,
         })
         .collect()
 }
@@ -1659,13 +1663,115 @@ impl Backend {
         Ok(change)
     }
 
+    /// Moves one of the account's JMAP folders under `parent` (another of
+    /// its own), or (`None`) to the top (RFC 8621 §2: `parentId`); the
+    /// folders inside it go with it.
+    // Backend-only until the UI calls it: moving a JMAP folder under another (Mailbox/set parentId).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn move_folder_jmap(&self, a: &Account, name: &str, parent: Option<&str>) -> Result<FolderChange> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP folders are moved this way.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let change = self.with_jmap(a, |s| {
+            let before = self.jmap_places(a, s, false)?;
+            let id = mailbox_id(&before, &Mailbox::Remote(name.to_owned()))?;
+            let parent = match parent {
+                Some(p) => {
+                    let pid = mailbox_id(&before, &Mailbox::Remote(p.to_owned()))?;
+                    ensure!(
+                        !(p == name || p.starts_with(&format!("{name}/"))),
+                        "A folder can't go inside itself."
+                    );
+                    ensure!(
+                        before.iter().find(|x| x.id == pid).is_none_or(|x| x.nestable),
+                        "You may not make folders inside “{p}”."
+                    );
+                    Some(pid)
+                }
+                None => None,
+            };
+            s.move_mailbox(&id, parent.as_deref())?;
+            let after = self.jmap_places(a, s, true)?;
+            let moved: Vec<(String, String)> = before
+                .iter()
+                .filter(|p| p.folder.is_none())
+                .filter_map(|old| {
+                    let new = after.iter().find(|n| n.id == old.id)?;
+                    (new.path != old.path).then(|| (old.path.clone(), new.path.clone()))
+                })
+                .collect();
+            Ok(FolderChange {
+                moved,
+                folders: remote_folders(&after),
+            })
+        })?;
+        for (old, new) in &change.moved {
+            self.store.rename_remote(&a.id, old, new)?;
+        }
+        self.store.save_folders(&a.id, &change.folders)?;
+        Ok(change)
+    }
+    /// Subscribes to one of the account's JMAP folders, or not (RFC 8621
+    /// §2: `isSubscribed`).
+    // Backend-only until the UI calls it: subscribing to a JMAP folder (Mailbox isSubscribed).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn subscribe_folder_jmap(&self, a: &Account, name: &str, subscribed: bool) -> Result<()> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP folders are subscribed to this way.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_jmap(a, |s| {
+            let id = mailbox_id(&self.jmap_places(a, s, false)?, &Mailbox::Remote(name.to_owned()))?;
+            s.subscribe_mailbox(&id, subscribed)
+        })
+    }
+    /// The account's JMAP folders that are subscribed to (Mailbox/query on
+    /// `isSubscribed`, RFC 8621 §2.3), by path. Once listed, only what
+    /// changed in the list is asked (Mailbox/queryChanges).
+    // Backend-only until the UI calls it: listing subscribed JMAP folders (Mailbox/query, Mailbox/queryChanges).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn subscribed_folders_jmap(&self, a: &Account) -> Result<Vec<String>> {
+        ensure!(a.provider == Provider::Jmap, "Only JMAP folders are listed this way.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        let key = format!("jmap_subscribed:{}", a.id);
+        let saved: Option<(Vec<String>, String)> = self
+            .store
+            .preference(&key)
+            .and_then(|j| serde_json::from_str(&j).ok());
+        let filter = json!({ "isSubscribed": true });
+        let (ids, state) = self.with_jmap(a, |s| {
+            if let Some((ids, since)) = &saved
+                && !since.is_empty()
+                && let Some(c) = s.mailbox_query_changes(filter.clone(), since)?
+            {
+                let mut ids: Vec<String> = ids.iter().filter(|i| !c.removed.contains(i)).cloned().collect();
+                let mut added = c.added.clone();
+                added.sort_by_key(|(_, at)| *at);
+                for (id, at) in added {
+                    ids.retain(|i| *i != id);
+                    ids.insert(at.min(ids.len()), id);
+                }
+                return Ok((ids, c.new_state));
+            }
+            s.query_mailboxes(filter.clone(), true)
+        })?;
+        let _ = self.store.set_preference(&key, &serde_json::to_string(&(&ids, &state))?);
+        let places = self.with_jmap(a, |s| self.jmap_places(a, s, false))?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| places.iter().find(|p| p.id == *id).map(|p| p.path.clone()))
+            .collect())
+    }
+    /// Deletes a folder with the messages only it holds, as the delete
+    /// dialog says (RFC 8621 §2.5: `onDestroyRemoveEmails`); messages also
+    /// in other folders stay there.
     pub(super) fn delete_folder_jmap(&self, a: &Account, name: &str) -> Result<Vec<RemoteFolder>> {
         let folders = self.with_jmap(a, |s| {
             let id = mailbox_id(
                 &self.jmap_places(a, s, false)?,
                 &Mailbox::Remote(name.to_owned()),
             )?;
-            s.destroy_mailbox(&id)?;
+            s.destroy_mailbox_with(&id, true)?;
             Ok(remote_folders(&self.jmap_places(a, s, true)?))
         })?;
         self.store.save_folders(&a.id, &folders)?;

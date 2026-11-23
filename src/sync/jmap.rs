@@ -105,6 +105,52 @@ pub struct Mailbox {
     pub total_emails: u64,
     #[serde(default)]
     pub unread_emails: u64,
+    /// RFC 8621 §2: conversations with a message in it, and with an
+    /// unread one.
+    #[serde(default)]
+    pub total_threads: u64,
+    #[serde(default)]
+    pub unread_threads: u64,
+    /// What the sign-in may do with it (RFC 8621 §2: `myRights`); `None`
+    /// where the server doesn't say, which is taken as allowing all.
+    #[serde(default)]
+    pub my_rights: Option<MailboxRights>,
+    /// RFC 8621 §2: whether the user has subscribed to it.
+    #[serde(default)]
+    pub is_subscribed: Option<bool>,
+}
+
+/// A mailbox's rights for the sign-in (RFC 8621 §2: `MailboxRights`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MailboxRights {
+    pub may_read_items: bool,
+    pub may_add_items: bool,
+    pub may_remove_items: bool,
+    pub may_set_seen: bool,
+    pub may_set_keywords: bool,
+    pub may_create_child: bool,
+    pub may_rename: bool,
+    pub may_delete: bool,
+    pub may_submit: bool,
+}
+impl Mailbox {
+    /// Whether the sign-in may rename (or move) it.
+    pub fn may_rename(&self) -> bool {
+        self.my_rights.is_none_or(|r| r.may_rename)
+    }
+    /// Whether the sign-in may delete it.
+    pub fn may_delete(&self) -> bool {
+        self.my_rights.is_none_or(|r| r.may_delete)
+    }
+    /// Whether the sign-in may make folders inside it.
+    pub fn may_create_child(&self) -> bool {
+        self.my_rights.is_none_or(|r| r.may_create_child)
+    }
+    /// Whether messages may be added to it (filed, moved or copied there).
+    pub fn may_add_items(&self) -> bool {
+        self.my_rights.is_none_or(|r| r.may_add_items)
+    }
 }
 
 /// A name and address.
@@ -985,8 +1031,10 @@ impl Session {
     /// since (Mailbox/changes, then Mailbox/get of those in one request),
     /// else all of them.
     pub fn reload_mailboxes(&self) -> Result<Vec<Mailbox>> {
-        const PROPERTIES: [&str; 7] =
-            ["id", "name", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails"];
+        const PROPERTIES: [&str; 11] = [
+            "id", "name", "parentId", "role", "sortOrder", "totalEmails", "unreadEmails",
+            "totalThreads", "unreadThreads", "myRights", "isSubscribed",
+        ];
         let since = self.mailbox_state.lock().unwrap().clone();
         let known = self.mailboxes.lock().unwrap().clone();
         if !since.is_empty() && !known.is_empty() {
@@ -1081,6 +1129,11 @@ impl Session {
         }
     }
     pub fn create_mailbox(&self, name: &str, parent: Option<&str>) -> Result<String> {
+        if let Some(p) = parent
+            && let Some(m) = self.mailboxes.lock().unwrap().iter().find(|m| m.id == p)
+        {
+            ensure!(m.may_create_child(), "You may not make folders inside “{}”.", m.name);
+        }
         let v = self.one(
             "Mailbox/set",
             json!({
@@ -1099,24 +1152,91 @@ impl Session {
         Ok(id)
     }
     pub fn rename_mailbox(&self, id: &str, name: &str) -> Result<()> {
+        self.update_mailbox(id, json!({ "name": name }), "rename")
+    }
+    /// Moves a mailbox under `parent`, or (`None`) to the top (RFC 8621
+    /// §2: `parentId`); the server refuses a move into itself or one of
+    /// its own folders.
+    // Backend-only until the UI calls it: moving a mailbox under another (`Backend::move_folder_jmap`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn move_mailbox(&self, id: &str, parent: Option<&str>) -> Result<()> {
+        self.update_mailbox(id, json!({ "parentId": parent }), "move")
+    }
+    /// Subscribes to a mailbox, or not (RFC 8621 §2: `isSubscribed`).
+    // Backend-only until the UI calls it: subscribing to a mailbox (`Backend::subscribe_folder_jmap`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn subscribe_mailbox(&self, id: &str, subscribed: bool) -> Result<()> {
+        self.update_mailbox(id, json!({ "isSubscribed": subscribed }), "subscribe to")
+    }
+    fn update_mailbox(&self, id: &str, patch: Value, what: &str) -> Result<()> {
+        let known = self.mailboxes.lock().unwrap().iter().find(|m| m.id == id).cloned();
+        // RFC 8621 §2: moving and renaming both need `mayRename`.
+        if let Some(m) = &known
+            && (patch.get("name").is_some() || patch.get("parentId").is_some())
+        {
+            ensure!(m.may_rename(), "You may not {what} the folder “{}”.", m.name);
+        }
         let v = self.one(
             "Mailbox/set",
-            json!({ "accountId": self.account_id, "update": { id: { "name": name } } }),
+            json!({ "accountId": self.account_id, "update": { id: patch } }),
         )?;
         if let Some(e) = v["notUpdated"].get(id) {
-            bail!("The server didn't rename the folder: {}", set_error(e));
+            bail!("The server didn't {what} the folder: {}", set_error(e));
         }
         self.reload_mailboxes()?;
         Ok(())
     }
-    /// Deletes an empty mailbox; a mailbox with mail in it is refused.
-    pub fn destroy_mailbox(&self, id: &str) -> Result<()> {
+    /// The ids of mailboxes matching `filter`, in `sort` order
+    /// (Mailbox/query, RFC 8621 §2.3), and the query state.
+    // Backend-only until the UI calls it: listing subscribed mailboxes (`Backend::subscribed_folders_jmap`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn query_mailboxes(&self, filter: Value, sort_as_tree: bool) -> Result<(Vec<String>, String)> {
+        let v = self.one(
+            "Mailbox/query",
+            json!({
+                "accountId": self.account_id,
+                "filter": filter,
+                "sort": [{ "property": "sortOrder" }, { "property": "name" }],
+                "sortAsTree": sort_as_tree,
+            }),
+        )?;
+        let ids = v["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect();
+        Ok((ids, v["queryState"].as_str().unwrap_or_default().to_owned()))
+    }
+    /// What changed in a Mailbox/query's results since `since`
+    /// (Mailbox/queryChanges, RFC 8620 §5.6); `None` where the server can't
+    /// say, and the query is read again.
+    // Backend-only until the UI calls it: listing subscribed mailboxes (`Backend::subscribed_folders_jmap`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn mailbox_query_changes(&self, filter: Value, since: &str) -> Result<Option<QueryChanges>> {
+        let v = match self.one(
+            "Mailbox/queryChanges",
+            json!({
+                "accountId": self.account_id,
+                "filter": filter,
+                "sort": [{ "property": "sortOrder" }, { "property": "name" }],
+                "sinceQueryState": since,
+            }),
+        ) {
+            Ok(v) => v,
+            Err(e) if must_resync(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(read_query_changes(&v)))
+    }
+    /// Deletes a mailbox; with `remove_emails`, its messages go too where
+    /// they are in no other mailbox (RFC 8621 §2.5: `onDestroyRemoveEmails`),
+    /// rather than the server refusing a mailbox with mail in it.
+    pub fn destroy_mailbox_with(&self, id: &str, remove_emails: bool) -> Result<()> {
+        if let Some(m) = self.mailboxes.lock().unwrap().iter().find(|m| m.id == id) {
+            ensure!(m.may_delete(), "You may not delete the folder “{}”.", m.name);
+        }
         let v = self.one(
             "Mailbox/set",
             json!({
                 "accountId": self.account_id,
                 "destroy": [id],
-                "onDestroyRemoveEmails": false,
+                "onDestroyRemoveEmails": remove_emails,
             }),
         )?;
         if let Some(e) = v["notDestroyed"].get(id) {
@@ -1269,6 +1389,25 @@ impl Session {
     }
     /// Changes messages: each id with its patch (`keywords/$seen`: true…).
     pub fn update(&self, patches: Map<String, Value>) -> Result<()> {
+        // RFC 8621 §2: a mailbox without `mayAddItems` takes no messages;
+        // said here rather than as the server's "forbidden".
+        {
+            let boxes = self.mailboxes.lock().unwrap();
+            for patch in patches.values() {
+                let targets = patch.as_object().into_iter().flatten().flat_map(|(path, v)| {
+                    let one = path.strip_prefix("mailboxIds/").filter(|_| v == &Value::Bool(true)).map(str::to_owned);
+                    let all = (path == "mailboxIds")
+                        .then(|| v.as_object().into_iter().flatten().map(|(k, _)| k.clone()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    one.into_iter().chain(all)
+                });
+                for id in targets {
+                    if let Some(m) = boxes.iter().find(|m| m.id == id) {
+                        ensure!(m.may_add_items(), "You may not put messages in the folder “{}”.", m.name);
+                    }
+                }
+            }
+        }
         let all: Vec<(String, Value)> = patches.into_iter().collect();
         for chunk in all.chunks(self.max_set) {
             let update: Map<String, Value> = chunk.iter().cloned().collect();
@@ -1960,26 +2099,7 @@ impl Session {
             Err(e) if must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let removed = v["removed"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|i| i.as_str().map(str::to_owned))
-            .collect();
-        let added = v["added"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|a| {
-                Some((a["id"].as_str()?.to_owned(), a["index"].as_u64()? as usize))
-            })
-            .collect();
-        Ok(Some(QueryChanges {
-            removed,
-            added,
-            total: v["total"].as_u64().map(|n| n as usize),
-            new_state: v["newQueryState"].as_str().unwrap_or_default().to_owned(),
-        }))
+        Ok(Some(read_query_changes(&v)))
     }
     /// Copies messages from another account this sign-in reaches (shared
     /// with it) into this one, in `mailbox` (Email/copy, RFC 8621 §4.7).
@@ -2880,6 +3000,26 @@ pub struct IdentityChange {
 
 /// Conversations changed and gone since a state, and the new state.
 pub type ThreadChanges = (Vec<String>, Vec<String>, String);
+
+/// A /queryChanges response's changes (RFC 8620 §5.6).
+fn read_query_changes(v: &Value) -> QueryChanges {
+    QueryChanges {
+        removed: v["removed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect(),
+        added: v["added"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| Some((a["id"].as_str()?.to_owned(), a["index"].as_u64()? as usize)))
+            .collect(),
+        total: v["total"].as_u64().map(|n| n as usize),
+        new_state: v["newQueryState"].as_str().unwrap_or_default().to_owned(),
+    }
+}
 
 /// What changed in a query's results (Email/queryChanges).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

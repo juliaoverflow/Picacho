@@ -80,6 +80,9 @@ struct Server {
     cdn_auth: Vec<String>,
     /// Paths requested, in order.
     paths: Vec<String>,
+    /// Mailboxes as `Mailbox/set` left them, where it was used (else the
+    /// fixed `mailboxes()`).
+    boxes: Option<Vec<Value>>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -248,8 +251,59 @@ impl Server {
         };
         let state = self.state.to_string();
         match name {
+            "Mailbox/set" => {
+                let boxes = self.boxes.get_or_insert_with(|| Self::mailboxes().as_array().unwrap().clone());
+                let mut out = json!({ "updated": {}, "created": {}, "destroyed": [] });
+                for (key, props) in args["create"].as_object().into_iter().flatten() {
+                    let id = format!("box{}", boxes.len());
+                    let mut m = props.clone();
+                    m["id"] = json!(id);
+                    boxes.push(m);
+                    out["created"][key] = json!({ "id": id });
+                }
+                for (id, patch) in args["update"].as_object().into_iter().flatten() {
+                    let rights = boxes.iter().find(|m| m["id"] == id.as_str()).map(|m| m["myRights"].clone());
+                    if rights.as_ref().is_some_and(|r| r["mayRename"] == false) {
+                        out["notUpdated"][id] = json!({ "type": "forbidden" });
+                        continue;
+                    }
+                    let m = boxes.iter_mut().find(|m| m["id"] == id.as_str()).unwrap();
+                    for (k, v) in patch.as_object().unwrap() {
+                        m[k] = v.clone();
+                    }
+                    out["updated"][id] = Value::Null;
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    let id = id.as_str().unwrap().to_owned();
+                    let has = self.emails.iter().any(|e| e.mailboxes.contains(&id));
+                    if has && args["onDestroyRemoveEmails"] != true {
+                        out["notDestroyed"][&id] = json!({ "type": "mailboxHasEmail" });
+                        continue;
+                    }
+                    // Its messages go where they are in no other mailbox.
+                    self.emails.retain(|e| !(e.mailboxes == [id.clone()]));
+                    for e in &mut self.emails {
+                        e.mailboxes.retain(|m| *m != id);
+                    }
+                    self.boxes.as_mut().unwrap().retain(|m| m["id"] != id.as_str());
+                    out["destroyed"].as_array_mut().unwrap().push(json!(id));
+                }
+                vec![(name.into(), out)]
+            }
+            "Mailbox/query" => {
+                let all = self.boxes.clone().unwrap_or_else(|| Self::mailboxes().as_array().unwrap().clone());
+                let ids: Vec<&Value> = all
+                    .iter()
+                    .filter(|m| args["filter"]["isSubscribed"].as_bool().is_none_or(|on| m["isSubscribed"].as_bool().unwrap_or(true) == on))
+                    .map(|m| &m["id"])
+                    .collect();
+                vec![(name.into(), json!({ "ids": ids, "queryState": "mq1" }))]
+            }
             "Mailbox/get" => {
-                let all = Self::mailboxes();
+                let all = match &self.boxes {
+                    Some(b) => Value::Array(b.clone()),
+                    None => Self::mailboxes(),
+                };
                 let list = match ids_of(args) {
                     Some(ids) => all
                         .as_array()
@@ -260,7 +314,8 @@ impl Server {
                         .collect(),
                     None => all,
                 };
-                vec![(name.into(), json!({ "list": list, "state": "m1" }))]
+                let state = if self.boxes.is_some() { "m2" } else { "m1" };
+                vec![(name.into(), json!({ "list": list, "state": state }))]
             }
             // The mailboxes don't change here.
             "Mailbox/changes" if args["sinceState"] == "m1" => vec![(
@@ -2136,5 +2191,70 @@ fn jmap_card_changes_use_if_in_state() -> Result<()> {
         assert_eq!(s.cards[0]["notes"]["n1"]["note"], "Two");
         assert_eq!(s.calls.iter().filter(|c| *c == "ContactCard/set").count(), 2, "{:?}", s.calls);
     }
+    Ok(())
+}
+
+/// Mailboxes (RFC 8621 §2): rights, subscription and thread counts are
+/// read; a folder is moved under another and subscribed to; a folder the
+/// sign-in may not rename is refused before anything is sent; and a folder
+/// with mail is deleted with it only when asked (`onDestroyRemoveEmails`).
+#[test]
+fn jmap_mailbox_rights_moves_and_removal() -> Result<()> {
+    let mut fixture = Server::default();
+    fixture.boxes = Some(vec![
+        json!({ "id": "i", "name": "Inbox", "role": "inbox", "parentId": null, "totalThreads": 3, "unreadThreads": 1,
+                "myRights": { "mayRename": false, "mayDelete": false, "mayCreateChild": true, "mayAddItems": true } }),
+        json!({ "id": "w", "name": "Work", "parentId": null, "isSubscribed": true }),
+        json!({ "id": "r", "name": "Reports", "parentId": null, "myRights": { "mayAddItems": false } }),
+        json!({ "id": "p", "name": "Projects", "parentId": null, "isSubscribed": false }),
+    ]);
+    fixture.blobs.insert("B0".into(), MESSAGE.to_vec());
+    fixture.emails.push(Message {
+        id: "M1".into(),
+        blob: "B0".into(),
+        mailboxes: vec!["p".into()],
+        keywords: vec![],
+        subject: "Plans".into(),
+        received: "2026-10-24T10:00:00Z".into(),
+    });
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.with_jmap(&a, |s| {
+        let boxes = s.reload_mailboxes()?;
+        let inbox = boxes.iter().find(|m| m.id == "i").unwrap();
+        assert_eq!((inbox.total_threads, inbox.unread_threads), (3, 1));
+        assert!(!inbox.may_rename() && !inbox.may_delete() && inbox.may_create_child());
+        assert_eq!(boxes.iter().find(|m| m.id == "p").unwrap().is_subscribed, Some(false));
+        // Refused here: the server isn't asked.
+        let before = server.lock().unwrap().calls.len();
+        assert!(s.rename_mailbox("i", "Post").is_err());
+        assert!(s.move_mailbox("i", Some("w")).is_err());
+        assert!(s.destroy_mailbox_with("i", true).is_err());
+        assert_eq!(server.lock().unwrap().calls.len(), before);
+        // A folder that takes no messages: refused here.
+        let mut patch = serde_json::Map::new();
+        patch.insert("M1".into(), json!({ "mailboxIds/r": true }));
+        let e = s.update(patch).unwrap_err();
+        assert!(e.to_string().contains("Reports"), "{e}");
+        // With mail in it, unless its mail goes too: refused.
+        assert!(s.destroy_mailbox_with("p", false).is_err());
+        Ok(())
+    })?;
+    // Moved under Work, its path changing with it, and subscribed to.
+    let change = b.move_folder_jmap(&a, "Projects", Some("Work"))?;
+    assert_eq!(change.moved, [("Projects".to_owned(), "Work/Projects".to_owned())]);
+    assert!(b.move_folder_jmap(&a, "Work", Some("Work/Projects")).is_err(), "not inside itself");
+    assert!(!b.subscribed_folders_jmap(&a)?.contains(&"Work/Projects".to_owned()));
+    b.subscribe_folder_jmap(&a, "Work/Projects", true)?;
+    // This fixture has no Mailbox/queryChanges: listed again.
+    assert!(b.subscribed_folders_jmap(&a)?.contains(&"Work/Projects".to_owned()));
+    assert!(server.lock().unwrap().calls.contains(&"Mailbox/queryChanges".to_owned()));
+    // Deleted with the mail only it held.
+    let left = b.delete_remote_folder(&a, "Work/Projects")?;
+    assert!(left.iter().all(|f| f.name != "Work/Projects"));
+    assert!(server.lock().unwrap().emails.is_empty());
     Ok(())
 }
