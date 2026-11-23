@@ -1,6 +1,7 @@
 //! Finds server settings from an email address, following the order used by
 //! Thunderbird: the provider's own autoconfig file, the public ISPDB, the
-//! domain's MX records, and finally well-known hostnames.
+//! domain's SRV records, Exchange's Autodiscover, the domain's MX records,
+//! and finally well-known hostnames.
 //!
 //! JMAP (RFC 8620 §2.2) comes first where the domain names a JMAP server
 //! itself, with an `_jmap._tcp` SRV record whose target is in the domain; a
@@ -112,6 +113,7 @@ pub fn discover(email: &str) -> Option<Settings> {
         .map(|url| s.spawn(move || fetch_config(&url, email)));
         let mx = s.spawn(|| mx_host(domain));
         let mail_srv = s.spawn(|| mail_srv(domain));
+        let autodiscover = s.spawn(|| autodiscover(email, domain));
         // The domain names its JMAP server, in the domain: that is what it
         // wants used. One elsewhere waits until the HTTPS sources are asked.
         let srv = srv.join().ok().flatten();
@@ -128,6 +130,10 @@ pub fn discover(email: &str) -> Option<Settings> {
         }
         // The domain's own SRV records for mail (RFC 6186).
         if let Ok(Some(found)) = mail_srv.join() {
+            return Some(found);
+        }
+        // Exchange's Autodiscover, for domains whose servers run it.
+        if let Ok(Some(found)) = autodiscover.join() {
             return Some(found);
         }
         if let Ok(Some(mx)) = mx.join() {
@@ -521,6 +527,134 @@ fn substitute(text: &str, email: &str) -> String {
         .replace("%EMAILDOMAIN%", &domain)
 }
 
+/// Exchange's Autodiscover (the "POX" form, [MS-OXDSCLI] §3.1.5): an
+/// XML request posted to the domain's two well-known addresses, asking for
+/// the settings of mail clients that speak the standard protocols
+/// (`outlook/responseschema/2006a`). Only https is asked, with no redirect
+/// to another host followed: the answer names the servers the password
+/// goes to, and a redirect would let a network or a lookalike name them.
+fn autodiscover(email: &str, domain: &str) -> Option<Settings> {
+    let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .build()
+        .ok()?;
+    let request = autodiscover_request(email);
+    for url in [
+        format!("https://{domain}/autodiscover/autodiscover.xml"),
+        format!("https://autodiscover.{domain}/autodiscover/autodiscover.xml"),
+    ] {
+        let Ok(response) = client
+            .post(&url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .body(request.clone())
+            .send()
+        else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let mut body = String::new();
+        if response.take(256 * 1024).read_to_string(&mut body).is_err() {
+            continue;
+        }
+        if let Some(found) = parse_autodiscover(&body, email) {
+            return Some(found);
+        }
+    }
+    None
+}
+/// The Autodiscover request for `email`, escaped as XML text.
+fn autodiscover_request(email: &str) -> String {
+    let email = email
+        .trim()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">
+  <Request>
+    <EMailAddress>{email}</EMailAddress>
+    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+  </Request>
+</Autodiscover>"#
+    )
+}
+/// The IMAP, POP3 and SMTP settings in an Autodiscover answer
+/// ([MS-OXDSCLI] §2.2.4: `Protocol` elements of `Type` IMAP, POP3 and
+/// SMTP, each with `Server`, `Port` and `SSL`/`Encryption`). TLS is
+/// required: `Encryption` of TLS or SSL, or `SSL` on. On port 993, 995 or
+/// 465, TLS comes first; elsewhere, it is STARTTLS. An answer that only
+/// redirects (`Action` of redirectAddr/redirectUrl) is not followed.
+pub fn parse_autodiscover(xml: &str, email: &str) -> Option<Settings> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let account = doc
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "Account")?;
+    if child(account, "AccountType").is_some_and(|_| text(account, "AccountType").as_deref() != Some("email")) {
+        return None;
+    }
+    // (kind, host, port, starttls, login name)
+    let mut incoming: Option<(Provider, String, u16, bool, Option<String>)> = None;
+    let mut smtp: Option<(String, u16, bool)> = None;
+    for protocol in children(account, "Protocol") {
+        let Some(kind) = text(protocol, "Type") else { continue };
+        let (Some(host), Some(port)) = (
+            text(protocol, "Server").map(|h| h.trim_end_matches('.').to_ascii_lowercase()),
+            text(protocol, "Port").and_then(|p| p.parse::<u16>().ok()).filter(|p| *p > 0),
+        ) else {
+            continue;
+        };
+        if !crate::sync::mta_sts::is_domain(&host) {
+            continue;
+        }
+        let encrypted = match text(protocol, "Encryption").as_deref() {
+            Some(e) => matches!(e.to_ascii_lowercase().as_str(), "tls" | "ssl" | "auto"),
+            None => text(protocol, "SSL").is_none_or(|v| v.eq_ignore_ascii_case("on")),
+        };
+        if !encrypted {
+            continue;
+        }
+        let implicit = matches!(port, 993 | 995 | 465);
+        let login = text(protocol, "LoginName").filter(|l| !l.is_empty());
+        let rank = |kind: Provider, starttls: bool| (!starttls, kind == Provider::Imap);
+        match kind.to_ascii_uppercase().as_str() {
+            k @ ("IMAP" | "POP3") => {
+                let kind = if k == "IMAP" { Provider::Imap } else { Provider::Pop3 };
+                if incoming
+                    .as_ref()
+                    .is_none_or(|(existing, _, _, tls, _)| rank(kind, !implicit) > rank(*existing, *tls))
+                {
+                    incoming = Some((kind, host, port, !implicit, login));
+                }
+            }
+            "SMTP" => {
+                if smtp.as_ref().is_none_or(|(.., tls)| implicit && !*tls) {
+                    smtp = Some((host, port, implicit));
+                }
+            }
+            _ => {}
+        }
+    }
+    let ((provider, incoming_host, incoming_port, incoming_starttls, login), (smtp_host, smtp_port, smtp_tls)) =
+        (incoming?, smtp?);
+    Some(Settings {
+        provider,
+        incoming_host,
+        incoming_port,
+        smtp_host,
+        smtp_port,
+        smtp_tls: Some(smtp_tls),
+        incoming_starttls,
+        sso: None,
+        username: login.filter(|l| !l.eq_ignore_ascii_case(email.trim())),
+    })
+}
+
 /// The domain's most preferred mail server, through the system's DNS
 /// resolver, so no third-party DNS service learns the address being
 /// configured.
@@ -762,6 +896,39 @@ mod tests {
                 .collect::<String>()
         );
         assert_eq!(parse_config(&bomb, "a@example.org"), None);
+    }
+
+    /// Exchange's Autodiscover (POX) answer for an IMAP/POP3/SMTP mailbox.
+    #[test]
+    fn exchange_autodiscover_answers_are_read() {
+        let answer = r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
+  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">
+    <User><DisplayName>Ana</DisplayName></User>
+    <Account>
+      <AccountType>email</AccountType>
+      <Action>settings</Action>
+      <Protocol><Type>EXCH</Type><Server>exch.example.com</Server></Protocol>
+      <Protocol><Type>POP3</Type><Server>pop.example.com</Server><Port>995</Port><SSL>on</SSL></Protocol>
+      <Protocol><Type>IMAP</Type><Server>mail.example.com</Server><Port>143</Port><SSL>off</SSL></Protocol>
+      <Protocol><Type>IMAP</Type><Server>mail.example.com</Server><Port>993</Port><SSL>on</SSL><LoginName>EXAMPLE\ana</LoginName></Protocol>
+      <Protocol><Type>SMTP</Type><Server>smtp.example.com</Server><Port>587</Port><Encryption>TLS</Encryption></Protocol>
+    </Account>
+  </Response>
+</Autodiscover>"#;
+        let found = parse_autodiscover(answer, "ana@example.com").unwrap();
+        assert_eq!(found.provider, Provider::Imap);
+        assert_eq!((found.incoming_host.as_str(), found.incoming_port, found.incoming_starttls), ("mail.example.com", 993, false));
+        assert_eq!((found.smtp_host.as_str(), found.smtp_port, found.smtp_tls), ("smtp.example.com", 587, Some(false)));
+        assert_eq!(found.username.as_deref(), Some("EXAMPLE\\ana"));
+        // Plain only: nothing usable.
+        let plain = answer.replace("<Port>993</Port><SSL>on</SSL>", "<Port>143</Port><SSL>off</SSL>").replace("<Port>995</Port><SSL>on</SSL>", "<Port>110</Port><SSL>off</SSL>");
+        assert_eq!(parse_autodiscover(&plain, "ana@example.com"), None);
+        // A redirect isn't settings.
+        let redirect = r#"<Autodiscover><Response><Account><AccountType>email</AccountType><Action>redirectAddr</Action><RedirectAddr>x@elsewhere.example</RedirectAddr></Account></Response></Autodiscover>"#;
+        assert_eq!(parse_autodiscover(redirect, "ana@example.com"), None);
+        // The request names the address, escaped.
+        assert!(autodiscover_request("a&b@example.com").contains("<EMailAddress>a&amp;b@example.com</EMailAddress>"));
     }
 
     /// RFC 5890: international domains in their ASCII form.
