@@ -663,15 +663,23 @@ pub(crate) struct Resync {
 /// validity still matches, the server answers with VANISHED (EARLIER) for
 /// what was removed and FETCH for what changed since `modseq`. Returns
 /// the selected state, and the resync when the validity matched.
+/// `known` are the UIDs kept here (RFC 7162 §3.2.5.1's known-uids): the
+/// server reports as VANISHED only those, not every UID ever removed.
 pub(crate) fn select_qresync(
     session: &mut ImapSession,
     name: &str,
     utf8: bool,
     validity: u32,
     modseq: u64,
+    known: &[u32],
 ) -> Result<(Selected, Option<Resync>)> {
     let wire = wire_name(name, utf8);
-    let command = format!("SELECT {} (QRESYNC ({validity} {modseq}))", quote(&wire)?);
+    let known = if known.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", super::imap::uid_ranges(known))
+    };
+    let command = format!("SELECT {} (QRESYNC ({validity} {modseq}{known}))", quote(&wire)?);
     let data = session.run_command_and_read_response(command)?;
     // Where a mailbox was selected before, its end is marked `[CLOSED]`
     // (RFC 7162 §3.2.11): what came before is about that one, not this.

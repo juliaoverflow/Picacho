@@ -551,6 +551,7 @@ impl Connection {
         name: &str,
         validity: u32,
         modseq: u64,
+        known: &[u32],
     ) -> Result<(Selected, Option<crate::sync::transport::Resync>)> {
         self.selected = None;
         if let Some(tap) = &self.tap {
@@ -562,6 +563,7 @@ impl Connection {
             self.enabled.utf8,
             validity,
             modseq,
+            known,
         );
         let heard = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         let (mut selected, resync) = result?;

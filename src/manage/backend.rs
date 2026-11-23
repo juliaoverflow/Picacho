@@ -1507,7 +1507,19 @@ impl Backend {
             .filter(|s| c.enabled.qresync && s.days == a.sync.days && s.uid_next > 0)
             .and_then(|s| s.modseq.map(|m| (s.validity, m)));
         let (selected, resync) = match resync_from {
-            Some((validity, modseq)) => c.select_resync(remote, validity, modseq)?,
+            Some((validity, modseq)) => {
+                // The UIDs kept here (known-uids, RFC 7162 §3.2.5.1): only
+                // their removals are reported, not every UID ever removed.
+                let prefix = format!("{}:{remote}:{validity}:", a.id);
+                let mut known: Vec<u32> = self
+                    .store
+                    .cached_ids(&a.id, &prefix)?
+                    .iter()
+                    .filter_map(|id| id.strip_prefix(&prefix)?.parse().ok())
+                    .collect();
+                known.sort_unstable();
+                c.select_resync(remote, validity, modseq, &known)?
+            }
             None => (c.select(remote)?, None),
         };
         let Some((state, uid_next)) = state.zip(selected.uid_next).filter(|(state, next)| {
