@@ -186,6 +186,10 @@ pub(crate) struct Exchange {
     gss: Option<Box<dyn crate::sync::gss::Context>>,
     /// Challenges answered so far (see `MAX_STEPS`).
     steps: u32,
+    /// The identity to act as, when not the signed-in user's own (a shared
+    /// mailbox): SCRAM's `a=` (RFC 5802 §5.1) and PLAIN's authzid (RFC
+    /// 4616 §2). Empty: the user's own, and the messages are as without.
+    authzid: String,
 }
 
 /// The most challenges one sign-in answers. Every mechanism here finishes
@@ -204,7 +208,15 @@ impl Exchange {
             nonce: None,
             gss: None,
             steps: 0,
+            authzid: String::new(),
         }
+    }
+    /// The exchange, acting as `authzid` (see `Exchange::authzid`). No
+    /// account sets one yet: that needs a setting of its own.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn acting_as(mut self, authzid: &str) -> Self {
+        self.authzid = authzid.trim().to_owned();
+        self
     }
     pub(crate) fn mechanism(&self) -> Mechanism {
         self.mechanism
@@ -233,9 +245,10 @@ impl Exchange {
         } = &self.credentials;
         let state = std::mem::replace(&mut self.state, State::Done);
         let (answer, next) = match (self.mechanism, state) {
-            (Mechanism::Plain, State::Start) => {
-                (format!("\0{user}\0{secret}").into_bytes(), State::Done)
-            }
+            (Mechanism::Plain, State::Start) => (
+                format!("{}\0{user}\0{secret}", self.authzid).into_bytes(),
+                State::Done,
+            ),
             (Mechanism::Login, State::Start) => (user.clone().into_bytes(), State::LoginUser),
             (Mechanism::Login, State::LoginUser) => (secret.clone().into_bytes(), State::Done),
             (Mechanism::CramMd5, State::Start) => {
@@ -318,7 +331,10 @@ impl Exchange {
                     // The user to sign in as: the ticket's own unless a
                     // different sign-in name is set (authorization identity):
                     // empty asks for the ticket's own (RFC 4752 §3.1).
-                    answer.extend_from_slice(user.trim().as_bytes());
+                    // An authorization identity set for the exchange
+                    // takes the place of the sign-in name.
+                    let acting = if self.authzid.is_empty() { user.trim() } else { &self.authzid };
+                    answer.extend_from_slice(acting.as_bytes());
                     (context.wrap(&answer)?, State::Done)
                 }
             }
@@ -328,16 +344,23 @@ impl Exchange {
                     .clone()
                     .unwrap_or_else(|| STANDARD.encode(rand::random::<[u8; 18]>()));
                 let bare = format!("n={},r={nonce}", saslname(user));
+                // RFC 5802 §7: gs2-header = gs2-cbind-flag "," [authzid] ",",
+                // with authzid = "a=" saslname.
+                let authzid = if self.authzid.is_empty() {
+                    String::new()
+                } else {
+                    format!("a={}", saslname(&self.authzid))
+                };
                 let header = if m.plus() {
                     ensure!(
                         !self.credentials.binding.is_empty(),
                         "The connection's channel binding isn't known."
                     );
-                    "p=tls-server-end-point,,".to_owned()
+                    format!("p=tls-server-end-point,{authzid},")
                 } else {
                     // Not "y,,": servers behind a TLS-ending proxy offer no
                     // -PLUS and would refuse a client that says it could.
-                    "n,,".to_owned()
+                    format!("n,{authzid},")
                 };
                 (
                     format!("{header}{bare}").into_bytes(),
@@ -793,6 +816,38 @@ mod tests {
         Ok(())
     }
 
+    /// RFC 5802 §5.1 and RFC 4616 §2: an authorization identity, escaped,
+    /// in SCRAM's GS2 header (and so in its binding data, `c=`) and as
+    /// PLAIN's first field; none leaves the messages as before.
+    #[test]
+    fn authzid_is_sent_only_when_set() -> Result<()> {
+        // None: the RFC 7677 exchange byte for byte (`n,,`, `c=biws`).
+        let mut x = Exchange::new(Mechanism::ScramSha256, credentials("user", "pencil")).acting_as("");
+        x.nonce = Some("rOprNGfwEbeRWgbNEkqO".into());
+        assert_eq!(x.initial().unwrap(), b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+        let answer = x.step(b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")?;
+        assert_eq!(answer, b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=".to_vec());
+        x.finish(Some(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="))?;
+        // Set: `a=` with `=` and `,` escaped, and the header in `c=`.
+        let mut x = Exchange::new(Mechanism::ScramSha256, credentials("user", "pencil")).acting_as("shared=box,1");
+        x.nonce = Some("abc".into());
+        assert_eq!(x.initial().unwrap(), b"n,a=shared=3Dbox=2C1,n=user,r=abc");
+        let answer = String::from_utf8(x.step(b"r=abcdef,s=QSXCR+Q6sek8bf92,i=4096")?)?;
+        assert!(answer.starts_with(&format!("c={},", STANDARD.encode("n,a=shared=3Dbox=2C1,"))), "{answer}");
+        // With channel binding the header is the binding's, with `a=`.
+        let mut c = credentials("user", "pencil");
+        c.binding = vec![7; 32];
+        let mut x = Exchange::new(Mechanism::ScramSha256Plus, c).acting_as("shared");
+        x.nonce = Some("abc".into());
+        assert_eq!(x.initial().unwrap(), b"p=tls-server-end-point,a=shared,n=user,r=abc");
+        // PLAIN: authzid NUL authcid NUL password.
+        let mut x = Exchange::new(Mechanism::Plain, credentials("ana", "secret")).acting_as("shared");
+        assert_eq!(x.initial().unwrap(), b"shared\0ana\0secret");
+        let mut x = Exchange::new(Mechanism::Plain, credentials("ana", "secret"));
+        assert_eq!(x.initial().unwrap(), b"\0ana\0secret");
+        Ok(())
+    }
+
     /// RFC 2195's example.
     #[test]
     fn cram_md5_matches_rfc_2195() -> Result<()> {
@@ -917,6 +972,11 @@ mod tests {
         x.step(b"ap-rep")?;
         x.step(b"")?;
         assert_eq!(x.step(b"W\x01\x00\x10\x00")?, b"W\x01\x00\x00\x00ana");
+        // An authorization identity is the one asked for instead.
+        let mut x = kerberos_exchange("ana", true).acting_as("shared");
+        x.initial();
+        x.step(b"ap-rep")?;
+        assert_eq!(x.step(b"W\x01\x00\x10\x00")?, b"W\x01\x00\x00\x00shared");
         Ok(())
     }
 }
