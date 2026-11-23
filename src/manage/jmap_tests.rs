@@ -1119,9 +1119,12 @@ fn jmap_sieve_filters_and_vacation() -> Result<()> {
     assert!(again.active);
     assert_eq!(again.filters, filters);
 
-    // Saved again: the same script is replaced, not a second one made.
+    // Saved again: the same script is replaced, not a second one made,
+    // and its text uploaded once for both validating and saving (RFC 9661).
+    let blobs_before = server.lock().unwrap().blobs.len();
     b.save_filters(&a, &filters)?;
     assert_eq!(server.lock().unwrap().scripts.len(), 2);
+    assert_eq!(server.lock().unwrap().blobs.len(), blobs_before + 1);
 
     // No rules: back to the script it included.
     let mut none = filters.clone();

@@ -2265,10 +2265,16 @@ impl Session {
         let bytes = self.download(&script.blob_id, name, "application/sieve", 1 << 20)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
-    /// Checks a script the server would run, without saving it.
-    pub fn sieve_validate(&self, text: &str) -> Result<()> {
+    /// Uploads a script's text, returning its blob id, which validating
+    /// and saving then both name (RFC 9661 §2.2, §2.3): it goes up once.
+    pub fn sieve_upload(&self, text: &str) -> Result<String> {
         self.require_sieve()?;
-        let blob = self.upload_inline(text.as_bytes(), "application/sieve")?;
+        self.upload_inline(text.as_bytes(), "application/sieve")
+    }
+    /// Checks a script the server would run (uploaded as `blob`), without
+    /// saving it.
+    pub fn sieve_validate(&self, blob: &str) -> Result<()> {
+        self.require_sieve()?;
         let v = self.one(
             "SieveScript/validate",
             json!({ "accountId": self.account_id, "blobId": blob }),
@@ -2281,11 +2287,10 @@ impl Session {
         }
         Ok(())
     }
-    /// Saves `text` as the script named `name` (replacing `existing`, its id
-    /// if it is there) and makes it the active one.
-    pub fn sieve_put(&self, name: &str, text: &str, existing: Option<&str>) -> Result<()> {
+    /// Saves the script uploaded as `blob` under `name` (replacing
+    /// `existing`, its id if it is there) and makes it the active one.
+    pub fn sieve_put(&self, name: &str, blob: &str, existing: Option<&str>) -> Result<()> {
         self.require_sieve()?;
-        let blob = self.upload_inline(text.as_bytes(), "application/sieve")?;
         let (args, key, activate) = match existing {
             Some(id) => (
                 json!({ "update": { id: { "blobId": blob } } }),

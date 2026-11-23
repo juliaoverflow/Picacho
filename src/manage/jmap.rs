@@ -1740,8 +1740,9 @@ impl Backend {
                     s.sieve_activate(back)?;
                 }
             } else {
-                s.sieve_validate(&text)?;
-                s.sieve_put(sieve::SCRIPT, &text, own.map(|x| x.id.as_str()))?;
+                let blob = s.sieve_upload(&text)?;
+                s.sieve_validate(&blob)?;
+                s.sieve_put(sieve::SCRIPT, &blob, own.map(|x| x.id.as_str()))?;
             }
             let other = scripts
                 .iter()
