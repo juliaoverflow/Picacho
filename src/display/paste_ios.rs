@@ -2,6 +2,7 @@
 //! string; apps copy formatting alongside it as HTML (`public.html`), a web
 //! archive (Safari) or RTF (Notes, Pages, Mail), each turned into HTML here.
 use super::Run;
+use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{Encode, Encoding, RefEncode, class, msg_send};
 use std::ffi::{CStr, CString, c_void};
@@ -40,10 +41,14 @@ const TRAIT_MONO_SPACE: u32 = 1 << 10;
 
 /// The pasteboard's formatting as HTML, when it has some.
 pub(super) fn clipboard_html() -> Option<String> {
+    // UIKit's pasteboard and its attributed-string document conversions
+    // (which use WebKit for HTML) belong to the main thread; the composer
+    // pastes from it.
+    objc2::MainThreadMarker::new()?;
     objc2::rc::autoreleasepool(|_| {
         // Safety: UIKit and Foundation messages with their documented
         // argument and return types; objects come from the autorelease pool
-        // above or are released below.
+        // above or are owned by a `Retained` that releases them.
         unsafe {
             let board: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
             if board.is_null() {
@@ -62,12 +67,13 @@ pub(super) fn clipboard_html() -> Option<String> {
                 ("com.apple.flat-rtfd", NSRTFDTextDocumentType),
             ] {
                 let Some(d) = data(board, kind) else { continue };
+                let Some(text) = attributed_string(d, document) else { continue };
                 // UIKit's own HTML of it first: headings, quotes, lists and
                 // tables kept, which styled runs alone lose.
-                if let Some(html) = attributed_html(d, document) {
+                if let Some(html) = attributed_html(&text) {
                     return Some(html);
                 }
-                if let Some(runs) = attributed_runs(d, document) {
+                if let Some(runs) = attributed_runs(&text) {
                     return Some(super::runs_to_html(&runs));
                 }
             }
@@ -145,15 +151,21 @@ unsafe fn web_archive_html(data: *mut AnyObject) -> Option<String> {
     }
 }
 
-/// RTF (or RTFD) as HTML, by UIKit's own conversion of the attributed
-/// string (`NSHTMLTextDocumentType`).
-unsafe fn attributed_html(data: *mut AnyObject, document: *const AnyObject) -> Option<String> {
+/// RTF (or RTFD) read as an attributed string, owned (released when
+/// dropped).
+unsafe fn attributed_string(
+    data: *mut AnyObject,
+    document: *const AnyObject,
+) -> Option<Retained<AnyObject>> {
     unsafe {
         let options: *mut AnyObject = msg_send![
             class!(NSDictionary),
             dictionaryWithObject: document,
             forKey: NSDocumentTypeDocumentAttribute
         ];
+        // `alloc` and `init…` each hand over a +1 reference: `init…` takes
+        // the allocation's and returns its own, or releases it and returns
+        // nil when the data doesn't parse.
         let text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
         let text: *mut AnyObject = msg_send![
             text,
@@ -162,53 +174,39 @@ unsafe fn attributed_html(data: *mut AnyObject, document: *const AnyObject) -> O
             documentAttributes: null_mut::<*mut AnyObject>(),
             error: null_mut::<*mut AnyObject>()
         ];
-        if text.is_null() {
-            return None;
-        }
+        Retained::from_raw(text)
+    }
+}
+
+/// An attributed string as HTML, by UIKit's own conversion
+/// (`NSHTMLTextDocumentType`, written as UTF-8, its default for HTML).
+unsafe fn attributed_html(text: &AnyObject) -> Option<String> {
+    unsafe {
+        // NSRange counts UTF-16 units, as `length` does.
         let len: usize = msg_send![text, length];
-        let out_options: *mut AnyObject = msg_send![
+        let options: *mut AnyObject = msg_send![
             class!(NSDictionary),
             dictionaryWithObject: NSHTMLTextDocumentType,
             forKey: NSDocumentTypeDocumentAttribute
         ];
+        // Autoreleased, so it lives until the pool in `clipboard_html` ends.
         let html: *mut AnyObject = msg_send![
             text,
             dataFromRange: NSRange { location: 0, length: len },
-            documentAttributes: out_options,
+            documentAttributes: options,
             error: null_mut::<*mut AnyObject>()
         ];
-        let out = if html.is_null() { None } else { utf8(html) };
-        let _: () = msg_send![text, release];
-        out
+        if html.is_null() { None } else { utf8(html) }
     }
 }
 
-/// RTF (or RTFD) read as an attributed string, as its styled runs.
-unsafe fn attributed_runs(data: *mut AnyObject, document: *const AnyObject) -> Option<Vec<Run>> {
-    unsafe {
-        let options: *mut AnyObject = msg_send![
-            class!(NSDictionary),
-            dictionaryWithObject: document,
-            forKey: NSDocumentTypeDocumentAttribute
-        ];
-        let text: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let text: *mut AnyObject = msg_send![
-            text,
-            initWithData: data,
-            options: options,
-            documentAttributes: null_mut::<*mut AnyObject>(),
-            error: null_mut::<*mut AnyObject>()
-        ];
-        if text.is_null() {
-            return None;
-        }
-        let runs = runs(text);
-        let _: () = msg_send![text, release];
-        (!runs.is_empty()).then_some(runs)
-    }
+/// An attributed string as its styled runs.
+unsafe fn attributed_runs(text: &AnyObject) -> Option<Vec<Run>> {
+    let runs = unsafe { runs(text) };
+    (!runs.is_empty()).then_some(runs)
 }
 
-unsafe fn runs(text: *mut AnyObject) -> Vec<Run> {
+unsafe fn runs(text: &AnyObject) -> Vec<Run> {
     let mut out = vec![];
     unsafe {
         let string: *mut AnyObject = msg_send![text, string];
