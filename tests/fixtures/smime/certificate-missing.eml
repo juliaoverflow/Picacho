@@ -1,0 +1,30 @@
+From: Ana <ana@example.org>
+To: bo@example.se
+Subject: Plans
+MIME-Version: 1.0
+Content-Type: multipart/signed; protocol="application/pkcs7-signature"; micalg="sha-256"; boundary="----BD923974891454189DB2AF5C6CB3D4D1"
+
+This is an S/MIME signed message
+
+------BD923974891454189DB2AF5C6CB3D4D1
+Content-Type: text/plain; charset=utf-8
+
+Meet at noon.
+
+------BD923974891454189DB2AF5C6CB3D4D1
+Content-Type: application/pkcs7-signature; name="smime.p7s"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="smime.p7s"
+
+MIIBgwYJKoZIhvcNAQcCoIIBdDCCAXACAQExDTALBglghkgBZQMEAgEwCwYJKoZI
+hvcNAQcBMYIBTTCCAUkCAQEwMjAaMRgwFgYDVQQDDA9QaWNhY2hvIFRlc3QgQ0EC
+FAHPPGLrtAoo3G9KIJsDcSK33DLkMAsGCWCGSAFlAwQCAaCBrTAYBgkqhkiG9w0B
+CQMxCwYJKoZIhvcNAQcBMBwGCSqGSIb3DQEJBTEPFw0yNjExMjMyMjU0MzFaMC8G
+CSqGSIb3DQEJBDEiBCD3k7XBvFeqczo+LqIoeZQG7ZkzBsw0t7jdoJIBdXjB+DBC
+BgkqhkiG9w0BCQ8xNTAzMAsGCWCGSAFlAwQBKjALBglghkgBZQMEARYwCwYJYIZI
+AWUDBAECMAoGCCqGSIb3DQMHMAoGCCqGSM49BAMCBEcwRQIgE3e+41yX+tHJ3Meq
+Lk9ti+oH1tsbvKUqxhDqwXld4AMCIQDqpwL4+VEuikaCuZoATbUgbvJ/tADNbru0
+osNVQWyFlw==
+
+------BD923974891454189DB2AF5C6CB3D4D1--
+

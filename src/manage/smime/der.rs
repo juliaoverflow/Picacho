@@ -189,12 +189,229 @@ pub(super) fn single(input: &[u8]) -> Result<Tlv<'_>, Error> {
     Ok(tlv)
 }
 
+/// One value: `tag`, the DER length (X.690 §10.1: its shortest form) and
+/// `parts` as its contents, in order.
+pub(super) fn encode(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(len + 6);
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let digits = len.to_be_bytes();
+        let first = digits.iter().position(|&d| d != 0).unwrap_or(digits.len() - 1);
+        let digits = digits.get(first..).unwrap_or_default();
+        out.push(0x80 | digits.len() as u8);
+        out.extend_from_slice(digits);
+    }
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+pub(super) const SEQUENCE: u8 = 0x30;
+pub(super) const SET: u8 = 0x31;
+const INTEGER: u8 = 0x02;
+const OCTET_STRING: u8 = 0x04;
+const OID: u8 = 0x06;
+/// `[0]` and `[1]`, constructed (EXPLICIT, or IMPLICIT SET OF).
+const CONTEXT_0: u8 = 0xa0;
+const CONTEXT_1: u8 = 0xa1;
+/// `[0]` IMPLICIT, primitive: SignerIdentifier's subjectKeyIdentifier.
+const CONTEXT_0_PRIMITIVE: u8 = 0x80;
+
+/// RFC 5652 §5.1: id-signedData, 1.2.840.113549.1.7.2.
+pub(super) const SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+/// RFC 3274 §1.1: id-ct-compressedData, 1.2.840.113549.1.9.16.1.9.
+pub(super) const COMPRESSED_DATA: &[u8] =
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x09];
+/// RFC 3274 §1.1: id-alg-zlibCompress, 1.2.840.113549.1.9.16.3.8.
+const ZLIB_COMPRESS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x03, 0x08];
+
+/// RFC 5652 §3: ContentInfo's contentType and its `[0] EXPLICIT` content.
+pub(super) fn content_info(input: &[u8]) -> Result<(&[u8], Tlv<'_>), Error> {
+    let mut info = single(input)?.children()?;
+    let oid = info.read_tag(OID)?.value;
+    let mut explicit = info.read_tag(CONTEXT_0)?.children()?;
+    info.finish()?;
+    let content = explicit.read()?;
+    explicit.finish()?;
+    Ok((oid, content))
+}
+
+/// RFC 5652 §5.1: a SignedData, its fields kept as their raw encodings.
+pub(super) struct SignedData<'a> {
+    version: Tlv<'a>,
+    digest_algorithms: Tlv<'a>,
+    encap_content_info: Tlv<'a>,
+    certificates: Option<Tlv<'a>>,
+    crls: Option<Tlv<'a>>,
+    pub signer_infos: Vec<Tlv<'a>>,
+}
+
+impl<'a> SignedData<'a> {
+    /// The SignedData a DER ContentInfo holds.
+    pub fn parse(input: &'a [u8]) -> Result<Self, Error> {
+        let (oid, content) = content_info(input)?;
+        if oid != SIGNED_DATA {
+            return Err(Error::Unexpected {
+                expected: OID,
+                found: content.tag,
+            });
+        }
+        let mut fields = content.children()?;
+        let version = fields.read_tag(INTEGER)?;
+        let digest_algorithms = fields.read_tag(SET)?;
+        let encap_content_info = fields.read_tag(SEQUENCE)?;
+        let certificates = fields.optional(CONTEXT_0)?;
+        let crls = fields.optional(CONTEXT_1)?;
+        let mut signers = fields.read_tag(SET)?.children()?;
+        fields.finish()?;
+        let mut signer_infos = Vec::new();
+        while !signers.is_empty() {
+            signer_infos.push(signers.read_tag(SEQUENCE)?);
+        }
+        Ok(Self {
+            version,
+            digest_algorithms,
+            encap_content_info,
+            certificates,
+            crls,
+            signer_infos,
+        })
+    }
+    /// The certificates it carries, each as its DER encoding. RFC 5652
+    /// §10.2.2: other choices (attribute certificates, `[n]`-tagged) are
+    /// skipped.
+    pub fn certificates(&self) -> Result<Vec<&'a [u8]>, Error> {
+        let mut out = Vec::new();
+        if let Some(certificates) = self.certificates {
+            let mut choices = certificates.children()?;
+            while !choices.is_empty() {
+                let choice = choices.read()?;
+                if choice.tag == SEQUENCE {
+                    out.push(choice.raw);
+                }
+            }
+        }
+        Ok(out)
+    }
+    /// The encapsulated content (RFC 5652 §5.2 eContent), where it isn't
+    /// detached.
+    pub fn content(&self) -> Result<Option<&'a [u8]>, Error> {
+        let mut encap = self.encap_content_info.children()?;
+        encap.read_tag(OID)?;
+        let Some(explicit) = encap.optional(CONTEXT_0)? else {
+            return Ok(None);
+        };
+        encap.finish()?;
+        let mut explicit = explicit.children()?;
+        let content = explicit.read_tag(OCTET_STRING)?;
+        explicit.finish()?;
+        Ok(Some(content.value))
+    }
+    /// A ContentInfo with this SignedData's version, digest algorithms,
+    /// content, certificates and CRLs, and only `signer_infos` (each a raw
+    /// SignerInfo): OpenSSL checks every signer at once, so each is checked
+    /// alone in one. RFC 5652 §5.1 makes signerInfos a SET OF, so they are
+    /// written in DER order (X.690 §11.6).
+    pub fn with_signers(&self, signer_infos: &[&[u8]]) -> Vec<u8> {
+        let mut sorted = signer_infos.to_vec();
+        sorted.sort();
+        let signer_infos = encode(SET, &sorted);
+        let mut fields: Vec<&[u8]> = vec![
+            self.version.raw,
+            self.digest_algorithms.raw,
+            self.encap_content_info.raw,
+        ];
+        fields.extend(self.certificates.map(|c| c.raw));
+        fields.extend(self.crls.map(|c| c.raw));
+        fields.push(&signer_infos);
+        let signed_data = encode(SEQUENCE, &fields);
+        let oid = encode(OID, &[SIGNED_DATA]);
+        encode(SEQUENCE, &[&oid, &encode(CONTEXT_0, &[&signed_data])])
+    }
+}
+
+/// RFC 5652 §5.3: who made a signature.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SignerId<'a> {
+    /// The issuer's Name (its DER) and the serial number's content octets.
+    IssuerAndSerial { issuer: &'a [u8], serial: &'a [u8] },
+    SubjectKeyId(&'a [u8]),
+}
+
+/// A SignerInfo's SignerIdentifier.
+pub(super) fn signer_id<'a>(signer_info: &Tlv<'a>) -> Result<SignerId<'a>, Error> {
+    let mut fields = signer_info.children()?;
+    fields.read_tag(INTEGER)?;
+    if let Some(key_id) = fields.optional(CONTEXT_0_PRIMITIVE)? {
+        return Ok(SignerId::SubjectKeyId(key_id.value));
+    }
+    let mut issuer_and_serial = fields.read_tag(SEQUENCE)?.children()?;
+    let issuer = issuer_and_serial.read_tag(SEQUENCE)?.raw;
+    let serial = issuer_and_serial.read_tag(INTEGER)?.value;
+    issuer_and_serial.finish()?;
+    Ok(SignerId::IssuerAndSerial { issuer, serial })
+}
+
+/// RFC 5280 §4.1: a certificate's issuer (its DER) and serial number's
+/// content octets, to match against a SignerIdentifier.
+pub(super) fn issuer_and_serial(certificate: &[u8]) -> Result<(&[u8], &[u8]), Error> {
+    let mut certificate = single(certificate)?.children()?;
+    let mut tbs = certificate.read_tag(SEQUENCE)?.children()?;
+    tbs.optional(CONTEXT_0)?;
+    let serial = tbs.read_tag(INTEGER)?.value;
+    tbs.read_tag(SEQUENCE)?;
+    let issuer = tbs.read_tag(SEQUENCE)?.raw;
+    Ok((issuer, serial))
+}
+
+/// RFC 3274 §1.1: the zlib stream a DER CompressedData ContentInfo holds.
+pub(super) fn compressed_content(input: &[u8]) -> Result<&[u8], Error> {
+    let (oid, content) = content_info(input)?;
+    if oid != COMPRESSED_DATA {
+        return Err(Error::Unexpected {
+            expected: OID,
+            found: content.tag,
+        });
+    }
+    let mut fields = content.children()?;
+    fields.read_tag(INTEGER)?;
+    let mut algorithm = fields.read_tag(SEQUENCE)?.children()?;
+    let algorithm_oid = algorithm.read_tag(OID)?;
+    if algorithm_oid.value != ZLIB_COMPRESS {
+        return Err(Error::Unexpected {
+            expected: OID,
+            found: algorithm_oid.tag,
+        });
+    }
+    let mut encap = fields.read_tag(SEQUENCE)?.children()?;
+    fields.finish()?;
+    encap.read_tag(OID)?;
+    let mut explicit = encap.read_tag(CONTEXT_0)?.children()?;
+    encap.finish()?;
+    let content = explicit.read_tag(OCTET_STRING)?;
+    explicit.finish()?;
+    Ok(content.value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SEQUENCE: u8 = 0x30;
-    const INTEGER: u8 = 0x02;
+    #[test]
+    fn der_encode_writes_minimal_lengths_the_reader_reads_back() {
+        for len in [0usize, 1, 0x7f, 0x80, 0xff, 0x100, 0xffff, 0x10000] {
+            let value = vec![9u8; len];
+            let encoded = encode(0x04, &[&value[..len / 2], &value[len / 2..]]);
+            let tlv = single(&encoded).unwrap();
+            assert_eq!((tlv.tag, tlv.value.len()), (0x04, len), "{len}");
+        }
+        assert_eq!(encode(0x30, &[&[0x05, 0x00]]), [0x30, 0x02, 0x05, 0x00]);
+        assert_eq!(&encode(0x04, &[&[0u8; 0x80]])[..3], &[0x04, 0x81, 0x80]);
+    }
 
     /// Every value under `tlv`, depth first, as far as the reader allows.
     fn walk(tlv: Tlv<'_>, seen: &mut usize) -> Result<(), Error> {

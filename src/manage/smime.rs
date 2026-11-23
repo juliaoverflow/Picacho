@@ -8,15 +8,14 @@
 //! authorities; one that checks out, but by a certificate they don't vouch
 //! for, is shown as such rather than as good.
 use crate::manage::store;
-// Used by per-signer verification, which follows in the next commit.
-#[allow(dead_code)]
 mod der;
 use anyhow::{Context, Result, bail, ensure};
+use openssl::cms::{CMSOptions, CmsContentInfo};
 use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
 use openssl::pkey::{PKey, Private};
 use openssl::stack::Stack;
 use openssl::symm::Cipher;
-use openssl::x509::{X509, store::X509StoreBuilder};
+use openssl::x509::{X509, store::{X509StoreBuilder, X509StoreRef}};
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(test, allow(dead_code))]
@@ -49,7 +48,37 @@ pub struct CertInfo {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verdict {
     pub decrypted: bool,
+    /// The message as a whole: see `overall` for how its signers add up.
     pub signature: Signature,
+    /// Each signature's own result: outer layers first, and within one in
+    /// the order the message lists them.
+    pub signers: Vec<Signer>,
+    /// A certs-only message's certificates (RFC 8551 §3.6), as PEM, for
+    /// importing when asked. They vouch for nothing by being sent.
+    pub certificates: Vec<String>,
+}
+
+/// One SignerInfo's result (RFC 5652 §5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signer {
+    /// The address in the signer's certificate, or "an unknown signer"
+    /// when the message doesn't carry it.
+    pub address: String,
+    pub result: SignerResult,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerResult {
+    /// The signature matches, by a certificate a trusted authority issued.
+    Good,
+    /// The signature matches; no trusted authority vouches for it.
+    Untrusted,
+    /// The message doesn't carry the signer's certificate, so the
+    /// signature couldn't be checked.
+    Unverified,
+    /// The signature doesn't match the content, or its certificate isn't
+    /// one for signing mail.
+    Bad,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -63,6 +92,9 @@ pub enum Signature {
     /// The signature matches, but the certificate isn't for the address the
     /// message says it is from: someone else signed it.
     OtherSender(String),
+    /// Signed, but the message doesn't carry the certificate of anyone who
+    /// signed it, so no signature could be checked.
+    Unverified,
     /// The signature doesn't match: the message was changed, or forged.
     Bad,
 }
@@ -79,6 +111,9 @@ impl Signature {
             }
             Self::OtherSender(who) => {
                 format!("Signed by {who} (S/MIME), who isn't the sender shown")
+            }
+            Self::Unverified => {
+                "Signed with S/MIME, by a certificate the message doesn't include: it couldn't be checked".into()
             }
             Self::Bad => {
                 "The S/MIME signature doesn't match: the message may have been changed".into()
@@ -309,6 +344,13 @@ impl Certificates {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     }
+    /// Every certificate kept, yours and others': a signature whose
+    /// certificate the message doesn't carry is checked with these.
+    fn known(&self) -> Vec<X509> {
+        let mut out: Vec<X509> = self.identities().into_iter().map(|(c, _, _)| c).collect();
+        out.extend(self.others());
+        out
+    }
     pub fn has_own(&self, email: &str) -> bool {
         self.own_for(email).is_some()
     }
@@ -499,11 +541,25 @@ fn trusted_store() -> Result<openssl::x509::store::X509Store> {
 }
 
 /// Opens an S/MIME message: decrypts it with your key and checks its
-/// signature. Returns the readable message (with its outer headers), what
+/// signatures. Returns the readable message (with its outer headers), what
 /// was found, and the signer's certificate (to keep, so you can write to
 /// them encrypted). `None` when it has no S/MIME protection, or can't be
 /// opened.
 pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Option<X509>)> {
+    let store = trusted_store().ok()?;
+    open_with(raw, certs, &store)
+}
+
+/// The most layers read: encryption, a signature, a second signature (RFC
+/// 2634 §1.1's triple wrapping) and one compression.
+const MAX_LAYERS: usize = 4;
+
+/// `open`, with signatures checked against `store`.
+fn open_with(
+    raw: &[u8],
+    certs: &Certificates,
+    store: &X509StoreRef,
+) -> Option<(Vec<u8>, Verdict, Option<X509>)> {
     // As OpenPGP's: past this, the copies made opening it (decoded,
     // decrypted, each layer's) would be several times its size.
     if raw.len() > crate::manage::crypto::MAX_MESSAGE {
@@ -523,65 +579,78 @@ pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Optio
     let mut current = raw.to_vec();
     let mut verdict = Verdict::default();
     let mut signer = None;
-    // Up to two layers: encrypted, then signed (or signed opaquely).
-    for _ in 0..3 {
-        let (k, smime_type) = kind(&current)?;
-        if matches!(
+    let mut compressed = false;
+    let known = certs.known();
+    for _ in 0..MAX_LAYERS {
+        let (k, _) = kind(&current)?;
+        let (content, found) = if matches!(
             k.as_str(),
             "application/pkcs7-mime" | "application/x-pkcs7-mime"
         ) {
-            let (p7, _) = Pkcs7::from_smime(&current).ok()?;
-            // smime-type is optional (RFC 8551 §3.2.2): without it, the
-            // structure itself says whether it's signed.
-            let signed = smime_type == "signed-data"
-                || (smime_type.is_empty() && p7.signed().is_some());
-            if signed {
-                // Opaque signing: the content is inside the signature.
-                let (out, verified, who) = verify(&p7, None)?;
-                // A layer that failed stays failed: an inner signature that
-                // checks out doesn't hide that an outer one didn't.
-                if verdict.signature != Signature::Bad {
-                    verdict.signature = verified;
+            // The structure itself says what it is (RFC 8551 §3.2.2:
+            // smime-type is optional, and a sender can get it wrong).
+            // Read through OpenSSL and written back as DER, which also
+            // turns BER's indefinite lengths into definite ones.
+            let der = CmsContentInfo::smime_read_cms(&current).ok()?.to_der().ok()?;
+            let (oid, _) = der::content_info(&der).ok()?;
+            if oid == der::SIGNED_DATA {
+                let signed = der::SignedData::parse(&der).ok()?;
+                if signed.signer_infos.is_empty() && signed.content().ok()?.is_none() {
+                    // RFC 8551 §3.6: certs-only, a way of handing over
+                    // certificates. Shown as it came, for importing.
+                    verdict.certificates = signed
+                        .certificates()
+                        .ok()?
+                        .into_iter()
+                        .filter_map(|c| X509::from_der(c).ok()?.to_pem().ok())
+                        .filter_map(|pem| String::from_utf8(pem).ok())
+                        .collect();
+                    if verdict.certificates.is_empty() {
+                        return None;
+                    }
+                    break;
                 }
-                signer = who;
-                current = out;
-                continue;
+                let (content, signers) = check_signers(&der, None, store, &known)?;
+                (content, Some(signers))
+            } else if oid == der::COMPRESSED_DATA {
+                // RFC 3274: one level, at most, so a small message can't
+                // unpack into a large one again and again.
+                if compressed {
+                    return None;
+                }
+                compressed = true;
+                (inflate(der::compressed_content(&der).ok()?, crate::manage::crypto::MAX_MESSAGE)?, None)
+            } else {
+                let p7 = Pkcs7::from_der(&der).ok()?;
+                let opened = certs
+                    .identities()
+                    .into_iter()
+                    .find_map(|(cert, _, key)| p7.decrypt(&key, &cert, Pkcs7Flags::BINARY).ok())?;
+                verdict.decrypted = true;
+                (opened, None)
             }
-            let opened = certs
-                .identities()
-                .into_iter()
-                .find_map(|(cert, _, key)| p7.decrypt(&key, &cert, Pkcs7Flags::BINARY).ok())?;
-            verdict.decrypted = true;
-            current = opened;
         } else if k.starts_with("multipart/signed;") {
-            let (p7, content) = Pkcs7::from_smime(&current).ok()?;
-            let content = content?;
-            let (_, verified, who) = verify(&p7, Some(&content))?;
-            if verdict.signature != Signature::Bad {
-                verdict.signature = verified;
-            }
-            signer = who;
-            current = content;
+            let (content, signature) = signed_parts(&current)?;
+            let der = CmsContentInfo::from_der(&signature).ok()?.to_der().ok()?;
+            let (_, signers) = check_signers(&der, Some(&content), store, &known)?;
+            (content, Some(signers))
         } else {
             break;
-        }
-    }
-    // A signature is the sender's only with a certificate for the address
-    // the message is from: a message signed by one person can be sent on,
-    // re-encrypted, as from another.
-    if let (Some(cert), Signature::Good(_) | Signature::Untrusted(_)) = (&signer, &verdict.signature) {
-        let from = {
-            use mailparse::MailHeaderMap as _;
-            mailparse::parse_headers(raw)
-                .ok()
-                .and_then(|(h, _)| h.get_first_value("From"))
-                .map(|v| crate::sync::mime::receipt_address(&v).to_lowercase())
-                .unwrap_or_default()
         };
-        if !from.is_empty() && !emails(cert).contains(&from) {
-            let who = emails(cert).into_iter().next().unwrap_or_else(|| "an unknown sender".into());
-            verdict.signature = Signature::OtherSender(who);
+        if let Some(found) = found {
+            let (signature, cert) = overall(&found, raw);
+            // A layer that failed stays failed: an inner signature that
+            // checks out doesn't hide that an outer one didn't.
+            if verdict.signature != Signature::Bad {
+                verdict.signature = signature;
+                signer = cert;
+            }
+            verdict.signers.extend(found.into_iter().map(|(s, _)| s));
         }
+        current = content;
+    }
+    if !verdict.certificates.is_empty() {
+        return Some((raw.to_vec(), verdict, None));
     }
     let mut readable = outer;
     readable.extend_from_slice(b"MIME-Version: 1.0\r\n");
@@ -608,40 +677,153 @@ pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Optio
     Some((readable, verdict, signer))
 }
 
-/// Checks a signature: first against trusted authorities, then for the
-/// signature alone. Returns the signed content, the verdict and the signer.
-fn verify(p7: &Pkcs7, content: Option<&[u8]>) -> Option<(Vec<u8>, Signature, Option<X509>)> {
-    let empty = Stack::new().ok()?;
-    let signer = p7
-        .signers(&empty, Pkcs7Flags::empty())
-        .ok()
-        .and_then(|s| s.iter().next().map(|c| c.to_owned()));
-    let who = signer
-        .as_ref()
-        .and_then(|c| emails(c).into_iter().next())
-        .unwrap_or_else(|| "an unknown sender".into());
-    let store = trusted_store().ok()?;
+/// RFC 1847 §2.1: a multipart/signed's first part, byte for byte as it was
+/// signed, and its second, the signature, decoded.
+fn signed_parts(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let parsed = mailparse::parse_mail(raw).ok()?;
+    let [content, signature] = parsed.subparts.as_slice() else {
+        return None;
+    };
+    Some((content.raw_bytes.to_vec(), signature.get_body_raw().ok()?))
+}
+
+/// RFC 3274 §1.1: zlib-compressed content, inflated up to `limit` (the
+/// largest message opened); past that, it isn't.
+fn inflate(packed: &[u8], limit: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
     let mut out = Vec::new();
-    if p7
-        .verify(&empty, &store, content, Some(&mut out), Pkcs7Flags::BINARY)
-        .is_ok()
-    {
-        return Some((out, Signature::Good(who), signer));
+    flate2::read::ZlibDecoder::new(packed)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() <= limit).then_some(out)
+}
+
+/// The message as a whole, from its signers' results (RFC 5652 §5.1 lets
+/// one message carry several): Bad if any signature is cryptographically
+/// invalid; otherwise the best of the rest, so a good signature beside one
+/// that couldn't be checked shows as good. The certificate is that best
+/// signer's, preferring one for the address the message is from.
+fn overall(signers: &[(Signer, Option<X509>)], raw: &[u8]) -> (Signature, Option<X509>) {
+    if signers.iter().any(|(s, _)| s.result == SignerResult::Bad) {
+        let cert = signers
+            .iter()
+            .find(|(s, _)| s.result == SignerResult::Bad)
+            .and_then(|(_, c)| c.clone());
+        return (Signature::Bad, cert);
     }
-    out.clear();
-    let unchecked = Pkcs7Flags::BINARY | Pkcs7Flags::NOVERIFY;
+    let from = {
+        use mailparse::MailHeaderMap as _;
+        mailparse::parse_headers(raw)
+            .ok()
+            .and_then(|(h, _)| h.get_first_value("From"))
+            .map(|v| crate::sync::mime::receipt_address(&v).to_lowercase())
+            .unwrap_or_default()
+    };
+    for best in [SignerResult::Good, SignerResult::Untrusted] {
+        let mut candidates = signers.iter().filter(|(s, _)| s.result == best);
+        let first = candidates.clone().next();
+        let chosen = candidates
+            .find(|(_, c)| c.as_ref().is_some_and(|c| emails(c).contains(&from)))
+            .or(first);
+        let Some((signer, cert)) = chosen else {
+            continue;
+        };
+        let who = signer.address.clone();
+        // A signature is the sender's only with a certificate for the
+        // address the message is from: a message signed by one person can
+        // be sent on, re-encrypted, as from another.
+        let other = !from.is_empty() && cert.as_ref().is_some_and(|c| !emails(c).contains(&from));
+        let signature = match (other, best) {
+            (true, _) => Signature::OtherSender(who),
+            (false, SignerResult::Good) => Signature::Good(who),
+            (false, _) => Signature::Untrusted(who),
+        };
+        return (signature, cert.clone());
+    }
+    (Signature::Unverified, None)
+}
+
+/// The certificate a SignerInfo names (RFC 5652 §5.3 SignerIdentifier),
+/// from the message's own or those already known.
+fn signer_certificate(signer_info: &der::Tlv<'_>, message: &[X509], known: &[X509]) -> Option<X509> {
+    let id = der::signer_id(signer_info).ok()?;
+    message.iter().chain(known).find_map(|cert| {
+        let matches = match id {
+            der::SignerId::SubjectKeyId(key_id) => {
+                cert.subject_key_id().is_some_and(|k| k.as_slice() == key_id)
+            }
+            der::SignerId::IssuerAndSerial { issuer, serial } => {
+                let encoded = cert.to_der().ok()?;
+                der::issuer_and_serial(&encoded).ok() == Some((issuer, serial))
+            }
+        };
+        matches.then(|| cert.clone())
+    })
+}
+
+/// Checks each signature of a DER SignedData on its own, the content
+/// (`detached`, or the one inside) and certificates kept. Returns the
+/// content and each signer's result with its certificate.
+fn check_signers(
+    der: &[u8],
+    detached: Option<&[u8]>,
+    store: &X509StoreRef,
+    known: &[X509],
+) -> Option<(Vec<u8>, Vec<(Signer, Option<X509>)>)> {
+    let signed = der::SignedData::parse(der).ok()?;
+    let content = match detached {
+        Some(content) => content.to_vec(),
+        None => signed.content().ok()??.to_vec(),
+    };
+    let message: Vec<X509> = signed
+        .certificates()
+        .ok()?
+        .into_iter()
+        .filter_map(|c| X509::from_der(c).ok())
+        .collect();
+    let mut out = Vec::new();
+    for signer_info in &signed.signer_infos {
+        let cert = signer_certificate(signer_info, &message, known);
+        let address = cert
+            .as_ref()
+            .and_then(|c| emails(c).into_iter().next())
+            .unwrap_or_else(|| "an unknown signer".into());
+        let result = match &cert {
+            None => SignerResult::Unverified,
+            Some(cert) => check_one(&signed.with_signers(&[signer_info.raw]), detached, cert, store),
+        };
+        out.push((Signer { address, result }, cert));
+    }
+    Some((content, out))
+}
+
+/// One signer's SignedData, checked first against trusted authorities, then
+/// for the signature alone. CMS_verify compares the messageDigest attribute
+/// with the content's digest (RFC 5652 §5.4), so changed content fails both.
+fn check_one(single: &[u8], detached: Option<&[u8]>, cert: &X509, store: &X509StoreRef) -> SignerResult {
+    let attempt = |flags: CMSOptions| -> bool {
+        let Ok(mut cms) = CmsContentInfo::from_der(single) else {
+            return false;
+        };
+        let Ok(mut extra) = Stack::new() else {
+            return false;
+        };
+        if extra.push(cert.clone()).is_err() {
+            return false;
+        }
+        cms.verify(Some(&extra), Some(store), detached, None, flags).is_ok()
+    };
+    if attempt(CMSOptions::BINARY) {
+        return SignerResult::Good;
+    }
     // Checked without its chain (NOVERIFY), so the certificate itself is
     // checked here: in its dates (OpenSSL checks them with the chain, for
     // Good), and meant for signing mail where it says what it's for.
-    if p7
-        .verify(&empty, &store, content, Some(&mut out), unchecked)
-        .is_ok()
-        && signer.as_ref().is_some_and(usable_for_mail)
-    {
-        return Some((out, Signature::Untrusted(who), signer));
+    if attempt(CMSOptions::BINARY | CMSOptions::NOVERIFY) && usable_for_mail(cert) {
+        return SignerResult::Untrusted;
     }
-    let content = content.map(<[u8]>::to_vec).unwrap_or_default();
-    Some((content, Signature::Bad, signer))
+    SignerResult::Bad
 }
 
 /// Keeps the signer's certificate from a signed message, so you can write
@@ -654,7 +836,7 @@ fn verify(p7: &Pkcs7, content: Option<&[u8]>) -> Option<(Vec<u8>, Signature, Opt
 /// certificate yet for its addresses, so a stranger's can never replace
 /// one already kept; one an authority vouches for replaces what was kept.
 pub fn learn(certs: &mut Certificates, signer: &X509, verdict: &Signature, from: &str) -> Result<bool> {
-    if matches!(verdict, Signature::Bad | Signature::None) {
+    if matches!(verdict, Signature::Bad | Signature::None | Signature::Unverified) {
         return Ok(false);
     }
     let addresses = emails(signer);
@@ -921,5 +1103,223 @@ mod tests {
         let fp = ana.list()[1].fingerprint.clone();
         ana.remove(&fp);
         assert_eq!(ana.list().len(), 1);
+    }
+
+    /// The fixtures tests/fixtures/smime/make.sh makes with the openssl CLI.
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = format!("{}/tests/fixtures/smime/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// The fixtures' test authority, as the only one trusted.
+    fn test_authority() -> openssl::x509::store::X509Store {
+        let mut builder = X509StoreBuilder::new().unwrap();
+        builder.add_cert(X509::from_pem(&fixture("ca.pem")).unwrap()).unwrap();
+        builder.build()
+    }
+
+    fn untrusting() -> openssl::x509::store::X509Store {
+        X509StoreBuilder::new().unwrap().build()
+    }
+
+    /// The signers' results, sorted: RFC 5652 §5.1's signerInfos is a SET,
+    /// whose DER order isn't the order they signed in.
+    fn results(verdict: &Verdict) -> Vec<(&str, SignerResult)> {
+        let mut out: Vec<_> = verdict.signers.iter().map(|s| (s.address.as_str(), s.result)).collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    #[test]
+    fn each_of_two_signers_is_checked_on_its_own() {
+        let (readable, verdict, signer) =
+            open_with(&fixture("two-signers.eml"), &Certificates::default(), &test_authority()).unwrap();
+        assert_eq!(
+            results(&verdict),
+            [("ana@example.org", SignerResult::Good), ("bo@example.se", SignerResult::Good)]
+        );
+        // The message is from Ana: hers is the signature shown and kept.
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        assert_eq!(signer.map(|c| emails(&c)), Some(vec!["ana@example.org".to_owned()]));
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+    }
+
+    /// RFC 5652 §5.4: each signature covers the content through its
+    /// messageDigest attribute, so changed content fails every signer.
+    #[test]
+    fn changed_content_fails_every_signer() {
+        let raw = String::from_utf8(fixture("two-signers.eml")).unwrap();
+        let changed = raw.replace("Meet at noon.", "Meet at nine.");
+        let (_, verdict, _) =
+            open_with(changed.as_bytes(), &Certificates::default(), &test_authority()).unwrap();
+        assert_eq!(
+            results(&verdict),
+            [("ana@example.org", SignerResult::Bad), ("bo@example.se", SignerResult::Bad)]
+        );
+        assert_eq!(verdict.signature, Signature::Bad);
+    }
+
+    /// A signer whose certificate the message lacks is unverified, not bad:
+    /// beside a good one the message shows as good.
+    #[test]
+    fn a_signer_without_a_certificate_is_unverified_not_bad() {
+        let (_, verdict, _) = open_with(
+            &fixture("one-certificate-missing.eml"),
+            &Certificates::default(),
+            &test_authority(),
+        )
+        .unwrap();
+        assert_eq!(
+            results(&verdict),
+            [("an unknown signer", SignerResult::Unverified), ("ana@example.org", SignerResult::Good)]
+        );
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        // Untrusted beside unverified is untrusted.
+        let (_, verdict, _) =
+            open_with(&fixture("one-certificate-missing.eml"), &Certificates::default(), &untrusting())
+                .unwrap();
+        assert_eq!(verdict.signature, Signature::Untrusted("ana@example.org".into()));
+        // Only unverified signers: unverified.
+        let (readable, verdict, signer) =
+            open_with(&fixture("certificate-missing.eml"), &Certificates::default(), &test_authority())
+                .unwrap();
+        assert_eq!(results(&verdict), [("an unknown signer", SignerResult::Unverified)]);
+        assert_eq!(verdict.signature, Signature::Unverified);
+        assert!(signer.is_none());
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+        // With Bo's certificate already kept, his signature is checked.
+        let mut known = Certificates::default();
+        known.others.push(String::from_utf8(fixture("bo.pem")).unwrap());
+        let (_, verdict, _) =
+            open_with(&fixture("certificate-missing.eml"), &known, &test_authority()).unwrap();
+        assert_eq!(results(&verdict), [("bo@example.se", SignerResult::Good)]);
+        // Bo's signature on mail from Ana: not Ana's.
+        assert_eq!(verdict.signature, Signature::OtherSender("bo@example.se".into()));
+    }
+
+    /// One cryptographically invalid signature makes the message bad, beside
+    /// a good one or one that couldn't be checked.
+    #[test]
+    fn one_invalid_signature_makes_the_message_bad() {
+        let (content, signature) = signed_parts(&fixture("two-signers.eml")).unwrap();
+        let der = CmsContentInfo::from_der(&signature).unwrap().to_der().unwrap();
+        let signed = der::SignedData::parse(&der).unwrap();
+        let [ana, bo] = [signed.signer_infos[0].raw, signed.signer_infos[1].raw];
+        // SignerInfo ends with its signature value (RFC 5652 §5.3, no
+        // unsigned attributes here): one bit of it changed.
+        let mut forged = bo.to_vec();
+        if let Some(last) = forged.last_mut() {
+            *last ^= 1;
+        }
+        let store = test_authority();
+        let check = |infos: &[&[u8]]| {
+            let mixed = signed.with_signers(infos);
+            let (_, found) = check_signers(&mixed, Some(&content), &store, &[]).unwrap();
+            let mut results: Vec<SignerResult> = found.iter().map(|(s, _)| s.result).collect();
+            results.sort_by_key(|r| *r as u8);
+            (results, overall(&found, b"From: ana@example.org\r\n\r\n").0)
+        };
+        assert_eq!(
+            check(&[ana, &forged]),
+            (vec![SignerResult::Good, SignerResult::Bad], Signature::Bad)
+        );
+        // The forged signature alone is bad too.
+        let (_, found) =
+            check_signers(&signed.with_signers(&[&forged]), Some(&content), &store, &[]).unwrap();
+        assert_eq!(found[0].0.result, SignerResult::Bad);
+        assert_eq!(
+            check(&[ana, bo]),
+            (vec![SignerResult::Good, SignerResult::Good], Signature::Good("ana@example.org".into()))
+        );
+    }
+
+    /// How signers add up, for every mix of results.
+    #[test]
+    fn overall_result_is_bad_if_any_is_and_otherwise_the_best() {
+        let ana = X509::from_pem(&fixture("ana.pem")).unwrap();
+        let signer = |result, cert: Option<&X509>| {
+            let address = cert.map_or("an unknown signer".into(), |c| emails(c)[0].clone());
+            (Signer { address, result }, cert.cloned())
+        };
+        let from = b"From: Ana <ana@example.org>\r\n\r\n";
+        let good = || Signature::Good("ana@example.org".into());
+        let untrusted = || Signature::Untrusted("ana@example.org".into());
+        use SignerResult::*;
+        for (mix, expected) in [
+            (vec![signer(Good, Some(&ana)), signer(Unverified, None)], good()),
+            (vec![signer(Unverified, None), signer(Untrusted, Some(&ana))], untrusted()),
+            (vec![signer(Untrusted, Some(&ana)), signer(Good, Some(&ana))], good()),
+            (vec![signer(Good, Some(&ana)), signer(Bad, Some(&ana))], Signature::Bad),
+            (vec![signer(Unverified, None), signer(Bad, Some(&ana))], Signature::Bad),
+            (vec![signer(Unverified, None), signer(Unverified, None)], Signature::Unverified),
+            (vec![], Signature::Unverified),
+        ] {
+            assert_eq!(overall(&mix, from).0, expected, "{mix:?}");
+        }
+    }
+
+    /// RFC 8551 §3.6: certs-only mail hands over certificates, signs nothing.
+    #[test]
+    fn certs_only_mail_lists_its_certificates() {
+        let (readable, verdict, signer) =
+            open_with(&fixture("certs-only.eml"), &Certificates::default(), &test_authority()).unwrap();
+        assert_eq!(verdict.signature, Signature::None);
+        assert!(verdict.signers.is_empty() && signer.is_none() && !verdict.decrypted);
+        let names: Vec<String> = verdict
+            .certificates
+            .iter()
+            .map(|pem| name(X509::from_pem(pem.as_bytes()).unwrap().subject_name()))
+            .collect();
+        let mut names = names;
+        names.sort();
+        assert_eq!(names, ["Ana", "Picacho Test CA"]);
+        assert_eq!(readable, fixture("certs-only.eml"));
+    }
+
+    /// RFC 3274: compressed content, alone or inside a signature, opens;
+    /// compressed twice, it doesn't.
+    #[test]
+    fn compressed_mail_opens_once_compressed() {
+        let none = Certificates::default();
+        let (readable, verdict, _) = open_with(&fixture("compressed.eml"), &none, &test_authority()).unwrap();
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+        assert_eq!(verdict.signature, Signature::None);
+        let (readable, verdict, _) =
+            open_with(&fixture("signed-compressed.eml"), &none, &test_authority()).unwrap();
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        assert!(open_with(&fixture("compressed-twice.eml"), &none, &test_authority()).is_none());
+    }
+
+    #[test]
+    fn compressed_content_is_inflated_only_up_to_the_limit() {
+        use std::io::Write as _;
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        zlib.write_all(&vec![0u8; 100_000]).unwrap();
+        let packed = zlib.finish().unwrap();
+        assert!(packed.len() < 1_000);
+        assert_eq!(inflate(&packed, 100_000).map(|v| v.len()), Some(100_000));
+        assert_eq!(inflate(&packed, 99_999), None);
+        assert_eq!(inflate(b"not zlib", 100), None);
+    }
+
+    /// Opaque signing as Outlook writes it: BER, with indefinite lengths.
+    #[test]
+    fn opaque_ber_signed_mail_is_checked() {
+        let (readable, verdict, _) =
+            open_with(&fixture("opaque-signed-ber.eml"), &Certificates::default(), &test_authority())
+                .unwrap();
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+    }
+
+    /// Old PKCS#7 mail (application/x-pkcs7-signature, as `openssl smime`
+    /// and older clients write it) still reads.
+    #[test]
+    fn old_pkcs7_signed_mail_still_reads() {
+        let (readable, verdict, _) =
+            open_with(&fixture("pkcs7-signed.eml"), &Certificates::default(), &test_authority()).unwrap();
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
     }
 }
