@@ -1013,6 +1013,19 @@ mod tests {
         }
     }
 
+    /// Against the real DNS: `cargo test -- --ignored dane_live`. A
+    /// signed domain with DANE, a signed one without, an unsigned one, and
+    /// the deliberately broken dnssec-failed.org.
+    #[test]
+    #[ignore = "needs the network and a DNS resolver that passes DNSSEC records"]
+    fn dane_live() {
+        assert_eq!(dane("ietf.org").ok(), Some(true), "ietf.org publishes DANE");
+        assert_eq!(dane("gmail.com").ok(), Some(false));
+        // Bogus: refused, whether found so here or by a validating resolver
+        // upstream (which answers SERVFAIL).
+        assert!(dane("dnssec-failed.org").is_err(), "bogus records refuse delivery");
+    }
+
     #[test]
     fn srv_records_go_by_priority_then_weight() {
         let mut rng = rand::rng();
