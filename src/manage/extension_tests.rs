@@ -1723,6 +1723,7 @@ fn command_with_literals(p: &mut Peer) -> Option<(String, String, Vec<Vec<u8>>)>
             command.push_str(&line);
             return Some((tag, command, literals));
         };
+        // literal8 (`~{n}`, RFC 3516) is read the same, its `~` kept.
         command.push_str(&line[..open]);
         command.push_str("{}");
         p.send("+ go ahead\r\n");
@@ -2620,6 +2621,62 @@ fn folder_changes_heard_while_idle_relist_the_folders() -> Result<()> {
     assert_eq!(notify.len(), 2, "{seen:?}");
     assert!(notify[0].contains("MailboxName SubscriptionChange"), "{notify:?}");
     assert!(!notify[1].contains("MailboxName"), "{notify:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// RFC 6855 §4: with UTF8=ACCEPT on, a message whose headers are UTF-8
+/// itself is appended with APPEND's UTF8 form and a literal8; an ASCII one
+/// with plain APPEND.
+#[test]
+fn utf8_messages_are_appended_as_utf8() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut appends = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literals)) = command_with_literals(&mut p) {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 ENABLE UTF8=ACCEPT UIDPLUS\r\n");
+                } else if upper.starts_with("ENABLE") {
+                    p.send("* ENABLED UTF8=ACCEPT\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Sent) \"/\" Sent\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 0 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH\r\n");
+                } else if upper.starts_with("APPEND") {
+                    appends.push((command.clone(), literals));
+                    p.send(&format!("{tag} OK [APPENDUID 42 {}] Saved\r\n", appends.len()));
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        appends
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let international = "From: José <josé@example.com>\r\nSubject: Olá\r\nMessage-ID: <u@example.com>\r\n\r\nCorpo.\r\n";
+    let ascii = "From: Ana <ana@example.com>\r\nSubject: Hi\r\nMessage-ID: <a@example.com>\r\n\r\nBody.\r\n";
+    b.with_imap(&a, |c| b.file_sent_copy(c, &a, international.as_bytes()))?;
+    b.with_imap(&a, |c| b.file_sent_copy(c, &a, ascii.as_bytes()))?;
+    b.disconnect(&a.id);
+    let appends = server.join().unwrap();
+    assert_eq!(appends.len(), 2, "{appends:?}");
+    assert_eq!(appends[0].0, "APPEND \"Sent\" (\\Seen) UTF8 (~{})");
+    assert_eq!(appends[0].1, [international.as_bytes().to_vec()]);
+    assert!(!appends[1].0.contains("UTF8"), "{:?}", appends[1].0);
     drop(b);
     std::fs::remove_dir_all(path)?;
     Ok(())

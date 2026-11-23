@@ -362,8 +362,10 @@ impl Literals {
                         current.extend_from_slice(t.as_bytes())
                     }
                 }
-                Part::Literal(bytes) => {
-                    let size = format!("{{{}}}", bytes.len());
+                Part::Literal(bytes) | Part::Literal8(bytes) => {
+                    // literal8 (RFC 3516 §4.1, RFC 6855 §4): `~{n}`.
+                    let tilde = if matches!(part, Part::Literal8(_)) { "~" } else { "" };
+                    let size = format!("{tilde}{{{}}}", bytes.len());
                     if first {
                         line.push_str(&size);
                         first = false;
@@ -391,6 +393,8 @@ impl Literals {
 pub(crate) enum Part<'a> {
     Text(&'a str),
     Literal(&'a [u8]),
+    /// Bytes of any kind, NUL too (literal8: `~{n}`).
+    Literal8(&'a [u8]),
 }
 impl ImapStream {
     pub(crate) fn new(tls: native_tls::TlsStream<Wire>) -> Self {

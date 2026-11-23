@@ -4715,7 +4715,7 @@ impl Backend {
                     .filter(|(v, _)| *v == selected.validity)
                     .map(|(_, uid)| uid);
                 if replaced.is_none() {
-                    c.session.append_with_flags(&wire, &raw, &flags)?;
+                    c.append_heard(&wire, &raw, &flags)?;
                 }
                 // The new copy is the newest message carrying this draft's
                 // id: mail another app added meanwhile can't be taken for it.

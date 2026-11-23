@@ -91,12 +91,43 @@ impl Connection {
         raw: &[u8],
         flags: &[imap::types::Flag<'_>],
     ) -> imap::error::Result<Vec<u8>> {
+        if let Some(heard) = self.append_utf8(mailbox, raw, flags, None)? {
+            return Ok(heard);
+        }
         if let Some(tap) = &self.tap {
             tap.start();
         }
         let result = self.session.append_with_flags(mailbox, raw, flags);
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
+    }
+    /// A message whose headers are UTF-8 itself (internationalized mail)
+    /// appended as UTF8 (RFC 6855 §4: `APPEND … UTF8 (~{n}…)`), where
+    /// UTF8=ACCEPT is on; plain APPEND would carry it as if it were
+    /// 7-bit. `None` where that isn't needed, or can't be sent here.
+    fn append_utf8(
+        &mut self,
+        mailbox: &str,
+        raw: &[u8],
+        flags: &[imap::types::Flag<'_>],
+        date: Option<chrono::DateTime<chrono::FixedOffset>>,
+    ) -> imap::error::Result<Option<Vec<u8>>> {
+        use crate::sync::stream::Part;
+        if !self.enabled.utf8 || self.tap.is_none() || !utf8_headers(raw) {
+            return Ok(None);
+        }
+        let quoted = crate::sync::transport::quote(mailbox)
+            .map_err(|e| imap::error::Error::Bad(format!("{e:#}")))?;
+        let date = date
+            .map(|d| format!(" \"{}\"", d.format("%d-%b-%Y %H:%M:%S %z")))
+            .unwrap_or_default();
+        let head = format!("APPEND {quoted} ({}){date} UTF8 (", flag_list(flags));
+        self.with_literals(&[Part::Text(&head), Part::Literal8(raw), Part::Text(")")])
+            .map(Some)
+            .map_err(|e| match e.downcast::<imap::error::Error>() {
+                Ok(e) => e,
+                Err(e) => imap::error::Error::Bad(format!("{e:#}")),
+            })
     }
     /// As `append_heard`, keeping the message's own date as when it
     /// arrived (APPEND's date-time, RFC 3501 §6.3.11): imported mail sorts
@@ -109,6 +140,9 @@ impl Connection {
         flags: &[imap::types::Flag<'_>],
         received: Option<i64>,
     ) -> imap::error::Result<Vec<u8>> {
+        if let Some(heard) = self.append_utf8(mailbox, raw, flags, append_date(raw, received))? {
+            return Ok(heard);
+        }
         if let Some(tap) = &self.tap {
             tap.start();
         }
@@ -151,7 +185,9 @@ impl Connection {
         messages: &[(&[u8], &[imap::types::Flag<'_>], Option<i64>)],
     ) -> Result<Vec<Vec<u8>>> {
         use crate::sync::stream::Part;
-        if messages.len() < 2 || !self.extensions()?.multiappend || self.tap.is_none() {
+        // UTF-8 headers go one at a time, each as UTF8 (`append_utf8`).
+        let utf8 = self.enabled.utf8 && messages.iter().any(|(raw, ..)| utf8_headers(raw));
+        if messages.len() < 2 || !self.extensions()?.multiappend || self.tap.is_none() || utf8 {
             return messages
                 .iter()
                 .map(|(raw, flags, received)| Ok(self.append_dated(mailbox, raw, flags, *received)?))
@@ -187,7 +223,8 @@ impl Connection {
         flags: &[imap::types::Flag<'_>],
     ) -> Result<Option<Vec<u8>>> {
         use crate::sync::stream::Part;
-        if !self.extensions()?.replace || self.tap.is_none() {
+        // A draft with UTF-8 headers is appended as UTF8 instead.
+        if !self.extensions()?.replace || self.tap.is_none() || (self.enabled.utf8 && utf8_headers(raw)) {
             return Ok(None);
         }
         let head = format!(
@@ -866,6 +903,13 @@ fn message_date(raw: &[u8]) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
     let date = headers.get_first_value("Date")?;
     chrono::DateTime::parse_from_rfc2822(date.trim()).ok()
+}
+
+/// Whether a message's header block has bytes outside ASCII (UTF-8
+/// headers, RFC 6532), which IMAP carries with APPEND's UTF8 form.
+fn utf8_headers(raw: &[u8]) -> bool {
+    let end = memchr::memmem::find(raw, b"\r\n\r\n").unwrap_or(raw.len());
+    !raw[..end].is_ascii()
 }
 
 /// Flags as APPEND writes them, without \\Recent (servers set it).
