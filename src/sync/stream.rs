@@ -94,6 +94,248 @@ pub(crate) struct ImapStream {
     /// The end of the last read, so a `[INPROGRESS` split between two
     /// reads is still seen.
     tail: Vec<u8>,
+    /// Literals in extension replies, made readable; see [`Framer`].
+    framer: Framer,
+}
+
+/// Untagged replies whose literals are rewritten as quoted strings.
+///
+/// The vendored imap-proto keeps these replies (`resp_other`) as text up to
+/// the line's end, so a literal in one (`{n}` CRLF and n bytes; RFC 9051
+/// §4.3) cuts it short, and the imap crate then fails the whole command on
+/// the literal's bytes. METADATA has a parser of its own, which reads
+/// literals as entry names and values but not as the mailbox name.
+///
+/// A stopgap: once imap-proto reads literals there itself
+/// (docs/imap-proto-resp_other-literals.patch), `Framer` goes.
+const REWRITTEN: [&str; 13] = [
+    "NAMESPACE",
+    "QUOTA",
+    "QUOTAROOT",
+    "ACL",
+    "MYRIGHTS",
+    "LISTRIGHTS",
+    "METADATA",
+    "ID",
+    "ENABLED",
+    "ESEARCH",
+    "SORT",
+    "THREAD",
+    "GENURLAUTH",
+];
+/// The response code of the line that replaces a `REWRITTEN` reply whose
+/// literal can't be quoted: `* NO [PICACHO-UNREADABLE NAME] …`. The
+/// command's own tagged reply still follows, so the session stays in step;
+/// `other_lines` turns the line into an error for that one command.
+pub(crate) const UNREADABLE: &str = "PICACHO-UNREADABLE";
+
+/// A piece of an untagged reply kept whole until its last line.
+enum Piece {
+    Text(Vec<u8>),
+    /// A literal: its announcement (`{n}` or `~{n}` with CRLF) and bytes.
+    Literal(Vec<u8>, Vec<u8>),
+}
+
+/// Finds where the server's responses and their literals begin and end,
+/// counting each literal's bytes (`{n}` and literal8's `~{n}`, RFC 3516),
+/// so a literal's contents are never read as lines. Responses named in
+/// `REWRITTEN` are held until complete and their literals written as
+/// quoted strings; everything else passes through unchanged.
+#[derive(Default)]
+pub(crate) struct Framer {
+    /// Bytes ready for the reader, from `taken` on.
+    out: Vec<u8>,
+    taken: usize,
+    /// The line being read, up to its line feed.
+    line: Vec<u8>,
+    /// Bytes of the current literal still to come.
+    literal_left: usize,
+    /// The current line continues an untagged response after a literal.
+    continuing: bool,
+    /// The `REWRITTEN` response being held, with its name.
+    held: Option<(String, Vec<Piece>)>,
+}
+impl Framer {
+    /// Takes bytes as the server sent them.
+    pub(crate) fn feed(&mut self, mut input: &[u8]) {
+        while !input.is_empty() {
+            if self.literal_left > 0 {
+                let n = self.literal_left.min(input.len());
+                match &mut self.held {
+                    // A held literal always follows its announcement.
+                    Some((_, pieces)) => {
+                        if let Some(Piece::Literal(_, data)) = pieces.last_mut() {
+                            data.extend_from_slice(&input[..n]);
+                        }
+                    }
+                    None => self.out.extend_from_slice(&input[..n]),
+                }
+                self.literal_left -= n;
+                input = &input[n..];
+                continue;
+            }
+            match memchr::memchr(b'\n', input) {
+                Some(at) => {
+                    self.line.extend_from_slice(&input[..=at]);
+                    input = &input[at + 1..];
+                    self.end_line();
+                }
+                None => {
+                    self.line.extend_from_slice(input);
+                    input = &[];
+                }
+            }
+        }
+    }
+    /// What the server sent last before the connection ended, as it is.
+    pub(crate) fn finish(&mut self) {
+        if let Some((_, pieces)) = self.held.take() {
+            for piece in pieces {
+                match piece {
+                    Piece::Text(t) => self.out.extend(t),
+                    Piece::Literal(head, data) => {
+                        self.out.extend(head);
+                        self.out.extend(data);
+                    }
+                }
+            }
+        }
+        let line = std::mem::take(&mut self.line);
+        self.out.extend(line);
+        self.literal_left = 0;
+        self.continuing = false;
+    }
+    /// Hands out up to `buf.len()` ready bytes.
+    pub(crate) fn take(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.out.len() - self.taken);
+        buf[..n].copy_from_slice(&self.out[self.taken..self.taken + n]);
+        self.taken += n;
+        if self.taken == self.out.len() {
+            self.out.clear();
+            self.taken = 0;
+        }
+        n
+    }
+    fn end_line(&mut self) {
+        let line = std::mem::take(&mut self.line);
+        if !self.continuing {
+            self.held = rewritten_name(&line).map(|name| (name, Vec::new()));
+        }
+        // Only untagged responses have literals (RFC 9051 §7); a tagged
+        // reply's or a continuation's text is text.
+        let literal = if self.continuing || (line.starts_with(b"* ") && !status_line(&line)) {
+            announced_literal(&line)
+        } else {
+            None
+        };
+        self.continuing = literal.is_some();
+        match (&mut self.held, literal) {
+            (Some((_, pieces)), Some((at, n))) => {
+                pieces.push(Piece::Text(line[..at].to_vec()));
+                pieces.push(Piece::Literal(line[at..].to_vec(), Vec::with_capacity(n.min(4096))));
+                self.literal_left = n;
+            }
+            (Some(_), None) => {
+                let Some((name, mut pieces)) = self.held.take() else {
+                    return;
+                };
+                pieces.push(Piece::Text(line));
+                let rewritten = rewrite(&name, pieces);
+                self.out.extend(rewritten);
+            }
+            (None, literal) => {
+                self.out.extend(line);
+                self.literal_left = literal.map_or(0, |(_, n)| n);
+            }
+        }
+    }
+}
+/// The name of a `REWRITTEN` untagged response that `line` begins.
+fn rewritten_name(line: &[u8]) -> Option<String> {
+    let rest = line.strip_prefix(b"* ")?;
+    let end = rest
+        .iter()
+        .position(|b| matches!(b, b' ' | b'\r' | b'\n'))
+        .unwrap_or(rest.len());
+    let word = std::str::from_utf8(&rest[..end]).ok()?;
+    REWRITTEN
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(word))
+        .map(|n| (*n).to_owned())
+}
+/// Whether `line` is an untagged status or capability response, whose
+/// human-readable text (RFC 9051 §7.1) has no literals even if it ends
+/// with what looks like one.
+fn status_line(line: &[u8]) -> bool {
+    let rest = &line[2..];
+    ["OK", "NO", "BAD", "BYE", "PREAUTH", "CAPABILITY"].iter().any(|w| {
+        rest.len() >= w.len()
+            && rest[..w.len()].eq_ignore_ascii_case(w.as_bytes())
+            && matches!(rest.get(w.len()), None | Some(b' ' | b'\r' | b'\n'))
+    })
+}
+/// Where the literal announced at the end of `line` begins (its `{` or
+/// `~{`) and how many bytes it has.
+fn announced_literal(line: &[u8]) -> Option<(usize, usize)> {
+    let body = line.strip_suffix(b"\r\n").or_else(|| line.strip_suffix(b"\n"))?;
+    let body = body.strip_suffix(b"}")?;
+    let open = body.iter().rposition(|b| *b == b'{')?;
+    let digits = &body[open + 1..];
+    let digits = digits.strip_suffix(b"+").unwrap_or(digits);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let n = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    let start = if open > 0 && body[open - 1] == b'~' { open - 1 } else { open };
+    Some((start, n))
+}
+/// Whether a literal's bytes can be a quoted string: no line breaks or
+/// NUL (RFC 9051 §4.3's QUOTED-CHAR), and text the parser can read.
+fn quotable(data: &[u8]) -> bool {
+    !data.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) && std::str::from_utf8(data).is_ok()
+}
+/// A held response, with its literals as quoted strings; or, where one
+/// can't be, a line saying so (`UNREADABLE`).
+fn rewrite(name: &str, pieces: Vec<Piece>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Text(t) => out.extend(t),
+            // RFC 9051 §4.3: quoted-specials are escaped.
+            Piece::Literal(_, data)
+                if quotable(&data) && !(name == "METADATA" && needs_escape(&data)) =>
+            {
+                out.push(b'"');
+                for b in data {
+                    if matches!(b, b'"' | b'\\') {
+                        out.push(b'\\');
+                    }
+                    out.push(b);
+                }
+                out.push(b'"');
+            }
+            // METADATA's parser reads literal values (with line breaks)
+            // itself, and keeps quoted values' escapes as they are: what
+            // it reads, or needs escaping, stays a literal.
+            // Its parser can't take bytes that aren't text, though.
+            Piece::Literal(head, data)
+                if name == "METADATA" && std::str::from_utf8(&data).is_ok() =>
+            {
+                out.extend(head);
+                out.extend(data);
+            }
+            Piece::Literal(..) => {
+                return format!(
+                    "* NO [{UNREADABLE} {name}] The server's {name} reply has a string with a line break or bytes that aren't text, which Picacho can't read.\r\n"
+                )
+                .into_bytes();
+            }
+        }
+    }
+    out
+}
+fn needs_escape(data: &[u8]) -> bool {
+    data.iter().any(|b| matches!(b, b'"' | b'\\'))
 }
 
 /// Commands with literals of any bytes, through the imap crate's text
@@ -161,6 +403,7 @@ impl ImapStream {
             literals,
             unread: Vec::new(),
             tail: Vec::new(),
+            framer: Framer::default(),
         }
     }
     /// Reads one line from below the imap crate's buffer, which is empty
@@ -282,9 +525,25 @@ impl Read for ImapStream {
             self.unread.drain(..n);
             return Ok(n);
         }
-        let read = match self.read_plain(buf) {
-            Err(e) if closed_without_goodbye(&e) => 0,
-            other => other?,
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // What the server sent, framed (see `Framer`), until some is ready.
+        let read = loop {
+            let ready = self.framer.take(buf);
+            if ready > 0 {
+                break ready;
+            }
+            let mut chunk = [0u8; 16 * 1024];
+            let got = match self.read_plain(&mut chunk) {
+                Err(e) if closed_without_goodbye(&e) => 0,
+                other => other?,
+            };
+            if got == 0 {
+                self.framer.finish();
+                break self.framer.take(buf);
+            }
+            self.framer.feed(&chunk[..got]);
         };
         self.tap.record(&buf[..read]);
         // `* OK [INPROGRESS ("tag" n total)]`: still working (RFC 9585;
@@ -422,6 +681,82 @@ mod tests {
         assert_eq!(trailing_literal(b"* 1 EXISTS\r\n"), None);
     }
     use super::*;
+    /// What `input` reads as through a `Framer`, fed in pieces of `step`.
+    fn framed(input: &[u8], step: usize) -> Vec<u8> {
+        let mut f = Framer::default();
+        let mut out = Vec::new();
+        for piece in input.chunks(step) {
+            f.feed(piece);
+            let mut buf = [0u8; 7];
+            loop {
+                let n = f.take(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+        }
+        f.finish();
+        let mut buf = vec![0u8; 1 << 16];
+        let n = f.take(&mut buf);
+        out.extend_from_slice(&buf[..n]);
+        out
+    }
+    /// RFC 9051 §4.3: an extension reply's literal is read as a string,
+    /// however the bytes arrive.
+    #[test]
+    fn extension_reply_literals_become_quoted_strings() {
+        let sent = b"* NAMESPACE (({5}\r\nINBOX \"/\")) NIL NIL\r\na1 OK done\r\n";
+        let want = b"* NAMESPACE ((\"INBOX\" \"/\")) NIL NIL\r\na1 OK done\r\n".to_vec();
+        for step in [1, 2, 3, 5, 11, sent.len()] {
+            assert_eq!(framed(sent, step), want, "step {step}");
+        }
+        // Quoted-specials are escaped; literal8 and LITERAL+ forms count too.
+        assert_eq!(
+            framed(b"* MYRIGHTS {6}\r\na\"b\\cd ~{2}\r\nlr\r\n", 4),
+            b"* MYRIGHTS \"a\\\"b\\\\cd\" \"lr\"\r\n"
+        );
+        assert_eq!(
+            framed(b"* QUOTA {2+}\r\nab (STORAGE 1 2)\r\n", 3),
+            b"* QUOTA \"ab\" (STORAGE 1 2)\r\n"
+        );
+        // A literal that can't be a quoted string stands for the reply as
+        // a refusal, before the command's own tagged reply.
+        let broken = framed(b"* NAMESPACE (({7}\r\nIN\r\nBOX \"/\")) NIL NIL\r\na1 OK done\r\n", 3);
+        let text = String::from_utf8(broken).unwrap();
+        assert!(text.starts_with("* NO [PICACHO-UNREADABLE NAMESPACE] "), "{text}");
+        assert!(text.ends_with("\r\na1 OK done\r\n"), "{text}");
+        assert_eq!(text.matches("\r\n").count(), 2, "{text}");
+        let bytes = framed(b"* ID ({2}\r\n\xff\xfe NIL)\r\n", 1);
+        assert!(bytes.starts_with(b"* NO [PICACHO-UNREADABLE ID]"));
+    }
+    /// Everything else passes byte for byte, and literals' contents are
+    /// never taken for responses (RFC 9051 §4.3).
+    #[test]
+    fn other_responses_and_message_literals_pass_unchanged() {
+        let body = b"* NAMESPACE ((\"x\" \"/\")) {5}\r\n\r\n* OK [ALERT] fake\r\n";
+        let mut sent = format!("* 1 FETCH (UID 4 BODY[] {{{}}}\r\n", body.len()).into_bytes();
+        sent.extend_from_slice(body);
+        sent.extend_from_slice(b" FLAGS (\\Seen))\r\n* 2 FETCH (BINARY[1] ~{3}\r\n{1}\r\n)\r\n");
+        sent.extend_from_slice(b"* OK [CAPABILITY IMAP4rev1] text {3}\r\n");
+        sent.extend_from_slice(b"* LIST () \"/\" {4}\r\nWork\r\n");
+        sent.extend_from_slice(b"+ go ahead {9}\r\na2 OK [READ-WRITE] {4}\r\n");
+        for step in [1, 3, 8, sent.len()] {
+            assert_eq!(framed(&sent, step), sent, "step {step}");
+        }
+        // A METADATA value with a line break stays a literal its own
+        // parser reads; its quotable ones become quoted strings.
+        let metadata = b"* METADATA \"\" (/shared/comment {7}\r\nA\r\nnote /shared/admin {4}\r\nroot)\r\n";
+        let once = framed(metadata, 2);
+        assert_eq!(
+            once,
+            b"* METADATA \"\" (/shared/comment {7}\r\nA\r\nnote /shared/admin \"root\")\r\n"
+        );
+        assert!(matches!(
+            imap_proto::parse_response(&once),
+            Ok((rest, imap_proto::Response::MailboxData(_))) if rest.is_empty()
+        ));
+    }
     /// What a response inflates to is bounded, not just what it costs on
     /// the wire: a few compressed megabytes can inflate to gigabytes.
     #[test]

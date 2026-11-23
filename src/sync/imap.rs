@@ -1290,16 +1290,32 @@ impl Extensions {
 /// The untagged lines of an extension's reply that start with `name`, as
 /// text after it (NAMESPACE, QUOTA…; see the vendored parser's `resp_other`).
 pub(crate) fn other_lines<'a>(data: &'a [u8], name: &str) -> Result<Vec<&'a str>> {
-    Ok(responses(data)?
-        .into_iter()
-        .filter_map(|r| match r {
-            imap_proto::Response::Other(line) => line
-                .get(..name.len())
-                .filter(|n| n.eq_ignore_ascii_case(name))
-                .map(|_| line[name.len()..].trim_start()),
-            _ => None,
-        })
-        .collect())
+    let mut out = Vec::new();
+    for response in responses(data)? {
+        match response {
+            imap_proto::Response::Other(line) => out.extend(
+                line.get(..name.len())
+                    .filter(|n| n.eq_ignore_ascii_case(name))
+                    .map(|_| line[name.len()..].trim_start()),
+            ),
+            // A reply of this name the stream couldn't make readable (a
+            // literal with a line break; see `stream::Framer`).
+            imap_proto::Response::Data {
+                status: imap_proto::Status::No,
+                information: Some(text),
+                ..
+            } if unreadable_reply(text).is_some_and(|n| n.eq_ignore_ascii_case(name)) => {
+                bail!("{}", text.split_once("] ").map_or(text, |(_, t)| t))
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+/// The reply's name in a `* NO [PICACHO-UNREADABLE name] …` line.
+fn unreadable_reply(information: &str) -> Option<&str> {
+    let rest = information.strip_prefix('[')?.strip_prefix(super::stream::UNREADABLE)?;
+    rest.strip_prefix(' ')?.split(']').next()
 }
 /// Words, quoted strings, NIL and parentheses in an extension's reply.
 #[derive(Debug, PartialEq)]
@@ -2237,5 +2253,14 @@ mod token_tests {
             vec![Token::Open, Token::Text("a".into()), Token::Text("b c d".into()), Token::Nil, Token::Close]
         );
         assert_eq!(tokens("{x}"), vec![Token::Text("{x}".into())]);
+    }
+    /// A reply the stream couldn't make readable fails the command that
+    /// asked for it, and only for that reply's name.
+    #[test]
+    fn unreadable_replies_are_errors() {
+        let data = b"* NO [PICACHO-UNREADABLE NAMESPACE] The server's NAMESPACE reply has a string with a line break.\r\n* MYRIGHTS INBOX lr\r\n";
+        let e = other_lines(data, "NAMESPACE").unwrap_err();
+        assert!(e.to_string().starts_with("The server's NAMESPACE reply"), "{e}");
+        assert_eq!(other_lines(data, "MYRIGHTS").unwrap(), ["INBOX lr"]);
     }
 }

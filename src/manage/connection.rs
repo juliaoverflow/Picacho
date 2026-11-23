@@ -388,9 +388,29 @@ impl Connection {
             return Ok(n.clone());
         }
         let n = if self.extensions()?.namespace {
-            let (personal, others) = crate::sync::transport::namespaces(&mut self.session)?;
-            self.others = others;
-            personal
+            match crate::sync::transport::namespaces(&mut self.session) {
+                Ok((personal, others)) => {
+                    self.others = others;
+                    personal
+                }
+                // A broken connection is no answer about namespaces.
+                Err(e) if connection_failed(&e) => return Err(e),
+                Err(e) => {
+                    // RFC 2342 is only advice on where folders go: without
+                    // it, the hierarchy's delimiter (LIST "" "", RFC 9051
+                    // §6.3.9) is all that is needed, and new folders go at
+                    // the top, as on servers without NAMESPACE.
+                    let delimiter = self
+                        .session
+                        .list(Some(""), Some("\"\""))?
+                        .iter()
+                        .find_map(|n| n.delimiter().map(str::to_owned));
+                    eprintln!(
+                        "Picacho: the server's NAMESPACE reply couldn't be used ({e:#}); folders go at the top, delimiter {delimiter:?}."
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -721,6 +741,21 @@ impl Backend {
             .or_insert_with(|| self.saved_traffic(&a.id, day));
         entry.0 != day || entry.1 < GMAIL_DAILY_BUDGET
     }
+}
+
+/// Whether `error` is the connection failing (rather than the server
+/// refusing or saying something unreadable): nothing more can be asked on it.
+fn connection_failed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<imap::error::Error>().is_some_and(|e| {
+        matches!(
+            e,
+            imap::error::Error::Io(_)
+                | imap::error::Error::ConnectionLost
+                | imap::error::Error::Parse(_)
+                | imap::error::Error::Tls(_)
+                | imap::error::Error::TlsHandshake(_)
+        )
+    })
 }
 
 /// A message's Date header as APPEND's date-time, if it has a sane one.

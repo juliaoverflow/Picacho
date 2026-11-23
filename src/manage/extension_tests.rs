@@ -1986,3 +1986,66 @@ fn rev2_multisearch_within_and_fuzzy() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Extension replies with literals (RFC 9051 §4.3) are read through the
+/// stream's framing: a NAMESPACE prefix sent as a literal is used; one
+/// that can't be read (a line break inside) fails NAMESPACE alone, and the
+/// session goes on with LIST "" "" and folders at the top. A METADATA
+/// value with a line break, which its own parser reads, comes through.
+#[test]
+fn extension_replies_with_literals_are_read() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for readable in [true, false] {
+            let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+                break;
+            };
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") || upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 NAMESPACE METADATA\r\n");
+                } else if upper == "LIST \"\" \"\"" {
+                    p.send("* LIST (\\Noselect) \".\" \"\"\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \".\" INBOX\r\n* LIST () \".\" \"Archive\"\r\n");
+                } else if upper == "NAMESPACE" {
+                    if readable {
+                        p.send("* NAMESPACE (({6}\r\nINBOX. \".\")) NIL NIL\r\n");
+                    } else {
+                        p.send("* NAMESPACE (({7}\r\nINB\r\nOX \".\")) NIL NIL\r\n");
+                    }
+                } else if upper.starts_with("GETMETADATA") {
+                    p.send("* METADATA \"\" (/shared/comment {14}\r\nLine 1\r\nLine 2 /shared/admin {18}\r\nmailto:a@b.example)\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.create_remote_folder(&a, None, "Travel")?;
+    let notes = b.server_notes(&a)?;
+    assert_eq!(notes.comment.as_deref(), Some("Line 1\r\nLine 2"));
+    assert_eq!(notes.admin.as_deref(), Some("mailto:a@b.example"));
+    b.disconnect(&a.id);
+    b.create_remote_folder(&a, None, "Trips")?;
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    let creates: Vec<_> = seen.iter().filter(|c| c.starts_with("CREATE")).collect();
+    assert_eq!(creates, ["CREATE \"INBOX.Travel\"", "CREATE \"Trips\""]);
+    assert_eq!(seen.iter().filter(|c| *c == "LIST \"\" \"\"").count(), 1, "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

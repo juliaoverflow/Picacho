@@ -648,6 +648,8 @@ pub(crate) fn get_metadata(
         Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => return Ok(vec![]),
         Err(e) => return Err(e.into()),
     };
+    // A reply the stream couldn't make readable is an error, not no notes.
+    other_lines(&data, "METADATA")?;
     let mut out = Vec::new();
     for response in responses(&data)? {
         if let imap_proto::Response::MailboxData(imap_proto::MailboxDatum::MetadataSolicited {
