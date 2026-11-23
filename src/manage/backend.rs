@@ -90,6 +90,9 @@ mod kerberos_tests;
 #[cfg(test)]
 #[path = "sso_tests.rs"]
 mod sso_tests;
+#[cfg(test)]
+#[path = "smtp_tests.rs"]
+mod smtp_tests;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     Read(bool),
@@ -3841,6 +3844,27 @@ impl Backend {
         }
     }
     fn send_held(&self, a: &Account, d: &Draft, hold_until: Option<i64>) -> Result<Vec<String>> {
+        // Encrypted with Bcc through Proton's or a JMAP server's API: one
+        // message goes to everyone, so it can't be kept from naming the Bcc
+        // recipients' keys (RFC 5322 §3.6.3). Refused before anything is
+        // sent or filed. A sending address with its own server sends by
+        // SMTP, which gives each Bcc recipient a copy of their own.
+        let own_smtp = d.send_as.trim().is_empty()
+            && a.identity(&d.identity).is_some_and(|i| i.smtp.is_some());
+        if a.provider.api_sending()
+            && !own_smtp
+            && d.encrypt
+            && !crate::sync::smtp::recipients(&d.bcc)?.is_empty()
+        {
+            return Err(crate::sync::smtp::EncryptedBccUnsupported {
+                service: if a.provider == Provider::Proton {
+                    "Proton".into()
+                } else {
+                    "this JMAP server".into()
+                },
+            }
+            .into());
+        }
         // Sending as an alias asks its service for the routed addresses
         // first, outside the account's lock, once it knows the alias is
         // still there.
@@ -4106,6 +4130,9 @@ impl Backend {
             .sum::<u64>()
             >= BURL_FROM;
         if a.provider != Provider::Imap || endpoint.host != a.smtp_host || !large {
+            return None;
+        }
+        if !burl_allowed(d) {
             return None;
         }
         let ready = self.with_imap(a, |c| {
@@ -4870,6 +4897,15 @@ impl std::fmt::Display for TooLargeForSent {
 }
 impl std::error::Error for TooLargeForSent {}
 
+/// Whether a draft may go by BURL. Not with Bcc: BURL's server sends the
+/// copy in Sent exactly as it is (RFC 4468 §3), so that copy can't keep
+/// the Bcc field without showing it to everyone, and RFC 5322 §3.6.3
+/// wants it out of what To and Cc get. Encrypted, each Bcc recipient also
+/// needs a copy of their own. The cost: a large message with Bcc is
+/// uploaded twice (sent, then filed).
+fn burl_allowed(d: &Draft) -> bool {
+    crate::sync::smtp::recipients(&d.bcc).is_ok_and(|bcc| bcc.is_empty())
+}
 /// A message's Message-ID header, or empty.
 fn message_id_of(raw: &[u8]) -> String {
     use mailparse::MailHeaderMap;

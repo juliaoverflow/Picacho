@@ -22,6 +22,13 @@ fn raw_header(name: &'static str, value: String) -> header::HeaderValue {
 /// server's Drafts folder: then incomplete drafts are allowed, Bcc is kept,
 /// and Picacho's own headers let it be found again.
 pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
+    build_to(a, d, draft, None)
+}
+/// As `build`, sent only to `only_to` when given: the To and Cc headers
+/// are the draft's, but the envelope (and so whom it is encrypted to)
+/// names that one address. RFC 5322 §3.6.3: a Bcc recipient's own copy
+/// of a message whose other copy has no Bcc field.
+fn build_to(a: &Account, d: &Draft, draft: bool, only_to: Option<&str>) -> Result<Message> {
     // One of the mailbox's other addresses, unless sent as an alias.
     let identity = match d.identity.as_str() {
         "" => None,
@@ -75,7 +82,13 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
             builder = builder.raw_header(raw_header(FORMAT_HEADER, "markdown".into()));
         }
     } else {
-        ensure!(count > 0, "Add at least one recipient.");
+        ensure!(count > 0 || only_to.is_some(), "Add at least one recipient.");
+        if let Some(to) = only_to {
+            builder = builder.envelope(lettre::address::Envelope::new(
+                Some(from.email.clone()),
+                vec![to.parse().with_context(|| format!("“{to}” isn't a valid address."))?],
+            )?);
+        }
     }
     // Sent as an alias, the forwarding service puts the alias in From; the
     // mailbox's own address must not show up elsewhere in the message.
@@ -324,6 +337,28 @@ impl std::fmt::Display for NoServerHold {
     }
 }
 impl std::error::Error for NoServerHold {}
+
+/// Encrypted mail with Bcc through a service that takes one message for
+/// all its recipients (Proton, JMAP): its encryption would name every Bcc
+/// recipient's key to everyone, and the service can't be sent a separate
+/// copy for each without delivering to To and Cc again or filing each copy
+/// in Sent. Refused before anything is sent; the recipients can be written
+/// to separately.
+#[derive(Debug)]
+pub(crate) struct EncryptedBccUnsupported {
+    /// The service, as named to the person sending.
+    pub(crate) service: String,
+}
+impl std::fmt::Display for EncryptedBccUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Encrypted mail with Bcc can't be sent through {} without showing who got a Bcc. Send to them separately, or turn off Encrypt.",
+            self.service
+        )
+    }
+}
+impl std::error::Error for EncryptedBccUnsupported {}
 pub(crate) fn server_limits<'a>(lines: impl Iterator<Item = &'a str>) -> ServerLimits {
     let mut limits = ServerLimits::default();
     for line in lines {
@@ -953,82 +988,76 @@ pub(crate) fn deliver(
     hold_until: Option<i64>,
     keys: &Keys,
 ) -> Result<Delivered> {
-    // Encrypted with Bcc: the Bcc recipients' keys would be listed in
-    // the copy everyone gets (each encrypted session key names its key),
-    // telling To and Cc who else got it. Each Bcc recipient gets a copy of
-    // their own instead, encrypted to them alone and the sender.
-    if d.encrypt && !d.bcc.trim().is_empty() {
-        let visible = Draft {
-            bcc: String::new(),
-            ..d.clone()
-        };
-        let message = build(a, &visible, false)?;
-        let bytes = protected(&message, &visible, keys)?;
-        let delivered = deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None)?;
-        for (_, address) in recipients(&d.bcc)? {
-            let alone = Draft {
-                to: d.to.clone(),
-                cc: d.cc.clone(),
-                bcc: address.clone(),
-                ..d.clone()
-            };
-            let message = build(a, &alone, false)?;
-            // Encrypted to the Bcc recipient and the sender only; the
-            // envelope sends it to them alone.
-            let only = Draft {
-                to: address.clone(),
-                cc: String::new(),
-                bcc: String::new(),
-                ..d.clone()
-            };
-            let envelope_message = build(a, &only, false)?;
-            let bytes = protected(&envelope_message, &only, keys)?;
-            // The visible headers are the To/Cc copy's, as Bcc shows them.
-            let bytes = with_headers_of(&message, bytes);
-            deliver_bytes(a, &only, &envelope_message, bytes, endpoint, secret, tls, hold_until, None)
-                .with_context(|| format!("The message went to its other recipients, but not to {address}."))?;
-        }
-        return Ok(delivered);
-    }
-    let message = build(a, d, false)?;
-    let bytes = protected(&message, d, keys)?;
-    deliver_bytes(a, d, &message, bytes, endpoint, secret, tls, hold_until, None)
+    let mut delivered = if d.encrypt && !d.bcc.trim().is_empty() {
+        deliver_bcc_apart(a, d, endpoint, secret, tls, hold_until, keys)?
+    } else {
+        let message = build(a, d, false)?;
+        let bytes = protected(&message, d, keys)?;
+        deliver_bytes(a, d, &message, bytes, endpoint, secret, tls, hold_until, None)?
+    };
+    // RFC 5322 §3.6.3: what went out has no Bcc field; the sender's own
+    // copy (in Sent) keeps it, so it shows whom the message also went to.
+    delivered.raw = with_bcc(delivered.raw, d)?;
+    Ok(delivered)
 }
 
-/// `bytes` (a protected message) with the To and Cc of `message` in place
-/// of its own, so a Bcc recipient's own copy shows who it went to.
-fn with_headers_of(message: &Message, bytes: Vec<u8>) -> Vec<u8> {
-    let shown = message.formatted();
-    let header = |raw: &[u8], name: &str| -> Option<String> {
-        use mailparse::MailHeaderMap as _;
-        let (h, _) = mailparse::parse_headers(raw).ok()?;
-        h.get_first_header(name)
-            .map(|h| String::from_utf8_lossy(h.get_key_raw()).into_owned() + ": " + &String::from_utf8_lossy(h.get_value_raw()))
+/// Encrypted with Bcc: the Bcc recipients' keys would be listed in the
+/// copy everyone gets (each encrypted session key names its key), telling
+/// To and Cc who else got it. Each Bcc recipient gets a copy of their own
+/// instead, encrypted to them alone and the sender; its To and Cc are the
+/// message's, with no Bcc field (RFC 5322 §3.6.3), and its envelope names
+/// only them. The result is the To/Cc copy (or, with no To or Cc, the first
+/// Bcc copy), for Sent.
+fn deliver_bcc_apart(
+    a: &Account,
+    d: &Draft,
+    endpoint: &Endpoint,
+    secret: &str,
+    tls: &native_tls::TlsConnector,
+    hold_until: Option<i64>,
+    keys: &Keys,
+) -> Result<Delivered> {
+    let visible = Draft {
+        bcc: String::new(),
+        ..d.clone()
     };
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let Some(split) = text.find("\r\n\r\n") else {
-        return bytes;
-    };
-    let (head, body) = text.split_at(split);
-    let mut lines: Vec<String> = Vec::new();
-    let mut skip = false;
-    for line in head.split("\r\n") {
-        if !line.starts_with([' ', '\t']) {
-            let name = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
-            skip = name == "to" || name == "cc";
-        }
-        if !skip {
-            lines.push(line.to_owned());
-        }
+    let mut delivered = None;
+    if !recipients(&d.to)?.is_empty() || !recipients(&d.cc)?.is_empty() {
+        let message = build(a, &visible, false)?;
+        let bytes = protected(&message, &visible, keys)?;
+        delivered = Some(deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None)?);
     }
-    for name in ["To", "Cc"] {
-        if let Some(h) = header(&shown, name) {
-            lines.push(h);
-        }
+    for (_, address) in recipients(&d.bcc)? {
+        let message = build_to(a, &visible, false, Some(&address))?;
+        let bytes = protected(&message, &visible, keys)?;
+        let alone = deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None);
+        let alone = match delivered {
+            Some(_) => alone.with_context(|| {
+                format!("The message went to its other recipients, but not to {address}.")
+            })?,
+            None => alone?,
+        };
+        delivered.get_or_insert(alone);
     }
-    let mut out = lines.join("\r\n").into_bytes();
-    out.extend_from_slice(body.as_bytes());
-    out
+    delivered.context("Add at least one recipient.")
+}
+
+/// `raw` with the draft's Bcc field added in front, for the sender's own
+/// copy; as it is without Bcc recipients. Outside any signature or
+/// encryption, which cover the body part only (RFC 3156 §5, RFC 8551).
+fn with_bcc(raw: Vec<u8>, d: &Draft) -> Result<Vec<u8>> {
+    let mut list = lettre::message::Mailboxes::new();
+    for (name, address) in recipients(&d.bcc)? {
+        list.push(Mailbox::new(name, address.parse()?));
+    }
+    if list.iter().next().is_none() {
+        return Ok(raw);
+    }
+    let mut headers = header::Headers::new();
+    headers.set(header::Bcc::from(list));
+    let mut out = headers.to_string().into_bytes();
+    out.extend_from_slice(&raw);
+    Ok(out)
 }
 
 /// What the server can be told to fetch instead of being sent the
