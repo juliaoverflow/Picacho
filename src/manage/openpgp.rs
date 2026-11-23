@@ -27,6 +27,8 @@ mod protected;
 mod signers;
 mod v6;
 pub use autocrypt::{Peer, Recommendation, key_fingerprint, peer_preference_key};
+/// RFC 9788 §4.4.2's From comparison, shared with S/MIME.
+pub(crate) use protected::from_mismatch;
 
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]

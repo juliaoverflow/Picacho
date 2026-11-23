@@ -56,6 +56,27 @@ pub struct Verdict {
     /// A certs-only message's certificates (RFC 8551 §3.6), as PEM, for
     /// importing when asked. They vouch for nothing by being sent.
     pub certificates: Vec<String>,
+    /// RFC 9788 §4.4.2: the protected From is for another address than the
+    /// outer one, and no valid signer's certificate is for it. As for
+    /// OpenPGP (see `openpgp::from_mismatch`); the outer From stays the one
+    /// shown.
+    pub from_mismatch: Option<crate::manage::openpgp::FromMismatch>,
+}
+
+impl Verdict {
+    /// The message details' signature line and whether it is all good:
+    /// the signature's own label, with RFC 9788 §4.4.2's From warning
+    /// when there is one (as `openpgp::Verdict::signature_line`).
+    pub fn signature_line(&self) -> Option<(String, bool)> {
+        let signed = (self.signature != Signature::None).then(|| self.signature.label());
+        let good = self.signature.good() && self.from_mismatch.is_none();
+        match (signed, &self.from_mismatch) {
+            (Some(s), Some(w)) => Some((format!("{s}. {}", w.label()), good)),
+            (Some(s), None) => Some((s, good)),
+            (None, Some(w)) => Some((w.label(), good)),
+            (None, None) => None,
+        }
+    }
 }
 
 /// One SignerInfo's result (RFC 5652 §5.3).
@@ -1047,6 +1068,15 @@ fn open_checked(
     if !verdict.certificates.is_empty() {
         return Some((raw.to_vec(), verdict, None));
     }
+    // RFC 9788 §4.4: the protected From is vouched for by a signer whose
+    // certificate (one that checked out) names that address.
+    verdict.from_mismatch = crate::manage::openpgp::from_mismatch(&outer, &current, |address| {
+        let address = address.to_lowercase();
+        verdict.signers.iter().any(|s| {
+            matches!(s.result, SignerResult::Good | SignerResult::Untrusted)
+                && s.address.to_lowercase() == address
+        })
+    });
     let mut readable = take_protected_headers(outer, &mut current);
     readable.extend_from_slice(b"MIME-Version: 1.0\r\n");
     // Line ends made CRLF byte by byte: through a UTF-8 string, text in
@@ -2082,6 +2112,51 @@ mod tests {
         assert!(!text.contains("HP-Outer") && !text.contains("hp=\"cipher\"; hp"), "{text}");
         let parsed = mailparse::parse_mail(&readable).unwrap();
         assert_eq!(parsed.get_body().unwrap().trim(), "Meet at noon.");
+    }
+
+    /// RFC 9788 §4.4.2, as for OpenPGP: a protected From for another
+    /// address than the outer one warns, unless a signer whose signature
+    /// checks out has a certificate for it (§4.4.1.2). The outer From stays
+    /// the one shown.
+    #[test]
+    fn protected_from_mismatch_warns_without_a_signer_for_it() {
+        let ana = fixture_identity("ana");
+        let mut bo = fixture_identity("bo");
+        bo.others.push(String::from_utf8(fixture("ana.pem")).unwrap());
+        let rewrite = |raw: &[u8]| -> Vec<u8> {
+            // Only the outer header section: the signed part stays as it was.
+            let text = String::from_utf8_lossy(raw).into_owned();
+            let at = text.find("\r\n\r\n").unwrap();
+            let (head, body) = text.split_at(at);
+            (head.replacen("From: Ana <ana@example.org>", "From: Eve <eve@example.net>", 1) + body).into_bytes()
+        };
+        // Signed by Ana, protected From Ana, outer From rewritten to Eve:
+        // Ana's certificate vouches for the protected From, so no warning.
+        let signed = protect_with(&ana, WITH_BCC, "ana@example.org", &[], true, false).unwrap();
+        let (_, verdict, _) = open_with(&rewrite(&signed), &bo, &test_authority()).unwrap();
+        assert!(verdict.from_mismatch.is_none(), "{verdict:?}");
+        // A protected From for someone no signer is: a warning, naming
+        // both, and the line isn't good.
+        let forged = WITH_BCC.iter().copied().collect::<Vec<u8>>();
+        let forged = String::from_utf8(forged).unwrap().replacen(
+            "From: Ana <ana@example.org>",
+            "From: Bank <alerts@bank.example>",
+            1,
+        );
+        let signed = protect_with(&ana, forged.as_bytes(), "ana@example.org", &[], true, false).unwrap();
+        let outer_fixed = String::from_utf8_lossy(&signed).replacen(
+            "From: Bank <alerts@bank.example>",
+            "From: Ana <ana@example.org>",
+            1,
+        );
+        let (readable, verdict, _) = open_with(outer_fixed.as_bytes(), &bo, &test_authority()).unwrap();
+        let warning = verdict.from_mismatch.clone().expect("warned");
+        assert!(warning.protected.contains("alerts@bank.example"), "{warning:?}");
+        assert!(warning.outer.contains("ana@example.org"), "{warning:?}");
+        let (line, good) = verdict.signature_line().unwrap();
+        assert!(!good && line.contains("(S/MIME)"), "{line}");
+        let head = String::from_utf8_lossy(&readable);
+        assert!(head.contains("From: Ana <ana@example.org>") && !head.contains("bank.example>\r\nTo"), "{head}");
     }
 
     /// RFC 9788 §4.2 on read: a protected Subject replaces a hidden outer

@@ -249,7 +249,7 @@ fn protected_from(payload: &[u8]) -> Option<(String, String)> {
 /// another address than its outer From (§4.4.1.1) and that has no valid
 /// signature by a key bound to the protected address (§4.4.1.2), which
 /// `bound` tells for an address. `outer` is the outer header section.
-pub(super) fn from_mismatch(
+pub(crate) fn from_mismatch(
     outer: &[u8],
     payload: &[u8],
     bound: impl Fn(&str) -> bool,
