@@ -1284,13 +1284,10 @@ impl Session {
     /// As `download`, from another of the sign-in's accounts (contacts'
     /// or calendars', which may not be the mail account).
     pub fn download_in(&self, account: &str, blob: &str, name: &str, kind: &str, limit: usize) -> Result<Vec<u8>> {
-        let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-        let url = self
-            .download_url
-            .replace("{accountId}", &enc(account))
-            .replace("{blobId}", &enc(blob))
-            .replace("{name}", &enc(name))
-            .replace("{type}", &enc(kind));
+        let url = expand_template(
+            &self.download_url,
+            &[("accountId", account), ("blobId", blob), ("name", name), ("type", kind)],
+        );
         let response = self
             .signed(self.http.get(&url))
             .timeout(DOWNLOAD_TIMEOUT)
@@ -1329,10 +1326,7 @@ impl Session {
             bytes.len() <= self.max_upload,
             "The message is larger than the server accepts."
         );
-        let url = self.upload_url.replace(
-            "{accountId}",
-            &url::form_urlencoded::byte_serialize(self.account_id.as_bytes()).collect::<String>(),
-        );
+        let url = expand_template(&self.upload_url, &[("accountId", &self.account_id)]);
         let response = self
             .signed(self.http.post(&url))
             .timeout(DOWNLOAD_TIMEOUT)
@@ -2163,15 +2157,31 @@ impl Session {
         stop: &std::sync::atomic::AtomicBool,
         heard: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
+        self.listen_for(&Push::MAIL, stop, heard)
+    }
+    /// As `listen`, for the data types `push` names, and (where it says)
+    /// ending after the first change.
+    pub fn listen_for(
+        &self,
+        push: &Push,
+        stop: &std::sync::atomic::AtomicBool,
+        heard: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         ensure!(self.pushes(), "This JMAP server doesn't push changes.");
         if self.event_source_url.is_empty() {
-            return self.listen_websocket(stop, heard);
+            return self.listen_websocket(push, stop, heard);
         }
-        let url = self
-            .event_source_url
-            .replace("{types}", "Email,Mailbox")
-            .replace("{closeafter}", "no")
-            .replace("{ping}", &PING_SECONDS.to_string());
+        // RFC 8620 §7.3: `types` is a comma-separated list, or `*` for all;
+        // `closeafter` is `state` (end after one change) or `no`.
+        let types = push.names().join(",");
+        let url = expand_template(
+            &self.event_source_url,
+            &[
+                ("types", &types),
+                ("closeafter", if push.close_after_state { "state" } else { "no" }),
+                ("ping", &PING_SECONDS.to_string()),
+            ],
+        );
         let last_id = self
             .last_event_id
             .lock()
@@ -2200,18 +2210,208 @@ impl Session {
             status.is_success(),
             "The JMAP event stream answered {status}."
         );
-        read_events(BufReader::new(response), stop, &self.account_id, &self.last_event_id, heard)
+        // RFC 8620 §7.3: the server pings every `ping` seconds, so a stream
+        // silent for a few intervals is dead. Blocking reads have no
+        // timeout of their own: they are watched from here instead.
+        let silence = Duration::from_secs(u64::from(PING_SECONDS) * 3);
+        let reader = Watched::new(response, stop, silence);
+        let mut heard_for = || -> Result<bool> {
+            heard()?;
+            Ok(!push.close_after_state)
+        };
+        read_events(BufReader::new(reader), stop, &self.account_id, push, &self.last_event_id, &mut heard_for)
     }
 }
 
+/// What pushed changes are followed for (RFC 8620 §7.3, RFC 8887 §4.3.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Push {
+    /// The data types (`Email`, `Mailbox`, `CalendarEvent`…), or `*` for
+    /// all; empty: mail's (`Email` and `Mailbox`).
+    pub types: Vec<String>,
+    /// End after the first change (`closeafter=state`), rather than
+    /// following until stopped.
+    pub close_after_state: bool,
+}
+impl Push {
+    /// Mail: messages and mailboxes, followed until stopped.
+    pub const MAIL: Push = Push { types: Vec::new(), close_after_state: false };
+    /// Whether a change to `kind` is one followed.
+    fn wants(&self, kind: &str) -> bool {
+        if self.types.is_empty() {
+            // `MAIL`'s types, as a const can't hold a non-empty Vec.
+            return kind == "Email" || kind == "Mailbox";
+        }
+        self.types.iter().any(|t| t == "*" || t == kind)
+    }
+    /// The types to ask the server for.
+    fn names(&self) -> Vec<String> {
+        if self.types.is_empty() {
+            vec!["Email".into(), "Mailbox".into()]
+        } else {
+            self.types.clone()
+        }
+    }
+}
+
+/// A response body read on a thread of its own, so that a stream which
+/// goes silent (a dead connection, which a blocking read waits on for
+/// good) ends after `silence`, and `stop` is noticed within a second.
+///
+/// The reading thread can't be interrupted: given up on, it ends when the
+/// connection does, at the request's own timeout at the latest.
+struct Watched<'a> {
+    chunks: std::sync::mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    at: usize,
+    stop: &'a std::sync::atomic::AtomicBool,
+    silence: Duration,
+}
+impl<'a> Watched<'a> {
+    fn new(mut body: impl std::io::Read + Send + 'static, stop: &'a std::sync::atomic::AtomicBool, silence: Duration) -> Self {
+        let (tx, chunks) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+        std::thread::spawn(move || {
+            let mut buf = vec![0; 8192];
+            // Ends with the body, or once nobody reads (the receiver gone);
+            // a dead connection's read ends at the request's own timeout.
+            while let Ok(n) = body.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { chunks, pending: Vec::new(), at: 0, stop, silence }
+    }
+}
+impl std::io::Read for Watched<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::sync::mpsc::RecvTimeoutError;
+        if self.at >= self.pending.len() {
+            let since = std::time::Instant::now();
+            loop {
+                if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(0);
+                }
+                match self.chunks.recv_timeout(Duration::from_secs(1)) {
+                    Ok(chunk) => {
+                        self.pending = chunk;
+                        self.at = 0;
+                        break;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Ok(0),
+                    Err(RecvTimeoutError::Timeout) if since.elapsed() >= self.silence => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "The JMAP event stream went silent.",
+                        ));
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+        let n = out.len().min(self.pending.len() - self.at);
+        out[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+/// Expands a URI template (RFC 6570) with string values, as RFC 8620 §2
+/// asks of `downloadUrl`, `uploadUrl` and `eventSourceUrl`: every operator
+/// (`{+x}`, `{#x}`, `{?x,y}`, `{&x}`, `{/x}`, `{.x}`, `{;x}`) and the
+/// prefix modifier (`{x:3}`). Variables without a value are left out, as
+/// §3.2.1 says of undefined ones.
+pub fn expand_template(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len() + 64);
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let expression = &rest[open + 1..open + close];
+        rest = &rest[open + close + 1..];
+        // §3.2.1: (operator, first, separator, named, if empty, reserved).
+        let (op, body) = match expression.chars().next() {
+            Some(c @ ('+' | '#' | '.' | '/' | ';' | '?' | '&')) => (Some(c), &expression[1..]),
+            _ => (None, expression),
+        };
+        let (first, sep, named, if_empty, reserved) = match op {
+            None => ("", ",", false, "", false),
+            Some('+') => ("", ",", false, "", true),
+            Some('#') => ("#", ",", false, "", true),
+            Some('.') => (".", ".", false, "", false),
+            Some('/') => ("/", "/", false, "", false),
+            Some(';') => (";", ";", true, "", false),
+            Some('?') => ("?", "&", true, "=", false),
+            _ => ("&", "&", true, "=", false),
+        };
+        let mut parts = Vec::new();
+        for spec in body.split(',') {
+            // `*` (explode) changes nothing for a string value.
+            let spec = spec.trim_end_matches('*');
+            let (name, prefix) = match spec.split_once(':') {
+                Some((n, len)) => (n, len.parse::<usize>().ok()),
+                None => (spec, None),
+            };
+            let Some((_, value)) = vars.iter().find(|(n, _)| *n == name) else { continue };
+            let value: String = match prefix {
+                Some(len) => value.chars().take(len).collect(),
+                None => (*value).to_owned(),
+            };
+            let encoded = template_encode(&value, reserved);
+            parts.push(if !named {
+                encoded
+            } else if value.is_empty() {
+                format!("{name}{if_empty}")
+            } else {
+                format!("{name}={encoded}")
+            });
+        }
+        if !parts.is_empty() {
+            out.push_str(first);
+            out.push_str(&parts.join(sep));
+        }
+    }
+    out.push_str(rest);
+    out
+}
+/// RFC 6570 §1.5: everything but unreserved characters percent-encoded;
+/// with `reserved` (`{+x}`, `{#x}`), reserved characters and existing
+/// percent-encodings too are kept.
+fn template_encode(value: &str, reserved: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let unreserved = b.is_ascii_alphanumeric() || b"-._~".contains(&b);
+        let kept_reserved = reserved && b":/?#[]@!$&'()*+,;=".contains(&b);
+        let pct = reserved
+            && b == b'%'
+            && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+            && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
+        if unreserved || kept_reserved || pct {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Reads an event stream (`text/event-stream`) until `stop` or its end,
-/// calling `heard` for each state change of `account`.
+/// calling `heard` for each state change of `account` to a type `push`
+/// follows; `heard` answering false ends it.
 fn read_events(
     mut reader: impl BufRead,
     stop: &std::sync::atomic::AtomicBool,
     account: &str,
+    push: &Push,
     last_id: &std::sync::Mutex<String>,
-    heard: &mut dyn FnMut() -> Result<()>,
+    heard: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
     use std::io::Read as _;
     use std::sync::atomic::Ordering;
@@ -2237,8 +2437,11 @@ fn read_events(
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
-            if (event.is_empty() || event == "state") && state_change_for(&data, account) {
-                heard()?;
+            if (event.is_empty() || event == "state")
+                && state_change_for(&data, account, push)
+                && !heard()?
+            {
+                return Ok(());
             }
             event.clear();
             data.clear();
@@ -2351,12 +2554,12 @@ impl Session {
     }
 }
 
-/// Whether an event stream's StateChange says mail of `account` changed.
 impl Session {
     /// Follows pushed changes over a WebSocket (RFC 8887), where the server
     /// has no event source: as `listen`.
     fn listen_websocket(
         &self,
+        push: &Push,
         stop: &std::sync::atomic::AtomicBool,
         heard: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
@@ -2378,8 +2581,12 @@ impl Session {
             Duration::from_secs(u64::from(PING_SECONDS) * 2),
         )?;
         socket.send_text(
-            &json!({ "@type": "WebSocketPushEnable", "dataTypes": ["Email", "Mailbox"] })
-                .to_string(),
+            // RFC 8887 §4.3.5: `dataTypes` null means every type.
+            &json!({
+                "@type": "WebSocketPushEnable",
+                "dataTypes": if push.types.iter().any(|t| t == "*") { Value::Null } else { json!(push.names()) },
+            })
+            .to_string(),
         )?;
         // Reconnected now and then, as servers and proxies end long
         // connections anyway.
@@ -2394,8 +2601,12 @@ impl Session {
             match socket.receive()? {
                 super::websocket::Incoming::Text(text) => {
                     unanswered = 0;
-                    if state_change_for(&text, &self.account_id) {
+                    if state_change_for(&text, &self.account_id, push) {
                         heard()?;
+                        if push.close_after_state {
+                            let _ = socket.close();
+                            return Ok(());
+                        }
                     }
                 }
                 super::websocket::Incoming::Pong => unanswered = 0,
@@ -2415,13 +2626,15 @@ impl Session {
     }
 }
 
-fn state_change_for(data: &str, account: &str) -> bool {
+/// Whether a StateChange (RFC 8620 §7.1) says a type `push` follows
+/// changed in `account`.
+fn state_change_for(data: &str, account: &str, push: &Push) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(data) else {
         return false;
     };
     v["changed"][account]
         .as_object()
-        .is_some_and(|types| types.contains_key("Email") || types.contains_key("Mailbox"))
+        .is_some_and(|types| types.keys().any(|k| push.wants(k)))
 }
 
 /// Runs `work` on each item on at most `workers` threads at once, returning
@@ -2746,16 +2959,24 @@ mod tests {
         let change = r#"{"@type":"StateChange","changed":{"A1":{"Email":"s2"}}}"#;
         let stream = format!(": ping\r\n\r\nevent: state\r\ndata: {change}\r\n\r\ndata: {change}\n\n");
         let mut heard = 0;
-        read_events(stream.as_bytes(), &stop, "A1", &Default::default(), &mut || {
+        read_events(stream.as_bytes(), &stop, "A1", &Push::MAIL, &Default::default(), &mut || {
             heard += 1;
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         assert_eq!(heard, 2);
+        // closeafter=state: the first change ends it.
+        let mut heard = 0;
+        read_events(stream.as_bytes(), &stop, "A1", &Push::MAIL, &Default::default(), &mut || {
+            heard += 1;
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(heard, 1);
         let endless = "data: x\n".repeat(600_000);
-        assert!(read_events(endless.as_bytes(), &stop, "A1", &Default::default(), &mut || Ok(())).is_err());
+        assert!(read_events(endless.as_bytes(), &stop, "A1", &Push::MAIL, &Default::default(), &mut || Ok(true)).is_err());
         let long_line = format!("data: {}", "x".repeat(2 << 20));
-        assert!(read_events(long_line.as_bytes(), &stop, "A1", &Default::default(), &mut || Ok(())).is_err());
+        assert!(read_events(long_line.as_bytes(), &stop, "A1", &Push::MAIL, &Default::default(), &mut || Ok(true)).is_err());
     }
 
     /// Work runs on no more threads than asked, and results keep the
@@ -2816,6 +3037,59 @@ mod tests {
         assert!(out[0].value().is_err());
     }
 
+    /// RFC 6570 templates as servers write them, with each operator, and
+    /// values encoded as the operator asks (RFC 8620 §2).
+    #[test]
+    fn uri_templates_expand_every_operator() {
+        let vars = [("accountId", "u 1"), ("blobId", "B/2"), ("name", "a b.eml"), ("type", "text/plain")];
+        assert_eq!(
+            expand_template("https://x/d/{accountId}/{blobId}/{name}?accept={type}", &vars),
+            "https://x/d/u%201/B%2F2/a%20b.eml?accept=text%2Fplain"
+        );
+        assert_eq!(
+            expand_template("https://x/d{/accountId,blobId}{?name,type}", &vars),
+            "https://x/d/u%201/B%2F2?name=a%20b.eml&type=text%2Fplain"
+        );
+        assert_eq!(expand_template("https://x/d?x=1{&type}", &vars), "https://x/d?x=1&type=text%2Fplain");
+        assert_eq!(expand_template("https://x/{+type}{#blobId}", &vars), "https://x/text/plain#B/2");
+        assert_eq!(expand_template("https://x/f{.name}{;accountId:1}", &vars), "https://x/f.a%20b.eml;accountId=u");
+        // Unknown variables drop out; text without braces is kept.
+        assert_eq!(expand_template("https://x/{missing}{?missing}/y", &vars), "https://x//y");
+        assert_eq!(
+            expand_template("https://x/es?types={types}&closeafter={closeafter}&ping={ping}", &[("types", "Email,Mailbox"), ("closeafter", "no"), ("ping", "30")]),
+            "https://x/es?types=Email%2CMailbox&closeafter=no&ping=30"
+        );
+    }
+
+    /// A stream that goes silent is given up on after the silence allowed,
+    /// rather than waited on for good, and `stop` ends it at once.
+    #[test]
+    fn silent_event_streams_end() {
+        use std::io::Read as _;
+        struct Silent;
+        impl std::io::Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(0)
+            }
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let mut reader = Watched::new(Silent, &stop, Duration::from_millis(1500));
+        let e = reader.read(&mut [0; 16]).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let mut reader = Watched::new(Silent, &stop, Duration::from_secs(600));
+        assert_eq!(reader.read(&mut [0; 16]).unwrap(), 0);
+        // What arrives is read through.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut reader = Watched::new(&b"data: x\n\n"[..], &stop, Duration::from_secs(5));
+        let mut all = String::new();
+        reader.read_to_string(&mut all).unwrap();
+        assert_eq!(all, "data: x\n\n");
+    }
+
     #[test]
     fn session_urls() {
         assert_eq!(
@@ -2869,13 +3143,17 @@ mod tests {
     #[test]
     fn state_changes_name_the_account() {
         let data = r#"{"@type":"StateChange","changed":{"u1":{"Email":"s2"}}}"#;
-        assert!(state_change_for(data, "u1"));
-        assert!(!state_change_for(data, "u2"));
-        assert!(!state_change_for(
-            r#"{"changed":{"u1":{"Calendar":"x"}}}"#,
-            "u1"
-        ));
-        assert!(!state_change_for("not json", "u1"));
+        let mail = Push::MAIL;
+        assert!(state_change_for(data, "u1", &mail));
+        assert!(!state_change_for(data, "u2", &mail));
+        let calendar = r#"{"changed":{"u1":{"CalendarEvent":"x"}}}"#;
+        assert!(!state_change_for(calendar, "u1", &mail));
+        let events = Push { types: vec!["CalendarEvent".into()], close_after_state: true };
+        assert!(state_change_for(calendar, "u1", &events));
+        assert!(!state_change_for(data, "u1", &events));
+        let all = Push { types: vec!["*".into()], close_after_state: false };
+        assert!(state_change_for(calendar, "u1", &all));
+        assert!(!state_change_for("not json", "u1", &mail));
     }
 
     #[test]
