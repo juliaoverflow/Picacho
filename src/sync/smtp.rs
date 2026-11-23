@@ -1524,7 +1524,7 @@ fn dot_stuff_into(bytes: &[u8], out: &mut impl Write) -> std::io::Result<()> {
 pub(crate) fn receipt(
     a: &Account,
     m: &crate::manage::model::Mail,
-    to: &str,
+    to: &[String],
     original_recipient: &str,
 ) -> Vec<u8> {
     let encoded = crate::sync::mime::encoded_words;
@@ -1541,12 +1541,18 @@ pub(crate) fn receipt(
         .filter(|c| !c.is_control())
         .collect();
     let original = original.trim();
-    // The same for the address, which comes from the sender's
-    // Disposition-Notification-To.
-    let to: String = to.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>')).collect();
+    // The same for the addresses, which come from the sender's
+    // Disposition-Notification-To; all of them are written (RFC 8098 §2.1).
+    let to: Vec<String> = to
+        .iter()
+        .map(|t| t.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | ',')).collect())
+        .collect();
     let mut out = String::new();
     out.push_str(&format!("From: {name} <{}>\r\n", a.email));
-    out.push_str(&format!("To: <{to}>\r\n"));
+    out.push_str(&format!(
+        "To: {}\r\n",
+        to.iter().map(|t| format!("<{t}>")).collect::<Vec<_>>().join(", ")
+    ));
     out.push_str(&format!("Subject: {subject}\r\n"));
     out.push_str(&format!("Date: {}\r\n", now.to_rfc2822()));
     out.push_str(&format!("Message-ID: <{}@{domain}>\r\n", uuid::Uuid::new_v4()));
@@ -1760,10 +1766,17 @@ mod tests {
             subject: "Hi".into(),
             ..Default::default()
         };
-        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com>\r\nX-Evil: 1", "rfc822;qa@example.com\r\nX-Evil: 2"))?;
+        let raw = String::from_utf8(receipt(
+            &a,
+            &m,
+            &["ana@example.com>\r\nX-Evil: 1".into(), "bo@example.com".into()],
+            "rfc822;qa@example.com\r\nX-Evil: 2",
+        ))?;
         let headers = raw.split("\r\n\r\n").next().unwrap_or_default();
         assert!(!headers.contains("\r\nBcc:"), "{headers}");
         assert!(!headers.contains("\r\nX-Evil:"), "{headers}");
+        // Every address that asked is told (RFC 8098 §2.1).
+        assert!(headers.contains("\r\nTo: <ana@example.comX-Evil: 1>, <bo@example.com>\r\n"), "{headers}");
         let d = Draft {
             to: "ana@example.com".into(),
             subject: "Re: Hi".into(),

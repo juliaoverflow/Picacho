@@ -1920,7 +1920,11 @@ impl Store {
             if let Some(data) = data {
                 let mut mail: Mail = serde_json::from_str(&data)?;
                 let labels_changed = labels.as_ref().is_some_and(|l| *l != mail.labels());
-                let marks = (*answered, *forwarded, *mdn_sent);
+                // A receipt handled here stays handled: where the mailbox
+                // can't keep $MDNSent (no \* in PERMANENTFLAGS, RFC 3503
+                // §3.1), the server never shows it, and asking again would
+                // send a second receipt.
+                let marks = (*answered, *forwarded, *mdn_sent || mail.mdn_sent);
                 if (mail.unread, mail.starred) != (*unread, *starred)
                     || labels_changed
                     || (mail.answered, mail.forwarded, mail.mdn_sent) != marks

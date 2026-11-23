@@ -74,22 +74,30 @@ impl Backend {
         let _ = self.change_many(a, &[m], Change::Mark(mark));
     }
     /// Sends the read receipt `m`'s sender asked for (RFC 8098), then
-    /// marks it $MDNSent so no mail app asks again.
+    /// marks it $MDNSent so no mail app asks again. It goes to every
+    /// address the message named (RFC 8098 §2.1), in one report.
     pub fn send_receipt(&self, a: &Account, m: &Mail) -> Result<()> {
-        let to = m.receipt_to().trim().to_owned();
+        let to: Vec<String> = m
+            .receipt_to()
+            .split(", ")
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect();
         ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
-        // The address is the sender's to write: checked for every provider,
-        // not only for SMTP's envelope (`deliver_raw`).
-        // One plain address: list separators, quotes or a second `@` could
-        // make more than one recipient of it for some servers.
-        ensure!(
-            !to.contains(|c: char| {
-                c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"' | '(' | ')')
-            }) && to.matches('@').count() == 1
-                && !to.starts_with('@')
-                && !to.ends_with('@'),
-            "The read receipt's address “{to}” isn't valid."
-        );
+        // The addresses are the sender's to write: checked for every
+        // provider, not only for SMTP's envelope (`deliver_raw`).
+        // Plain addresses: list separators, quotes or a second `@` could
+        // make more recipients of one for some servers.
+        for to in &to {
+            ensure!(
+                !to.contains(|c: char| {
+                    c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"' | '(' | ')')
+                }) && to.matches('@').count() == 1
+                    && !to.starts_with('@')
+                    && !to.ends_with('@'),
+                "The read receipt's address “{to}” isn't valid."
+            );
+        }
         ensure!(m.account == a.id, "Message belongs to another account");
         // Original-Recipient, where the receiving server noted it (RFC
         // 8098 §3.2.3: copied into the report when present).
@@ -104,10 +112,11 @@ impl Backend {
             })
             .unwrap_or_default();
         let raw = crate::sync::smtp::receipt(a, m, &to, &original_recipient);
+        let to_all = to;
         if a.provider == Provider::Proton {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
-            self.send_proton(a, &a.email, &[to], &raw)?;
+            self.send_proton(a, &a.email, &to_all, &raw)?;
         } else if a.provider == Provider::Jmap {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
@@ -133,7 +142,7 @@ impl Backend {
                 Ok(true)
             })?;
             if !by_server {
-                self.send_jmap(a, &a.email, &[to], &raw, &Default::default())?;
+                self.send_jmap(a, &a.email, &to_all, &raw, &Default::default())?;
             }
         } else {
             let lock = self.account_lock(&a.id);
@@ -145,7 +154,7 @@ impl Backend {
             crate::sync::smtp::deliver_raw(
                 a,
                 "",
-                &[to],
+                &to_all,
                 &raw,
                 &crate::sync::smtp::Endpoint::of(a),
                 &secret,

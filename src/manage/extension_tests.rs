@@ -2170,3 +2170,69 @@ fn read_only_mailboxes_are_not_changed() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 3503 §3.1: where a mailbox can't keep $MDNSent (PERMANENTFLAGS
+/// without `\*`), a declined (or sent) read receipt is remembered here
+/// without a STORE, and a later flag check doesn't ask again.
+#[test]
+fn mdn_sent_is_kept_locally_where_the_server_cannot() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut stores = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 8] next\r\n");
+                    p.send("* OK [PERMANENTFLAGS (\\Seen \\Flagged)] no keywords\r\n");
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH 7\r\n");
+                } else if upper.starts_with("UID FETCH") {
+                    if upper.contains("HEADER") {
+                        let header = "From: Ana <ana@example.com>\r\nDisposition-Notification-To: ana@example.com, bo@example.com\r\nSubject: Read?\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\nMessage-ID: <r@example.com>\r\n\r\n";
+                        p.send(&format!(
+                            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                            header.len()
+                        ));
+                    } else {
+                        p.send("* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n");
+                    }
+                } else if upper.starts_with("UID STORE") {
+                    stores.push(command);
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        stores
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let synced = b.sync(&a, Folder::Inbox, 300)?;
+    let m = &synced[0];
+    assert_eq!(m.receipt_to(), "ana@example.com, bo@example.com");
+    assert!(!m.mdn_sent);
+    b.decline_receipt(&a, m)?;
+    assert!(b.store.message(&m.id)?.unwrap().mdn_sent);
+    // The server still shows no $MDNSent: it stays handled here.
+    let again = b.sync(&a, Folder::Inbox, 300)?;
+    assert!(again[0].mdn_sent);
+    assert!(b.store.message(&m.id)?.unwrap().mdn_sent);
+    b.disconnect(&a.id);
+    let stores = server.join().unwrap();
+    assert!(stores.is_empty(), "{stores:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

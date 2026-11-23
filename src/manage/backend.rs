@@ -2028,7 +2028,8 @@ impl Backend {
                 m.starred = row.flagged();
                 m.answered = row.answered();
                 m.forwarded = row.forwarded();
-                m.mdn_sent = row.mdn_sent();
+                // Kept once handled here; see `Store::apply_changes`.
+                m.mdn_sent |= row.mdn_sent();
                 if let Some(labels) = row.labels(gmail) {
                     m.set_labels(labels);
                 }
