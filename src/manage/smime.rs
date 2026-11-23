@@ -585,6 +585,147 @@ fn sign_part(cert: &X509, chain: &[X509], key: &PKey<Private>, content: &[u8]) -
     Ok(multipart_signed(content, &signed.to_der()?))
 }
 
+/// RFC 9788 §1.1.2 (RFC 9787's user-facing fields): the header fields
+/// copied into the Cryptographic Payload. Bcc never is (RFC 9788 §11.4):
+/// each Bcc recipient gets a copy of their own, and inside it would show
+/// them to everyone who can decrypt. To be merged with the hp sub-lane's
+/// OpenPGP helper, which uses the same set.
+const INNER_HEADERS: [&str; 9] = [
+    "from",
+    "to",
+    "cc",
+    "reply-to",
+    "subject",
+    "date",
+    "message-id",
+    "in-reply-to",
+    "references",
+];
+
+/// A header section's fields, each with its folded lines, and the name
+/// lowercased.
+fn header_fields(head: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in head.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            continue;
+        }
+        let mut line = line.to_owned();
+        if !line.ends_with('\n') {
+            line.push_str("\r\n");
+        }
+        match out.last_mut() {
+            Some((_, field)) if line.starts_with([' ', '\t']) => field.push_str(&line),
+            _ => {
+                let name = line.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+                out.push((name, line));
+            }
+        }
+    }
+    out
+}
+
+/// RFC 9788 §5.2.1: the MIME part about to be signed or encrypted, with
+/// the message's user-facing header fields copied into it and its
+/// Content-Type marked hp="clear" (signed only) or hp="cipher"
+/// (encrypted). Encrypted, every non-structural field left outside is
+/// recorded in an HP-Outer field (§2.2), so a reader knows none were made
+/// confidential. The outer header section stays as it is.
+fn protected_part(part: &[u8], outer: &[u8], encrypt: bool) -> Vec<u8> {
+    let latin1 = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() };
+    let part = latin1(part);
+    let outer = latin1(outer);
+    let (head, body) = if part.starts_with("\r\n") {
+        ("", part.as_str())
+    } else {
+        match part.find("\r\n\r\n") {
+            Some(at) => (&part[..at + 2], &part[at + 2..]),
+            None => (part.as_str(), "\r\n"),
+        }
+    };
+    let hp = if encrypt { "cipher" } else { "clear" };
+    let mut new_head = String::new();
+    let mut marked = false;
+    for (name, field) in header_fields(head) {
+        if name == "content-type" && !marked {
+            let field = field.trim_end_matches(['\r', '\n']);
+            new_head.push_str(&format!("{field}; hp=\"{hp}\"\r\n"));
+            marked = true;
+        } else {
+            new_head.push_str(&field);
+        }
+    }
+    if !marked {
+        // RFC 2045 §5.2: without one, the part is text/plain in US-ASCII.
+        new_head.insert_str(0, &format!("Content-Type: text/plain; charset=us-ascii; hp=\"{hp}\"\r\n"));
+    }
+    let fields = header_fields(&outer);
+    for (name, field) in &fields {
+        if INNER_HEADERS.contains(&name.as_str()) {
+            new_head.push_str(field);
+        }
+    }
+    if encrypt {
+        for (name, field) in &fields {
+            // RFC 9788 §1.1.1 (RFC 9787): MIME-Version and Content-* are
+            // structural, and Bcc isn't sent at all.
+            if name == "bcc" || name == "mime-version" || name.starts_with("content-") {
+                continue;
+            }
+            new_head.push_str(&format!("HP-Outer: {field}"));
+        }
+    }
+    let out = new_head + body;
+    out.chars().map(|c| c as u8).collect()
+}
+
+/// RFC 9788 §4.2: where the opened payload's Content-Type has an hp
+/// parameter, its header fields are the message's, so outer fields of the
+/// same names give way to them, except From: the outer From is the one
+/// each signature's certificate was compared with (`overall`), so an inner
+/// one would show an address no check covered. RFC 9788 §4.4's From
+/// comparison is left to the merge with the hp sub-lane's reading helper.
+/// HP-Outer fields are dropped: they describe the outside and are not the
+/// message's own.
+fn take_protected_headers(outer: Vec<u8>, payload: &mut Vec<u8>) -> Vec<u8> {
+    let Some((ctype, _)) = kind(payload) else {
+        return outer;
+    };
+    let Ok((headers, _)) = mailparse::parse_headers(payload) else {
+        return outer;
+    };
+    use mailparse::MailHeaderMap as _;
+    let protected = headers
+        .get_first_value("Content-Type")
+        .map(|v| mailparse::parse_content_type(&v).params.contains_key("hp"))
+        .unwrap_or(false);
+    if !protected || ctype.is_empty() {
+        return outer;
+    }
+    let latin1 = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() };
+    let text = latin1(payload);
+    let at = text.find("\r\n\r\n").map_or(text.len(), |i| i + 2);
+    let (head, body) = text.split_at(at);
+    let inner = header_fields(head);
+    let shown = |n: &str| INNER_HEADERS.contains(&n) && n != "from";
+    let inside: Vec<&str> = inner.iter().map(|(n, _)| n.as_str()).filter(|n| shown(n)).collect();
+    let mut kept: String = header_fields(&latin1(&outer))
+        .into_iter()
+        .filter(|(n, _)| !inside.contains(&n.as_str()))
+        .map(|(_, f)| f)
+        .collect();
+    let mut rest = String::new();
+    for (name, field) in inner {
+        if shown(&name) {
+            kept.push_str(&field);
+        } else if name != "hp-outer" && !INNER_HEADERS.contains(&name.as_str()) {
+            rest.push_str(&field);
+        }
+    }
+    *payload = (rest + body).chars().map(|c| c as u8).collect();
+    kept.chars().map(|c| c as u8).collect()
+}
+
 /// Signs and/or encrypts a finished message with S/MIME. Encrypted mail is
 /// encrypted to each recipient's certificate and the sender's own.
 pub fn protect_with(
@@ -600,7 +741,9 @@ pub fn protect_with(
         part.truncate(part.len() - 2);
     }
     let own = certs.own_for(from);
-    let mut content = part;
+    // RFC 9788 §5.2: the user-facing header fields are protected too,
+    // signed (and encrypted) with the body.
+    let mut content = protected_part(&part, &outer, encrypt);
     if sign {
         let (cert, chain, key) = own.as_ref().with_context(|| {
             format!("There's no S/MIME certificate of yours for {from}. Import one in Settings → Encryption, or turn off Sign.")
@@ -901,7 +1044,7 @@ fn open_checked(
     if !verdict.certificates.is_empty() {
         return Some((raw.to_vec(), verdict, None));
     }
-    let mut readable = outer;
+    let mut readable = take_protected_headers(outer, &mut current);
     readable.extend_from_slice(b"MIME-Version: 1.0\r\n");
     // Line ends made CRLF byte by byte: through a UTF-8 string, text in
     // another charset (and binary parts) came out as replacement marks.
@@ -1863,5 +2006,94 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(verdict.signature, Signature::Untrusted("ana@example.org".into()));
+    }
+
+    const WITH_BCC: &[u8] = b"From: Ana <ana@example.org>\r\nTo: bo@example.se\r\nCc: cy@example.com\r\nBcc: dee@example.net\r\nReply-To: ana@home.example\r\nSubject: Plans\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\nMessage-ID: <plans@example.org>\r\nIn-Reply-To: <earlier@example.org>\r\nReferences: <earlier@example.org>\r\nX-Mailer: Picacho\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
+
+    fn names(head: &[u8]) -> Vec<String> {
+        header_fields(&String::from_utf8_lossy(head)).into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// RFC 9788 §5.2.1: signed only, the inner part carries the nine
+    /// user-facing fields, never Bcc, and hp="clear", with no HP-Outer.
+    #[test]
+    fn signed_part_carries_the_rfc_9788_headers_without_bcc() {
+        let (part, outer) = split(WITH_BCC);
+        let inner = protected_part(&part, &outer, false);
+        let text = String::from_utf8_lossy(&inner);
+        let head = &text[..text.find("\r\n\r\n").unwrap() + 2];
+        assert!(head.starts_with("Content-Type: text/plain; charset=utf-8; hp=\"clear\"\r\n"), "{head}");
+        assert_eq!(
+            names(head.as_bytes()),
+            ["content-type", "from", "to", "cc", "reply-to", "subject", "date", "message-id", "in-reply-to", "references"]
+        );
+        assert!(!head.to_lowercase().contains("bcc") && !head.contains("HP-Outer") && !head.contains("X-Mailer"));
+        assert!(text.ends_with("\r\n\r\nMeet at noon.\r\n"));
+    }
+
+    /// RFC 9788 §5.2.1 step 5 and §2.2: encrypted, hp="cipher", and each
+    /// non-structural field left outside is recorded as HP-Outer; Bcc in
+    /// neither.
+    #[test]
+    fn encrypted_part_records_outer_fields_as_hp_outer() {
+        let (part, outer) = split(WITH_BCC);
+        let inner = protected_part(&part, &outer, true);
+        let text = String::from_utf8_lossy(&inner);
+        let head = &text[..text.find("\r\n\r\n").unwrap() + 2];
+        assert!(head.contains("; hp=\"cipher\"\r\n"));
+        assert!(head.contains("HP-Outer: Subject: Plans\r\n") && head.contains("HP-Outer: X-Mailer: Picacho\r\n"));
+        assert!(!head.to_lowercase().contains("bcc"), "{head}");
+        assert!(!head.contains("HP-Outer: MIME-Version") && !head.contains("HP-Outer: Content-Type"));
+        // A part without a Content-Type gets the default one, marked.
+        let bare = protected_part(b"\r\nHi.", b"Subject: Hi\r\n", true);
+        assert!(String::from_utf8_lossy(&bare).starts_with("Content-Type: text/plain; charset=us-ascii; hp=\"cipher\"\r\n"));
+    }
+
+    /// Signed-only S/MIME with protected headers verifies, as the inner
+    /// headers are under the signature; on read, the inner fields are the
+    /// message's (once each) and HP-Outer isn't shown.
+    #[test]
+    fn protected_headers_round_trip_signed_and_encrypted() {
+        let ana = fixture_identity("ana");
+        let mut bo = fixture_identity("bo");
+        bo.others.push(String::from_utf8(fixture("ana.pem")).unwrap());
+        let signed = protect_with(&ana, WITH_BCC, "ana@example.org", &[], true, false).unwrap();
+        assert!(openssl_cli_verifies("cms", &signed));
+        let (readable, verdict, _) = open_with(&signed, &bo, &test_authority()).unwrap();
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        let head = &readable[..readable.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 2];
+        let mut seen = names(head);
+        assert_eq!(seen.iter().filter(|n| *n == "subject").count(), 1, "{}", String::from_utf8_lossy(head));
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), names(head).len(), "no field twice");
+        // Encrypted to Ana's own (RSA) certificate: Pkcs7::encrypt, which
+        // sending uses, can't encrypt to Bo's EC one.
+        let encrypted = protect_with(&ana, WITH_BCC, "ana@example.org", &[], true, true).unwrap();
+        let (readable, verdict, _) = open_with(&encrypted, &ana, &test_authority()).unwrap();
+        assert!(verdict.decrypted);
+        let text = String::from_utf8_lossy(&readable);
+        assert!(!text.contains("HP-Outer") && !text.contains("hp=\"cipher\"; hp"), "{text}");
+        let parsed = mailparse::parse_mail(&readable).unwrap();
+        assert_eq!(parsed.get_body().unwrap().trim(), "Meet at noon.");
+    }
+
+    /// RFC 9788 §4.2 on read: a protected Subject replaces a hidden outer
+    /// one, but an inner From never replaces the outer From the signature
+    /// was checked against; an unprotected payload changes nothing.
+    #[test]
+    fn inner_headers_replace_outer_ones_except_from() {
+        let outer = b"From: eve@example.net\r\nSubject: ...\r\nX-Mailer: Other\r\n".to_vec();
+        let mut payload = b"Content-Type: text/plain; hp=\"cipher\"\r\nFrom: Bank <alerts@bank.example>\r\nSubject: Real subject\r\nHP-Outer: Subject: ...\r\n\r\nBody\r\n".to_vec();
+        let kept = take_protected_headers(outer.clone(), &mut payload);
+        let kept = String::from_utf8(kept).unwrap();
+        assert!(kept.contains("From: eve@example.net\r\n") && !kept.contains("bank"), "{kept}");
+        assert!(kept.contains("Subject: Real subject\r\n") && !kept.contains("Subject: ...\r\n"), "{kept}");
+        assert!(kept.contains("X-Mailer: Other\r\n"));
+        assert_eq!(payload, b"Content-Type: text/plain; hp=\"cipher\"\r\n\r\nBody\r\n");
+        let mut plain = b"Content-Type: text/plain\r\nSubject: Inner\r\n\r\nBody\r\n".to_vec();
+        let before = plain.clone();
+        assert_eq!(take_protected_headers(outer.clone(), &mut plain), outer);
+        assert_eq!(plain, before);
     }
 }
