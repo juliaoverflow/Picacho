@@ -40,7 +40,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleURLTypes:
           - CFBundleURLName: tech.pinal.picacho.sign-in
-            CFBundleURLSchemes: [picacho]
+            CFBundleURLSchemes: [picacho, tech.pinal.picacho]
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     settings:

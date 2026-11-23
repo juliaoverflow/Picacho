@@ -672,17 +672,27 @@ pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
 /// Tests: what plays the person in the browser, instead of opening one.
 #[cfg(test)]
 pub(crate) static TEST_BROWSER: Mutex<Option<fn(url::Url)>> = Mutex::new(None);
-/// `picacho://` URLs macOS handed the app, waiting for a sign-in to claim them.
+/// The app's URL schemes (Info.plist, packaging/ios/project.yml):
+/// `picacho:`, which Pinal's callback page opens, and the reverse-DNS form
+/// RFC 8252 §7.1 asks native apps to use, `tech.pinal.picacho:`, which no
+/// other app's name can collide with.
+const SCHEMES: [&str; 2] = ["picacho:", "tech.pinal.picacho:"];
+/// Callback URLs macOS handed the app in one of `SCHEMES`, waiting for a
+/// sign-in to claim them. Only one whose `state` is a pending sign-in's is
+/// ever taken (`Browser::wait`), and its code is then redeemed with that
+/// sign-in's PKCE verifier; the rest are dropped.
 static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub fn opened(urls: Vec<String>) {
-    // Any web page can ask for `picacho://` addresses: only the latest few,
-    // of a callback's size, are kept for a sign-in to claim.
+    // Any web page can ask for these addresses: only the latest few, of a
+    // callback's size, are kept for a sign-in to claim.
     const KEPT: usize = 16;
     let mut opened = OPENED.lock().unwrap();
-    opened.extend(
-        urls.into_iter()
-            .filter(|u| u.starts_with("picacho:") && u.len() <= 8192),
-    );
+    opened.extend(urls.into_iter().filter(|u| {
+        u.len() <= 8192
+            && SCHEMES
+                .iter()
+                .any(|s| u.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s)))
+    }));
     let extra = opened.len().saturating_sub(KEPT);
     opened.drain(..extra);
 }
@@ -2332,6 +2342,15 @@ mod tests {
             format!("picacho://callback?state={}&code=real&iss=x", browser.state),
         ]);
         assert_eq!(browser.wait(&AtomicBool::new(false)).unwrap(), "real");
+        // RFC 8252 §7.1's reverse-DNS scheme answers the same way, and only
+        // with this sign-in's state.
+        opened(vec![
+            "tech.pinal.picacho:/callback?state=forged&code=no".into(),
+            "tech.pinal.picacho.evil:/callback?state=x&code=no".into(),
+            format!("tech.pinal.picacho:/callback?state={}&code=reverse", browser.state),
+        ]);
+        assert_eq!(browser.wait(&AtomicBool::new(false)).unwrap(), "reverse");
+        assert!(OPENED.lock().unwrap().iter().all(|u| !u.contains("evil")));
         opened(vec![format!(
             "picacho://callback?state={}&error=access_denied",
             browser.state
