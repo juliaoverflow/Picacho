@@ -842,7 +842,18 @@ pub(crate) fn new_folder_name(
             format!("{parent}{d}")
         }
     };
-    let leaf = leaf_name(leaf, hierarchy(names))?;
+    // The delimiter of where it goes: its parent's, or that of the
+    // folders already in the prefix's namespace (RFC 2342 §5: each
+    // namespace has its own), else the server's.
+    let delimiter = match parent {
+        Some(parent) => names.iter().find(|n| n.name == parent).and_then(Name::delimiter),
+        None if !prefix.is_empty() => names
+            .iter()
+            .filter(|n| n.name.starts_with(prefix.as_str()))
+            .find_map(Name::delimiter),
+        None => None,
+    };
+    let leaf = leaf_name(leaf, delimiter.or_else(|| hierarchy(names)))?;
     let top = at_top(&prefix, namespace);
     check_new_name(names, provider, &prefix, &leaf, top)
 }
@@ -1461,28 +1472,43 @@ pub(crate) fn tokens(line: &str) -> Vec<Token> {
     }
     out
 }
-/// The personal namespace's prefix ("" or "INBOX."), from a NAMESPACE reply.
-fn personal_namespace(line: &str) -> Option<String> {
-    match tokens(line).as_slice() {
-        [Token::Open, Token::Open, Token::Text(prefix), ..] => Some(prefix.clone()),
-        _ => None,
+/// One namespace from a NAMESPACE reply (RFC 2342 §5): where its
+/// mailboxes start, and its own hierarchy delimiter (NIL for a flat one).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Namespace {
+    pub(crate) prefix: String,
+    pub(crate) delimiter: Option<String>,
+}
+/// A NAMESPACE reply's three groups: personal, other users', shared.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Namespaces {
+    pub(crate) personal: Vec<Namespace>,
+    pub(crate) other_users: Vec<Namespace>,
+    pub(crate) shared: Vec<Namespace>,
+}
+impl Namespaces {
+    /// Where new folders go: the first personal namespace's prefix (RFC
+    /// 2342 §5: the first is the default), if the server says.
+    pub(crate) fn default_prefix(&self) -> Option<String> {
+        self.personal.first().map(|n| n.prefix.clone())
+    }
+    /// The prefixes listed apart from the rest: personal namespaces after
+    /// the first, other users' and shared ones.
+    pub(crate) fn listed_apart(&self) -> Vec<String> {
+        self.personal
+            .iter()
+            .skip(1)
+            .chain(&self.other_users)
+            .chain(&self.shared)
+            .map(|n| n.prefix.clone())
+            .collect()
     }
 }
-/// The personal namespace's prefix, and those of other users' and shared
-/// folders (NAMESPACE).
-pub(crate) fn namespaces(session: &mut ImapSession) -> Result<(Option<String>, Vec<String>)> {
-    let data = session.run_command_and_read_response("NAMESPACE")?;
-    let lines = other_lines(&data, "NAMESPACE")?;
-    let Some(line) = lines.first() else {
-        return Ok((None, Vec::new()));
-    };
-    Ok((personal_namespace(line), other_namespaces(line)))
-}
-/// The prefixes of the other users' and shared namespaces (the second and
-/// third groups of a NAMESPACE reply).
-fn other_namespaces(line: &str) -> Vec<String> {
+/// A NAMESPACE reply: `(("" "/")("#mh/" "/")) (("~" "/")) NIL`. Each group
+/// is NIL or a list of (prefix delimiter extension…).
+fn parse_namespaces(line: &str) -> Namespaces {
     let tokens = tokens(line);
-    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut groups: Vec<Vec<Namespace>> = Vec::new();
     let mut i = 0;
     while i < tokens.len() && groups.len() < 3 {
         match &tokens[i] {
@@ -1491,9 +1517,8 @@ fn other_namespaces(line: &str) -> Vec<String> {
                 i += 1;
             }
             Token::Open => {
-                // (("prefix" "delim" ext…) …): each namespace's first word.
                 let mut depth = 0;
-                let mut prefixes = Vec::new();
+                let mut group = Vec::new();
                 while i < tokens.len() {
                     match &tokens[i] {
                         Token::Open => {
@@ -1501,7 +1526,14 @@ fn other_namespaces(line: &str) -> Vec<String> {
                             if depth == 2
                                 && let Some(Token::Text(prefix)) = tokens.get(i + 1)
                             {
-                                prefixes.push(prefix.clone());
+                                let delimiter = match tokens.get(i + 2) {
+                                    Some(Token::Text(d)) => Some(d.clone()),
+                                    _ => None,
+                                };
+                                group.push(Namespace {
+                                    prefix: prefix.clone(),
+                                    delimiter,
+                                });
                             }
                         }
                         Token::Close => {
@@ -1515,12 +1547,23 @@ fn other_namespaces(line: &str) -> Vec<String> {
                     }
                     i += 1;
                 }
-                groups.push(prefixes);
+                groups.push(group);
             }
             _ => i += 1,
         }
     }
-    groups.into_iter().skip(1).flatten().collect()
+    let mut groups = groups.into_iter();
+    Namespaces {
+        personal: groups.next().unwrap_or_default(),
+        other_users: groups.next().unwrap_or_default(),
+        shared: groups.next().unwrap_or_default(),
+    }
+}
+/// The server's namespaces (NAMESPACE, RFC 2342).
+pub(crate) fn namespaces(session: &mut ImapSession) -> Result<Namespaces> {
+    let data = session.run_command_and_read_response("NAMESPACE")?;
+    let lines = other_lines(&data, "NAMESPACE")?;
+    Ok(lines.first().map(|line| parse_namespaces(line)).unwrap_or_default())
 }
 /// How much of a mailbox's storage is used and allowed, in KiB.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2228,6 +2271,18 @@ mod extension_tests {
             renamed_folder_name(&dotted, Provider::Imap, "INBOX.Receipts", "Bills", None).unwrap(),
             "INBOX.Bills"
         );
+        // RFC 2342 §5: a namespace with its own delimiter ("." where the
+        // rest has "/"): a new folder there can't hold its "." but may "/".
+        let mixed = [
+            name("INBOX", &[], Some("/")),
+            name("Work", &[], Some("/")),
+            name("#news.comp", &[], Some(".")),
+        ];
+        assert!(new_folder_name(&mixed, Provider::Imap, None, "a.b", Some("#news.")).is_err());
+        assert_eq!(
+            new_folder_name(&mixed, Provider::Imap, None, "a/b", Some("#news.")).unwrap(),
+            "#news.a/b"
+        );
         // Without a hierarchy, folders can't be nested.
         let flat = [name("INBOX", &[], None), name("Receipts", &[], None)];
         assert!(new_folder_name(&flat, Provider::Imap, Some("Receipts"), "x", None).is_err());
@@ -2238,15 +2293,16 @@ mod extension_tests {
     }
     #[test]
     fn extension_replies_are_read() {
-        assert_eq!(
-            personal_namespace(r#"(("INBOX." ".")) NIL NIL"#).as_deref(),
-            Some("INBOX.")
-        );
-        assert_eq!(
-            personal_namespace(r#"(("" "/")) (("Other Users/" "/")) NIL"#).as_deref(),
-            Some("")
-        );
-        assert_eq!(personal_namespace("NIL NIL NIL"), None);
+        let personal = |line: &str| parse_namespaces(line).default_prefix();
+        assert_eq!(personal(r#"(("INBOX." ".")) NIL NIL"#).as_deref(), Some("INBOX."));
+        assert_eq!(personal(r#"(("" "/")) (("Other Users/" "/")) NIL"#).as_deref(), Some(""));
+        assert_eq!(personal("NIL NIL NIL"), None);
+        // RFC 2342 §5.4: several personal namespaces, each its delimiter.
+        let several = parse_namespaces(r##"(("" "/")("#mh/" "/" "X-PARAM" ("FLAG1" "FLAG2"))("#news." ".")) (("~" "/")) (("#shared/" "/")("#public/" NIL))"##);
+        assert_eq!(several.default_prefix().as_deref(), Some(""));
+        assert_eq!(several.listed_apart(), ["#mh/", "#news.", "~", "#shared/", "#public/"]);
+        assert_eq!(several.personal[2], Namespace { prefix: "#news.".into(), delimiter: Some(".".into()) });
+        assert_eq!(several.shared[1].delimiter, None);
         assert_eq!(
             copy_uids(b"* OK [COPYUID 38505 304,319:320 3956:3958] Done\r\n"),
             Some((38505, vec![(304, 3956), (319, 3957), (320, 3958)]))
@@ -2257,10 +2313,10 @@ mod extension_tests {
             Some((38505, 3955))
         );
         assert_eq!(
-            other_namespaces(r#"(("" "/")) (("Other Users/" "/")) (("Shared/" "/") ("Public/" "/"))"#),
+            parse_namespaces(r#"(("" "/")) (("Other Users/" "/")) (("Shared/" "/") ("Public/" "/"))"#).listed_apart(),
             ["Other Users/", "Shared/", "Public/"]
         );
-        assert!(other_namespaces(r#"(("INBOX." ".")) NIL NIL"#).is_empty());
+        assert!(parse_namespaces(r#"(("INBOX." ".")) NIL NIL"#).listed_apart().is_empty());
         assert_eq!(
             storage_quota(r#""" (MESSAGE 4 1000 STORAGE 10 512)"#),
             Some(Quota {

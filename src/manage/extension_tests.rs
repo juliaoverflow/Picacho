@@ -1430,7 +1430,9 @@ fn listing_fixture(capabilities: &'static str) -> Result<()> {
             if upper == "CAPABILITY" {
                 p.send(capabilities);
             } else if upper == "NAMESPACE" {
-                p.send("* NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) ((\"Shared/\" \"/\"))\r\n");
+                // RFC 2342 §5.4: a second personal namespace, with its
+                // own delimiter, listed apart.
+                p.send("* NAMESPACE ((\"\" \"/\")(\"#mh/\" \".\")) ((\"Other Users/\" \"/\")) ((\"Shared/\" \"/\"))\r\n");
             } else if upper.starts_with("LIST \"\" \"*\"") {
                 assert_eq!(
                     command,
@@ -1446,6 +1448,8 @@ fn listing_fixture(capabilities: &'static str) -> Result<()> {
                 p.send("* LIST (\\Noselect) \"/\" Shared\r\n");
                 p.send("* LIST (\\Noselect) \"/\" Shared/team\r\n");
                 p.send("* LIST (\\Subscribed) \"/\" Shared/team/Projects\r\n");
+            } else if upper.starts_with("LIST \"\" \"#MH/*\"") {
+                p.send("* LIST (\\Subscribed) \".\" \"#mh/inbox.drafts\"\r\n");
             } else if upper.starts_with("LIST \"\" \"OTHER USERS/*\"") {
             } else if upper.starts_with("SELECT") {
                 p.send("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n* OK [HIGHESTMODSEQ 40] ok\r\n");
@@ -1480,7 +1484,12 @@ fn listing_fixture(capabilities: &'static str) -> Result<()> {
     // the path to it, its parents being placeholders.
     assert_eq!(
         shown,
-        [("Receipts", "Receipts", 0), ("Shared/team/Projects", "Shared/team/Projects", 0)]
+        [
+            // Shown with "/" between levels, whatever the delimiter.
+            ("#mh/inbox.drafts", "#mh/inbox/drafts", 0),
+            ("Receipts", "Receipts", 0),
+            ("Shared/team/Projects", "Shared/team/Projects", 0)
+        ]
     );
     // The listing's counters tell an unchanged folder from a changed one.
     b.store.save_mailbox_state(

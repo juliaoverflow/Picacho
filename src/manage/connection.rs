@@ -32,10 +32,9 @@ pub(super) struct Connection {
     pub(super) session: ImapSession,
     extensions: Option<Extensions>,
     names: Option<Vec<Name>>,
-    /// The personal namespace's prefix, once asked (NAMESPACE).
-    namespace: Option<Option<String>>,
-    /// Other users' and shared namespaces' prefixes, asked with it.
-    others: Vec<String>,
+    /// The server's namespaces, once asked (NAMESPACE; empty where it has
+    /// none or its reply couldn't be used).
+    namespaces: Option<crate::sync::transport::Namespaces>,
     /// Only subscribed folders are listed (the account's setting).
     pub(super) subscribed_only: bool,
     /// Each folder's counters from the last listing, where the server
@@ -60,8 +59,7 @@ impl Connection {
             session,
             extensions: None,
             names: None,
-            namespace: None,
-            others: Vec::new(),
+            namespaces: None,
             subscribed_only: false,
             statuses: std::collections::HashMap::new(),
             rights: std::collections::HashMap::new(),
@@ -403,7 +401,7 @@ impl Connection {
                 condstore: ext.condstore,
                 subscribed_only: self.subscribed_only,
             };
-            let others = self.others.clone();
+            let others = self.namespaces.as_ref().map(|n| n.listed_apart()).unwrap_or_default();
             let (names, statuses) = crate::sync::transport::list_full(
                 &mut self.session,
                 &options,
@@ -415,17 +413,25 @@ impl Connection {
         }
         Ok(self.names.as_deref().unwrap_or_default())
     }
-    /// Where the server keeps personal folders, if it says (NAMESPACE).
+    /// Where new personal folders go, if the server says (NAMESPACE's
+    /// first personal namespace).
     pub(super) fn namespace(&mut self) -> Result<Option<String>> {
-        if let Some(n) = &self.namespace {
-            return Ok(n.clone());
+        Ok(self.namespaces()?.default_prefix())
+    }
+    /// The server's namespaces (NAMESPACE, RFC 2342), asked once.
+    pub(super) fn namespaces(&mut self) -> Result<&crate::sync::transport::Namespaces> {
+        if self.namespaces.is_none() {
+            let found = self.ask_namespaces()?;
+            self.namespaces = Some(found);
         }
-        let n = if self.extensions()?.namespace {
-            match crate::sync::transport::namespaces(&mut self.session) {
-                Ok((personal, others)) => {
-                    self.others = others;
-                    personal
-                }
+        Ok(self.namespaces.as_ref().expect("just set"))
+    }
+    fn ask_namespaces(&mut self) -> Result<crate::sync::transport::Namespaces> {
+        if !self.extensions()?.namespace {
+            return Ok(Default::default());
+        }
+        match crate::sync::transport::namespaces(&mut self.session) {
+                Ok(found) => Ok(found),
                 // A broken connection is no answer about namespaces.
                 Err(e) if connection_failed(&e) => return Err(e),
                 Err(e) => {
@@ -441,14 +447,9 @@ impl Connection {
                     eprintln!(
                         "Picacho: the server's NAMESPACE reply couldn't be used ({e:#}); folders go at the top, delimiter {delimiter:?}."
                     );
-                    None
+                    Ok(Default::default())
                 }
-            }
-        } else {
-            None
-        };
-        self.namespace = Some(n.clone());
-        Ok(n)
+        }
     }
     /// Refuses, before trying, what this sign-in has no right to do in
     /// `mailbox` on servers that say (ACL's MYRIGHTS). Elsewhere the server
