@@ -334,8 +334,11 @@ pub struct Session {
     max_calls: usize,
     max_request: usize,
     /// RFC 8620 §2: the most requests the server takes at once from one
-    /// client (`maxConcurrentRequests`).
+    /// client (`maxConcurrentRequests`), and uploads (`maxConcurrentUpload`):
+    /// more wait here for a turn rather than being refused there.
     max_concurrent_requests: usize,
+    requests: Slots,
+    uploads: Slots,
     /// The session resource's state when it was read. A response naming
     /// another one means the session changed (new addresses, limits or
     /// accounts): `stale` is set, and the session is read again.
@@ -720,6 +723,8 @@ impl Session {
             // RFC 8620 §2: servers SHOULD take at least 4; more than 8 at
             // once is never needed here.
             max_concurrent_requests: usize_of(&core["maxConcurrentRequests"], 4).min(8),
+            requests: Slots::new(usize_of(&core["maxConcurrentRequests"], 4)),
+            uploads: Slots::new(usize_of(&core["maxConcurrentUpload"], 4)),
             session_state: v["state"].as_str().unwrap_or_default().to_owned(),
             stale: std::sync::atomic::AtomicBool::new(false),
             websocket_url: caps[WEBSOCKET]["url"]
@@ -830,20 +835,28 @@ impl Session {
     /// call's answer alone: the others' results still come back (RFC 8620
     /// §3.6.2), so what an earlier call made isn't lost.
     pub fn call(&self, calls: &[(&str, Value)]) -> Result<Vec<Answer>> {
-        // More calls than the server takes at once go in several requests,
-        // where none uses another's result.
+        // More calls than the server takes at once go in several requests.
+        // A result back-reference (`#ids`) can't cross requests; creation
+        // ids (`"#m"`) can, carried in `createdIds` (RFC 8620 §3.3).
         if calls.len() > self.max_calls {
             ensure!(
-                !calls.iter().any(|(_, args)| uses_results(args)),
+                !calls.iter().any(|(_, args)| uses_result_references(args)),
                 "This JMAP server takes only {} method calls at a time.",
                 self.max_calls
             );
+            let mut created = Some(Map::new());
             let mut out = Vec::with_capacity(calls.len());
             for chunk in calls.chunks(self.max_calls) {
-                out.extend(self.call(chunk)?);
+                out.extend(self.request(chunk, &mut created)?);
             }
             return Ok(out);
         }
+        self.request(calls, &mut None)
+    }
+    /// One request of `calls`. `created`, where there, is sent as
+    /// `createdIds` and replaced by the server's (RFC 8620 §3.3), so the
+    /// next request can name what this one made.
+    fn request(&self, calls: &[(&str, Value)], created: &mut Option<Map<String, Value>>) -> Result<Vec<Answer>> {
         // RFC 8620 §2: an account that is `isReadOnly` refuses every change;
         // asked here, so the user hears why rather than "forbidden".
         if let Some((name, _)) = calls.iter().find(|(name, args)| {
@@ -913,12 +926,17 @@ impl Session {
             .enumerate()
             .map(|(i, (name, args))| json!([name, args, format!("c{i}")]))
             .collect();
-        let body = serde_json::to_vec(&json!({ "using": using, "methodCalls": method_calls }))?;
+        let mut request = json!({ "using": using, "methodCalls": method_calls });
+        if let Some(ids) = created.as_ref() {
+            request["createdIds"] = Value::Object(ids.clone());
+        }
+        let body = serde_json::to_vec(&request)?;
         ensure!(
             body.len() <= self.max_request,
             "This request is larger than the JMAP server takes ({} bytes at most).",
             self.max_request
         );
+        let _turn = self.requests.take();
         let response = self
             .signed(self.http.post(&self.api_url))
             .header("Accept", "application/json")
@@ -943,6 +961,9 @@ impl Session {
             && state != self.session_state
         {
             self.stale.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let (Some(ids), Some(back)) = (created.as_mut(), v["createdIds"].as_object()) {
+            ids.extend(back.clone());
         }
         let responses = v["methodResponses"]
             .as_array()
@@ -1417,6 +1438,7 @@ impl Session {
             "The message is larger than the server accepts."
         );
         let url = expand_template(&self.upload_url, &[("accountId", &self.account_id)]);
+        let _turn = self.uploads.take();
         let response = self
             .signed(self.http.post(&url))
             .timeout(DOWNLOAD_TIMEOUT)
@@ -2757,18 +2779,47 @@ fn bounded_parallel<T: Sync, R: Send>(items: &[T], workers: usize, work: impl Fn
         .collect()
 }
 
-/// Whether a call uses another's result: a back-reference (`#ids`), or a
-/// creation id another call made (`"#m"` as a value, RFC 8620 §5.3).
-fn uses_results(args: &Value) -> bool {
+/// Whether a call uses an earlier call's result by back-reference (an
+/// argument named `#ids`, RFC 8620 §3.7), which only works within one
+/// request. Creation ids (`"#m"` as a value, §5.3) are not this: they
+/// cross requests in `createdIds`.
+fn uses_result_references(args: &Value) -> bool {
     fn refers(v: &Value) -> bool {
         match v {
-            Value::String(s) => s.starts_with('#') && s.len() > 1,
             Value::Array(a) => a.iter().any(refers),
-            Value::Object(m) => m.iter().any(|(k, v)| k.starts_with('#') || refers(v)),
+            Value::Object(m) => m.iter().any(|(k, v)| (k.starts_with('#') && v.get("resultOf").is_some()) || refers(v)),
             _ => false,
         }
     }
     refers(args)
+}
+
+/// A counting limit on things in flight at once (RFC 8620 §2:
+/// `maxConcurrentRequests`, `maxConcurrentUpload`); `take` waits for a
+/// turn, given back when the turn is dropped.
+struct Slots {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+impl Slots {
+    fn new(n: usize) -> Self {
+        Self { free: Mutex::new(n.max(1)), freed: std::sync::Condvar::new() }
+    }
+    fn take(&self) -> Turn<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        Turn(self)
+    }
+}
+struct Turn<'a>(&'a Slots);
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
 }
 
 /// A search snippet as plain text: its `<mark>` tags gone and its
@@ -3231,6 +3282,37 @@ mod tests {
         for m in ["Email/get", "Email/query", "Email/changes", "Blob/get", "Email/parse"] {
             assert!(!writes(m), "{m}");
         }
+    }
+
+    /// No more turns are out at once than the limit; a dropped turn frees
+    /// its slot for a waiting one.
+    #[test]
+    fn slots_bound_what_runs_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Slots::new(2);
+        let running = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _turn = slots.take();
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert!(most.load(Ordering::SeqCst) <= 2);
+        assert_eq!(*slots.free.lock().unwrap(), 2);
+    }
+
+    /// Result references keep calls in one request; creation ids don't.
+    #[test]
+    fn result_references_are_told_from_creation_ids() {
+        assert!(uses_result_references(&json!({ "#ids": { "resultOf": "c0", "name": "Email/query", "path": "/ids" } })));
+        assert!(!uses_result_references(&json!({ "create": { "s": { "emailId": "#m" } } })));
+        assert!(!uses_result_references(&json!({ "onSuccessUpdateEmail": { "#s": { "keywords/$draft": null } } })));
     }
 
     #[test]

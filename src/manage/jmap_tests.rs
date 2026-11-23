@@ -473,6 +473,19 @@ impl Server {
                 let state = if self.dav_changes { format!("e{}", self.dav_state) } else { "e".into() };
                 vec![(name.into(), json!({ "list": list, "state": state }))]
             }
+            "ContactCard/set" | "CalendarEvent/set"
+                if args["ifInState"].is_string() && self.dav_changes =>
+            {
+                // RFC 8620 §5.3: refused unless the state is still that.
+                let kind = if name.starts_with("Calendar") { 'e' } else { 'k' };
+                if args["ifInState"] != format!("{kind}{}", self.dav_state).as_str() {
+                    return vec![("error".into(), json!({ "type": "stateMismatch" }))];
+                }
+                let mut plain = args.clone();
+                plain.as_object_mut().unwrap().remove("ifInState");
+                self.dav_state += 1;
+                self.method(name, &plain, earlier)
+            }
             "CalendarEvent/set" => {
                 assert_eq!(args["sendSchedulingMessages"], false, "Picacho invites by mail");
                 let mut out = json!({});
@@ -777,7 +790,15 @@ impl Server {
         if method == "POST" && path == "/api" {
             let request: Value = serde_json::from_slice(body).unwrap();
             let mut responses = Vec::new();
-            let mut earlier: Vec<Value> = Vec::new();
+            // RFC 8620 §3.3: creation ids from earlier requests resolve as
+            // if made in this one.
+            let mut earlier: Vec<Value> = request["createdIds"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, id)| json!({ "created": { k.clone(): { "id": id } } }))
+                .collect();
+            let carried = earlier.len();
             for call in request["methodCalls"].as_array().unwrap() {
                 let (name, args, id) = (call[0].as_str().unwrap(), &call[1], &call[2]);
                 assert!(
@@ -791,12 +812,17 @@ impl Server {
                     }
                 }
             }
-            return (
-                200,
-                json!({ "methodResponses": responses, "sessionState": self.state_name() })
-                    .to_string()
-                    .into_bytes(),
-            );
+            let mut reply = json!({ "methodResponses": responses, "sessionState": self.state_name() });
+            if request.get("createdIds").is_some() {
+                let mut ids = request["createdIds"].clone();
+                for v in &earlier[carried..] {
+                    for (k, c) in v["created"].as_object().into_iter().flatten() {
+                        ids[k] = c["id"].clone();
+                    }
+                }
+                reply["createdIds"] = ids;
+            }
+            return (200, reply.to_string().into_bytes());
         }
         if method == "POST" && (path.starts_with("/upload/u1/") || path.starts_with("/upload/u2/")) {
             self.next += 1;
@@ -2036,5 +2062,79 @@ fn jmap_blob_redirects_drop_credentials_off_the_origin() -> Result<()> {
     server.lock().unwrap().blobs.insert("B-1".into(), b"one".to_vec());
     let bytes = b.with_jmap(&a, |s| s.download("B-cdn", "m.eml", "message/rfc822", 1 << 20))?;
     assert_eq!(bytes, b"one");
+    Ok(())
+}
+
+/// More calls than the server takes in one request: a creation id made in
+/// one request is named in the next, carried in `createdIds` (RFC 8620
+/// §3.3).
+#[test]
+fn jmap_creation_ids_cross_requests() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let blob = b.with_jmap(&a, |s| s.upload(MESSAGE, "message/rfc822"))?;
+    // The server takes two calls a time: the submission goes in a second
+    // request, naming the import's `#m`.
+    let answers = b.with_jmap(&a, |s| {
+        s.call(&[
+            ("Email/import", json!({ "accountId": "u1", "emails": { "m": {
+                "blobId": blob, "mailboxIds": { "d": true }, "keywords": {} } } })),
+            ("Identity/get", json!({ "accountId": "u1" })),
+            ("EmailSubmission/set", json!({ "accountId": "u1", "create": { "s": {
+                "identityId": "id1", "emailId": "#m",
+                "envelope": { "mailFrom": { "email": "qa@example.com" }, "rcptTo": [{ "email": "r@example.com" }] } } } })),
+        ])
+    })?;
+    assert_eq!(answers.len(), 3);
+    assert_eq!(answers[2].value()?["created"]["s"]["id"], "sub1");
+    assert_eq!(server.lock().unwrap().sent.len(), 1);
+    Ok(())
+}
+
+/// A card is changed with `ifInState` (RFC 8620 §5.3): another card's change
+/// in between moves the state, and the change is tried again since this card
+/// is as it was; this card's own change in between is a conflict.
+#[test]
+fn jmap_card_changes_use_if_in_state() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        dav_changes: true,
+        ..Default::default()
+    };
+    fixture.cards.push(json!({ "@type": "Card", "id": "K0", "uid": "bo", "name": { "full": "Bo" }, "updated": "1" }));
+    fixture.cards.push(json!({ "@type": "Card", "id": "K1", "uid": "cy", "name": { "full": "Cy" }, "updated": "1" }));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_contacts(&a)?;
+    // Saved as read: one ContactCard/set, with the state it was read in.
+    let mut bo = b.contacts().into_iter().find(|c| c.name == "Bo").unwrap();
+    bo.note = "One".into();
+    let bo = b.save_contact(bo)?;
+    assert_eq!(server.lock().unwrap().cards[0]["notes"]["n1"]["note"], "One");
+    // Another card changes on the server: the state moves, this card is
+    // still as read, so the change goes through on the second try.
+    {
+        let mut s = server.lock().unwrap();
+        s.dav_state += 1;
+        s.calls.clear();
+    }
+    let mut again = bo.clone();
+    again.note = "Two".into();
+    b.save_contact(again)?;
+    {
+        let s = server.lock().unwrap();
+        assert_eq!(s.cards[0]["notes"]["n1"]["note"], "Two");
+        assert_eq!(s.calls.iter().filter(|c| *c == "ContactCard/set").count(), 2, "{:?}", s.calls);
+    }
     Ok(())
 }

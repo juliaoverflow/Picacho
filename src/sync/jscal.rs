@@ -759,11 +759,11 @@ pub fn save_event_in(
     // An edit keeps what Picacho doesn't model in the server's copy: the
     // other properties of each location and participant (their links,
     // roles, invitedBy…), and the rest of the event isn't sent at all.
-    let current = match id {
+    let (current, read_state) = match id {
         Some(id) => get_all(s, "CalendarEvent/get", account, &[id.to_owned()])
-            .ok()
-            .and_then(|(list, _)| list.into_iter().next()),
-        None => None,
+            .map(|(list, state)| (list.into_iter().next(), state))
+            .unwrap_or_default(),
+        None => (None, String::new()),
     };
     if let Some(current) = &current {
         merge_entries(&mut props, current, "participants", &["sendTo", "roles", "name", "participationStatus", "scheduleAgent", "@type"]);
@@ -786,22 +786,14 @@ pub fn save_event_in(
     };
     // Only over the version it was read in (`in_state`: the event's
     // version, `event_version`): one changed elsewhere meanwhile isn't
-    // overwritten. Compared per event, since JMAP's ifInState would refuse
-    // for any change to any event.
-    if let (Some(version), Some(id)) = (in_state.filter(|s| !s.is_empty()), id) {
-        let (now, _) = get_all(s, "CalendarEvent/get", account, &[id.to_owned()])?;
-        if let Some(current) = now.first()
-            && event_version(current) != version
-        {
-            bail!(Conflict("This event was changed elsewhere since it was read. Refresh the calendar and make the change again."));
+    // overwritten.
+    const CHANGED: &str = "This event was changed elsewhere since it was read. Refresh the calendar and make the change again.";
+    let v = match (in_state.filter(|s| !s.is_empty()), id, &current) {
+        (Some(version), Some(id), Some(current)) => {
+            ensure!(event_version(current) == version, Conflict(CHANGED));
+            set_if_unchanged(s, "CalendarEvent", account, id, version, &read_state, args, event_version, CHANGED)?
         }
-    }
-    let v = match s.call_one("CalendarEvent/set", args) {
-        Ok(v) => v,
-        Err(e) if refused(&e, "stateMismatch") => {
-            bail!(Conflict("This event was changed elsewhere since it was read. Refresh the calendar and make the change again."))
-        }
-        Err(e) => return Err(e),
+        _ => s.call_one("CalendarEvent/set", args)?,
     };
     if let Some(id) = id {
         if let Some(e) = v["notUpdated"].get(id) {
@@ -816,6 +808,44 @@ pub fn save_event_in(
         .as_str()
         .context("The server didn't say which event it added.")?
         .to_owned())
+}
+
+/// `{kind}/set` with `args`, changing `id` only while it is still at
+/// `version` (as `version_of` reads it): sent with `ifInState`, the state
+/// it was read in (RFC 8620 §5.3), so nothing changes between the check and
+/// the write. The state covers every object of the kind, so a mismatch is
+/// read again: where `id` itself is unchanged, the change is tried once
+/// more in the new state; where it changed, it is a `Conflict`.
+#[allow(clippy::too_many_arguments)]
+fn set_if_unchanged(
+    s: &Session,
+    kind: &str,
+    account: &str,
+    id: &str,
+    version: &str,
+    read_state: &str,
+    args: Value,
+    version_of: fn(&Value) -> String,
+    changed: &'static str,
+) -> Result<Value> {
+    let mut state = read_state.to_owned();
+    for _ in 0..2 {
+        let mut call = args.clone();
+        if !state.is_empty() {
+            call["ifInState"] = json!(state);
+        }
+        match s.call_one(&format!("{kind}/set"), call) {
+            Err(e) if refused(&e, "stateMismatch") => {
+                let (now, new_state) = get_all(s, &format!("{kind}/get"), account, &[id.to_owned()])?;
+                match now.first() {
+                    Some(current) if version_of(current) == version => state = new_state,
+                    _ => bail!(Conflict(changed)),
+                }
+            }
+            other => return other,
+        }
+    }
+    bail!(Conflict(changed))
 }
 
 /// Each entry of `key` in `props` (as Picacho wrote it) takes the other
@@ -1349,21 +1379,18 @@ pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
     match existing {
         Some(id) => {
             // Only over the version it was read in: a card changed
-            // elsewhere meanwhile isn't overwritten. JMAP has no per-object
-            // condition, so this reads it first and compares (ifInState
-            // would also refuse for any other card's change).
-            if !card.etag.is_empty() {
-                let (now, _) = get_all(s, "ContactCard/get", account, &[id.to_owned()])?;
-                if let Some(current) = now.first()
-                    && card_version(current) != card.etag
-                {
-                    bail!(Conflict("This contact was changed elsewhere since it was read. Refresh contacts and make the change again."));
+            // elsewhere meanwhile isn't overwritten.
+            const CHANGED: &str = "This contact was changed elsewhere since it was read. Refresh contacts and make the change again.";
+            let args = json!({ "accountId": account, "update": { id: props } });
+            let v = if card.etag.is_empty() {
+                s.call_one("ContactCard/set", args)?
+            } else {
+                let (now, state) = get_all(s, "ContactCard/get", account, &[id.to_owned()])?;
+                if let Some(current) = now.first() {
+                    ensure!(card_version(current) == card.etag, Conflict(CHANGED));
                 }
-            }
-            let v = s.call_one(
-                "ContactCard/set",
-                json!({ "accountId": account, "update": { id: props } }),
-            )?;
+                set_if_unchanged(s, "ContactCard", account, id, &card.etag, &state, args, card_version, CHANGED)?
+            };
             if let Some(e) = v["notUpdated"].get(id) {
                 bail!("The server didn't change the contact: {}", e["type"].as_str().unwrap_or("refused"));
             }
