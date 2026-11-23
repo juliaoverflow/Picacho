@@ -460,3 +460,28 @@ fn delivery_report_and_time_limit_options_are_in_settings(cx: &mut TestAppContex
     assert!(!saved.dsn.success && saved.dsn.failure && saved.dsn.delay && saved.dsn.return_full);
     assert!(saved.deliver_late_notify && saved.deliver_by_trace);
 }
+
+/// A picture pasted into a formatted draft goes in where it was pasted,
+/// as Markdown naming its attachment; in a plain draft only attached.
+#[gpui::test]
+fn pasted_pictures_are_placed_in_formatted_drafts(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    let body = |cx: &mut VisualTestContext| {
+        composer.read_with(cx, |c, cx| c.body.read(cx).value().to_string())
+    };
+    let picture = std::path::PathBuf::from("/drafts/x/Pasted image (2).png");
+    composer.update_in(cx, |c, w, cx| {
+        c.draft.formatted = false;
+        c.body.update(cx, |s, cx| s.set_text("Look: ", w, cx));
+        c.place_pictures(std::slice::from_ref(&picture), w, cx);
+    });
+    assert_eq!(body(cx), "Look: ");
+    composer.update_in(cx, |c, w, cx| {
+        c.draft.formatted = true;
+        c.body.update(cx, |s, cx| s.set_text("", w, cx));
+        c.place_pictures(std::slice::from_ref(&picture), w, cx);
+    });
+    assert_eq!(body(cx), "![Pasted image (2)](<file:Pasted image (2).png>)");
+}

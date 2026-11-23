@@ -174,37 +174,72 @@ fn build_to(
     }
     // Plain text as format=flowed (RFC 3676): long paragraphs reflow on
     // narrow screens instead of breaking mid-sentence.
+    // A formatted body's `file:` pictures read as their alt text there:
+    // no local file name goes out (`html_body_with`). A draft's copy in
+    // Drafts keeps its source, which is how it's read back (FORMAT_HEADER).
+    let text_body = if !draft && d.formatted && !file_images(&d.body).is_empty() {
+        rewrite_file_images(&d.body, false, |_| None)
+    } else {
+        d.body.clone()
+    };
     let plain = || {
         SinglePart::builder()
             .header(
                 header::ContentType::parse("text/plain; charset=utf-8; format=flowed; delsp=no")
                     .expect("a valid content type"),
             )
-            .body(flowed(&d.body))
+            .body(flowed(&text_body))
     };
+    // Pictures placed in a formatted body (`![…](file:<attachment name>)`)
+    // go beside its HTML, named by Content-ID (RFC 2387, RFC 2392).
+    let inline = if d.formatted {
+        inline_images(&d.body, &d.attachments, &from_address(a, d)?)
+    } else {
+        InlineImages::default()
+    };
+    let html = || SinglePart::html(html_body_with(&d.body, &inline));
     // Without attachments, the text alone: a multipart/mixed wrapper made
     // every message look like it had some.
     if d.attachments.is_empty() {
         return Ok(if d.formatted {
-            builder.multipart(
-                MultiPart::alternative()
-                    .singlepart(plain())
-                    .singlepart(SinglePart::html(html_body(&d.body))),
-            )?
+            builder.multipart(MultiPart::alternative().singlepart(plain()).singlepart(html()))?
         } else {
             builder.singlepart(plain())?
         });
     }
-    let text = if d.formatted {
-        MultiPart::alternative()
-            .singlepart(plain())
-            .singlepart(SinglePart::html(html_body(&d.body)))
+    let mut total = d.body.len();
+    let text = if d.formatted && !inline.images.is_empty() {
+        // RFC 2387 §3.1: the HTML first, its pictures after; the required
+        // `type` parameter names the HTML's type.
+        let kind = header::ContentType::parse(&format!(
+            "multipart/related; type=\"text/html\"; boundary=\"{}\"",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .expect("a valid content type");
+        let mut related = MultiPart::builder().header(kind).singlepart(html());
+        for image in &inline.images {
+            let meta = std::fs::metadata(&image.path)
+                .with_context(|| format!("The picture {} can't be read.", image.path.display()))?;
+            total += meta.len() as usize;
+            ensure!(
+                total < 4 * DEFAULT_LIMIT,
+                "Attachments are too large to send by email. Share them by link instead."
+            );
+            let bytes = std::fs::read(&image.path)?;
+            let name = image.name.clone();
+            related = related.singlepart(
+                Attachment::new_inline_with_name(image.content_id.clone(), name)
+                    .body(bytes, content_type(&image.path)),
+            );
+        }
+        MultiPart::alternative().singlepart(plain()).multipart(related)
+    } else if d.formatted {
+        MultiPart::alternative().singlepart(plain()).singlepart(html())
     } else {
         MultiPart::alternative().singlepart(plain())
     };
     let mut multipart = MultiPart::mixed().multipart(text);
-    let mut total = d.body.len();
-    for path in &d.attachments {
+    for path in d.attachments.iter().filter(|p| !inline.images.iter().any(|i| &i.path == *p)) {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("The attachment {} can't be read.", path.display()))?;
         total += meta.len() as usize;
@@ -1928,9 +1963,148 @@ pub(crate) fn recipients(list: &str) -> Result<Vec<(Option<String>, String)>> {
     Ok(out)
 }
 
+/// Pictures a formatted body places, with the Content-IDs its HTML names
+/// them by.
+#[derive(Debug, Default)]
+struct InlineImages {
+    images: Vec<InlineImage>,
+}
+#[derive(Debug)]
+struct InlineImage {
+    /// The attachment's file name, as `file:` named it.
+    name: String,
+    path: std::path::PathBuf,
+    /// Without its angle brackets.
+    content_id: String,
+}
+/// The pictures `markdown` places with `![alt](file:<name>)` where `name`
+/// is exactly one of `attachments`' file names; each is given a Content-ID
+/// at `from`'s domain (RFC 2392, RFC 5322 §3.6.4), random so unique.
+fn inline_images(markdown: &str, attachments: &[std::path::PathBuf], from: &str) -> InlineImages {
+    let mut found = InlineImages::default();
+    let domain = new_message_id(from);
+    let domain = domain.trim_end_matches('>').rsplit_once('@').map_or("localhost", |(_, d)| d).to_owned();
+    for name in file_images(markdown) {
+        if found.images.iter().any(|i| i.name == name) {
+            continue;
+        }
+        let matching: Vec<&std::path::PathBuf> = attachments
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == name.as_str()))
+            .collect();
+        // Two attachments of one name: which is meant can't be told.
+        if let [path] = matching[..] {
+            found.images.push(InlineImage {
+                name,
+                path: path.clone(),
+                content_id: format!("{}@{domain}", uuid::Uuid::new_v4().simple()),
+            });
+        }
+    }
+    found
+}
+/// The names `![…](file:<name>)` images in `markdown` refer to, in order.
+fn file_images(markdown: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(tree) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else {
+        return names;
+    };
+    fn walk(node: &markdown::mdast::Node, names: &mut Vec<String>) {
+        if let markdown::mdast::Node::Image(image) = node
+            && let Some(name) = image.url.strip_prefix("file:")
+        {
+            names.push(name.to_owned());
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, names);
+        }
+    }
+    walk(&tree, &mut names);
+    names
+}
+
 /// The HTML version of a formatted (Markdown) body. Raw HTML in the text is
 /// escaped, not passed through.
+#[cfg(test)]
 pub(crate) fn html_body(markdown: &str) -> String {
+    html_body_with(markdown, &InlineImages::default())
+}
+/// As `html_body`, with `![…](file:<name>)` pictures shown from `inline`'s
+/// parts by `cid:` (RFC 2392). One not among them (its attachment removed,
+/// or never there) shows its alt text: a `file:` address never goes out,
+/// so no local file name or path does either.
+fn html_body_with(markdown: &str, inline: &InlineImages) -> String {
+    // Each placed picture's address becomes a placeholder the compiler
+    // lets through (it drops `cid:` as an unknown protocol); after, the
+    // placeholder becomes the `cid:` address.
+    let placeholder = |i: usize| format!("https://inline.invalid/{i}");
+    let markdown = rewrite_file_images(markdown, true, |name| {
+        inline
+            .images
+            .iter()
+            .position(|image| image.name == name)
+            .map(placeholder)
+    });
+    let mut html = html_compiled(&markdown);
+    for (i, image) in inline.images.iter().enumerate() {
+        html = html.replace(
+            &format!("src=\"{}\"", placeholder(i)),
+            &format!("src=\"cid:{}\"", image.content_id),
+        );
+    }
+    html
+}
+/// `markdown` with each `file:` image either pointed at what `resolve`
+/// gives for its name, or replaced by its alt text where it gives nothing:
+/// escaped to stay text where the result is compiled (`escape`), as it is
+/// for the plain text.
+fn rewrite_file_images(
+    markdown: &str,
+    escape: bool,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> String {
+    let Ok(tree) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else {
+        return markdown.to_owned();
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    fn walk(
+        node: &markdown::mdast::Node,
+        escape: bool,
+        resolve: &dyn Fn(&str) -> Option<String>,
+        edits: &mut Vec<(usize, usize, String)>,
+    ) {
+        if let markdown::mdast::Node::Image(image) = node
+            && let Some(name) = image.url.strip_prefix("file:")
+            && let Some(at) = &image.position
+        {
+            // The alt text, escaped so it stays text.
+            let alt: String = image
+                .alt
+                .chars()
+                .flat_map(|c| {
+                    let special = matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '!' | '<' | '>' | '#' | '&');
+                    (escape && special).then_some('\\').into_iter().chain(std::iter::once(c))
+                })
+                .collect();
+            let replacement = match resolve(name) {
+                Some(url) => format!("![{alt}](<{url}>)"),
+                None => alt,
+            };
+            edits.push((at.start.offset, at.end.offset, replacement));
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, escape, resolve, edits);
+        }
+    }
+    walk(&tree, escape, &resolve, &mut edits);
+    let mut out = markdown.to_owned();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        out.replace_range(start..end, &replacement);
+    }
+    out
+}
+/// The compiled HTML document of a Markdown body.
+fn html_compiled(markdown: &str) -> String {
     let options = markdown::Options {
         parse: markdown::ParseOptions::gfm(),
         compile: markdown::CompileOptions {
@@ -2119,6 +2293,131 @@ mod tests {
         };
         let sent = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
         assert!(!sent.contains("\r\nBcc:"), "{sent}");
+        Ok(())
+    }
+
+    /// A formatted draft with its attachments in a fresh folder.
+    fn with_files(files: &[(&str, &[u8])]) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("picacho-inline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = files
+            .iter()
+            .map(|(name, bytes)| {
+                let path = dir.join(name);
+                std::fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    /// RFC 2387: a picture a formatted body places by `file:` goes in
+    /// multipart/related (type="text/html") beside the HTML, which names
+    /// it by `cid:`, and leaves the attachments; others stay attached.
+    #[test]
+    fn pictures_in_the_body_go_inline_by_content_id() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let (dir, attachments) = with_files(&[("Pasted image.png", b"\x89PNG-1"), ("notes.pdf", b"%PDF")]);
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Look".into(),
+            body: "Here:\n\n![Pasted image](<file:Pasted image.png>)\n\nAnd `![x](file:notes.pdf)` in code.".into(),
+            formatted: true,
+            attachments,
+            ..Draft::default()
+        };
+        let raw = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
+        let parsed = mailparse::parse_mail(raw.as_bytes())?;
+        assert_eq!(parsed.ctype.mimetype, "multipart/mixed");
+        let alternative = &parsed.subparts[0];
+        assert_eq!(alternative.ctype.mimetype, "multipart/alternative");
+        assert_eq!(alternative.subparts[0].ctype.mimetype, "text/plain");
+        let related = &alternative.subparts[1];
+        assert_eq!(related.ctype.mimetype, "multipart/related");
+        assert_eq!(related.ctype.params.get("type").map(String::as_str), Some("text/html"));
+        let html = related.subparts[0].get_body()?;
+        let image = &related.subparts[1];
+        assert_eq!(image.ctype.mimetype, "image/png");
+        use mailparse::MailHeaderMap as _;
+        let cid = image.headers.get_first_value("Content-ID").unwrap();
+        let cid = cid.trim().trim_start_matches('<').trim_end_matches('>');
+        assert!(cid.ends_with("@example.com"), "{cid}");
+        assert!(html.contains(&format!("src=\"cid:{cid}\"")), "{html}");
+        assert_eq!(image.get_content_disposition().disposition, mailparse::DispositionType::Inline);
+        assert_eq!(image.get_body_raw()?, b"\x89PNG-1");
+        // The PDF stays an attachment, and only it; the code span is text.
+        assert_eq!(parsed.subparts.len(), 2);
+        assert!(parsed.subparts[1].ctype.mimetype == "application/pdf");
+        assert!(html.contains("<code>![x](file:notes.pdf)</code>"), "{html}");
+        // No local name or `file:` address goes out as a picture's source;
+        // the plain text reads the alt text.
+        assert!(!html.contains("src=\"file:") && !html.contains("Pasted image.png"), "{html}");
+        let plain = alternative.subparts[0].get_body()?;
+        assert!(plain.contains("Pasted image") && !plain.contains("<file:"), "{plain}");
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// A `file:` picture with no attachment of its name (removed, or never
+    /// there), or two of that name, shows its alt text; other images
+    /// (https, data:) are as before.
+    #[test]
+    fn unmatched_file_pictures_are_their_alt_text() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let (dir, attachments) = with_files(&[("other.txt", b"x")]);
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Look".into(),
+            body: "![My *photo*](file:/home/me/secret/photo.png) and ![web](https://example.com/a.png)".into(),
+            formatted: true,
+            attachments,
+            ..Draft::default()
+        };
+        let raw = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
+        assert!(!raw.contains("file:") && !raw.contains("/home/me"), "{raw}");
+        assert!(!raw.contains("multipart/related"));
+        let parsed = mailparse::parse_mail(raw.as_bytes())?;
+        let html = parsed.subparts[0].subparts[1].get_body()?;
+        // Its alt text as text (Markdown's alt is plain: emphasis dropped).
+        assert!(html.contains("<p>My photo and "), "{html}");
+        assert!(html.contains("<img src=\"https://example.com/a.png\" alt=\"web\" />"), "{html}");
+        // Unchanged where there are no `file:` pictures.
+        assert_eq!(
+            html_body_with("![web](https://example.com/a.png)", &InlineImages::default()),
+            html_body("![web](https://example.com/a.png)")
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Without `file:` pictures, the MIME structure is as before: the
+    /// alternative straight in mixed, and the HTML as `html_body` made it.
+    #[test]
+    fn messages_without_inline_pictures_are_unchanged() -> Result<()> {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "me@example.com".into();
+        let (dir, attachments) = with_files(&[("photo.png", b"\x89PNG")]);
+        let d = Draft {
+            to: "ana@example.com".into(),
+            subject: "Look".into(),
+            body: "**Bold** and ![web](https://example.com/a.png)".into(),
+            formatted: true,
+            attachments,
+            ..Draft::default()
+        };
+        let raw = build(&a, &d, false)?.formatted();
+        let parsed = mailparse::parse_mail(&raw)?;
+        assert_eq!(parsed.subparts[0].ctype.mimetype, "multipart/alternative");
+        assert_eq!(parsed.subparts[0].subparts[1].ctype.mimetype, "text/html");
+        assert_eq!(
+            parsed.subparts[0].subparts[1].get_body()?.replace("\r\n", "\n"),
+            html_body(&d.body)
+        );
+        assert_eq!(parsed.subparts[0].subparts[0].get_body()?, flowed(&d.body));
+        assert_eq!(parsed.subparts[1].get_content_disposition().disposition, mailparse::DispositionType::Attachment);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

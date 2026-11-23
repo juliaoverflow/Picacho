@@ -728,6 +728,8 @@ impl Composer {
         // A copied picture or files: attached.
         if let Some(item) = cx.read_from_clipboard() {
             let mut files = Vec::new();
+            // Pictures from the clipboard, as against copied files.
+            let mut pictures = Vec::new();
             for entry in item.entries() {
                 match entry {
                     ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
@@ -735,7 +737,10 @@ impl Composer {
                         let extension = extension.split('+').next().unwrap_or(extension);
                         let name = format!("Pasted image.{extension}");
                         match self.backend.save_pasted(&self.draft.id, &name, &image.bytes) {
-                            Ok(path) => files.push(path),
+                            Ok(path) => {
+                                pictures.push(path.clone());
+                                files.push(path)
+                            }
                             Err(e) => eprintln!("A pasted picture couldn't be kept: {e:#}"),
                         }
                     }
@@ -746,6 +751,7 @@ impl Composer {
                 }
             }
             if !files.is_empty() && item.text().is_none_or(|t| t.trim().is_empty()) {
+                self.place_pictures(&pictures, window, cx);
                 self.add_files(files, cx);
                 return true;
             }
@@ -758,6 +764,32 @@ impl Composer {
         };
         self.insert_pasted(pasted, window, cx);
         true
+    }
+
+    /// A formatted draft shows pasted pictures where they were pasted
+    /// (sent inline, RFC 2387): their Markdown goes in at the cursor. A
+    /// plain draft only attaches them.
+    pub(super) fn place_pictures(
+        &mut self,
+        pictures: &[std::path::PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.draft.formatted {
+            return;
+        }
+        let text: Vec<String> = pictures
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .map(|name| inline_picture(&name))
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        let text = text.join("\n");
+        let (_, range) = self.selection(window, cx);
+        let end = range.start + text.len();
+        self.edit(range, &text, end, window, cx);
     }
 
     pub(super) fn insert_pasted(
@@ -1238,6 +1270,16 @@ impl Composer {
         }
         self.changed(cx);
     }
+}
+
+/// A pasted picture's place in a formatted body: Markdown naming its
+/// attachment (`file:` and the file's name, in angle brackets so spaces
+/// stay), which the sent message shows inline by Content-ID.
+fn inline_picture(name: &str) -> String {
+    let alt: String = name.chars().filter(|c| !matches!(c, '[' | ']' | '\\')).collect();
+    let alt = alt.rsplit_once('.').map_or(alt.as_str(), |(stem, _)| stem).to_owned();
+    let name: String = name.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r')).collect();
+    format!("![{alt}](<file:{name}>)")
 }
 
 /// Line formats applied by `prefix_lines`.

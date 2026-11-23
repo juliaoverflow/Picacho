@@ -729,3 +729,57 @@ fn downloaded_delivery_reports_are_read() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A formatted draft with a pasted picture, saved to the server's Drafts
+/// folder and read back (as on another device): its body keeps the `file:`
+/// reference and the picture is an attachment again, by the same name; sent,
+/// it is multipart/related, the HTML naming the picture by its Content-ID.
+#[test]
+fn inline_pictures_survive_the_drafts_folder_and_go_out_related() -> Result<()> {
+    let fixture = SmtpFixture::start("250-fixture\r\n250 AUTH PLAIN\r\n", no_script())?;
+    let (b, a, path) = smtp_account(&fixture)?;
+    let picture = b.save_pasted("inline-rt", "Pasted image.png", b"\x89PNG-inline")?;
+    // A second paste of the same name gets a name of its own.
+    let second = b.save_pasted("inline-rt", "Pasted image.png", b"\x89PNG-two")?;
+    assert_ne!(picture.file_name(), second.file_name());
+    let d = Draft {
+        id: "inline-rt".into(),
+        account: a.id.clone(),
+        to: "ana@example.com".into(),
+        subject: "Look".into(),
+        body: "Here it is:\n\n![Pasted image](<file:Pasted image.png>)".into(),
+        formatted: true,
+        attachments: vec![picture],
+        ..Draft::default()
+    };
+    let uploaded = b.draft_upload(&a, &d)?.context("uploaded")?;
+    let back = b.draft_from(&a, "inline-rt-back", &uploaded)?;
+    assert!(back.formatted);
+    assert!(back.body.contains("![Pasted image](<file:Pasted image.png>)"), "{}", back.body);
+    assert_eq!(back.attachments.len(), 1);
+    assert_eq!(
+        back.attachments[0].file_name().map(|n| n.to_string_lossy().into_owned()).as_deref(),
+        Some("Pasted image.png")
+    );
+    let back = Draft {
+        account: a.id.clone(),
+        ..back
+    };
+    b.store.save_draft(&back)?;
+    b.send(&a, &back)?;
+    let seen = fixture.finish();
+    let sent = &seen.transactions[0].message;
+    let parsed = mailparse::parse_mail(sent)?;
+    let related = &parsed.subparts[0].subparts[1];
+    assert_eq!(related.ctype.mimetype, "multipart/related");
+    use mailparse::MailHeaderMap as _;
+    let cid = related.subparts[1].headers.get_first_value("Content-ID").context("Content-ID")?;
+    let cid = cid.trim().trim_start_matches('<').trim_end_matches('>').to_owned();
+    assert!(related.subparts[0].get_body()?.contains(&format!("src=\"cid:{cid}\"")));
+    assert_eq!(related.subparts[1].get_body_raw()?, b"\x89PNG-inline");
+    let text = String::from_utf8_lossy(sent);
+    assert!(!text.contains("file:"), "{text}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
