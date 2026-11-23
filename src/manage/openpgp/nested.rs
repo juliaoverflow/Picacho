@@ -122,22 +122,28 @@ pub(super) fn unwrap_message<'a>(
 }
 
 /// The signature on a message read to its end (see `unwrap_message`):
-/// every signature of every signed layer is checked against `public`, a
-/// layer is good when one of its signatures is, and the layers' verdicts
-/// are combined (see `combine`). `Signature::None` when nothing was signed.
+/// every signature of every signed layer is checked against the key it
+/// names in `public` (see `signers`), a layer is good when one of its
+/// signatures is (else what its first says), and the layers' verdicts are
+/// combined (see `combine`). `Signature::None` when nothing was signed.
 pub(super) fn message_signature(message: &Message<'_>, public: &[SignedPublicKey], from: Option<&str>) -> Signature {
     let mut signature = Signature::None;
     let mut layer = message;
     while let Message::Signed { reader, .. } = layer {
-        let mut verdict = Signature::UnknownKey;
-        'signatures: for index in 0..reader.num_signatures() {
-            for (key, verifier) in super::verifiers(public) {
-                if layer.verify_nested_explicit(index, verifier).is_ok() {
-                    verdict = super::good_from(key, from);
-                    break 'signatures;
-                }
-            }
-        }
+        let verdicts: Vec<Signature> = (0..reader.num_signatures())
+            .filter_map(|index| {
+                let made = reader.signature(index)?;
+                Some(super::signers::verdict(made, public, from, |v| {
+                    layer.verify_nested_explicit(index, v.as_dyn()).is_ok()
+                }))
+            })
+            .collect();
+        let verdict = verdicts
+            .iter()
+            .find(|s| matches!(s, Signature::Good(_) | Signature::OtherSender(_)))
+            .or(verdicts.first())
+            .cloned()
+            .unwrap_or(Signature::UnknownKey);
         signature = stronger(signature, verdict);
         layer = reader.get_ref();
     }

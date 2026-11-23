@@ -20,6 +20,7 @@ use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
 mod nested;
+mod signers;
 
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]
@@ -684,18 +685,6 @@ fn primary_expired(key: &SignedPublicKey) -> bool {
     newest.is_some_and(|s| past(key.primary_key.created_at().as_secs(), s.key_expiration_time()))
 }
 
-/// The keys a signature may be checked against (see `unrevoked`).
-fn verifiers(public: &[SignedPublicKey]) -> Vec<(&SignedPublicKey, &dyn pgp::types::VerifyingKey)> {
-    let mut out: Vec<(&SignedPublicKey, &dyn pgp::types::VerifyingKey)> = Vec::new();
-    for key in unrevoked(public) {
-        out.push((key, &key.primary_key));
-        for sub in usable_subkeys(key) {
-            out.push((key, &sub.key));
-        }
-    }
-    out
-}
-
 /// The verdict for a good signature by `key` on a message from `from`
 /// (its From address): Good when the key is for that address, else
 /// OtherSender. Without a From to compare (none given), Good.
@@ -722,38 +711,14 @@ fn signer_name(key: &SignedPublicKey) -> String {
         .unwrap_or_else(|| fingerprint(key))
 }
 
-/// Checks a detached signature over `content` against your keyring.
+/// Checks a detached signature over `content` against your keyring, with
+/// the key it names (see `signers`).
 fn check(signature: &str, content: &[u8], keys: &[SignedPublicKey], from: Option<&str>) -> Signature {
     let Ok((signature, _)) = DetachedSignature::from_string(signature) else {
         return Signature::Bad;
     };
-    let issuers: Vec<pgp::types::KeyId> = signature
-        .signature
-        .issuer_key_id()
-        .into_iter()
-        .cloned()
-        .collect();
-    let mut known = false;
-    // Only keys still good (see `unrevoked`): one revoked is unknown, not a
-    // failure, as what it signed may well predate the revocation.
-    for key in unrevoked(keys) {
-        let primary = &key.primary_key;
-        if signature.signature.verify(primary, content).is_ok() {
-            return good_from(key, from);
-        }
-        known |= issuers.contains(&primary.legacy_key_id());
-        for sub in usable_subkeys(key) {
-            if signature.signature.verify(&sub.key, content).is_ok() {
-                return good_from(key, from);
-            }
-            known |= issuers.contains(&sub.key.legacy_key_id());
-        }
-    }
-    if known {
-        Signature::Bad
-    } else {
-        Signature::UnknownKey
-    }
+    let signature = signature.signature;
+    signers::verdict(&signature, keys, from, |v| v.verifies(&signature, content))
 }
 
 /// Opens a PGP/MIME message with your keys: decrypts it (and checks a
@@ -881,16 +846,18 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
         let (message, _) = CleartextSignedMessage::from_string(&body[start..end]).ok()?;
         let public = ring.public_keys();
         let signed = message.signed_text();
-        let mut signature = Signature::UnknownKey;
-        'keys: for key in unrevoked(&public) {
-            for sig in message.signatures() {
-                let by_sub = usable_subkeys(key).any(|sub| sig.verify(&sub.key, signed.as_bytes()).is_ok());
-                if by_sub || sig.verify(&key.primary_key, signed.as_bytes()).is_ok() {
-                    signature = good_from(key, from);
-                    break 'keys;
-                }
-            }
-        }
+        // Good when one of its signatures is good, else what the first says.
+        let verdicts: Vec<Signature> = message
+            .signatures()
+            .iter()
+            .map(|sig| signers::verdict(sig, &public, from, |v| v.verifies(sig, signed.as_bytes())))
+            .collect();
+        let signature = verdicts
+            .iter()
+            .find(|s| matches!(s, Signature::Good(_) | Signature::OtherSender(_)))
+            .or(verdicts.first())
+            .cloned()
+            .unwrap_or(Signature::UnknownKey);
         // Text around the signed block isn't covered by it: left out.
         return Some((
             readable(&signed),
