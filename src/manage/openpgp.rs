@@ -19,6 +19,8 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
+mod nested;
+
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]
 const KEYRING: &str = "openpgp:keyring";
@@ -755,10 +757,21 @@ fn check(signature: &str, content: &[u8], keys: &[SignedPublicKey], from: Option
 }
 
 /// Opens a PGP/MIME message with your keys: decrypts it (and checks a
-/// signature inside), or checks a multipart/signed one. Returns the
-/// readable message, with its outer headers, and what was found; `None`
-/// when the message has no OpenPGP protection, or can't be decrypted.
+/// signature inside), or checks a multipart/signed one, layer by layer
+/// where one is inside another (see `nested`). Returns the readable
+/// message, with its outer headers, and what was found; `None` when the
+/// message has no OpenPGP protection, can't be decrypted, or has more
+/// layers than `nested::MAX_NESTING`.
 pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
+    nested::open_layers(raw, ring, &mut 0)
+}
+
+/// One PGP/MIME layer of `open`: the OpenPGP message inside it unwrapped
+/// whole (RFC 9580 §10.3.1), `depth` counting the layers on the way.
+fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
+    if !nested::descend(depth) {
+        return None;
+    }
     // A signature counts as the sender's only from a key for the address
     // the message is from (see `good_from`).
     let from = from_address(raw);
@@ -768,15 +781,8 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             return None;
         }
         let (message, _) = Message::from_string(&armored).ok()?;
-        let passwords: Vec<Password> = secret.iter().map(|_| Password::empty()).collect();
-        let mut opened = message
-            .decrypt_with_keys(passwords.iter().collect(), secret.iter().collect())
-            .ok()?;
-        if opened.is_compressed() {
-            opened = opened.decompress().ok()?;
-        }
+        let mut opened = nested::unwrap_message(message, &secret, depth)?;
         let public = ring.public_keys();
-        let signed_inline = opened.is_signed();
         // The signature is checked once the data has been read. Read up to
         // what a message may be: compressed data a few kilobytes long can
         // inflate to gigabytes, and was read whole.
@@ -790,16 +796,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             }
             inner
         };
-        let mut signature = Signature::None;
-        if signed_inline {
-            signature = Signature::UnknownKey;
-            for (key, verifier) in verifiers(&public) {
-                if opened.verify(verifier).is_ok() {
-                    signature = good_from(key, from.as_deref());
-                    break;
-                }
-            }
-        }
+        let mut signature = nested::message_signature(&opened, &public, from.as_deref());
         let protected = protected_subject(&inner);
         let outer = match &protected {
             Some(headers) => with_headers(&outer, headers),
@@ -809,7 +806,11 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
         full.extend_from_slice(&inner);
         // A multipart/signed message inside the encryption (sign, then encrypt).
         if let Some((content, sig)) = signed_parts(&full) {
-            signature = check(&sig, &content, &public, from.as_deref());
+            signature = nested::combine(
+                Verdict { decrypted: true, signature },
+                Verdict { decrypted: true, signature: check(&sig, &content, &public, from.as_deref()) },
+            )
+            .signature;
             let mut readable = outer_headers(&full);
             // Hidden headers signed with the text sit on the signed part,
             // not the encrypted one: the subject read "..." whenever the
@@ -848,14 +849,14 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             ))
         }
         // Not PGP/MIME: inline PGP, or PGP/MIME a list wrapped in a part.
-        None => open_inline(raw, ring, from.as_deref()).or_else(|| open_nested(raw, ring)),
+        None => open_inline(raw, ring, from.as_deref(), depth).or_else(|| open_nested(raw, ring, depth)),
     }
 }
 
 /// Inline PGP (RFC 4880 §7, the old way): a plain-text body that is a
 /// cleartext-signed message or an armored encrypted one. The readable
 /// message is its headers with the text as a plain UTF-8 body.
-fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8>, Verdict)> {
+fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
     let parsed = mailparse::parse_mail(raw).ok()?;
     let text_part = if parsed.subparts.is_empty() {
         &parsed
@@ -906,14 +907,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
             return None;
         }
         let (message, _) = Message::from_string(&body[start..end]).ok()?;
-        let passwords: Vec<Password> = secret.iter().map(|_| Password::empty()).collect();
-        let mut opened = message
-            .decrypt_with_keys(passwords.iter().collect(), secret.iter().collect())
-            .ok()?;
-        if opened.is_compressed() {
-            opened = opened.decompress().ok()?;
-        }
-        let signed = opened.is_signed();
+        let mut opened = nested::unwrap_message(message, &secret, depth)?;
         let inner = {
             use std::io::Read as _;
             let limit = crate::manage::store::MAX_SOURCE;
@@ -924,17 +918,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
             }
             inner
         };
-        let mut signature = Signature::None;
-        if signed {
-            signature = Signature::UnknownKey;
-            let public = ring.public_keys();
-            for (key, verifier) in verifiers(&public) {
-                if opened.verify(verifier).is_ok() {
-                    signature = good_from(key, from);
-                    break;
-                }
-            }
-        }
+        let signature = nested::message_signature(&opened, &ring.public_keys(), from);
         return Some((
             readable(&String::from_utf8_lossy(&inner)),
             Verdict {
@@ -949,7 +933,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
 /// PGP/MIME one level down: a mailing list's multipart/mixed wrapping the
 /// signed or encrypted message with its footer. The message is opened as
 /// its own; the footer, not covered by the signature, is left out.
-fn open_nested(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
+fn open_nested(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
     let parsed = mailparse::parse_mail(raw).ok()?;
     if !parsed.ctype.mimetype.eq_ignore_ascii_case("multipart/mixed") {
         return None;
@@ -964,7 +948,7 @@ fn open_nested(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
     let mut inner = outer_headers(raw);
     inner.truncate(inner.len().saturating_sub(b"MIME-Version: 1.0\r\n".len()));
     inner.extend_from_slice(part);
-    open(&inner, ring)
+    nested::open_layers(&inner, ring, depth)
 }
 
 // --- Sending -----------------------------------------------------------------
