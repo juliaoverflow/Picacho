@@ -332,6 +332,16 @@ fn rule_of(c: &Command) -> Option<Rule> {
             _ => None,
         })
     };
+    // RFC 5229: an action naming a variable (`fileinto "${1}"`) isn't a
+    // fixed one; RFC 5232's `:flags`, RFC 3894's `:copy` on fileinto and
+    // RFC 8580's `:fcc` do more than a rule says.
+    if action.args.iter().any(|a| match a {
+        Arg::Strings(s) => s.iter().any(|s| s.contains("${")),
+        Arg::Tag(t) => matches!(t.as_str(), "flags" | "fcc") || (t == "copy" && action.name == "fileinto"),
+        _ => false,
+    }) {
+        return None;
+    }
     rule.act = match action.name.as_str() {
         "fileinto" => {
             let name = first(&action.args)?;
@@ -388,8 +398,12 @@ fn rule_test(t: &Test) -> Option<Rule> {
         ..Rule::default()
     };
     // Part selectors and comparators other than the defaults change what
-    // matches; such tests aren't rules.
-    if t.args.iter().any(|a| matches!(a, Arg::Tag(t) if matches!(t.as_str(), "localpart" | "domain" | "user" | "detail" | "comparator" | "count" | "value"))) {
+    // matches; such tests aren't rules. So do RFC 5703's `:mime` header
+    // tests (a body part's headers), RFC 5260's `:index`, and RFC 5229's
+    // variables in a value (`${1}`), which Picacho's rules can't say.
+    if t.args.iter().any(|a| matches!(a, Arg::Tag(t) if matches!(t.as_str(), "localpart" | "domain" | "user" | "detail" | "comparator" | "count" | "value" | "mime" | "anychild" | "index" | "last" | "type" | "subtype" | "contenttype" | "param" | "raw" | "content")))
+        || lists.iter().flat_map(|l| l.iter()).any(|s| s.contains("${"))
+    {
         return None;
     }
     match t.name.as_str() {
@@ -593,6 +607,51 @@ mod tests {
         assert!(super::read("vacation text:\r\nno end\r\n").is_err());
         // An unclosed bracketed comment too.
         assert!(super::read("keep; /* no end").is_err());
+    }
+
+    /// Each extension's commands and tests in their RFC's own forms parse
+    /// without error, and those that do more than a rule aren't taken for
+    /// one (so taking another app's rules over changes nothing they do).
+    #[test]
+    fn extensions_parse_and_are_not_mistaken_for_rules() {
+        let cases: &[(&str, &str)] = &[
+            // RFC 5435 enotify.
+            ("enotify", "require \"enotify\"; if header :contains \"from\" \"boss\" { notify :importance \"1\" :options [\"a\"] :message \"Boss\" \"mailto:me@x.example\"; }"),
+            ("enotify test", "if valid_notify_method \"xmpp:me@x.example\" { keep; }"),
+            ("notify_method_capability", "if notify_method_capability \"xmpp:me@x.example\" \"Online\" [\"yes\"] { keep; }"),
+            // RFC 5293 editheader.
+            ("addheader", "if header :is \"x\" \"y\" { addheader :last \"X-Seen\" \"yes\"; }"),
+            ("deleteheader", "deleteheader :index 1 :last :contains \"X-Spam\" \"yes\";"),
+            // RFC 7352 duplicate.
+            ("duplicate", "if duplicate :header \"message-id\" :handle \"h\" :seconds 600 :last { discard; }"),
+            ("duplicate uniqueid", "if duplicate :uniqueid \"${id}\" { discard; }"),
+            // RFC 8580 fcc.
+            ("fcc", "if header :is \"x\" \"y\" { notify :fcc \"Sent\" :create \"mailto:a@x.example\"; }"),
+            // RFC 5229 variables.
+            ("set", "set :lower :upperfirst \"name\" \"${1}\";"),
+            ("string", "if string :matches \"${name}\" \"a*\" { keep; }"),
+            ("variable folder", "if header :matches \"list-id\" \"*<*.x>\" { fileinto \"Lists/${2}\"; }"),
+            ("variable value", "if header :is \"subject\" \"${x}\" { discard; }"),
+            // RFC 5235 spamtest and virustest.
+            ("spamtest", "if spamtest :value \"ge\" :comparator \"i;ascii-numeric\" \"5\" { discard; }"),
+            ("spamtest percent", "if spamtest :percent :count \"eq\" \"0\" { keep; }"),
+            ("virustest", "if virustest :value \"eq\" \"5\" { discard; }"),
+            // RFC 5703 mime, foreverypart, replace, enclose, extracttext.
+            ("mime header", "if header :mime :type \"Content-Type\" \"image\" { discard; }"),
+            ("mime anychild", "if header :mime :anychild :param [\"filename\"] :matches \"Content-Disposition\" \"*.exe\" { discard; }"),
+            ("foreverypart", "foreverypart :name \"outer\" { if exists :mime \"Content-ID\" { break :name \"outer\"; } }"),
+            ("replace", "replace :mime :subject \"Removed\" \"text\";"),
+            ("enclose", "enclose :subject \"Warning\" :headers [\"From\"] \"This was flagged\";"),
+            ("extracttext", "foreverypart { extracttext :first 100 \"body\"; }"),
+            // RFC 5232 :flags, RFC 3894 :copy on fileinto.
+            ("fileinto flags", "if header :is \"x\" \"y\" { fileinto :flags \"\\\\Seen\" \"A\"; }"),
+            ("fileinto copy", "if header :is \"x\" \"y\" { fileinto :copy \"A\"; }"),
+        ];
+        for (name, script) in cases {
+            let read = read(script).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(read.filters.rules.is_empty(), "{name}: taken for a rule: {:?}", read.filters.rules);
+            assert!(read.left_out >= 1, "{name}: not counted");
+        }
     }
 
     /// Picacho's own script, read as another app's would be, says the same.
