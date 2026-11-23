@@ -2376,3 +2376,69 @@ fn objectid_copies_download_once() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A message too large to keep is read from its parts (BODYSTRUCTURE,
+/// BINARY), and its attachment's size is the decoded one the server gives
+/// (BINARY.SIZE, RFC 3516 §4.2), not an estimate from its encoded size.
+#[test]
+fn large_messages_list_attachments_by_their_decoded_size() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 BINARY\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.contains("BODY.PEEK[HEADER]") {
+                    let header = "From: Ana <ana@example.com>\r\nSubject: Big\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n";
+                    p.send(&format!("* 1 FETCH (UID 7 BODY[HEADER] {{{}}}\r\n{header})\r\n", header.len()));
+                } else if upper.contains("BODYSTRUCTURE") {
+                    p.send("* 1 FETCH (UID 7 BODYSTRUCTURE ((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" 5 1 NIL NIL NIL NIL)(\"application\" \"pdf\" (\"name\" \"big.pdf\") NIL NIL \"base64\" 400000000 NIL (\"attachment\" (\"filename\" \"big.pdf\")) NIL NIL) \"mixed\" (\"boundary\" \"b\") NIL NIL NIL))\r\n");
+                } else if upper.contains("BINARY.PEEK[1]") {
+                    p.send("* 1 FETCH (UID 7 BINARY[1] ~{5}\r\nHello)\r\n");
+                } else if upper.contains("BINARY.SIZE[2]") {
+                    p.send("* 1 FETCH (UID 7 BINARY.SIZE[2] 291234567)\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let m = Mail {
+        id: format!("{}:INBOX:42:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: 7,
+        size: 400_001_000,
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    let read = b.read(&a, &m)?;
+    assert_eq!(read.body.as_deref(), Some("Hello"));
+    let attachments = read.attachments();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!((attachments[0].name.as_str(), attachments[0].size), ("big.pdf", 291_234_567));
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c == "UID FETCH 7 (UID BINARY.SIZE[2])"), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

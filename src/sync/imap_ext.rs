@@ -998,6 +998,47 @@ fn mailparse_decode(value: &str) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
+/// The decoded sizes of a message's parts `sections` ("1.2"), where the
+/// server can say (BINARY.SIZE, RFC 3516 §4.2), in one FETCH: exact where
+/// the transfer encoding's size is only an estimate. Parts the server
+/// can't decode ([UNKNOWN-CTE]) or doesn't answer for are left out.
+pub(crate) fn binary_sizes(
+    session: &mut ImapSession,
+    uid: u32,
+    sections: &[&str],
+) -> Result<std::collections::HashMap<String, u64>> {
+    let mut out = std::collections::HashMap::new();
+    let sections: Vec<&str> = sections
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .collect();
+    if sections.is_empty() {
+        return Ok(out);
+    }
+    let items: Vec<String> = sections.iter().map(|s| format!("BINARY.SIZE[{s}]")).collect();
+    let data = match session.run_command_and_read_response(format!("UID FETCH {uid} (UID {})", items.join(" "))) {
+        Ok(data) => data,
+        Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for response in responses(&data)? {
+        let imap_proto::Response::Fetch(_, attributes) = response else {
+            continue;
+        };
+        if !attributes.contains(&imap_proto::AttributeValue::Uid(uid)) {
+            continue;
+        }
+        for a in &attributes {
+            if let imap_proto::AttributeValue::BinarySize { section, size } = a {
+                let name: Vec<String> = section.iter().map(u32::to_string).collect();
+                out.insert(name.join("."), u64::from(*size));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// One part of a message, decoded: by the server where it can (BINARY,
 /// RFC 3516), else fetched as it is and decoded here.
 pub(crate) fn fetch_part(
@@ -1103,6 +1144,15 @@ mod tests {
             Some("ért.txt")
         );
         assert_eq!(rfc2231(&[("name", "plain.txt")], "name"), None);
+    }
+    /// RFC 3516 §4.2: BINARY.SIZE replies, as the parser reads them.
+    #[test]
+    fn binary_sizes_are_read() {
+        let data = b"* 3 FETCH (UID 9 BINARY.SIZE[2] 1024 BINARY.SIZE[3.1] 77)\r\n";
+        let imap_proto::Response::Fetch(_, attributes) = &responses(data).unwrap()[0] else {
+            panic!("not a fetch")
+        };
+        assert!(attributes.contains(&imap_proto::AttributeValue::BinarySize { section: vec![3, 1], size: 77 }));
     }
     #[test]
     fn closed_splits_a_reselect_and_overflow_is_seen() {
