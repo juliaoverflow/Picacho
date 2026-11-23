@@ -105,6 +105,19 @@ pub struct Assertion {
     pub authenticator_data: Vec<u8>,
     pub signature: Vec<u8>,
     pub credential_id: Vec<u8>,
+    /// The account the passkey is for (WebAuthn Level 3 §5.2.2
+    /// `userHandle`), where the authenticator says: a discoverable
+    /// credential (a passkey) does, a security key asked for a listed
+    /// credential need not. Proton identifies the key by its id.
+    #[allow(dead_code)]
+    pub user_handle: Option<Vec<u8>>,
+}
+/// The user handle of a WebAuthn response, as WebAuthn §5.2.2 allows: none
+/// where it is missing or empty (an authenticator that stored none).
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+fn user_handle(handle: Option<&[u8]>) -> Option<Vec<u8>> {
+    // §5.4.3: at most 64 bytes; a longer one isn't a user handle.
+    handle.filter(|h| !h.is_empty() && h.len() <= 64).map(<[u8]>::to_vec)
 }
 
 /// The authenticator library's questions, answered from the sign-in.
@@ -313,7 +326,7 @@ pub async fn assert(
         )
         .into()),
         #[cfg(windows)]
-        Method::Windows => windows(options),
+        Method::Windows => windows(options, cancel).await,
     };
     answers.show(Prompt::Idle);
     let (credential, own_client_data) = result.map_err(|e| match e {
@@ -322,6 +335,7 @@ pub async fn assert(
     })?;
     Ok(Assertion {
         client_data_json: own_client_data.unwrap_or_else(|| client_data_json.to_vec()),
+        user_handle: user_handle(credential.response.user_handle.as_deref()),
         authenticator_data: credential.response.authenticator_data,
         signature: credential.response.signature,
         credential_id: credential.raw_id,
@@ -382,6 +396,7 @@ pub async fn assert(
     })?;
     Ok(Assertion {
         client_data_json: client_data_json.to_vec(),
+        user_handle: user_handle(credential.response.user_handle.as_deref()),
         authenticator_data: credential.response.authenticator_data.into(),
         signature: credential.response.signature.into(),
         credential_id: credential.raw_id.into(),
@@ -502,12 +517,25 @@ async fn phone(
     Ok((signed, None))
 }
 
+/// Windows Hello, on a thread of its own (its call blocks until the dialog
+/// closes), so the sign-in can be cancelled. webauthn.dll can cancel its
+/// dialog (WebAuthNCancelCurrentOperation, with the id passed in the
+/// options' pCancellationId), but webauthn-authenticator-rs 0.6.2 passes
+/// no id, so a cancelled sign-in stops waiting at once and leaves the
+/// dialog to its own Cancel button or its timeout (`WAIT`); its answer is
+/// then dropped unread. The thread owns everything it uses.
 #[cfg(windows)]
-fn windows(options: PublicKeyCredentialRequestOptions) -> Signed {
+async fn windows(options: PublicKeyCredentialRequestOptions, cancel: &AtomicBool) -> Signed {
     use webauthn_authenticator_rs::{AuthenticatorBackend, win10::Win10};
     let origin = url::Url::parse(&format!("https://{}", options.rp_id))
         .map_err(|_| anyhow!("Proton named itself oddly for the key."))?;
-    let signed = Win10::default().perform_auth(origin, options, WAIT.as_millis() as u32)?;
+    let hello = tokio::task::spawn_blocking(move || {
+        Win10::default().perform_auth(origin, options, WAIT.as_millis() as u32)
+    });
+    let signed = tokio::select! {
+        done = hello => done.map_err(|e| anyhow!("Windows Hello stopped unexpectedly ({e})."))??,
+        () = cancelled(cancel) => return Err(WebauthnCError::Cancelled.into()),
+    };
     let client_data = signed.response.client_data_json.clone();
     Ok((signed, Some(client_data)))
 }
@@ -567,6 +595,20 @@ mod tests {
         assert!(!proton_rp("victim.example:443/x.proton.me"));
         assert!(!usable(Some(&serde_json::json!({}))));
         assert!(!usable(None));
+    }
+
+    /// WebAuthn §5.2.2 and §5.4.3: a user handle is kept where given, at
+    /// most 64 bytes, and none is none.
+    #[test]
+    fn user_handles_are_kept_where_given() {
+        assert_eq!(user_handle(Some(b"user-1")), Some(b"user-1".to_vec()));
+        assert_eq!(user_handle(Some(b"")), None);
+        assert_eq!(user_handle(None), None);
+        assert_eq!(user_handle(Some(&[7; 65])), None);
+        // A cancelled sign-in says so, rather than that the key failed.
+        let answers = Answers { pin: None, pin_asked: AtomicBool::new(false), prompt: Default::default() };
+        let e = explain(WebauthnCError::Cancelled, &answers);
+        assert_eq!(e.to_string(), "Using the security key was cancelled.");
     }
 
     #[test]
