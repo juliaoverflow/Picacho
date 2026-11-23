@@ -1029,24 +1029,32 @@ impl Backend {
         if self.calendar_server().is_none() {
             return Ok(None);
         }
-        let result = match status {
-            PartStat::Declined => self.delete_event(&event.uid),
+        Ok(self
+            .file_answer(&event, &me, status)
+            .err()
+            .map(|e| format!("The answer was sent, but the calendar wasn't changed: {e:#}")))
+    }
+    /// Puts your answer to an invitation in the calendar: declined, it goes
+    /// (only that occurrence, where the invitation is for one: RFC 5546
+    /// §3.2.3, a REPLY with a RECURRENCE-ID answers just it); otherwise it
+    /// is saved with your answer in it.
+    fn file_answer(&self, event: &Event, me: &str, status: PartStat) -> Result<()> {
+        match (status, event.recurrence_id) {
+            (PartStat::Declined, Some(at)) => self.cancel_occurrence(&event.uid, at),
+            (PartStat::Declined, None) => self.delete_event(&event.uid),
             _ => {
                 let mut kept = event.clone();
                 for at in &mut kept.attendees {
-                    if at.email.eq_ignore_ascii_case(&me) {
+                    if at.email.eq_ignore_ascii_case(me) {
                         at.status = Some(status);
                     }
                 }
                 // The event as it came is what's saved: the answer goes in
                 // it too, or it would be lost on the server.
-                with_partstat(&mut kept, &me, status);
+                with_partstat(&mut kept, me, status);
                 self.save_invited(kept)
             }
-        };
-        Ok(result
-            .err()
-            .map(|e| format!("The answer was sent, but the calendar wasn't changed: {e:#}")))
+        }
     }
     /// Saves an invitation's event as the organizer sent it.
     fn save_invited(&self, event: Event) -> Result<()> {
@@ -1066,7 +1074,15 @@ impl Backend {
         } else {
             stored.calendar.clone()
         };
-        stored.event = event;
+        match event.recurrence_id {
+            // One occurrence of a series already here (RFC 5545 §3.8.4.4):
+            // it becomes that occurrence's own, the series stays.
+            Some(at) if !stored.event.recurrence.is_empty() || !stored.event.rdates.is_empty() => {
+                stored.overrides.retain(|o| o.recurrence_id != Some(at));
+                stored.overrides.push(Event { source: String::new(), ..event });
+            }
+            _ => stored.event = event,
+        }
         let saved = self.calendar_save(&server, &target, &stored)?;
         events.retain(|s| s.event.uid != saved.event.uid);
         events.push(saved);
@@ -2059,6 +2075,76 @@ mod tests {
         let mut back = ical::parse(&put).events;
         let series = back.remove(0);
         assert_eq!(ical::occurrences(&series, &back, 0, 2_000_000_000).len(), 4);
+        drop(server);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    /// Declining one occurrence of an invitation takes only it out (RFC
+    /// 5546 §3.2.3); accepting one keeps it as that occurrence's own.
+    #[test]
+    fn declining_one_occurrence_keeps_the_series() -> Result<()> {
+        use std::sync::{Arc as A, Mutex as M};
+        let series = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly\r\nSUMMARY:Weekly\r\nDTSTART:20261102T090000Z\r\nDTEND:20261102T093000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nORGANIZER:mailto:ana@example.org\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:qa@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let kept: A<M<String>> = A::new(M::new(series.into()));
+        let store_side = kept.clone();
+        let (port, server) = crate::sync::dav::test_server(5, move |method, path, body| {
+            match (method, path) {
+            ("PROPFIND", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("REPORT", _) => {
+                let data = store_side.lock().unwrap().replace('&', "&amp;").replace('<', "&lt;");
+                ("207 Multi-Status", format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/weekly.ics</d:href><d:propstat><d:prop><d:getetag>\"1\"</d:getetag><c:calendar-data>{data}</c:calendar-data></d:prop></d:propstat></d:response></d:multistatus>"))
+            }
+            ("PUT", "/cal/weekly.ics") => {
+                *store_side.lock().unwrap() = body.to_owned();
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", String::new()),
+        }
+        });
+        let path = std::env::temp_dir().join(format!("picacho-cal-{}", uuid::Uuid::new_v4()));
+        let mut b = Backend::new(Arc::new(Store::open(&path)?));
+        b.test_secret = Some(Secret { password: "secret".into(), ..Default::default() });
+        b.store.set_preference(
+            SERVER,
+            &serde_json::to_string(&caldav::Server {
+                url: format!("http://127.0.0.1:{port}"),
+                user: "ana".into(),
+                ..Default::default()
+            })?,
+        )?;
+        let cals = caldav::calendars(&b.calendar_server().unwrap(), "secret", b.tls_connector()?)?;
+        b.store.set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        let events = caldav::events(&b.calendar_server().unwrap(), "secret", b.tls_connector()?, &cals, 0, 2_000_000_000)?;
+        b.save_events(events)?;
+        let all = b.agenda(0, 2_000_000_000);
+        assert_eq!(all.len(), 4);
+        // An invitation to the second occurrence only, declined.
+        let second = all[1].recurrence_id.unwrap();
+        let one = |at: i64| Event {
+            recurrence: String::new(),
+            recurrence_id: Some(at),
+            start: at,
+            end: at + 1800,
+            source: String::new(),
+            ..all[0].clone()
+        };
+        b.file_answer(&one(second), "qa@example.com", PartStat::Declined)?;
+        let after = b.agenda(0, 2_000_000_000);
+        assert_eq!(after.len(), 3, "only that occurrence went");
+        assert!(after.iter().all(|e| e.start != second));
+        assert!(kept.lock().unwrap().contains("EXDATE:20261109T090000Z"), "{}", kept.lock().unwrap());
+        // The third accepted tentatively: its own, the series as it was.
+        let third = all[2].recurrence_id.unwrap();
+        b.file_answer(&one(third), "qa@example.com", PartStat::Tentative)?;
+        let stored = b.stored_event("weekly").unwrap();
+        assert_eq!(stored.event.recurrence, "FREQ=WEEKLY;COUNT=4");
+        assert_eq!(stored.overrides.len(), 1);
+        assert_eq!(stored.overrides[0].attendees[0].status, Some(PartStat::Tentative));
+        assert_eq!(b.agenda(0, 2_000_000_000).len(), 3);
+        let put = kept.lock().unwrap().clone();
+        assert!(put.contains("RECURRENCE-ID:20261116T090000Z"), "{put}");
         drop(server);
         drop(b);
         std::fs::remove_dir_all(path)?;
