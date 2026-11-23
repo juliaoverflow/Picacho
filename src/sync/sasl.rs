@@ -12,9 +12,19 @@
 //! - CRAM-MD5 (RFC 2195): a keyed hash of a challenge; only where nothing
 //!   better is offered, since it needs the server to keep the password.
 //! - OAUTHBEARER (RFC 7628) and Google/Microsoft's XOAUTH2: an access token.
-//! - GSSAPI (RFC 4752): Kerberos, with the ticket the system already has
-//!   (`sync::gss`); no password is used or sent. Only for accounts set to
-//!   sign in with Kerberos (`Account::kerberos`), never chosen otherwise.
+//! - GSSAPI (RFC 4752) and GS2-KRB5(-PLUS) (RFC 5801): Kerberos, with the
+//!   ticket the system already has (`sync::gss`); no password is used or
+//!   sent. Only for accounts set to sign in with Kerberos
+//!   (`Account::kerberos`), never chosen otherwise.
+//! - EXTERNAL (RFC 4422 Appendix A): the exchange only. No account chooses
+//!   it yet: signing in with a TLS client certificate also needs, per
+//!   account, a PKCS#12 identity kept in the keychain (as a secret of its
+//!   own, `<account id>:client-certificate`, with its password), a choice
+//!   of it in the account's server settings, and each protocol's TLS
+//!   connector built with `native_tls::TlsConnectorBuilder::identity` from
+//!   it (IMAP, POP3, SMTP and ManageSieve share `Backend::tls_connector`,
+//!   which would take the account). Then a server offering `AUTH=EXTERNAL`
+//!   over that connection is asked with this mechanism before any other.
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
@@ -41,6 +51,11 @@ pub(crate) enum Mechanism {
     /// channel binding in its -PLUS form.
     Gs2Krb5Plus,
     Gs2Krb5,
+    /// EXTERNAL (RFC 4422 Appendix A): the TLS client certificate signs in.
+    /// Only for a connection made with one (see the module's note).
+    // Backend-only until the UI calls it:
+    #[cfg_attr(not(test), allow(dead_code))]
+    External,
 }
 
 /// For a password, best first: SCRAM proves both sides without sending the
@@ -91,6 +106,7 @@ impl Mechanism {
             Self::Gssapi => "GSSAPI",
             Self::Gs2Krb5Plus => "GS2-KRB5-PLUS",
             Self::Gs2Krb5 => "GS2-KRB5",
+            Self::External => "EXTERNAL",
         }
     }
     /// The best of `order` among the mechanisms a server offers (names in
@@ -296,6 +312,9 @@ impl Exchange {
                 };
                 (answer, State::Refused(reason))
             }
+            // RFC 4422 Appendix A.1: the authorization identity, or
+            // nothing for the certificate's own; the server answers.
+            (Mechanism::External, State::Start) => (self.authzid.clone().into_bytes(), State::Done),
             // RFC 5801 §4: the GS2 header, then the context's first
             // token without its RFC 2743 §3.1 framing; the header and the
             // TLS binding go into the context's channel bindings (§5).
@@ -921,6 +940,21 @@ mod tests {
         assert_eq!(x.initial().unwrap(), b"shared\0ana\0secret");
         let mut x = Exchange::new(Mechanism::Plain, credentials("ana", "secret"));
         assert_eq!(x.initial().unwrap(), b"\0ana\0secret");
+        Ok(())
+    }
+
+    /// RFC 4422 Appendix A.1: EXTERNAL sends the authorization identity,
+    /// or nothing (the certificate's own), and is never chosen unasked.
+    #[test]
+    fn external_sends_only_the_authorization_identity() -> Result<()> {
+        let mut x = Exchange::new(Mechanism::External, credentials("ana", "unused"));
+        assert_eq!(x.initial().unwrap(), b"");
+        x.finish(None)?;
+        let mut x = Exchange::new(Mechanism::External, credentials("ana", "unused")).acting_as("shared");
+        assert_eq!(x.initial().unwrap(), b"shared");
+        for order in [&PASSWORD_ORDER[..], &TOKEN_ORDER[..], &KERBEROS_ORDER[..]] {
+            assert_eq!(Mechanism::choose_bound(order, ["EXTERNAL"], true), None);
+        }
         Ok(())
     }
 
