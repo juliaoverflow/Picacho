@@ -1215,6 +1215,30 @@ impl Backend {
         }
         Ok(())
     }
+    /// Autocrypt's recommendation for a message from `a` to `recipients`
+    /// (Autocrypt 1.1 §2.3), with their peer state as kept. A suggestion
+    /// only: it never turns Encrypt on in the composer.
+    // Backend-only until the UI calls it: Autocrypt's encryption recommendation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn autocrypt_recommendation(
+        &self,
+        own_mutual: bool,
+        recipients: &[String],
+        reply_to_encrypted: bool,
+    ) -> crate::manage::openpgp::Recommendation {
+        use crate::manage::openpgp::{Peer, peer_preference_key};
+        let peers: Vec<(String, Option<Peer>)> = recipients
+            .iter()
+            .map(|r| {
+                let peer = self
+                    .store
+                    .preference(&peer_preference_key(r))
+                    .map(|v| Peer::from_preference(&v));
+                (r.trim().to_lowercase(), peer)
+            })
+            .collect();
+        self.keyring().recommend(&peers, own_mutual, reply_to_encrypted)
+    }
     /// What OpenPGP found when the message was last read, if it had any.
     pub fn verdict(&self, id: &str) -> Option<crate::manage::openpgp::Verdict> {
         self.verdicts.lock().unwrap().get(id).cloned()
@@ -5299,9 +5323,16 @@ mod layout_tests {
         assert_eq!(peer(), Peer { last_seen: october, autocrypt_timestamp: october, mutual: true, fingerprint: key_fingerprint(&first).unwrap() });
         assert_eq!(kept(), key_fingerprint(&first));
         assert_eq!(b.keyring().autocrypt, [key_fingerprint(&first).unwrap()]);
+        // Both prefer encryption: encrypt; without ours, available.
+        use crate::manage::openpgp::Recommendation;
+        let to = ["Ana@example.org".to_owned()];
+        assert_eq!(b.autocrypt_recommendation(true, &to, false), Recommendation::Encrypt);
+        assert_eq!(b.autocrypt_recommendation(false, &to, false), Recommendation::Available);
         // Later mail without a header: last_seen only.
         b.learn_autocrypt(&mail("Fri, 1 Nov 2024 10:00:00 +0000", None, false));
         assert_eq!((peer().last_seen, peer().autocrypt_timestamp), (october + 31 * 86_400, october));
+        // Silent for 31 days isn't stale yet.
+        assert_eq!(b.autocrypt_recommendation(true, &to, false), Recommendation::Encrypt);
         // An older message with another key: nothing changes.
         b.learn_autocrypt(&mail("Sun, 1 Sep 2024 10:00:00 +0000", Some(&second), false));
         assert!(peer().mutual);
@@ -5314,6 +5345,8 @@ mod layout_tests {
         // From the future: as if received now.
         b.learn_autocrypt(&mail("Fri, 1 Jan 2100 00:00:00 +0000", None, false));
         assert!(peer().last_seen <= chrono::Utc::now().timestamp());
+        // Mail without Autocrypt since, for more than 35 days: stale.
+        assert_eq!(b.autocrypt_recommendation(true, &to, false), Recommendation::Discourage);
         // A reset forgets the state and Autocrypt's key; an older message
         // then counts again.
         b.reset_autocrypt_peer("ana@example.org")?;

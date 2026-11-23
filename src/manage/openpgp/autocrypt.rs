@@ -80,16 +80,98 @@ impl Peer {
 /// How much older than last_seen the youngest Autocrypt header may be
 /// before its key is stale (Autocrypt 1.1 §2.3, "Preliminary
 /// Recommendation"): 35 days, in seconds.
-#[cfg_attr(not(test), allow(dead_code))]
 const STALE_AFTER: i64 = 35 * 24 * 60 * 60;
 
 impl Peer {
     /// Whether the peer has since sent mail without Autocrypt for more than
     /// 35 days (their app may no longer read encrypted mail), so encrypting
     /// to them is discouraged (Autocrypt 1.1 §2.3).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stale(&self) -> bool {
         self.last_seen - self.autocrypt_timestamp > STALE_AFTER
+    }
+}
+
+/// What Autocrypt suggests for encrypting a message (Autocrypt 1.1 §2.3,
+/// "Recommendation structure"). Only a suggestion: it never turns
+/// Encrypt on in the composer by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Recommendation {
+    /// Encryption isn't possible: a recipient has no usable key.
+    Disable,
+    /// Possible, but a recipient may not read it (a stale or gossiped key).
+    Discourage,
+    /// Possible; not the default.
+    Available,
+    /// Possible, and the default: a reply to encrypted mail, or everyone
+    /// prefers it (prefer-encrypt=mutual on both sides).
+    Encrypt,
+}
+
+impl Keyring {
+    /// Autocrypt's recommendation for a message to `recipients`, each with
+    /// their peer state if any (Autocrypt 1.1 §2.3): `own_mutual` is the
+    /// sending account's prefer-encrypt=mutual, and `reply_to_encrypted`
+    /// whether the message replies to an encrypted one.
+    ///
+    /// A recipient's key is the one Picacho would encrypt to (`key_for`),
+    /// treated as absent if it has no usable encryption subkey. A key
+    /// from another source with no peer state counts as available, as §2.3
+    /// allows ("keys from other sources (e.g., a local keyring)"). A key
+    /// known only from Autocrypt-Gossip (Autocrypt's, but not the one their
+    /// own header gave) is discouraged, as §2.3 does for `gossip_key`.
+    // Backend-only until the UI calls it: see `Backend::autocrypt_recommendation`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn recommend(
+        &self,
+        recipients: &[(String, Option<Peer>)],
+        own_mutual: bool,
+        reply_to_encrypted: bool,
+    ) -> Recommendation {
+        if recipients.is_empty() {
+            return Recommendation::Disable;
+        }
+        let each: Vec<Recommendation> = recipients
+            .iter()
+            .map(|(email, peer)| self.recommend_one(email, peer.as_ref(), own_mutual, reply_to_encrypted))
+            .collect();
+        // §2.3, "Recommendations for messages to multiple addresses": the
+        // earliest rule that matches.
+        if each.contains(&Recommendation::Disable) {
+            Recommendation::Disable
+        } else if each.iter().all(|r| *r == Recommendation::Encrypt) {
+            Recommendation::Encrypt
+        } else if each.contains(&Recommendation::Discourage) {
+            Recommendation::Discourage
+        } else {
+            Recommendation::Available
+        }
+    }
+    /// §2.3, "Recommendations for single-recipient messages".
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn recommend_one(
+        &self,
+        email: &str,
+        peer: Option<&Peer>,
+        own_mutual: bool,
+        reply_to_encrypted: bool,
+    ) -> Recommendation {
+        let Some(key) = self.key_for(email).filter(|k| super::encryption_subkey(k).is_some()) else {
+            return Recommendation::Disable;
+        };
+        let fp = fingerprint(&key);
+        let gossip_only =
+            self.autocrypt.contains(&fp) && peer.is_none_or(|p| p.fingerprint != fp);
+        let preliminary = if gossip_only || peer.is_some_and(Peer::stale) {
+            Recommendation::Discourage
+        } else {
+            Recommendation::Available
+        };
+        let mutual = !gossip_only && peer.is_some_and(|p| p.mutual) && own_mutual;
+        if reply_to_encrypted || (preliminary == Recommendation::Available && mutual) {
+            Recommendation::Encrypt
+        } else {
+            preliminary
+        }
     }
 }
 
@@ -253,6 +335,53 @@ mod tests {
         let before = ring.clone();
         assert!(!ring.reset_peer("ana@example.org"));
         assert_eq!(ring, before);
+    }
+
+    /// Autocrypt 1.1 §2.3's recommendation, for one recipient and for
+    /// several.
+    #[test]
+    fn recommendations_follow_autocrypt() {
+        use Recommendation::*;
+        let day = 24 * 60 * 60;
+        let ana = public_bytes("Ana <ana@example.org>");
+        let bo = public_bytes("Bo <bo@example.se>");
+        let mut ring = Keyring::default();
+        ring.add_autocrypt("ana@example.org", &ana).unwrap();
+        let peer = |mutual, header_age: i64, key: &[u8]| Peer {
+            last_seen: 100 * day,
+            autocrypt_timestamp: 100 * day - header_age,
+            mutual,
+            fingerprint: key_fingerprint(key).unwrap(),
+        };
+        let to = |peer: Option<Peer>| vec![("ana@example.org".to_owned(), peer)];
+        // No key: disable, even replying to encrypted mail.
+        assert_eq!(ring.recommend(&[("cy@example.net".into(), None)], true, true), Disable);
+        assert_eq!(ring.recommend(&[], false, false), Disable);
+        // Fresh key: available; encrypt when both prefer it or replying.
+        assert_eq!(ring.recommend(&to(Some(peer(false, 0, &ana))), true, false), Available);
+        assert_eq!(ring.recommend(&to(Some(peer(true, 0, &ana))), false, false), Available);
+        assert_eq!(ring.recommend(&to(Some(peer(true, 0, &ana))), true, false), Encrypt);
+        assert_eq!(ring.recommend(&to(Some(peer(false, 0, &ana))), false, true), Encrypt);
+        // Stale (header over 35 days older than last_seen): discourage,
+        // even with mutual on both sides; a reply still encrypts.
+        assert_eq!(ring.recommend(&to(Some(peer(true, 36 * day, &ana))), true, false), Discourage);
+        assert_eq!(ring.recommend(&to(Some(peer(true, 35 * day, &ana))), true, false), Encrypt);
+        assert_eq!(ring.recommend(&to(Some(peer(false, 36 * day, &ana))), false, true), Encrypt);
+        // Known only from Gossip (no header of theirs gave it): discourage.
+        assert_eq!(ring.recommend(&to(None), true, false), Discourage);
+        assert_eq!(ring.recommend(&to(Some(peer(true, 0, &bo))), true, false), Discourage);
+        // A key from elsewhere, without peer state: available.
+        let mut found = ring.clone();
+        found.add_found_from("bo@example.se", &bo, Source::Wkd).unwrap();
+        assert_eq!(found.recommend(&[("bo@example.se".into(), None)], true, false), Available);
+        // Several: disable beats all, encrypt needs everyone, then discourage.
+        let both = |a: Option<Peer>| {
+            vec![("ana@example.org".to_owned(), a), ("bo@example.se".to_owned(), None)]
+        };
+        assert_eq!(ring.recommend(&both(Some(peer(true, 0, &ana))), true, true), Disable);
+        assert_eq!(found.recommend(&both(Some(peer(true, 0, &ana))), true, true), Encrypt);
+        assert_eq!(found.recommend(&both(Some(peer(true, 0, &ana))), true, false), Available);
+        assert_eq!(found.recommend(&both(Some(peer(true, 36 * day, &ana))), true, false), Discourage);
     }
 
     /// Autocrypt 1.1 §2.3: stale only when the header is more than 35
