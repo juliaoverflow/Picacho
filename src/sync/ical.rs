@@ -142,17 +142,168 @@ pub struct Event {
     /// it; `cancelled` and `completed` say the two Picacho acts on.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// GEO (RFC 5545 §3.8.1.6): `latitude;longitude` as written; read it
+    /// with `coordinates`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub geo: String,
+    /// CATEGORIES (RFC 5545 §3.8.1.2), every such line's in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    /// CLASS (RFC 5545 §3.8.1.3): PUBLIC, PRIVATE, CONFIDENTIAL or
+    /// another, uppercase; empty where not given (PUBLIC).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub class: String,
+    /// COLOR (RFC 7986 §5.9): a CSS3 colour name such as `turquoise`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
+    /// IMAGE (RFC 7986 §5.10): pictures of the event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
+    /// CONFERENCE (RFC 7986 §5.11): ways to join it (a video call, a
+    /// phone number).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conferences: Vec<Conference>,
+}
+
+/// An event's IMAGE (RFC 7986 §5.10).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Image {
+    /// Where it is (VALUE=URI), or its base64 data (VALUE=BINARY).
+    pub uri: String,
+    /// FMTTYPE: its media type, where given.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_type: String,
+    /// DISPLAY: BADGE, GRAPHIC, FULLSIZE or THUMBNAIL; empty for BADGE.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display: String,
+    /// Its other parameters (VALUE, ENCODING, ALTREP, X-…) as written.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra: String,
+}
+
+/// A way to join an event (CONFERENCE, RFC 7986 §5.11).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Conference {
+    /// Its URI: `https://…`, `tel:…`, `sip:…`.
+    pub uri: String,
+    /// LABEL: what to call it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// FEATURE: AUDIO, VIDEO, CHAT, PHONE, SCREEN, MODERATOR, FEED…
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    /// Its other parameters (LANGUAGE, X-…) as written.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra: String,
+}
+
+/// A reminder in full (VALARM, RFC 5545 §3.6.6), as `Event::reminders`
+/// reads it: the plain ones of `Event::alarms` and those kept whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Alarm {
+    /// ACTION: DISPLAY, AUDIO, EMAIL, or another (Apple's NONE), uppercase.
+    pub action: String,
+    /// Seconds before the start it goes off (negative: after); for an
+    /// absolute trigger, before the event's start too.
+    pub before: i64,
+    /// REPEAT and DURATION: how many more times, and how far apart in
+    /// seconds (RFC 5545 §3.8.6.2: both or neither).
+    pub repeat: u32,
+    pub interval: i64,
+    /// DESCRIPTION, or for an email its SUMMARY's text too.
+    pub description: String,
+    pub summary: String,
+    /// An email reminder's recipients (ATTENDEE), as addresses.
+    pub attendees: Vec<String>,
+    /// ACKNOWLEDGED (RFC 9074 §6): it was dismissed.
+    pub acknowledged: bool,
+}
+
+impl Event {
+    /// GEO's latitude and longitude, where it holds two numbers in range.
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        let (lat, lon) = self.geo.split_once(';')?;
+        let (lat, lon): (f64, f64) = (lat.trim().parse().ok()?, lon.trim().parse().ok()?);
+        ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
+    }
+    /// Sets GEO (RFC 5545 §3.8.1.6), or clears it with `None`.
+    pub fn set_coordinates(&mut self, at: Option<(f64, f64)>) {
+        self.geo = at.map(|(lat, lon)| format!("{lat:.6};{lon:.6}")).unwrap_or_default();
+    }
+    /// Every reminder in full: the plain ones Picacho edits (`alarms`)
+    /// and the others kept as they came (an email, a sound, repeats).
+    pub fn reminders(&self) -> Vec<Alarm> {
+        let mut out: Vec<Alarm> = self
+            .alarms
+            .iter()
+            .map(|before| Alarm {
+                action: "DISPLAY".into(),
+                before: *before,
+                description: self.summary.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let length = (self.end - self.start).max(0);
+        let mut current: Option<Alarm> = None;
+        let mut depth = 0;
+        for line in unfold(&self.kept) {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("BEGIN:") {
+                depth += 1;
+                if upper == "BEGIN:VALARM" && depth == 1 {
+                    current = Some(Alarm::default());
+                }
+                continue;
+            }
+            if upper.starts_with("END:") {
+                depth -= 1;
+                if upper == "END:VALARM" && depth == 0 {
+                    out.extend(current.take());
+                }
+                continue;
+            }
+            let (Some(a), Some((name, params, value))) = (current.as_mut(), split_line(&line)) else {
+                continue;
+            };
+            if depth != 1 {
+                continue;
+            }
+            match name.as_str() {
+                "ACTION" => a.action = value.trim().to_ascii_uppercase(),
+                "TRIGGER" => {
+                    a.before = if param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
+                        parse_time(&value, &[]).map_or(0, |(t, _)| self.start - t)
+                    } else {
+                        let d = parse_duration(&value).unwrap_or(0);
+                        if param(&params, "RELATED").is_some_and(|r| r.eq_ignore_ascii_case("END")) {
+                            -(d + length)
+                        } else {
+                            -d
+                        }
+                    }
+                }
+                "REPEAT" => a.repeat = value.trim().parse().unwrap_or(0),
+                "DURATION" => a.interval = parse_duration(&value).unwrap_or(0),
+                "DESCRIPTION" => a.description = unescape(&value),
+                "SUMMARY" => a.summary = unescape(&value),
+                "ATTENDEE" => a.attendees.push(attendee(&line, &value, &params).email),
+                "ACKNOWLEDGED" => a.acknowledged = true,
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 /// Properties `write_event` writes from an event's fields; others are
 /// kept as they came (`Event::kept`).
 /// CREATED isn't one: RFC 5545 §3.8.7.1 has it stay as it was first
 /// written, so it is kept; LAST-MODIFIED is written anew (§3.8.7.3).
-const MODELLED: [&str; 24] = [
+const MODELLED: [&str; 30] = [
     "COMMENT", "BEGIN", "END", "UID", "DTSTAMP", "SEQUENCE", "DTSTART", "DTEND", "DUE", "DURATION",
     "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "SUMMARY", "LOCATION", "DESCRIPTION",
     "RRULE", "ORGANIZER", "ATTENDEE", "COMPLETED", "PERCENT-COMPLETE", "LAST-MODIFIED",
-    "X-PICACHO",
+    "X-PICACHO", "GEO", "CATEGORIES", "CLASS", "COLOR", "IMAGE", "CONFERENCE",
 ];
 
 /// The lines of a component (unfolded, BEGIN and END included) that
@@ -741,18 +892,80 @@ fn parse_time(value: &str, params: &[(String, String)]) -> Option<(i64, bool)> {
     Some((local.timestamp(), false))
 }
 
-fn attendee(value: &str, params: &[(String, String)]) -> Attendee {
+/// A TEXT list value (CATEGORIES, RESOURCES: RFC 5545 §3.1.1), split at
+/// unescaped commas, each unescaped.
+fn text_list(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                current.push(c);
+                current.extend(chars.next());
+            }
+            ',' => out.push(unescape(std::mem::take(&mut current).trim())),
+            c => current.push(c),
+        }
+    }
+    out.push(unescape(current.trim()));
+    out
+}
+/// A content line's parameters split into those named in `known` (by
+/// name, values decoded) and the rest as written, `;`-joined.
+fn split_params(line: &str, known: &[&str]) -> (Vec<(String, String)>, String) {
+    let mut found = Vec::new();
+    let mut rest = Vec::new();
+    for piece in raw_params(line) {
+        let (k, v) = piece.split_once('=').unwrap_or((piece, ""));
+        let k = k.trim().to_ascii_uppercase();
+        if known.contains(&k.as_str()) {
+            // A list value (FEATURE=AUDIO,VIDEO) stays a list; quotes go.
+            let v = v.split(',').map(|p| caret_decode(p.trim_matches('"'))).collect::<Vec<_>>().join(",");
+            found.push((k, v));
+        } else {
+            rest.push(piece);
+        }
+    }
+    (found, rest.join(";"))
+}
+/// The `;`-separated parameter pieces of a content line's head, as
+/// written (quotes and escapes kept), without its name.
+fn raw_params(line: &str) -> Vec<&str> {
+    let head = &line[..quote_aware_colon(line).unwrap_or(line.len())];
+    let mut out = Vec::new();
+    let (mut quoted, mut start) = (false, 0);
+    for (i, c) in head.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                out.push(&head[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&head[start..]);
+    out.remove(0);
+    out
+}
+
+fn attendee(line: &str, value: &str, params: &[(String, String)]) -> Attendee {
     let email = value
         .trim()
         .trim_start_matches("mailto:")
         .trim_start_matches("MAILTO:")
         .to_owned();
-    // The parameters Picacho doesn't edit, as written (RFC 6868 escapes
-    // put back).
-    let extra = params
-        .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT"))
-        .map(|(k, v)| format!("{k}={}", param_value(v)))
+    // The parameters Picacho doesn't edit, exactly as written: a list
+    // value (RFC 5545 §3.2.11 DELEGATED-TO="mailto:a","mailto:b") stays a
+    // list. SCHEDULE-STATUS is the server's to set (RFC 6638 §7.3), kept
+    // apart.
+    let extra = raw_params(line)
+        .into_iter()
+        .filter(|p| {
+            let k = p.split('=').next().unwrap_or("").trim().to_ascii_uppercase();
+            !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT")
+        })
         .collect::<Vec<_>>()
         .join(";");
     Attendee {
@@ -1118,8 +1331,8 @@ fn parse_lines(lines: Vec<String>) -> Calendar {
                     }
                 }
                 "DURATION" => end_duration = parse_duration(&value),
-                "ORGANIZER" => e.organizer = Some(attendee(&value, &params)),
-                "ATTENDEE" => e.attendees.push(attendee(&value, &params)),
+                "ORGANIZER" => e.organizer = Some(attendee(line, &value, &params)),
+                "ATTENDEE" => e.attendees.push(attendee(line, &value, &params)),
                 "SEQUENCE" => e.sequence = value.trim().parse().unwrap_or(0),
                 "RRULE" => e.recurrence = value.trim().to_owned(),
                 "STATUS" => {
@@ -1128,6 +1341,27 @@ fn parse_lines(lines: Vec<String>) -> Calendar {
                     e.completed |= e.status == "COMPLETED";
                 }
                 "COMPLETED" => e.completed = true,
+                "GEO" => e.geo = value.trim().to_owned(),
+                "CATEGORIES" => e.categories.extend(
+                    text_list(&value).into_iter().filter(|c| !c.is_empty()),
+                ),
+                "CLASS" => e.class = value.trim().to_ascii_uppercase(),
+                "COLOR" => e.color = value.trim().to_owned(),
+                "IMAGE" => {
+                    let (known, extra) = split_params(line, &["FMTTYPE", "DISPLAY"]);
+                    let get = |k: &str| known.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+                    e.images.push(Image { uri: value.trim().to_owned(), media_type: get("FMTTYPE"), display: get("DISPLAY"), extra });
+                }
+                "CONFERENCE" => {
+                    let (known, extra) = split_params(line, &["LABEL", "FEATURE"]);
+                    let get = |k: &str| known.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+                    e.conferences.push(Conference {
+                        uri: value.trim().to_owned(),
+                        label: get("LABEL"),
+                        features: get("FEATURE").split(',').map(|f| f.trim().to_ascii_uppercase()).filter(|f| !f.is_empty()).collect(),
+                        extra,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2275,6 +2509,40 @@ pub fn write_event(e: &Event) -> String {
     if !e.recurrence.is_empty() {
         lines.push(format!("RRULE:{}", e.recurrence));
     }
+    if !e.class.is_empty() {
+        lines.push(format!("CLASS:{}", e.class));
+    }
+    if !e.categories.is_empty() {
+        lines.push(format!("CATEGORIES:{}", e.categories.iter().map(|c| escape(c)).collect::<Vec<_>>().join(",")));
+    }
+    if !e.geo.is_empty() {
+        lines.push(format!("GEO:{}", e.geo));
+    }
+    if !e.color.is_empty() {
+        lines.push(format!("COLOR:{}", e.color));
+    }
+    let with = |name: &str, params: &[(&str, String)], extra: &str, value: &str| {
+        let mut head = name.to_owned();
+        if !extra.is_empty() {
+            head.push(';');
+            head.push_str(extra);
+        }
+        for (k, v) in params.iter().filter(|(_, v)| !v.is_empty()) {
+            head.push_str(&format!(";{k}={v}"));
+        }
+        format!("{head}:{value}")
+    };
+    for i in &e.images {
+        // RFC 7986 §5.10: VALUE=URI unless the data is inline.
+        let extra = if i.extra.is_empty() { "VALUE=URI".to_owned() } else { i.extra.clone() };
+        lines.push(with("IMAGE", &[("FMTTYPE", param_value(&i.media_type)), ("DISPLAY", param_value(&i.display))], &extra, &i.uri));
+    }
+    for c in &e.conferences {
+        // RFC 7986 §5.11: VALUE=URI is required.
+        let extra = if c.extra.to_ascii_uppercase().contains("VALUE=") { c.extra.clone() } else if c.extra.is_empty() { "VALUE=URI".to_owned() } else { format!("VALUE=URI;{}", c.extra) };
+        let features = c.features.iter().map(|f| param_value(f)).collect::<Vec<_>>().join(",");
+        lines.push(with("CONFERENCE", &[("FEATURE", features), ("LABEL", param_value(&c.label))], &extra, &c.uri));
+    }
     let person = |p: &Attendee| -> String {
         if p.name.is_empty() {
             String::new()
@@ -2484,6 +2752,68 @@ mod tests {
         assert_eq!(nextcloud[0].status, "TENTATIVE");
         assert!(nextcloud[0].kept.contains("REPEAT:2"));
     }
+    /// GEO, CATEGORIES, CLASS and RFC 7986's COLOR, IMAGE and CONFERENCE
+    /// are read into fields, written from them, and not also kept.
+    #[test]
+    fn descriptive_properties_are_modelled() {
+        let e = parse(NEXTCLOUD).events.remove(0);
+        assert_eq!(e.coordinates(), Some((48.208176, 16.373819)));
+        assert_eq!(e.categories, ["Work", "Finance"]);
+        assert_eq!((e.class.as_str(), e.color.as_str()), ("CONFIDENTIAL", "darkslateblue"));
+        assert_eq!(e.conferences.len(), 1);
+        let c = &e.conferences[0];
+        assert_eq!((c.uri.as_str(), c.label.as_str()), ("https://cloud.example.at/call/x7y8z9", "Talk"));
+        assert_eq!(c.features, ["AUDIO", "VIDEO"]);
+        for name in ["GEO:", "CATEGORIES:", "CLASS:", "COLOR:", "CONFERENCE"] {
+            assert!(!e.kept.contains(name), "{name} kept too");
+        }
+        // Several CATEGORIES lines, an escaped comma, an image.
+        let mut e = parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:i\r\nDTSTART:20261124T090000Z\r\nCATEGORIES:A\\, B,C\r\nCATEGORIES:D\r\nIMAGE;VALUE=URI;DISPLAY=BADGE;FMTTYPE=image/png:https://x.example/i.png\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").events.remove(0);
+        assert_eq!(e.categories, ["A, B", "C", "D"]);
+        assert_eq!(e.images, [Image { uri: "https://x.example/i.png".into(), media_type: "image/png".into(), display: "BADGE".into(), extra: "VALUE=URI".into() }]);
+        e.set_coordinates(Some((-33.8688, 151.2093)));
+        e.conferences.push(Conference { uri: "tel:+1-555-0100".into(), label: "Dial in; PIN 42".into(), features: vec!["PHONE".into()], extra: "VALUE=URI".into() });
+        e.source.clear();
+        let back = parse(&to_store(&e)).events.remove(0);
+        assert_eq!(back.categories, e.categories);
+        assert_eq!(back.images, e.images);
+        assert_eq!(back.conferences, e.conferences);
+        assert_eq!(back.coordinates(), Some((-33.8688, 151.2093)));
+        assert!(back.kept.is_empty(), "{}", back.kept);
+        assert!(to_store(&e).contains("CONFERENCE;VALUE=URI;FEATURE=PHONE;LABEL=\"Dial in; PIN 42\":tel:+1-555-0100"));
+    }
+
+    /// Reminders in full (RFC 5545 §3.6.6): their action, repeats and
+    /// recipients, the plain ones and those kept whole alike.
+    #[test]
+    fn reminders_are_read_in_full() {
+        let e = parse(NEXTCLOUD).events.remove(0);
+        let r = e.reminders();
+        assert_eq!(r.len(), 3);
+        assert_eq!((r[0].action.as_str(), r[0].before), ("DISPLAY", 900));
+        let email = r.iter().find(|a| a.action == "EMAIL").unwrap();
+        assert_eq!((email.before, email.attendees.as_slice()), (3600, ["chris@cloud.example.at".to_owned()].as_slice()));
+        assert_eq!(email.description, "Starts in an hour");
+        let repeating = r.iter().find(|a| a.repeat > 0).unwrap();
+        assert_eq!((repeating.before, repeating.repeat, repeating.interval), (300, 2, 300));
+        let icloud = parse(ICLOUD).events.remove(0).reminders();
+        assert!(icloud.iter().any(|a| a.action == "AUDIO" && a.before == 7200));
+        assert!(icloud.iter().any(|a| a.action == "NONE"));
+        assert!(icloud.iter().any(|a| a.acknowledged && a.before == 86_400));
+    }
+
+    /// A guest's list parameter (RFC 5545 §3.2.4 DELEGATED-FROM) is
+    /// written back as the list it was, not one quoted value.
+    #[test]
+    fn attendee_list_parameters_stay_lists() {
+        let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261124T090000Z\r\nATTENDEE;DELEGATED-FROM=\"mailto:a@x.example\",\"mailto:b@x.example\";PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:c@x.example\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut e = parse(text).events.remove(0);
+        assert_eq!(e.attendees[0].extra, "DELEGATED-FROM=\"mailto:a@x.example\",\"mailto:b@x.example\"");
+        e.source.clear();
+        let written = unfold(&to_store(&e)).join("\n");
+        assert!(written.contains("ATTENDEE;DELEGATED-FROM=\"mailto:a@x.example\",\"mailto:b@x.example\";PARTSTAT=ACCEPTED:mailto:c@x.example"), "{written}");
+    }
+
     #[test]
     fn edits_keep_what_picacho_doesnt_read() {
         let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:k\r\nDTSTART:20261124T090000Z\r\nDTEND:20261124T100000Z\r\nSUMMARY:Review\r\nCATEGORIES:Work,Q4\r\nCLASS:PRIVATE\r\nATTACH:https://x.example/agenda.pdf\r\nCOLOR:teal\r\nATTENDEE;ROLE=OPT-PARTICIPANT;CUTYPE=ROOM;PARTSTAT=ACCEPTED;CN=Room 4:mailto:room@x.example\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT1H\r\nATTENDEE:mailto:me@x.example\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
