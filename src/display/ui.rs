@@ -1699,6 +1699,12 @@ pub struct MailApp {
     /// (a group's, by name or address).
     contact_addresses: Entity<InputState>,
     contact_birthday: Entity<InputState>,
+    /// The contact's job title, nicknames, web and chat addresses, and
+    /// anniversary (RFC 6350 TITLE, NICKNAME, URL/IMPP, ANNIVERSARY).
+    contact_title: Entity<InputState>,
+    contact_nicknames: Entity<InputState>,
+    contact_links: Entity<InputState>,
+    contact_anniversary: Entity<InputState>,
     contact_members: Entity<InputState>,
     contact_filter: Entity<InputState>,
     /// Encryption settings: the passphrase of a key being imported.
@@ -2695,6 +2701,10 @@ impl MailApp {
             contact_note,
             contact_addresses: input("Street, city (one a line; optional)", false, window, cx),
             contact_birthday: input("1990-01-31, or --01-31 without a year (optional)", false, window, cx),
+            contact_title: input("Job title (optional)", false, window, cx),
+            contact_nicknames: input("Nicknames, separated by commas (optional)", false, window, cx),
+            contact_links: input("Web pages and chat (https://…, xmpp:…; optional)", false, window, cx),
+            contact_anniversary: input("2010-06-12, or --06-12 without a year (optional)", false, window, cx),
             contact_members: input("For a group: its people, by address (optional)", false, window, cx),
             contact_filter,
             key_passphrase,

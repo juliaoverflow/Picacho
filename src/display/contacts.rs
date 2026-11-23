@@ -388,6 +388,17 @@ impl MailApp {
                     .filter(|a| !a.is_empty())
                     .collect();
                 card.birthday = value(&self.contact_birthday, cx).trim().to_owned();
+                card.title = value(&self.contact_title, cx).trim().to_owned();
+                card.nicknames = list(value(&self.contact_nicknames, cx));
+                card.anniversary = value(&self.contact_anniversary, cx).trim().to_owned();
+                // Web pages (http/https) and chat addresses (any other URI).
+                // Split at commas and spaces only: a URL may hold a `;`.
+                let (urls, impps): (Vec<String>, Vec<String>) = value(&self.contact_links, cx)
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned)
+                    .partition(|l| l.starts_with("http://") || l.starts_with("https://"));
+                (card.urls, card.impps) = (urls, impps);
                 // A group's members, by address: the UIDs of those people.
                 let members = list(value(&self.contact_members, cx));
                 if !members.is_empty() || card.group {
@@ -532,6 +543,10 @@ impl MailApp {
             (&self.contact_note, card.note.clone()),
             (&self.contact_addresses, card.addresses.join("\n")),
             (&self.contact_birthday, card.birthday.clone()),
+            (&self.contact_title, card.title.clone()),
+            (&self.contact_nicknames, card.nicknames.join(", ")),
+            (&self.contact_links, card.urls.iter().chain(&card.impps).cloned().collect::<Vec<_>>().join(", ")),
+            (&self.contact_anniversary, card.anniversary.clone()),
             (&self.contact_members, {
                 let all = self.backend.contacts();
                 card.members
@@ -632,6 +647,10 @@ impl MailApp {
                 .child(labelled("Note", "contact-note", &self.contact_note))
                 .child(labelled("Postal addresses", "contact-addresses", &self.contact_addresses))
                 .child(labelled("Birthday", "contact-birthday", &self.contact_birthday))
+                .child(labelled("Job title", "contact-title", &self.contact_title))
+                .child(labelled("Nicknames", "contact-nicknames", &self.contact_nicknames))
+                .child(labelled("Web and chat", "contact-links", &self.contact_links))
+                .child(labelled("Anniversary", "contact-anniversary", &self.contact_anniversary))
                 .child(labelled(
                     "Members (makes it a group)",
                     "contact-members",

@@ -54,6 +54,31 @@ pub struct Card {
     pub group: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+    /// NICKNAME (RFC 6350 §6.2.3), every one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nicknames: Vec<String>,
+    /// TITLE (RFC 6350 §6.6.1): the job title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// IMPP (RFC 6350 §6.4.3, RFC 4770): chat addresses as URIs
+    /// (`xmpp:ana@example.org`, `sip:…`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impps: Vec<String>,
+    /// URL (RFC 6350 §6.7.8): web pages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+    /// ANNIVERSARY (RFC 6350 §6.2.6), as `birthday` is written.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub anniversary: String,
+    /// RELATED (RFC 6350 §6.6.6): people related, each (TYPE, value),
+    /// such as (`spouse`, `urn:uuid:…`) or (``, `Bo`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<(String, String)>,
+    /// KIND (RFC 6350 §6.1.4) other than an individual or a group:
+    /// `org`, `location`, or another, lowercase. Empty for a person;
+    /// groups are `group`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
 }
 
 impl Card {
@@ -345,7 +370,35 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
                         };
                     }
                     "KIND" | "X-ADDRESSBOOKSERVER-KIND" => {
-                        card.group = value.trim().eq_ignore_ascii_case("group")
+                        let kind = value.trim().to_ascii_lowercase();
+                        card.group = kind == "group";
+                        card.kind = if card.group || kind == "individual" { String::new() } else { kind };
+                    }
+                    // RFC 6350 §6.2.3: a list of nicknames.
+                    "NICKNAME" => card.nicknames.extend(
+                        text_list(value).into_iter().filter(|n| !n.is_empty()),
+                    ),
+                    "TITLE" => card.title = unescape(value).trim().to_owned(),
+                    p if IMPP_NAMES.contains(&p) => {
+                        let uri = impp_uri(p, value);
+                        if !uri.is_empty() && !card.impps.contains(&uri) {
+                            card.impps.push(uri);
+                        }
+                    }
+                    "URL" => {
+                        let v = unescape(value).trim().to_owned();
+                        if !v.is_empty() {
+                            card.urls.push(v);
+                        }
+                    }
+                    "ANNIVERSARY" | "X-ANNIVERSARY" if card.anniversary.is_empty() => {
+                        card.anniversary = birthday_value(value)
+                    }
+                    "RELATED" => {
+                        let r = related_value(head, value);
+                        if !r.1.is_empty() {
+                            card.related.push(r);
+                        }
                     }
                     "MEMBER" | "X-ADDRESSBOOKSERVER-MEMBER" => {
                         // A uid by `urn:uuid:` as the bare uid; any other
@@ -362,6 +415,57 @@ pub fn parse_vcards(text: &str) -> Vec<Card> {
         }
     }
     cards
+}
+
+/// The properties a chat address is written in: IMPP (RFC 6350 §6.4.3)
+/// and the X- forms vCard 3 apps used before it (RFC 4770 §1).
+const IMPP_NAMES: [&str; 7] = ["IMPP", "X-JABBER", "X-SKYPE", "X-ICQ", "X-AIM", "X-MSN", "X-YAHOO"];
+/// A chat address line's value as an IMPP URI (`X-JABBER:ana@x` is
+/// `xmpp:ana@x`).
+fn impp_uri(property: &str, value: &str) -> String {
+    let v = unescape(value).trim().to_owned();
+    let scheme = match property {
+        "X-JABBER" => "xmpp",
+        "X-SKYPE" => "skype",
+        "X-ICQ" => "icq",
+        "X-AIM" => "aim",
+        "X-MSN" => "msnim",
+        "X-YAHOO" => "ymsgr",
+        _ => return v,
+    };
+    if v.is_empty() || v.contains(':') { v } else { format!("{scheme}:{v}") }
+}
+/// A RELATED line's (TYPE, value), as `parse_vcards` reads it.
+fn related_value(head: &str, value: &str) -> (String, String) {
+    let kind = head
+        .split(';')
+        .skip(1)
+        .find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            k.eq_ignore_ascii_case("TYPE").then(|| v.trim_matches('"').to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    (kind, unescape(value).trim().to_owned())
+}
+
+/// A list value (NICKNAME, CATEGORIES: RFC 6350 §3.4) split at unescaped
+/// commas, each unescaped.
+fn text_list(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                current.push(c);
+                current.extend(chars.next());
+            }
+            ',' => out.push(unescape(std::mem::take(&mut current).trim()).trim().to_owned()),
+            c => current.push(c),
+        }
+    }
+    out.push(unescape(current.trim()).trim().to_owned());
+    out
 }
 
 /// A value escaped for a vCard property.
@@ -436,6 +540,31 @@ fn own_lines(card: &Card) -> Vec<String> {
             None => lines.push(format!("PHOTO;VALUE=uri:{}", card.photo)),
         }
     }
+    if !card.nicknames.is_empty() {
+        lines.push(format!("NICKNAME:{}", card.nicknames.iter().map(|n| escape(n)).collect::<Vec<_>>().join(",")));
+    }
+    if !card.title.is_empty() {
+        lines.push(format!("TITLE:{}", escape(&card.title)));
+    }
+    // RFC 4770 brought IMPP to vCard 3 as well.
+    lines.extend(card.impps.iter().map(|i| format!("IMPP:{i}")));
+    lines.extend(card.urls.iter().map(|u| format!("URL:{u}")));
+    if !card.anniversary.is_empty() {
+        // vCard 3 has no ANNIVERSARY: the X- form Evolution and KDE
+        // write, which `to_vcard4` makes ANNIVERSARY.
+        let a = &card.anniversary;
+        lines.push(match a.strip_prefix("--") {
+            Some(md) => format!("X-ANNIVERSARY:--{}", md.replace('-', "")),
+            None => format!("X-ANNIVERSARY:{a}"),
+        });
+    }
+    for (kind, value) in &card.related {
+        let kind = if kind.is_empty() { String::new() } else { format!(";TYPE={kind}") };
+        lines.push(format!("RELATED{kind}:{}", escape(value)));
+    }
+    if !card.kind.is_empty() && !card.group {
+        lines.push(format!("KIND:{}", card.kind));
+    }
     if card.group {
         // Apple's form, which vCard 3 servers (iCloud too) keep.
         lines.push("X-ADDRESSBOOKSERVER-KIND:group".into());
@@ -494,6 +623,20 @@ pub fn write_vcard(card: &Card) -> String {
     let mut members_left: Vec<&String> = card.members.iter().collect();
     let mut emails_left: Vec<&String> = card.emails.iter().collect();
     let mut phones_left: Vec<&String> = card.phones.iter().collect();
+    let mut impps_left: Vec<&String> = card.impps.iter().collect();
+    let mut urls_left: Vec<&String> = card.urls.iter().collect();
+    let mut related_left: Vec<&(String, String)> = card.related.iter().collect();
+    // Takes a value from what's left, where it is there: then its line
+    // stays as it was.
+    fn take<T: PartialEq + ?Sized>(left: &mut Vec<&T>, v: &T) -> bool {
+        match left.iter().position(|x| *x == v) {
+            Some(i) => {
+                left.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
     let mut kept: Vec<String> = Vec::new();
     let mut dropped_groups: Vec<String> = Vec::new();
     let mut version = "VERSION:3.0".to_owned();
@@ -550,7 +693,13 @@ pub fn write_vcard(card: &Card) -> String {
             }
             "BDAY" => birthday_value(value) == card.birthday,
             "PHOTO" => before.photo == card.photo,
-            "KIND" | "X-ADDRESSBOOKSERVER-KIND" => before.group == card.group,
+            "KIND" | "X-ADDRESSBOOKSERVER-KIND" => before.group == card.group && before.kind == card.kind,
+            "NICKNAME" => before.nicknames == card.nicknames,
+            "TITLE" => before.title == card.title,
+            p if IMPP_NAMES.contains(&p) => take(&mut impps_left, &impp_uri(p, value)),
+            "URL" => take(&mut urls_left, &unescape(value).trim().to_owned()),
+            "ANNIVERSARY" | "X-ANNIVERSARY" => birthday_value(value) == card.anniversary,
+            "RELATED" => take(&mut related_left, &related_value(head, value)),
             "MEMBER" | "X-ADDRESSBOOKSERVER-MEMBER" => {
                 let v = value.trim();
                 let v = v.strip_prefix("urn:uuid:").unwrap_or(v);
@@ -600,8 +749,16 @@ pub fn write_vcard(card: &Card) -> String {
             }
             "BDAY" => !has("BDAY", &kept),
             "PHOTO" => !has("PHOTO", &kept),
-            "X-ADDRESSBOOKSERVER-KIND" => {
+            "X-ADDRESSBOOKSERVER-KIND" | "KIND" => {
                 !has("X-ADDRESSBOOKSERVER-KIND", &kept) && !has("KIND", &kept)
+            }
+            "NICKNAME" | "TITLE" => !has(&p, &kept),
+            "IMPP" => impps_left.iter().any(|i| Some(i.as_str()) == line.split_once(':').map(|(_, v)| v)),
+            "URL" => urls_left.iter().any(|u| Some(u.as_str()) == line.split_once(':').map(|(_, v)| v)),
+            "X-ANNIVERSARY" => !has("ANNIVERSARY", &kept) && !has("X-ANNIVERSARY", &kept),
+            "RELATED" => {
+                let (head, value) = line.split_once(':').unwrap_or((&line, ""));
+                related_left.contains(&&related_value(head, value))
             }
             "X-ADDRESSBOOKSERVER-MEMBER" => {
                 let v = line.split_once(':').map_or("", |(_, v)| v);
@@ -690,6 +847,9 @@ pub fn to_vcard4(text: &str) -> String {
             format!("PHOTO:{}", &line["PHOTO;VALUE=uri:".len()..])
         } else if let Some(md) = upper.strip_prefix("BDAY;X-APPLE-OMIT-YEAR=1604:1604-") {
             format!("BDAY:--{}", md.replace('-', ""))
+        } else if upper.starts_with("X-ANNIVERSARY:") {
+            // RFC 6350 §6.2.6.
+            format!("ANNIVERSARY:{}", &line["X-ANNIVERSARY:".len()..])
         } else {
             line
         };
@@ -929,6 +1089,54 @@ mod tests {
         let again = parse_vcards(&write_vcards(&cards));
         assert_eq!(again[0].emails, cards[0].emails);
         assert_eq!(again[1].name, cards[1].name);
+    }
+
+    /// RFC 6350's NICKNAME, TITLE, IMPP, URL, ANNIVERSARY, RELATED and
+    /// KIND are read, and survive an edit of something else exactly as
+    /// written; changed, they're written anew in the card's version.
+    #[test]
+    fn vcard4_properties_are_modelled() {
+        let v4 = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ana López\r\nNICKNAME:Anita,La Jefa\r\nTITLE:Head of Research\r\nIMPP;PREF=1:xmpp:ana@example.org\r\nURL;TYPE=work:https://example.org/ana\r\nANNIVERSARY:20100612\r\nRELATED;TYPE=spouse:urn:uuid:bo-1\r\nRELATED;VALUE=text:Cy\r\nUID:ana\r\nEND:VCARD\r\n";
+        let ana = parse_vcards(v4).remove(0);
+        assert_eq!(ana.nicknames, ["Anita", "La Jefa"]);
+        assert_eq!(ana.title, "Head of Research");
+        assert_eq!(ana.impps, ["xmpp:ana@example.org"]);
+        assert_eq!(ana.urls, ["https://example.org/ana"]);
+        assert_eq!(ana.anniversary, "2010-06-12");
+        assert_eq!(ana.related, [("spouse".to_owned(), "urn:uuid:bo-1".to_owned()), (String::new(), "Cy".to_owned())]);
+        // Another field edited: these lines stay as written, once each.
+        let mut edited = ana.clone();
+        edited.note = "Met at the conference".into();
+        let written = write_vcard(&edited);
+        for line in ["NICKNAME:Anita,La Jefa", "IMPP;PREF=1:xmpp:ana@example.org", "URL;TYPE=work:https://example.org/ana", "ANNIVERSARY:20100612", "RELATED;TYPE=spouse:urn:uuid:bo-1", "RELATED;VALUE=text:Cy"] {
+            assert_eq!(written.matches(line).count(), 1, "{line} in {written}");
+        }
+        assert_eq!(written.matches("IMPP").count(), 1);
+        // Changed: written anew, nothing doubled.
+        edited.title = "Director".into();
+        edited.impps.push("sip:ana@example.org".into());
+        edited.urls.clear();
+        edited.anniversary = "--06-12".into();
+        edited.related.remove(1);
+        let back = parse_vcards(&write_vcard(&edited)).remove(0);
+        assert_eq!((back.title.as_str(), back.anniversary.as_str()), ("Director", "--06-12"));
+        assert_eq!(back.impps, edited.impps);
+        assert!(back.urls.is_empty());
+        assert_eq!(back.related, edited.related);
+        assert!(write_vcard(&edited).contains("ANNIVERSARY:--0612"), "{}", write_vcard(&edited));
+        // vCard 3's chat forms read as IMPP; an organization's KIND.
+        let v3 = parse_vcards("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Acme\r\nX-JABBER:acme@example.com\r\nX-SKYPE:acme.support\r\nX-ANNIVERSARY:1999-01-01\r\nKIND:org\r\nEND:VCARD\r\nBEGIN:VCARD\r\nVERSION:4.0\r\nFN:Room 4\r\nKIND:location\r\nEND:VCARD\r\n");
+        assert_eq!(v3[0].impps, ["xmpp:acme@example.com", "skype:acme.support"]);
+        assert_eq!((v3[0].kind.as_str(), v3[0].anniversary.as_str()), ("org", "1999-01-01"));
+        assert_eq!(v3[1].kind, "location");
+        // Made here: each written once, and read back the same.
+        let made = Card { uid: "n".into(), name: "Acme".into(), kind: "org".into(), nicknames: vec!["A, Inc".into()], ..v3[0].clone() };
+        let made = Card { vcard: String::new(), ..made };
+        let text = write_vcard(&made);
+        assert!(text.contains("KIND:org") && text.contains("X-ANNIVERSARY:1999-01-01") && text.contains("NICKNAME:A\\, Inc"), "{text}");
+        let back = parse_vcards(&text).remove(0);
+        assert_eq!((back.kind, back.impps, back.nicknames), (made.kind.clone(), made.impps.clone(), made.nicknames.clone()));
+        assert!(to_vcard4(&text).contains("ANNIVERSARY:1999-01-01"));
     }
 
     #[test]
