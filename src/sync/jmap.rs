@@ -406,6 +406,13 @@ pub struct Session {
     /// Other accounts with mail that this sign-in reaches (shared with
     /// it): (id, name). The one used is `account_id`.
     other_accounts: Vec<(String, String)>,
+    /// RFC 8621 §1.3.1: the mail account's limits: how many mailboxes a
+    /// message may be in (`maxMailboxesPerEmail`, `None` for no limit),
+    /// how deep folders may go (`maxMailboxDepth`), how long a folder's
+    /// name may be in bytes (`maxSizeMailboxName`), how large a message's
+    /// attachments may be together (`maxSizeAttachmentsPerEmail`), and
+    /// whether folders may be made at the top (`mayCreateTopLevelMailbox`).
+    mail_limits: MailLimits,
     /// The accounts the sign-in may only read (RFC 8620 §2: `isReadOnly`),
     /// whose /set, /copy, /import and the like are refused here rather
     /// than sent.
@@ -428,6 +435,29 @@ pub struct Session {
     /// The Sieve extensions of the account's filters, where it has JMAP
     /// for Sieve Scripts.
     sieve: Option<Vec<String>>,
+}
+
+/// A mail account's limits (RFC 8621 §1.3.1), where it says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MailLimits {
+    pub max_mailboxes_per_email: Option<usize>,
+    pub max_mailbox_depth: Option<usize>,
+    pub max_size_mailbox_name: usize,
+    pub max_size_attachments_per_email: usize,
+    pub may_create_top_level_mailbox: bool,
+}
+impl MailLimits {
+    fn read(caps: &Value) -> Self {
+        let n = |k: &str| caps[k].as_u64().and_then(|n| usize::try_from(n).ok());
+        Self {
+            max_mailboxes_per_email: n("maxMailboxesPerEmail").filter(|n| *n > 0),
+            max_mailbox_depth: n("maxMailboxDepth"),
+            // RFC 8621 §1.3.1: at least 100 octets.
+            max_size_mailbox_name: n("maxSizeMailboxName").unwrap_or(usize::MAX).max(100),
+            max_size_attachments_per_email: n("maxSizeAttachmentsPerEmail").filter(|n| *n > 0).unwrap_or(usize::MAX),
+            may_create_top_level_mailbox: caps["mayCreateTopLevelMailbox"].as_bool().unwrap_or(true),
+        }
+    }
 }
 
 /// A Sieve script on the server (RFC 9661).
@@ -790,6 +820,7 @@ impl Session {
                 .to_owned(),
             other_accounts,
             read_only,
+            mail_limits: MailLimits::read(&account[MAIL]),
             username: v["username"].as_str().unwrap_or_default().to_owned(),
             sieve: caps.get(SIEVE).map(|_| {
                 let ext = &account[SIEVE]["sieveExtensions"];
@@ -1139,10 +1170,34 @@ impl Session {
         }
     }
     pub fn create_mailbox(&self, name: &str, parent: Option<&str>) -> Result<String> {
-        if let Some(p) = parent
-            && let Some(m) = self.mailboxes.lock().unwrap().iter().find(|m| m.id == p)
-        {
-            ensure!(m.may_create_child(), "You may not make folders inside “{}”.", m.name);
+        let limits = self.mail_limits;
+        ensure!(
+            name.len() <= limits.max_size_mailbox_name,
+            "This server takes folder names of up to {} bytes.",
+            limits.max_size_mailbox_name
+        );
+        ensure!(
+            parent.is_some() || limits.may_create_top_level_mailbox,
+            "This server makes new folders only inside others."
+        );
+        if let Some(p) = parent {
+            let boxes = self.mailboxes.lock().unwrap();
+            if let Some(m) = boxes.iter().find(|m| m.id == p) {
+                ensure!(m.may_create_child(), "You may not make folders inside “{}”.", m.name);
+            }
+            // RFC 8621 §1.3.1: `maxMailboxDepth` counts the top as 1.
+            if let Some(most) = limits.max_mailbox_depth {
+                let mut depth = 1;
+                let mut at = Some(p.to_owned());
+                while let Some(id) = at.take() {
+                    depth += 1;
+                    at = boxes.iter().find(|m| m.id == id).and_then(|m| m.parent_id.clone());
+                    if depth > 64 {
+                        break;
+                    }
+                }
+                ensure!(depth <= most, "This server takes folders only {most} deep.");
+            }
         }
         let v = self.one(
             "Mailbox/set",
@@ -1179,6 +1234,13 @@ impl Session {
         self.update_mailbox(id, json!({ "isSubscribed": subscribed }), "subscribe to")
     }
     fn update_mailbox(&self, id: &str, patch: Value, what: &str) -> Result<()> {
+        if let Some(name) = patch["name"].as_str() {
+            ensure!(
+                name.len() <= self.mail_limits.max_size_mailbox_name,
+                "This server takes folder names of up to {} bytes.",
+                self.mail_limits.max_size_mailbox_name
+            );
+        }
         let known = self.mailboxes.lock().unwrap().iter().find(|m| m.id == id).cloned();
         // RFC 8621 §2: moving and renaming both need `mayRename`.
         if let Some(m) = &known
@@ -1416,6 +1478,9 @@ impl Session {
                         ensure!(m.may_add_items(), "You may not put messages in the folder “{}”.", m.name);
                     }
                 }
+                if let Some(all) = patch["mailboxIds"].as_object() {
+                    self.check_mailbox_count(all.len())?;
+                }
             }
         }
         let all: Vec<(String, Value)> = patches.into_iter().collect();
@@ -1616,6 +1681,7 @@ impl Session {
     /// (`$seen`, `$draft`). Returns its id.
     /// Adds a message already uploaded (a blob) to `mailboxes`.
     pub fn import_blob(&self, blob: &str, mailboxes: &[&str], keywords: &[&str]) -> Result<String> {
+        self.check_mailbox_count(mailboxes.len())?;
         let v = self.one(
             "Email/import",
             json!({ "accountId": self.account_id, "emails": { "m": import_args(blob, mailboxes, keywords) } }),
@@ -1623,6 +1689,7 @@ impl Session {
         imported(&v, "m")
     }
     pub fn import(&self, raw: &[u8], mailboxes: &[&str], keywords: &[&str]) -> Result<String> {
+        self.check_mailbox_count(mailboxes.len())?;
         let blob = self.upload(raw, "message/rfc822")?;
         let v = self.one(
             "Email/import",
@@ -1632,6 +1699,39 @@ impl Session {
             }),
         )?;
         imported(&v, "m")
+    }
+    /// RFC 8621 §1.3.1: a message may be in at most `maxMailboxesPerEmail`.
+    fn check_mailbox_count(&self, n: usize) -> Result<()> {
+        if let Some(most) = self.mail_limits.max_mailboxes_per_email {
+            ensure!(n <= most, "This server keeps a message in at most {most} folders.");
+        }
+        Ok(())
+    }
+    /// RFC 8621 §1.3.1: a message's attachments together may be at most
+    /// `maxSizeAttachmentsPerEmail` (their decoded size); said before the
+    /// upload rather than as the server's refusal.
+    fn check_attachments(&self, raw: &[u8]) -> Result<()> {
+        let most = self.mail_limits.max_size_attachments_per_email;
+        if most == usize::MAX || raw.len() <= most {
+            return Ok(());
+        }
+        let Ok(parsed) = mailparse::parse_mail(raw) else { return Ok(()) };
+        let mut total = 0usize;
+        let mut stack = vec![&parsed];
+        while let Some(part) = stack.pop() {
+            stack.extend(part.subparts.iter());
+            if part.subparts.is_empty()
+                && part.get_content_disposition().disposition == mailparse::DispositionType::Attachment
+            {
+                total += part.get_body_raw().map(|b| b.len()).unwrap_or(0);
+            }
+        }
+        ensure!(
+            total <= most,
+            "The attachments are larger than this server sends ({} MB at most).",
+            most / 1_000_000
+        );
+        Ok(())
     }
     /// The bodies of a message too large to download whole: its text and
     /// HTML parts' values, and its attachments' blobs.
@@ -1796,6 +1896,7 @@ impl Session {
                 }
             })
             .collect();
+        self.check_attachments(raw)?;
         let blob = self.upload(raw, "message/rfc822")?;
         let first: Vec<&str> = drafts.or(sent).into_iter().collect();
         ensure!(
@@ -3632,6 +3733,25 @@ mod tests {
         let unclosed = Marked::parse("a <mark>b");
         assert_eq!(unclosed.marks, [2..3]);
         assert!(Marked::parse("<mark></mark>x").marks.is_empty());
+    }
+
+    /// The mail account's limits (RFC 8621 §1.3.1), with the RFC's floor
+    /// for names and none where the server doesn't say.
+    #[test]
+    fn mail_limits_are_read() {
+        let l = MailLimits::read(&json!({
+            "maxMailboxesPerEmail": 1, "maxMailboxDepth": 3, "maxSizeMailboxName": 10,
+            "maxSizeAttachmentsPerEmail": 1000, "mayCreateTopLevelMailbox": false,
+        }));
+        assert_eq!(l.max_mailboxes_per_email, Some(1));
+        assert_eq!(l.max_mailbox_depth, Some(3));
+        assert_eq!(l.max_size_mailbox_name, 100);
+        assert_eq!(l.max_size_attachments_per_email, 1000);
+        assert!(!l.may_create_top_level_mailbox);
+        let none = MailLimits::read(&json!({ "maxMailboxesPerEmail": null }));
+        assert_eq!(none.max_mailboxes_per_email, None);
+        assert!(none.may_create_top_level_mailbox);
+        assert_eq!(none.max_size_attachments_per_email, usize::MAX);
     }
 
     #[test]

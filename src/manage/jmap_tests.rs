@@ -90,6 +90,8 @@ struct Server {
     /// Each CalendarEvent/set: (sendSchedulingMessages, the participants'
     /// scheduleAgents).
     scheduling: Vec<(bool, Vec<String>)>,
+    /// The mail account's capability (RFC 8621 §1.3.1), where set.
+    mail_caps: Option<Value>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -324,8 +326,9 @@ impl Server {
                 let state = if self.boxes.is_some() { "m2" } else { "m1" };
                 vec![(name.into(), json!({ "list": list, "state": state }))]
             }
-            // The mailboxes don't change here.
-            "Mailbox/changes" if args["sinceState"] == "m1" => vec![(
+            // The mailboxes don't change here, unless Mailbox/set changed
+            // them (then the state is too old: read them all).
+            "Mailbox/changes" if args["sinceState"] == "m1" && self.boxes.is_none() => vec![(
                 name.into(),
                 json!({ "oldState": "m1", "newState": "m1", "hasMoreChanges": false,
                         "created": [], "updated": [], "destroyed": [] }),
@@ -891,7 +894,7 @@ impl Server {
                         "urn:ietf:params:jmap:sieve": {},
                     },
                     "accounts": { "u1": { "name": "qa@example.com", "accountCapabilities": {
-                        "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {},
+                        "urn:ietf:params:jmap:mail": self.mail_caps.clone().unwrap_or(json!({})), "urn:ietf:params:jmap:submission": {},
                         "urn:ietf:params:jmap:sieve": {
                             "sieveExtensions": ["fileinto", "vacation", "imap4flags", "include"] } } } },
                     "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
@@ -2434,5 +2437,47 @@ fn jmap_calendar_scheduling_uses_one_channel() -> Result<()> {
     // sends nothing for it; the answer goes by mail.
     b.save_event(lunch("theirs@x", "ana@example.org"), None)?;
     assert_eq!(last(&server), (false, vec!["client".to_owned(), "client".to_owned()]));
+    Ok(())
+}
+
+/// The mail account's limits (RFC 8621 §1.3.1) are said before anything is
+/// sent: folder depth, top-level folders, name length, attachments' size
+/// and how many folders a message may be in.
+#[test]
+fn jmap_mail_limits_are_honoured() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        mail_caps: Some(json!({
+            "maxMailboxesPerEmail": 1, "maxMailboxDepth": 2, "maxSizeMailboxName": 100,
+            "maxSizeAttachmentsPerEmail": 1000, "mayCreateTopLevelMailbox": false,
+        })),
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let big = format!(
+        "From: qa@example.com\r\nTo: r@example.com\r\nSubject: Big\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nHi\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=x.bin\r\n\r\n{}\r\n--b--\r\n",
+        "x".repeat(4000)
+    );
+    b.with_jmap(&a, |s| {
+        s.reload_mailboxes()?;
+        let before = server.lock().unwrap().calls.len();
+        assert!(s.create_mailbox("Top", None).is_err(), "not at the top");
+        assert!(s.create_mailbox(&"n".repeat(101), Some("w")).is_err(), "name too long");
+        assert!(s.import(MESSAGE, &["i", "w"], &[]).is_err(), "one folder per message");
+        let mut patch = serde_json::Map::new();
+        patch.insert("M1".into(), json!({ "mailboxIds": { "i": true, "w": true } }));
+        assert!(s.update(patch).is_err());
+        let options = crate::sync::jmap::SendOptions::default();
+        let e = s.send("id1", "qa@example.com", &["r@example.com".into()], big.as_bytes(), Some("d"), Some("s"), &options).unwrap_err();
+        assert!(e.to_string().contains("attachments"), "{e}");
+        assert_eq!(server.lock().unwrap().calls.len(), before, "nothing was asked of the server");
+        // Within the limits: made.
+        let id = s.create_mailbox("Inner", Some("w"))?;
+        // Inner is 2 deep; one inside it would be 3.
+        assert!(s.create_mailbox("Deeper", Some(&id)).is_err());
+        Ok(())
+    })?;
     Ok(())
 }
