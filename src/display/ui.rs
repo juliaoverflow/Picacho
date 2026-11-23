@@ -6097,10 +6097,10 @@ impl MailApp {
                     let _ = b.read(&account, &m);
                 }
                 if let Some(verdict) = b.verdict(&m.id) {
-                    use crate::manage::openpgp::Signature;
-                    if verdict.signature != Signature::None {
-                        details.signature_good = matches!(verdict.signature, Signature::Good(_));
-                        details.signature = Some(verdict.signature.label());
+                    // With RFC 9788 §4.4.2's From warning when there is one.
+                    if let Some((line, good)) = verdict.signature_line() {
+                        details.signature_good = good;
+                        details.signature = Some(line);
                     }
                 }
                 if let Some(verdict) = b.smime_verdict(&m.id) {

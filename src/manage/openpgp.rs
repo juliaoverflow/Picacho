@@ -65,6 +65,45 @@ pub struct Verdict {
     pub decrypted: bool,
     /// The signature, if any, and what it says.
     pub signature: Signature,
+    /// RFC 9788 §4.4.2: the protected From is for another address than the
+    /// outer one, and no signature by a key for it vouches for it.
+    pub from_mismatch: Option<FromMismatch>,
+}
+
+/// The two From fields of a message whose protected From doesn't match
+/// its outer one (RFC 9788 §4.4.1.1), as written (decoded).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FromMismatch {
+    /// The From outside the protection: what the sender's server saw.
+    pub outer: String,
+    /// The From inside the protection.
+    pub protected: String,
+}
+
+impl FromMismatch {
+    /// RFC 9788 §4.4.2: a warning that shows both From fields.
+    pub fn label(&self) -> String {
+        format!(
+            "Warning: the sender inside the message ({}) isn't the sender shown ({}), and no signature proves it",
+            self.protected, self.outer
+        )
+    }
+}
+
+impl Verdict {
+    /// The signature line of the message's details and whether it is good:
+    /// what the signature says, with the From warning (RFC 9788 §4.4.2)
+    /// after it. `None` with neither.
+    pub fn signature_line(&self) -> Option<(String, bool)> {
+        let signed = (self.signature != Signature::None).then(|| self.signature.label());
+        let good = matches!(self.signature, Signature::Good(_)) && self.from_mismatch.is_none();
+        match (signed, &self.from_mismatch) {
+            (Some(s), Some(w)) => Some((format!("{s}. {}", w.label()), good)),
+            (Some(s), None) => Some((s, good)),
+            (None, Some(w)) => Some((w.label(), good)),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -719,12 +758,16 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             inner
         };
         let mut signature = Signature::None;
+        // The keys whose signature checked out, for RFC 9788 §4.4.1.2.
+        let mut signers: Vec<&SignedPublicKey> = Vec::new();
         if signed_inline {
             signature = Signature::UnknownKey;
             for (key, verifier) in verifiers(&public) {
                 if opened.verify(verifier).is_ok() {
-                    signature = good_from(key, from.as_deref());
-                    break;
+                    if signers.is_empty() {
+                        signature = good_from(key, from.as_deref());
+                    }
+                    signers.push(key);
                 }
             }
         }
@@ -734,6 +777,8 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
         // A multipart/signed message inside the encryption (sign, then encrypt).
         if let Some((content, sig)) = signed_parts(&full) {
             signature = check(&sig, &content, &public, from.as_deref());
+            let from_mismatch =
+                protected::from_mismatch(&outer, &content, |a| signed_by_key_for(&sig, &content, &public, a));
             // RFC 9788 §4.5: the Cryptographic Payload is the signed part,
             // whose headers are the protected ones.
             return Some((
@@ -741,31 +786,46 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
                 Verdict {
                     decrypted: true,
                     signature,
+                    from_mismatch,
                 },
             ));
         }
+        let from_mismatch =
+            protected::from_mismatch(&outer, &inner, |a| signers.iter().any(|k| has_address(k, a)));
         return Some((
             shown(&outer, &inner),
             Verdict {
                 decrypted: true,
                 signature,
+                from_mismatch,
             },
         ));
     }
     match signed_parts(raw) {
         Some((content, sig)) => {
-            let signature = check(&sig, &content, &ring.public_keys(), from.as_deref());
+            let public = ring.public_keys();
+            let signature = check(&sig, &content, &public, from.as_deref());
+            let from_mismatch =
+                protected::from_mismatch(raw, &content, |a| signed_by_key_for(&sig, &content, &public, a));
             Some((
                 shown(&outer_headers(raw), &content),
                 Verdict {
                     decrypted: false,
                     signature,
+                    from_mismatch,
                 },
             ))
         }
         // Not PGP/MIME: inline PGP, or PGP/MIME a list wrapped in a part.
         None => open_inline(raw, ring, from.as_deref()).or_else(|| open_nested(raw, ring)),
     }
+}
+
+/// RFC 9788 §4.4.1.2: whether the detached `signature` over `content` is
+/// valid and made by a key whose user id is `address`.
+fn signed_by_key_for(signature: &str, content: &[u8], public: &[SignedPublicKey], address: &str) -> bool {
+    let keys: Vec<SignedPublicKey> = public.iter().filter(|k| has_address(k, address)).cloned().collect();
+    !keys.is_empty() && matches!(check(signature, content, &keys, None), Signature::Good(_))
 }
 
 /// The message shown for `outer` (its outer header fields) and `payload`
@@ -835,6 +895,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
             Verdict {
                 decrypted: false,
                 signature,
+                ..Default::default()
             },
         ));
     }
@@ -879,6 +940,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>) -> Option<(Vec<u8
             Verdict {
                 decrypted: true,
                 signature,
+                ..Default::default()
             },
         ));
     }

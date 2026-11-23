@@ -226,6 +226,48 @@ pub(super) fn unwrapped(payload: &[u8]) -> Option<Vec<u8>> {
     (!layer && !wrapped.ctype.params.contains_key("hp")).then_some(message)
 }
 
+/// The protected From of `payload` (the root of a Cryptographic
+/// Payload), as written, and its address: from its own header section
+/// with Header Protection, or from the message it wraps (RFC 9788
+/// §4.10). `None` without Header Protection or a From.
+fn protected_from(payload: &[u8]) -> Option<(String, String)> {
+    let wrapped = unwrapped(payload);
+    let text = latin1(wrapped.as_deref().unwrap_or(payload));
+    let (head, _) = head_of(&text);
+    if wrapped.is_none() && !has_header_protection(head) {
+        return None;
+    }
+    let field = fields(head).into_iter().find(|f| f.name == "from")?;
+    let value = field.lines.split_once(':')?.1.replace("\r\n", "").trim().to_owned();
+    let address = first_address(head, "from")?;
+    let decoded = mailparse::parse_header(format!("From: {value}").as_bytes())
+        .map_or(value, |(h, _)| h.get_value());
+    Some((decoded, address))
+}
+
+/// RFC 9788 §4.4.2: the warning for a message whose protected From is for
+/// another address than its outer From (§4.4.1.1) and that has no valid
+/// signature by a key bound to the protected address (§4.4.1.2), which
+/// `bound` tells for an address. `outer` is the outer header section.
+pub(super) fn from_mismatch(
+    outer: &[u8],
+    payload: &[u8],
+    bound: impl Fn(&str) -> bool,
+) -> Option<super::FromMismatch> {
+    let (protected, inner_address) = protected_from(payload)?;
+    let outer_text = latin1(outer);
+    let outer_address = first_address(&outer_text, "from");
+    if same_address(outer_address.as_deref(), Some(&inner_address)) || bound(&inner_address) {
+        return None;
+    }
+    use mailparse::MailHeaderMap as _;
+    let outer_from = mailparse::parse_headers(outer)
+        .ok()
+        .and_then(|(h, _)| h.get_first_value("From"))
+        .unwrap_or_default();
+    Some(super::FromMismatch { outer: outer_from, protected })
+}
+
 /// RFC 9788 §5.2.1 step 2 and RFC 9787 §1.1.2: the User-Facing fields of
 /// `outer` that `compose` obscures or takes off the outside, (name,
 /// decoded value), for a Legacy Display Element. Only an encrypted
@@ -602,6 +644,57 @@ mod tests {
         let marked = format!("Content-Type: message/rfc822; hp=\"cipher\"\r\n\r\n{WRAPPED}");
         assert!(unwrapped(marked.as_bytes()).is_none());
         assert_eq!(unwrapped(payload.as_bytes()).as_deref(), Some(WRAPPED.as_bytes()));
+    }
+
+    /// RFC 9788 §4.4.2: a protected From for another address than the
+    /// outer one warns, showing both, unless a valid signature by a key
+    /// for the protected address vouches for it; a matching address
+    /// (§4.4.5: case and IDNA aside) never warns.
+    #[test]
+    fn protected_from_mismatch_warns_without_a_bound_signature() {
+        use super::super::{FromMismatch, Keyring, Signature, Verdict, open, test_key};
+        let ana = test_key("Ana <ana@example.org>", "");
+        let boss = test_key("Boss <boss@bank.example>", "");
+        let mut ring = Keyring::default();
+        ring.import(&ana.to_armored_string(Default::default()).unwrap(), "").unwrap();
+        ring.import(
+            &pgp::composed::SignedPublicKey::from(boss.clone()).to_armored_string(Default::default()).unwrap(),
+            "",
+        )
+        .unwrap();
+        let outer = "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nSubject: ...\r\n";
+        let payload = |from: &str| {
+            format!("From: {from}\r\nSubject: Pay now\r\nContent-Type: text/plain; hp=\"cipher\"\r\n\r\nPay.\r\n")
+        };
+        // Unsigned, the protected From names the bank: a warning with both.
+        let forged = encrypted_mime(outer, &payload("Boss <boss@bank.example>"), &ana);
+        let (readable, verdict) = open(forged.as_bytes(), &ring).unwrap();
+        let warning = FromMismatch { outer: "Ana <ana@example.org>".into(), protected: "Boss <boss@bank.example>".into() };
+        assert_eq!(verdict.from_mismatch.as_ref(), Some(&warning));
+        let (line, good) = verdict.signature_line().unwrap();
+        assert!(!good && line.contains("boss@bank.example") && line.contains("ana@example.org"), "{line}");
+        // RFC 9788 §4.4.3: the outer From is the one shown.
+        assert_eq!(values(&String::from_utf8_lossy(&readable), "From"), ["Ana <ana@example.org>"]);
+        // Signed by Ana's key (bound to the outer address, not the
+        // protected one): still a warning, beside the signature.
+        let signed = encrypted_mime(outer, &signed_mime(&payload("Boss <boss@bank.example>"), &ana), &ana);
+        let verdict = open(signed.as_bytes(), &ring).unwrap().1;
+        assert_eq!(verdict.from_mismatch, Some(warning.clone()));
+        let (line, good) = verdict.signature_line().unwrap();
+        assert!(!good && line.starts_with("Signed by Ana") && line.contains("Warning"), "{line}");
+        // Signed by the bank's own key: the signature vouches for it.
+        let vouched = encrypted_mime(outer, &signed_mime(&payload("Boss <boss@bank.example>"), &boss), &ana);
+        assert_eq!(open(vouched.as_bytes(), &ring).unwrap().1.from_mismatch, None);
+        // Signed only, the same rules.
+        let clear = format!("{outer}MIME-Version: 1.0\r\n{}", signed_mime(&payload("Boss <boss@bank.example>"), &ana));
+        assert_eq!(open(clear.as_bytes(), &ring).unwrap().1.from_mismatch, Some(warning));
+        // The same address, written otherwise: no warning, and a plain
+        // verdict reads as before.
+        let same = encrypted_mime(outer, &payload("Ana Lima <ANA@Example.ORG>"), &ana);
+        assert_eq!(open(same.as_bytes(), &ring).unwrap().1.from_mismatch, None);
+        assert_eq!(Verdict::default().signature_line(), None);
+        let good = Verdict { signature: Signature::Good("Ana".into()), ..Default::default() };
+        assert_eq!(good.signature_line(), Some(("Signed by Ana".into(), true)));
     }
 
     /// Brief Q5: a payload without an hp parameter is never stripped, even
