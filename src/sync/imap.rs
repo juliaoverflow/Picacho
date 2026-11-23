@@ -1486,12 +1486,30 @@ fn other_namespaces(line: &str) -> Vec<String> {
     groups.into_iter().skip(1).flatten().collect()
 }
 /// How much of a mailbox's storage is used and allowed, in KiB.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Quota {
     pub used_kib: u64,
     pub limit_kib: u64,
+    /// Messages kept and allowed (RFC 9208 §5.2's MESSAGE), where the
+    /// server limits their number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<(u64, u64)>,
+    /// Storage that deleted mail still takes and allows, in KiB (RFC 9208
+    /// §5.5's DELETED-STORAGE): what emptying deleted mail would free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_kib: Option<(u64, u64)>,
 }
-/// STORAGE from a QUOTA reply: `"" (STORAGE 10 512 MESSAGE 4 1000)`.
+impl Quota {
+    /// How full it is, 0 to 1 and more: the fuller of storage and messages.
+    pub fn share(&self) -> f64 {
+        let storage = self.used_kib as f64 / self.limit_kib.max(1) as f64;
+        let messages = self.messages.map_or(0., |(used, limit)| used as f64 / limit.max(1) as f64);
+        if self.limit_kib == 0 { messages } else { storage.max(messages) }
+    }
+}
+/// A QUOTA reply's resources (RFC 9208 §5): `"" (STORAGE 10 512 MESSAGE
+/// 4 1000 DELETED-STORAGE 2 512)`. STORAGE, MESSAGE and DELETED-STORAGE
+/// are kept; others (MAILBOX, ANNOTATION-STORAGE…) aren't about mail.
 fn storage_quota(line: &str) -> Option<Quota> {
     let tokens = tokens(line);
     let start = tokens.iter().position(|t| *t == Token::Open)?;
@@ -1503,13 +1521,22 @@ fn storage_quota(line: &str) -> Option<Quota> {
             _ => None,
         })
         .collect();
-    words.chunks(3).find_map(|c| match c {
-        [resource, used, limit] if resource.eq_ignore_ascii_case("STORAGE") => Some(Quota {
-            used_kib: used.parse().ok()?,
-            limit_kib: limit.parse().ok()?,
-        }),
-        _ => None,
-    })
+    let mut quota = Quota::default();
+    let mut any = false;
+    for c in words.chunks(3) {
+        let [resource, used, limit] = c else { continue };
+        let (Ok(used), Ok(limit)) = (used.parse::<u64>(), limit.parse::<u64>()) else {
+            continue;
+        };
+        match resource.to_ascii_uppercase().as_str() {
+            "STORAGE" => (quota.used_kib, quota.limit_kib) = (used, limit),
+            "MESSAGE" => quota.messages = Some((used, limit)),
+            "DELETED-STORAGE" => quota.deleted_kib = Some((used, limit)),
+            _ => continue,
+        }
+        any = true;
+    }
+    any.then_some(quota)
 }
 /// The account's storage quota, if the server limits it. The inbox's
 /// quota roots (GETQUOTAROOT) come first; other roots whose STORAGE the
@@ -1529,10 +1556,7 @@ pub(crate) fn quota_of(session: &mut ImapSession, mailboxes: &[String]) -> Resul
         }
     }
     found.dedup();
-    Ok(found.into_iter().max_by(|a, b| {
-        let share = |q: &Quota| q.used_kib as f64 / q.limit_kib.max(1) as f64;
-        share(a).total_cmp(&share(b))
-    }))
+    Ok(found.into_iter().max_by(|a, b| a.share().total_cmp(&b.share())))
 }
 fn quotas_in(data: &[u8]) -> Result<Vec<Quota>> {
     Ok(other_lines(data, "QUOTA")?
@@ -2204,10 +2228,21 @@ mod extension_tests {
             storage_quota(r#""" (MESSAGE 4 1000 STORAGE 10 512)"#),
             Some(Quota {
                 used_kib: 10,
-                limit_kib: 512
+                limit_kib: 512,
+                messages: Some((4, 1000)),
+                ..Quota::default()
             })
         );
-        assert_eq!(storage_quota(r#""" (MESSAGE 4 1000)"#), None);
+        // RFC 9208: a limit on messages alone, and deleted mail's storage.
+        let messages_only = storage_quota(r#""" (MESSAGE 990 1000)"#).unwrap();
+        assert_eq!((messages_only.limit_kib, messages_only.messages), (0, Some((990, 1000))));
+        assert!(messages_only.share() > 0.98);
+        let deleted = storage_quota(r#""" (STORAGE 100 1000 DELETED-STORAGE 40 1000 MAILBOX 3 10)"#).unwrap();
+        assert_eq!(deleted.deleted_kib, Some((40, 1000)));
+        assert_eq!(storage_quota(r#""" (MAILBOX 3 10)"#), None);
+        // Saved quotas from before read as they were.
+        let old: Quota = serde_json::from_str(r#"{"used_kib":1,"limit_kib":2}"#).unwrap();
+        assert_eq!(old, Quota { used_kib: 1, limit_kib: 2, ..Quota::default() });
         // RFC 4314 rights, and RFC 2086's older letters.
         assert_eq!(lacks_rights("lrswipkxte", "kxte"), None);
         assert_eq!(lacks_rights("lrswi", "te"), Some('t'));

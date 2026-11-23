@@ -3260,7 +3260,7 @@ impl Backend {
                 // worth failing the account's settings over.
                 return Ok(c.total_size_kib().ok().flatten().map(|used_kib| Quota {
                     used_kib,
-                    limit_kib: 0,
+                    ..Quota::default()
                 }));
             }
             // The standard folders' own roots too, where they differ from

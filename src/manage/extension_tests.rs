@@ -211,7 +211,8 @@ fn capable_server_extensions_are_used() -> Result<()> {
         b.quota(&a)?,
         Some(Quota {
             used_kib: 900,
-            limit_kib: 1000
+            limit_kib: 1000,
+            ..Quota::default()
         })
     );
     b.disconnect(&a.id);
