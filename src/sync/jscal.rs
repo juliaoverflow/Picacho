@@ -789,20 +789,60 @@ pub fn event_changes(
     Ok(Some((events, gone, changed.state)))
 }
 
+/// Who tells an event's participants about a change (JMAP for Calendars:
+/// `sendSchedulingMessages`, and each participant's `scheduleAgent`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scheduling {
+    /// Picacho emails invitations itself (iMIP): the server sends nothing,
+    /// and participants are `scheduleAgent: client`.
+    #[default]
+    ByPicacho,
+    /// The server sends them, for an event organized here: participants
+    /// are `scheduleAgent: server` and the change is sent with
+    /// `sendSchedulingMessages: true`.
+    ByServer,
+}
+impl Scheduling {
+    fn agent(self) -> &'static str {
+        match self {
+            Scheduling::ByPicacho => "client",
+            Scheduling::ByServer => "server",
+        }
+    }
+    fn sends(self) -> bool {
+        self == Scheduling::ByServer
+    }
+}
+
+/// Whether the server can send invitations as this sign-in: it names at
+/// least one participant identity (JMAP for Calendars: the addresses it
+/// schedules as). Without one, there is no one it would send them from.
+pub fn server_can_schedule(s: &Session) -> Result<bool> {
+    Ok(!participant_identities(s)?.is_empty())
+}
+
 /// Creates or changes an event in `calendar`; returns its id. With
 /// `in_state` (its version when read), only if the event is still as it
 /// was read: a change made elsewhere meanwhile is reported (`Conflict`)
-/// rather than overwritten.
-pub fn save_event_in(
+/// rather than overwritten. `scheduling` says who tells the participants.
+pub fn save_event_scheduled(
     s: &Session,
     id: Option<&str>,
     calendar: &str,
     event: &ical::Event,
     overrides: &[ical::Event],
     in_state: Option<&str>,
+    scheduling: Scheduling,
 ) -> Result<String> {
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
     let mut props = to_jscalendar(event, overrides);
+    if scheduling != Scheduling::ByPicacho
+        && let Some(Value::Object(people)) = props.get_mut("participants")
+    {
+        for p in people.values_mut() {
+            p["scheduleAgent"] = json!(scheduling.agent());
+        }
+    }
     props.insert("calendarIds".into(), json!({ calendar: true }));
     // An edit keeps what Picacho doesn't model in the server's copy: the
     // other properties of each location and participant (their links,
@@ -820,9 +860,9 @@ pub fn save_event_in(
     let args = match id {
         Some(id) => {
             // Moving to another calendar replaces the set.
-            json!({ "accountId": account, "update": { id: props }, "sendSchedulingMessages": false })
+            json!({ "accountId": account, "update": { id: props }, "sendSchedulingMessages": scheduling.sends() })
         }
-        None => json!({ "accountId": account, "create": { "e": props }, "sendSchedulingMessages": false }),
+        None => json!({ "accountId": account, "create": { "e": props }, "sendSchedulingMessages": scheduling.sends() }),
     };
     // Only over the version it was read in (`in_state`: the event's
     // version, `event_version`): one changed elsewhere meanwhile isn't
@@ -1018,11 +1058,13 @@ fn merge_entries(props: &mut Map<String, Value>, current: &Value, key: &str, our
 }
 
 /// Removes an event.
-pub fn delete_event(s: &Session, id: &str) -> Result<()> {
+/// `Scheduling::ByServer` has the server tell the participants it is
+/// cancelled.
+pub fn delete_event_scheduled(s: &Session, id: &str, scheduling: Scheduling) -> Result<()> {
     let account = s.calendars_account().context("This JMAP server has no calendars.")?;
     let v = s.call_one(
         "CalendarEvent/set",
-        json!({ "accountId": account, "destroy": [id], "sendSchedulingMessages": false }),
+        json!({ "accountId": account, "destroy": [id], "sendSchedulingMessages": scheduling.sends() }),
     )?;
     if let Some(e) = v["notDestroyed"].get(id)
         && e["type"] != "notFound"

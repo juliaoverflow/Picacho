@@ -85,6 +85,11 @@ struct Server {
     boxes: Option<Vec<Value>>,
     /// Identities added after `id1`; the Identity state is `i<count>`.
     extra_identities: Vec<Value>,
+    /// ParticipantIdentity/get names one address (else unknownMethod).
+    participant_identities: bool,
+    /// Each CalendarEvent/set: (sendSchedulingMessages, the participants'
+    /// scheduleAgents).
+    scheduling: Vec<(bool, Vec<String>)>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -560,8 +565,20 @@ impl Server {
                 self.dav_state += 1;
                 self.method(name, &plain, earlier)
             }
+            "ParticipantIdentity/get" if self.participant_identities => vec![(
+                name.into(),
+                json!({ "list": [{ "id": "pi1", "name": "QA", "sendTo": { "imip": "mailto:qa@example.com" } }] }),
+            )],
             "CalendarEvent/set" => {
-                assert_eq!(args["sendSchedulingMessages"], false, "Picacho invites by mail");
+                // Who tells the participants: each /set's sendSchedulingMessages
+                // and the participants' scheduleAgent, in order.
+                let agents: Vec<String> = ["create", "update"]
+                    .iter()
+                    .flat_map(|k| args[*k].as_object().into_iter().flatten())
+                    .flat_map(|(_, e)| e["participants"].as_object().into_iter().flatten())
+                    .filter_map(|(_, p)| p["scheduleAgent"].as_str().map(str::to_owned))
+                    .collect();
+                self.scheduling.push((args["sendSchedulingMessages"] == true, agents));
                 let mut out = json!({});
                 if let Some(create) = args["create"].as_object() {
                     for (key, props) in create {
@@ -1827,6 +1844,8 @@ fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
         let made = s.events.iter().find(|e| e["title"] == "Lunch").unwrap();
         assert_eq!(made["calendarIds"]["c1"], true);
         assert_eq!(made["participants"]["p0"]["scheduleAgent"], "client");
+        // Picacho invites by mail: the server is told to send nothing.
+        assert!(s.scheduling.iter().all(|(sends, _)| !sends), "{:?}", s.scheduling);
     }
     b.delete_event(&saved.event.uid)?;
     assert!(!server.lock().unwrap().events.iter().any(|e| e["title"] == "Lunch"));
@@ -2343,5 +2362,77 @@ fn jmap_identities_read_their_defaults_and_changes() -> Result<()> {
     let before = server.lock().unwrap().calls.len();
     assert_eq!(b.jmap_identities(&a)?.len(), 2);
     assert_eq!(server.lock().unwrap().calls[before..], ["Identity/changes"]);
+    Ok(())
+}
+
+/// Server scheduling for JMAP calendars is opt-in. Off (the default), the
+/// server is told to send nothing and Picacho emails the guests, as before.
+/// On, the server sends for events organized here and Picacho emails
+/// nothing; never both for one change. Invitations from others are still
+/// answered by mail, the server sending nothing.
+#[test]
+fn jmap_calendar_scheduling_uses_one_channel() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        modern: true,
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    let lunch = |uid: &str, organizer: &str| {
+        let mut e = crate::sync::ical::Event {
+            uid: uid.into(),
+            summary: "Lunch".into(),
+            start: 4_100_000_000,
+            end: 4_100_003_600,
+            utc: true,
+            ..Default::default()
+        };
+        e.organizer = Some(crate::sync::ical::Attendee { email: organizer.into(), ..Default::default() });
+        e.attendees.push(crate::sync::ical::Attendee { email: "bo@example.se".into(), ..Default::default() });
+        e
+    };
+    let mails = |server: &Arc<Mutex<Server>>| server.lock().unwrap().sent.len();
+    let last = |server: &Arc<Mutex<Server>>| server.lock().unwrap().scheduling.last().cloned().unwrap();
+
+    // Off: byte-for-byte as before. The server sends nothing, participants
+    // are client-scheduled, and Picacho emails the guest.
+    b.save_event(lunch("off@x", "qa@example.com"), None)?;
+    assert_eq!(last(&server), (false, vec!["client".to_owned(), "client".to_owned()]));
+    let before = mails(&server);
+    assert_eq!(b.send_invitations(&a, "off@x")?, 1);
+    assert_eq!(mails(&server), before + 1, "invited by mail");
+    b.delete_event("off@x")?;
+    assert_eq!(last(&server).0, false);
+
+    // A server that doesn't name the addresses it sends as: refused.
+    let error = format!("{:#}", b.set_server_scheduling(true).unwrap_err());
+    assert!(error.contains("keeps emailing"), "{error}");
+    server.lock().unwrap().participant_identities = true;
+    b.set_server_scheduling(true)?;
+
+    // On, organized here: the server sends; Picacho emails nothing.
+    let before = mails(&server);
+    b.save_event(lunch("on@x", "qa@example.com"), None)?;
+    assert_eq!(last(&server), (true, vec!["server".to_owned(), "server".to_owned()]));
+    assert_eq!(b.send_invitations(&a, "on@x")?, 1);
+    // Changed: the server again.
+    let mut changed = b.calendar_events().into_iter().find(|s| s.event.uid == "on@x").unwrap().event;
+    changed.summary = "Long lunch".into();
+    b.save_event(changed, None)?;
+    assert_eq!(last(&server).0, true);
+    // Cancelled: the server tells them.
+    assert_eq!(b.cancel_invitations(&a, "on@x")?, 1);
+    b.delete_event("on@x")?;
+    assert_eq!(last(&server).0, true);
+    assert_eq!(mails(&server), before, "no mail while the server schedules");
+
+    // Someone else's event (an invitation answered here): the server
+    // sends nothing for it; the answer goes by mail.
+    b.save_event(lunch("theirs@x", "ana@example.org"), None)?;
+    assert_eq!(last(&server), (false, vec!["client".to_owned(), "client".to_owned()]));
     Ok(())
 }
