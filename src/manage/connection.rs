@@ -450,11 +450,24 @@ impl Connection {
         }
         Ok(())
     }
+    /// Refuses, before sending anything, to change the selected mailbox
+    /// where the server opened it read-only (`[READ-ONLY]` on SELECT, RFC
+    /// 9051 §6.3.2 and §7.1): STORE, MOVE and EXPUNGE would be refused.
+    pub(super) fn require_writable(&self, what: &str) -> Result<()> {
+        if let Some(s) = self.selected.as_ref().filter(|s| s.read_only) {
+            bail!(
+                "“{}” can only be read on the server, so Picacho can't {what} there. Another mail app or the server's settings may be holding it.",
+                crate::sync::transport::decode_name(&s.name)
+            );
+        }
+        Ok(())
+    }
     /// Whether `erase` can remove just `uids` from the selected mailbox: with
     /// UIDPLUS always; without, only if no other message there is already
     /// marked deleted (EXPUNGE would take those too). Checked before any
     /// change, so a refusal changes nothing.
     pub(super) fn can_erase(&mut self, uids: &[u32]) -> Result<()> {
+        self.require_writable("remove messages")?;
         if self.extensions()?.uidplus {
             return Ok(());
         }
@@ -488,8 +501,16 @@ impl Connection {
     pub(super) fn select(&mut self, name: &str) -> Result<Selected> {
         let condstore = self.extensions()?.condstore;
         self.selected = None;
-        let selected =
-            crate::sync::transport::select(&mut self.session, name, condstore, self.enabled.utf8)?;
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result =
+            crate::sync::transport::select(&mut self.session, name, condstore, self.enabled.utf8);
+        let heard = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        let mut selected = result?;
+        // RFC 9051 §6.3.2: `[READ-ONLY]` comes in the tagged OK, which the
+        // imap crate reads and drops.
+        selected.read_only |= crate::sync::transport::opened_read_only(&heard);
         self.alerts.extend(selected.alerts.iter().cloned());
         self.selected = Some(selected.clone());
         Ok(selected)
@@ -503,13 +524,19 @@ impl Connection {
         modseq: u64,
     ) -> Result<(Selected, Option<crate::sync::transport::Resync>)> {
         self.selected = None;
-        let (selected, resync) = crate::sync::transport::select_qresync(
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result = crate::sync::transport::select_qresync(
             &mut self.session,
             name,
             self.enabled.utf8,
             validity,
             modseq,
-        )?;
+        );
+        let heard = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        let (mut selected, resync) = result?;
+        selected.read_only |= crate::sync::transport::opened_read_only(&heard);
         self.alerts.extend(selected.alerts.iter().cloned());
         self.selected = Some(selected.clone());
         Ok((selected, resync))

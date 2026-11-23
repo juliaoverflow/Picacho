@@ -3380,6 +3380,11 @@ impl Backend {
         }
         for (first, uids) in groups {
             let selected = c.select_for(first)?;
+            c.require_writable(match &change {
+                Change::Move(_) | Change::MoveTo(_) => "move messages out",
+                Change::Label(..) => "change labels",
+                _ => "change messages",
+            })?;
             if target.is_some() {
                 c.require_rights(&first.remote_folder, "te", "remove messages")?;
             }
@@ -3603,6 +3608,7 @@ impl Backend {
             self.with_imap(a, |c| {
                 let remote = remote_name(c.names(false)?, a, mailbox)?;
                 c.selected(&remote)?;
+                c.require_writable("mark messages read")?;
                 let unseen: Vec<u32> = c.uid_search("UNSEEN")?.into_iter().collect();
                 if !unseen.is_empty() {
                     c.session

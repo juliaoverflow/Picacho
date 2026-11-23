@@ -1737,6 +1737,19 @@ pub(crate) fn selected_from(data: &[u8], name: &str, condstore: bool) -> Result<
     Ok(selected)
 }
 
+/// Whether a SELECT's tagged reply, in `heard` (all the server sent for
+/// it), says the mailbox was opened read-only (RFC 9051 §6.3.2:
+/// `tag OK [READ-ONLY]`). The last line is the tagged one.
+pub(crate) fn opened_read_only(heard: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(heard);
+    text.lines().rev().find(|l| !l.trim().is_empty()).is_some_and(|tagged| {
+        !tagged.starts_with("* ")
+            && tagged
+                .split_once(' ')
+                .is_some_and(|(_, rest)| rest.to_ascii_uppercase().starts_with("OK [READ-ONLY]"))
+    })
+}
+
 /// One message from a UID FETCH, with only the attributes that were asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Row {
@@ -2225,6 +2238,13 @@ mod extension_tests {
         assert!(keyword("$MDNSent").is_err());
         assert_eq!(gmail_label("Caf&AOk-").unwrap(), "\"Caf&AOk-\"");
         assert!(gmail_label("\\Starred").is_err());
+    }
+    #[test]
+    fn read_only_selects_are_recognized() {
+        assert!(opened_read_only(b"* 1 EXISTS\r\na3 OK [READ-ONLY] EXAMINE done\r\n"));
+        assert!(opened_read_only(b"a3 ok [read-only] done\r\n"));
+        assert!(!opened_read_only(b"* OK [READ-ONLY] old\r\na3 OK [READ-WRITE] done\r\n"));
+        assert!(!opened_read_only(b""));
     }
     #[test]
     fn uid_ranges_are_compact() {

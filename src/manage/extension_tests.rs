@@ -2102,3 +2102,71 @@ fn eight_bit_search_text_goes_as_a_synchronizing_literal() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 9051 §6.3.2: a mailbox the server opens `[READ-ONLY]` isn't
+/// changed. Marking, moving and deleting are refused with a plain reason
+/// before any STORE, MOVE or EXPUNGE is sent; reading still works.
+#[test]
+fn read_only_mailboxes_are_not_changed() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        // A refused change drops its connection: each of the four signs in.
+        'connections: for _ in 0..4 {
+            let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+                break;
+            };
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 UIDPLUS MOVE\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Shared\r\n* LIST (\\Trash) \"/\" Trash\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                    p.send(&format!("{tag} OK [READ-ONLY] opened for reading\r\n"));
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else if !upper.starts_with("LOGIN") {
+                    seen.push(command);
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let m = Mail {
+        id: format!("{}:Shared:42:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Other,
+        remote_folder: "Shared".into(),
+        uid: 7,
+        ..Mail::default()
+    };
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    for change in [Change::Read(true), Change::Star(true), Change::Move(Folder::Trash)] {
+        let refused = b.change(&a, &m, change).unwrap_err();
+        assert!(format!("{refused:#}").contains("can only be read"), "{refused:#}");
+    }
+    let refused = b.delete_forever(&a, std::slice::from_ref(&m)).unwrap_err();
+    assert!(format!("{refused:#}").contains("can only be read"), "{refused:#}");
+    assert!(b.store.message(&m.id)?.is_some());
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(
+        !seen.iter().any(|c| {
+            let c = c.to_ascii_uppercase();
+            c.contains("STORE") || c.contains("MOVE") || c.contains("EXPUNGE") || c.contains("COPY")
+        }),
+        "{seen:?}"
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
