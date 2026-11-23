@@ -268,9 +268,20 @@ pub struct Client {
     http: reqwest::blocking::Client,
     user: String,
     password: String,
+    /// How `password` signs requests.
+    scheme: Scheme,
     /// The server's Digest challenge (RFC 7616), once it has asked for
     /// Digest rather than Basic, and how many requests it has signed.
     digest: std::sync::Mutex<Option<(Digest, u32)>>,
+}
+
+/// What a `Client`'s secret is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scheme {
+    /// A password: Basic (RFC 7617), or Digest when asked (RFC 7616).
+    Password,
+    /// An OAuth access token (RFC 6750 Bearer).
+    Bearer,
 }
 
 /// A WWW-Authenticate Digest challenge (RFC 7616 §3.3).
@@ -530,12 +541,23 @@ impl Client {
                 .build()?,
             user: user.to_owned(),
             password: password.to_owned(),
+            scheme: Scheme::Password,
             digest: Default::default(),
         })
+    }
+    // Backend-only until the UI calls it: no CalDAV/CardDAV sign-in yields
+    // an access token yet (needs calendar/contacts OAuth scopes).
+    #[allow(dead_code)]
+    /// A client signing in with an OAuth access token (RFC 6750 §2.1).
+    pub fn with_token(user: &str, token: &str, tls: native_tls::TlsConnector) -> Result<Self> {
+        Ok(Self { scheme: Scheme::Bearer, ..Self::new(user, token, tls)? })
     }
     /// `request` signed: Digest once the server asked for it (RFC 7616);
     /// else Basic (RFC 7617).
     fn signed(&self, request: reqwest::blocking::RequestBuilder, method: &str, url: &url::Url) -> reqwest::blocking::RequestBuilder {
+        if self.scheme == Scheme::Bearer {
+            return request.bearer_auth(&self.password);
+        }
         let mut digest = self.digest.lock().unwrap_or_else(|e| e.into_inner());
         match digest.as_mut() {
             Some((challenge, count)) => {
@@ -557,6 +579,9 @@ impl Client {
     /// tried yet (a first one, or a stale nonce, RFC 7616 §3.3), which is
     /// then used. False where trying again wouldn't help.
     fn take_challenge(&self, response: &reqwest::blocking::Response) -> bool {
+        if self.scheme == Scheme::Bearer {
+            return false;
+        }
         let Some(challenge) = Digest::choose(
             response
                 .headers()
@@ -1723,7 +1748,7 @@ pub fn test_server(
                 }
                 // "ana:secret", base64; or a Digest answer, which the test
                 // checks itself (it's passed on with the body).
-                auth |= line.contains("Basic YW5hOnNlY3JldA==");
+                auth |= line.contains("Basic YW5hOnNlY3JldA==") || line.contains("Bearer secret");
                 if line.to_ascii_lowercase().starts_with("authorization: digest ") {
                     auth = true;
                     conditions.push_str(&line);
@@ -1911,6 +1936,12 @@ mod tests {
         let err = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?.quota(&url).unwrap_err();
         assert!(err.to_string().contains("user name and password"), "{err}");
         assert_eq!(server.join().unwrap().len(), 2);
+        // A token goes as Bearer (RFC 6750 §2.1), and a Digest challenge
+        // doesn't make it go as a password.
+        let (port, server) = test_server(1, |_, _, _| ("401 Unauthorized", "Digest realm=\"dav\", nonce=\"abc\"".into()));
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))?;
+        assert!(Client::with_token("ana", "secret", native_tls::TlsConnector::new()?)?.quota(&url).is_err());
+        assert_eq!(server.join().unwrap().len(), 1);
         Ok(())
     }
 
