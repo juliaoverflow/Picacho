@@ -715,10 +715,29 @@ impl Browser {
     /// As `new`, listening on `port` where it is free (the one a kept
     /// registration was made for), else on any.
     fn on_port(host: &str, path: &str, port: Option<u16>) -> Result<Self> {
-        let listener = match port.and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok()) {
-            Some(listener) => listener,
-            None => TcpListener::bind("127.0.0.1:0")?,
+        let v4 = match port.and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok()) {
+            Some(listener) => Ok(listener),
+            None => TcpListener::bind("127.0.0.1:0"),
         };
+        match v4 {
+            Ok(listener) => Self::listening(listener, host, path),
+            // RFC 8252 §7.3: `[::1]` is as much a loopback redirect as
+            // 127.0.0.1, for a system without IPv4 loopback. Microsoft's
+            // `localhost` resolves to either, so it is kept as it is.
+            Err(v4) => {
+                let listener = TcpListener::bind("[::1]:0").map_err(|_| v4)?;
+                let host = if host == "localhost" { host } else { "[::1]" };
+                Self::listening(listener, host, path)
+            }
+        }
+    }
+    /// The IPv6 loopback callback (`http://[::1]:port/path`), for tests and
+    /// for systems that only have IPv6 loopback.
+    #[cfg(test)]
+    fn on_ipv6(path: &str) -> Result<Self> {
+        Self::listening(TcpListener::bind("[::1]:0")?, "[::1]", path)
+    }
+    fn listening(listener: TcpListener, host: &str, path: &str) -> Result<Self> {
         listener.set_nonblocking(true)?;
         let redirect = format!("http://{host}:{}{path}", listener.local_addr()?.port());
         Ok(Self::with(Some(listener), redirect))
@@ -2276,6 +2295,22 @@ mod tests {
             browser.wait(&AtomicBool::new(true)).is_err(),
             "cancel stops waiting"
         );
+    }
+    /// RFC 8252 §7.3: the IPv6 loopback address is a callback too.
+    #[test]
+    fn ipv6_loopback_callback_answers() {
+        // A system without IPv6 loopback can't run this.
+        let Ok(browser) = Browser::on_ipv6("/callback") else { return };
+        assert!(browser.redirect.starts_with("http://[::1]:"), "{}", browser.redirect);
+        let port = browser.listener.as_ref().unwrap().local_addr().unwrap().port();
+        let state = browser.state.clone();
+        let visit = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(("::1", port)).unwrap();
+            write!(s, "GET /callback?state={state}&code=v6 HTTP/1.1\r\nHost: [::1]\r\n\r\n").unwrap();
+            let _ = s.read(&mut [0; 512]);
+        });
+        assert_eq!(browser.wait(&AtomicBool::new(false)).unwrap(), "v6");
+        visit.join().unwrap();
     }
     #[test]
     fn pinal_accounts_use_tokens_on_pinal_servers() {
