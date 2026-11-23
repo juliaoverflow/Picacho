@@ -191,6 +191,40 @@ fn has_header_protection(head: &str) -> bool {
         || ct.params.get("protected-headers").is_some_and(|v| v.eq_ignore_ascii_case("v1"))
 }
 
+/// RFC 9788 §4.1: whether `payload` (the root of a Cryptographic
+/// Payload) has an hp parameter ("clear" or "cipher") on its Content-Type.
+pub(super) fn has_hp_parameter(payload: &[u8]) -> bool {
+    let text = latin1(payload);
+    let (head, _) = head_of(&text);
+    let Some(field) = fields(head).into_iter().find(|f| f.name == "content-type") else {
+        return false;
+    };
+    let value = field.lines.split_once(':').map_or("", |(_, v)| v);
+    let ct = mailparse::parse_content_type(&value.replace("\r\n", ""));
+    ct.params
+        .get("hp")
+        .is_some_and(|v| v.eq_ignore_ascii_case("clear") || v.eq_ignore_ascii_case("cipher"))
+}
+
+/// RFC 9788 §5.2.1 step 2 and RFC 9787 §1.1.2: the User-Facing fields of
+/// `outer` that `compose` obscures or takes off the outside, (name,
+/// decoded value), for a Legacy Display Element. Only an encrypted
+/// message with its subject hidden has any.
+pub(super) fn legacy_display_fields(outer: &[u8], encrypted: bool, hide_subject: bool) -> Vec<(String, String)> {
+    let Ok((headers, _)) = mailparse::parse_headers(outer) else {
+        return Vec::new();
+    };
+    use mailparse::MailHeaderMap as _;
+    if !encrypted || !hide_subject || headers.get_first_value("Subject").is_none() {
+        return Vec::new();
+    }
+    // Of `HIDDEN` and the Subject, the User-Facing ones.
+    ["Subject", "Reply-To"]
+        .into_iter()
+        .filter_map(|name| headers.get_first_value(name).map(|v| (name.to_owned(), v)))
+        .collect()
+}
+
 /// The address of the first `name` field in `head`, if it has one.
 fn first_address(head: &str, name: &str) -> Option<String> {
     let field = fields(head).into_iter().find(|f| f.name == name)?;
@@ -414,7 +448,7 @@ mod tests {
         let (bos_own, bos_public) = rings("Bo <bo@example.se>");
         anas.public.extend(bos_public.public);
         bos.secret.extend(bos_own.secret);
-        let how = Protect { sign: true, encrypt: true, subject: false };
+        let how = Protect { sign: true, encrypt: true, ..Default::default() };
         let sent = protect(MESSAGE.as_bytes(), "ana@example.org", &["bo@example.se".into()], how, &anas).unwrap();
         let text = String::from_utf8_lossy(&sent);
         assert!(text.contains("\r\nSubject: Plans\r\n") && !text.contains("Meet at noon"), "{text}");
@@ -436,6 +470,54 @@ mod tests {
         let payload = String::from_utf8(opened.as_data_vec().unwrap()).unwrap();
         assert!(payload.contains("HP-Outer: Subject: Plans\r\n"), "{payload}");
         assert!(payload.contains("HP-Outer: From: Ana <ana@example.org>\r\n"), "{payload}");
+    }
+
+    /// RFC 9788 §5.2.1 step 2 and §4.5.3: with `legacy_display` and the
+    /// subject hidden, the decrypted text starts with the real Subject for
+    /// apps that don't know Header Protection; Picacho shows the text
+    /// without it. Off (the default), no element is added.
+    #[test]
+    fn legacy_display_elements_are_sent_on_request_and_never_shown() {
+        use super::super::{Protect, open, protect};
+        let (anas, _) = rings("Ana <ana@example.org>");
+        let how = Protect { encrypt: true, subject: true, legacy_display: true, ..Default::default() };
+        let sent = protect(MESSAGE.as_bytes(), "ana@example.org", &[], how, &anas).unwrap();
+        let (armored, _) = crate::manage::crypto::encrypted_part(&sent).unwrap();
+        let (message, _) = pgp::composed::Message::from_string(&armored).unwrap();
+        let key = &anas.secret_keys()[0];
+        let payload = message.decrypt(&pgp::types::Password::empty(), key).unwrap().as_data_vec().unwrap();
+        let parsed = mailparse::parse_mail(&payload).unwrap();
+        assert_eq!(parsed.ctype.params.get("hp-legacy-display").map(String::as_str), Some("1"));
+        assert_eq!(parsed.get_body().unwrap(), "Subject: Plans\r\n\r\nMeet at noon.");
+        let (readable, _) = open(&sent, &anas).unwrap();
+        let parsed = mailparse::parse_mail(&readable).unwrap();
+        assert_eq!(parsed.get_body().unwrap(), "Meet at noon.");
+        assert!(parsed.ctype.params.get("hp-legacy-display").is_none());
+        assert_eq!(values(&String::from_utf8_lossy(&readable), "Subject"), ["Plans"]);
+        // Off: the text is as written.
+        let how = Protect { encrypt: true, subject: true, ..Default::default() };
+        let sent = protect(MESSAGE.as_bytes(), "ana@example.org", &[], how, &anas).unwrap();
+        let (armored, _) = crate::manage::crypto::encrypted_part(&sent).unwrap();
+        let (message, _) = pgp::composed::Message::from_string(&armored).unwrap();
+        let payload = message.decrypt(&pgp::types::Password::empty(), key).unwrap().as_data_vec().unwrap();
+        assert!(!String::from_utf8_lossy(&payload).contains("hp-legacy-display"));
+    }
+
+    /// Brief Q5: a payload without an hp parameter is never stripped, even
+    /// with a part marked hp-legacy-display="1" (RFC 9788 §4.1: the
+    /// marker means something only with Header Protection).
+    #[test]
+    fn legacy_display_is_never_stripped_from_unprotected_payloads() {
+        let marked = b"Content-Type: text/plain; hp-legacy-display=\"1\"\r\n\r\nSubject: mine\r\n\r\nReal text\r\n";
+        assert!(!has_hp_parameter(marked));
+        assert_eq!(super::super::shown_payload(marked), marked);
+        let protected = b"Content-Type: text/plain; hp=\"cipher\"; hp-legacy-display=\"1\"\r\n\r\nSubject: mine\r\n\r\nReal text\r\n";
+        assert!(has_hp_parameter(protected));
+        let shown = super::super::shown_payload(protected);
+        assert_eq!(mailparse::parse_mail(&shown).unwrap().get_body().unwrap(), "Real text\r\n");
+        // The older draft's marker alone isn't an hp parameter.
+        let draft = b"Content-Type: text/plain; protected-headers=\"v1\"; hp-legacy-display=\"1\"\r\n\r\nSubject: mine\r\n\r\nReal text\r\n";
+        assert_eq!(super::super::shown_payload(draft), draft);
     }
 
     /// RFC 9788 §4 and §4.5: with Header Protection, the payload's fields

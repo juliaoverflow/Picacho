@@ -1653,6 +1653,7 @@ pub(crate) fn protected(message: &Message, d: &Draft, keys: &Keys) -> Result<Vec
             sign: d.sign,
             encrypt: d.encrypt,
             subject: d.encrypt_subject,
+            ..Default::default()
         },
         ring,
     )

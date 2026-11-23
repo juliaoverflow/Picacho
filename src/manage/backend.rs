@@ -4521,6 +4521,7 @@ impl Backend {
             sign: false,
             encrypt: true,
             subject: d.encrypt_subject,
+            ..Default::default()
         };
         Ok(Some(crate::manage::openpgp::protect(&raw, &me, &[], how, &ring)?))
     }

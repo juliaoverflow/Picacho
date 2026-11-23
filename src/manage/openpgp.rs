@@ -19,6 +19,7 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
+mod legacy_display;
 mod protected;
 
 /// The keychain entry holding the keyring.
@@ -736,7 +737,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             // RFC 9788 §4.5: the Cryptographic Payload is the signed part,
             // whose headers are the protected ones.
             return Some((
-                protected::readable(&outer_headers(&full), &content),
+                protected::readable(&outer_headers(&full), &shown_payload(&content)),
                 Verdict {
                     decrypted: true,
                     signature,
@@ -744,7 +745,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             ));
         }
         return Some((
-            protected::readable(&outer, &inner),
+            protected::readable(&outer, &shown_payload(&inner)),
             Verdict {
                 decrypted: true,
                 signature,
@@ -764,6 +765,18 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
         }
         // Not PGP/MIME: inline PGP, or PGP/MIME a list wrapped in a part.
         None => open_inline(raw, ring, from.as_deref()).or_else(|| open_nested(raw, ring)),
+    }
+}
+
+/// A decrypted Cryptographic Payload as it is shown. RFC 9788 §4.5.3:
+/// with Header Protection (an hp parameter on its root), the Legacy
+/// Display Elements of parts marked hp-legacy-display="1" are left out;
+/// a payload without one is never changed.
+fn shown_payload(payload: &[u8]) -> Vec<u8> {
+    if protected::has_hp_parameter(payload) {
+        legacy_display::without_elements(payload)
+    } else {
+        payload.to_vec()
     }
 }
 
@@ -893,6 +906,11 @@ pub struct Protect {
     /// the encryption (protected headers), and "..." outside.
     #[serde(default)]
     pub subject: bool,
+    /// With the subject hidden, repeat it (and Reply-To) at the top of the
+    /// text for apps that decrypt but don't read protected headers: a
+    /// Legacy Display Element (RFC 9788 §5.2.2). Off, with no setting.
+    #[serde(default)]
+    pub legacy_display: bool,
 }
 
 /// The message's body part (its Content-* headers and body, CRLF) and the
@@ -948,6 +966,12 @@ pub fn protect(
     // RFC 9788 §5.2.1: the inner headers on the Cryptographic Payload,
     // hp="cipher" when encrypted and hp="clear" when signed only. The
     // outside changes only when the subject is hidden.
+    let part = if how.legacy_display {
+        let fields = protected::legacy_display_fields(&outer, how.encrypt, how.subject);
+        legacy_display::with_elements(&part, &fields)
+    } else {
+        part
+    };
     let (part, outer) = protected::compose(&part, &outer, how.encrypt, how.subject);
     // Encrypted to several people: each one's key goes inside, so they can
     // write to the others encrypted too (Autocrypt-Gossip, Autocrypt 1.1
@@ -1429,6 +1453,7 @@ mod tests {
             sign: false,
             encrypt: true,
             subject: true,
+            ..Default::default()
         };
         let threaded = String::from_utf8_lossy(MESSAGE).replace(
             "Subject: Plans\r\n",
@@ -1469,6 +1494,7 @@ mod tests {
             sign: false,
             encrypt: true,
             subject: true,
+            ..Default::default()
         };
         let sent = protect(MULTI, "ana@example.org", &[], how, &ring).unwrap();
         let (readable, _) = open(&sent, &ring).unwrap();
