@@ -5631,7 +5631,7 @@ impl MailApp {
                     smtp_port: a.smtp_port,
                     smtp_tls: a.smtp_tls,
                     incoming_starttls: a.incoming_starttls,
-                    sso: None,
+                    ..Default::default()
                 },
                 w,
                 cx,
@@ -5670,6 +5670,12 @@ impl MailApp {
             .unwrap_or_default();
         Self::set(&self.form[SSO_ISSUER], issuer, w, cx);
         self.sso_scope = scope;
+        // The configuration's user name, unless one was typed already.
+        if let Some(username) = &settings.username
+            && Self::value(&self.form[LOGIN], cx).trim().is_empty()
+        {
+            Self::set(&self.form[LOGIN], username.clone(), w, cx);
+        }
     }
     fn discover(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.discovering {
@@ -5729,9 +5735,7 @@ impl MailApp {
                         incoming_port: 993,
                         smtp_host: format!("smtp.{domain}"),
                         smtp_port: 587,
-                        smtp_tls: None,
-                        incoming_starttls: false,
-                        sso: None,
+                        ..Default::default()
                     }
                 });
                 this.apply_settings(&settings, w, cx);
