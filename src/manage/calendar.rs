@@ -131,6 +131,20 @@ impl Backend {
             .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         self.store
             .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        // Who you are to the server (RFC 6638 §2.4.1), for telling your
+        // own events, and where it puts accepted invitations (§9.2), as
+        // the calendar new events go to unless one was chosen. Not every
+        // server schedules: not worth failing for.
+        if let Ok((addresses, default)) = caldav::scheduling_identity(&server, password, self.tls_connector()?) {
+            if !addresses.is_empty() {
+                self.store.set_preference(PARTICIPANTS, &serde_json::to_string(&addresses)?)?;
+            }
+            if let Some(href) = default.filter(|h| cals.iter().any(|c| &c.href == h))
+                && self.store.preference(DEFAULT).is_none_or(|d| d.is_empty())
+            {
+                self.store.set_preference(DEFAULT, &href)?;
+            }
+        }
         self.sync_calendar()
     }
     /// Lets the CalDAV server send invitations, updates and cancellations
@@ -224,11 +238,11 @@ impl Backend {
     fn calendar_save(&self, server: &caldav::Server, calendar: &str, stored: &Stored) -> Result<Stored> {
         let Some(a) = self.calendar_jmap(server)? else {
             let organized_here = self.organized_here(&stored.event);
-            let max_size = self
-                .calendars()
-                .iter()
-                .find(|c| c.href == calendar)
-                .map(|c| c.max_size);
+            let target = self.calendars().into_iter().find(|c| c.href == calendar);
+            if let Some(c) = &target {
+                caldav::check_limits(&c.limits, stored)?;
+            }
+            let max_size = target.map(|c| c.max_size);
             return caldav::save(
                 server,
                 &self.calendar_password()?,
@@ -300,6 +314,9 @@ impl Backend {
                 self.tls_connector()?,
                 name.trim(),
                 color,
+                // RFC 4791 §5.2.2: the calendar's floating times and
+                // time-range queries are in this computer's zone.
+                &crate::sync::dav::CollectionSetup { timezone: local_zone(), ..Default::default() },
             )?,
         };
         let mut cals = self.calendars();
@@ -602,15 +619,21 @@ impl Backend {
                 crate::sync::jscal::free_busy(s, attendees, from, to)
             });
         }
-        caldav::free_busy(
-            &server,
-            &self.calendar_password()?,
-            self.tls_connector()?,
-            organizer,
-            attendees,
-            from,
-            to,
-        )
+        let password = self.calendar_password()?;
+        // Your own busy time from your calendars (RFC 4791 §7.10
+        // free-busy-query), which every CalDAV server answers; the
+        // scheduling outbox (RFC 6638 §5) for everyone else's.
+        let (me, others): (Vec<String>, Vec<String>) =
+            attendees.iter().cloned().partition(|a| a.eq_ignore_ascii_case(organizer));
+        let mut out = Vec::new();
+        if !me.is_empty() {
+            let busy = caldav::own_free_busy(&server, &password, self.tls_connector()?, &self.calendars(), from, to)?;
+            out.push(ical::FreeBusy { attendee: organizer.to_owned(), busy });
+        }
+        if !others.is_empty() {
+            out.extend(caldav::free_busy(&server, &password, self.tls_connector()?, organizer, &others, from, to)?);
+        }
+        Ok(out)
     }
     /// Reads the calendars and their events again.
     pub fn sync_calendar(&self) -> Result<usize> {
@@ -786,7 +809,19 @@ impl Backend {
         let stored = self
             .stored_event(uid)
             .context("This event is no longer in your calendar. Read it again.")?;
-        caldav::attach(&server, &self.calendar_password()?, self.tls_connector()?, &stored, path)?;
+        caldav::attach(&server, &self.calendar_password()?, self.tls_connector()?, &stored, path, None, None)?;
+        self.sync_calendar()?;
+        Ok(())
+    }
+    /// Takes a file the calendar server keeps (its MANAGED-ID, RFC 8607
+    /// §3.6) off an event, then reads the calendar again.
+    pub fn remove_event_attachment(&self, uid: &str, managed_id: &str) -> Result<()> {
+        let server = self.calendar_server().context("No calendar server is set up.")?;
+        ensure!(self.calendar_jmap(&server)?.is_none(), "Attachments are kept on CalDAV calendars.");
+        let stored = self
+            .stored_event(uid)
+            .context("This event is no longer in your calendar. Read it again.")?;
+        caldav::remove_attachment(&server, &self.calendar_password()?, self.tls_connector()?, &stored, managed_id, None)?;
         self.sync_calendar()?;
         Ok(())
     }
@@ -829,12 +864,26 @@ impl Backend {
             }
         };
         let mut stored = existing.unwrap_or_default();
-        if stored.calendar != target {
-            // Moving it to another calendar: a new resource there.
-            stored.href.clear();
-            stored.etag.clear();
+        // Where it was, for taking it out of a calendar it moves from.
+        let before = stored.clone();
+        let moving = !stored.href.is_empty() && stored.calendar != target;
+        // The old copy is left to delete where the server didn't move it.
+        let mut left_behind = false;
+        if moving {
+            // RFC 4918 §9.9: moved on the server, keeping it whole, where
+            // both calendars are there (CalDAV; JMAP moves by saving).
+            match self.calendar_move(&server, &stored, &target) {
+                Ok(Some(moved)) => stored = moved,
+                // Else a new resource there, and the old one deleted.
+                _ => {
+                    stored.href.clear();
+                    stored.etag.clear();
+                    stored.schedule_tag.clear();
+                    left_behind = true;
+                }
+            }
         }
-        if !stored.href.is_empty() {
+        if !stored.href.is_empty() || moving {
             event.sequence = stored.event.sequence + 1;
             // Edited here: written from its fields.
             event.source.clear();
@@ -847,16 +896,24 @@ impl Backend {
                 event.exdates = stored.event.exdates.clone();
             }
         }
-        let old = stored.clone();
         stored.event = event;
         let saved = self.calendar_save(&server, &target, &stored)?;
-        if !old.href.is_empty() && old.calendar != target {
-            let _ = self.calendar_delete(&server, &old);
+        if left_behind {
+            let _ = self.calendar_delete(&server, &before);
         }
         events.retain(|s| s.event.uid != saved.event.uid);
         events.push(saved.clone());
         self.save_events(events)?;
         Ok(saved)
+    }
+    /// Moves an event's resource to the calendar `target` on the server
+    /// (MOVE, RFC 4918 §9.9), returning it there. `None` where it can't
+    /// be (JMAP), so it is saved anew instead.
+    fn calendar_move(&self, server: &caldav::Server, stored: &Stored, target: &str) -> Result<Option<Stored>> {
+        if self.calendar_jmap(server)?.is_some() || target.starts_with("jmap:") {
+            return Ok(None);
+        }
+        caldav::move_event(server, &self.calendar_password()?, self.tls_connector()?, stored, target).map(Some)
     }
     /// Every time an event happens between `from` and `to`: repeating
     /// events once for each repeat, changed and cancelled repeats as they
@@ -1029,24 +1086,32 @@ impl Backend {
         if self.calendar_server().is_none() {
             return Ok(None);
         }
-        let result = match status {
-            PartStat::Declined => self.delete_event(&event.uid),
+        Ok(self
+            .file_answer(&event, &me, status)
+            .err()
+            .map(|e| format!("The answer was sent, but the calendar wasn't changed: {e:#}")))
+    }
+    /// Puts your answer to an invitation in the calendar: declined, it goes
+    /// (only that occurrence, where the invitation is for one: RFC 5546
+    /// §3.2.3, a REPLY with a RECURRENCE-ID answers just it); otherwise it
+    /// is saved with your answer in it.
+    fn file_answer(&self, event: &Event, me: &str, status: PartStat) -> Result<()> {
+        match (status, event.recurrence_id) {
+            (PartStat::Declined, Some(at)) => self.cancel_occurrence(&event.uid, at),
+            (PartStat::Declined, None) => self.delete_event(&event.uid),
             _ => {
                 let mut kept = event.clone();
                 for at in &mut kept.attendees {
-                    if at.email.eq_ignore_ascii_case(&me) {
+                    if at.email.eq_ignore_ascii_case(me) {
                         at.status = Some(status);
                     }
                 }
                 // The event as it came is what's saved: the answer goes in
                 // it too, or it would be lost on the server.
-                with_partstat(&mut kept, &me, status);
+                with_partstat(&mut kept, me, status);
                 self.save_invited(kept)
             }
-        };
-        Ok(result
-            .err()
-            .map(|e| format!("The answer was sent, but the calendar wasn't changed: {e:#}")))
+        }
     }
     /// Saves an invitation's event as the organizer sent it.
     fn save_invited(&self, event: Event) -> Result<()> {
@@ -1066,7 +1131,15 @@ impl Backend {
         } else {
             stored.calendar.clone()
         };
-        stored.event = event;
+        match event.recurrence_id {
+            // One occurrence of a series already here (RFC 5545 §3.8.4.4):
+            // it becomes that occurrence's own, the series stays.
+            Some(at) if !stored.event.recurrence.is_empty() || !stored.event.rdates.is_empty() => {
+                stored.overrides.retain(|o| o.recurrence_id != Some(at));
+                stored.overrides.push(Event { source: String::new(), ..event });
+            }
+            _ => stored.event = event,
+        }
         let saved = self.calendar_save(&server, &target, &stored)?;
         events.retain(|s| s.event.uid != saved.event.uid);
         events.push(saved);
@@ -1519,6 +1592,36 @@ impl Backend {
             .find(|s| s.event.uid == uid)
             .context("This event is no longer in your calendar.")?;
         self.invite(a, &stored.event, &stored.overrides, false)
+    }
+    /// Sends an event's invitations again, though nothing changed: by mail,
+    /// or on a scheduling server by saving it with SCHEDULE-FORCE-SEND
+    /// (RFC 6638 §7.2), since a server sends only on a change that
+    /// matters. For guests whose invitation got lost (SCHEDULE-STATUS 3.x
+    /// or 5.x, `Attendee::delivery_failed`).
+    pub fn resend_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if !self.server_schedules() || self.calendar_jmap(&self.calendar_server().context("No calendar server is set up.")?)?.is_some() {
+            return self.send_invitations(a, uid);
+        }
+        let mut stored = self.stored_event(uid).context("This event is no longer in your calendar.")?;
+        ensure!(self.organized_here(&stored.event), "Only the organizer sends the invitations.");
+        for g in std::iter::once(&mut stored.event).chain(&mut stored.overrides).flat_map(|e| &mut e.attendees) {
+            g.force_send = "REQUEST".into();
+        }
+        let count = stored.event.attendees.len();
+        // Written from its fields, so the parameter is in what's sent.
+        stored.event.source.clear();
+        let server = self.calendar_server().context("No calendar server is set up.")?;
+        let calendar = stored.calendar.clone();
+        let mut saved = self.calendar_save(&server, &calendar, &stored)?;
+        // Once: a later save mustn't send them all again.
+        for g in std::iter::once(&mut saved.event).chain(&mut saved.overrides).flat_map(|e| &mut e.attendees) {
+            g.force_send.clear();
+        }
+        let mut events = self.calendar_events();
+        events.retain(|s| s.event.uid != saved.event.uid);
+        events.push(saved);
+        self.save_events(events)?;
+        Ok(count)
     }
     /// Tells an event's guests it's cancelled (before deleting it).
     pub fn cancel_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
@@ -2059,6 +2162,119 @@ mod tests {
         let mut back = ical::parse(&put).events;
         let series = back.remove(0);
         assert_eq!(ical::occurrences(&series, &back, 0, 2_000_000_000).len(), 4);
+        drop(server);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    /// An event moved to another calendar is moved on the server (MOVE,
+    /// RFC 4918 §9.9), then saved there; where the server can't, it is
+    /// saved there anew and the old copy deleted, not left behind.
+    #[test]
+    fn moving_an_event_between_calendars() -> Result<()> {
+        let (port, server) = crate::sync::dav::test_server(6, |method, path, _| match (method, path) {
+            ("PROPFIND", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/home/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response><d:response><d:href>/work/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("MOVE", "/home/a.ics") => ("201 Created", String::new()),
+            ("PUT", "/work/a.ics") => ("204 No Content", String::new()),
+            // This server can't move the second.
+            ("MOVE", "/home/b.ics") => ("403 Forbidden", String::new()),
+            ("PUT", "/work/b.ics") => ("201 Created", String::new()),
+            ("DELETE", "/home/b.ics") => ("204 No Content", String::new()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let path = std::env::temp_dir().join(format!("picacho-cal-{}", uuid::Uuid::new_v4()));
+        let mut b = Backend::new(Arc::new(Store::open(&path)?));
+        b.test_secret = Some(Secret { password: "secret".into(), ..Default::default() });
+        let base = format!("http://127.0.0.1:{port}");
+        b.store.set_preference(SERVER, &serde_json::to_string(&caldav::Server { url: base.clone(), user: "ana".into(), ..Default::default() })?)?;
+        let cals = caldav::calendars(&b.calendar_server().unwrap(), "secret", b.tls_connector()?)?;
+        b.store.set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        let at = |uid: &str| Stored {
+            event: Event { uid: uid.into(), summary: "Lunch".into(), start: 1_800_000_000, end: 1_800_003_600, ..Default::default() },
+            calendar: format!("{base}/home/"),
+            href: format!("{base}/home/{uid}.ics"),
+            etag: "\"1\"".into(),
+            ..Default::default()
+        };
+        b.save_events(vec![at("a"), at("b")])?;
+        let work = format!("{base}/work/");
+        let moved = b.save_event(at("a").event, Some(&work))?;
+        assert_eq!((moved.calendar.as_str(), moved.href.as_str()), (work.as_str(), format!("{work}a.ics").as_str()));
+        let saved = b.save_event(at("b").event, Some(&work))?;
+        assert_eq!(saved.href, format!("{work}b.ics"));
+        assert_eq!(b.calendar_events().len(), 2);
+        let seen: Vec<String> = server.join().unwrap().iter().skip(1).map(|(m, p, _)| format!("{m} {p}")).collect();
+        assert_eq!(seen, ["MOVE /home/a.ics", "PUT /work/a.ics", "MOVE /home/b.ics", "PUT /work/b.ics", "DELETE /home/b.ics"]);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    /// Declining one occurrence of an invitation takes only it out (RFC
+    /// 5546 §3.2.3); accepting one keeps it as that occurrence's own.
+    #[test]
+    fn declining_one_occurrence_keeps_the_series() -> Result<()> {
+        use std::sync::{Arc as A, Mutex as M};
+        let series = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly\r\nSUMMARY:Weekly\r\nDTSTART:20261102T090000Z\r\nDTEND:20261102T093000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nORGANIZER:mailto:ana@example.org\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:qa@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let kept: A<M<String>> = A::new(M::new(series.into()));
+        let store_side = kept.clone();
+        let (port, server) = crate::sync::dav::test_server(5, move |method, path, body| {
+            match (method, path) {
+            ("PROPFIND", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>".into()),
+            ("REPORT", _) => {
+                let data = store_side.lock().unwrap().replace('&', "&amp;").replace('<', "&lt;");
+                ("207 Multi-Status", format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/weekly.ics</d:href><d:propstat><d:prop><d:getetag>\"1\"</d:getetag><c:calendar-data>{data}</c:calendar-data></d:prop></d:propstat></d:response></d:multistatus>"))
+            }
+            ("PUT", "/cal/weekly.ics") => {
+                *store_side.lock().unwrap() = body.to_owned();
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", String::new()),
+        }
+        });
+        let path = std::env::temp_dir().join(format!("picacho-cal-{}", uuid::Uuid::new_v4()));
+        let mut b = Backend::new(Arc::new(Store::open(&path)?));
+        b.test_secret = Some(Secret { password: "secret".into(), ..Default::default() });
+        b.store.set_preference(
+            SERVER,
+            &serde_json::to_string(&caldav::Server {
+                url: format!("http://127.0.0.1:{port}"),
+                user: "ana".into(),
+                ..Default::default()
+            })?,
+        )?;
+        let cals = caldav::calendars(&b.calendar_server().unwrap(), "secret", b.tls_connector()?)?;
+        b.store.set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        let events = caldav::events(&b.calendar_server().unwrap(), "secret", b.tls_connector()?, &cals, 0, 2_000_000_000)?;
+        b.save_events(events)?;
+        let all = b.agenda(0, 2_000_000_000);
+        assert_eq!(all.len(), 4);
+        // An invitation to the second occurrence only, declined.
+        let second = all[1].recurrence_id.unwrap();
+        let one = |at: i64| Event {
+            recurrence: String::new(),
+            recurrence_id: Some(at),
+            start: at,
+            end: at + 1800,
+            source: String::new(),
+            ..all[0].clone()
+        };
+        b.file_answer(&one(second), "qa@example.com", PartStat::Declined)?;
+        let after = b.agenda(0, 2_000_000_000);
+        assert_eq!(after.len(), 3, "only that occurrence went");
+        assert!(after.iter().all(|e| e.start != second));
+        assert!(kept.lock().unwrap().contains("EXDATE:20261109T090000Z"), "{}", kept.lock().unwrap());
+        // The third accepted tentatively: its own, the series as it was.
+        let third = all[2].recurrence_id.unwrap();
+        b.file_answer(&one(third), "qa@example.com", PartStat::Tentative)?;
+        let stored = b.stored_event("weekly").unwrap();
+        assert_eq!(stored.event.recurrence, "FREQ=WEEKLY;COUNT=4");
+        assert_eq!(stored.overrides.len(), 1);
+        assert_eq!(stored.overrides[0].attendees[0].status, Some(PartStat::Tentative));
+        assert_eq!(b.agenda(0, 2_000_000_000).len(), 3);
+        let put = kept.lock().unwrap().clone();
+        assert!(put.contains("RECURRENCE-ID:20261116T090000Z"), "{put}");
         drop(server);
         drop(b);
         std::fs::remove_dir_all(path)?;

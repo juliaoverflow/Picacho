@@ -767,6 +767,9 @@ enum Action {
     /// Attaches a file to an event (its UID) where the calendar keeps
     /// attachments itself (RFC 8607).
     AttachToEvent(String),
+    /// Takes a file the calendar server keeps off an event: (UID,
+    /// MANAGED-ID), RFC 8607 §3.6.
+    RemoveEventAttachment(String, String),
     /// Adds the task in the form; marks a task (its UID) done.
     AddTask,
     CompleteTask(String),
@@ -781,6 +784,9 @@ enum Action {
     ServerScheduling(bool),
     /// Looks up when the event's guests are busy around its time.
     CheckFreeBusy,
+    /// Sends the edited event's invitations again (its uid), for guests
+    /// the server couldn't reach (RFC 6638 SCHEDULE-STATUS).
+    ResendInvitations(String),
     /// Messages a JMAP server holds to send later: lists them (account
     /// id), or takes one back: (account id, submission id).
     ListHeld(String),
@@ -798,6 +804,9 @@ enum Action {
     /// Lists the server's address books; renames one (its href) as in the
     /// form, deletes one, or makes it where new contacts go.
     ListAddressBooks,
+    /// Asks the contacts server for those matching the filter (RFC 6352
+    /// addressbook-query), for books it doesn't list whole.
+    SearchServerContacts,
     RenameAddressBook(String),
     DeleteAddressBook(String),
     RefreshAccount(String),
@@ -1701,6 +1710,8 @@ pub struct MailApp {
     /// The contacts server's address books, once listed: (href, name,
     /// writable).
     address_books: Option<Vec<(String, String, bool)>>,
+    /// The contacts server's storage (used, left), once asked (RFC 4331).
+    contacts_quota: Option<(u64, u64)>,
     /// The calendar server's storage (used, left), once asked.
     calendar_quota: Option<(u64, u64)>,
     contacts_error: Option<String>,
@@ -1716,6 +1727,12 @@ pub struct MailApp {
     /// (a group's, by name or address).
     contact_addresses: Entity<InputState>,
     contact_birthday: Entity<InputState>,
+    /// The contact's job title, nicknames, web and chat addresses, and
+    /// anniversary (RFC 6350 TITLE, NICKNAME, URL/IMPP, ANNIVERSARY).
+    contact_title: Entity<InputState>,
+    contact_nicknames: Entity<InputState>,
+    contact_links: Entity<InputState>,
+    contact_anniversary: Entity<InputState>,
     contact_members: Entity<InputState>,
     contact_filter: Entity<InputState>,
     /// Encryption settings: the passphrase of a key being imported.
@@ -2702,6 +2719,7 @@ impl MailApp {
             contacts_password,
             contacts_busy: false,
             address_books: None,
+            contacts_quota: None,
             calendar_quota: None,
             contacts_error: None,
             contact_editing: None,
@@ -2712,6 +2730,10 @@ impl MailApp {
             contact_note,
             contact_addresses: input("Street, city (one a line; optional)", false, window, cx),
             contact_birthday: input("1990-01-31, or --01-31 without a year (optional)", false, window, cx),
+            contact_title: input("Job title (optional)", false, window, cx),
+            contact_nicknames: input("Nicknames, separated by commas (optional)", false, window, cx),
+            contact_links: input("Web pages and chat (https://…, xmpp:…; optional)", false, window, cx),
+            contact_anniversary: input("2010-06-12, or --06-12 without a year (optional)", false, window, cx),
             contact_members: input("For a group: its people, by address (optional)", false, window, cx),
             contact_filter,
             key_passphrase,
@@ -6410,6 +6432,7 @@ impl MailApp {
             | Action::ConnectJmapContacts(_)
             | Action::CreateAddressBook
             | Action::ListAddressBooks
+            | Action::SearchServerContacts
             | Action::RenameAddressBook(_)
             | Action::DeleteAddressBook(_)) => self.contacts_action(action, w, cx),
             action @ (Action::LoadServerIdentities(_)
@@ -6459,6 +6482,7 @@ impl MailApp {
             | Action::RenameCalendar(_)
             | Action::DeleteCalendar(_)
             | Action::AttachToEvent(_)
+            | Action::RemoveEventAttachment(..)
             | Action::AddTask
             | Action::CompleteTask(_)
             | Action::EditTask(_)
@@ -6467,6 +6491,7 @@ impl MailApp {
             | Action::DeleteTask(_)
             | Action::ServerScheduling(_)
             | Action::CheckFreeBusy
+            | Action::ResendInvitations(_)
             | Action::ListHeld(_)
             | Action::CancelHeld(..)) => self.calendar_action(action, w, cx),
             Action::RefreshAccount(id) if fwd::is_view(&id) => {

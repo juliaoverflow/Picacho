@@ -1313,6 +1313,7 @@ fn jmap_away_reply_without_sieve() -> Result<()> {
         days: 7,
         from: Some("2026-12-01".into()),
         until: Some("2026-12-05".into()),
+        ..Default::default()
     };
     let saved = b.save_filters(&a, &filters)?;
     assert!(saved.active && saved.vacation_only);

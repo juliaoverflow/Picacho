@@ -45,6 +45,12 @@ pub struct Calendar {
     /// where it doesn't say.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_size: u64,
+    /// What else the calendar takes (RFC 4791 §5.2.4–§5.2.9).
+    #[serde(default, skip_serializing_if = "is_unlimited")]
+    pub limits: dav::CalendarLimits,
+}
+fn is_unlimited(l: &dav::CalendarLimits) -> bool {
+    *l == dav::CalendarLimits::default()
 }
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -83,6 +89,29 @@ pub fn schedules(server: &Server, password: &str, tls: native_tls::TlsConnector)
         .any(|class| class == "calendar-auto-schedule"))
 }
 
+/// Who the account is to the scheduling server (RFC 6638 §2.4.1
+/// `calendar-user-address-set`: its addresses, `mailto:` taken off) and
+/// where invitations it accepts go (§9.2 `schedule-default-calendar-URL`
+/// on the inbox). Either empty where the server doesn't say.
+pub fn scheduling_identity(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<(Vec<String>, Option<String>)> {
+    let c = client(server, password, tls)?;
+    let (_, principal) = c.principal(&dav::start_url(&server.url, "caldav")?)?;
+    let addresses = c
+        .hrefs(&principal, "calendar-user-address-set", dav::CALDAV)?
+        .into_iter()
+        .filter_map(|u| {
+            let u = u.trim();
+            let lower = u.to_ascii_lowercase();
+            lower.starts_with("mailto:").then(|| u[7..].to_owned())
+        })
+        .collect();
+    let default = match c.inbox(&server.url) {
+        Ok(inbox) => c.find_href(&inbox, "schedule-default-calendar-URL", dav::CALDAV)?.map(|u| u.to_string()),
+        Err(_) => None,
+    };
+    Ok((addresses, default))
+}
+
 /// The account's calendars.
 pub fn calendars(
     server: &Server,
@@ -99,9 +128,11 @@ pub fn calendars(
         dav::CALDAV,
     )?
     .into_iter()
-    // Calendars for tasks or notes only have no events to show or take.
+    // Calendars for tasks or notes only have no events to show or take,
+    // nor those that don't take iCalendar 2.0 (RFC 4791 §5.2.4).
     .filter(|c| {
-        c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT" || k == "VTODO")
+        (c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT" || k == "VTODO"))
+            && c.limits.takes_icalendar()
     })
     .map(|c| Calendar {
         href: c.href.to_string(),
@@ -115,6 +146,7 @@ pub fn calendars(
         read_until: 0,
         components: c.components,
         max_size: c.max_size,
+        limits: c.limits,
     })
     .collect())
 }
@@ -225,13 +257,111 @@ pub fn free_busy(
     let outbox = c.outbox(&server.url)?;
     let body = ical::free_busy_request(organizer, attendees, from, to);
     let text = c.post(&outbox, "text/calendar; charset=utf-8", body, &format!("mailto:{organizer}"), attendees)?;
-    // A schedule-response: each recipient's calendar-data.
-    let doc = roxmltree::Document::parse(&text).context("The server's answer couldn't be read.")?;
+    let answers = schedule_response(&text)?;
     let mut out = Vec::new();
-    for data in doc.descendants().filter(|n| n.tag_name().name() == "calendar-data") {
-        out.extend(ical::parse_free_busy(data.text().unwrap_or_default()));
+    let mut unknown = Vec::new();
+    for a in answers {
+        if a.delivered() {
+            out.extend(ical::parse_free_busy(&a.calendar_data));
+        } else {
+            unknown.push(a.recipient);
+        }
+    }
+    // Nobody answered: say why rather than show everyone free.
+    ensure!(
+        !out.is_empty() || unknown.is_empty(),
+        "The server couldn't say when {} {} free.",
+        unknown.join(", "),
+        if unknown.len() == 1 { "is" } else { "are" }
+    );
+    Ok(out)
+}
+
+/// One recipient's part of a scheduling answer (RFC 6638 §5.1.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScheduleAnswer {
+    /// Who, as an address (`mailto:` taken off).
+    pub recipient: String,
+    /// `request-status` (RFC 5545 §3.8.8.3): its code (`2.0`, `3.7`…) and
+    /// text.
+    pub code: String,
+    pub status: String,
+    /// What the server answered for them (a VFREEBUSY), where it did.
+    pub calendar_data: String,
+}
+impl ScheduleAnswer {
+    /// RFC 5545 §3.8.8.3: class 2 is success; 1 pending.
+    pub fn delivered(&self) -> bool {
+        self.code.starts_with('2') || self.code.starts_with('1')
+    }
+}
+
+/// A `schedule-response` (RFC 6638 §10.2): each `response`'s recipient,
+/// request-status and calendar-data.
+pub fn schedule_response(text: &str) -> Result<Vec<ScheduleAnswer>> {
+    let doc = roxmltree::Document::parse(text).context("The server's answer couldn't be read.")?;
+    let in_caldav = |n: &roxmltree::Node, name: &str| n.tag_name().name() == name && n.tag_name().namespace() == Some(dav::CALDAV);
+    let mut out = Vec::new();
+    for response in doc.descendants().filter(|n| in_caldav(n, "response")) {
+        let child = |name: &str| response.children().find(|c| in_caldav(c, name));
+        let recipient = child("recipient")
+            .and_then(|r| r.descendants().find(|h| h.tag_name().name() == "href" && h.tag_name().namespace() == Some(dav::DAV)))
+            .and_then(|h| h.text())
+            .unwrap_or_default()
+            .trim();
+        let recipient = recipient
+            .strip_prefix("mailto:")
+            .or_else(|| recipient.strip_prefix("MAILTO:"))
+            .unwrap_or(recipient)
+            .to_owned();
+        // "2.0;Success": the code, then its text.
+        let status = child("request-status").and_then(|s| s.text()).unwrap_or_default().trim();
+        let (code, words) = status.split_once(';').unwrap_or((status, ""));
+        out.push(ScheduleAnswer {
+            recipient,
+            code: code.trim().to_owned(),
+            status: words.trim().to_owned(),
+            calendar_data: child("calendar-data").and_then(|d| d.text()).unwrap_or_default().to_owned(),
+        });
     }
     Ok(out)
+}
+
+/// When the account is busy in `calendars` over `from`..`to`, by each
+/// calendar's free-busy-query REPORT (RFC 4791 §7.10): the server works
+/// out the busy time itself, repeats and all, and gives only the periods,
+/// not the events. Periods from every calendar, merged and in order.
+pub fn own_free_busy(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    calendars: &[Calendar],
+    from: i64,
+    to: i64,
+) -> Result<Vec<(i64, i64)>> {
+    ensure!(to > from, "The time asked about ends before it starts.");
+    let c = client(server, password, tls)?;
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:free-busy-query xmlns:c=\"{}\"><c:time-range start=\"{}\" end=\"{}\"/></c:free-busy-query>",
+        dav::CALDAV,
+        stamp(from),
+        stamp(to)
+    );
+    let mut busy = Vec::new();
+    for cal in calendars.iter().filter(|c| c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT")) {
+        // RFC 4791 §7.10: a 200 with a text/calendar VFREEBUSY.
+        let text = c.report_text(&url::Url::parse(&cal.href)?, &body)?;
+        busy.extend(ical::parse_free_busy(&text).into_iter().flat_map(|f| f.busy));
+    }
+    busy.sort();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in busy {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
 }
 
 /// A resource's events as kept: the series (or single event) and its
@@ -330,8 +460,12 @@ pub fn sync(
             ctag: cal.state.ctag.clone(),
             max_size: 0,
             vcard_versions: Vec::new(),
+            limits: cal.limits.clone(),
         };
-        let query = range_query(from, to + MARGIN);
+        // RFC 4791 §5.2.6–§5.2.7: a time range outside the calendar's
+        // dates is refused (min-date-time, max-date-time).
+        let (q_from, q_to) = cal.limits.clamp(from, to + MARGIN);
+        let query = range_query(q_from, q_to);
         let read = dav::read_collection(
             &c,
             &collection,
@@ -365,20 +499,22 @@ pub fn sync(
     Ok((cals, out))
 }
 
-/// Makes a calendar named `name` in the account's calendar home.
+/// Makes a calendar named `name` in the account's calendar home, with
+/// `setup`'s description and time zone (RFC 4791 §5.3.1).
 pub fn create_calendar(
     server: &Server,
     password: &str,
     tls: native_tls::TlsConnector,
     name: &str,
     color: &str,
+    setup: &dav::CollectionSetup,
 ) -> Result<Calendar> {
     let c = client(server, password, tls)?;
     let home = c.home(&server.url, "caldav", "calendar-home-set", dav::CALDAV)?;
     let href = dav::new_href(&home, &uuid::Uuid::new_v4().to_string(), "x")?;
     // A collection: the path without the extension, ending in '/'.
     let href = url::Url::parse(&format!("{}/", href.as_str().trim_end_matches(".x")))?;
-    c.make_collection(&href, true, name, color)?;
+    c.make_collection_with(&href, true, name, color, setup)?;
     Ok(Calendar {
         href: href.to_string(),
         name: name.to_owned(),
@@ -386,6 +522,39 @@ pub fn create_calendar(
         color: color.to_owned(),
         ..Default::default()
     })
+}
+
+/// Whether `stored` fits `limits` (RFC 4791 §5.2.6–§5.2.9), checked
+/// before it is sent: the server would refuse it with a precondition
+/// (`min-date-time`, `max-instances`, `max-attendees-per-instance`) that
+/// says less.
+pub fn check_limits(limits: &dav::CalendarLimits, stored: &Stored) -> Result<()> {
+    let events = std::iter::once(&stored.event).chain(&stored.overrides);
+    if let Some(most) = limits.max_attendees {
+        let guests = events.clone().map(|e| e.attendees.len()).max().unwrap_or(0) as u64;
+        ensure!(guests <= most, "This calendar takes at most {most} guests an event.");
+    }
+    for e in events.filter(|e| e.start != 0) {
+        let (from, to) = limits.clamp(e.start, e.end.max(e.start));
+        ensure!(
+            from == e.start && to == e.end.max(e.start),
+            "This calendar doesn't take events at that date."
+        );
+    }
+    if let Some(most) = limits.max_instances
+        && (!stored.event.recurrence.is_empty() || !stored.event.rdates.is_empty())
+    {
+        // Counted over the calendar's dates, or a century: a rule without
+        // an end is past any limit.
+        let to = limits.max_time.unwrap_or(stored.event.start + 100 * 366 * 86_400);
+        let count = ical::occurrences(&stored.event, &[], stored.event.start, to).len() as u64
+            + stored.event.exdates.len() as u64;
+        ensure!(
+            count <= most,
+            "This calendar takes at most {most} repeats of an event. Give the repeats an end."
+        );
+    }
+    Ok(())
 }
 
 /// Saves an event: new in `calendar`, or a change to the one at its href.
@@ -424,6 +593,8 @@ pub fn save(
     } else {
         ical::scheduled_by_client(&text)
     };
+    // RFC 6638 §3.2.3: SCHEDULE-STATUS is the server's.
+    let text = ical::without_schedule_status(&text);
     if let Some(max) = max_size.filter(|m| *m > 0)
         && text.len() as u64 > max
     {
@@ -507,14 +678,18 @@ pub fn remove_from_inbox(
 }
 
 /// Attaches a file to an event where the calendar keeps attachments itself
-/// (managed attachments, RFC 8607). Returns the event's new ETag; the
-/// server adds the ATTACH to it, so read the event again to show it.
+/// (managed attachments, RFC 8607), or replaces the one with MANAGED-ID
+/// `replacing`. `occurrence`: only that one of a repeating event (§3.4
+/// `rid`). Returns the event's new ETag; the server changes the ATTACH in
+/// it, so read the event again to show it.
 pub fn attach(
     server: &Server,
     password: &str,
     tls: native_tls::TlsConnector,
     stored: &Stored,
     path: &std::path::Path,
+    replacing: Option<&str>,
+    occurrence: Option<i64>,
 ) -> Result<String> {
     ensure!(!stored.href.is_empty(), "Save the event before attaching files.");
     let c = client(server, password, tls)?;
@@ -523,10 +698,23 @@ pub fn attach(
         c.manages_attachments(&calendar)?,
         "This calendar server can't keep attachments."
     );
+    // RFC 8607 §6: the server's limits, said before the file is sent.
+    let (most_size, most_count) = c.attachment_limits(&calendar).unwrap_or((None, None));
     // Servers refuse large files anyway; don't read a huge one into memory.
     const MOST: u64 = 100 * 1024 * 1024;
+    let most = most_size.map_or(MOST, |m| m.min(MOST));
     let size = std::fs::metadata(path)?.len();
-    ensure!(size <= MOST, "This file is too large to attach to an event (100 MB at most).");
+    ensure!(
+        size <= most,
+        "This file is too large to attach to this event ({} at most).",
+        if most >= 1 << 20 { format!("{} MB", most >> 20) } else { format!("{} KB", (most >> 10).max(1)) }
+    );
+    if let Some(n) = most_count.filter(|_| replacing.is_none()) {
+        ensure!(
+            (stored.event.attachments().iter().filter(|a| !a.managed_id.is_empty()).count() as u64) < n,
+            "This event has as many attachments as the server allows ({n})."
+        );
+    }
     let data = std::fs::read(path)?;
     let name = path
         .file_name()
@@ -534,7 +722,50 @@ pub fn attach(
         .unwrap_or("attachment")
         .to_owned();
     let kind = mime_guess::from_path(path).first_or_octet_stream().to_string();
-    c.add_attachment(&url::Url::parse(&stored.href)?, &stored.etag, &name, &kind, data)
+    let change = match replacing {
+        Some(managed_id) => dav::AttachmentChange::Update { managed_id, name: &name, content_type: &kind, data },
+        None => dav::AttachmentChange::Add { name: &name, content_type: &kind, data },
+    };
+    let rids = occurrence.map(|at| vec![rid(&stored.event, at)]).unwrap_or_default();
+    Ok(c.attachment(&url::Url::parse(&stored.href)?, &stored.etag, &change, &rids)?.etag)
+}
+
+/// Removes a managed attachment (RFC 8607 §3.6) from an event, or from
+/// only `occurrence` of a repeating one. Returns the event's new ETag.
+pub fn remove_attachment(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    stored: &Stored,
+    managed_id: &str,
+    occurrence: Option<i64>,
+) -> Result<String> {
+    ensure!(!managed_id.is_empty(), "This attachment isn't kept by the calendar server.");
+    let c = client(server, password, tls)?;
+    let rids = occurrence.map(|at| vec![rid(&stored.event, at)]).unwrap_or_default();
+    Ok(c.attachment(&url::Url::parse(&stored.href)?, &stored.etag, &dav::AttachmentChange::Remove { managed_id }, &rids)?.etag)
+}
+
+/// An occurrence's RECURRENCE-ID as RFC 8607 §3.4's `rid` writes it: UTC,
+/// or a date for all-day events.
+fn rid(series: &ical::Event, at: i64) -> String {
+    let t = chrono::DateTime::from_timestamp(at, 0).unwrap_or_default();
+    if series.all_day { t.format("%Y%m%d").to_string() } else { t.format("%Y%m%dT%H%M%SZ").to_string() }
+}
+
+/// Moves an event to the calendar `target` on the same server (MOVE, RFC
+/// 4918 §9.9; RFC 4791 §5.3.3 has the server check the target takes it).
+/// Returns it as kept there.
+pub fn move_event(server: &Server, password: &str, tls: native_tls::TlsConnector, stored: &Stored, target: &str) -> Result<Stored> {
+    let from = url::Url::parse(&stored.href)?;
+    let name = from.path_segments().and_then(|mut s| s.next_back()).filter(|n| !n.is_empty()).context("This event has no resource name.")?;
+    let mut to = url::Url::parse(target)?;
+    if !to.path().ends_with('/') {
+        to.set_path(&format!("{}/", to.path()));
+    }
+    let to = to.join(name)?;
+    let etag = client(server, password, tls)?.transfer(&from, &to, &stored.etag, false)?;
+    Ok(Stored { calendar: target.to_owned(), href: to.to_string(), etag, ..stored.clone() })
 }
 
 /// Removes an event.
@@ -608,6 +839,171 @@ mod tests {
         remove_from_inbox(&srv, "secret", tls(), &items[0])?;
         let seen = server.join().unwrap();
         assert_eq!(seen.iter().filter(|(m, ..)| m == "PUT").count(), 1);
+        Ok(())
+    }
+
+    /// RFC 8607: an attachment is added with its name (filename* where it
+    /// isn't ASCII), replaced and removed by its MANAGED-ID, for one
+    /// occurrence by `rid`; the server's limits are said before sending.
+    #[test]
+    fn managed_attachments() -> Result<()> {
+        assert_eq!(dav_disposition("plan.pdf"), "attachment;filename=\"plan.pdf\"");
+        assert_eq!(dav_disposition("Pläne 2026.pdf"), "attachment;filename=\"Pl_ne 2026.pdf\";filename*=UTF-8''Pl%C3%A4ne%202026.pdf");
+        let (port, server) = dav::test_server(8, |method, path, body| match (method, path) {
+            ("OPTIONS", _) => ("200 OK", String::new()),
+            ("PROPFIND", "/cal/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><c:max-attachment-size>20</c:max-attachment-size><c:max-attachments-per-resource>1</c:max-attachments-per-resource></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("POST", p) if p.starts_with("/cal/e.ics?action=attachment-update&managed-id=m1&rid=20261124T090000Z") => {
+                assert!(body.ends_with("small"), "{body}");
+                ("200 OK", String::new())
+            }
+            ("POST", "/cal/e.ics?action=attachment-remove&managed-id=m1") => ("204 No Content", String::new()),
+            _ => ("404 Not Found", format!("{method} {path}")),
+        });
+        let dir = std::env::temp_dir().join(format!("picacho-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let (small, big) = (dir.join("s.txt"), dir.join("b.txt"));
+        std::fs::write(&small, "small")?;
+        std::fs::write(&big, "x".repeat(100))?;
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let at = 1_795_510_800; // 2026-11-24T09:00Z
+        let stored = Stored {
+            event: ical::parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\nDTSTART:20261117T090000Z\r\nRRULE:FREQ=WEEKLY\r\nATTACH;MANAGED-ID=m1;FILENAME=agenda.txt;SIZE=12;FMTTYPE=text/plain:https://dav.example/att/m1\r\nATTACH:https://example.org/files/map.png\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").events.remove(0),
+            calendar: format!("http://127.0.0.1:{port}/cal/"),
+            href: format!("http://127.0.0.1:{port}/cal/e.ics"),
+            ..Default::default()
+        };
+        let files = stored.event.attachments();
+        assert_eq!(files.len(), 2);
+        assert_eq!((files[0].name.as_str(), files[0].size, files[0].managed_id.as_str()), ("agenda.txt", Some(12), "m1"));
+        assert_eq!((files[1].name.as_str(), files[1].managed_id.as_str()), ("map.png", ""));
+        // Too large for the server; one too many.
+        let err = attach(&srv, "secret", tls(), &stored, &big, Some("m1"), None).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let err = attach(&srv, "secret", tls(), &stored, &small, None, None).unwrap_err();
+        assert!(err.to_string().contains("as many attachments"), "{err}");
+        // Replaced for one occurrence; then removed.
+        attach(&srv, "secret", tls(), &stored, &small, Some("m1"), Some(at))?;
+        remove_attachment(&srv, "secret", tls(), &stored, "m1", None)?;
+        assert!(remove_attachment(&srv, "secret", tls(), &stored, "", None).is_err());
+        assert_eq!(server.join().unwrap().len(), 8);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    fn dav_disposition(name: &str) -> String {
+        dav::content_disposition(name)
+    }
+
+    /// RFC 6638 §5.1.2, §10.2: each recipient's request-status is read;
+    /// those the server couldn't ask are left out of the busy times, and
+    /// all of them failing is an error, not "everyone is free". The
+    /// calendar user's addresses (§2.4.1) and default calendar (§9.2)
+    /// are read from the principal and inbox.
+    #[test]
+    fn scheduling_answers_and_identity() -> Result<()> {
+        let answer = "<C:schedule-response xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:response><C:recipient><D:href>mailto:bo@example.se</D:href></C:recipient><C:request-status>2.0;Success</C:request-status><C:calendar-data>BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nBEGIN:VFREEBUSY\r\nATTENDEE:mailto:bo@example.se\r\nFREEBUSY:20261124T090000Z/PT1H\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n</C:calendar-data></C:response><C:response><C:recipient><D:href>mailto:cy@elsewhere.example</D:href></C:recipient><C:request-status>3.7;Invalid calendar user</C:request-status></C:response></C:schedule-response>";
+        let parsed = schedule_response(answer)?;
+        assert_eq!(parsed.len(), 2);
+        assert_eq!((parsed[1].recipient.as_str(), parsed[1].code.as_str(), parsed[1].status.as_str()), ("cy@elsewhere.example", "3.7", "Invalid calendar user"));
+        assert!(parsed[0].delivered() && !parsed[1].delivered());
+        let principal = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/ana/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal><c:calendar-user-address-set><d:href>mailto:ana@example.org</d:href><d:href>/p/ana/</d:href><d:href>MAILTO:a.lopez@example.org</d:href></c:calendar-user-address-set><c:schedule-outbox-URL><d:href>/out/</d:href></c:schedule-outbox-URL><c:schedule-inbox-URL><d:href>/in/</d:href></c:schedule-inbox-URL></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+        let only_cy = answer.replace("2.0;Success", "5.3;No scheduling support");
+        let (port, server) = dav::test_server(8, move |method, path, _| match (method, path) {
+            ("PROPFIND", "/in/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/in/</d:href><d:propstat><d:prop><c:schedule-default-calendar-URL><d:href>/cal/home/</d:href></c:schedule-default-calendar-URL></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", _) => ("207 Multi-Status", principal.into()),
+            ("POST", "/out/") => ("200 OK", only_cy.clone()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let srv = Server { url: format!("http://127.0.0.1:{port}/p/ana/"), user: "ana".into(), ..Default::default() };
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let (addresses, default) = scheduling_identity(&srv, "secret", tls())?;
+        assert_eq!(addresses, ["ana@example.org", "a.lopez@example.org"]);
+        assert_eq!(default, Some(format!("http://127.0.0.1:{port}/cal/home/")));
+        // Nobody could be asked: said so.
+        let err = free_busy(&srv, "secret", tls(), "ana@example.org", &["bo@example.se".into(), "cy@elsewhere.example".into()], 0, 3600).unwrap_err();
+        assert!(err.to_string().contains("bo@example.se, cy@elsewhere.example are"), "{err}");
+        // The identity: principal and address set, then the inbox's
+        // principal, its URL and the inbox; free-busy: the outbox's
+        // principal and URL, and the POST.
+        let seen: Vec<String> = server.join().unwrap().iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+        assert_eq!(seen.iter().filter(|r| *r == "POST /out/").count(), 1);
+        assert_eq!(seen.len(), 8);
+        Ok(())
+    }
+
+    /// RFC 4791 §5.2.4–§5.2.9: a calendar's limits are read with it, and
+    /// an event past them is refused before it is sent. MKCALENDAR sends
+    /// a description and time zone (§5.3.1) and reads what was refused.
+    #[test]
+    fn calendar_limits_and_new_calendars() -> Result<()> {
+        let (port, server) = dav::test_server(7, |method, path, body| match (method, path) {
+            ("PROPFIND", "/.well-known/caldav") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/.well-known/caldav</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/a/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-data><c:calendar-data content-type=\"text/calendar\" version=\"2.0\"/></c:supported-calendar-data><c:min-date-time>19000101T000000Z</c:min-date-time><c:max-date-time>20491231T235959Z</c:max-date-time><c:max-instances>100</c:max-instances><c:max-attendees-per-instance>2</c:max-attendees-per-instance></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/cal/json/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-data><c:calendar-data content-type=\"application/calendar+json\"/></c:supported-calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/cal/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("MKCALENDAR", _) => {
+                assert!(body.contains("<c:calendar-timezone>BEGIN:VCALENDAR") && body.contains("TZID:Europe/Vienna"), "{body}");
+                assert!(body.contains("<c:calendar-description>Kids &amp; school</c:calendar-description>"), "{body}");
+                if body.contains("refuse-me") {
+                    ("403 Forbidden", "<c:mkcalendar-response xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:propstat><d:prop><c:calendar-timezone/></d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat><d:propstat><d:prop><d:displayname/></d:prop><d:status>HTTP/1.1 424 Failed Dependency</d:status></d:propstat></c:mkcalendar-response>".into())
+                } else {
+                    ("201 Created", String::new())
+                }
+            }
+            _ => ("404 Not Found", String::new()),
+        });
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let cals = calendars(&srv, "secret", tls())?;
+        // The jCal-only calendar can't take Picacho's events.
+        assert_eq!(cals.len(), 1);
+        let l = &cals[0].limits;
+        assert_eq!((l.max_instances, l.max_attendees), (Some(100), Some(2)));
+        assert_eq!(l.max_time, Some(2_524_607_999));
+        assert_eq!(l.clamp(-3_000_000_000, 3_000_000_000), (-2_208_988_800, 2_524_607_999));
+        let setup = dav::CollectionSetup { description: "Kids & school".into(), timezone: Some("Europe/Vienna".into()) };
+        create_calendar(&srv, "secret", tls(), "School", "", &setup)?;
+        let refused = create_calendar(&srv, "secret", tls(), "refuse-me", "", &setup).unwrap_err();
+        assert!(refused.to_string().contains("calendar-timezone"), "{refused}");
+        // Discovery, then for each new calendar the principal, its home
+        // and MKCALENDAR.
+        assert_eq!(server.join().unwrap().len(), 7);
+        // An event within them goes; too many guests, too late, or
+        // repeating without end don't.
+        let guest = |e: &str| ical::Attendee { email: e.into(), ..Default::default() };
+        let ok = Stored { event: ical::Event { uid: "e".into(), start: 1_800_000_000, end: 1_800_003_600, attendees: vec![guest("a@x"), guest("b@x")], ..Default::default() }, ..Default::default() };
+        check_limits(l, &ok)?;
+        let mut crowded = ok.clone();
+        crowded.event.attendees.push(guest("c@x"));
+        assert!(check_limits(l, &crowded).unwrap_err().to_string().contains("2 guests"));
+        let mut late = ok.clone();
+        late.event.start = 2_600_000_000;
+        late.event.end = 2_600_003_600;
+        assert!(check_limits(l, &late).is_err());
+        let mut endless = ok.clone();
+        endless.event.recurrence = "FREQ=WEEKLY".into();
+        assert!(check_limits(l, &endless).unwrap_err().to_string().contains("100 repeats"));
+        endless.event.recurrence = "FREQ=WEEKLY;COUNT=10".into();
+        check_limits(l, &endless)?;
+        Ok(())
+    }
+
+    /// RFC 4791 §7.10: each calendar is asked for its busy time over the
+    /// range; overlapping periods from two calendars become one.
+    #[test]
+    fn own_busy_time_comes_from_free_busy_query() -> Result<()> {
+        let (port, server) = dav::test_server(2, |method, path, body| {
+            assert_eq!(method, "REPORT");
+            assert!(body.contains("<c:free-busy-query") && body.contains("start=\"20261124T000000Z\" end=\"20261125T000000Z\""), "{body}");
+            let periods = if path == "/cal/work/" { "20261124T090000Z/20261124T100000Z" } else { "20261124T093000Z/PT1H,20261124T150000Z/20261124T160000Z" };
+            ("200 OK", format!("BEGIN:VCALENDAR\r\nBEGIN:VFREEBUSY\r\nDTSTART:20261124T000000Z\r\nDTEND:20261125T000000Z\r\nFREEBUSY:{periods}\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n"))
+        });
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let cal = |p: &str| Calendar { href: format!("http://127.0.0.1:{port}{p}"), ..Default::default() };
+        // A task list isn't asked.
+        let tasks = Calendar { components: vec!["VTODO".into()], ..cal("/cal/tasks/") };
+        let from = 1_795_478_400; // 2026-11-24T00:00Z
+        let busy = own_free_busy(&srv, "secret", native_tls::TlsConnector::new()?, &[cal("/cal/work/"), cal("/cal/home/"), tasks], from, from + 86_400)?;
+        assert_eq!(busy, [(from + 9 * 3600, from + 10 * 3600 + 1800), (from + 15 * 3600, from + 16 * 3600)]);
+        assert_eq!(server.join().unwrap().len(), 2);
         Ok(())
     }
 

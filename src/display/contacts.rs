@@ -304,15 +304,30 @@ impl MailApp {
                     Ok(format!("Read {n} contacts from {}", a.email))
                 });
             }
+            Action::SearchServerContacts => {
+                let text = self.contact_filter.read(cx).value().trim().to_owned();
+                self.contacts_run(cx, move |b| {
+                    let n = b.search_server_contacts(&text)?;
+                    Ok(match n {
+                        0 => "The server has no one else by that.".to_owned(),
+                        1 => "Found 1 more on the server".to_owned(),
+                        n => format!("Found {n} more on the server"),
+                    })
+                });
+            }
             Action::ListAddressBooks => {
                 if self.contacts_busy {
                     return;
                 }
                 self.contacts_busy = true;
-                self.task(cx, |b| b.address_books(), |this, result, cx| {
+                // The storage with them; not worth failing the list for.
+                self.task(cx, |b| Ok((b.address_books()?, b.contacts_quota().ok().flatten())), |this, result, cx| {
                     this.contacts_busy = false;
                     match result {
-                        Ok(books) => this.address_books = Some(books),
+                        Ok((books, quota)) => {
+                            this.address_books = Some(books);
+                            this.contacts_quota = quota;
+                        }
                         Err(e) => this.contacts_error = Some(format!("{e:#}")),
                     }
                     cx.notify();
@@ -388,6 +403,17 @@ impl MailApp {
                     .filter(|a| !a.is_empty())
                     .collect();
                 card.birthday = value(&self.contact_birthday, cx).trim().to_owned();
+                card.title = value(&self.contact_title, cx).trim().to_owned();
+                card.nicknames = list(value(&self.contact_nicknames, cx));
+                card.anniversary = value(&self.contact_anniversary, cx).trim().to_owned();
+                // Web pages (http/https) and chat addresses (any other URI).
+                // Split at commas and spaces only: a URL may hold a `;`.
+                let (urls, impps): (Vec<String>, Vec<String>) = value(&self.contact_links, cx)
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned)
+                    .partition(|l| l.starts_with("http://") || l.starts_with("https://"));
+                (card.urls, card.impps) = (urls, impps);
                 // A group's members, by address: the UIDs of those people.
                 let members = list(value(&self.contact_members, cx));
                 if !members.is_empty() || card.group {
@@ -473,9 +499,16 @@ impl MailApp {
                     }),
             );
         }
+        let storage = self.contacts_quota.map(|(used, left)| {
+            let mb = |b: u64| b as f64 / 1_048_576.0;
+            format!(" The server keeps {:.0} MB of yours, with {:.0} MB left.", mb(used), mb(left))
+        });
         self.setting(
             "Address books",
-            "Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.",
+            &format!(
+                "Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.{}",
+                storage.unwrap_or_default()
+            ),
             list,
         )
         .into_any_element()
@@ -532,6 +565,10 @@ impl MailApp {
             (&self.contact_note, card.note.clone()),
             (&self.contact_addresses, card.addresses.join("\n")),
             (&self.contact_birthday, card.birthday.clone()),
+            (&self.contact_title, card.title.clone()),
+            (&self.contact_nicknames, card.nicknames.join(", ")),
+            (&self.contact_links, card.urls.iter().chain(&card.impps).cloned().collect::<Vec<_>>().join(", ")),
+            (&self.contact_anniversary, card.anniversary.clone()),
             (&self.contact_members, {
                 let all = self.backend.contacts();
                 card.members
@@ -632,6 +669,10 @@ impl MailApp {
                 .child(labelled("Note", "contact-note", &self.contact_note))
                 .child(labelled("Postal addresses", "contact-addresses", &self.contact_addresses))
                 .child(labelled("Birthday", "contact-birthday", &self.contact_birthday))
+                .child(labelled("Job title", "contact-title", &self.contact_title))
+                .child(labelled("Nicknames", "contact-nicknames", &self.contact_nicknames))
+                .child(labelled("Web and chat", "contact-links", &self.contact_links))
+                .child(labelled("Anniversary", "contact-anniversary", &self.contact_anniversary))
                 .child(labelled(
                     "Members (makes it a group)",
                     "contact-members",
@@ -700,6 +741,21 @@ impl MailApp {
                     } else {
                         "No one matches."
                     }),
+            )
+            // A CardDAV server can be asked for more (RFC 6352 §8.6).
+            .when(
+                !filter.is_empty()
+                    && self.backend.contacts_server().is_some_and(|s| s.jmap_account.is_empty()),
+                |d| {
+                    d.child(div().px_4().pb_3().child(self.button(
+                        "contacts-search-server",
+                        "Search the server",
+                        "search",
+                        Action::SearchServerContacts,
+                        busy,
+                        cx,
+                    )))
+                },
             )
         } else {
             list.children(shown.into_iter().enumerate().map(|(i, card)| {

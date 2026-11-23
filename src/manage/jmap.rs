@@ -249,6 +249,7 @@ fn vacation_state(reply: &jmap::VacationResponse) -> sieve::State {
                 days: 7,
                 from: day(&reply.from_date),
                 until: day(&reply.to_date),
+                ..Default::default()
             },
             include: None,
         },

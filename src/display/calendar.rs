@@ -396,6 +396,7 @@ impl MailApp {
                 .when(!e.location.is_empty(), |d| {
                     d.child(row("Where", e.location.clone()))
                 })
+                .children(e.details().into_iter().map(|(label, text)| row(label, text)))
                 .when_some(organizer, |d, o| d.child(row("Organizer", o)))
                 .when(!people.is_empty(), |d| d.child(row("Guests", people)))
                 .when(invited, |d| {
@@ -1078,6 +1079,12 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::RemoveEventAttachment(uid, managed_id) => {
+                self.calendar_run(cx, move |b| {
+                    b.remove_event_attachment(&uid, &managed_id)?;
+                    Ok("Removed the attachment".into())
+                });
+            }
             Action::DeleteCalendar(href) => {
                 self.calendar_run(cx, move |b| {
                     b.delete_calendar(&href)?;
@@ -1192,6 +1199,18 @@ impl MailApp {
                             "Picacho emails your invitations again".into()
                         }
                     })
+                });
+            }
+            Action::ResendInvitations(uid) => {
+                let Some(stored) = self.backend.stored_event(&uid) else { return };
+                let Some(a) = self.organizer_account(&stored.event) else {
+                    self.calendar_error = Some("Add an email account first: invitations are sent from it.".into());
+                    cx.notify();
+                    return;
+                };
+                self.calendar_run(cx, move |b| {
+                    let n = b.resend_invitations(&a, &uid)?;
+                    Ok(format!("Invitations sent again to {n} {}", if n == 1 { "guest" } else { "guests" }))
                 });
             }
             Action::CheckFreeBusy => {
@@ -1313,6 +1332,81 @@ impl MailApp {
 
     /// The account an event you organize is sent from: the one whose
     /// address organizes it, or (for a new event) the first.
+    /// The event's attached files (ATTACH); those the server keeps (RFC
+    /// 8607 MANAGED-ID) can be removed here.
+    fn event_attachments(&self, uid: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = self.colors();
+        let stored = self.backend.stored_event(uid).filter(|_| !uid.is_empty())?;
+        let files = stored.event.attachments();
+        if files.is_empty() {
+            return None;
+        }
+        let mut list = div().id("event-attachments").flex().flex_col().gap_1();
+        for (i, f) in files.into_iter().enumerate() {
+            let size = f.size.map(|s| format!(" ({} KB)", s.div_ceil(1024))).unwrap_or_default();
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon_el("paperclip", 13., c.muted))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(format!(
+                        "{}{size}",
+                        if f.name.is_empty() { "Attachment".to_owned() } else { f.name.clone() }
+                    )))
+                    .when(!f.managed_id.is_empty(), |d| {
+                        d.child(self.button(
+                            format!("event-attachment-remove-{i}"),
+                            "Remove",
+                            "",
+                            Action::RemoveEventAttachment(uid.to_owned(), f.managed_id.clone()),
+                            false,
+                            cx,
+                        ))
+                    }),
+            );
+        }
+        Some(list.into_any_element())
+    }
+    /// Under the guests: those the server says it couldn't reach (RFC 6638
+    /// §7.3 SCHEDULE-STATUS 3.x or 5.x), and a way to send again.
+    fn undelivered_guests(&self, uid: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = self.colors();
+        let stored = self.backend.stored_event(uid).filter(|_| !uid.is_empty())?;
+        let failed: Vec<String> = stored
+            .event
+            .attendees
+            .iter()
+            .filter(|g| g.delivery_failed())
+            .map(|g| if g.name.is_empty() { g.email.clone() } else { g.name.clone() })
+            .collect();
+        if failed.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .id("event-undelivered")
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.5))
+                        .text_color(rgb(c.danger))
+                        .child(format!("The server couldn't deliver the invitation to {}.", failed.join(", "))),
+                )
+                .child(self.button(
+                    "event-resend",
+                    "Send Again",
+                    "send",
+                    Action::ResendInvitations(uid.to_owned()),
+                    false,
+                    cx,
+                ))
+                .into_any_element(),
+        )
+    }
     fn organizer_account(&self, e: &Event) -> Option<Account> {
         match &e.organizer {
             Some(o) => self.accounts.iter().find(|a| {
@@ -2015,6 +2109,8 @@ impl MailApp {
                     .child(labelled("Where", "event-location", &self.event_location))
                     .child(labelled("Notes", "event-notes", &self.event_notes))
                     .child(labelled("Guests (invited by mail; separated by commas)", "event-guests", &self.event_guests))
+                    .children(self.undelivered_guests(uid, cx))
+                    .children(self.event_attachments(uid, cx))
                     .child(
                         div()
                             .flex()

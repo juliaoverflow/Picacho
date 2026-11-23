@@ -68,6 +68,39 @@ pub struct Attendee {
     /// rewriting an event doesn't lose them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub extra: String,
+    /// SCHEDULE-STATUS (RFC 6638 §7.3): how the server's delivery to
+    /// them went, as its codes (`1.2`, `3.7`…). The server's to write; read
+    /// only, and left out of what is written back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule_status: Vec<String>,
+    /// SCHEDULE-AGENT (RFC 6638 §7.1) as written: SERVER, CLIENT or NONE,
+    /// uppercase; empty where not given (SERVER).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schedule_agent: String,
+    /// SCHEDULE-FORCE-SEND (RFC 6638 §7.2): REQUEST or REPLY, for the
+    /// server to send even where it thinks nothing changed. Sent once, so
+    /// not read back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub force_send: String,
+}
+
+impl Attendee {
+    /// Whether the server says it couldn't deliver to them (RFC 6638
+    /// §7.3, RFC 5545 §3.8.8.3: a status of class 3 or 5).
+    pub fn delivery_failed(&self) -> bool {
+        self.schedule_status.iter().any(|s| s.starts_with('3') || s.starts_with('5'))
+    }
+    /// The parameters RFC 6638 defines, as written in front of `extra`.
+    fn scheduling_params(&self) -> String {
+        let mut out = String::new();
+        if !self.schedule_agent.is_empty() {
+            out.push_str(&format!(";SCHEDULE-AGENT={}", self.schedule_agent));
+        }
+        if !self.force_send.is_empty() {
+            out.push_str(&format!(";SCHEDULE-FORCE-SEND={}", self.force_send));
+        }
+        out
+    }
 }
 
 /// One event.
@@ -137,15 +170,260 @@ pub struct Event {
     /// COMMENT: a note with an iTIP message (a proposed time's reason).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// STATUS as written (RFC 5545 §3.8.1.11: TENTATIVE, CONFIRMED,
+    /// IN-PROCESS…), uppercase, so writing the event from its fields keeps
+    /// it; `cancelled` and `completed` say the two Picacho acts on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// GEO (RFC 5545 §3.8.1.6): `latitude;longitude` as written; read it
+    /// with `coordinates`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub geo: String,
+    /// CATEGORIES (RFC 5545 §3.8.1.2), every such line's in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    /// CLASS (RFC 5545 §3.8.1.3): PUBLIC, PRIVATE, CONFIDENTIAL or
+    /// another, uppercase; empty where not given (PUBLIC).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub class: String,
+    /// COLOR (RFC 7986 §5.9): a CSS3 colour name such as `turquoise`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
+    /// IMAGE (RFC 7986 §5.10): pictures of the event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
+    /// CONFERENCE (RFC 7986 §5.11): ways to join it (a video call, a
+    /// phone number).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conferences: Vec<Conference>,
+}
+
+/// An event's IMAGE (RFC 7986 §5.10).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Image {
+    /// Where it is (VALUE=URI), or its base64 data (VALUE=BINARY).
+    pub uri: String,
+    /// FMTTYPE: its media type, where given.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_type: String,
+    /// DISPLAY: BADGE, GRAPHIC, FULLSIZE or THUMBNAIL; empty for BADGE.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display: String,
+    /// Its other parameters (VALUE, ENCODING, ALTREP, X-…) as written.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra: String,
+}
+
+/// A way to join an event (CONFERENCE, RFC 7986 §5.11).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Conference {
+    /// Its URI: `https://…`, `tel:…`, `sip:…`.
+    pub uri: String,
+    /// LABEL: what to call it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// FEATURE: AUDIO, VIDEO, CHAT, PHONE, SCREEN, MODERATOR, FEED…
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    /// Its other parameters (LANGUAGE, X-…) as written.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra: String,
+}
+
+/// A reminder in full (VALARM, RFC 5545 §3.6.6), as `Event::reminders`
+/// reads it: the plain ones of `Event::alarms` and those kept whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Alarm {
+    /// ACTION: DISPLAY, AUDIO, EMAIL, or another (Apple's NONE), uppercase.
+    pub action: String,
+    /// Seconds before the start it goes off (negative: after); for an
+    /// absolute trigger, before the event's start too.
+    pub before: i64,
+    /// REPEAT and DURATION: how many more times, and how far apart in
+    /// seconds (RFC 5545 §3.8.6.2: both or neither).
+    pub repeat: u32,
+    pub interval: i64,
+    /// DESCRIPTION, or for an email its SUMMARY's text too.
+    pub description: String,
+    pub summary: String,
+    /// An email reminder's recipients (ATTENDEE), as addresses.
+    pub attendees: Vec<String>,
+    /// ACKNOWLEDGED (RFC 9074 §6): it was dismissed.
+    pub acknowledged: bool,
+}
+
+/// A file attached to an event (ATTACH, RFC 5545 §3.8.1.1), as
+/// `Event::attachments` reads it from what's kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Attachment {
+    /// Where it is (a URI), or empty for one inline (VALUE=BINARY).
+    pub uri: String,
+    /// FILENAME (RFC 8607 §4.2), else the URI's last part.
+    pub name: String,
+    /// FMTTYPE: its media type, where given.
+    pub media_type: String,
+    /// SIZE (RFC 8607 §4.3), in octets, where given.
+    pub size: Option<u64>,
+    /// MANAGED-ID (RFC 8607 §4.1): the server keeps it, and updates or
+    /// removes it by this.
+    pub managed_id: String,
+}
+
+impl Event {
+    /// The files attached to the event (ATTACH lines kept as they came).
+    pub fn attachments(&self) -> Vec<Attachment> {
+        let mut depth = 0;
+        let mut out = Vec::new();
+        for line in unfold(&self.kept) {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("BEGIN:") {
+                depth += 1;
+            } else if upper.starts_with("END:") {
+                depth -= 1;
+            } else if depth == 0
+                && let Some((name, params, value)) = split_line(&line)
+                && name == "ATTACH"
+            {
+                let inline = param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("BINARY"));
+                let uri = if inline { String::new() } else { value.trim().to_owned() };
+                let file = param(&params, "FILENAME").map(str::to_owned).unwrap_or_else(|| {
+                    uri.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("").to_owned()
+                });
+                out.push(Attachment {
+                    uri,
+                    name: file,
+                    media_type: param(&params, "FMTTYPE").unwrap_or_default().to_owned(),
+                    size: param(&params, "SIZE").and_then(|s| s.parse().ok()),
+                    managed_id: param(&params, "MANAGED-ID").unwrap_or_default().to_owned(),
+                });
+            }
+        }
+        out
+    }
+    /// GEO's latitude and longitude, where it holds two numbers in range.
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        let (lat, lon) = self.geo.split_once(';')?;
+        let (lat, lon): (f64, f64) = (lat.trim().parse().ok()?, lon.trim().parse().ok()?);
+        ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
+    }
+    /// What the invitation card shows besides time, place and people, as
+    /// (label, text) rows: ways to join (CONFERENCE), the map position
+    /// (GEO, where no place is named), CATEGORIES, CLASS when not public,
+    /// and the reminders that do more than show a note.
+    pub fn details(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        for c in &self.conferences {
+            let label = if c.label.is_empty() { c.features.join(", ").to_lowercase() } else { c.label.clone() };
+            out.push(("Join", if label.is_empty() { c.uri.clone() } else { format!("{label}: {}", c.uri) }));
+        }
+        if let Some((lat, lon)) = self.coordinates().filter(|_| self.location.is_empty()) {
+            out.push(("Where", format!("{lat:.5}, {lon:.5}")));
+        }
+        if !self.categories.is_empty() {
+            out.push(("Categories", self.categories.join(", ")));
+        }
+        match self.class.as_str() {
+            "" | "PUBLIC" => {}
+            "CONFIDENTIAL" => out.push(("Privacy", "Confidential".into())),
+            _ => out.push(("Privacy", "Private".into())),
+        }
+        let others: Vec<String> = self
+            .reminders()
+            .iter()
+            .filter(|a| a.action != "DISPLAY" && a.action != "NONE" && !a.acknowledged)
+            .map(|a| {
+                let how = match a.action.as_str() {
+                    "EMAIL" => "email",
+                    "AUDIO" => "sound",
+                    _ => "other",
+                };
+                let minutes = a.before / 60;
+                let mut text = if minutes >= 0 { format!("{how} {minutes} min before") } else { format!("{how} {} min after", -minutes) };
+                if a.repeat > 0 {
+                    text.push_str(&format!(", {} more every {} min", a.repeat, a.interval / 60));
+                }
+                text
+            })
+            .collect();
+        if !others.is_empty() {
+            out.push(("Reminders", others.join("; ")));
+        }
+        out
+    }
+    /// Every reminder in full: the plain ones Picacho edits (`alarms`)
+    /// and the others kept as they came (an email, a sound, repeats).
+    pub fn reminders(&self) -> Vec<Alarm> {
+        let mut out: Vec<Alarm> = self
+            .alarms
+            .iter()
+            .map(|before| Alarm {
+                action: "DISPLAY".into(),
+                before: *before,
+                description: self.summary.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let length = (self.end - self.start).max(0);
+        let mut current: Option<Alarm> = None;
+        let mut depth = 0;
+        for line in unfold(&self.kept) {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("BEGIN:") {
+                depth += 1;
+                if upper == "BEGIN:VALARM" && depth == 1 {
+                    current = Some(Alarm::default());
+                }
+                continue;
+            }
+            if upper.starts_with("END:") {
+                depth -= 1;
+                if upper == "END:VALARM" && depth == 0 {
+                    out.extend(current.take());
+                }
+                continue;
+            }
+            let (Some(a), Some((name, params, value))) = (current.as_mut(), split_line(&line)) else {
+                continue;
+            };
+            if depth != 1 {
+                continue;
+            }
+            match name.as_str() {
+                "ACTION" => a.action = value.trim().to_ascii_uppercase(),
+                "TRIGGER" => {
+                    a.before = if param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
+                        parse_time(&value, &[]).map_or(0, |(t, _)| self.start - t)
+                    } else {
+                        let d = parse_duration(&value).unwrap_or(0);
+                        if param(&params, "RELATED").is_some_and(|r| r.eq_ignore_ascii_case("END")) {
+                            -(d + length)
+                        } else {
+                            -d
+                        }
+                    }
+                }
+                "REPEAT" => a.repeat = value.trim().parse().unwrap_or(0),
+                "DURATION" => a.interval = parse_duration(&value).unwrap_or(0),
+                "DESCRIPTION" => a.description = unescape(&value),
+                "SUMMARY" => a.summary = unescape(&value),
+                "ATTENDEE" => a.attendees.push(attendee(&line, &value, &params).email),
+                "ACKNOWLEDGED" => a.acknowledged = true,
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 /// Properties `write_event` writes from an event's fields; others are
 /// kept as they came (`Event::kept`).
-const MODELLED: [&str; 25] = [
+/// CREATED isn't one: RFC 5545 §3.8.7.1 has it stay as it was first
+/// written, so it is kept; LAST-MODIFIED is written anew (§3.8.7.3).
+const MODELLED: [&str; 30] = [
     "COMMENT", "BEGIN", "END", "UID", "DTSTAMP", "SEQUENCE", "DTSTART", "DTEND", "DUE", "DURATION",
     "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "SUMMARY", "LOCATION", "DESCRIPTION",
     "RRULE", "ORGANIZER", "ATTENDEE", "COMPLETED", "PERCENT-COMPLETE", "LAST-MODIFIED",
-    "CREATED", "X-PICACHO",
+    "X-PICACHO", "GEO", "CATEGORIES", "CLASS", "COLOR", "IMAGE", "CONFERENCE",
 ];
 
 /// The lines of a component (unfolded, BEGIN and END included) that
@@ -734,18 +1012,80 @@ fn parse_time(value: &str, params: &[(String, String)]) -> Option<(i64, bool)> {
     Some((local.timestamp(), false))
 }
 
-fn attendee(value: &str, params: &[(String, String)]) -> Attendee {
+/// A TEXT list value (CATEGORIES, RESOURCES: RFC 5545 §3.1.1), split at
+/// unescaped commas, each unescaped.
+fn text_list(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                current.push(c);
+                current.extend(chars.next());
+            }
+            ',' => out.push(unescape(std::mem::take(&mut current).trim())),
+            c => current.push(c),
+        }
+    }
+    out.push(unescape(current.trim()));
+    out
+}
+/// A content line's parameters split into those named in `known` (by
+/// name, values decoded) and the rest as written, `;`-joined.
+fn split_params(line: &str, known: &[&str]) -> (Vec<(String, String)>, String) {
+    let mut found = Vec::new();
+    let mut rest = Vec::new();
+    for piece in raw_params(line) {
+        let (k, v) = piece.split_once('=').unwrap_or((piece, ""));
+        let k = k.trim().to_ascii_uppercase();
+        if known.contains(&k.as_str()) {
+            // A list value (FEATURE=AUDIO,VIDEO) stays a list; quotes go.
+            let v = v.split(',').map(|p| caret_decode(p.trim_matches('"'))).collect::<Vec<_>>().join(",");
+            found.push((k, v));
+        } else {
+            rest.push(piece);
+        }
+    }
+    (found, rest.join(";"))
+}
+/// The `;`-separated parameter pieces of a content line's head, as
+/// written (quotes and escapes kept), without its name.
+fn raw_params(line: &str) -> Vec<&str> {
+    let head = &line[..quote_aware_colon(line).unwrap_or(line.len())];
+    let mut out = Vec::new();
+    let (mut quoted, mut start) = (false, 0);
+    for (i, c) in head.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                out.push(&head[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&head[start..]);
+    out.remove(0);
+    out
+}
+
+fn attendee(line: &str, value: &str, params: &[(String, String)]) -> Attendee {
     let email = value
         .trim()
         .trim_start_matches("mailto:")
         .trim_start_matches("MAILTO:")
         .to_owned();
-    // The parameters Picacho doesn't edit, as written (RFC 6868 escapes
-    // put back).
-    let extra = params
-        .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT"))
-        .map(|(k, v)| format!("{k}={}", param_value(v)))
+    // The parameters Picacho doesn't edit, exactly as written: a list
+    // value (RFC 5545 §3.2.11 DELEGATED-TO="mailto:a","mailto:b") stays a
+    // list. RFC 6638's parameters are kept apart: SCHEDULE-STATUS is the
+    // server's to set (§7.3), SCHEDULE-FORCE-SEND a one-time request (§7.2).
+    let extra = raw_params(line)
+        .into_iter()
+        .filter(|p| {
+            let k = p.split('=').next().unwrap_or("").trim().to_ascii_uppercase();
+            !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT" | "SCHEDULE-FORCE-SEND")
+        })
         .collect::<Vec<_>>()
         .join(";");
     Attendee {
@@ -753,6 +1093,12 @@ fn attendee(value: &str, params: &[(String, String)]) -> Attendee {
         status: param(params, "PARTSTAT").map(PartStat::parse),
         email,
         extra,
+        // RFC 6638 §7.3: a list of statuses, quoted where several.
+        schedule_status: param(params, "SCHEDULE-STATUS")
+            .map(|s| s.split(',').map(|c| c.trim().trim_matches('"').to_owned()).filter(|c| !c.is_empty()).collect())
+            .unwrap_or_default(),
+        schedule_agent: param(params, "SCHEDULE-AGENT").unwrap_or_default().to_ascii_uppercase(),
+        force_send: String::new(),
     }
 }
 /// A parameter value as written: RFC 6868's escapes put in, quoted where
@@ -1111,15 +1457,37 @@ fn parse_lines(lines: Vec<String>) -> Calendar {
                     }
                 }
                 "DURATION" => end_duration = parse_duration(&value),
-                "ORGANIZER" => e.organizer = Some(attendee(&value, &params)),
-                "ATTENDEE" => e.attendees.push(attendee(&value, &params)),
+                "ORGANIZER" => e.organizer = Some(attendee(line, &value, &params)),
+                "ATTENDEE" => e.attendees.push(attendee(line, &value, &params)),
                 "SEQUENCE" => e.sequence = value.trim().parse().unwrap_or(0),
                 "RRULE" => e.recurrence = value.trim().to_owned(),
                 "STATUS" => {
-                    e.cancelled |= value.trim().eq_ignore_ascii_case("CANCELLED");
-                    e.completed |= value.trim().eq_ignore_ascii_case("COMPLETED");
+                    e.status = value.trim().to_ascii_uppercase();
+                    e.cancelled |= e.status == "CANCELLED";
+                    e.completed |= e.status == "COMPLETED";
                 }
                 "COMPLETED" => e.completed = true,
+                "GEO" => e.geo = value.trim().to_owned(),
+                "CATEGORIES" => e.categories.extend(
+                    text_list(&value).into_iter().filter(|c| !c.is_empty()),
+                ),
+                "CLASS" => e.class = value.trim().to_ascii_uppercase(),
+                "COLOR" => e.color = value.trim().to_owned(),
+                "IMAGE" => {
+                    let (known, extra) = split_params(line, &["FMTTYPE", "DISPLAY"]);
+                    let get = |k: &str| known.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+                    e.images.push(Image { uri: value.trim().to_owned(), media_type: get("FMTTYPE"), display: get("DISPLAY"), extra });
+                }
+                "CONFERENCE" => {
+                    let (known, extra) = split_params(line, &["LABEL", "FEATURE"]);
+                    let get = |k: &str| known.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+                    e.conferences.push(Conference {
+                        uri: value.trim().to_owned(),
+                        label: get("LABEL"),
+                        features: get("FEATURE").split(',').map(|f| f.trim().to_ascii_uppercase()).filter(|f| !f.is_empty()).collect(),
+                        extra,
+                    });
+                }
                 _ => {}
             }
         }
@@ -1970,6 +2338,30 @@ pub fn scheduled_by_client(text: &str) -> String {
     out
 }
 
+/// `text` with every ORGANIZER's and ATTENDEE's SCHEDULE-STATUS left out:
+/// RFC 6638 §3.2.3 has the server set it, and refuse a client's write
+/// that includes one it didn't (or ignore it), so one read with the event
+/// isn't sent back.
+pub fn without_schedule_status(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in unfold(text) {
+        let upper = line.to_ascii_uppercase();
+        if (upper.starts_with("ORGANIZER;") || upper.starts_with("ATTENDEE;")) && upper.contains("SCHEDULE-STATUS=") {
+            let colon = quote_aware_colon(&line).unwrap_or(line.len());
+            let name = &line[..line.find(';').unwrap_or(colon)];
+            let kept: Vec<&str> = raw_params(&line)
+                .into_iter()
+                .filter(|p| !p.trim().to_ascii_uppercase().starts_with("SCHEDULE-STATUS="))
+                .collect();
+            let head = std::iter::once(name).chain(kept).collect::<Vec<_>>().join(";");
+            out.push_str(&fold(&format!("{head}{}", &line[colon..])));
+        } else {
+            out.push_str(&fold(&line));
+        }
+    }
+    out
+}
+
 /// The UTC offset (seconds east) of `zone` at `t`.
 fn offset_at(zone: chrono_tz::Tz, t: i64) -> i32 {
     use chrono::Offset;
@@ -2225,8 +2617,10 @@ pub fn write_event(e: &Event) -> String {
         if e.completed {
             lines.push("STATUS:COMPLETED".to_owned());
             lines.push(format!("COMPLETED:{}", stamp(Utc::now().timestamp())));
-        } else {
-            lines.push("STATUS:NEEDS-ACTION".to_owned());
+        } else if !e.cancelled {
+            // RFC 5545 §3.8.1.11: a task's other open state (IN-PROCESS) stays.
+            let open = matches!(e.status.as_str(), "IN-PROCESS" | "NEEDS-ACTION");
+            lines.push(format!("STATUS:{}", if open { e.status.as_str() } else { "NEEDS-ACTION" }));
         }
     } else {
         lines.push(at("DTSTART", e.start));
@@ -2247,7 +2641,11 @@ pub fn write_event(e: &Event) -> String {
     }
     if e.cancelled {
         lines.push("STATUS:CANCELLED".to_owned());
+    } else if !e.task && matches!(e.status.as_str(), "TENTATIVE" | "CONFIRMED") {
+        // RFC 5545 §3.8.1.11: an event's other states, as they came.
+        lines.push(format!("STATUS:{}", e.status));
     }
+    lines.push(format!("LAST-MODIFIED:{}", stamp(Utc::now().timestamp())));
     lines.push(format!("SUMMARY:{}", escape(&e.summary)));
     if !e.location.is_empty() {
         lines.push(format!("LOCATION:{}", escape(&e.location)));
@@ -2261,6 +2659,40 @@ pub fn write_event(e: &Event) -> String {
     if !e.recurrence.is_empty() {
         lines.push(format!("RRULE:{}", e.recurrence));
     }
+    if !e.class.is_empty() {
+        lines.push(format!("CLASS:{}", e.class));
+    }
+    if !e.categories.is_empty() {
+        lines.push(format!("CATEGORIES:{}", e.categories.iter().map(|c| escape(c)).collect::<Vec<_>>().join(",")));
+    }
+    if !e.geo.is_empty() {
+        lines.push(format!("GEO:{}", e.geo));
+    }
+    if !e.color.is_empty() {
+        lines.push(format!("COLOR:{}", e.color));
+    }
+    let with = |name: &str, params: &[(&str, String)], extra: &str, value: &str| {
+        let mut head = name.to_owned();
+        if !extra.is_empty() {
+            head.push(';');
+            head.push_str(extra);
+        }
+        for (k, v) in params.iter().filter(|(_, v)| !v.is_empty()) {
+            head.push_str(&format!(";{k}={v}"));
+        }
+        format!("{head}:{value}")
+    };
+    for i in &e.images {
+        // RFC 7986 §5.10: VALUE=URI unless the data is inline.
+        let extra = if i.extra.is_empty() { "VALUE=URI".to_owned() } else { i.extra.clone() };
+        lines.push(with("IMAGE", &[("FMTTYPE", param_value(&i.media_type)), ("DISPLAY", param_value(&i.display))], &extra, &i.uri));
+    }
+    for c in &e.conferences {
+        // RFC 7986 §5.11: VALUE=URI is required.
+        let extra = if c.extra.to_ascii_uppercase().contains("VALUE=") { c.extra.clone() } else if c.extra.is_empty() { "VALUE=URI".to_owned() } else { format!("VALUE=URI;{}", c.extra) };
+        let features = c.features.iter().map(|f| param_value(f)).collect::<Vec<_>>().join(",");
+        lines.push(with("CONFERENCE", &[("FEATURE", features), ("LABEL", param_value(&c.label))], &extra, &c.uri));
+    }
     let person = |p: &Attendee| -> String {
         if p.name.is_empty() {
             String::new()
@@ -2270,7 +2702,7 @@ pub fn write_event(e: &Event) -> String {
     };
     if let Some(o) = e.organizer.as_ref().filter(|o| !o.email.is_empty()) {
         let extra = if o.extra.is_empty() { String::new() } else { format!(";{}", o.extra) };
-        lines.push(format!("ORGANIZER{extra}{}:mailto:{}", person(o), o.email));
+        lines.push(format!("ORGANIZER{extra}{}{}:mailto:{}", o.scheduling_params(), person(o), o.email));
     }
     for at in &e.attendees {
         // Its own parameters where it came with them; a new guest is a
@@ -2281,8 +2713,9 @@ pub fn write_event(e: &Event) -> String {
             at.extra.clone()
         };
         lines.push(format!(
-            "ATTENDEE;{extra};PARTSTAT={}{}:mailto:{}",
+            "ATTENDEE;{extra};PARTSTAT={}{}{}:mailto:{}",
             at.status.unwrap_or(PartStat::NeedsAction).as_str(),
+            at.scheduling_params(),
             person(at),
             at.email
         ));
@@ -2328,6 +2761,266 @@ fn trigger(before: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Calendar objects as Google, iCloud and Nextcloud write them: several
+    /// reminders of different kinds, X- properties, ATTACH, a changed
+    /// occurrence (RECURRENCE-ID) and the calendar's own VTIMEZONE.
+    const GOOGLE: &str = include_str!("../../tests/fixtures/ical/google.ics");
+    const ICLOUD: &str = include_str!("../../tests/fixtures/ical/icloud.ics");
+    const NEXTCLOUD: &str = include_str!("../../tests/fixtures/ical/nextcloud.ics");
+
+    /// The top-level property lines of each component (not its
+    /// sub-components), with DTSTAMP and LAST-MODIFIED left out since
+    /// writing renews them.
+    fn own_lines(component: &str) -> Vec<String> {
+        let lines = unfold(component);
+        let mut depth = 0;
+        let mut out = Vec::new();
+        for l in &lines {
+            let u = l.to_ascii_uppercase();
+            if u.starts_with("BEGIN:") {
+                depth += 1;
+                continue;
+            }
+            if u.starts_with("END:") {
+                depth -= 1;
+                continue;
+            }
+            if depth == 1 && !u.starts_with("DTSTAMP") && !u.starts_with("LAST-MODIFIED") {
+                out.push(l.clone());
+            }
+        }
+        out
+    }
+    /// The VALARM blocks of a component, each as its lines in order.
+    fn alarm_blocks(component: &str) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        let mut current: Option<Vec<String>> = None;
+        for l in unfold(component) {
+            let u = l.to_ascii_uppercase();
+            if u == "BEGIN:VALARM" {
+                current = Some(Vec::new());
+            } else if u == "END:VALARM" {
+                out.extend(current.take());
+            } else if let Some(c) = current.as_mut() {
+                c.push(l);
+            }
+        }
+        out
+    }
+
+    /// Every fixture is edited (its title changed) and written from its
+    /// fields: what Picacho doesn't model comes back exactly once, the
+    /// reminders aren't doubled, and a modelled property isn't also kept.
+    #[test]
+    fn edited_events_from_other_apps_lose_and_double_nothing() {
+        for (name, text) in [("google", GOOGLE), ("icloud", ICLOUD), ("nextcloud", NEXTCLOUD)] {
+            let mut events = parse(text).events;
+            let series_at = events.iter().position(|e| e.recurrence_id.is_none()).unwrap();
+            let original_series = events.remove(series_at);
+            let original_overrides = events;
+            for e in std::iter::once(&original_series).chain(&original_overrides) {
+                // RFC 5545 §3.6.1: what `write_event` writes from fields
+                // isn't also in `kept`, or it would be written twice.
+                let mut depth = 0;
+                for line in unfold(&e.kept) {
+                    let u = line.to_ascii_uppercase();
+                    if u.starts_with("BEGIN:") {
+                        depth += 1;
+                    } else if u.starts_with("END:") {
+                        depth -= 1;
+                    } else if depth == 0 {
+                        let n = split_line(&line).unwrap().0;
+                        assert!(!MODELLED.contains(&n.as_str()), "{name}: {n} is modelled and kept");
+                    }
+                }
+            }
+            // Edited here: written from the fields, each changed
+            // occurrence too.
+            let edit = |e: &Event| Event { summary: format!("{} (edited)", e.summary), source: String::new(), ..e.clone() };
+            let series = edit(&original_series);
+            let overrides: Vec<Event> = original_overrides.iter().map(edit).collect();
+            let written = to_store_all(&series, &overrides);
+            let back = parse(&written).events;
+            assert_eq!(back.len(), 1 + overrides.len(), "{name}");
+            let pairs = std::iter::once((&original_series, &back[0])).chain(original_overrides.iter().zip(&back[1..]));
+            for (before, after) in pairs {
+                assert_eq!(after.summary, format!("{} (edited)", before.summary), "{name}");
+                assert_eq!(after.alarms, before.alarms, "{name}: reminders");
+                assert_eq!(after.kept, before.kept, "{name}: kept");
+                assert_eq!((after.start, after.end, after.recurrence_id), (before.start, before.end, before.recurrence_id), "{name}");
+                assert_eq!(after.attendees, before.attendees, "{name}");
+                assert_eq!(after.exdates, before.exdates, "{name}");
+                // Each of the component's own properties is there as
+                // many times as it was, SUMMARY aside.
+                let was = own_lines(&before.source);
+                let now = own_lines(&after.source);
+                for line in &was {
+                    let n = split_line(line).unwrap().0;
+                    if matches!(n.as_str(), "SUMMARY" | "DTSTART" | "DTEND" | "RECURRENCE-ID" | "EXDATE" | "ATTENDEE" | "ORGANIZER") {
+                        // Written from fields, perhaps with parameters in
+                        // another order; compared through the fields above.
+                        continue;
+                    }
+                    assert_eq!(
+                        now.iter().filter(|l| *l == line).count(),
+                        was.iter().filter(|l| *l == line).count(),
+                        "{name}: {line} in\n{}",
+                        now.join("\n")
+                    );
+                }
+                // As many reminders, none doubled.
+                let (alarms_was, alarms_now) = (alarm_blocks(&before.source), alarm_blocks(&after.source));
+                assert_eq!(alarms_now.len(), alarms_was.len(), "{name}: {:#?}", alarms_now);
+                // A rich reminder comes back exactly as it was.
+                for block in alarms_was.iter().filter(|b| !kept_lines(&[vec![String::new(), "BEGIN:VALARM".into()], (*b).clone(), vec!["END:VALARM".into(), String::new()]].concat()).is_empty()) {
+                    assert_eq!(alarms_now.iter().filter(|b| *b == block).count(), 1, "{name}: {block:?}");
+                }
+            }
+            // Written again unchanged, nothing grows.
+            let (s2, o2) = back.split_first().unwrap();
+            let again = to_store_all(&Event { source: String::new(), ..s2.clone() }, &o2.iter().map(|o| Event { source: String::new(), ..o.clone() }).collect::<Vec<_>>());
+            assert_eq!(unfold(&again).len(), unfold(&written).len(), "{name}");
+        }
+    }
+    /// The fixtures' details as read.
+    #[test]
+    fn other_apps_fixtures_are_read() {
+        let google = parse(GOOGLE).events;
+        assert_eq!(google.len(), 2);
+        assert_eq!(google[0].alarms, [600, 86_400]);
+        assert!(google[0].kept.contains("ACTION:EMAIL"));
+        assert!(google[0].kept.contains("ATTACH;FILENAME=Agenda.pdf"));
+        assert_eq!(google[0].status, "CONFIRMED");
+        assert!(google[0].kept.contains("CREATED:20261020T080000Z"));
+        assert_eq!(google[1].recurrence_id, Some(google[0].start + 7 * 86_400));
+        let icloud = parse(ICLOUD).events;
+        assert_eq!(icloud[0].alarms, [1800], "{:?}", icloud[0].alarms);
+        // The sound, the never-firing default and the acknowledged one
+        // are kept whole.
+        assert_eq!(icloud[0].kept.matches("BEGIN:VALARM").count(), 3);
+        let nextcloud = parse(NEXTCLOUD).events;
+        assert_eq!(nextcloud[0].alarms, [900]);
+        assert_eq!(nextcloud[0].status, "TENTATIVE");
+        assert!(nextcloud[0].kept.contains("REPEAT:2"));
+    }
+    /// GEO, CATEGORIES, CLASS and RFC 7986's COLOR, IMAGE and CONFERENCE
+    /// are read into fields, written from them, and not also kept.
+    #[test]
+    fn descriptive_properties_are_modelled() {
+        let e = parse(NEXTCLOUD).events.remove(0);
+        assert_eq!(e.coordinates(), Some((48.208176, 16.373819)));
+        assert_eq!(e.categories, ["Work", "Finance"]);
+        assert_eq!((e.class.as_str(), e.color.as_str()), ("CONFIDENTIAL", "darkslateblue"));
+        assert_eq!(e.conferences.len(), 1);
+        let c = &e.conferences[0];
+        assert_eq!((c.uri.as_str(), c.label.as_str()), ("https://cloud.example.at/call/x7y8z9", "Talk"));
+        assert_eq!(c.features, ["AUDIO", "VIDEO"]);
+        for name in ["GEO:", "CATEGORIES:", "CLASS:", "COLOR:", "CONFERENCE"] {
+            assert!(!e.kept.contains(name), "{name} kept too");
+        }
+        // Several CATEGORIES lines, an escaped comma, an image.
+        let mut e = parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:i\r\nDTSTART:20261124T090000Z\r\nCATEGORIES:A\\, B,C\r\nCATEGORIES:D\r\nIMAGE;VALUE=URI;DISPLAY=BADGE;FMTTYPE=image/png:https://x.example/i.png\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").events.remove(0);
+        assert_eq!(e.categories, ["A, B", "C", "D"]);
+        assert_eq!(e.images, [Image { uri: "https://x.example/i.png".into(), media_type: "image/png".into(), display: "BADGE".into(), extra: "VALUE=URI".into() }]);
+        e.geo = "-33.8688;151.2093".into();
+        e.conferences.push(Conference { uri: "tel:+1-555-0100".into(), label: "Dial in; PIN 42".into(), features: vec!["PHONE".into()], extra: "VALUE=URI".into() });
+        e.source.clear();
+        let back = parse(&to_store(&e)).events.remove(0);
+        assert_eq!(back.categories, e.categories);
+        assert_eq!(back.images, e.images);
+        assert_eq!(back.conferences, e.conferences);
+        assert_eq!(back.coordinates(), Some((-33.8688, 151.2093)));
+        assert!(back.kept.is_empty(), "{}", back.kept);
+        assert!(to_store(&e).contains("CONFERENCE;VALUE=URI;FEATURE=PHONE;LABEL=\"Dial in; PIN 42\":tel:+1-555-0100"));
+    }
+
+    /// An event cached by an earlier version (these properties still in
+    /// `kept`, its new fields empty) is written with each of them once.
+    #[test]
+    fn events_cached_before_the_new_fields_write_them_once() {
+        let old = Event {
+            uid: "o".into(),
+            summary: "Old".into(),
+            start: 1_800_000_000,
+            end: 1_800_003_600,
+            kept: "CATEGORIES:Work\r\nCLASS:PRIVATE\r\nGEO:1.5;2.5\r\nCOLOR:red\r\nCONFERENCE;VALUE=URI:https://x.example/c\r\n".into(),
+            ..Default::default()
+        };
+        let text = to_store(&old);
+        for p in ["CATEGORIES:", "CLASS:", "GEO:", "COLOR:", "CONFERENCE"] {
+            assert_eq!(text.matches(p).count(), 1, "{p} in {text}");
+        }
+        // Read again, they're fields, and still once each.
+        let back = parse(&text).events.remove(0);
+        assert_eq!((back.categories.len(), back.class.as_str(), back.conferences.len()), (1, "PRIVATE", 1));
+        assert!(back.kept.is_empty());
+    }
+
+    /// Reminders in full (RFC 5545 §3.6.6): their action, repeats and
+    /// recipients, the plain ones and those kept whole alike.
+    #[test]
+    fn reminders_are_read_in_full() {
+        let e = parse(NEXTCLOUD).events.remove(0);
+        let r = e.reminders();
+        assert_eq!(r.len(), 3);
+        assert_eq!((r[0].action.as_str(), r[0].before), ("DISPLAY", 900));
+        let email = r.iter().find(|a| a.action == "EMAIL").unwrap();
+        assert_eq!((email.before, email.attendees.as_slice()), (3600, ["chris@cloud.example.at".to_owned()].as_slice()));
+        assert_eq!(email.description, "Starts in an hour");
+        let repeating = r.iter().find(|a| a.repeat > 0).unwrap();
+        assert_eq!((repeating.before, repeating.repeat, repeating.interval), (300, 2, 300));
+        let details = e.details();
+        assert!(details.contains(&("Join", "Talk: https://cloud.example.at/call/x7y8z9".into())), "{details:?}");
+        assert!(details.contains(&("Categories", "Work, Finance".into())));
+        assert!(details.contains(&("Privacy", "Confidential".into())));
+        assert!(details.contains(&("Reminders", "email 60 min before".into())));
+        // A place is named, so GEO isn't shown as one.
+        assert!(!details.iter().any(|(l, _)| *l == "Where"));
+        let icloud = parse(ICLOUD).events.remove(0).reminders();
+        assert!(icloud.iter().any(|a| a.action == "AUDIO" && a.before == 7200));
+        assert!(icloud.iter().any(|a| a.action == "NONE"));
+        assert!(icloud.iter().any(|a| a.acknowledged && a.before == 86_400));
+    }
+
+    /// RFC 6638 §7: SCHEDULE-STATUS is read and never sent back;
+    /// SCHEDULE-AGENT stays as written; SCHEDULE-FORCE-SEND is written.
+    #[test]
+    fn scheduling_parameters() {
+        let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nDTSTART:20261124T090000Z\r\nORGANIZER;SCHEDULE-AGENT=SERVER:mailto:ana@x.example\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;SCHEDULE-STATUS=\"3.7,5.1\":mailto:gone@x.example\r\nATTENDEE;SCHEDULE-STATUS=1.2;SCHEDULE-AGENT=NONE:mailto:bo@x.example\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let e = parse(text).events.remove(0);
+        assert_eq!(e.attendees[0].schedule_status, ["3.7", "5.1"]);
+        assert!(e.attendees[0].delivery_failed() && !e.attendees[1].delivery_failed());
+        assert_eq!((e.organizer.as_ref().unwrap().schedule_agent.as_str(), e.attendees[1].schedule_agent.as_str()), ("SERVER", "NONE"));
+        // Sent as it came (its source): the server's status is taken out.
+        let stored = without_schedule_status(&to_store(&e));
+        assert!(!stored.contains("SCHEDULE-STATUS"), "{stored}");
+        assert!(stored.contains("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:gone@x.example") && stored.contains("ATTENDEE;SCHEDULE-AGENT=NONE:mailto:bo@x.example"), "{stored}");
+        // Written from fields: the agent kept, the status not, a forced send.
+        let mut edited = Event { source: String::new(), ..e };
+        edited.attendees[0].force_send = "REQUEST".into();
+        let written = to_store(&edited);
+        assert!(!written.contains("SCHEDULE-STATUS"));
+        assert!(written.contains("ORGANIZER;SCHEDULE-AGENT=SERVER:mailto:ana@x.example"), "{written}");
+        assert!(unfold(&written).iter().any(|l| l.starts_with("ATTENDEE;") && l.contains("SCHEDULE-FORCE-SEND=REQUEST") && l.ends_with("gone@x.example")), "{written}");
+        // An agent already named isn't overridden for Picacho's own.
+        let ours = parse(&scheduled_by_client(&written)).events.remove(0);
+        assert_eq!(ours.attendees[1].schedule_agent, "NONE");
+        assert_eq!(ours.organizer.unwrap().schedule_agent, "SERVER");
+        assert_eq!(scheduled_by_client(&written).matches("SCHEDULE-AGENT=CLIENT").count(), 1);
+    }
+
+    /// A guest's list parameter (RFC 5545 §3.2.4 DELEGATED-FROM) is
+    /// written back as the list it was, not one quoted value.
+    #[test]
+    fn attendee_list_parameters_stay_lists() {
+        let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261124T090000Z\r\nATTENDEE;DELEGATED-FROM=\"mailto:a@x.example\",\"mailto:b@x.example\";PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:c@x.example\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut e = parse(text).events.remove(0);
+        assert_eq!(e.attendees[0].extra, "DELEGATED-FROM=\"mailto:a@x.example\",\"mailto:b@x.example\"");
+        e.source.clear();
+        let written = unfold(&to_store(&e)).join("\n");
+        assert!(written.contains("ATTENDEE;DELEGATED-FROM=\"mailto:a@x.example\",\"mailto:b@x.example\";PARTSTAT=ACCEPTED:mailto:c@x.example"), "{written}");
+    }
+
     #[test]
     fn edits_keep_what_picacho_doesnt_read() {
         let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:k\r\nDTSTART:20261124T090000Z\r\nDTEND:20261124T100000Z\r\nSUMMARY:Review\r\nCATEGORIES:Work,Q4\r\nCLASS:PRIVATE\r\nATTACH:https://x.example/agenda.pdf\r\nCOLOR:teal\r\nATTENDEE;ROLE=OPT-PARTICIPANT;CUTYPE=ROOM;PARTSTAT=ACCEPTED;CN=Room 4:mailto:room@x.example\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT1H\r\nATTENDEE:mailto:me@x.example\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -2457,6 +3150,11 @@ mod tests {
         assert_eq!(back.events[0].attendees[0].status, Some(PartStat::Accepted));
         assert_eq!(back.events[0].start, e.start);
         assert!(r.lines().all(|l| l.len() <= 76));
+        // RFC 5546 §3.2.3: an answer to one occurrence names it.
+        let one = Event { recurrence_id: Some(e.start), ..e.clone() };
+        let r = reply(&one, "qa@example.com", "QA", PartStat::Declined).unwrap();
+        assert_eq!(parse(&r).events[0].recurrence_id, Some(e.start));
+        assert!(r.contains("RECURRENCE-ID:20261124T090000Z"), "{r}");
     }
 
     #[test]
@@ -2722,8 +3420,11 @@ mod tests {
         // The people and their answers read the same, and doing it again
         // changes nothing.
         let back = parse(&text).events.remove(0);
-        assert_eq!(back.attendees, e.attendees);
-        assert_eq!(back.organizer, e.organizer);
+        // Read back with the agent now named (RFC 6638 §7.1), else the same.
+        let agentless = |a: &Attendee| Attendee { schedule_agent: String::new(), ..a.clone() };
+        assert!(back.attendees.iter().chain(&back.organizer).all(|a| a.schedule_agent == "CLIENT"));
+        assert_eq!(back.attendees.iter().map(agentless).collect::<Vec<_>>(), e.attendees);
+        assert_eq!(back.organizer.as_ref().map(agentless), e.organizer);
         assert_eq!(scheduled_by_client(&text), text);
         let server = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nATTENDEE;SCHEDULE-AGENT=SERVER:mailto:a@b.c\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert_eq!(scheduled_by_client(server), server);

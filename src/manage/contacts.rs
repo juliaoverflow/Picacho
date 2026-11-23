@@ -67,6 +67,7 @@ impl Backend {
         server.states = fetched.states;
         server.vcard4 = fetched.vcard4;
         server.max_size = fetched.max_size;
+        server.books = fetched.books;
         #[cfg(not(test))]
         store::write_secret_text(PASSWORD, password)?;
         self.store
@@ -146,6 +147,36 @@ impl Backend {
             });
         }
         carddav::books(&server, &self.contacts_password()?, self.tls_connector()?)
+    }
+    /// Asks the server for its contacts whose name, nickname or address
+    /// contains `text` (RFC 6352 §8.6), at most 50, and adds those not
+    /// here yet: for address books and directories that don't list all
+    /// they hold. Returns how many were new.
+    pub fn search_server_contacts(&self, text: &str) -> Result<usize> {
+        let server = self.contacts_server().context("No contacts server is set up.")?;
+        ensure!(self.contacts_jmap(&server)?.is_none(), "This server's contacts are all read already.");
+        let found = carddav::search(&server, &self.contacts_password()?, self.tls_connector()?, text, 50)?;
+        let mut all = self.contacts();
+        let before = all.len();
+        for card in found {
+            if !all.iter().any(|c| c.href == card.href && !c.href.is_empty()) {
+                all.push(card);
+            }
+        }
+        let added = all.len() - before;
+        if added > 0 {
+            self.save_contacts(&all)?;
+        }
+        Ok(added)
+    }
+    /// The account's storage on the contacts server (used, left), where
+    /// it says (RFC 4331); JMAP servers don't.
+    pub fn contacts_quota(&self) -> Result<Option<(u64, u64)>> {
+        let server = self.contacts_server().context("No contacts server is set up.")?;
+        if self.contacts_jmap(&server)?.is_some() {
+            return Ok(None);
+        }
+        carddav::quota(&server, &self.contacts_password()?, self.tls_connector()?)
     }
     /// Renames an address book on the server.
     pub fn rename_address_book(&self, href: &str, name: &str) -> Result<()> {
@@ -263,11 +294,13 @@ impl Backend {
             || server.states != fetched.states
             || server.vcard4 != fetched.vcard4
             || server.max_size != fetched.max_size
+            || server.books != fetched.books
         {
             server.book = fetched.book;
             server.states = fetched.states;
             server.vcard4 = fetched.vcard4;
             server.max_size = fetched.max_size;
+            server.books = fetched.books;
             self.store
                 .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         }
