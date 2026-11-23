@@ -259,10 +259,6 @@ fn property<'a>(node: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::
         .find(|n| n.tag_name().name() == name && !failed_propstat(*n))
 }
 
-/// The href inside the first `name` element under `node`.
-fn href_in(node: roxmltree::Node, name: &str) -> Option<String> {
-    hrefs_in(node, name).into_iter().next()
-}
 /// Every href inside the first `name` element under `node` (a home set
 /// may list several, RFC 4791 §6.2.1).
 fn hrefs_in(node: roxmltree::Node, name: &str) -> Vec<String> {
@@ -391,12 +387,24 @@ impl Client {
         property: &str,
         namespace: &str,
     ) -> Result<Option<url::Url>> {
+        Ok(self.find_hrefs(url, property, namespace)?.into_iter().next())
+    }
+    /// Every href of a property at `url` (Depth 0), in the server's order.
+    fn find_hrefs(&self, url: &url::Url, property: &str, namespace: &str) -> Result<Vec<url::Url>> {
         let body = format!(
             "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"{namespace}\"><d:prop><c:{property}/></d:prop></d:propfind>"
         );
         let text = self.xml("PROPFIND", url, "0", &body)?;
         let doc = parse(&text)?;
-        Ok(href_in(doc.root(), property).and_then(|h| url.join(&h).ok()))
+        let mut out: Vec<url::Url> = Vec::new();
+        for h in hrefs_in(doc.root(), property) {
+            if let Ok(u) = url.join(&h)
+                && !out.contains(&u)
+            {
+                out.push(u);
+            }
+        }
+        Ok(out)
     }
 
     /// The collections of kind `kind` (`addressbook` or `calendar`) at
@@ -1036,10 +1044,29 @@ pub fn discover(
         let principal = client
             .find_href(&start, "current-user-principal", DAV)?
             .unwrap_or_else(|| start.clone());
-        let home = client
-            .find_href(&principal, home_set, namespace)?
-            .context("This server doesn't list any for your account.")?;
-        found = client.collections(&home, kind)?;
+        // RFC 4791 §6.2.1, RFC 6352 §7.1.1: a home set may list several
+        // homes; the collections in each are the account's.
+        let homes = client.find_hrefs(&principal, home_set, namespace)?;
+        ensure!(!homes.is_empty(), "This server doesn't list any for your account.");
+        let mut failed = None;
+        for home in &homes {
+            match client.collections(home, kind) {
+                Ok(more) => {
+                    for c in more {
+                        if !found.iter().any(|f| f.href == c.href) {
+                            found.push(c);
+                        }
+                    }
+                }
+                Err(e) => failed = Some(e),
+            }
+        }
+        // One home failing is that home's trouble; all of them, the server's.
+        if found.is_empty()
+            && let Some(e) = failed
+        {
+            return Err(e);
+        }
     }
     ensure!(
         !found.is_empty(),
@@ -1269,6 +1296,27 @@ mod tests {
         let read = read_collection(&client, &collection, Some(&gone), &known, |_| Ok(vec![]), multiget)?;
         assert!(read.whole);
         assert_eq!(server.join().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// A home set listing two homes (RFC 4791 §6.2.1): the calendars of
+    /// both are found, a home that fails doesn't hide the other's.
+    #[test]
+    fn every_home_in_a_home_set_is_read() -> Result<()> {
+        let calendar = |href: &str| format!("<d:response><d:href>{href}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
+        let (port, server) = test_server(6, move |method, path, _| match (method, path) {
+            // Not a collection itself: the principal is asked.
+            ("PROPFIND", "/.well-known/caldav") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/.well-known/caldav</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", "/p/ana/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/ana/</d:href><d:propstat><d:prop><c:calendar-home-set><d:href>/home1/</d:href><d:href>/home2/</d:href><d:href>/gone/</d:href></c:calendar-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", "/home1/") => ("207 Multi-Status", format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>", calendar("/home1/work/"))),
+            ("PROPFIND", "/home2/") => ("207 Multi-Status", format!("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">{}</d:multistatus>", calendar("/home2/shared/"))),
+            _ => ("404 Not Found", String::new()),
+        });
+        let client = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?;
+        let found = discover(&client, &format!("http://127.0.0.1:{port}"), "caldav", "calendar", "calendar-home-set", CALDAV)?;
+        let paths: Vec<&str> = found.iter().map(|c| c.href.path()).collect();
+        assert_eq!(paths, ["/home1/work/", "/home2/shared/"]);
+        assert_eq!(server.join().unwrap().len(), 6);
         Ok(())
     }
 }
