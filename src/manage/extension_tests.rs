@@ -2442,3 +2442,73 @@ fn large_messages_list_attachments_by_their_decoded_size() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 4314 §3: a mailbox's access list is read (GETACL), changed (SETACL,
+/// DELETEACL) and its grantable rights listed (LISTRIGHTS); rights that
+/// aren't letters are refused before anything is sent.
+#[test]
+fn mailbox_access_lists() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 ACL RIGHTS=texk\r\n");
+                } else if upper.starts_with("GETACL") {
+                    seen.push(command.clone());
+                    p.send("* ACL \"Team\" qa@example.com lrswipkxtecda \"-guest\" w anyone lr\r\n");
+                } else if upper.starts_with("LISTRIGHTS") {
+                    seen.push(command.clone());
+                    p.send("* LISTRIGHTS \"Team\" \"bo@example.com\" \"\" l r s w i p k x t e c d a\r\n");
+                } else if upper.starts_with("SETACL") || upper.starts_with("DELETEACL") {
+                    seen.push(command.clone());
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let acl = b.mailbox_acl(&a, "Team")?;
+    assert_eq!(
+        acl,
+        [
+            ("qa@example.com".to_owned(), "lrswipkxtecda".to_owned()),
+            ("-guest".to_owned(), "w".to_owned()),
+            ("anyone".to_owned(), "lr".to_owned()),
+        ]
+    );
+    b.set_mailbox_acl(&a, "Team", "bo@example.com", Some("+lrs"))?;
+    b.set_mailbox_acl(&a, "Team", "guest", None)?;
+    assert!(b.set_mailbox_acl(&a, "Team", "bo@example.com", Some("all")).is_ok());
+    assert!(b.set_mailbox_acl(&a, "Team", "bo@example.com", Some("l r")).is_err());
+    let (required, optional) = b.mailbox_listrights(&a, "Team", "bo@example.com")?.unwrap();
+    assert_eq!(required, "");
+    assert_eq!(optional.len(), 13);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert_eq!(
+        seen,
+        [
+            "GETACL \"Team\"",
+            "SETACL \"Team\" \"bo@example.com\" \"+lrs\"",
+            "DELETEACL \"Team\" \"guest\"",
+            "SETACL \"Team\" \"bo@example.com\" \"all\"",
+            "LISTRIGHTS \"Team\" \"bo@example.com\"",
+        ]
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

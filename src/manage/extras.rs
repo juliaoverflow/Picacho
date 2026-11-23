@@ -361,3 +361,50 @@ impl Backend {
         })
     }
 }
+
+/// Mailbox access lists (ACL, RFC 4314). Backend-only until the UI calls
+/// them: nothing in the app offers sharing a mailbox yet.
+#[allow(dead_code)]
+impl Backend {
+    /// Who may do what in one of the account's server mailboxes (ACL's
+    /// GETACL, RFC 4314): identifiers with their rights' letters.
+    pub fn mailbox_acl(&self, a: &Account, mailbox: &str) -> Result<Vec<(String, String)>> {
+        self.with_acl(a, mailbox, |c, wire| crate::sync::transport::get_acl(&mut c.session, wire))
+    }
+    /// Sets (`Some`, letters or `+`/`-` changes) or removes (`None`) an
+    /// identifier's rights in a mailbox (SETACL, DELETEACL). The rights
+    /// themselves need `a` there (RFC 4314 §4).
+    pub fn set_mailbox_acl(&self, a: &Account, mailbox: &str, identifier: &str, rights: Option<&str>) -> Result<()> {
+        self.with_acl(a, mailbox, |c, wire| match rights {
+            Some(rights) => crate::sync::transport::set_acl(&mut c.session, wire, identifier, rights),
+            None => crate::sync::transport::delete_acl(&mut c.session, wire, identifier),
+        })
+    }
+    /// What `identifier` can be given in a mailbox (LISTRIGHTS): what it
+    /// always has, and the groups of rights that can be granted.
+    pub fn mailbox_listrights(
+        &self,
+        a: &Account,
+        mailbox: &str,
+        identifier: &str,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        self.with_acl(a, mailbox, |c, wire| crate::sync::transport::list_rights(&mut c.session, wire, identifier))
+    }
+    /// Runs an ACL command for `mailbox` (as the cache names it) on an IMAP
+    /// account whose server has ACL.
+    fn with_acl<T>(
+        &self,
+        a: &Account,
+        mailbox: &str,
+        work: impl FnOnce(&mut Connection, &str) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(a.provider.imap(), "Only IMAP mailboxes have access lists here.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            ensure!(c.extensions()?.acl, "This server doesn't share mailboxes (no ACL).");
+            let wire = c.wire(mailbox);
+            work(c, &wire)
+        })
+    }
+}

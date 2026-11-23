@@ -1678,6 +1678,83 @@ pub(crate) fn my_rights(session: &mut ImapSession, mailbox: &str) -> Result<Opti
             _ => None,
         }))
 }
+/// Who may do what in a mailbox (GETACL, RFC 4314 §3.3): each identifier
+/// ("anyone", a user, or one negated with "-") with its rights' letters.
+pub(crate) fn get_acl(session: &mut ImapSession, mailbox: &str) -> Result<Vec<(String, String)>> {
+    let data = session.run_command_and_read_response(format!("GETACL {}", quote(mailbox)?))?;
+    Ok(other_lines(&data, "ACL")?
+        .into_iter()
+        .flat_map(|line| acl_entries(line))
+        .collect())
+}
+/// `"INBOX" Fred rwipslxetad "-Bob" lr`: the mailbox, then pairs.
+fn acl_entries(line: &str) -> Vec<(String, String)> {
+    let words: Vec<String> = tokens(line)
+        .into_iter()
+        .filter_map(|t| match t {
+            Token::Text(w) => Some(w),
+            _ => None,
+        })
+        .collect();
+    words
+        .get(1..)
+        .unwrap_or_default()
+        .chunks(2)
+        .filter_map(|c| match c {
+            [who, rights] => Some((who.clone(), rights.clone())),
+            _ => None,
+        })
+        .collect()
+}
+/// Gives `identifier` `rights` in a mailbox (SETACL, RFC 4314 §3.1):
+/// letters to set, or with a leading `+` or `-`, to add or take away.
+pub(crate) fn set_acl(session: &mut ImapSession, mailbox: &str, identifier: &str, rights: &str) -> Result<()> {
+    ensure!(
+        rights
+            .trim_start_matches(['+', '-'])
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+        "Rights are written as letters (RFC 4314 §2.1), such as “lrs”."
+    );
+    session.run_command_and_check_ok(format!(
+        "SETACL {} {} {}",
+        quote(mailbox)?,
+        quote(identifier)?,
+        quote(rights)?
+    ))?;
+    Ok(())
+}
+/// Takes `identifier`'s entry out of a mailbox's ACL (DELETEACL, RFC 4314
+/// §3.2).
+pub(crate) fn delete_acl(session: &mut ImapSession, mailbox: &str, identifier: &str) -> Result<()> {
+    session.run_command_and_check_ok(format!("DELETEACL {} {}", quote(mailbox)?, quote(identifier)?))?;
+    Ok(())
+}
+/// The rights `identifier` may be given in a mailbox (LISTRIGHTS, RFC
+/// 4314 §3.4): those it always has, then the groups of letters that can
+/// be granted (each group only together).
+pub(crate) fn list_rights(session: &mut ImapSession, mailbox: &str, identifier: &str) -> Result<Option<(String, Vec<String>)>> {
+    let data = session.run_command_and_read_response(format!(
+        "LISTRIGHTS {} {}",
+        quote(mailbox)?,
+        quote(identifier)?
+    ))?;
+    Ok(other_lines(&data, "LISTRIGHTS")?.first().and_then(|line| listed_rights(line)))
+}
+/// `"~/Mail/saved" smith la r swicdkxte`: mailbox, identifier, required
+/// rights, then each optional group.
+fn listed_rights(line: &str) -> Option<(String, Vec<String>)> {
+    let words: Vec<String> = tokens(line)
+        .into_iter()
+        .filter_map(|t| match t {
+            Token::Text(w) => Some(w),
+            Token::Nil => Some(String::new()),
+            _ => None,
+        })
+        .collect();
+    let required = words.get(2)?.clone();
+    Some((required, words[3..].to_vec()))
+}
 /// Whether `rights` (from MYRIGHTS) lacks one of `needed`. RFC 2086's
 /// older letters count too: c for creating (k), d for deleting (x, t, e).
 pub(crate) fn lacks_rights(rights: &str, needed: &str) -> Option<char> {
@@ -2340,6 +2417,16 @@ mod extension_tests {
         assert_eq!(lacks_rights("lrswipkxte", "kxte"), None);
         assert_eq!(lacks_rights("lrswi", "te"), Some('t'));
         assert_eq!(lacks_rights("lrswicd", "kxte"), None);
+        // RFC 4314 §3.6–3.7: GETACL's and LISTRIGHTS' replies.
+        assert_eq!(
+            acl_entries(r#""INBOX" Fred rwipslxetad "-Bob Smith" lr"#),
+            [("Fred".to_owned(), "rwipslxetad".to_owned()), ("-Bob Smith".to_owned(), "lr".to_owned())]
+        );
+        assert_eq!(
+            listed_rights(r#""~/Mail/saved" smith la r swicdkxte"#),
+            Some(("la".to_owned(), vec!["r".to_owned(), "swicdkxte".to_owned()]))
+        );
+        assert_eq!(listed_rights(r#"INBOX anyone "" l r"#), Some((String::new(), vec!["l".to_owned(), "r".to_owned()])));
         // Untagged extension data reaches the client as text.
         let data = b"* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n* MYRIGHTS \"INBOX\" lrswi\r\n";
         assert_eq!(other_lines(data, "MYRIGHTS").unwrap(), [r#""INBOX" lrswi"#]);
