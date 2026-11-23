@@ -1684,6 +1684,8 @@ pub struct MailApp {
     /// The contacts server's address books, once listed: (href, name,
     /// writable).
     address_books: Option<Vec<(String, String, bool)>>,
+    /// The contacts server's storage (used, left), once asked (RFC 4331).
+    contacts_quota: Option<(u64, u64)>,
     /// The calendar server's storage (used, left), once asked.
     calendar_quota: Option<(u64, u64)>,
     contacts_error: Option<String>,
@@ -2691,6 +2693,7 @@ impl MailApp {
             contacts_password,
             contacts_busy: false,
             address_books: None,
+            contacts_quota: None,
             calendar_quota: None,
             contacts_error: None,
             contact_editing: None,

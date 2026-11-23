@@ -819,9 +819,44 @@ pub struct Server {
     /// 0 where it doesn't say.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_size: u64,
+    /// What each address book takes, by href (RFC 6352 §6.2.2
+    /// `supported-address-data`, §6.2.3 `max-resource-size`): a card is
+    /// saved by its own book's, not the one new cards go to.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub books: std::collections::BTreeMap<String, BookLimits>,
 }
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// What one address book takes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BookLimits {
+    /// Only vCard 4.0 (RFC 6352 §6.2.2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vcard4: bool,
+    /// The largest card in octets; 0 where it doesn't say (§6.2.3).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_size: u64,
+}
+impl Server {
+    /// The limits of the book `href` is in (a card's href, or a book's),
+    /// else those of the book new cards go to.
+    pub fn limits_for(&self, href: &str) -> BookLimits {
+        self.books
+            .iter()
+            .filter(|(book, _)| url::Url::parse(book).is_ok_and(|b| href == book.as_str() || dav::in_collection(href, &b)))
+            .map(|(_, l)| l.clone())
+            .next()
+            .unwrap_or(BookLimits { vcard4: self.vcard4, max_size: self.max_size })
+    }
+}
+/// A collection's limits as an address book's.
+fn book_limits(b: &dav::Collection) -> BookLimits {
+    BookLimits {
+        vcard4: !b.vcard_versions.is_empty() && !b.vcard_versions.iter().any(|v| v == "3.0"),
+        max_size: b.max_size,
+    }
 }
 
 /// A card written as vCard 3.0, as vCard 4.0 (RFC 6350) for a book that
@@ -884,6 +919,8 @@ pub struct Fetched {
     /// What that book takes (`Server::vcard4`, `Server::max_size`).
     pub vcard4: bool,
     pub max_size: u64,
+    /// What every book takes, by href (`Server::books`).
+    pub books: std::collections::BTreeMap<String, BookLimits>,
 }
 
 /// Reads the address books, downloading only what changed since `known`
@@ -950,14 +987,14 @@ pub fn fetch_changes(
     }
     let writable = books.iter().find(|b| b.writable);
     let book = writable.map(|b| b.href.to_string()).unwrap_or_default();
+    let chosen = writable.map(book_limits).unwrap_or_default();
     Ok(Fetched {
         cards,
         book,
         states,
-        vcard4: writable.is_some_and(|b| {
-            !b.vcard_versions.is_empty() && !b.vcard_versions.iter().any(|v| v == "3.0")
-        }),
-        max_size: writable.map_or(0, |b| b.max_size),
+        vcard4: chosen.vcard4,
+        max_size: chosen.max_size,
+        books: books.iter().map(|b| (b.href.to_string(), book_limits(b))).collect(),
     })
 }
 
@@ -986,6 +1023,13 @@ pub fn books(server: &Server, password: &str, tls: native_tls::TlsConnector) -> 
     .into_iter()
     .map(|b| (b.href.to_string(), b.name, b.writable))
     .collect())
+}
+/// The account's storage on the contacts server, used and left in
+/// octets, where it says (RFC 4331 on the address book home).
+pub fn quota(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<Option<(u64, u64)>> {
+    let client = dav::Client::new(&server.user, password, tls)?;
+    let home = client.home(&server.url, "carddav", "addressbook-home-set", dav::CARDDAV)?;
+    client.quota(&home)
 }
 /// Renames an address book (PROPPATCH).
 pub fn rename_book(server: &Server, password: &str, tls: native_tls::TlsConnector, href: &str, name: &str) -> Result<()> {
@@ -1017,16 +1061,17 @@ pub fn save(
     } else {
         url::Url::parse(&card.href)?
     };
+    let limits = server.limits_for(href.as_str());
     let mut text = write_vcard(card);
     // A new card for a book that only takes vCard 4.0; edited ones keep
     // the version they came in.
-    if card.href.is_empty() && server.vcard4 {
+    if card.href.is_empty() && limits.vcard4 {
         text = to_vcard4(&text);
     }
-    if server.max_size > 0 && text.len() as u64 > server.max_size {
+    if limits.max_size > 0 && text.len() as u64 > limits.max_size {
         bail!(
             "This contact is too large for the address book ({} KB at most). Use a smaller photo.",
-            server.max_size / 1024
+            limits.max_size / 1024
         );
     }
     saved.etag = client.put(&href, "text/vcard; charset=utf-8", &card.etag, text.clone())?;
@@ -1089,6 +1134,41 @@ mod tests {
         let again = parse_vcards(&write_vcards(&cards));
         assert_eq!(again[0].emails, cards[0].emails);
         assert_eq!(again[1].name, cards[1].name);
+    }
+
+    /// RFC 6352 §6.2.2–§6.2.3: each book's vCard versions and size are
+    /// kept, and a card is saved by its own book's; RFC 4331 quota is read
+    /// from the address book home.
+    #[test]
+    fn each_book_has_its_own_limits_and_quota_is_read() -> Result<()> {
+        let (port, server) = dav::test_server(6, |method, path, _| match (method, path) {
+            ("PROPFIND", "/.well-known/carddav") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\"><d:response><d:href>/ab/big/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><r:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/ab/small/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><r:addressbook/></d:resourcetype><r:max-resource-size>200</r:max-resource-size><r:supported-address-data><r:address-data-type content-type=\"text/vcard\" version=\"4.0\"/></r:supported-address-data><d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("REPORT", _) => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"/>".into()),
+            ("PROPFIND", "/p/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:r=\"urn:ietf:params:xml:ns:carddav\"><d:response><d:href>/p/</d:href><d:propstat><d:prop><r:addressbook-home-set><d:href>/ab/</d:href></r:addressbook-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", "/ab/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/ab/</d:href><d:propstat><d:prop><d:quota-used-bytes>1048576</d:quota-used-bytes><d:quota-available-bytes>9437184</d:quota-available-bytes></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let fetched = fetch_changes(&srv, "secret", tls(), &[])?;
+        let base = format!("http://127.0.0.1:{port}");
+        assert_eq!(fetched.book, format!("{base}/ab/big/"));
+        assert_eq!((fetched.vcard4, fetched.max_size), (false, 0));
+        let srv = Server { book: fetched.book.clone(), books: fetched.books.clone(), ..srv };
+        // A card in the small, vCard-4-only book is held to its limits,
+        // though new ones go to the big one.
+        let small = srv.limits_for(&format!("{base}/ab/small/x.vcf"));
+        assert_eq!(small, BookLimits { vcard4: true, max_size: 200 });
+        assert_eq!(srv.limits_for(&format!("{base}/ab/big/y.vcf")), BookLimits::default());
+        let big = Card { uid: "x".into(), name: "X".into(), note: "n".repeat(300), href: format!("{base}/ab/small/x.vcf"), ..Default::default() };
+        assert!(save(&srv, "secret", tls(), &big).unwrap_err().to_string().contains("too large"));
+        // Given the principal's address, which names no other principal.
+        let srv = Server { url: format!("{base}/p/"), ..srv };
+        assert_eq!(quota(&srv, "secret", tls())?, Some((1_048_576, 9_437_184)));
+        // Discovery, two book reads; the principal twice (its principal,
+        // its home set) and the home's quota.
+        assert_eq!(server.join().unwrap().len(), 6);
+        Ok(())
     }
 
     /// RFC 6350's NICKNAME, TITLE, IMPP, URL, ANNIVERSARY, RELATED and

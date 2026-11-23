@@ -67,6 +67,7 @@ impl Backend {
         server.states = fetched.states;
         server.vcard4 = fetched.vcard4;
         server.max_size = fetched.max_size;
+        server.books = fetched.books;
         #[cfg(not(test))]
         store::write_secret_text(PASSWORD, password)?;
         self.store
@@ -146,6 +147,15 @@ impl Backend {
             });
         }
         carddav::books(&server, &self.contacts_password()?, self.tls_connector()?)
+    }
+    /// The account's storage on the contacts server (used, left), where
+    /// it says (RFC 4331); JMAP servers don't.
+    pub fn contacts_quota(&self) -> Result<Option<(u64, u64)>> {
+        let server = self.contacts_server().context("No contacts server is set up.")?;
+        if self.contacts_jmap(&server)?.is_some() {
+            return Ok(None);
+        }
+        carddav::quota(&server, &self.contacts_password()?, self.tls_connector()?)
     }
     /// Renames an address book on the server.
     pub fn rename_address_book(&self, href: &str, name: &str) -> Result<()> {
@@ -263,11 +273,13 @@ impl Backend {
             || server.states != fetched.states
             || server.vcard4 != fetched.vcard4
             || server.max_size != fetched.max_size
+            || server.books != fetched.books
         {
             server.book = fetched.book;
             server.states = fetched.states;
             server.vcard4 = fetched.vcard4;
             server.max_size = fetched.max_size;
+            server.books = fetched.books;
             self.store
                 .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         }

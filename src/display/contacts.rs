@@ -309,10 +309,14 @@ impl MailApp {
                     return;
                 }
                 self.contacts_busy = true;
-                self.task(cx, |b| b.address_books(), |this, result, cx| {
+                // The storage with them; not worth failing the list for.
+                self.task(cx, |b| Ok((b.address_books()?, b.contacts_quota().ok().flatten())), |this, result, cx| {
                     this.contacts_busy = false;
                     match result {
-                        Ok(books) => this.address_books = Some(books),
+                        Ok((books, quota)) => {
+                            this.address_books = Some(books);
+                            this.contacts_quota = quota;
+                        }
                         Err(e) => this.contacts_error = Some(format!("{e:#}")),
                     }
                     cx.notify();
@@ -484,9 +488,16 @@ impl MailApp {
                     }),
             );
         }
+        let storage = self.contacts_quota.map(|(used, left)| {
+            let mb = |b: u64| b as f64 / 1_048_576.0;
+            format!(" The server keeps {:.0} MB of yours, with {:.0} MB left.", mb(used), mb(left))
+        });
         self.setting(
             "Address books",
-            "Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.",
+            &format!(
+                "Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.{}",
+                storage.unwrap_or_default()
+            ),
             list,
         )
         .into_any_element()
