@@ -441,7 +441,9 @@ impl Backend {
         a: &Account,
         password: &str,
     ) -> Result<PopSession<native_tls::TlsStream<crate::sync::wire::Wire>>> {
-        pop_login(a, password, &self.tls_connector()?)
+        let session = pop_login(a, password, &self.tls_connector()?)?;
+        self.note_pop_login(a, session.limits().login_delay);
+        Ok(session)
     }
     /// Signs in and checks the incoming server, then saves the account. For
     /// browser and Pinal sign-in, the returned account names the address
@@ -1937,12 +1939,16 @@ impl Backend {
         // Headers alone where TOP works: a batch costs a few KB each.
         let sizes = if missing.is_empty() { Default::default() } else { pop.list()? };
         let mut headers = Vec::new();
-        let mut whole = false;
-        for (number, uid) in missing.iter().take(batch.min(200)) {
-            let Some(top) = pop.top(*number, 256 * 1024)? else {
-                whole = true;
-                break;
-            };
+        let listing: Vec<&(u32, String)> = missing.iter().take(batch.min(200)).copied().collect();
+        let numbers: Vec<u32> = listing.iter().map(|(n, _)| *n).collect();
+        // Many at a time where the server pipelines (RFC 2449 §6.6).
+        let tops = if numbers.is_empty() { Some(Vec::new()) } else { pop.top_many(&numbers, 256 * 1024)? };
+        let whole = tops.is_none();
+        for ((number, uid), top) in listing.iter().zip(tops.unwrap_or_default()) {
+            // Refused (gone meanwhile): listed with the next check.
+            if top.is_empty() {
+                continue;
+            }
             let id = format!("{prefix}{uid}");
             let mut m = parse_message(&top, a, &id, Folder::Inbox, "INBOX", *number)?;
             // The header block isn't its text: no snippet or body yet.

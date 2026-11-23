@@ -591,6 +591,9 @@ pub(super) struct Limits {
     paused: HashMap<String, (i64, Duration)>,
     /// Bytes downloaded in the background today (UTC day), per account.
     traffic: HashMap<String, (i64, u64)>,
+    /// When a POP3 account may sign in again, where its server said how
+    /// often it may (CAPA's LOGIN-DELAY, RFC 2449 §6.5).
+    pop_next_login: HashMap<String, i64>,
 }
 
 impl Backend {
@@ -708,10 +711,34 @@ impl Backend {
             .map(|(until, _)| *until)
             .filter(|until| *until > now)
     }
+    /// Notes a POP3 sign-in: where the server allows one only every so
+    /// many seconds (LOGIN-DELAY), background work waits that long before
+    /// the next, rather than be refused with `[LOGIN-DELAY]`.
+    pub(super) fn note_pop_login(&self, a: &Account, login_delay: Option<u64>) {
+        let mut limits = self.limits.lock().unwrap();
+        match login_delay.filter(|d| *d > 0) {
+            Some(delay) => {
+                let next = chrono::Utc::now().timestamp() + delay.min(i64::MAX as u64 / 2) as i64;
+                limits.pop_next_login.insert(a.id.clone(), next);
+            }
+            None => {
+                limits.pop_next_login.remove(&a.id);
+            }
+        }
+    }
     /// Background work refuses to run while the server is limiting us, or
     /// once the day's allowance is used.
     pub(super) fn ensure_background(&self, a: &Account) -> Result<()> {
         if let Some(until) = self.throttled_until(&a.id) {
+            return Err(anyhow::Error::new(Throttled {
+                until,
+                budget: false,
+            }));
+        }
+        let next_login = self.limits.lock().unwrap().pop_next_login.get(&a.id).copied();
+        if a.provider == Provider::Pop3
+            && let Some(until) = next_login.filter(|t| *t > chrono::Utc::now().timestamp())
+        {
             return Err(anyhow::Error::new(Throttled {
                 until,
                 budget: false,

@@ -19,9 +19,17 @@ pub(crate) struct Rejected {
 impl Rejected {
     fn parse(status: &str) -> Self {
         let text = status.strip_prefix("-ERR").unwrap_or(status).trim();
+        // A response code is `[` then a code word (RFC 2449 §8: atoms and
+        // `/`): a server without RESP-CODES may begin its text with `[`
+        // for other reasons, which isn't read as a code.
         let (code, text) = match text.strip_prefix('[').and_then(|t| t.split_once(']')) {
-            Some((code, rest)) => (Some(code.trim().to_ascii_uppercase()), rest.trim()),
-            None => (None, text),
+            Some((code, rest))
+                if !code.is_empty()
+                    && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'/') =>
+            {
+                (Some(code.trim().to_ascii_uppercase()), rest.trim())
+            }
+            _ => (None, text),
         };
         Self {
             code,
@@ -73,6 +81,30 @@ impl std::fmt::Display for Rejected {
     }
 }
 impl std::error::Error for Rejected {}
+
+/// What CAPA says about how the server limits a mailbox (RFC 2449 §6.5),
+/// once signed in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// LOGIN-DELAY: the fewest seconds between sign-ins. Signing in sooner
+    /// is refused (`[LOGIN-DELAY]`).
+    pub(crate) login_delay: Option<u64>,
+}
+impl Limits {
+    /// From CAPA's lines (uppercase). Before signing in it may say `USER`:
+    /// the value is for this user, known only after (RFC 2449 §6.5).
+    pub(crate) fn from_caps(caps: &[String]) -> Self {
+        let value = |name: &str| {
+            caps.iter().find_map(|c| {
+                let mut words = c.split_ascii_whitespace();
+                (words.next() == Some(name)).then(|| words.next()).flatten()
+            })
+        };
+        Self {
+            login_delay: value("LOGIN-DELAY").and_then(|v| v.parse().ok()),
+        }
+    }
+}
 /// The refusal behind an error, if POP3 gave one.
 pub(crate) fn rejection(error: &anyhow::Error) -> Option<&Rejected> {
     error.chain().find_map(|c| c.downcast_ref::<Rejected>())
@@ -126,6 +158,10 @@ impl<T: Read + Write> PopSession<T> {
         );
         Ok(line)
     }
+    /// The mailbox's limits, as CAPA says them.
+    pub(crate) fn limits(&self) -> Limits {
+        Limits::from_caps(&self.caps)
+    }
     /// Whether CAPA listed `capability` (its first word).
     pub(crate) fn has(&self, capability: &str) -> bool {
         self.caps.iter().any(|c| {
@@ -146,6 +182,52 @@ impl<T: Read + Write> PopSession<T> {
             // A server without CAPA may not know TOP.
             Err(e) if self.caps.is_empty() && rejection(&e).is_some() => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+    /// The headers of each of `numbers` (TOP n 0), in order, where the
+    /// server lists TOP; `None` where it doesn't. With PIPELINING (RFC
+    /// 2449 §6.6) the commands go together and the replies are read after,
+    /// saving a round trip per message; else one at a time. A message the
+    /// server refuses (deleted meanwhile, say) is an empty header block.
+    pub(crate) fn top_many(&mut self, numbers: &[u32], max: usize) -> Result<Option<Vec<Vec<u8>>>> {
+        ensure!(numbers.iter().all(|n| *n > 0), "Invalid POP3 message number");
+        if !self.has("PIPELINING") || !self.has("TOP") {
+            let mut out = Vec::with_capacity(numbers.len());
+            for n in numbers {
+                match self.top(*n, max)? {
+                    Some(header) => out.push(header),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(out));
+        }
+        let mut commands = String::new();
+        for n in numbers {
+            commands.push_str(&format!("TOP {n} 0\r\n"));
+        }
+        self.reader.get_mut().write_all(commands.as_bytes())?;
+        self.reader.get_mut().flush()?;
+        let mut out = Vec::with_capacity(numbers.len());
+        // Every reply is read, whatever happens to one, so the session
+        // stays in step.
+        let mut failed = None;
+        for _ in numbers {
+            match self.status() {
+                Ok(_) => match self.multiline(max) {
+                    Ok(header) => out.push(header),
+                    // A reply cut short or too long: the rest can't be read.
+                    Err(e) => return Err(e),
+                },
+                Err(e) if e.is::<Rejected>() => out.push(Vec::new()),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(Some(out)),
         }
     }
     /// Each message's size in octets (LIST), by message number.
@@ -712,6 +794,30 @@ mod tests {
         assert_eq!(header_identity(a.as_bytes()), ids[0].1);
         let sent = String::from_utf8(pop.reader.get_ref().sent.clone()).unwrap();
         assert_eq!(sent, "CAPA\r\nSTAT\r\nRSET\r\nSTAT\r\nTOP 1 0\r\nTOP 2 0\r\nTOP 3 0\r\n");
+        Ok(())
+    }
+    /// RFC 2449 §6.5 and §8: LOGIN-DELAY's seconds (not `USER`, said
+    /// before signing in), and response codes only as code words.
+    #[test]
+    fn capa_limits_and_response_codes() {
+        let caps = |l: &[&str]| l.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        assert_eq!(Limits::from_caps(&caps(&["USER", "LOGIN-DELAY 900"])).login_delay, Some(900));
+        assert_eq!(Limits::from_caps(&caps(&["LOGIN-DELAY USER"])).login_delay, None);
+        assert_eq!(Limits::from_caps(&caps(&["USER"])).login_delay, None);
+        assert_eq!(Rejected::parse("-ERR [IN-USE] busy").code.as_deref(), Some("IN-USE"));
+        let r = Rejected::parse("-ERR [mailbox locked by pid 7] try later");
+        assert_eq!(r.code, None);
+        assert_eq!(r.text, "[mailbox locked by pid 7] try later");
+    }
+    /// RFC 2449 §6.6: with PIPELINING, the TOP commands go in one write and
+    /// every reply is read in order, a refused one included.
+    #[test]
+    fn pipelined_tops_are_read_in_order() -> Result<()> {
+        let replies = "+OK ready\r\n+OK\r\nTOP\r\nPIPELINING\r\n.\r\n+OK\r\nSubject: 1\r\n\r\n.\r\n-ERR no such message\r\n+OK\r\nSubject: 3\r\n\r\n.\r\n";
+        let mut pop = PopSession::new(Cursor::new(replies.as_bytes().to_vec()))?;
+        pop.capabilities()?;
+        let tops = pop.top_many(&[1, 2, 3], 4096)?.unwrap();
+        assert_eq!(tops, [b"Subject: 1\r\n\r\n".to_vec(), Vec::new(), b"Subject: 3\r\n\r\n".to_vec()]);
         Ok(())
     }
     #[test]
