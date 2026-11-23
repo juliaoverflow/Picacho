@@ -2367,18 +2367,35 @@ impl Session {
     /// Reads a message kept as a blob (an attached `.eml`) without adding
     /// it to the mailbox (Email/parse, RFC 8621 §4.9): its headers, text
     /// and attachments as for any message.
-    pub fn parse_blob(&self, blob: &str) -> Result<Option<Email>> {
-        let v = self.one(
-            "Email/parse",
-            json!({
-                "accountId": self.account_id,
-                "blobIds": [blob],
-                "properties": LIST_PROPERTIES.iter().filter(|p| !["id", "blobId", "threadId", "mailboxIds", "keywords", "receivedAt", "size"].contains(p)).collect::<Vec<_>>(),
-            }),
-        )?;
+    /// With `text_bytes`, the start of its text too: up to that many bytes
+    /// of its text parts' values (Email/parse takes `fetchTextBodyValues`
+    /// and `maxBodyValueBytes` as Email/get does); without, none.
+    pub fn parse_blob_with_text(&self, blob: &str, text_bytes: usize) -> Result<Option<(Email, String)>> {
+        let mut properties: Vec<&str> = LIST_PROPERTIES
+            .iter()
+            .copied()
+            .filter(|p| !["id", "blobId", "threadId", "mailboxIds", "keywords", "receivedAt", "size"].contains(p))
+            .collect();
+        let mut args = json!({ "accountId": self.account_id, "blobIds": [blob] });
+        if text_bytes > 0 {
+            properties.extend(["textBody", "bodyValues"]);
+            args["fetchTextBodyValues"] = json!(true);
+            args["maxBodyValueBytes"] = json!(text_bytes);
+        }
+        args["properties"] = json!(properties);
+        let v = self.one("Email/parse", args)?;
         let Some(parsed) = v["parsed"].get(blob) else {
             return Ok(None);
         };
+        let text = parsed["textBody"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["type"].as_str().is_none_or(|t| t.eq_ignore_ascii_case("text/plain")))
+            .filter_map(|p| p["partId"].as_str())
+            .filter_map(|id| parsed["bodyValues"][id]["value"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut parsed = parsed.clone();
         // What Email/get always gives, which a parsed blob has not.
         for (k, d) in [
@@ -2392,9 +2409,10 @@ impl Session {
                 parsed[k] = d;
             }
         }
-        Ok(Some(serde_json::from_value(parsed).context(
+        let email = serde_json::from_value(parsed).context(
             "The JMAP server's reading of the message isn't in a form Picacho can read.",
-        )?))
+        )?;
+        Ok(Some((email, text)))
     }
     /// Copies blobs from another account this sign-in reaches (Blob/copy,
     /// RFC 8620 §6.3), returning the new ids by old id.

@@ -1426,14 +1426,17 @@ impl Backend {
         {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
-            if let Some(e) = self.with_jmap(a, |s| s.parse_blob(&attachment.section))? {
+            // The start of its text, as a downloaded one shows (RFC 8621
+            // §4.9: bodyValues); its preview where it has none.
+            if let Some((e, text)) = self.with_jmap(a, |s| s.parse_blob_with_text(&attachment.section, 4096))? {
+                let start: String = text.chars().take(600).collect();
                 return Ok(format!(
                     "From: {}\nTo: {}\nDate: {}\nSubject: {}\n\n{}",
                     crate::sync::jmap::addresses(&e.from),
                     crate::sync::jmap::addresses(&e.to),
                     e.sent_at.clone().unwrap_or_default(),
                     e.subject.clone().unwrap_or_default(),
-                    e.preview.clone().unwrap_or_default()
+                    if start.trim().is_empty() { e.preview.clone().unwrap_or_default() } else { start }
                 ));
             }
         }

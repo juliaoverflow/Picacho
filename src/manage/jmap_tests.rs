@@ -738,6 +738,24 @@ impl Server {
                 }
                 out
             }
+            "Email/parse" => {
+                let mut parsed = serde_json::Map::new();
+                for blob in args["blobIds"].as_array().into_iter().flatten() {
+                    let blob = blob.as_str().unwrap();
+                    if !self.blobs.contains_key(blob) {
+                        continue;
+                    }
+                    let mut e = json!({ "subject": "Attached", "from": [{ "email": "ana@example.org" }], "preview": "Short preview" });
+                    if args["fetchTextBodyValues"] == true {
+                        let most = args["maxBodyValueBytes"].as_u64().unwrap_or(u64::MAX) as usize;
+                        let text = "The whole first paragraph of the attached message.";
+                        e["textBody"] = json!([{ "partId": "1", "type": "text/plain" }]);
+                        e["bodyValues"] = json!({ "1": { "value": &text[..text.len().min(most)], "isTruncated": text.len() > most } });
+                    }
+                    parsed.insert(blob.to_owned(), e);
+                }
+                vec![(name.into(), json!({ "parsed": parsed, "notParsable": [], "notFound": [] }))]
+            }
             "Email/copy" => {
                 let mut created = serde_json::Map::new();
                 for (key, c) in args["create"].as_object().into_iter().flatten() {
@@ -2479,5 +2497,28 @@ fn jmap_mail_limits_are_honoured() -> Result<()> {
         assert!(s.create_mailbox("Deeper", Some(&id)).is_err());
         Ok(())
     })?;
+    Ok(())
+}
+
+/// Email/parse with bodyValues (RFC 8621 §4.9): the start of an attached
+/// message's text, not only its preview.
+#[test]
+fn jmap_parsed_messages_read_their_text() -> Result<()> {
+    let mut fixture = Server::default();
+    fixture.blobs.insert("B-att".into(), MESSAGE.to_vec());
+    let (cert, port, _server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let (e, text) = b.with_jmap(&a, |s| s.parse_blob_with_text("B-att", 4096))?.unwrap();
+    assert_eq!(e.subject.as_deref(), Some("Attached"));
+    assert_eq!(text, "The whole first paragraph of the attached message.");
+    let (_, cut) = b.with_jmap(&a, |s| s.parse_blob_with_text("B-att", 9))?.unwrap();
+    assert_eq!(cut, "The whole");
+    let (plain, none) = b.with_jmap(&a, |s| s.parse_blob_with_text("B-att", 0))?.unwrap();
+    assert_eq!(plain.preview.as_deref(), Some("Short preview"));
+    assert!(none.is_empty());
+    assert!(b.with_jmap(&a, |s| s.parse_blob_with_text("B-none", 0))?.is_none());
     Ok(())
 }
