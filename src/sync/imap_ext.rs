@@ -182,6 +182,7 @@ pub(crate) struct Found {
 /// come with its UIDVALIDITY, so they can name cached mail.
 pub(crate) fn multisearch(
     session: &mut ImapSession,
+    literals: Option<&super::stream::Literals>,
     names: &[String],
     criteria: &str,
     utf8: bool,
@@ -191,10 +192,14 @@ pub(crate) fn multisearch(
         return Ok(Vec::new());
     }
     let charset = search_charset(criteria, utf8);
-    let data = session.run_command_and_read_response(format!(
-        "ESEARCH IN (mailboxes ({})) RETURN (COUNT ALL) {charset}{criteria}",
-        names.join(" ")
-    ))?;
+    let data = run_with_literals(
+        session,
+        literals,
+        &format!(
+            "ESEARCH IN (mailboxes ({})) RETURN (COUNT ALL) {charset}{criteria}",
+            names.join(" ")
+        ),
+    )?;
     parse_multisearch(&data)
 }
 /// `* ESEARCH (TAG "a" MAILBOX "INBOX" UIDVALIDITY 9) UID COUNT 3 ALL 4:6`
@@ -299,15 +304,20 @@ pub(crate) fn uid_search_any(
 /// no single reply outgrows the connection's size limit.
 pub(crate) fn search_uids(
     session: &mut ImapSession,
+    literals: Option<&super::stream::Literals>,
     ext: &Extensions,
     selected: &Selected,
     criteria: &str,
 ) -> Result<Vec<u32>> {
-    ensure!(!criteria.contains(['\r', '\n']), "Invalid IMAP search");
+    ensure!(literals_only(criteria), "Invalid IMAP search");
     let mut uids = if ext.esearch {
-        let data =
-            session.run_command_and_read_response(format!("UID SEARCH RETURN (ALL) {criteria}"))?;
+        let data = run_with_literals(session, literals, &format!("UID SEARCH RETURN (ALL) {criteria}"))?;
         esearch_uids(&data)?
+    } else if criteria.contains('\n') {
+        // A search with literals: its SEARCH reply read here, as the imap
+        // crate's `uid_search` would.
+        let data = run_with_literals(session, literals, &format!("UID SEARCH {criteria}"))?;
+        search_reply_uids(&data)?
     } else {
         // Each UID costs up to 11 bytes in a SEARCH reply; windows of
         // 500,000 stay far below the 32 MB limit.
@@ -342,10 +352,20 @@ pub(crate) fn search_uids(
     Ok(uids)
 }
 
-/// Whether every line break in `command` begins a LITERAL+ literal
-/// (`{n+}\r\n` and exactly `n` bytes, without line breaks of their own).
-/// One literal anywhere let any other line break through before, which
-/// would end the command and start another.
+/// The UIDs in a SEARCH reply (`* SEARCH 2 84 882`).
+fn search_reply_uids(data: &[u8]) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for response in responses(data)? {
+        if let imap_proto::Response::IDs(ids) = response {
+            out.extend(ids);
+        }
+    }
+    Ok(out)
+}
+/// Whether every line break in `command` begins a literal (`{n}` or
+/// LITERAL+'s `{n+}`, then CRLF and exactly `n` bytes, without line breaks
+/// of their own). One literal anywhere let any other line break through
+/// before, which would end the command and start another.
 fn literals_only(command: &str) -> bool {
     let bytes = command.as_bytes();
     let mut i = 0;
@@ -360,7 +380,8 @@ fn literals_only(command: &str) -> bool {
                     return false;
                 };
                 let Some(n) = command[open + 1..i]
-                    .strip_suffix("+}")
+                    .strip_suffix('}')
+                    .map(|n| n.strip_suffix('+').unwrap_or(n))
                     .and_then(|n| n.parse::<usize>().ok())
                 else {
                     return false;
@@ -382,19 +403,79 @@ fn literals_only(command: &str) -> bool {
 
 /// A search term's text as an IMAP string the session accepts: quoted
 /// where it can be (ASCII, or any text once UTF8=ACCEPT is on), else a
-/// literal that needs no go-ahead (LITERAL+), else quoted UTF-8, which
-/// most servers searching in UTF-8 accept.
+/// literal. RFC 9051 §4.3 (RFC 3501 §4.3): a quoted string holds 7-bit
+/// text only, so 8-bit text goes as a literal: one needing no go-ahead
+/// (LITERAL+, or LITERAL- up to 4096 bytes; RFC 7888), else a synchronizing
+/// one, which the command must be sent with `run_with_literals` for.
 pub(crate) fn search_string(text: &str, ext: &Extensions, utf8: bool) -> Result<String> {
     let text = text.replace(['\r', '\n'], " ");
-    // LITERAL- literals hold at most 4096 bytes (RFC 7888 §5).
-    let fits = !ext.literal_minus || text.len() <= 4096;
-    if text.is_ascii() || utf8 || !ext.literal_plus || !fits {
-        // 8-bit text in a quoted string is outside RFC 3501's syntax;
-        // it is the last resort where no non-synchronizing literal can
-        // carry it, and most servers searching in UTF-8 accept it.
+    if text.is_ascii() || utf8 {
         return quote(&text);
     }
-    Ok(format!("{{{}+}}\r\n{text}", text.len()))
+    // LITERAL- literals hold at most 4096 bytes (RFC 7888 §5).
+    let fits = !ext.literal_minus || text.len() <= 4096;
+    if ext.literal_plus && fits {
+        Ok(format!("{{{}+}}\r\n{text}", text.len()))
+    } else {
+        Ok(format!("{{{}}}\r\n{text}", text.len()))
+    }
+}
+/// Runs `command`, which may hold synchronizing literals (`{n}` CRLF and
+/// n bytes, as `search_string` makes them): each is sent once the server
+/// says to go ahead (RFC 9051 §7.5). Without such literals, or without
+/// `literals` to send them with, the command goes as one line.
+pub(crate) fn run_with_literals(
+    session: &mut ImapSession,
+    literals: Option<&super::stream::Literals>,
+    command: &str,
+) -> imap::error::Result<Vec<u8>> {
+    let parts = synchronizing_parts(command);
+    match literals {
+        Some(literals) if parts.iter().any(|p| matches!(p, super::stream::Part::Literal(_))) => {
+            let line = literals.command(&parts);
+            session.run_command_and_read_response(line)
+        }
+        Some(_) => session.run_command_and_read_response(command),
+        None if parts.len() > 1 => Err(imap::error::Error::Bad(
+            "This connection can't send text with accents to the server's search.".into(),
+        )),
+        None => session.run_command_and_read_response(command),
+    }
+}
+/// `command` as text and its synchronizing literals' bytes, in order;
+/// LITERAL+ literals (`{n+}`) stay in the text, needing no go-ahead.
+fn synchronizing_parts(command: &str) -> Vec<super::stream::Part<'_>> {
+    use super::stream::Part;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while let Some(found) = command[at..].find("}\r\n") {
+        let close = at + found;
+        let after = close + 3;
+        let literal = command[..close].rfind('{').and_then(|open| {
+            let digits = &command[open + 1..close];
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.parse::<usize>().ok())
+                .flatten()
+                .filter(|n| after + n <= command.len() && command.is_char_boundary(after + n))
+                .map(|n| (open, n))
+        });
+        match literal {
+            Some((open, n)) => {
+                // `Literals::command` announces each literal itself.
+                parts.push(Part::Text(&command[start..open]));
+                parts.push(Part::Literal(command[after..after + n].as_bytes()));
+                start = after + n;
+                at = start;
+            }
+            None => at = after,
+        }
+    }
+    if parts.is_empty() {
+        return vec![Part::Text(command)];
+    }
+    parts.push(Part::Text(&command[start..]));
+    parts
 }
 /// `CHARSET UTF-8 ` when a search has non-ASCII text and UTF8=ACCEPT is
 /// off (with it on, a CHARSET is not used).
@@ -410,6 +491,7 @@ pub(crate) fn search_charset(criteria: &str, utf8: bool) -> &'static str {
 /// RFC 5256) when it can; else by UID.
 pub(crate) fn sorted_search(
     session: &mut ImapSession,
+    literals: Option<&super::stream::Literals>,
     ext: &Extensions,
     selected: &Selected,
     criteria: &str,
@@ -423,9 +505,11 @@ pub(crate) fn sorted_search(
         } else {
             "UTF-8"
         };
-        let data = session.run_command_and_read_response(format!(
-            "UID SORT (REVERSE DATE) {charset} {criteria}"
-        ))?;
+        let data = run_with_literals(
+            session,
+            literals,
+            &format!("UID SORT (REVERSE DATE) {charset} {criteria}"),
+        )?;
         let mut out = Vec::new();
         for line in other_lines(&data, "SORT")? {
             // With CONDSTORE, a MODSEQ search adds `(MODSEQ n)` at the
@@ -441,7 +525,7 @@ pub(crate) fn sorted_search(
         return Ok(out);
     }
     let charset = search_charset(criteria, utf8);
-    let mut uids = search_uids(session, ext, selected, &format!("{charset}{criteria}"))?;
+    let mut uids = search_uids(session, literals, ext, selected, &format!("{charset}{criteria}"))?;
     uids.reverse();
     Ok(uids)
 }
@@ -452,6 +536,7 @@ pub(crate) fn sorted_search(
 /// search matching most of a large mailbox doesn't bring back every UID.
 pub(crate) fn newest_search(
     session: &mut ImapSession,
+    literals: Option<&super::stream::Literals>,
     ext: &Extensions,
     selected: &Selected,
     criteria: &str,
@@ -464,30 +549,34 @@ pub(crate) fn newest_search(
     // only `limit` UIDs.
     if ext.sort && ext.esort && ext.partial && limit > 0 {
         let charset = if utf8 || !criteria.is_ascii() { "UTF-8" } else { "US-ASCII" };
-        let data = session.run_command_and_read_response(format!(
-            "UID SORT RETURN (COUNT PARTIAL 1:{limit}) (REVERSE DATE) {charset} {criteria}"
-        ))?;
+        let data = run_with_literals(
+            session,
+            literals,
+            &format!("UID SORT RETURN (COUNT PARTIAL 1:{limit}) (REVERSE DATE) {charset} {criteria}"),
+        )?;
         let (page, count) = partial_uids(&data)?;
         let count = count.unwrap_or(page.len());
         if page.is_empty() {
             return Ok((page, count));
         }
         let set = super::imap::uid_ranges(&page);
-        let ordered = sorted_search(session, ext, selected, &format!("UID {set}"), utf8)?;
+        let ordered = sorted_search(session, literals, ext, selected, &format!("UID {set}"), utf8)?;
         return Ok((ordered.into_iter().take(limit).collect(), count));
     }
     if !ext.sort && ext.partial && ext.esearch && limit > 0 {
         let charset = search_charset(criteria, utf8);
-        let data = session.run_command_and_read_response(format!(
-            "UID SEARCH RETURN (COUNT PARTIAL -1:-{limit}) {charset}{criteria}"
-        ))?;
+        let data = run_with_literals(
+            session,
+            literals,
+            &format!("UID SEARCH RETURN (COUNT PARTIAL -1:-{limit}) {charset}{criteria}"),
+        )?;
         let (mut uids, count) = partial_uids(&data)?;
         uids.sort_unstable_by(|a, b| b.cmp(a));
         uids.truncate(limit);
         let count = count.unwrap_or(uids.len());
         return Ok((uids, count));
     }
-    let uids = sorted_search(session, ext, selected, criteria, utf8)?;
+    let uids = sorted_search(session, literals, ext, selected, criteria, utf8)?;
     let total = uids.len();
     Ok((uids.into_iter().take(limit).collect(), total))
 }
@@ -574,15 +663,23 @@ pub(crate) struct Resync {
 /// validity still matches, the server answers with VANISHED (EARLIER) for
 /// what was removed and FETCH for what changed since `modseq`. Returns
 /// the selected state, and the resync when the validity matched.
+/// `known` are the UIDs kept here (RFC 7162 §3.2.5.1's known-uids): the
+/// server reports as VANISHED only those, not every UID ever removed.
 pub(crate) fn select_qresync(
     session: &mut ImapSession,
     name: &str,
     utf8: bool,
     validity: u32,
     modseq: u64,
+    known: &[u32],
 ) -> Result<(Selected, Option<Resync>)> {
     let wire = wire_name(name, utf8);
-    let command = format!("SELECT {} (QRESYNC ({validity} {modseq}))", quote(&wire)?);
+    let known = if known.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", super::imap::uid_ranges(known))
+    };
+    let command = format!("SELECT {} (QRESYNC ({validity} {modseq}{known}))", quote(&wire)?);
     let data = session.run_command_and_read_response(command)?;
     // Where a mailbox was selected before, its end is marked `[CLOSED]`
     // (RFC 7162 §3.2.11): what came before is about that one, not this.
@@ -648,6 +745,8 @@ pub(crate) fn get_metadata(
         Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => return Ok(vec![]),
         Err(e) => return Err(e.into()),
     };
+    // A reply the stream couldn't make readable is an error, not no notes.
+    other_lines(&data, "METADATA")?;
     let mut out = Vec::new();
     for response in responses(&data)? {
         if let imap_proto::Response::MailboxData(imap_proto::MailboxDatum::MetadataSolicited {
@@ -693,24 +792,41 @@ pub(crate) fn notify_personal(session: &mut ImapSession, condstore: bool) -> Res
     } else {
         "MessageNew MessageExpunge"
     };
-    let command = format!(
-        "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
-         (PERSONAL ({others}))"
-    );
-    match session.run_command_and_check_ok(&command) {
-        Ok(()) => Ok(true),
-        // [BADEVENT]: the server named what it can report; ask again
-        // for the essentials alone.
-        Err(imap::error::Error::No(e) | imap::error::Error::Bad(e))
-            if e.to_ascii_uppercase().contains("BADEVENT") =>
-        {
-            super::imap::optional(session.run_command_and_check_ok(
-                "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge)) \
-                 (PERSONAL (MessageNew MessageExpunge))",
-            ))
+    // Folders made, renamed or deleted, and subscriptions changed, come as
+    // untagged LIST lines (MailboxName, SubscriptionChange; RFC 5465 §5.4
+    // and §5.5); see `mailbox_list_changed`.
+    let commands = [
+        format!(
+            "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
+             (PERSONAL ({others} MailboxName SubscriptionChange))"
+        ),
+        format!(
+            "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
+             (PERSONAL ({others}))"
+        ),
+        "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge)) \
+         (PERSONAL (MessageNew MessageExpunge))"
+            .to_owned(),
+    ];
+    for command in &commands {
+        match session.run_command_and_check_ok(command) {
+            Ok(()) => return Ok(true),
+            // [BADEVENT] (RFC 5465 §6): the server can't report one of
+            // those; ask again for less.
+            Err(imap::error::Error::No(e) | imap::error::Error::Bad(e))
+                if e.to_ascii_uppercase().contains("BADEVENT") => {}
+            Err(e) => return super::imap::optional(Err(e)),
         }
-        Err(e) => super::imap::optional(Err(e)),
     }
+    Ok(false)
+}
+/// Whether a NOTIFY session heard a mailbox made, renamed, deleted or
+/// (un)subscribed (an untagged LIST line, RFC 5465 §5.4 and §5.5): the
+/// folder list should be read again. One answer for however many lines.
+pub(crate) fn mailbox_list_changed(heard: &[u8]) -> bool {
+    String::from_utf8_lossy(heard).lines().any(|line| {
+        line.get(..7).is_some_and(|start| start.eq_ignore_ascii_case("* LIST "))
+    })
 }
 /// Whether a NOTIFY session lost events ([NOTIFICATIONOVERFLOW], RFC 5465
 /// §5.8): the server stopped notifying, and every mailbox may have
@@ -907,6 +1023,47 @@ fn mailparse_decode(value: &str) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
+/// The decoded sizes of a message's parts `sections` ("1.2"), where the
+/// server can say (BINARY.SIZE, RFC 3516 §4.2), in one FETCH: exact where
+/// the transfer encoding's size is only an estimate. Parts the server
+/// can't decode ([UNKNOWN-CTE]) or doesn't answer for are left out.
+pub(crate) fn binary_sizes(
+    session: &mut ImapSession,
+    uid: u32,
+    sections: &[&str],
+) -> Result<std::collections::HashMap<String, u64>> {
+    let mut out = std::collections::HashMap::new();
+    let sections: Vec<&str> = sections
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .collect();
+    if sections.is_empty() {
+        return Ok(out);
+    }
+    let items: Vec<String> = sections.iter().map(|s| format!("BINARY.SIZE[{s}]")).collect();
+    let data = match session.run_command_and_read_response(format!("UID FETCH {uid} (UID {})", items.join(" "))) {
+        Ok(data) => data,
+        Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for response in responses(&data)? {
+        let imap_proto::Response::Fetch(_, attributes) = response else {
+            continue;
+        };
+        if !attributes.contains(&imap_proto::AttributeValue::Uid(uid)) {
+            continue;
+        }
+        for a in &attributes {
+            if let imap_proto::AttributeValue::BinarySize { section, size } = a {
+                let name: Vec<String> = section.iter().map(u32::to_string).collect();
+                out.insert(name.join("."), u64::from(*size));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// One part of a message, decoded: by the server where it can (BINARY,
 /// RFC 3516), else fetched as it is and decoded here.
 pub(crate) fn fetch_part(
@@ -1013,12 +1170,23 @@ mod tests {
         );
         assert_eq!(rfc2231(&[("name", "plain.txt")], "name"), None);
     }
+    /// RFC 3516 §4.2: BINARY.SIZE replies, as the parser reads them.
+    #[test]
+    fn binary_sizes_are_read() {
+        let data = b"* 3 FETCH (UID 9 BINARY.SIZE[2] 1024 BINARY.SIZE[3.1] 77)\r\n";
+        let imap_proto::Response::Fetch(_, attributes) = &responses(data).unwrap()[0] else {
+            panic!("not a fetch")
+        };
+        assert!(attributes.contains(&imap_proto::AttributeValue::BinarySize { section: vec![3, 1], size: 77 }));
+    }
     #[test]
     fn closed_splits_a_reselect_and_overflow_is_seen() {
         let data = b"* 3 FETCH (UID 9 FLAGS ())\r\n* OK [CLOSED] previous mailbox\r\n* 1 EXISTS\r\n";
         assert_eq!(after_closed(data), b"* 1 EXISTS\r\n");
         assert_eq!(after_closed(b"* 1 EXISTS\r\n"), b"* 1 EXISTS\r\n");
         assert!(notification_overflow(b"* OK [NOTIFICATIONOVERFLOW] lost\r\n"));
+        assert!(mailbox_list_changed(b"* LIST () \"/\" \"Projects/2027\"\r\n* list (\\NonExistent) \"/\" Old\r\n"));
+        assert!(!mailbox_list_changed(b"* STATUS Work (MESSAGES 4)\r\n* 3 EXISTS\r\n"));
         assert!(!notification_overflow(b"* OK still here\r\n"));
     }
     use super::*;
@@ -1066,6 +1234,22 @@ mod tests {
         assert!(decode_part(b"x", "7bit\r\nContent-Type: text/html").is_err());
         // Line breaks only as literals' own, of their stated length.
         assert!(literals_only("TEXT {3+}\r\nabc SUBJECT {2+}\r\nhi"));
+        assert!(literals_only("TEXT {5}\r\ncaf\u{e9}"));
+        // 8-bit text is a literal: LITERAL+ where it can, else synchronizing.
+        let plain = Extensions::default();
+        let plus = Extensions { literal_plus: true, ..Extensions::default() };
+        assert_eq!(search_string("caf\u{e9}", &plain, false).unwrap(), "{5}\r\ncaf\u{e9}");
+        assert_eq!(search_string("caf\u{e9}", &plus, false).unwrap(), "{5+}\r\ncaf\u{e9}");
+        assert_eq!(search_string("caf\u{e9}", &plain, true).unwrap(), "\"caf\u{e9}\"");
+        assert_eq!(search_string("a \"b\"", &plain, false).unwrap(), "\"a \\\"b\\\"\"");
+        use super::super::stream::Part;
+        let parts = synchronizing_parts("UID SEARCH TEXT {5}\r\ncaf\u{e9} FROM {2+}\r\n\u{e9}");
+        assert!(matches!(
+            parts.as_slice(),
+            [Part::Text("UID SEARCH TEXT "), Part::Literal(l), Part::Text(" FROM {2+}\r\n\u{e9}")]
+                if *l == "caf\u{e9}".as_bytes()
+        ));
+        assert!(matches!(synchronizing_parts("UID SEARCH ALL").as_slice(), [Part::Text("UID SEARCH ALL")]));
         assert!(literals_only("TEXT \"a\""));
         assert!(!literals_only("TEXT {3+}\r\nabc\r\nLOGOUT"));
         assert!(!literals_only("TEXT {9+}\r\nab\r\nLOGOUT"));

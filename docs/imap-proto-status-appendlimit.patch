@@ -1,0 +1,53 @@
+Picacho-Patches imap-proto patch 0009 (draft): STATUS's APPENDLIMIT (RFC 7889 §4) parses as StatusAttribute::AppendLimit(Option<u64>) (None for NIL); without it a STATUS or LIST-STATUS reply carrying APPENDLIMIT fails to parse. Applies on top of 0001-0007 (independent of 0008), in crate/ (-p1 from crate/).
+
+diff -ru a/src/parser/rfc3501.rs d/src/parser/rfc3501.rs
+--- a/src/parser/rfc3501.rs	2026-11-23 01:46:51.003966558 -0700
++++ d/src/parser/rfc3501.rs	2026-11-23 02:42:18.475075167 -0700
+@@ -279,6 +279,13 @@
+         tag_no_case!("SIZE ") >>
+         val: number_64 >>
+         (StatusAttribute::Size(val))
++    ) |
++    // APPENDLIMIT (RFC 7889 §4, Picacho patch 0009): the largest message
++    // this mailbox takes, or NIL for no limit.
++    do_parse!(
++        tag_no_case!("APPENDLIMIT ") >>
++        val: alt!(map!(number_64, Some) | map!(tag_no_case!("NIL"), |_| None)) >>
++        (StatusAttribute::AppendLimit(val))
+     )
+ ));
+ 
+@@ -655,6 +662,22 @@
+             },
+             rsp => panic!("unexpected response {:?}", rsp),
+         }
++    }
++
++    #[test]
++    fn test_status_appendlimit() {
++        match parse_response(b"* STATUS INBOX (MESSAGES 3 APPENDLIMIT 1048576)\r\n") {
++            Ok((_, Response::MailboxData(MailboxDatum::Status { status, .. }))) => {
++                assert_eq!(status, [StatusAttribute::Messages(3), StatusAttribute::AppendLimit(Some(1048576))]);
++            },
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
++        match parse_response(b"* STATUS Archive (APPENDLIMIT NIL)\r\n") {
++            Ok((_, Response::MailboxData(MailboxDatum::Status { status, .. }))) => {
++                assert_eq!(status, [StatusAttribute::AppendLimit(None)]);
++            },
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
+     }
+ 
+     #[test]
+diff -ru a/src/types.rs d/src/types.rs
+--- a/src/types.rs	2026-11-23 01:46:51.003990483 -0700
++++ d/src/types.rs	2026-11-23 02:42:18.475113269 -0700
+@@ -70,6 +70,7 @@
+     UidValidity(u32),
+     Unseen(u32),
+     Size(u64), // RFC 8438 (Picacho patch)
++    AppendLimit(Option<u64>), // RFC 7889 (Picacho patch 0009); None: NIL
+ }
+ 
+ #[derive(Debug, Eq, PartialEq)]

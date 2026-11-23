@@ -205,6 +205,9 @@ fn imap_tls_sync_read_flags_move_and_reconcile() -> Result<()> {
     });
     let (b, mut a, path) = backend(&cert)?;
     a.incoming_port = port;
+    // Every message downloads in the background, however old the fixed
+    // dates below are by the time this runs (the default is 30 days).
+    a.sync.offline_days = 0;
     let result = (|| -> Result<()> {
         let messages = b.sync(&a, Folder::Inbox, 300)?;
         assert_eq!(messages.len(), 1);

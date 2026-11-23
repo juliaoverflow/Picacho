@@ -1055,6 +1055,7 @@ impl Backend {
                 .map(|(used, max)| Quota {
                     used_kib: used / 1024,
                     limit_kib: max / 1024,
+                    ..Quota::default()
                 }))
         })
     }

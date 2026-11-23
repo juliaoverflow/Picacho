@@ -6,7 +6,7 @@
 //! (decoded by the server with BINARY where it can), and each attachment
 //! downloads by itself when saved.
 use super::*;
-use crate::sync::transport::{Leaf, decode_part, fetch_part, fetch_range, structure};
+use crate::sync::transport::{Leaf, binary_sizes, decode_part, fetch_part, fetch_range, structure};
 
 /// The largest message downloaded whole: the largest the cache reads back.
 pub(super) const MAX_DOWNLOAD: usize = super::store::MAX_SOURCE as usize;
@@ -175,6 +175,18 @@ impl Backend {
             && let Some(html) = &html
         {
             body = Some(html_to_text(html));
+        }
+        // Exact decoded sizes where the server can say (BINARY.SIZE, RFC
+        // 3516 §4.2), in place of the estimate from the encoded size.
+        if ext.binary && !attachments.is_empty() {
+            let sections: Vec<&str> = attachments.iter().map(|a| a.section.as_str()).collect();
+            if let Ok(sizes) = binary_sizes(&mut c.session, m.uid, &sections) {
+                for attachment in &mut attachments {
+                    if let Some(size) = sizes.get(&attachment.section) {
+                        attachment.size = *size as usize;
+                    }
+                }
+            }
         }
         next.snippet = body.as_deref().map(snippet).unwrap_or_default();
         next.body = body.or_else(|| Some(String::new()));

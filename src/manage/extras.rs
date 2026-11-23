@@ -74,22 +74,30 @@ impl Backend {
         let _ = self.change_many(a, &[m], Change::Mark(mark));
     }
     /// Sends the read receipt `m`'s sender asked for (RFC 8098), then
-    /// marks it $MDNSent so no mail app asks again.
+    /// marks it $MDNSent so no mail app asks again. It goes to every
+    /// address the message named (RFC 8098 §2.1), in one report.
     pub fn send_receipt(&self, a: &Account, m: &Mail) -> Result<()> {
-        let to = m.receipt_to().trim().to_owned();
+        let to: Vec<String> = m
+            .receipt_to()
+            .split(", ")
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect();
         ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
-        // The address is the sender's to write: checked for every provider,
-        // not only for SMTP's envelope (`deliver_raw`).
-        // One plain address: list separators, quotes or a second `@` could
-        // make more than one recipient of it for some servers.
-        ensure!(
-            !to.contains(|c: char| {
-                c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"' | '(' | ')')
-            }) && to.matches('@').count() == 1
-                && !to.starts_with('@')
-                && !to.ends_with('@'),
-            "The read receipt's address “{to}” isn't valid."
-        );
+        // The addresses are the sender's to write: checked for every
+        // provider, not only for SMTP's envelope (`deliver_raw`).
+        // Plain addresses: list separators, quotes or a second `@` could
+        // make more recipients of one for some servers.
+        for to in &to {
+            ensure!(
+                !to.contains(|c: char| {
+                    c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"' | '(' | ')')
+                }) && to.matches('@').count() == 1
+                    && !to.starts_with('@')
+                    && !to.ends_with('@'),
+                "The read receipt's address “{to}” isn't valid."
+            );
+        }
         ensure!(m.account == a.id, "Message belongs to another account");
         // Original-Recipient, where the receiving server noted it (RFC
         // 8098 §3.2.3: copied into the report when present).
@@ -104,10 +112,11 @@ impl Backend {
             })
             .unwrap_or_default();
         let raw = crate::sync::smtp::receipt(a, m, &to, &original_recipient);
+        let to_all = to;
         if a.provider == Provider::Proton {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
-            self.send_proton(a, &a.email, &[to], &raw)?;
+            self.send_proton(a, &a.email, &to_all, &raw)?;
         } else if a.provider == Provider::Jmap {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
@@ -135,7 +144,7 @@ impl Backend {
                 Ok(true)
             })?;
             if !by_server {
-                self.send_jmap(a, &a.email, &[to], &raw, &Default::default())?;
+                self.send_jmap(a, &a.email, &to_all, &raw, &Default::default())?;
             }
         } else {
             let lock = self.account_lock(&a.id);
@@ -147,7 +156,7 @@ impl Backend {
             crate::sync::smtp::deliver_raw(
                 a,
                 "",
-                &[to],
+                &to_all,
                 &raw,
                 &crate::sync::smtp::Endpoint::of(a),
                 &secret,
@@ -351,6 +360,53 @@ impl Backend {
                 }
             }
             Ok(notes)
+        })
+    }
+}
+
+/// Mailbox access lists (ACL, RFC 4314). Backend-only until the UI calls
+/// them: nothing in the app offers sharing a mailbox yet.
+#[allow(dead_code)]
+impl Backend {
+    /// Who may do what in one of the account's server mailboxes (ACL's
+    /// GETACL, RFC 4314): identifiers with their rights' letters.
+    pub fn mailbox_acl(&self, a: &Account, mailbox: &str) -> Result<Vec<(String, String)>> {
+        self.with_acl(a, mailbox, |c, wire| crate::sync::transport::get_acl(&mut c.session, wire))
+    }
+    /// Sets (`Some`, letters or `+`/`-` changes) or removes (`None`) an
+    /// identifier's rights in a mailbox (SETACL, DELETEACL). The rights
+    /// themselves need `a` there (RFC 4314 §4).
+    pub fn set_mailbox_acl(&self, a: &Account, mailbox: &str, identifier: &str, rights: Option<&str>) -> Result<()> {
+        self.with_acl(a, mailbox, |c, wire| match rights {
+            Some(rights) => crate::sync::transport::set_acl(&mut c.session, wire, identifier, rights),
+            None => crate::sync::transport::delete_acl(&mut c.session, wire, identifier),
+        })
+    }
+    /// What `identifier` can be given in a mailbox (LISTRIGHTS): what it
+    /// always has, and the groups of rights that can be granted.
+    pub fn mailbox_listrights(
+        &self,
+        a: &Account,
+        mailbox: &str,
+        identifier: &str,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        self.with_acl(a, mailbox, |c, wire| crate::sync::transport::list_rights(&mut c.session, wire, identifier))
+    }
+    /// Runs an ACL command for `mailbox` (as the cache names it) on an IMAP
+    /// account whose server has ACL.
+    fn with_acl<T>(
+        &self,
+        a: &Account,
+        mailbox: &str,
+        work: impl FnOnce(&mut Connection, &str) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(a.provider.imap(), "Only IMAP mailboxes have access lists here.");
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_imap(a, |c| {
+            ensure!(c.extensions()?.acl, "This server doesn't share mailboxes (no ACL).");
+            let wire = c.wire(mailbox);
+            work(c, &wire)
         })
     }
 }

@@ -1,0 +1,90 @@
+Picacho-Patches imap-proto patch 0008 (draft): untagged extension replies (resp_other) keep their literals ({n}, {n+}, ~{n}) whole, line breaks included, instead of ending at the first CRLF. Applies on top of 0001-0007, in crate/ (-p1 from crate/).
+
+--- a/src/parser/rfc3501.rs	2026-11-23 01:46:51.003966558 -0700
++++ b/src/parser/rfc3501.rs	2026-11-23 01:47:12.398332144 -0700
+@@ -569,11 +569,54 @@
+             tag_no_case!("URLFETCH") |
+             tag_no_case!("ENABLED")
+         ),
+-        text
++        other_text
+     )),
+     |line| str::from_utf8(line).map(Response::Other)
+ ));
+ 
++// The rest of an extension's untagged line (Picacho patch 0008): text, in
++// which each literal (`{n}` or literal8's `~{n}`, then CRLF and n bytes;
++// RFC 9051 §4.3, RFC 3516) is kept whole, line breaks and all, so the
++// response doesn't end inside it. Incomplete until the literal's bytes and
++// the line after it have arrived, which makes `imap` read on.
++fn other_text(i: &[u8]) -> IResult<&[u8], &[u8]> {
++    let mut at = 0;
++    loop {
++        let end = match i[at..].iter().position(|b| *b == b'\r' || *b == b'\n') {
++            Some(p) => at + p,
++            None => return Err(nom::Err::Incomplete(nom::Needed::Unknown)),
++        };
++        match announced_literal(&i[at..end]) {
++            Some(n) if i[end..].starts_with(b"\r\n") => {
++                let start = end + 2;
++                if i.len() < start + n {
++                    return Err(nom::Err::Incomplete(nom::Needed::Size(start + n - i.len())));
++                }
++                at = start + n;
++            }
++            _ => return Ok((&i[end..], &i[..end])),
++        }
++    }
++}
++
++// The size of the literal announced at the end of `text` (`{n}`, `{n+}`
++// or `~{n}`), if one is.
++fn announced_literal(text: &[u8]) -> Option<usize> {
++    if text.last() != Some(&b'}') {
++        return None;
++    }
++    let body = &text[..text.len() - 1];
++    let open = body.iter().rposition(|b| *b == b'{')?;
++    let mut digits = &body[open + 1..];
++    if digits.last() == Some(&b'+') {
++        digits = &digits[..digits.len() - 1];
++    }
++    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    str::from_utf8(digits).ok()?.parse().ok()
++}
++
+ named!(response_data<Response>, do_parse!(
+     tag!("* ") >>
+     contents: alt!(
+@@ -656,6 +699,29 @@
+             rsp => panic!("unexpected response {:?}", rsp),
+         }
+     }
++
++    #[test]
++    fn test_other_with_literals() {
++        match parse_response(b"* NAMESPACE (({6}\r\nINBOX. \".\")) NIL NIL\r\n") {
++            Ok((rest, Response::Other(line))) => {
++                assert!(rest.is_empty());
++                assert_eq!(line, "NAMESPACE (({6}\r\nINBOX. \".\")) NIL NIL");
++            },
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
++        match parse_response(b"* ID (\"name\" ~{4}\r\na\r\nb)\r\n") {
++            Ok((rest, Response::Other(line))) => {
++                assert!(rest.is_empty());
++                assert_eq!(line, "ID (\"name\" ~{4}\r\na\r\nb)");
++            },
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
++        // Until the literal has arrived, more is needed.
++        match parse_response(b"* MYRIGHTS {5}\r\nIN") {
++            Err(nom::Err::Incomplete(_)) => {},
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
++    }
+ 
+     #[test]
+     fn test_status_size_and_urlauth() {

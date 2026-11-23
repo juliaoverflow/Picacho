@@ -80,6 +80,9 @@ impl Backend {
                     back += 1;
                     continue;
                 }
+                // COPY alone (above) leaves the mailbox as it is; moving
+                // out of it changes it.
+                c.require_writable("move messages back")?;
                 if c.extensions()?.moves {
                     c.session
                         .run_command_and_check_ok(format!("UID MOVE {set} {wire}"))?;

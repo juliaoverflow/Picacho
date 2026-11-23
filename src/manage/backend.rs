@@ -444,7 +444,9 @@ impl Backend {
         a: &Account,
         password: &str,
     ) -> Result<PopSession<native_tls::TlsStream<crate::sync::wire::Wire>>> {
-        pop_login(a, password, &self.tls_connector()?)
+        let session = pop_login(a, password, &self.tls_connector()?)?;
+        self.note_pop_login(a, session.limits().login_delay);
+        Ok(session)
     }
     /// Signs in and checks the incoming server, then saves the account. For
     /// browser and Pinal sign-in, the returned account names the address
@@ -648,6 +650,8 @@ impl Backend {
     fn check_login(&self, account: &Account, secret: &mut Secret) -> Result<()> {
         if account.provider == Provider::Pop3 {
             let mut pop = self.pop_login(account, pop_secret(account, secret))?;
+            // The mailbox opens, not just the sign-in (STAT, RFC 1939 §5).
+            pop.stat()?;
             let _ = pop.command("QUIT");
             return Ok(());
         }
@@ -1507,7 +1511,19 @@ impl Backend {
             .filter(|s| c.enabled.qresync && s.days == a.sync.days && s.uid_next > 0)
             .and_then(|s| s.modseq.map(|m| (s.validity, m)));
         let (selected, resync) = match resync_from {
-            Some((validity, modseq)) => c.select_resync(remote, validity, modseq)?,
+            Some((validity, modseq)) => {
+                // The UIDs kept here (known-uids, RFC 7162 §3.2.5.1): only
+                // their removals are reported, not every UID ever removed.
+                let prefix = format!("{}:{remote}:{validity}:", a.id);
+                let mut known: Vec<u32> = self
+                    .store
+                    .cached_ids(&a.id, &prefix)?
+                    .iter()
+                    .filter_map(|id| id.strip_prefix(&prefix)?.parse().ok())
+                    .collect();
+                known.sort_unstable();
+                c.select_resync(remote, validity, modseq, &known)?
+            }
             None => (c.select(remote)?, None),
         };
         let Some((state, uid_next)) = state.zip(selected.uid_next).filter(|(state, next)| {
@@ -1927,7 +1943,7 @@ impl Backend {
             return Ok(Catalog::default());
         }
         let mut pop = self.pop_login(a, password)?;
-        let ids = pop.uidl()?;
+        let ids = pop.identities(256 * 1024)?;
         let prefix = format!("{}:pop:", a.id);
         let cached = self.store.cached_ids(&a.id, &prefix)?;
         let missing: Vec<&(u32, String)> = ids
@@ -1939,12 +1955,16 @@ impl Backend {
         // Headers alone where TOP works: a batch costs a few KB each.
         let sizes = if missing.is_empty() { Default::default() } else { pop.list()? };
         let mut headers = Vec::new();
-        let mut whole = false;
-        for (number, uid) in missing.iter().take(batch.min(200)) {
-            let Some(top) = pop.top(*number, 256 * 1024)? else {
-                whole = true;
-                break;
-            };
+        let listing: Vec<&(u32, String)> = missing.iter().take(batch.min(200)).copied().collect();
+        let numbers: Vec<u32> = listing.iter().map(|(n, _)| *n).collect();
+        // Many at a time where the server pipelines (RFC 2449 §6.6).
+        let tops = if numbers.is_empty() { Some(Vec::new()) } else { pop.top_many(&numbers, 256 * 1024)? };
+        let whole = tops.is_none();
+        for ((number, uid), top) in listing.iter().zip(tops.unwrap_or_default()) {
+            // Refused (gone meanwhile): listed with the next check.
+            if top.is_empty() {
+                continue;
+            }
             let id = format!("{prefix}{uid}");
             let mut m = parse_message(&top, a, &id, Folder::Inbox, "INBOX", *number)?;
             // The header block isn't its text: no snippet or body yet.
@@ -2032,7 +2052,8 @@ impl Backend {
                 m.starred = row.flagged();
                 m.answered = row.answered();
                 m.forwarded = row.forwarded();
-                m.mdn_sent = row.mdn_sent();
+                // Kept once handled here; see `Store::apply_changes`.
+                m.mdn_sent |= row.mdn_sent();
                 if let Some(labels) = row.labels(gmail) {
                     m.set_labels(labels);
                 }
@@ -2171,6 +2192,7 @@ impl Backend {
             m.starred = row.flagged();
             m.size = row.size.unwrap_or(0);
             m.gmail_id = row.gmail_id.unwrap_or(0);
+            m.set_email_id(row.email_id.clone().unwrap_or_default());
             m.set_labels(row.labels(gmail).unwrap_or_default());
             m.answered = row.answered();
             m.forwarded = row.forwarded();
@@ -2212,7 +2234,7 @@ impl Backend {
             .context("This message isn't from this POP3 account.")?;
         let secret = self.credentials(a)?;
         let mut pop = self.pop_login(a, pop_secret(a, &secret))?;
-        let ids = pop.uidl()?;
+        let ids = pop.identities(256 * 1024)?;
         // Message numbers last only for a session: find it by UIDL.
         let (number, _) = ids
             .iter()
@@ -2240,7 +2262,7 @@ impl Backend {
             return self.store.newest(&a.id, folder, limit);
         }
         let mut pop = self.pop_login(a, password)?;
-        let ids = pop.uidl()?;
+        let ids = pop.identities(256 * 1024)?;
         let mut erased = self.pop_erased(&a.id);
         // Forget deletions of mail no longer on the server.
         let before = erased.len();
@@ -2410,12 +2432,23 @@ impl Backend {
         let mut stored = 0;
         let mut pending: Vec<&Mail> = Vec::new();
         for m in mails {
-            // A Gmail message appears once per label: download it once.
+            // A Gmail message appears once per label: download it once. The
+            // same for one message in several mailboxes (OBJECTID's EMAILID).
             if m.gmail_id != 0 {
                 if pending.iter().any(|p| p.gmail_id == m.gmail_id) {
                     continue;
                 }
                 if let Some(raw) = self.store.gmail_raw(&a.id, m.gmail_id)? {
+                    self.store.save_raw(&m.id, &raw)?;
+                    stored += 1;
+                    continue;
+                }
+            }
+            if !m.email_id().is_empty() {
+                if pending.iter().any(|p| p.email_id() == m.email_id()) {
+                    continue;
+                }
+                if let Some(raw) = self.store.email_raw(&a.id, m.email_id())? {
                     self.store.save_raw(&m.id, &raw)?;
                     stored += 1;
                     continue;
@@ -2513,6 +2546,12 @@ impl Backend {
             if next.list_unsubscribe.is_empty() {
                 next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
                 next.one_click = parsed.one_click;
+            }
+            if next.list_id().is_empty() {
+                next.set_list_id(parsed.list_id());
+            }
+            if next.list_links().is_empty() {
+                next.set_list_links(parsed.list_links().to_vec());
             }
             self.store.save_messages(&[next])?;
         }
@@ -2747,8 +2786,13 @@ impl Backend {
                 self.store.save_messages(std::slice::from_ref(&next))?;
                 return Ok(next);
             }
-            let raw = match self.store.gmail_raw(&a.id, m.gmail_id)? {
-                // The same Gmail message, already downloaded under another label.
+            let shared = match self.store.gmail_raw(&a.id, m.gmail_id)? {
+                Some(raw) => Some(raw),
+                None => self.store.email_raw(&a.id, m.email_id())?,
+            };
+            let raw = match shared {
+                // The same message, already downloaded under another label
+                // (Gmail) or in another mailbox (EMAILID).
                 Some(raw) => raw,
                 // Large messages download in pieces that resume after an
                 // interruption; others in one request.
@@ -3219,7 +3263,12 @@ impl Backend {
     ) -> Result<()> {
         for (number, _) in deleting {
             // A refused DELE (already marked, say) leaves the rest to go.
-            pop.dele(*number)?;
+            if let Err(e) = pop.dele(*number) {
+                // Anything else is unknown: unmark what was marked (RSET,
+                // RFC 1939 §5), so a QUIT can't remove only some of them.
+                let _ = pop.rset();
+                return Err(e);
+            }
         }
         pop.quit()
             .context("The POP3 server didn't confirm deleting downloaded mail; it is checked again next time.")
@@ -3251,7 +3300,7 @@ impl Backend {
                 // worth failing the account's settings over.
                 return Ok(c.total_size_kib().ok().flatten().map(|used_kib| Quota {
                     used_kib,
-                    limit_kib: 0,
+                    ..Quota::default()
                 }));
             }
             // The standard folders' own roots too, where they differ from
@@ -3391,6 +3440,11 @@ impl Backend {
         }
         for (first, uids) in groups {
             let selected = c.select_for(first)?;
+            c.require_writable(match &change {
+                Change::Move(_) | Change::MoveTo(_) => "move messages out",
+                Change::Label(..) => "change labels",
+                _ => "change messages",
+            })?;
             if target.is_some() {
                 c.require_rights(&first.remote_folder, "te", "remove messages")?;
             }
@@ -3614,6 +3668,7 @@ impl Backend {
             self.with_imap(a, |c| {
                 let remote = remote_name(c.names(false)?, a, mailbox)?;
                 c.selected(&remote)?;
+                c.require_writable("mark messages read")?;
                 let unseen: Vec<u32> = c.uid_search("UNSEEN")?.into_iter().collect();
                 if !unseen.is_empty() {
                     c.session
@@ -3645,7 +3700,7 @@ impl Backend {
             return self.download_batch_jmap(a, max, since);
         }
         // A Gmail message appears once per label; download it only once.
-        let shared = if a.provider == Provider::Gmail {
+        let mut shared = if a.provider == Provider::Gmail {
             self.store.share_gmail_raw(&a.id)?
         } else {
             0
@@ -3658,6 +3713,17 @@ impl Backend {
             }
             if m.gmail_id != 0 && pending.iter().any(|p| p.gmail_id == m.gmail_id) {
                 continue;
+            }
+            // Another mailbox's copy, downloaded already: shared, not fetched.
+            if !m.email_id().is_empty() {
+                if pending.iter().any(|p| p.email_id() == m.email_id()) {
+                    continue;
+                }
+                if let Some(raw) = self.store.email_raw(&a.id, m.email_id())? {
+                    self.store.save_raw(&m.id, &raw)?;
+                    shared += 1;
+                    continue;
+                }
             }
             budget = budget.saturating_sub(m.size as usize);
             pending.push(m);
@@ -4079,12 +4145,12 @@ impl Backend {
     /// with its Message-ID is already there (an earlier try may have
     /// succeeded without its reply arriving).
     fn file_sent_copy(&self, c: &mut Connection, a: &Account, raw: &[u8]) -> Result<()> {
-        if let Some(limit) = c.extensions()?.append_limit
+        let sent = c.standard_folder(a.provider, Folder::Sent)?;
+        if let Some(limit) = c.append_limit(&sent)?
             && raw.len() as u64 > limit
         {
             return Err(TooLargeForSent(limit).into());
         }
-        let sent = c.standard_folder(a.provider, Folder::Sent)?;
         let id = message_id_of(raw);
         if !id.is_empty() {
             c.select(&sent)?;
@@ -4166,12 +4232,12 @@ impl Backend {
         let original = self.catenated_original(a, d, &raw);
         // Filed and authorized; nothing has been sent yet.
         let filed = self.with_imap(a, |c| {
-            if let Some(limit) = c.extensions()?.append_limit
+            let sent = c.standard_folder(a.provider, Folder::Sent)?;
+            if let Some(limit) = c.append_limit(&sent)?
                 && raw.len() as u64 > limit
             {
                 bail!(TooLargeForSent(limit));
             }
-            let sent = c.standard_folder(a.provider, Folder::Sent)?;
             let wire = c.wire(&sent);
             let flags = [imap::types::Flag::Seen];
             let catenated = match &original {
@@ -4649,7 +4715,7 @@ impl Backend {
             }
             locals.extend(found);
             // Drafts written or changed here.
-            let limit = c.extensions()?.append_limit;
+            let limit = c.append_limit(&mailbox)?;
             // UIDs only grow: anything uploaded from here on is above this.
             let mut floor = on_server.last().copied().unwrap_or(0);
             for d in &locals {
@@ -4685,7 +4751,7 @@ impl Backend {
                     .filter(|(v, _)| *v == selected.validity)
                     .map(|(_, uid)| uid);
                 if replaced.is_none() {
-                    c.session.append_with_flags(&wire, &raw, &flags)?;
+                    c.append_heard(&wire, &raw, &flags)?;
                 }
                 // The new copy is the newest message carrying this draft's
                 // id: mail another app added meanwhile can't be taken for it.
@@ -5004,7 +5070,7 @@ fn search(c: &mut Connection, a: &Account, starred_only: bool) -> Result<Vec<u32
     }
     let ext = c.extensions()?;
     let selected = c.current().cloned().unwrap_or_default();
-    search_uids(&mut c.session, &ext, &selected, &query)
+    search_uids(&mut c.session, None, &ext, &selected, &query)
 }
 
 /// The server mailbox behind a mailbox view.

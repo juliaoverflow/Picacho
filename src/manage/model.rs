@@ -840,6 +840,14 @@ pub struct MailExtra {
     saved: i64,
     /// Where the sender asked for a read receipt (Disposition-Notification-To).
     receipt_to: String,
+    /// The mailing list it came through (List-Id, RFC 2919), lowercase.
+    list_id: String,
+    /// The list's other addresses (RFC 2369: List-Help, -Subscribe,
+    /// -Post, -Owner, -Archive), stored only, never opened by themselves.
+    list_links: Vec<crate::manage::list_headers::ListLink>,
+    /// The server's id for the message itself (OBJECTID's EMAILID, RFC
+    /// 8474 §5.1): the same in every mailbox of the account.
+    email_id: String,
 }
 impl MailExtra {
     fn is_empty(&self) -> bool {
@@ -850,6 +858,9 @@ impl MailExtra {
             && self.thread_id.is_empty()
             && self.saved == 0
             && self.receipt_to.is_empty()
+            && self.list_id.is_empty()
+            && self.list_links.is_empty()
+            && self.email_id.is_empty()
     }
 }
 
@@ -905,6 +916,29 @@ impl Mail {
     pub fn set_receipt_to(&mut self, receipt_to: impl Into<String>) {
         let receipt_to = receipt_to.into();
         self.change_extra(receipt_to.is_empty(), |e| e.receipt_to = receipt_to);
+    }
+    /// The mailing list it came through (List-Id), lowercase; empty if none.
+    pub fn list_id(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.list_id)
+    }
+    pub fn set_list_id(&mut self, list_id: impl Into<String>) {
+        let list_id = list_id.into();
+        self.change_extra(list_id.is_empty(), |e| e.list_id = list_id);
+    }
+    /// The list's help, subscribe, post, owner and archive addresses.
+    pub fn list_links(&self) -> &[crate::manage::list_headers::ListLink] {
+        self.extra.as_ref().map_or(&[], |e| &e.list_links)
+    }
+    pub fn set_list_links(&mut self, links: Vec<crate::manage::list_headers::ListLink>) {
+        self.change_extra(links.is_empty(), |e| e.list_links = links);
+    }
+    /// The server's EMAILID for it (OBJECTID); empty where unknown.
+    pub fn email_id(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.email_id)
+    }
+    pub fn set_email_id(&mut self, email_id: impl Into<String>) {
+        let email_id = email_id.into();
+        self.change_extra(email_id.is_empty(), |e| e.email_id = email_id);
     }
     /// Takes the attachments out, leaving none.
     pub fn take_attachments(&mut self) -> Vec<Attachment> {
@@ -984,6 +1018,12 @@ struct MailRecord {
     #[serde(default)]
     receipt_to: String,
     #[serde(default)]
+    list_id: String,
+    #[serde(default)]
+    list_links: Vec<crate::manage::list_headers::ListLink>,
+    #[serde(default)]
+    email_id: String,
+    #[serde(default)]
     mdn_sent: bool,
     #[serde(default)]
     partial: bool,
@@ -1032,6 +1072,12 @@ struct MailRecordRef<'a> {
     saved: i64,
     #[serde(skip_serializing_if = "no_text")]
     receipt_to: &'a str,
+    #[serde(skip_serializing_if = "no_text")]
+    list_id: &'a str,
+    #[serde(skip_serializing_if = "no_items")]
+    list_links: &'a [crate::manage::list_headers::ListLink],
+    #[serde(skip_serializing_if = "no_text")]
+    email_id: &'a str,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mdn_sent: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1053,6 +1099,9 @@ impl From<MailRecord> for Mail {
             thread_id: r.thread_id,
             saved: r.saved,
             receipt_to: r.receipt_to,
+            list_id: r.list_id,
+            list_links: r.list_links,
+            email_id: r.email_id,
         };
         Mail {
             id: r.id,
@@ -1121,6 +1170,9 @@ impl Serialize for Mail {
             thread_id: self.thread_id(),
             saved: self.saved(),
             receipt_to: self.receipt_to(),
+            list_id: self.list_id(),
+            list_links: self.list_links(),
+            email_id: self.email_id(),
             mdn_sent: self.mdn_sent,
             partial: self.partial,
         }
@@ -1758,6 +1810,30 @@ mod tests {
         );
     }
 
+    /// A mailing list's identity and links are kept (by name, the kind as
+    /// a word), and mail cached before them reads and writes as it did.
+    #[test]
+    fn list_headers_are_kept_in_the_cache() {
+        use crate::manage::list_headers::{ListLink, ListLinkKind};
+        let old: Mail = serde_json::from_str(full_mail_json()).unwrap();
+        assert_eq!(old.list_id(), "");
+        assert!(old.list_links().is_empty());
+        let mut m = old.clone();
+        m.set_list_id("users.example.org");
+        m.set_list_links(vec![ListLink {
+            kind: ListLinkKind::Archive,
+            uri: "https://example.org/archive".into(),
+        }]);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains(r#""list_id":"users.example.org","list_links":[{"kind":"Archive","uri":"https://example.org/archive"}]"#),
+            "{json}"
+        );
+        let back: Mail = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.list_id(), "users.example.org");
+        assert_eq!(back.list_links(), m.list_links());
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
     /// Accounts saved before Proton's event pace was a setting keep the
     /// pace they had: about every 30 seconds.
     #[test]

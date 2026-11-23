@@ -32,10 +32,9 @@ pub(super) struct Connection {
     pub(super) session: ImapSession,
     extensions: Option<Extensions>,
     names: Option<Vec<Name>>,
-    /// The personal namespace's prefix, once asked (NAMESPACE).
-    namespace: Option<Option<String>>,
-    /// Other users' and shared namespaces' prefixes, asked with it.
-    others: Vec<String>,
+    /// The server's namespaces, once asked (NAMESPACE; empty where it has
+    /// none or its reply couldn't be used).
+    namespaces: Option<crate::sync::transport::Namespaces>,
     /// Only subscribed folders are listed (the account's setting).
     pub(super) subscribed_only: bool,
     /// Each folder's counters from the last listing, where the server
@@ -43,6 +42,8 @@ pub(super) struct Connection {
     pub(super) statuses: std::collections::HashMap<String, crate::sync::transport::FolderStatus>,
     /// Rights by mailbox, as MYRIGHTS gave them and when.
     rights: std::collections::HashMap<String, (Option<String>, Instant)>,
+    /// Each mailbox's own APPENDLIMIT, once asked (`None`: no limit there).
+    append_limits: std::collections::HashMap<String, Option<u64>>,
     selected: Option<Selected>,
     used: Instant,
     /// What ENABLE turned on (QRESYNC, UTF8=ACCEPT, UIDONLY).
@@ -58,11 +59,11 @@ impl Connection {
             session,
             extensions: None,
             names: None,
-            namespace: None,
-            others: Vec::new(),
+            namespaces: None,
             subscribed_only: false,
             statuses: std::collections::HashMap::new(),
             rights: std::collections::HashMap::new(),
+            append_limits: std::collections::HashMap::new(),
             selected: None,
             used: Instant::now(),
             enabled: Default::default(),
@@ -90,6 +91,9 @@ impl Connection {
         raw: &[u8],
         flags: &[imap::types::Flag<'_>],
     ) -> imap::error::Result<Vec<u8>> {
+        if let Some(heard) = self.append_utf8(mailbox, raw, flags, None)? {
+            return Ok(heard);
+        }
         if let Some(tap) = &self.tap {
             tap.start();
         }
@@ -97,23 +101,61 @@ impl Connection {
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
     }
+    /// A message whose headers are UTF-8 itself (internationalized mail)
+    /// appended as UTF8 (RFC 6855 §4: `APPEND … UTF8 (~{n}…)`), where
+    /// UTF8=ACCEPT is on; plain APPEND would carry it as if it were
+    /// 7-bit. `None` where that isn't needed, or can't be sent here.
+    fn append_utf8(
+        &mut self,
+        mailbox: &str,
+        raw: &[u8],
+        flags: &[imap::types::Flag<'_>],
+        date: Option<chrono::DateTime<chrono::FixedOffset>>,
+    ) -> imap::error::Result<Option<Vec<u8>>> {
+        use crate::sync::stream::Part;
+        if !self.enabled.utf8 || self.tap.is_none() || !utf8_headers(raw) {
+            return Ok(None);
+        }
+        let quoted = crate::sync::transport::quote(mailbox)
+            .map_err(|e| imap::error::Error::Bad(format!("{e:#}")))?;
+        let date = date
+            .map(|d| format!(" \"{}\"", d.format("%d-%b-%Y %H:%M:%S %z")))
+            .unwrap_or_default();
+        let head = format!("APPEND {quoted} ({}){date} UTF8 (", flag_list(flags));
+        self.with_literals(&[Part::Text(&head), Part::Literal8(raw), Part::Text(")")])
+            .map(Some)
+            .map_err(|e| match e.downcast::<imap::error::Error>() {
+                Ok(e) => e,
+                Err(e) => imap::error::Error::Bad(format!("{e:#}")),
+            })
+    }
     /// As `append_heard`, keeping the message's own date as when it
     /// arrived (APPEND's date-time, RFC 3501 §6.3.11): imported mail sorts
-    /// by when it was sent, not when it was imported.
+    /// by when it was sent, not when it was imported. `received` (UTC
+    /// seconds; an mbox `From ` line's) is used where it has no usable Date.
     pub(super) fn append_dated(
         &mut self,
         mailbox: &str,
         raw: &[u8],
         flags: &[imap::types::Flag<'_>],
+        received: Option<i64>,
     ) -> imap::error::Result<Vec<u8>> {
+        if let Some(heard) = self.append_utf8(mailbox, raw, flags, append_date(raw, received))? {
+            return Ok(heard);
+        }
         if let Some(tap) = &self.tap {
             tap.start();
         }
         let result = self
             .session
-            .append_with_flags_and_date(mailbox, raw, flags, message_date(raw));
+            .append_with_flags_and_date(mailbox, raw, flags, append_date(raw, received));
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
+    }
+    /// What sends this session's synchronizing literals (see
+    /// `run_with_literals`), where it has the tap that carries them.
+    pub(super) fn literals(&self) -> Option<crate::sync::stream::Literals> {
+        self.tap.as_ref().map(|t| t.literals())
     }
     /// Runs a command with literals (`Part`s, text first), returning what
     /// the server sent for it. Needs the tap, which carries the literals.
@@ -133,34 +175,37 @@ impl Connection {
         Ok(copy)
     }
     /// Appends several messages to `mailbox` (a wire name) in one command
-    /// (MULTIAPPEND, RFC 3502), each with `flags`; one APPEND each where
-    /// the server doesn't have it. Either all are added or, with
-    /// MULTIAPPEND, none. Returns what the server sent for each command.
+    /// (MULTIAPPEND, RFC 3502), each with its flags and dated as
+    /// `append_dated` dates it; one APPEND each where the server doesn't
+    /// have it. Either all are added or, with MULTIAPPEND, none. Returns
+    /// what the server sent for each command.
     pub(super) fn append_many(
         &mut self,
         mailbox: &str,
-        messages: &[&[u8]],
-        flags: &[imap::types::Flag<'_>],
+        messages: &[(&[u8], &[imap::types::Flag<'_>], Option<i64>)],
     ) -> Result<Vec<Vec<u8>>> {
         use crate::sync::stream::Part;
-        if messages.len() < 2 || !self.extensions()?.multiappend || self.tap.is_none() {
+        // UTF-8 headers go one at a time, each as UTF8 (`append_utf8`).
+        let utf8 = self.enabled.utf8 && messages.iter().any(|(raw, ..)| utf8_headers(raw));
+        if messages.len() < 2 || !self.extensions()?.multiappend || self.tap.is_none() || utf8 {
             return messages
                 .iter()
-                .map(|raw| Ok(self.append_heard(mailbox, raw, flags)?))
+                .map(|(raw, flags, received)| Ok(self.append_dated(mailbox, raw, flags, *received)?))
                 .collect();
         }
-        let flags = flag_list(flags);
         let head = format!("APPEND {}", crate::sync::transport::quote(mailbox)?);
-        // Each with its own date, as `append_dated`.
         let each: Vec<String> = messages
             .iter()
-            .map(|raw| match message_date(raw) {
-                Some(d) => format!(" ({flags}) \"{}\" ", d.format("%d-%b-%Y %H:%M:%S %z")),
-                None => format!(" ({flags}) "),
+            .map(|(raw, flags, received)| {
+                let flags = flag_list(flags);
+                match append_date(raw, *received) {
+                    Some(d) => format!(" ({flags}) \"{}\" ", d.format("%d-%b-%Y %H:%M:%S %z")),
+                    None => format!(" ({flags}) "),
+                }
             })
             .collect();
         let mut parts = vec![Part::Text(&head)];
-        for (raw, each) in messages.iter().zip(&each) {
+        for ((raw, ..), each) in messages.iter().zip(&each) {
             parts.push(Part::Text(each));
             parts.push(Part::Literal(raw));
         }
@@ -178,7 +223,8 @@ impl Connection {
         flags: &[imap::types::Flag<'_>],
     ) -> Result<Option<Vec<u8>>> {
         use crate::sync::stream::Part;
-        if !self.extensions()?.replace || self.tap.is_none() {
+        // A draft with UTF-8 headers is appended as UTF8 instead.
+        if !self.extensions()?.replace || self.tap.is_none() || (self.enabled.utf8 && utf8_headers(raw)) {
             return Ok(None);
         }
         let head = format!(
@@ -248,10 +294,7 @@ impl Connection {
         } else {
             format!("{host}:{port}")
         };
-        // Valid for a day (RFC 4467 §3: `;EXPIRE=`), long enough for the
-        // submission server to fetch it, not forever.
-        let expire = (chrono::Utc::now() + chrono::Duration::days(1))
-            .format("%Y-%m-%dT%H:%M:%SZ");
+        let expire = url_expiry(chrono::Utc::now());
         let url = format!(
             "imap://{}@{authority}/{};UIDVALIDITY={validity}/;UID={uid};EXPIRE={expire};urlauth=submit+{}",
             url_user(user),
@@ -291,6 +334,28 @@ impl Connection {
             .session
             .run_command_and_check_ok(format!("SUBSCRIBE {wire}"));
         crate::sync::transport::resolve_in(self.names(true)?, provider, folder)
+    }
+    /// The largest message `mailbox` takes (RFC 7889): its own APPENDLIMIT
+    /// where the server says per mailbox (STATUS … (APPENDLIMIT), which a
+    /// server listing APPENDLIMIT without a number gives), else the
+    /// server's (`APPENDLIMIT=n`). Asked once per connection.
+    pub(super) fn append_limit(&mut self, mailbox: &str) -> Result<Option<u64>> {
+        let ext = self.extensions()?;
+        if !ext.append_limit_status || !crate::sync::transport::reads_status_appendlimit() {
+            return Ok(ext.append_limit);
+        }
+        if let Some(limit) = self.append_limits.get(mailbox) {
+            return Ok(*limit);
+        }
+        let wire = self.mailbox(mailbox)?;
+        let limit = match self.heard(&format!("STATUS {wire} (APPENDLIMIT)")) {
+            Ok(heard) => crate::sync::transport::status_append_limit(&heard).unwrap_or(ext.append_limit),
+            // A mailbox that can't say: the server's limit, if any.
+            Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => ext.append_limit,
+            Err(e) => return Err(e.into()),
+        };
+        self.append_limits.insert(mailbox.to_owned(), limit);
+        Ok(limit)
     }
     /// The space every mailbox takes, from STATUS=SIZE (RFC 8438), in KiB:
     /// storage used where the server has no QUOTA to say.
@@ -370,7 +435,7 @@ impl Connection {
                 condstore: ext.condstore,
                 subscribed_only: self.subscribed_only,
             };
-            let others = self.others.clone();
+            let others = self.namespaces.as_ref().map(|n| n.listed_apart()).unwrap_or_default();
             let (names, statuses) = crate::sync::transport::list_full(
                 &mut self.session,
                 &options,
@@ -382,20 +447,43 @@ impl Connection {
         }
         Ok(self.names.as_deref().unwrap_or_default())
     }
-    /// Where the server keeps personal folders, if it says (NAMESPACE).
+    /// Where new personal folders go, if the server says (NAMESPACE's
+    /// first personal namespace).
     pub(super) fn namespace(&mut self) -> Result<Option<String>> {
-        if let Some(n) = &self.namespace {
-            return Ok(n.clone());
+        Ok(self.namespaces()?.default_prefix())
+    }
+    /// The server's namespaces (NAMESPACE, RFC 2342), asked once.
+    pub(super) fn namespaces(&mut self) -> Result<&crate::sync::transport::Namespaces> {
+        if self.namespaces.is_none() {
+            let found = self.ask_namespaces()?;
+            self.namespaces = Some(found);
         }
-        let n = if self.extensions()?.namespace {
-            let (personal, others) = crate::sync::transport::namespaces(&mut self.session)?;
-            self.others = others;
-            personal
-        } else {
-            None
-        };
-        self.namespace = Some(n.clone());
-        Ok(n)
+        Ok(self.namespaces.as_ref().expect("just set"))
+    }
+    fn ask_namespaces(&mut self) -> Result<crate::sync::transport::Namespaces> {
+        if !self.extensions()?.namespace {
+            return Ok(Default::default());
+        }
+        match crate::sync::transport::namespaces(&mut self.session) {
+                Ok(found) => Ok(found),
+                // A broken connection is no answer about namespaces.
+                Err(e) if connection_failed(&e) => return Err(e),
+                Err(e) => {
+                    // RFC 2342 is only advice on where folders go: without
+                    // it, the hierarchy's delimiter (LIST "" "", RFC 9051
+                    // §6.3.9) is all that is needed, and new folders go at
+                    // the top, as on servers without NAMESPACE.
+                    let delimiter = self
+                        .session
+                        .list(Some(""), Some("\"\""))?
+                        .iter()
+                        .find_map(|n| n.delimiter().map(str::to_owned));
+                    eprintln!(
+                        "Picacho: the server's NAMESPACE reply couldn't be used ({e:#}); folders go at the top, delimiter {delimiter:?}."
+                    );
+                    Ok(Default::default())
+                }
+        }
     }
     /// Refuses, before trying, what this sign-in has no right to do in
     /// `mailbox` on servers that say (ACL's MYRIGHTS). Elsewhere the server
@@ -425,11 +513,24 @@ impl Connection {
         }
         Ok(())
     }
+    /// Refuses, before sending anything, to change the selected mailbox
+    /// where the server opened it read-only (`[READ-ONLY]` on SELECT, RFC
+    /// 9051 §6.3.2 and §7.1): STORE, MOVE and EXPUNGE would be refused.
+    pub(super) fn require_writable(&self, what: &str) -> Result<()> {
+        if let Some(s) = self.selected.as_ref().filter(|s| s.read_only) {
+            bail!(
+                "“{}” can only be read on the server, so Picacho can't {what} there. Another mail app or the server's settings may be holding it.",
+                crate::sync::transport::decode_name(&s.name)
+            );
+        }
+        Ok(())
+    }
     /// Whether `erase` can remove just `uids` from the selected mailbox: with
     /// UIDPLUS always; without, only if no other message there is already
     /// marked deleted (EXPUNGE would take those too). Checked before any
     /// change, so a refusal changes nothing.
     pub(super) fn can_erase(&mut self, uids: &[u32]) -> Result<()> {
+        self.require_writable("remove messages")?;
         if self.extensions()?.uidplus {
             return Ok(());
         }
@@ -463,8 +564,16 @@ impl Connection {
     pub(super) fn select(&mut self, name: &str) -> Result<Selected> {
         let condstore = self.extensions()?.condstore;
         self.selected = None;
-        let selected =
-            crate::sync::transport::select(&mut self.session, name, condstore, self.enabled.utf8)?;
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result =
+            crate::sync::transport::select(&mut self.session, name, condstore, self.enabled.utf8);
+        let heard = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        let mut selected = result?;
+        // RFC 9051 §6.3.2: `[READ-ONLY]` comes in the tagged OK, which the
+        // imap crate reads and drops.
+        selected.read_only |= crate::sync::transport::opened_read_only(&heard);
         self.alerts.extend(selected.alerts.iter().cloned());
         self.selected = Some(selected.clone());
         Ok(selected)
@@ -476,15 +585,23 @@ impl Connection {
         name: &str,
         validity: u32,
         modseq: u64,
+        known: &[u32],
     ) -> Result<(Selected, Option<crate::sync::transport::Resync>)> {
         self.selected = None;
-        let (selected, resync) = crate::sync::transport::select_qresync(
+        if let Some(tap) = &self.tap {
+            tap.start();
+        }
+        let result = crate::sync::transport::select_qresync(
             &mut self.session,
             name,
             self.enabled.utf8,
             validity,
             modseq,
-        )?;
+            known,
+        );
+        let heard = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
+        let (mut selected, resync) = result?;
+        selected.read_only |= crate::sync::transport::opened_read_only(&heard);
         self.alerts.extend(selected.alerts.iter().cloned());
         self.selected = Some(selected.clone());
         Ok((selected, resync))
@@ -539,6 +656,9 @@ pub(super) struct Limits {
     paused: HashMap<String, (i64, Duration)>,
     /// Bytes downloaded in the background today (UTC day), per account.
     traffic: HashMap<String, (i64, u64)>,
+    /// When a POP3 account may sign in again, where its server said how
+    /// often it may (CAPA's LOGIN-DELAY, RFC 2449 §6.5).
+    pop_next_login: HashMap<String, i64>,
 }
 
 impl Backend {
@@ -656,10 +776,34 @@ impl Backend {
             .map(|(until, _)| *until)
             .filter(|until| *until > now)
     }
+    /// Notes a POP3 sign-in: where the server allows one only every so
+    /// many seconds (LOGIN-DELAY), background work waits that long before
+    /// the next, rather than be refused with `[LOGIN-DELAY]`.
+    pub(super) fn note_pop_login(&self, a: &Account, login_delay: Option<u64>) {
+        let mut limits = self.limits.lock().unwrap();
+        match login_delay.filter(|d| *d > 0) {
+            Some(delay) => {
+                let next = chrono::Utc::now().timestamp() + delay.min(i64::MAX as u64 / 2) as i64;
+                limits.pop_next_login.insert(a.id.clone(), next);
+            }
+            None => {
+                limits.pop_next_login.remove(&a.id);
+            }
+        }
+    }
     /// Background work refuses to run while the server is limiting us, or
     /// once the day's allowance is used.
     pub(super) fn ensure_background(&self, a: &Account) -> Result<()> {
         if let Some(until) = self.throttled_until(&a.id) {
+            return Err(anyhow::Error::new(Throttled {
+                until,
+                budget: false,
+            }));
+        }
+        let next_login = self.limits.lock().unwrap().pop_next_login.get(&a.id).copied();
+        if a.provider == Provider::Pop3
+            && let Some(until) = next_login.filter(|t| *t > chrono::Utc::now().timestamp())
+        {
             return Err(anyhow::Error::new(Throttled {
                 until,
                 budget: false,
@@ -723,15 +867,46 @@ impl Backend {
     }
 }
 
-/// A message's Date header as APPEND's date-time, if it has a sane one.
+/// Whether `error` is the connection failing (rather than the server
+/// refusing or saying something unreadable): nothing more can be asked on it.
+fn connection_failed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<imap::error::Error>().is_some_and(|e| {
+        matches!(
+            e,
+            imap::error::Error::Io(_)
+                | imap::error::Error::ConnectionLost
+                | imap::error::Error::Parse(_)
+                | imap::error::Error::Tls(_)
+                | imap::error::Error::TlsHandshake(_)
+        )
+    })
+}
+
+/// APPEND's date-time for a message: its Date header, if it has a sane
+/// one, else `received` (UTC seconds) where sane; else none, and the
+/// server dates it now.
+fn append_date(raw: &[u8], received: Option<i64>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    // Not before 1971 nor in the future: a server refuses those.
+    let now = chrono::Utc::now().timestamp();
+    let sane = |t: i64| (31_536_000..=now + 86_400).contains(&t);
+    message_date(raw).filter(|d| sane(d.timestamp())).or_else(|| {
+        let at = received.filter(|t| sane(*t))?;
+        Some(chrono::DateTime::from_timestamp(at, 0)?.fixed_offset())
+    })
+}
+/// A message's Date header, if it reads as one.
 fn message_date(raw: &[u8]) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     use mailparse::MailHeaderMap as _;
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
     let date = headers.get_first_value("Date")?;
-    let parsed = chrono::DateTime::parse_from_rfc2822(date.trim()).ok()?;
-    // Not before 1971 nor in the future: a server refuses those.
-    let now = chrono::Utc::now().timestamp();
-    (31_536_000..=now + 86_400).contains(&parsed.timestamp()).then_some(parsed)
+    chrono::DateTime::parse_from_rfc2822(date.trim()).ok()
+}
+
+/// Whether a message's header block has bytes outside ASCII (UTF-8
+/// headers, RFC 6532), which IMAP carries with APPEND's UTF8 form.
+fn utf8_headers(raw: &[u8]) -> bool {
+    let end = memchr::memmem::find(raw, b"\r\n\r\n").unwrap_or(raw.len());
+    !raw[..end].is_ascii()
 }
 
 /// Flags as APPEND writes them, without \\Recent (servers set it).
@@ -742,6 +917,15 @@ fn flag_list(flags: &[imap::types::Flag<'_>]) -> String {
         .map(|f| f.to_string())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// When a URL made for one delivery stops working (RFC 4467 §3:
+/// `;EXPIRE=`, checked by the server's clock): soon, as it is made just
+/// before the message is handed over and fetched at once, with a margin
+/// for a computer whose clock is off (this is the computer's time, not
+/// the server's).
+fn url_expiry(now: chrono::DateTime<chrono::Utc>) -> String {
+    (now + chrono::Duration::hours(4)).format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// A mailbox name in an IMAP URL (RFC 5092): percent-encoded where it
@@ -811,6 +995,9 @@ mod url_tests {
     #[test]
     fn imap_urls_and_their_authorization() {
         assert_eq!(url_mailbox("Sent Items"), "Sent%20Items");
+        // Four hours on, by this computer's clock.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-23T10:00:00Z").unwrap().to_utc();
+        assert_eq!(url_expiry(now), "2026-11-23T14:00:00Z");
         assert_eq!(url_mailbox("INBOX/Work"), "INBOX/Work");
         assert_eq!(url_mailbox("ana@example.com"), "ana@example.com");
         let heard = b"* GENURLAUTH \"imap://ana@mail.example/Sent;UIDVALIDITY=7/;UID=3;urlauth=submit+ana:internal:91354a473744909de610943775f92038\"\r\na5 OK done\r\n";
@@ -823,5 +1010,12 @@ mod url_tests {
         assert_eq!(status_size(b"* STATUS INBOX (MESSAGES 3 SIZE 9)\r\n"), Some(9));
         assert_eq!(status_size(b"a3 OK\r\n"), None);
         assert_eq!(flag_list(&[imap::types::Flag::Seen, imap::types::Flag::Recent]), "\\Seen");
+        // APPEND's date: Date where it reads, else the mbox line's time.
+        let dated = b"Date: Mon, 1 Jan 2024 10:00:00 +0100\r\n\r\nx";
+        assert_eq!(append_date(dated, Some(1)).unwrap().timestamp(), 1_704_099_600);
+        let undated = b"Date: someday\r\n\r\nx";
+        assert_eq!(append_date(undated, Some(1_704_103_200)).unwrap().timestamp(), 1_704_103_200);
+        assert_eq!(append_date(undated, None), None);
+        assert_eq!(append_date(undated, Some(5)), None);
     }
 }

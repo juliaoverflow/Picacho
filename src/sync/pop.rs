@@ -19,9 +19,17 @@ pub(crate) struct Rejected {
 impl Rejected {
     fn parse(status: &str) -> Self {
         let text = status.strip_prefix("-ERR").unwrap_or(status).trim();
+        // A response code is `[` then a code word (RFC 2449 §8: atoms and
+        // `/`): a server without RESP-CODES may begin its text with `[`
+        // for other reasons, which isn't read as a code.
         let (code, text) = match text.strip_prefix('[').and_then(|t| t.split_once(']')) {
-            Some((code, rest)) => (Some(code.trim().to_ascii_uppercase()), rest.trim()),
-            None => (None, text),
+            Some((code, rest))
+                if !code.is_empty()
+                    && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'/') =>
+            {
+                (Some(code.trim().to_ascii_uppercase()), rest.trim())
+            }
+            _ => (None, text),
         };
         Self {
             code,
@@ -73,6 +81,30 @@ impl std::fmt::Display for Rejected {
     }
 }
 impl std::error::Error for Rejected {}
+
+/// What CAPA says about how the server limits a mailbox (RFC 2449 §6.5),
+/// once signed in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// LOGIN-DELAY: the fewest seconds between sign-ins. Signing in sooner
+    /// is refused (`[LOGIN-DELAY]`).
+    pub(crate) login_delay: Option<u64>,
+}
+impl Limits {
+    /// From CAPA's lines (uppercase). Before signing in it may say `USER`:
+    /// the value is for this user, known only after (RFC 2449 §6.5).
+    pub(crate) fn from_caps(caps: &[String]) -> Self {
+        let value = |name: &str| {
+            caps.iter().find_map(|c| {
+                let mut words = c.split_ascii_whitespace();
+                (words.next() == Some(name)).then(|| words.next()).flatten()
+            })
+        };
+        Self {
+            login_delay: value("LOGIN-DELAY").and_then(|v| v.parse().ok()),
+        }
+    }
+}
 /// The refusal behind an error, if POP3 gave one.
 pub(crate) fn rejection(error: &anyhow::Error) -> Option<&Rejected> {
     error.chain().find_map(|c| c.downcast_ref::<Rejected>())
@@ -126,6 +158,10 @@ impl<T: Read + Write> PopSession<T> {
         );
         Ok(line)
     }
+    /// The mailbox's limits, as CAPA says them.
+    pub(crate) fn limits(&self) -> Limits {
+        Limits::from_caps(&self.caps)
+    }
     /// Whether CAPA listed `capability` (its first word).
     pub(crate) fn has(&self, capability: &str) -> bool {
         self.caps.iter().any(|c| {
@@ -146,6 +182,52 @@ impl<T: Read + Write> PopSession<T> {
             // A server without CAPA may not know TOP.
             Err(e) if self.caps.is_empty() && rejection(&e).is_some() => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+    /// The headers of each of `numbers` (TOP n 0), in order, where the
+    /// server lists TOP; `None` where it doesn't. With PIPELINING (RFC
+    /// 2449 §6.6) the commands go together and the replies are read after,
+    /// saving a round trip per message; else one at a time. A message the
+    /// server refuses (deleted meanwhile, say) is an empty header block.
+    pub(crate) fn top_many(&mut self, numbers: &[u32], max: usize) -> Result<Option<Vec<Vec<u8>>>> {
+        ensure!(numbers.iter().all(|n| *n > 0), "Invalid POP3 message number");
+        if !self.has("PIPELINING") || !self.has("TOP") {
+            let mut out = Vec::with_capacity(numbers.len());
+            for n in numbers {
+                match self.top(*n, max)? {
+                    Some(header) => out.push(header),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(out));
+        }
+        let mut commands = String::new();
+        for n in numbers {
+            commands.push_str(&format!("TOP {n} 0\r\n"));
+        }
+        self.reader.get_mut().write_all(commands.as_bytes())?;
+        self.reader.get_mut().flush()?;
+        let mut out = Vec::with_capacity(numbers.len());
+        // Every reply is read, whatever happens to one, so the session
+        // stays in step.
+        let mut failed = None;
+        for _ in numbers {
+            match self.status() {
+                Ok(_) => match self.multiline(max) {
+                    Ok(header) => out.push(header),
+                    // A reply cut short or too long: the rest can't be read.
+                    Err(e) => return Err(e),
+                },
+                Err(e) if e.is::<Rejected>() => out.push(Vec::new()),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(Some(out)),
         }
     }
     /// Each message's size in octets (LIST), by message number.
@@ -185,6 +267,35 @@ impl<T: Read + Write> PopSession<T> {
             .filter(|l| !l.is_empty())
             .collect();
         Ok(self.caps.clone())
+    }
+    /// The SASL mechanisms the server offers: CAPA's SASL line (RFC 2449
+    /// §6.3), else what a bare AUTH lists (a multi-line reply, as many
+    /// servers from before CAPA answer it; RFC 1734's practice). A server
+    /// refusing bare AUTH offers none this way.
+    pub(crate) fn mechanisms(&mut self) -> Result<Vec<String>> {
+        let listed: Vec<String> = self
+            .caps
+            .iter()
+            .filter_map(|c| c.strip_prefix("SASL "))
+            .flat_map(str::split_ascii_whitespace)
+            .map(str::to_owned)
+            .collect();
+        if !listed.is_empty() || self.has("SASL") {
+            return Ok(listed);
+        }
+        match self.command("AUTH") {
+            Ok(_) => {}
+            Err(e) if e.is::<Rejected>() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
+        let list = self.multiline(16 * 1024)?;
+        Ok(String::from_utf8_lossy(&list)
+            .lines()
+            .map(str::trim)
+            // One mechanism name a line (RFC 4422 §3.1's characters).
+            .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            .map(str::to_ascii_uppercase)
+            .collect())
     }
     /// Signs in with AUTH and a SASL mechanism (RFC 5034).
     pub(crate) fn authenticate(&mut self, exchange: &mut sasl::Exchange) -> Result<()> {
@@ -290,6 +401,57 @@ impl<T: Read + Write> PopSession<T> {
         self.command("QUIT")?;
         Ok(())
     }
+    /// How many messages the mailbox has and their total size in octets
+    /// (STAT, RFC 1939 §5: `+OK nn mm`).
+    pub(crate) fn stat(&mut self) -> Result<(u32, u64)> {
+        let line = self.command("STAT")?;
+        let mut words = line.split_ascii_whitespace().skip(1);
+        let count = words.next().and_then(|n| n.parse().ok());
+        let size = words.next().and_then(|n| n.parse().ok());
+        count.zip(size).context("Invalid POP3 STAT reply")
+    }
+    /// Unmarks every message marked for deletion in this session (RSET,
+    /// RFC 1939 §5), so QUIT removes nothing.
+    pub(crate) fn rset(&mut self) -> Result<()> {
+        self.command("RSET")?;
+        Ok(())
+    }
+    /// Each message's lasting identity, by message number, oldest first:
+    /// UIDL's (RFC 1939 §7) where the server has it; otherwise one made
+    /// from a hash of the message's headers (`header_identity`), read with
+    /// TOP (or RETR, where there is no TOP). Messages with the same headers
+    /// are told apart by how many came before them.
+    pub(crate) fn identities(&mut self, max_header: usize) -> Result<Vec<(u32, String)>> {
+        // A server listing capabilities without UIDL lacks it; one without
+        // CAPA may still have it.
+        if self.caps.is_empty() || self.has("UIDL") {
+            match self.uidl() {
+                Ok(ids) => return Ok(ids),
+                Err(e) if self.caps.is_empty() && rejection(&e).is_some() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let (count, _) = self.stat()?;
+        let mut out = Vec::with_capacity(count as usize);
+        let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for number in 1..=count {
+            let header = match self.top(number, max_header)? {
+                Some(header) => header,
+                // Without TOP the whole message is read for it; only its
+                // headers are hashed.
+                None => {
+                    self.command(&format!("RETR {number}"))?;
+                    self.multiline(crate::manage::crypto::MAX_MESSAGE)?
+                }
+            };
+            let base = header_identity(&header);
+            let n = seen.entry(base.clone()).or_default();
+            *n += 1;
+            let id = if *n == 1 { base } else { format!("{base}-{n}") };
+            out.push((number, id));
+        }
+        Ok(out)
+    }
     pub(crate) fn uidl(&mut self) -> Result<Vec<(u32, String)>> {
         self.command("UIDL")?;
         let bytes = self.multiline(4 * 1024 * 1024)?;
@@ -322,6 +484,51 @@ impl<T: Read + Write> PopSession<T> {
         result.sort_unstable_by_key(|(number, _)| *number);
         Ok(result)
     }
+}
+/// A system locale (`en_US.UTF-8`, `pt-BR`, `C`) as a language tag for
+/// POP3's LANG (RFC 6856 §3: RFC 5646 tags): language and region only.
+/// `None` for the POSIX locales, which name no language.
+fn language_tag(locale: &str) -> Option<String> {
+    let locale = locale.split(['.', '@']).next().unwrap_or_default();
+    let mut parts = locale.split(['_', '-']);
+    let language = parts.next().filter(|l| (2..=3).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphabetic()))?;
+    let mut tag = language.to_ascii_lowercase();
+    if let Some(region) = parts
+        .next()
+        .filter(|r| r.len() == 2 && r.bytes().all(|b| b.is_ascii_alphabetic()))
+    {
+        tag.push('-');
+        tag.push_str(&region.to_ascii_uppercase());
+    }
+    Some(tag)
+}
+/// A lasting identity for a message on a server without UIDL: a hash of
+/// the headers that don't change while it sits in the mailbox (its
+/// Message-ID, Date, From, To, Subject, and the first Received). Prefixed
+/// so it can't be taken for a UIDL identity; 70 printable characters at
+/// most, as UIDL's (RFC 1939 §7).
+pub(crate) fn header_identity(header: &[u8]) -> String {
+    use sha2::Digest as _;
+    let (headers, _) = mailparse::parse_headers(header).unwrap_or_default();
+    let mut hash = sha2::Sha256::new();
+    for name in ["Message-ID", "Date", "From", "To", "Subject", "Received"] {
+        let value = headers
+            .iter()
+            .find(|h| h.get_key_ref().eq_ignore_ascii_case(name))
+            .map(|h| h.get_value_raw().to_vec())
+            .unwrap_or_default();
+        hash.update(name.as_bytes());
+        hash.update(b":");
+        hash.update(&value);
+        hash.update(b"\n");
+    }
+    // Without any of those, the header block as a whole.
+    if headers.is_empty() {
+        hash.update(header);
+    }
+    let digest = hash.finalize();
+    let hex: String = digest.iter().take(20).map(|b| format!("{b:02x}")).collect();
+    format!("hdr-{hex}")
 }
 /// Connects with TLS from the start, or (`Account::incoming_starttls`)
 /// in the clear and upgrades with STLS (RFC 2595) before anything else: a
@@ -387,11 +594,19 @@ pub(crate) fn pop_login(
     };
     let caps = s.capabilities()?;
     s.utf8();
-    let offered: Vec<&str> = caps
-        .iter()
-        .filter_map(|c| c.strip_prefix("SASL "))
-        .flat_map(str::split_ascii_whitespace)
-        .collect();
+    s.language(&sys_locale::get_locale().unwrap_or_default());
+    // Asked by bare AUTH only where it matters: a server without CAPA's
+    // SASL line, for an account that can't use a password.
+    let mechanisms = if a.oauth || a.kerberos || !(caps.is_empty() || caps.iter().any(|c| c == "USER")) {
+        s.mechanisms()?
+    } else {
+        caps.iter()
+            .filter_map(|c| c.strip_prefix("SASL "))
+            .flat_map(str::split_ascii_whitespace)
+            .map(str::to_owned)
+            .collect()
+    };
+    let offered: Vec<&str> = mechanisms.iter().map(String::as_str).collect();
     let credentials = sasl::Credentials {
         user: a.login().to_owned(),
         secret: password.to_owned(),
@@ -507,6 +722,19 @@ impl<T: Read + Write> PopSession<T> {
             self.utf8_on = self.command("UTF8").is_ok();
         }
     }
+    /// Asks the server to word its replies in the person's language (LANG,
+    /// RFC 6856 §3), where it lists LANG: its refusals are shown as it
+    /// words them. `locale` is the system's (`en_US`, `pt-BR`); its
+    /// language and region go as a language tag. Best effort: a server
+    /// that has no such language answers -ERR and keeps its own.
+    fn language(&mut self, locale: &str) {
+        if !self.has("LANG") {
+            return;
+        }
+        if let Some(tag) = language_tag(locale) {
+            let _ = self.command(&format!("LANG {tag}"));
+        }
+    }
     /// Asks CAPA again once signed in (RFC 2449 §5: the TRANSACTION
     /// state's capabilities may differ: TOP, UIDL, EXPIRE, LOGIN-DELAY).
     /// What was listed before stays where the server doesn't answer.
@@ -535,6 +763,33 @@ mod tests {
     }
     use super::*;
     use std::io::Cursor;
+    /// A server's replies, given in advance, and what was sent to it.
+    struct Script {
+        replies: Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+    impl Script {
+        fn new(replies: impl Into<Vec<u8>>) -> Self {
+            Self {
+                replies: Cursor::new(replies.into()),
+                sent: Vec::new(),
+            }
+        }
+    }
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.replies.read(buf)
+        }
+    }
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     #[test]
     fn rejects_truncated_oversized_and_ambiguous_status_lines() {
         for status in [
@@ -587,6 +842,94 @@ mod tests {
         );
         let seen = server.join().unwrap();
         assert_eq!(seen, ["CAPA"], "no USER, PASS or AUTH was sent");
+        Ok(())
+    }
+    /// RFC 1939 §5: STAT's counts and RSET; without UIDL, each
+    /// message's identity comes from a hash of its headers (TOP), the same
+    /// in every session and different for different mail.
+    #[test]
+    fn stat_rset_and_identities_without_uidl() -> Result<()> {
+        let a = "Message-ID: <a@x>\r\nSubject: One\r\n\r\n";
+        let b = "Message-ID: <b@x>\r\nSubject: Two\r\n\r\n";
+        let replies = format!(
+            "+OK ready\r\n+OK\r\nUSER\r\nTOP\r\n.\r\n+OK 3 920\r\n+OK\r\n+OK 3 920\r\n+OK\r\n{a}.\r\n+OK\r\n{b}.\r\n+OK\r\n{a}.\r\n"
+        );
+        let mut pop = PopSession::new(Script::new(replies))?;
+        pop.capabilities()?;
+        assert_eq!(pop.stat()?, (3, 920));
+        pop.rset()?;
+        let ids = pop.identities(4096)?;
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|(_, id)| id.starts_with("hdr-") && id.len() <= 70));
+        assert_ne!(ids[0].1, ids[1].1);
+        // The same headers again: told apart, the same way every session.
+        assert_eq!(ids[2].1, format!("{}-2", ids[0].1));
+        assert_eq!(header_identity(a.as_bytes()), ids[0].1);
+        let sent = String::from_utf8(pop.reader.get_ref().sent.clone()).unwrap();
+        assert_eq!(sent, "CAPA\r\nSTAT\r\nRSET\r\nSTAT\r\nTOP 1 0\r\nTOP 2 0\r\nTOP 3 0\r\n");
+        Ok(())
+    }
+    /// RFC 6856 §3: the system's language goes as a language tag, where
+    /// the server lists LANG.
+    #[test]
+    fn language_is_asked_for_where_listed() -> Result<()> {
+        assert_eq!(language_tag("en_US.UTF-8").as_deref(), Some("en-US"));
+        assert_eq!(language_tag("pt-BR").as_deref(), Some("pt-BR"));
+        assert_eq!(language_tag("de").as_deref(), Some("de"));
+        assert_eq!(language_tag("C"), None);
+        assert_eq!(language_tag("POSIX"), None);
+        let mut pop = PopSession::new(Script::new(
+            "+OK ready\r\n+OK\r\nLANG\r\n.\r\n+OK [LANG] Bienvenue\r\n",
+        ))?;
+        pop.capabilities()?;
+        pop.language("fr_FR.UTF-8");
+        assert_eq!(pop.reader.get_ref().sent, b"CAPA\r\nLANG fr-FR\r\n");
+        let mut pop = PopSession::new(Script::new("+OK ready\r\n+OK\r\nUSER\r\n.\r\n"))?;
+        pop.capabilities()?;
+        pop.language("fr_FR.UTF-8");
+        assert_eq!(pop.reader.get_ref().sent, b"CAPA\r\n");
+        Ok(())
+    }
+    /// A server without CAPA's SASL line lists its mechanisms for a bare
+    /// AUTH; one refusing it offers none.
+    #[test]
+    fn bare_auth_lists_mechanisms() -> Result<()> {
+        let mut pop = PopSession::new(Cursor::new(
+            b"+OK ready\r\n+OK\r\nTOP\r\n.\r\n+OK methods\r\nPLAIN\r\ngssapi\r\nbad name!\r\n.\r\n".to_vec(),
+        ))?;
+        pop.capabilities()?;
+        assert_eq!(pop.mechanisms()?, ["PLAIN", "GSSAPI"]);
+        let mut pop = PopSession::new(Cursor::new(b"+OK ready\r\n-ERR no\r\n-ERR what\r\n".to_vec()))?;
+        pop.capabilities()?;
+        assert!(pop.mechanisms()?.is_empty());
+        // CAPA's SASL line is enough: nothing is asked.
+        let mut pop = PopSession::new(Cursor::new(b"+OK ready\r\n+OK\r\nSASL SCRAM-SHA-256\r\n.\r\n".to_vec()))?;
+        pop.capabilities()?;
+        assert_eq!(pop.mechanisms()?, ["SCRAM-SHA-256"]);
+        Ok(())
+    }
+    /// RFC 2449 §6.5 and §8: LOGIN-DELAY's seconds (not `USER`, said
+    /// before signing in), and response codes only as code words.
+    #[test]
+    fn capa_limits_and_response_codes() {
+        let caps = |l: &[&str]| l.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        assert_eq!(Limits::from_caps(&caps(&["USER", "LOGIN-DELAY 900"])).login_delay, Some(900));
+        assert_eq!(Limits::from_caps(&caps(&["LOGIN-DELAY USER"])).login_delay, None);
+        assert_eq!(Limits::from_caps(&caps(&["USER"])).login_delay, None);
+        assert_eq!(Rejected::parse("-ERR [IN-USE] busy").code.as_deref(), Some("IN-USE"));
+        let r = Rejected::parse("-ERR [mailbox locked by pid 7] try later");
+        assert_eq!(r.code, None);
+        assert_eq!(r.text, "[mailbox locked by pid 7] try later");
+    }
+    /// RFC 2449 §6.6: with PIPELINING, the TOP commands go in one write and
+    /// every reply is read in order, a refused one included.
+    #[test]
+    fn pipelined_tops_are_read_in_order() -> Result<()> {
+        let replies = "+OK ready\r\n+OK\r\nTOP\r\nPIPELINING\r\n.\r\n+OK\r\nSubject: 1\r\n\r\n.\r\n-ERR no such message\r\n+OK\r\nSubject: 3\r\n\r\n.\r\n";
+        let mut pop = PopSession::new(Cursor::new(replies.as_bytes().to_vec()))?;
+        pop.capabilities()?;
+        let tops = pop.top_many(&[1, 2, 3], 4096)?.unwrap();
+        assert_eq!(tops, [b"Subject: 1\r\n\r\n".to_vec(), Vec::new(), b"Subject: 3\r\n\r\n".to_vec()]);
         Ok(())
     }
     #[test]

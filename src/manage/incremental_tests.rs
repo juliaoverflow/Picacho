@@ -17,6 +17,8 @@ struct ServerBox {
     messages: Vec<Message>,
     uid_next: u32,
     modseq: u64,
+    /// UIDs removed, for QRESYNC's VANISHED (EARLIER).
+    removed: Vec<u32>,
 }
 #[derive(Default)]
 struct World {
@@ -26,6 +28,8 @@ struct World {
     logins: usize,
     /// Reply NO [THROTTLED] to every FETCH.
     throttle: bool,
+    /// Offer QRESYNC (RFC 7162), and resynchronize on SELECT.
+    qresync: bool,
 }
 fn header(uid: u32) -> String {
     format!(
@@ -79,7 +83,13 @@ fn serve(
                     w.logins += 1;
                     String::new()
                 } else if upper == "CAPABILITY" {
-                    "* CAPABILITY IMAP4rev1 MOVE CONDSTORE X-GM-EXT-1\r\n".into()
+                    if w.qresync {
+                        "* CAPABILITY IMAP4rev1 MOVE CONDSTORE QRESYNC ENABLE\r\n".into()
+                    } else {
+                        "* CAPABILITY IMAP4rev1 MOVE CONDSTORE X-GM-EXT-1\r\n".into()
+                    }
+                } else if upper.starts_with("ENABLE ") {
+                    "* ENABLED QRESYNC\r\n".into()
                 } else if upper.starts_with("LIST ") {
                     "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n\
                      * LIST (\\All \\HasNoChildren) \"/\" \"[Gmail]/All Mail\"\r\n"
@@ -101,13 +111,42 @@ fn serve(
                             .trim_matches('"')
                             .to_owned();
                         let b = &w.boxes[&selected];
-                        format!(
+                        let mut out = format!(
                             "* {} EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT {}] ok\r\n\
                              * OK [HIGHESTMODSEQ {}] ok\r\n",
                             b.messages.len(),
                             b.uid_next,
                             b.modseq
-                        )
+                        );
+                        // (QRESYNC (validity modseq [known-uids])): what
+                        // went (of the known UIDs, where given) and what
+                        // changed since.
+                        if let Some(args) = upper.split("(QRESYNC (").nth(1) {
+                            let args: Vec<&str> = args.trim_end_matches(')').split(' ').collect();
+                            let since: u64 = args[1].parse().unwrap();
+                            let known = args.get(2).map(|k| expand(k));
+                            let gone: Vec<String> = b
+                                .removed
+                                .iter()
+                                .filter(|u| known.as_ref().is_none_or(|k| k.contains(u)))
+                                .map(u32::to_string)
+                                .collect();
+                            if !gone.is_empty() {
+                                out += &format!("* VANISHED (EARLIER) {}\r\n", gone.join(","));
+                            }
+                            for (seq, m) in b.messages.iter().enumerate() {
+                                if m.modseq > since {
+                                    let flags = if m.seen { "\\Seen" } else { "" };
+                                    out += &format!(
+                                        "* {} FETCH (UID {} FLAGS ({flags}) MODSEQ ({}))\r\n",
+                                        seq + 1,
+                                        m.uid,
+                                        m.modseq
+                                    );
+                                }
+                            }
+                        }
+                        out
                     } else if upper.starts_with("UID SEARCH ") {
                         let b = &w.boxes[&selected];
                         let uids: Vec<String> =
@@ -196,6 +235,7 @@ fn mailbox(uids: &[u32], gmail_base: u64) -> ServerBox {
             .collect(),
         uid_next: uids.iter().max().map_or(1, |u| u + 1),
         modseq: 10,
+        removed: Vec::new(),
     }
 }
 fn commands(world: &StdMutex<World>) -> Vec<String> {
@@ -444,6 +484,55 @@ fn a_relaunch_lists_a_mailbox_in_the_same_order_as_after_sync() -> Result<()> {
         let (rows, layout) = relaunched.listed(&a.id, &inbox)?;
         assert!(layout.is_none());
         assert_eq!(uids(rows), synced);
+        Ok(())
+    })();
+    b.disconnect(&a.id);
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    result
+}
+
+/// RFC 7162 §3.2.5: with QRESYNC, a later check's SELECT names the UIDs
+/// kept here (known-uids), and what it reports gone and changed is applied
+/// without a SEARCH.
+#[test]
+fn qresync_names_the_known_uids_and_applies_what_changed() -> Result<()> {
+    let world = Arc::new(StdMutex::new(World {
+        qresync: true,
+        ..World::default()
+    }));
+    world
+        .lock()
+        .unwrap()
+        .boxes
+        .insert("INBOX".into(), mailbox(&[1, 2, 3, 7], 0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (cert, port, server) = serve(world.clone(), stop.clone())?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let result = (|| -> Result<()> {
+        assert_eq!(b.sync(&a, Folder::Inbox, 300)?.len(), 4);
+        commands(&world);
+        {
+            let mut w = world.lock().unwrap();
+            let inbox = w.boxes.get_mut("INBOX").unwrap();
+            // 2 goes; 3 is read elsewhere. 40 went long ago, before any of
+            // the known UIDs: not reported, as known-uids exclude it.
+            inbox.messages.retain(|m| m.uid != 2);
+            inbox.removed = vec![2, 40];
+            inbox.messages[1].seen = true;
+            inbox.messages[1].modseq = 11;
+            inbox.modseq = 11;
+        }
+        let synced = b.sync(&a, Folder::Inbox, 300)?;
+        let uids: Vec<u32> = synced.iter().map(|m| m.uid).collect();
+        assert!(!uids.contains(&2), "{uids:?}");
+        assert!(!synced.iter().find(|m| m.uid == 3).unwrap().unread);
+        let log = commands(&world);
+        assert_eq!(log.first().map(String::as_str), Some("SELECT \"INBOX\" (QRESYNC (5 10 1:3,7))"), "{log:?}");
+        assert!(!log.iter().any(|c| c.starts_with("UID SEARCH")), "{log:?}");
         Ok(())
     })();
     b.disconnect(&a.id);

@@ -893,3 +893,65 @@ fn pop3_starttls_top_headers_and_login_delay() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 2449 §6.5–6.6: a server saying LOGIN-DELAY gets no background sign-in
+/// sooner than it allows (the account is paused, not refused); with
+/// PIPELINING, a batch's TOP commands are sent together.
+#[test]
+fn pop3_login_delay_and_pipelined_headers() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let server = Server::new(move |socket| {
+        let Ok(stream) = acceptor.accept(socket) else {
+            return;
+        };
+        let mut r = BufReader::new(stream);
+        let _ = r.get_mut().write_all(b"+OK ready\r\n");
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            // How many commands had arrived together with this one.
+            let together = r.buffer().split(|b| *b == b'\n').filter(|l| !l.is_empty()).count();
+            let command = line.trim_end().to_owned();
+            log.lock().unwrap().push(format!("{command} +{together}"));
+            let reply = match command.as_str() {
+                "CAPA" => "+OK\r\nUSER\r\nTOP\r\nUIDL\r\nPIPELINING\r\nLOGIN-DELAY 900\r\n.\r\n".to_owned(),
+                c if c.starts_with("USER ") || c.starts_with("PASS ") => "+OK\r\n".to_owned(),
+                "UIDL" => "+OK\r\n1 one\r\n2 two\r\n3 three\r\n.\r\n".to_owned(),
+                "LIST" => "+OK\r\n1 100\r\n2 100\r\n3 100\r\n.\r\n".to_owned(),
+                c if c.starts_with("TOP ") => {
+                    let n = c.split(' ').nth(1).unwrap();
+                    format!("+OK\r\nSubject: Message {n}\r\n\r\n.\r\n")
+                }
+                "QUIT" => return,
+                other => panic!("Unexpected POP3 command: {other}"),
+            };
+            if r.get_mut().write_all(reply.as_bytes()).is_err() {
+                return;
+            }
+        }
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.incoming_port = server.port;
+    assert_eq!(b.catalog(&a, Folder::Inbox, 50)?.total, 3);
+    let paused = b.catalog(&a, Folder::Inbox, 50).unwrap_err();
+    let throttled = paused
+        .downcast_ref::<crate::manage::status::Throttled>()
+        .expect("paused for LOGIN-DELAY");
+    assert!(throttled.until >= chrono::Utc::now().timestamp() + 800);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.iter().filter(|c| c.starts_with("USER ")).count(), 1, "{seen:?}");
+    // The TOPs went in one write, so the first was read with the others
+    // already there (one TLS record; the server reads them together).
+    let tops: Vec<&String> = seen.iter().filter(|c| c.starts_with("TOP ")).collect();
+    assert_eq!(tops.len(), 3, "{seen:?}");
+    assert!(!tops[0].ends_with(" +0"), "{seen:?}");
+    drop(server);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

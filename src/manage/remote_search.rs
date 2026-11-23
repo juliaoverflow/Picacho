@@ -83,6 +83,7 @@ impl Backend {
             }
             let ext = c.extensions()?;
             let utf8 = c.enabled.utf8;
+            let literals = c.literals();
             let string = |text: &str| search_string(text, &ext, utf8);
             let search = crate::manage::search::Search::parse(query);
             // Gmail's own search knows no code mail or package updates.
@@ -94,6 +95,8 @@ impl Backend {
                     crate::manage::search::ImapSearch {
                         within: ext.within,
                         fuzzy: ext.fuzzy,
+                        objectid: ext.objectid,
+                        gmail: ext.gmail,
                     },
                 )?
             };
@@ -115,7 +118,7 @@ impl Backend {
                 // §2 lets the server leave those out); only a refusal is
                 // searched again.
                 let (found, searched) =
-                    match crate::sync::transport::multisearch(&mut c.session, &wire, &criteria, utf8) {
+                    match crate::sync::transport::multisearch(&mut c.session, literals.as_ref(), &wire, &criteria, utf8) {
                         Ok(found) => (found, std::mem::take(&mut remotes)),
                         Err(_) => (Vec::new(), Vec::new()),
                     };
@@ -162,7 +165,7 @@ impl Backend {
                     Err(e) => return Err(e),
                 };
                 let (uids, total) =
-                    newest_search(&mut c.session, &ext, &selected, &criteria, utf8, limit)?;
+                    newest_search(&mut c.session, literals.as_ref(), &ext, &selected, &criteria, utf8, limit)?;
                 out.total += total;
                 let newest = &uids[..];
                 let prefix = format!("{}:{remote}:{}:", a.id, selected.validity);

@@ -607,6 +607,7 @@ impl Backend {
             return Ok(false);
         }
         let set = if saved && ext.moves { "$".to_owned() } else { uid_ranges(&uids) };
+        c.require_writable("move snoozed mail back")?;
         c.session.uid_store(&set, "-FLAGS.SILENT (\\Seen)")?;
         let inbox = c.mailbox("INBOX")?;
         if c.extensions()?.moves {

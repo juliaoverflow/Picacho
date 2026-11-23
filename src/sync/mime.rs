@@ -168,8 +168,11 @@ pub fn parse_message(
         .split(';')
         .any(|o| o.split_once('=').is_some_and(|(_, v)| v.trim().to_ascii_lowercase().starts_with("required")));
     if !(automatic || report || null_path || required) {
-        mail.set_receipt_to(receipt_address(&header("Disposition-Notification-To")));
+        mail.set_receipt_to(receipt_addresses(&header("Disposition-Notification-To")));
     }
+    // A mailing list's identity and addresses (RFC 2919, RFC 2369).
+    mail.set_list_id(crate::manage::list_headers::list_id(&header("List-Id")));
+    mail.set_list_links(crate::manage::list_headers::links(&header));
     Ok(mail)
 }
 /// format=flowed text (RFC 3676 §4) as paragraphs: a line ending in a
@@ -276,14 +279,31 @@ fn first_mailbox(list: &mailparse::MailAddrList) -> Option<mailparse::SingleInfo
         mailparse::MailAddr::Group(g) => g.addrs.first().cloned(),
     })
 }
-/// The address a read receipt goes to, from Disposition-Notification-To.
+/// The first address in an address header (From, Sender…).
 pub(crate) fn receipt_address(value: &str) -> String {
-    // Several addresses: the first (RFC 8098 §2.1 lets a UA pick).
     mailparse::addrparse(value)
         .ok()
         .and_then(|v| first_mailbox(&v))
         .map(|s| s.addr)
         .unwrap_or_default()
+}
+/// Where a read receipt goes: every address in Disposition-Notification-To
+/// (RFC 8098 §2.1: a list of mailboxes; the report goes to all of them),
+/// joined with ", ", each once. Groups give their members.
+pub(crate) fn receipt_addresses(value: &str) -> String {
+    let Ok(list) = mailparse::addrparse(value) else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for single in list.iter().flat_map(|a| match a {
+        mailparse::MailAddr::Single(s) => vec![s.addr.clone()],
+        mailparse::MailAddr::Group(g) => g.addrs.iter().map(|s| s.addr.clone()).collect(),
+    }) {
+        if !single.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&single)) {
+            out.push(single);
+        }
+    }
+    out.join(", ")
 }
 pub(crate) fn collect_leaves<'a>(
     p: &'a mailparse::ParsedMail<'a>,
@@ -676,6 +696,33 @@ fn entity(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 8098 §2.1: Disposition-Notification-To may name several
+    /// mailboxes; a receipt goes to each, once.
+    #[test]
+    fn every_receipt_address_is_kept() -> anyhow::Result<()> {
+        assert_eq!(
+            receipt_addresses("Ana <ana@example.com>, bo@example.com, Team: cy@example.com, ANA@example.com;"),
+            "ana@example.com, bo@example.com, cy@example.com"
+        );
+        assert_eq!(receipt_addresses(""), "");
+        let a = crate::manage::model::Account::new(crate::manage::model::Provider::Imap);
+        let raw = b"From: Ana <ana@example.com>\r\nDisposition-Notification-To: ana@example.com, Bo <bo@example.com>\r\nSubject: Hi\r\n\r\nBody";
+        let m = parse_message(raw, &a, "x:INBOX:1:1", crate::manage::model::Folder::Inbox, "INBOX", 1)?;
+        assert_eq!(m.receipt_to(), "ana@example.com, bo@example.com");
+        Ok(())
+    }
+    /// RFC 2919 and RFC 2369: a list message keeps its List-Id and links.
+    #[test]
+    fn list_headers_are_parsed() -> anyhow::Result<()> {
+        let a = crate::manage::model::Account::new(crate::manage::model::Provider::Imap);
+        let raw = b"From: list@example.org\r\nList-Id: Users <users.example.org>\r\nList-Post: <mailto:users@example.org>\r\nList-Help: <https://example.org/help>\r\nSubject: Hi\r\n\r\nBody";
+        let m = parse_message(raw, &a, "x:INBOX:1:1", crate::manage::model::Folder::Inbox, "INBOX", 1)?;
+        assert_eq!(m.list_id(), "users.example.org");
+        let kinds: Vec<_> = m.list_links().iter().map(|l| (l.kind, l.uri.as_str())).collect();
+        use crate::manage::list_headers::ListLinkKind as K;
+        assert_eq!(kinds, [(K::Help, "https://example.org/help"), (K::Post, "mailto:users@example.org")]);
+        Ok(())
+    }
     #[test]
     fn flowed_text_round_trips() {
         let text = format!("{}\n\n> quoted line\n-- \nAna", "word ".repeat(40).trim_end());
