@@ -95,6 +95,8 @@ impl Backend {
                     crate::manage::search::ImapSearch {
                         within: ext.within,
                         fuzzy: ext.fuzzy,
+                        objectid: ext.objectid,
+                        gmail: ext.gmail,
                     },
                 )?
             };

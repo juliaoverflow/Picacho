@@ -50,6 +50,9 @@ enum Field {
     Newer,
     /// Received longer ago than `value` seconds.
     Older,
+    /// In the server's conversation `value` (as `Mail::thread_id` keeps
+    /// it: "oid:…" or "gm:…"), case kept.
+    Thread,
 }
 
 impl Field {
@@ -103,6 +106,10 @@ pub struct ImapSearch {
     /// SEARCH=FUZZY (RFC 6203): words match approximately (typos, word
     /// forms), as people expect of a search box.
     pub fuzzy: bool,
+    /// OBJECTID (RFC 8474 §6): THREADID is a search key.
+    pub objectid: bool,
+    /// Gmail's X-GM-EXT-1: X-GM-THRID is a search key.
+    pub gmail: bool,
 }
 /// A length of time such as `7d`, `2w`, `3m`, `1y` (or `7`, days), in
 /// seconds.
@@ -182,6 +189,15 @@ impl Search {
         let mut parts = Vec::new();
         for t in &self.terms {
             let v = || string(&t.value);
+            if t.field == Field::Thread {
+                // A server's own conversation: THREADID (RFC 8474 §6) or
+                // Gmail's X-GM-THRID, where the id is that kind; elsewhere
+                // there is no such key, and the term narrows nothing there.
+                if let Some(part) = thread_criterion(&t.value, can) {
+                    parts.push(if t.negated { format!("NOT ({part})") } else { part });
+                }
+                continue;
+            }
             // WITHIN's interval is a positive nz-number (RFC 5032 §3).
             let seconds = || t.value.parse::<i64>().unwrap_or(0).clamp(1, i64::from(u32::MAX));
             let part = match t.field {
@@ -212,6 +228,7 @@ impl Search {
                 Field::Code => any_subject(CODE_SUBJECT_WORDS, string)?,
                 Field::Package => any_subject(PACKAGE_SUBJECT_WORDS, string)?,
                 Field::Receipt => any_subject(RECEIPT_SUBJECT_WORDS, string)?,
+                Field::Thread => unreachable!("handled above"),
             };
             parts.push(if t.negated { format!("NOT ({part})") } else { part });
         }
@@ -223,6 +240,9 @@ impl Search {
         use serde_json::json;
         self.terms
             .iter()
+            // JMAP's filter has no conversation (RFC 8621 §4.4.1); the
+            // term is matched here, on what is found.
+            .filter(|t| t.field != Field::Thread)
             .map(|t| {
                 let v = &t.value;
                 let c = match t.field {
@@ -250,6 +270,7 @@ impl Search {
                             json!({ "before": at })
                         }
                     }
+                    Field::Thread => unreachable!("filtered out above"),
                     Field::Code | Field::Package | Field::Receipt => {
                         let words = match t.field {
                             Field::Code => CODE_SUBJECT_WORDS,
@@ -284,6 +305,22 @@ const RECEIPT_SUBJECT_WORDS: &[&str] = &[
     "receipt", "invoice", "order", "purchase", "payment", "paid", "refund", "rechnung", "quittung",
     "factura", "recibo", "facture", "reçu", "fattura", "ricevuta",
 ];
+
+/// The IMAP search key for the server conversation `thread` (as
+/// `Mail::thread_id` writes it), where the server has one for that kind.
+fn thread_criterion(thread: &str, can: ImapSearch) -> Option<String> {
+    if let Some(id) = thread.strip_prefix("oid:") {
+        // RFC 8474 §4: objectid is 1–255 of A-Z a-z 0-9 _ -.
+        let valid = (1..=255).contains(&id.len())
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        return (can.objectid && valid).then(|| format!("THREADID {id}"));
+    }
+    if let Some(id) = thread.strip_prefix("gm:") {
+        let valid = !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+        return (can.gmail && valid).then(|| format!("X-GM-THRID {id}"));
+    }
+    None
+}
 
 /// IMAP criteria for a subject with any of `words`: ORs, nested, as IMAP
 /// takes two at a time.
@@ -330,6 +367,7 @@ impl Term {
             Field::Code => Kinds::code(kinds, m),
             Field::Package => Kinds::package(kinds, m),
             Field::Receipt => Kinds::receipt(kinds, m),
+            Field::Thread => m.thread_id() == self.value,
             Field::Newer | Field::Older => {
                 let cutoff = chrono::Utc::now().timestamp() - self.value.parse::<i64>().unwrap_or(0);
                 if self.field == Field::Newer {
@@ -425,6 +463,19 @@ fn term(raw: &str, phrase: bool) -> Option<Term> {
         "cc" => Field::Cc,
         "subject" => Field::Subject,
         "label" | "tag" | "keyword" => Field::Label,
+        // Backend-only until the UI calls it: a conversation's messages on
+        // the server. Ids are case-sensitive, so the typed one is kept.
+        "thread" => {
+            let raw_value = raw.split_once(':').map_or("", |(_, v)| v).trim();
+            if raw_value.is_empty() {
+                return None;
+            }
+            return Some(Term {
+                field: Field::Thread,
+                value: raw_value.to_owned(),
+                negated,
+            });
+        }
         "newer" | "newer_than" | "older" | "older_than" => {
             let Some(seconds) = age(value) else {
                 return any(lower);
@@ -475,12 +526,36 @@ fn term(raw: &str, phrase: bool) -> Option<Term> {
 mod tests {
     use super::*;
 
+    /// RFC 8474 §6: `thread:` searches the server's conversation by
+    /// THREADID where OBJECTID is offered, X-GM-THRID on Gmail, and by
+    /// nothing elsewhere; locally it matches the cached thread id.
+    #[test]
+    fn thread_terms_search_the_servers_conversation() {
+        let quote = |s: &str| Ok(format!("\"{s}\""));
+        let objectid = ImapSearch { objectid: true, ..ImapSearch::default() };
+        let gmail = ImapSearch { gmail: true, ..ImapSearch::default() };
+        let s = Search::parse("thread:oid:T64b478a75b7ea9 report");
+        assert_eq!(s.imap_criteria_with(&quote, objectid).unwrap(), "THREADID T64b478a75b7ea9 TEXT \"report\"");
+        assert_eq!(s.imap_criteria_with(&quote, gmail).unwrap(), "TEXT \"report\"");
+        assert_eq!(s.imap_criteria(&quote).unwrap(), "TEXT \"report\"");
+        let g = Search::parse("-thread:gm:1278455344230334865");
+        assert_eq!(g.imap_criteria_with(&quote, gmail).unwrap(), "NOT (X-GM-THRID 1278455344230334865)");
+        // Not an id a server could have: nothing is sent for it.
+        assert_eq!(Search::parse("thread:oid:a.b(c)").imap_criteria_with(&quote, objectid).unwrap(), "ALL");
+        assert!(Search::parse("thread:").terms.is_empty());
+        assert!(Search::parse("thread:oid:X").jmap_conditions().is_empty());
+        let mut m = Mail::default();
+        m.set_thread_id("oid:T64b478a75b7ea9");
+        assert!(Search::parse("thread:oid:T64b478a75b7ea9").matches(&m));
+        assert!(!Search::parse("thread:oid:t64b478a75b7ea9").matches(&m), "case kept");
+    }
+
     #[test]
     fn ages_search_by_the_servers_clock_where_it_can() {
         let quote = |s: &str| Ok(format!("\"{s}\""));
         let s = Search::parse("newer:2d report");
         assert_eq!(
-            s.imap_criteria_with(&quote, ImapSearch { within: true, fuzzy: true }).unwrap(),
+            s.imap_criteria_with(&quote, ImapSearch { within: true, fuzzy: true, ..ImapSearch::default() }).unwrap(),
             "YOUNGER 172800 FUZZY (TEXT \"report\")"
         );
         assert!(Search::parse("older:1y").imap_criteria(&quote).unwrap().starts_with("BEFORE "));

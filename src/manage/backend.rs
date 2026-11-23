@@ -2176,6 +2176,7 @@ impl Backend {
             m.starred = row.flagged();
             m.size = row.size.unwrap_or(0);
             m.gmail_id = row.gmail_id.unwrap_or(0);
+            m.set_email_id(row.email_id.clone().unwrap_or_default());
             m.set_labels(row.labels(gmail).unwrap_or_default());
             m.answered = row.answered();
             m.forwarded = row.forwarded();
@@ -2415,12 +2416,23 @@ impl Backend {
         let mut stored = 0;
         let mut pending: Vec<&Mail> = Vec::new();
         for m in mails {
-            // A Gmail message appears once per label: download it once.
+            // A Gmail message appears once per label: download it once. The
+            // same for one message in several mailboxes (OBJECTID's EMAILID).
             if m.gmail_id != 0 {
                 if pending.iter().any(|p| p.gmail_id == m.gmail_id) {
                     continue;
                 }
                 if let Some(raw) = self.store.gmail_raw(&a.id, m.gmail_id)? {
+                    self.store.save_raw(&m.id, &raw)?;
+                    stored += 1;
+                    continue;
+                }
+            }
+            if !m.email_id().is_empty() {
+                if pending.iter().any(|p| p.email_id() == m.email_id()) {
+                    continue;
+                }
+                if let Some(raw) = self.store.email_raw(&a.id, m.email_id())? {
                     self.store.save_raw(&m.id, &raw)?;
                     stored += 1;
                     continue;
@@ -2751,8 +2763,13 @@ impl Backend {
                 self.store.save_messages(std::slice::from_ref(&next))?;
                 return Ok(next);
             }
-            let raw = match self.store.gmail_raw(&a.id, m.gmail_id)? {
-                // The same Gmail message, already downloaded under another label.
+            let shared = match self.store.gmail_raw(&a.id, m.gmail_id)? {
+                Some(raw) => Some(raw),
+                None => self.store.email_raw(&a.id, m.email_id())?,
+            };
+            let raw = match shared {
+                // The same message, already downloaded under another label
+                // (Gmail) or in another mailbox (EMAILID).
                 Some(raw) => raw,
                 // Large messages download in pieces that resume after an
                 // interruption; others in one request.
@@ -3660,7 +3677,7 @@ impl Backend {
             return self.download_batch_jmap(a, max, since);
         }
         // A Gmail message appears once per label; download it only once.
-        let shared = if a.provider == Provider::Gmail {
+        let mut shared = if a.provider == Provider::Gmail {
             self.store.share_gmail_raw(&a.id)?
         } else {
             0
@@ -3673,6 +3690,17 @@ impl Backend {
             }
             if m.gmail_id != 0 && pending.iter().any(|p| p.gmail_id == m.gmail_id) {
                 continue;
+            }
+            // Another mailbox's copy, downloaded already: shared, not fetched.
+            if !m.email_id().is_empty() {
+                if pending.iter().any(|p| p.email_id() == m.email_id()) {
+                    continue;
+                }
+                if let Some(raw) = self.store.email_raw(&a.id, m.email_id())? {
+                    self.store.save_raw(&m.id, &raw)?;
+                    shared += 1;
+                    continue;
+                }
             }
             budget = budget.saturating_sub(m.size as usize);
             pending.push(m);

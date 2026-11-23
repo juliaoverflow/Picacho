@@ -188,6 +188,9 @@ impl Store {
              -- Copies of one Gmail message (one per label), for sharing a
              -- downloaded source between them (`share_gmail_raw`, `gmail_raw`).
              CREATE INDEX IF NOT EXISTS gmail ON messages(account, {GMAIL_ID}) WHERE {GMAIL_ID} > 0;
+             -- Copies of one message in several mailboxes by OBJECTID's
+             -- EMAILID (RFC 8474), for the same (`email_raw`).
+             CREATE INDEX IF NOT EXISTS email_id ON messages(account, {EMAIL_ID}) WHERE {EMAIL_ID} <> '';
              -- A server mailbox's rows, for replacing or forgetting them
              -- (under the write lock, which a scan of the account held).
              CREATE INDEX IF NOT EXISTS remote_folder ON messages(account, json_extract(data,'$.remote_folder'));"
@@ -1822,6 +1825,31 @@ impl Store {
         tx.commit()?;
         Ok(filled)
     }
+    /// The downloaded source of another copy of the message `email_id`
+    /// (OBJECTID's EMAILID) in the same account, if any: one id names one
+    /// unchanging message across the account's mailboxes (RFC 8474 §5.1).
+    /// Only copies downloaded whole have one; an empty id has none.
+    pub fn email_raw(&self, account: &str, email_id: &str) -> Result<Option<Vec<u8>>> {
+        use rusqlite::OptionalExtension;
+        if email_id.is_empty() {
+            return Ok(None);
+        }
+        let saved = self
+            .read()
+            .query_row(
+                &format!(
+                    "SELECT {SOURCE_COLUMNS} FROM messages WHERE account=?1 AND {DOWNLOADED}
+                     AND {EMAIL_ID} <> '' AND {EMAIL_ID}=?2 LIMIT 1"
+                ),
+                params![account, email_id],
+                |r| source_columns(r, 0),
+            )
+            .optional()?;
+        match saved {
+            Some((raw, source)) => unpack(raw, source),
+            None => Ok(None),
+        }
+    }
     /// Downloaded content of another copy of a Gmail message, if any.
     pub fn gmail_raw(&self, account: &str, gmail_id: u64) -> Result<Option<Vec<u8>>> {
         use rusqlite::OptionalExtension;
@@ -2440,6 +2468,9 @@ fn fill_from(mail: &mut Mail, raw: Option<&[u8]>) {
 /// The rows whose source hasn't been. Written exactly as the `downloaded`
 /// index has it, so that the download counts are read from the index.
 const NOT_DOWNLOADED: &str = "(raw IS NULL AND source IS NULL)";
+/// A row's EMAILID, written exactly as the `email_id` index has it; queries
+/// ask for it `<> ''`, the index's condition, so SQLite uses it.
+const EMAIL_ID: &str = "json_extract(data,'$.email_id')";
 /// A row's Gmail message id, written exactly as the `gmail` index has it.
 /// Queries also ask for it `> 0`, the index's condition, so SQLite uses it.
 const GMAIL_ID: &str = "json_extract(data,'$.gmail_id')";
@@ -2819,6 +2850,36 @@ mod tests {
         }
         assert_eq!(s.preference("jmap_state:gone:inbox"), None);
         assert!(s.preference("jmap_state:gone2:inbox").is_some());
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+    /// RFC 8474 §5.1: copies with one EMAILID share a downloaded source,
+    /// in the same account only, found through the `email_id` index.
+    #[test]
+    fn email_id_copies_share_downloaded_content() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let s = Store::open(&p)?;
+        let mut ms = demo_mail();
+        for (m, id) in ms.iter_mut().zip(["M1", "M1", "M2", ""]) {
+            m.set_email_id(id);
+        }
+        s.save_messages(&ms[..4])?;
+        assert_eq!(s.email_raw("demo", "M1")?, None, "none downloaded yet");
+        s.save_raw(&ms[0].id, b"one")?;
+        assert_eq!(s.email_raw("demo", "M1")?, Some(b"one".to_vec()));
+        assert_eq!(s.email_raw("demo", "M2")?, None);
+        assert_eq!(s.email_raw("demo", "")?, None);
+        assert_eq!(s.email_raw("other", "M1")?, None);
+        let plan: Vec<String> = {
+            let db = s.read();
+            let mut q = db.prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT {SOURCE_COLUMNS} FROM messages WHERE account=?1 AND {DOWNLOADED} AND {EMAIL_ID} <> '' AND {EMAIL_ID}=?2 LIMIT 1"
+            ))?;
+            q.query_map(params!["demo", "M1"], |r| r.get::<_, String>(3))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        assert!(plan.iter().any(|d| d.contains("INDEX email_id")), "{plan:?}");
         drop(s);
         std::fs::remove_dir_all(p)?;
         Ok(())

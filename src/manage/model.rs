@@ -829,6 +829,9 @@ pub struct MailExtra {
     /// The list's other addresses (RFC 2369: List-Help, -Subscribe,
     /// -Post, -Owner, -Archive), stored only, never opened by themselves.
     list_links: Vec<crate::manage::list_headers::ListLink>,
+    /// The server's id for the message itself (OBJECTID's EMAILID, RFC
+    /// 8474 §5.1): the same in every mailbox of the account.
+    email_id: String,
 }
 impl MailExtra {
     fn is_empty(&self) -> bool {
@@ -841,6 +844,7 @@ impl MailExtra {
             && self.receipt_to.is_empty()
             && self.list_id.is_empty()
             && self.list_links.is_empty()
+            && self.email_id.is_empty()
     }
 }
 
@@ -911,6 +915,14 @@ impl Mail {
     }
     pub fn set_list_links(&mut self, links: Vec<crate::manage::list_headers::ListLink>) {
         self.change_extra(links.is_empty(), |e| e.list_links = links);
+    }
+    /// The server's EMAILID for it (OBJECTID); empty where unknown.
+    pub fn email_id(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.email_id)
+    }
+    pub fn set_email_id(&mut self, email_id: impl Into<String>) {
+        let email_id = email_id.into();
+        self.change_extra(email_id.is_empty(), |e| e.email_id = email_id);
     }
     /// Takes the attachments out, leaving none.
     pub fn take_attachments(&mut self) -> Vec<Attachment> {
@@ -994,6 +1006,8 @@ struct MailRecord {
     #[serde(default)]
     list_links: Vec<crate::manage::list_headers::ListLink>,
     #[serde(default)]
+    email_id: String,
+    #[serde(default)]
     mdn_sent: bool,
     #[serde(default)]
     partial: bool,
@@ -1046,6 +1060,8 @@ struct MailRecordRef<'a> {
     list_id: &'a str,
     #[serde(skip_serializing_if = "no_items")]
     list_links: &'a [crate::manage::list_headers::ListLink],
+    #[serde(skip_serializing_if = "no_text")]
+    email_id: &'a str,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mdn_sent: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1069,6 +1085,7 @@ impl From<MailRecord> for Mail {
             receipt_to: r.receipt_to,
             list_id: r.list_id,
             list_links: r.list_links,
+            email_id: r.email_id,
         };
         Mail {
             id: r.id,
@@ -1139,6 +1156,7 @@ impl Serialize for Mail {
             receipt_to: self.receipt_to(),
             list_id: self.list_id(),
             list_links: self.list_links(),
+            email_id: self.email_id(),
             mdn_sent: self.mdn_sent,
             partial: self.partial,
         }

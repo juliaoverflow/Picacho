@@ -2308,3 +2308,71 @@ fn imap4rev2_sign_in_sends_the_initial_response() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 8474 §5.1: one message in two mailboxes (the same EMAILID) is
+/// downloaded once; the other copy shares its source.
+#[test]
+fn objectid_copies_download_once() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let body = "From: Ana <ana@example.com>\r\nSubject: Shared\r\nMessage-ID: <s@example.com>\r\n\r\nOne message, two mailboxes.\r\n";
+    let server = std::thread::spawn(move || {
+        let mut fetches = Vec::new();
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 OBJECTID UIDPLUS\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Work\r\n");
+                } else if upper.starts_with("SELECT") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if upper.starts_with("UID FETCH") && upper.contains("BODY.PEEK[]") {
+                    fetches.push(command.clone());
+                    p.send(&format!("* 1 FETCH (UID 7 BODY[] {{{}}}\r\n{body})\r\n", body.len()));
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        fetches
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    a.sync.offline_days = 0;
+    let copy = |remote: &str, folder: Folder| {
+        let mut m = Mail {
+            id: format!("{}:{remote}:42:7", a.id),
+            account: a.id.clone(),
+            folder,
+            remote_folder: remote.into(),
+            uid: 7,
+            size: 100,
+            date: 1_700_000_000,
+            ..Mail::default()
+        };
+        m.set_email_id("M7f3a");
+        m
+    };
+    let (inbox, work) = (copy("INBOX", Folder::Inbox), copy("Work", Folder::Other));
+    b.store.save_messages(&[inbox.clone(), work.clone()])?;
+    let mut stored = b.download_batch(&a, 10)?;
+    stored += b.download_batch(&a, 10)?;
+    assert_eq!(stored, 2);
+    for m in [&inbox, &work] {
+        let raw = b.store.raw(&m.id)?.expect("downloaded");
+        assert!(String::from_utf8_lossy(&raw).contains("two mailboxes"));
+    }
+    b.disconnect(&a.id);
+    let fetches = server.join().unwrap();
+    assert_eq!(fetches.len(), 1, "{fetches:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
