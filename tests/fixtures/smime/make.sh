@@ -5,6 +5,7 @@
 set -eu
 cd "$(dirname "$0")"
 rm -f -- *.pem *.key *.eml *.der *.srl *.cnf
+rm -rf crl.tmp
 days=36500
 
 cat > ext.cnf <<'EOF'
@@ -91,6 +92,22 @@ rm -f ext.cnf
     -recip bo.pem -binary; } > encrypted-aes-gcm.eml
 { printf "$headers"; openssl smime -encrypt -in content.txt -aes-256-cbc -binary ana.pem; } \
     > pkcs7-encrypted.eml
+
+# A CRL from the test authority revoking Bo's certificate (RFC 5280 §5),
+# and one revoking nothing.
+mkdir -p crl.tmp && : > crl.tmp/index.txt
+cat > crl.tmp/ca.cnf <<'EOF2'
+[ca]
+default_ca = test
+[test]
+database = crl.tmp/index.txt
+default_md = sha256
+default_crl_days = 36500
+EOF2
+openssl ca -config crl.tmp/ca.cnf -gencrl -keyfile ca.key -cert ca.pem -out crl-empty.pem 2>/dev/null
+openssl ca -config crl.tmp/ca.cnf -revoke bo.pem -keyfile ca.key -cert ca.pem 2>/dev/null
+openssl ca -config crl.tmp/ca.cnf -gencrl -keyfile ca.key -cert ca.pem -out crl-bo-revoked.pem 2>/dev/null
+rm -rf crl.tmp
 
 # Mail travels with CRLF line ends (RFC 5322 §2.1); openssl writes LF
 # outside the signed content, which already has CRLF.

@@ -76,6 +76,9 @@ pub enum SignerResult {
     /// The message doesn't carry the signer's certificate, so the
     /// signature couldn't be checked.
     Unverified,
+    /// The signature matches, but a supplied revocation list (RFC 5280
+    /// §5.3.1) lists the certificate.
+    Revoked,
     /// The signature doesn't match the content, or its certificate isn't
     /// one for signing mail.
     Bad,
@@ -95,6 +98,9 @@ pub enum Signature {
     /// Signed, but the message doesn't carry the certificate of anyone who
     /// signed it, so no signature could be checked.
     Unverified,
+    /// The signature matches, but a revocation list its authority issued
+    /// (RFC 5280 §5) says the certificate was withdrawn.
+    Revoked(String),
     /// The signature doesn't match: the message was changed, or forged.
     Bad,
 }
@@ -111,6 +117,9 @@ impl Signature {
             }
             Self::OtherSender(who) => {
                 format!("Signed by {who} (S/MIME), who isn't the sender shown")
+            }
+            Self::Revoked(who) => {
+                format!("Signed by {who} (S/MIME), whose certificate has been revoked")
             }
             Self::Unverified => {
                 "Signed with S/MIME, by a certificate the message doesn't include: it couldn't be checked".into()
@@ -677,6 +686,11 @@ fn legacy_provider() -> bool {
 }
 
 fn trusted_store() -> Result<openssl::x509::store::X509Store> {
+    Ok(trusted_builder()?.build())
+}
+
+/// The system's trusted authorities, in a store still to be built.
+fn trusted_builder() -> Result<X509StoreBuilder> {
     static ROOTS: std::sync::OnceLock<Vec<X509>> = std::sync::OnceLock::new();
     let mut builder = X509StoreBuilder::new()?;
     // OpenSSL's own configured authorities, where it has some.
@@ -695,7 +709,64 @@ fn trusted_store() -> Result<openssl::x509::store::X509Store> {
         // Duplicates of a default path's are refused; that's fine.
         let _ = builder.add_cert(root.clone());
     }
-    Ok(builder.build())
+    Ok(builder)
+}
+
+/// Certificate revocation lists the caller supplies (RFC 5280 §5), as PEM
+/// files, each checked for the certificate of every signature that matches.
+/// Fetching them (from a certificate's CRL distribution points, RFC 5280
+/// §4.2.1.13) and asking OCSP responders (RFC 6960) is not done here.
+#[derive(Clone, Debug, Default)]
+pub struct CrlCheck {
+    pub files: Vec<std::path::PathBuf>,
+}
+
+impl CrlCheck {
+    /// A store with `builder`'s authorities and these lists, checking the
+    /// signer's certificate against them (X509_V_FLAG_CRL_CHECK).
+    fn store(&self, mut builder: X509StoreBuilder) -> Result<openssl::x509::store::X509Store> {
+        let lookup = builder.add_lookup(openssl::x509::store::X509Lookup::file())?;
+        for file in &self.files {
+            // X509Lookup::load_crl_file panics on a path that isn't UTF-8
+            // or holds a NUL: refused here instead.
+            ensure!(
+                file.to_str().is_some_and(|f| !f.contains('\0')),
+                "A revocation list's path can't be read: {}",
+                file.display()
+            );
+            lookup
+                .load_crl_file(file, openssl::ssl::SslFiletype::PEM)
+                .with_context(|| format!("{} isn't a revocation list (PEM).", file.display()))?;
+        }
+        builder.set_flags(openssl::x509::verify::X509VerifyFlags::CRL_CHECK)?;
+        Ok(builder.build())
+    }
+}
+
+/// x509_vfy.h's X509_V_ERR_CERT_REVOKED, which the openssl crate doesn't name.
+const CERT_REVOKED: i32 = 23;
+
+/// Whether `crls` (a store from `CrlCheck::store`) says `cert` was revoked.
+/// Only that answer counts: a chain that can't be built, or an issuer with
+/// no list supplied, leaves the result as the signature check found it.
+fn revoked(cert: &X509, untrusted: &[X509], crls: &X509StoreRef) -> bool {
+    let Ok(mut chain) = Stack::new() else {
+        return false;
+    };
+    for c in untrusted {
+        if chain.push(c.clone()).is_err() {
+            return false;
+        }
+    }
+    let Ok(mut context) = openssl::x509::X509StoreContext::new() else {
+        return false;
+    };
+    context
+        .init(crls, cert, &chain, |c| {
+            c.verify_cert()?;
+            Ok(c.error())
+        })
+        .is_ok_and(|error| error.as_raw() == CERT_REVOKED)
 }
 
 /// Opens an S/MIME message: decrypts it with your key and checks its
@@ -708,6 +779,19 @@ pub fn open(raw: &[u8], certs: &Certificates) -> Option<(Vec<u8>, Verdict, Optio
     open_with(raw, certs, &store)
 }
 
+/// `open`, with each signer's certificate also checked against the
+/// revocation lists `crls` supplies.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn open_checking_revocation(
+    raw: &[u8],
+    certs: &Certificates,
+    crls: &CrlCheck,
+) -> Result<Option<(Vec<u8>, Verdict, Option<X509>)>> {
+    let store = trusted_store()?;
+    let crls = crls.store(trusted_builder()?)?;
+    Ok(open_checked(raw, certs, &store, Some(&crls)))
+}
+
 /// The most layers read: encryption, a signature, a second signature (RFC
 /// 2634 §1.1's triple wrapping) and one compression.
 const MAX_LAYERS: usize = 4;
@@ -717,6 +801,17 @@ fn open_with(
     raw: &[u8],
     certs: &Certificates,
     store: &X509StoreRef,
+) -> Option<(Vec<u8>, Verdict, Option<X509>)> {
+    open_checked(raw, certs, store, None)
+}
+
+/// `open_with`, and where `crls` is given, each signer's certificate
+/// checked against its revocation lists.
+fn open_checked(
+    raw: &[u8],
+    certs: &Certificates,
+    store: &X509StoreRef,
+    crls: Option<&X509StoreRef>,
 ) -> Option<(Vec<u8>, Verdict, Option<X509>)> {
     // As OpenPGP's: past this, the copies made opening it (decoded,
     // decrypted, each layer's) would be several times its size.
@@ -768,7 +863,7 @@ fn open_with(
                     }
                     break;
                 }
-                let (content, signers) = check_signers(&der, None, store, &known)?;
+                let (content, signers) = check_signers(&der, None, store, crls, &known)?;
                 (content, Some(signers))
             } else if oid == der::COMPRESSED_DATA {
                 // RFC 3274: one level, at most, so a small message can't
@@ -786,7 +881,7 @@ fn open_with(
         } else if k.starts_with("multipart/signed;") {
             let (content, signature) = signed_parts(&current)?;
             let der = CmsContentInfo::from_der(&signature).ok()?.to_der().ok()?;
-            let (_, signers) = check_signers(&der, Some(&content), store, &known)?;
+            let (_, signers) = check_signers(&der, Some(&content), store, crls, &known)?;
             (content, Some(signers))
         } else {
             break;
@@ -869,7 +964,7 @@ fn inflate(packed: &[u8], limit: usize) -> Option<Vec<u8>> {
 
 /// The message as a whole, from its signers' results (RFC 5652 §5.1 lets
 /// one message carry several): Bad if any signature is cryptographically
-/// invalid; otherwise the best of the rest, so a good signature beside one
+/// invalid; Revoked if any certificate is; otherwise the best of the rest, so a good signature beside one
 /// that couldn't be checked shows as good. The certificate is that best
 /// signer's, preferring one for the address the message is from.
 fn overall(signers: &[(Signer, Option<X509>)], raw: &[u8]) -> (Signature, Option<X509>) {
@@ -879,6 +974,11 @@ fn overall(signers: &[(Signer, Option<X509>)], raw: &[u8]) -> (Signature, Option
             .find(|(s, _)| s.result == SignerResult::Bad)
             .and_then(|(_, c)| c.clone());
         return (Signature::Bad, cert);
+    }
+    // RFC 5280 §3.3: a revoked certificate speaks for no one, so a
+    // signature by one isn't outweighed by a good one beside it.
+    if let Some((signer, cert)) = signers.iter().find(|(s, _)| s.result == SignerResult::Revoked) {
+        return (Signature::Revoked(signer.address.clone()), cert.clone());
     }
     let from = {
         use mailparse::MailHeaderMap as _;
@@ -931,12 +1031,14 @@ fn signer_certificate(signer_info: &der::Tlv<'_>, message: &[X509], known: &[X50
 }
 
 /// Checks each signature of a DER SignedData on its own, the content
-/// (`detached`, or the one inside) and certificates kept. Returns the
-/// content and each signer's result with its certificate.
+/// (`detached`, or the one inside) and certificates kept, and with `crls`
+/// each matching signature's certificate against revocation lists. Returns
+/// the content and each signer's result with its certificate.
 fn check_signers(
     der: &[u8],
     detached: Option<&[u8]>,
     store: &X509StoreRef,
+    crls: Option<&X509StoreRef>,
     known: &[X509],
 ) -> Option<(Vec<u8>, Vec<(Signer, Option<X509>)>)> {
     let signed = der::SignedData::parse(der).ok()?;
@@ -959,7 +1061,14 @@ fn check_signers(
             .unwrap_or_else(|| "an unknown signer".into());
         let result = match &cert {
             None => SignerResult::Unverified,
-            Some(cert) => check_one(&signed.with_signers(&[signer_info.raw]), detached, cert, store),
+            Some(cert) => match check_one(&signed.with_signers(&[signer_info.raw]), detached, cert, store) {
+                SignerResult::Good | SignerResult::Untrusted
+                    if crls.is_some_and(|crls| revoked(cert, &message, crls)) =>
+                {
+                    SignerResult::Revoked
+                }
+                result => result,
+            },
         };
         out.push((Signer { address, result }, cert));
     }
@@ -1004,7 +1113,7 @@ fn check_one(single: &[u8], detached: Option<&[u8]>, cert: &X509, store: &X509St
 /// certificate yet for its addresses, so a stranger's can never replace
 /// one already kept; one an authority vouches for replaces what was kept.
 pub fn learn(certs: &mut Certificates, signer: &X509, verdict: &Signature, from: &str) -> Result<bool> {
-    if matches!(verdict, Signature::Bad | Signature::None | Signature::Unverified) {
+    if matches!(verdict, Signature::Bad | Signature::None | Signature::Unverified | Signature::Revoked(_)) {
         return Ok(false);
     }
     let addresses = emails(signer);
@@ -1393,7 +1502,7 @@ mod tests {
         let store = test_authority();
         let check = |infos: &[&[u8]]| {
             let mixed = signed.with_signers(infos);
-            let (_, found) = check_signers(&mixed, Some(&content), &store, &[]).unwrap();
+            let (_, found) = check_signers(&mixed, Some(&content), &store, None, &[]).unwrap();
             let mut results: Vec<SignerResult> = found.iter().map(|(s, _)| s.result).collect();
             results.sort_by_key(|r| *r as u8);
             (results, overall(&found, b"From: ana@example.org\r\n\r\n").0)
@@ -1404,7 +1513,7 @@ mod tests {
         );
         // The forged signature alone is bad too.
         let (_, found) =
-            check_signers(&signed.with_signers(&[&forged]), Some(&content), &store, &[]).unwrap();
+            check_signers(&signed.with_signers(&[&forged]), Some(&content), &store, None, &[]).unwrap();
         assert_eq!(found[0].0.result, SignerResult::Bad);
         assert_eq!(
             check(&[ana, bo]),
@@ -1682,5 +1791,77 @@ mod tests {
         assert!(openssl_cli_verifies("cms", &signed));
         let (_, verdict, _) = open_with(&signed, &Certificates::default(), &test_authority()).unwrap();
         assert_eq!(verdict.signature, Signature::Good("bo@example.se".into()));
+    }
+
+    fn crl_check(files: &[&str]) -> CrlCheck {
+        let dir = format!("{}/tests/fixtures/smime", env!("CARGO_MANIFEST_DIR"));
+        CrlCheck { files: files.iter().map(|f| std::path::Path::new(&dir).join(f)).collect() }
+    }
+
+    /// RFC 5280 §5: with a supplied list revoking Bo's certificate, his
+    /// signature is revoked, and the message with it; Ana's beside it, on
+    /// a list that revokes nothing, stays good.
+    #[test]
+    fn a_revoked_signer_is_found_with_supplied_crls() {
+        let none = Certificates::default();
+        let mut builder = X509StoreBuilder::new().unwrap();
+        builder.add_cert(X509::from_pem(&fixture("ca.pem")).unwrap()).unwrap();
+        let revoking = crl_check(&["crl-bo-revoked.pem"]).store(builder).unwrap();
+        let (_, verdict, _) =
+            open_checked(&fixture("two-signers.eml"), &none, &test_authority(), Some(&revoking)).unwrap();
+        assert_eq!(
+            results(&verdict),
+            [("ana@example.org", SignerResult::Good), ("bo@example.se", SignerResult::Revoked)]
+        );
+        assert_eq!(verdict.signature, Signature::Revoked("bo@example.se".into()));
+        assert!(!verdict.signature.good());
+        let mut builder = X509StoreBuilder::new().unwrap();
+        builder.add_cert(X509::from_pem(&fixture("ca.pem")).unwrap()).unwrap();
+        let clean = crl_check(&["crl-empty.pem"]).store(builder).unwrap();
+        let (_, verdict, _) =
+            open_checked(&fixture("two-signers.eml"), &none, &test_authority(), Some(&clean)).unwrap();
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        // Changed content is still bad, revoked or not.
+        let changed = String::from_utf8(fixture("two-signers.eml")).unwrap().replace("noon", "nine");
+        let (_, verdict, _) =
+            open_checked(changed.as_bytes(), &none, &test_authority(), Some(&revoking)).unwrap();
+        assert_eq!(verdict.signature, Signature::Bad);
+        // A revoked signer's certificate isn't kept.
+        let bo = X509::from_pem(&fixture("bo.pem")).unwrap();
+        let mut kept = Certificates::default();
+        assert!(!learn(&mut kept, &bo, &Signature::Revoked("bo@example.se".into()), "bo@example.se").unwrap());
+    }
+
+    /// With no list for its issuer, a certificate isn't called revoked,
+    /// and a list that isn't one is refused.
+    #[test]
+    fn crl_checks_need_a_list_for_the_issuer() {
+        let mut builder = X509StoreBuilder::new().unwrap();
+        builder.add_cert(X509::from_pem(&fixture("ca.pem")).unwrap()).unwrap();
+        let no_lists = CrlCheck::default().store(builder).unwrap();
+        let (_, verdict, _) = open_checked(
+            &fixture("two-signers.eml"),
+            &Certificates::default(),
+            &test_authority(),
+            Some(&no_lists),
+        )
+        .unwrap();
+        assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+        assert!(crl_check(&["ana.pem"]).store(X509StoreBuilder::new().unwrap()).is_err());
+        assert!(crl_check(&["missing.pem"]).store(X509StoreBuilder::new().unwrap()).is_err());
+    }
+
+    /// The public hook, with the system's authorities: the fixtures' test
+    /// authority isn't one, so Ana's signature is unvouched, not revoked.
+    #[test]
+    fn open_checking_revocation_reads_mail_with_the_system_authorities() {
+        let (_, verdict, _) = open_checking_revocation(
+            &fixture("two-signers.eml"),
+            &Certificates::default(),
+            &crl_check(&["crl-bo-revoked.pem"]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdict.signature, Signature::Untrusted("ana@example.org".into()));
     }
 }
