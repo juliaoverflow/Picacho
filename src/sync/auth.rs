@@ -415,43 +415,216 @@ pub(crate) fn mx_hosts(domain: &str) -> anyhow::Result<Vec<String>> {
     })
 }
 
-/// Whether a domain's most preferred mail servers publish DANE records
-/// (TLSA at `_25._tcp.<server>`, RFC 7672), which also let servers insist
-/// on TLS. The records' DNSSEC signatures are the sending servers' to check.
+/// What DNSSEC says of an answer (RFC 4035 §4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Validation {
+    /// Signed, with a chain of trust from the root: the answer is the
+    /// zone's own.
+    Secure,
+    /// From an unsigned zone (or no answer could be had about it): as good
+    /// as any DNS answer, which anyone on the path can forge.
+    Insecure,
+    /// Signed, but the signatures don't check out: forged or broken.
+    Bogus,
+}
+impl Validation {
+    /// The validation of an RRset from its records' proofs: secure only if
+    /// every record is; bogus if any is.
+    fn of(proofs: impl IntoIterator<Item = mail_auth::hickory_resolver::proto::dnssec::Proof>) -> Self {
+        use mail_auth::hickory_resolver::proto::dnssec::Proof;
+        let mut all_secure = true;
+        let mut any = false;
+        for proof in proofs {
+            any = true;
+            match proof {
+                Proof::Bogus => return Self::Bogus,
+                Proof::Secure => {}
+                _ => all_secure = false,
+            }
+        }
+        if any && all_secure { Self::Secure } else { Self::Insecure }
+    }
+}
+
+/// The resolver for records whose worth is their DNSSEC signature (TLSA,
+/// OPENPGPKEY, SMIMEA): the system's own name servers, asked with DNSSEC
+/// OK (RFC 4035 §3.2.1), each answer validated here up to the root's
+/// trust anchors (hickory's built-in IANA keys), so a resolver on the path
+/// (or the network) can't vouch for it. Separate from `checker`'s, which
+/// mail-auth's DKIM, SPF, DMARC and ARC checks keep using unchanged. On the
+/// same runtime.
+fn validating() -> Option<&'static mail_auth::hickory_resolver::TokioResolver> {
+    use mail_auth::hickory_resolver::{TokioResolver, net::runtime::TokioRuntimeProvider};
+    static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
+    RESOLVER
+        .get_or_init(|| {
+            let checker = checker()?;
+            let _entered = checker.runtime.enter();
+            let (config, mut options) =
+                mail_auth::hickory_resolver::system_conf::read_system_conf().ok()?;
+            options.timeout = Duration::from_secs(4);
+            options.attempts = 2;
+            options.validate = true;
+            let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+            *builder.options_mut() = options;
+            builder.build().ok()
+        })
+        .as_ref()
+}
+/// The records of `kind` at `name`, validated, through `validating`. None
+/// found, in a zone signed or not, is an empty answer; one DNSSEC finds
+/// bogus is `Bogus` with no records (they mustn't be used).
+async fn validated_lookup(
+    name: &str,
+    kind: mail_auth::hickory_resolver::proto::rr::RecordType,
+) -> anyhow::Result<(Vec<mail_auth::hickory_resolver::proto::rr::RData>, Validation)> {
+    use mail_auth::hickory_resolver::net::{DnsError, NetError};
+    let resolver = validating().ok_or_else(|| anyhow::anyhow!("DNS isn't available"))?;
+    match resolver.lookup(name, kind).await {
+        Ok(found) => {
+            let records: Vec<_> = found
+                .answers()
+                .iter()
+                .filter(|r| r.record_type() == kind)
+                .collect();
+            let validation = Validation::of(records.iter().map(|r| r.proof));
+            if validation == Validation::Bogus {
+                return Ok((Vec::new(), Validation::Bogus));
+            }
+            Ok((records.into_iter().map(|r| r.data.clone()).collect(), validation))
+        }
+        Err(NetError::Dns(DnsError::DnssecBogus)) => Ok((Vec::new(), Validation::Bogus)),
+        Err(NetError::Dns(DnsError::Nsec { proof, .. })) => {
+            // A proof that there are none: secure or not, as proven.
+            Ok((Vec::new(), Validation::of([proof])))
+        }
+        Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok((Vec::new(), Validation::Insecure)),
+        Err(e) => anyhow::bail!("{e}"),
+    }
+}
+
+/// A TLSA record's fields (RFC 6698 §2.1), as numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Tlsa {
+    pub(crate) usage: u8,
+    pub(crate) selector: u8,
+    pub(crate) matching: u8,
+}
+impl Tlsa {
+    /// Whether an SMTP client can use it (RFC 7672 §3.1): DANE-TA(2) or
+    /// DANE-EE(3), as PKIX-TA(0) and PKIX-EE(1) are not for SMTP (§3.1.3);
+    /// a whole certificate or its public key (selector 0, 1); and the data
+    /// itself or its SHA-256 or SHA-512 hash (matching 0, 1, 2), of the
+    /// length that hash has (RFC 6698 §2.1.3, RFC 7671 §10.1.2).
+    pub(crate) fn usable(self, data_len: usize) -> bool {
+        matches!(self.usage, 2 | 3)
+            && matches!(self.selector, 0 | 1)
+            && match self.matching {
+                0 => data_len > 0,
+                1 => data_len == 32,
+                2 => data_len == 64,
+                _ => false,
+            }
+    }
+}
+fn tlsa_of(data: &mail_auth::hickory_resolver::proto::rr::RData) -> Option<(Tlsa, usize)> {
+    use mail_auth::hickory_resolver::proto::rr::RData;
+    let RData::TLSA(t) = data else { return None };
+    Some((
+        Tlsa {
+            usage: t.cert_usage.into(),
+            selector: t.selector.into(),
+            matching: t.matching.into(),
+        },
+        t.cert_data.len(),
+    ))
+}
+
+/// What DANE (RFC 7672) says of a mail server, from its TLSA RRset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DaneState {
+    /// Secure, with records an SMTP client can use: servers must use TLS
+    /// and check the certificate against them.
+    Usable,
+    /// No secure, usable records (none at all, an unsigned zone, or only
+    /// usages SMTP ignores): as if there were none (§2.2).
+    None,
+    /// The records are bogus: a sending server mustn't deliver (§2.1.1).
+    Bogus,
+}
+/// DANE's verdict on one TLSA answer.
+pub(crate) fn dane_state(records: &[(Tlsa, usize)], validation: Validation) -> DaneState {
+    match validation {
+        Validation::Bogus => DaneState::Bogus,
+        Validation::Insecure => DaneState::None,
+        Validation::Secure if records.iter().any(|(t, len)| t.usable(*len)) => DaneState::Usable,
+        Validation::Secure => DaneState::None,
+    }
+}
+/// The servers RFC 7672 §2.2.1 looks at for a domain: those at the lowest
+/// preference among its MX records, each one; with no MX records, the
+/// domain itself (the implicit MX, RFC 5321 §5.1). `None` where the domain
+/// takes no mail (a null MX, RFC 7505).
+pub(crate) fn dane_hosts(domain: &str, mx: &[(u16, Vec<String>)]) -> Option<Vec<String>> {
+    let Some(lowest) = mx.iter().map(|(p, _)| *p).min() else {
+        return Some(vec![domain.to_owned()]);
+    };
+    let hosts: Vec<String> = mx
+        .iter()
+        .filter(|(p, _)| *p == lowest)
+        .flat_map(|(_, hosts)| hosts.iter())
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .collect();
+    if hosts.iter().all(|h| h.is_empty()) {
+        return None;
+    }
+    Some(hosts.into_iter().filter(|h| !h.is_empty()).collect())
+}
+
+/// Whether a domain's mail servers are protected by DANE (RFC 7672): each
+/// server at its lowest MX preference (or the domain itself, with no MX)
+/// has secure TLSA records at `_25._tcp.<server>` that SMTP can use, so
+/// servers sending to it must use TLS and check the certificate. Bogus
+/// records are an error: mail there can't be delivered (§2.1.1).
 pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
     use anyhow::Context as _;
-    use mail_auth::hickory_resolver::proto::rr::RecordType;
-    use mail_auth::{DnsError, Error};
+    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
     let checker = checker().context("DNS isn't available")?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
-            let mx = match checker
-                .authenticator
-                .mx_lookup(domain, Some(&checker.cache.mx))
-                .await
-            {
-                Ok(mx) => mx,
-                Err(Error::Dns(DnsError::RecordNotFound(_))) => return Ok(false),
-                Err(e) => anyhow::bail!("{e}"),
-            };
-            let Some(first) = mx.records.first() else {
+            // The MX records themselves must be secure for DANE to apply
+            // to the servers they name (§2.2.1).
+            let (mx, validation) = validated_lookup(domain, RecordType::MX).await?;
+            anyhow::ensure!(
+                validation != Validation::Bogus,
+                "{domain}'s mail servers' DNS records fail DNSSEC validation"
+            );
+            if validation == Validation::Insecure && !mx.is_empty() {
                 return Ok(false);
-            };
-            for exchange in first.exchanges.iter() {
-                let name = format!("_25._tcp.{}", exchange.trim_end_matches('.'));
-                match checker
-                    .authenticator
-                    .resolver()
-                    .lookup(name.as_str(), RecordType::TLSA)
-                    .await
-                {
-                    Ok(found) if !found.answers().is_empty() => return Ok(true),
-                    Ok(_) => {}
-                    Err(e) if e.is_no_records_found() || e.is_nx_domain() => {}
-                    Err(e) => anyhow::bail!("{e}"),
+            }
+            let mut preferences: Vec<(u16, Vec<String>)> = Vec::new();
+            for record in &mx {
+                if let RData::MX(m) = record {
+                    preferences.push((m.preference, vec![m.exchange.to_ascii()]));
                 }
             }
-            Ok(false)
+            let Some(hosts) = dane_hosts(domain, &preferences) else {
+                return Ok(false);
+            };
+            let mut any = false;
+            for host in hosts {
+                let name = format!("_25._tcp.{}.", host.trim_end_matches('.'));
+                let (found, validation) = validated_lookup(&name, RecordType::TLSA).await?;
+                let records: Vec<_> = found.iter().filter_map(tlsa_of).collect();
+                match dane_state(&records, validation) {
+                    DaneState::Usable => any = true,
+                    DaneState::Bogus => anyhow::bail!(
+                        "{host}'s DANE records fail DNSSEC validation, so mail to {domain} can't be delivered securely"
+                    ),
+                    DaneState::None => {}
+                }
+            }
+            Ok(any)
         })
         .await
         .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
@@ -464,39 +637,83 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
 /// The strings of a name's TXT records, each record's pieces joined by a
 /// space: RFC 6763 §6 key/value pairs are separate character-strings, and
 /// joined without one they would run together.
-/// The OpenPGP keys a domain publishes for an address in DNS
-/// (OPENPGPKEY, RFC 7929): at `<sha256(local part) first 28 bytes, hex>.
-/// _openpgpkey.<domain>`. Without DNSSEC (not checked here) such a key is
-/// as good as a key server's: one to compare with its owner.
-pub(crate) fn openpgpkey(email: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+/// Keys a domain publishes in DNS, and whether DNSSEC vouched for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DnsKeys {
+    pub(crate) keys: Vec<Vec<u8>>,
+    /// The answer was signed and validated up to the root (see
+    /// `validating`): the domain itself published these keys. Without it
+    /// they are only as good as a key server's (RFC 7929 §7).
+    pub(crate) dnssec_validated: bool,
+}
+/// The keys of a validated answer: none where DNSSEC found it bogus (forged
+/// or broken; not offered even as unverified), else all, marked as
+/// validated only when secure.
+fn dns_keys(keys: Vec<Vec<u8>>, validation: Validation) -> DnsKeys {
+    match validation {
+        Validation::Bogus => DnsKeys::default(),
+        v => DnsKeys {
+            keys,
+            dnssec_validated: v == Validation::Secure,
+        },
+    }
+}
+/// The owner name for an address's DNS-published key (RFC 7929 §3,
+/// RFC 8162 §3.1): the first 28 bytes of the SHA-256 of its local part, in
+/// hex, under `_<label>.<domain>`.
+fn hashed_name(email: &str, label: &str) -> anyhow::Result<String> {
     use anyhow::Context as _;
-    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
     use sha2::Digest as _;
     let (local, domain) = email.trim().rsplit_once('@').context("Not an address")?;
     let hash = sha2::Sha256::digest(local.as_bytes());
-    let label: String = hash[..28].iter().map(|b| format!("{b:02x}")).collect();
-    let name = format!("{label}._openpgpkey.{}.", domain.trim_end_matches('.'));
+    let hex: String = hash[..28].iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{hex}.{label}.{}.", domain.trim_end_matches('.')))
+}
+/// The OpenPGP keys a domain publishes for an address in DNS
+/// (OPENPGPKEY, RFC 7929), DNSSEC-validated where the zone is signed.
+pub(crate) fn openpgpkey(email: &str) -> anyhow::Result<DnsKeys> {
+    use anyhow::Context as _;
+    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
+    let name = hashed_name(email, "_openpgpkey")?;
     let checker = checker().context("DNS isn't available")?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
-            let found = match checker
-                .authenticator
-                .resolver()
-                .lookup(name.as_str(), RecordType::OPENPGPKEY)
-                .await
-            {
-                Ok(found) => found,
-                Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(vec![]),
-                Err(e) => anyhow::bail!("{e}"),
-            };
-            Ok(found
-                .answers()
+            let (found, validation) = validated_lookup(&name, RecordType::OPENPGPKEY).await?;
+            let keys = found
                 .iter()
-                .filter_map(|r| match &r.data {
+                .filter_map(|r| match r {
                     RData::OPENPGPKEY(k) => Some(k.public_key.clone()),
                     _ => None,
                 })
-                .collect())
+                .collect();
+            Ok(dns_keys(keys, validation))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+    })
+}
+/// The S/MIME certificates a domain publishes for an address in DNS
+/// (SMIMEA, RFC 8162), as DER: records with a full certificate (selector
+/// 0, matching 0), DNSSEC-validated where the zone is signed.
+#[allow(dead_code)]
+pub(crate) fn smimea(email: &str) -> anyhow::Result<DnsKeys> {
+    use anyhow::Context as _;
+    use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
+    let name = hashed_name(email, "_smimecert")?;
+    let checker = checker().context("DNS isn't available")?;
+    checker.runtime.block_on(async {
+        tokio::time::timeout(TIMEOUT, async {
+            let (found, validation) = validated_lookup(&name, RecordType::SMIMEA).await?;
+            let keys = found
+                .iter()
+                .filter_map(|r| match r {
+                    RData::SMIMEA(t) if u8::from(t.selector) == 0 && u8::from(t.matching) == 0 => {
+                        Some(t.cert_data.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(dns_keys(keys, validation))
         })
         .await
         .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
@@ -718,6 +935,97 @@ async fn unsubscribe_signature(
 
 #[cfg(test)]
 mod tests {
+    use mail_auth::hickory_resolver::proto::dnssec::Proof;
+
+    /// RFC 4035 §4.3: an RRset is secure only if each record is, bogus if
+    /// any is, else insecure (indeterminate counts as insecure).
+    #[test]
+    fn dnssec_proofs_map_to_secure_insecure_and_bogus() {
+        assert_eq!(Validation::of([Proof::Secure, Proof::Secure]), Validation::Secure);
+        assert_eq!(Validation::of([Proof::Secure, Proof::Insecure]), Validation::Insecure);
+        assert_eq!(Validation::of([Proof::Indeterminate]), Validation::Insecure);
+        assert_eq!(Validation::of([Proof::Secure, Proof::Bogus]), Validation::Bogus);
+        assert_eq!(Validation::of([]), Validation::Insecure);
+        // DNS-published keys: marked validated only when secure, and none
+        // at all from a bogus answer.
+        let key = vec![vec![1u8, 2, 3]];
+        assert_eq!(dns_keys(key.clone(), Validation::Secure), DnsKeys { keys: key.clone(), dnssec_validated: true });
+        assert_eq!(dns_keys(key.clone(), Validation::Insecure), DnsKeys { keys: key.clone(), dnssec_validated: false });
+        assert_eq!(dns_keys(key, Validation::Bogus), DnsKeys::default());
+        // RFC 7929 §3 and RFC 8162 §3.1's owner names.
+        assert_eq!(
+            hashed_name("hugh@example.com", "_openpgpkey").unwrap(),
+            "c93f1e400f26708f98cb19d936620da35eec8f72e57f9eec01c1afd6._openpgpkey.example.com."
+        );
+        assert!(hashed_name("hugh@example.com", "_smimecert").unwrap().ends_with("._smimecert.example.com."));
+    }
+
+    /// RFC 7672 §3.1 and RFC 6698 §2.1: only usages SMTP uses, known
+    /// selectors and matching types of the right length; insecure answers
+    /// count as none (§2.2), bogus ones refuse delivery (§2.1.1).
+    #[test]
+    fn tlsa_records_are_checked_for_smtp() {
+        let t = |usage, selector, matching| Tlsa { usage, selector, matching };
+        assert!(t(3, 1, 1).usable(32));
+        assert!(t(2, 0, 2).usable(64));
+        assert!(t(3, 0, 0).usable(800));
+        // PKIX usages aren't SMTP's.
+        assert!(!t(0, 1, 1).usable(32));
+        assert!(!t(1, 1, 1).usable(32));
+        // Unknown selector or matching type, or a hash of the wrong length.
+        assert!(!t(3, 2, 1).usable(32));
+        assert!(!t(3, 1, 3).usable(32));
+        assert!(!t(3, 1, 1).usable(20));
+        assert!(!t(3, 1, 2).usable(32));
+        assert!(!t(3, 1, 0).usable(0));
+        let good = [(t(3, 1, 1), 32)];
+        let pkix = [(t(1, 1, 1), 32)];
+        assert_eq!(dane_state(&good, Validation::Secure), DaneState::Usable);
+        assert_eq!(dane_state(&pkix, Validation::Secure), DaneState::None);
+        assert_eq!(dane_state(&good, Validation::Insecure), DaneState::None);
+        assert_eq!(dane_state(&good, Validation::Bogus), DaneState::Bogus);
+        assert_eq!(dane_state(&[], Validation::Bogus), DaneState::Bogus);
+    }
+
+    /// RFC 7672 §2.2.1: every server at the lowest preference; RFC 5321
+    /// §5.1: with no MX, the domain itself; RFC 7505: a null MX takes none.
+    #[test]
+    fn dane_looks_at_peer_mxs_and_the_implicit_mx() {
+        let mx = vec![
+            (20, vec!["backup.example.com.".to_owned()]),
+            (10, vec!["mx1.example.com.".to_owned()]),
+            (10, vec!["MX2.example.com".to_owned()]),
+        ];
+        assert_eq!(dane_hosts("example.com", &mx), Some(vec!["mx1.example.com".into(), "mx2.example.com".into()]));
+        assert_eq!(dane_hosts("example.com", &[]), Some(vec!["example.com".into()]));
+        assert_eq!(dane_hosts("example.com", &[(0, vec![".".into()])]), None);
+    }
+
+    /// mail-auth's resolver (DKIM, SPF, DMARC, ARC) is configured as
+    /// before: hickory's DNSSEC feature, now built, leaves validation off
+    /// unless asked, as only `validating` does.
+    #[test]
+    fn mail_auth_resolver_does_not_validate() {
+        let options = mail_auth::hickory_resolver::config::ResolverOpts::default();
+        assert!(!options.validate);
+        if let Ok((_, system)) = mail_auth::hickory_resolver::system_conf::read_system_conf() {
+            assert!(!system.validate, "the system configuration turns validation on");
+        }
+    }
+
+    /// Against the real DNS: `cargo test -- --ignored dane_live`. A
+    /// signed domain with DANE, a signed one without, an unsigned one, and
+    /// the deliberately broken dnssec-failed.org.
+    #[test]
+    #[ignore = "needs the network and a DNS resolver that passes DNSSEC records"]
+    fn dane_live() {
+        assert_eq!(dane("ietf.org").ok(), Some(true), "ietf.org publishes DANE");
+        assert_eq!(dane("gmail.com").ok(), Some(false));
+        // Bogus: refused, whether found so here or by a validating resolver
+        // upstream (which answers SERVFAIL).
+        assert!(dane("dnssec-failed.org").is_err(), "bogus records refuse delivery");
+    }
+
     #[test]
     fn srv_records_go_by_priority_then_weight() {
         let mut rng = rand::rng();

@@ -96,21 +96,67 @@ pub struct Metadata {
     pub revocation: Option<String>,
     /// The server's issuer identifier, for the callback's `iss` (RFC 9207).
     pub issuer: Option<String>,
+    /// How the token endpoint wants a client with a secret to say so.
+    pub client_auth: ClientAuth,
+    /// Where the browser's session with the issuer is ended (OpenID
+    /// Connect RP-Initiated Logout 1.0 §2.1), where it has that.
+    pub end_session: Option<String>,
+}
+/// How a client with a secret authenticates at the token endpoint
+/// (RFC 6749 §2.3.1, RFC 8414 §2 `token_endpoint_auth_methods_supported`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientAuth {
+    /// HTTP Basic with the form-encoded id and secret: what RFC 6749
+    /// §2.3.1 requires servers to support, and RFC 8414 §2's default.
+    #[default]
+    Basic,
+    /// `client_id` and `client_secret` in the request body, for servers
+    /// that list only that (and Google, whose documentation uses it).
+    Post,
 }
 /// Reads a server's metadata document, keeping only https endpoints.
+/// Refused: a document whose `jwks_uri` isn't https (RFC 8414 §2), or
+/// one listing PKCE methods without S256 (RFC 9700 §2.1.1: "plain"
+/// protects nothing against a code seen in transit). One that lists none
+/// is used, with S256 sent anyway: many servers that check PKCE omit it.
 pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
     let https = |key: &str| -> Option<String> {
         let u = v[key].as_str()?;
         let parsed = url::Url::parse(u).ok()?;
         (parsed.scheme() == "https" || cfg!(test)).then(|| u.to_owned())
     };
+    ensure!(
+        v["jwks_uri"].is_null() || https("jwks_uri").is_some(),
+        "The server's sign-in keys (jwks_uri) aren't served over https."
+    );
+    if let Some(methods) = v["code_challenge_methods_supported"].as_array() {
+        ensure!(
+            methods.iter().any(|m| m.as_str() == Some("S256")),
+            "The server's sign-in doesn't support PKCE with S256, which Picacho requires."
+        );
+    }
+    let listed = |key: &str, value: &str| {
+        v[key]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|m| m.as_str() == Some(value)))
+    };
+    let client_auth = if v["token_endpoint_auth_methods_supported"].is_array()
+        && !listed("token_endpoint_auth_methods_supported", "client_secret_basic")
+        && listed("token_endpoint_auth_methods_supported", "client_secret_post")
+    {
+        ClientAuth::Post
+    } else {
+        ClientAuth::Basic
+    };
     Ok(Metadata {
+        client_auth,
         authorization: https("authorization_endpoint")
             .context("The server's sign-in settings have no https authorization endpoint.")?,
         token: https("token_endpoint")
             .context("The server's sign-in settings have no https token endpoint.")?,
         registration: https("registration_endpoint"),
         revocation: https("revocation_endpoint"),
+        end_session: https("end_session_endpoint"),
         issuer: v["issuer"].as_str().map(str::to_owned),
         scopes: v["scopes_supported"]
             .as_array()
@@ -272,38 +318,147 @@ pub fn sso_scopes(supported: &[String], extra: &str) -> String {
 }
 
 /// Checks that a metadata document fetched from `origin` is that server's
-/// own (RFC 8414 §3.3): its `issuer`, where it names one, is `origin`.
+/// own (RFC 8414 §3.3): its `issuer`, which §2 requires, is `origin`. A
+/// trailing `/` is allowed, as servers write their origin both ways.
 fn issued_by(v: &serde_json::Value, origin: &str) -> Result<()> {
     match v["issuer"].as_str() {
-        None => Ok(()),
+        None => Err(anyhow::anyhow!("its sign-in settings name no issuer")),
         Some(issuer) if issuer.trim_end_matches('/').eq_ignore_ascii_case(origin) => Ok(()),
         Some(issuer) => Err(anyhow::anyhow!(
             "its sign-in settings are for {issuer}, not {origin}"
         )),
     }
 }
+/// Picacho's registration with a server (RFC 7591 §3.2.1), kept in the
+/// keychain for the next sign-in there, so each one doesn't add another
+/// client to the server: the client id, the loopback address it was
+/// registered for, and where and with what it can be read and changed
+/// (RFC 7592 §3), where the server allows that.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Registration {
+    client_id: String,
+    redirect: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registration_access_token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registration_client_uri: String,
+}
+impl Registration {
+    /// The keychain entry for registrations at `endpoint`.
+    fn key(endpoint: &str) -> String {
+        format!("oauth-registration:{endpoint}")
+    }
+    fn load(endpoint: &str) -> Option<Self> {
+        #[cfg(test)]
+        let text = TEST_REGISTRATIONS.lock().unwrap().get(endpoint).cloned();
+        #[cfg(not(test))]
+        let text = crate::manage::store::read_secret_text(&Self::key(endpoint)).ok().flatten();
+        serde_json::from_str(&text?).ok()
+    }
+    /// Kept, best effort: one that can't be is registered again next time.
+    fn save(&self, endpoint: &str) {
+        let Ok(text) = serde_json::to_string(self) else { return };
+        #[cfg(test)]
+        {
+            let _ = Self::key(endpoint);
+            TEST_REGISTRATIONS.lock().unwrap().insert(endpoint.to_owned(), text);
+        }
+        #[cfg(not(test))]
+        let _ = crate::manage::store::write_secret_text(&Self::key(endpoint), &text);
+    }
+    /// The loopback port it was registered with, to listen on again.
+    fn port(&self) -> Option<u16> {
+        url::Url::parse(&self.redirect).ok()?.port()
+    }
+    fn from_response(v: &serde_json::Value, redirect: &str) -> Result<Self> {
+        let text = |key: &str| v[key].as_str().unwrap_or_default().to_owned();
+        let client_id = text("client_id");
+        ensure!(!client_id.is_empty(), "The server registered Picacho without a client id.");
+        // RFC 7592 §3: the management URI must be https, as the access
+        // token is sent to it.
+        let uri = text("registration_client_uri");
+        let managed = uri.starts_with("https://") || (cfg!(test) && !uri.is_empty());
+        Ok(Self {
+            client_id,
+            redirect: redirect.to_owned(),
+            registration_access_token: if managed { text("registration_access_token") } else { String::new() },
+            registration_client_uri: if managed { uri } else { String::new() },
+        })
+    }
+}
+#[cfg(test)]
+static TEST_REGISTRATIONS: Mutex<std::collections::BTreeMap<String, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// What Picacho registers as: a native public client, without a secret
+/// (RFC 8252 §8.4), for `redirect`.
+fn client_metadata(redirect: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "Picacho",
+        "application_type": "native",
+        "redirect_uris": [redirect],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+}
 /// Registers Picacho with a server that allows apps to (RFC 7591), for
-/// `redirect`: a public client, without a secret (RFC 8252).
+/// `redirect`, and keeps the registration.
 fn register(endpoint: &str, redirect: &str) -> Result<String> {
     let v: serde_json::Value = http()?
         .post(endpoint)
-        .json(&serde_json::json!({
-            "client_name": "Picacho",
-            "application_type": "native",
-            "redirect_uris": [redirect],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-        }))
+        .json(&client_metadata(redirect))
         .send()
         .context("Couldn't reach the server to register Picacho for sign-in.")?
         .error_for_status()
         .context("The server didn't register Picacho for browser sign-in.")?
         .and_then_bounded_json()?;
-    Ok(v["client_id"]
-        .as_str()
-        .context("The server registered Picacho without a client id.")?
-        .to_owned())
+    let registration = Registration::from_response(&v, redirect)?;
+    registration.save(endpoint);
+    Ok(registration.client_id)
+}
+/// The client id to sign in with at a server that registers apps: the one
+/// kept from an earlier sign-in where it is still good for `redirect`, else
+/// a new registration. A kept one registered for another port (the one it
+/// had was taken) is changed to this one where the server lets Picacho
+/// (RFC 7592 §2.2); one the server no longer knows (401, 404: §2.1) is
+/// registered again.
+fn registered(endpoint: &str, redirect: &str) -> Result<String> {
+    let Some(kept) = Registration::load(endpoint) else {
+        return register(endpoint, redirect);
+    };
+    if kept.redirect == redirect {
+        return Ok(kept.client_id);
+    }
+    if kept.registration_client_uri.is_empty() {
+        return register(endpoint, redirect);
+    }
+    // §2.2: the whole metadata again, with the client id, and the new
+    // redirect in place of the old.
+    let mut metadata = client_metadata(redirect);
+    metadata["client_id"] = kept.client_id.clone().into();
+    let updated = http()?
+        .put(&kept.registration_client_uri)
+        .bearer_auth(&kept.registration_access_token)
+        .json(&metadata)
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(|r| Ok(r.error_for_status()?))
+        .and_then(bounded_json)
+        .and_then(|v| Registration::from_response(&v, redirect));
+    match updated {
+        Ok(mut registration) if registration.client_id == kept.client_id => {
+            // §2.2: the server may issue a new access token; else the old
+            // one stays good.
+            if registration.registration_access_token.is_empty() {
+                registration.registration_access_token = kept.registration_access_token;
+                registration.registration_client_uri = kept.registration_client_uri;
+            }
+            registration.save(endpoint);
+            Ok(registration.client_id)
+        }
+        _ => register(endpoint, redirect),
+    }
 }
 fn pinal_accounts() -> String {
     let origin = setting(
@@ -342,28 +497,97 @@ fn endpoints(provider: Provider) -> (&'static str, &'static str, &'static str) {
         ),
     }
 }
-/// Gives up a refresh token (RFC 7009) at `endpoint`, so it can't be used
-/// once the account is removed here. Best effort: a server that can't is
-/// left alone; the token expires there in time.
-pub fn revoke(endpoint: &str, client_id: &str, token: &str) {
-    if token.is_empty() || !endpoint.starts_with("https://") {
-        return;
+/// Gives up a token (RFC 7009 §2.1) at `endpoint`, so it can't be used
+/// once the account is removed here: the refresh token where there is one
+/// (which also ends its access tokens, §2.1), else the access token. A
+/// client with a secret authenticates with it (§2.1: confidential clients
+/// must). Best effort: a server that can't is left alone; the token
+/// expires there in time.
+pub fn revoke(endpoint: &str, client_id: &str, secret: &Secret) -> Result<()> {
+    ensure!(
+        endpoint.starts_with("https://") || cfg!(test),
+        "Tokens are only given up over https."
+    );
+    let (token, hint) = if !secret.refresh_token.is_empty() {
+        (secret.refresh_token.as_str(), "refresh_token")
+    } else {
+        (secret.access_token.as_str(), "access_token")
+    };
+    if token.is_empty() {
+        return Ok(());
     }
-    let Ok(client) = http() else { return };
-    let _ = client
+    let mut fields = vec![("token", token), ("token_type_hint", hint)];
+    if !client_id.is_empty() {
+        fields.push(("client_id", client_id));
+    }
+    if !secret.client_secret.is_empty() {
+        fields.push(("client_secret", &secret.client_secret));
+    }
+    // §2.2: 200 whether or not the token was still good; §2.2.1's
+    // `unsupported_token_type` and the like are errors.
+    http()?
         .post(endpoint)
-        .form(&[
-            ("token", token),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", client_id),
-        ])
-        .timeout(std::time::Duration::from_secs(10))
-        .send();
+        .form(&fields)
+        .timeout(Duration::from_secs(10))
+        .send()?
+        .error_for_status()?;
+    Ok(())
 }
-/// Google's revocation endpoint; Microsoft's identity platform has none
-/// (tokens are revoked from the account's own page).
-pub fn provider_revocation(provider: Provider) -> Option<&'static str> {
-    (provider == Provider::Gmail).then_some("https://oauth2.googleapis.com/revoke")
+/// Where to send the browser to end its session with the issuer (OpenID
+/// Connect RP-Initiated Logout 1.0 §2): `end_session` with the ID token
+/// it issued as the hint, else this client's id (§2, required without a
+/// hint so the issuer knows who asks), and a `state`. No
+/// `post_logout_redirect_uri`: nothing listens for the browser's return.
+// Backend-only until the UI calls it:
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn logout_url(end_session: &str, client_id: &str, id_token_hint: Option<&str>) -> Option<url::Url> {
+    let mut url = url::Url::parse(end_session).ok()?;
+    if url.scheme() != "https" && !cfg!(test) {
+        return None;
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        match id_token_hint.filter(|t| !t.is_empty()) {
+            Some(hint) => {
+                query.append_pair("id_token_hint", hint);
+            }
+            None if client_id.is_empty() => return None,
+            None => {}
+        }
+        if !client_id.is_empty() {
+            query.append_pair("client_id", client_id);
+        }
+        query.append_pair("state", &random_url_token());
+    }
+    Some(url)
+}
+/// Where an account's tokens are given up (RFC 7009), if its issuer has
+/// such an endpoint: Google's own; a JMAP server's, an organization's
+/// identity provider's or Pinal's, from its metadata's
+/// `revocation_endpoint` (RFC 8414 §2). Microsoft's identity platform has
+/// none (tokens are revoked from the account's own page).
+pub fn revocation_endpoint(account: &Account) -> Option<String> {
+    if !account.oauth {
+        return None;
+    }
+    if account.service == Service::Pinal {
+        return pinal_endpoints(&http().ok()?)
+            .ok()?
+            .revocation
+            .map(|u| u.to_string());
+    }
+    if let Some(sso) = &account.sso {
+        return sso_metadata(&sso.issuer).ok()?.revocation;
+    }
+    match account.provider {
+        Provider::Gmail => Some("https://oauth2.googleapis.com/revoke".into()),
+        Provider::Jmap => {
+            jmap_metadata(&account.incoming_host, account.incoming_port)
+                .ok()?
+                .revocation
+        }
+        _ => None,
+    }
 }
 fn random_url_token() -> String {
     URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
@@ -480,17 +704,27 @@ pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
 /// Tests: what plays the person in the browser, instead of opening one.
 #[cfg(test)]
 pub(crate) static TEST_BROWSER: Mutex<Option<fn(url::Url)>> = Mutex::new(None);
-/// `picacho://` URLs macOS handed the app, waiting for a sign-in to claim them.
+/// The app's URL schemes (Info.plist, packaging/ios/project.yml):
+/// `picacho:`, which Pinal's callback page opens, and the reverse-DNS form
+/// RFC 8252 §7.1 asks native apps to use, `tech.pinal.picacho:`, which no
+/// other app's name can collide with.
+const SCHEMES: [&str; 2] = ["picacho:", "tech.pinal.picacho:"];
+/// Callback URLs macOS handed the app in one of `SCHEMES`, waiting for a
+/// sign-in to claim them. Only one whose `state` is a pending sign-in's is
+/// ever taken (`Browser::wait`), and its code is then redeemed with that
+/// sign-in's PKCE verifier; the rest are dropped.
 static OPENED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub fn opened(urls: Vec<String>) {
-    // Any web page can ask for `picacho://` addresses: only the latest few,
-    // of a callback's size, are kept for a sign-in to claim.
+    // Any web page can ask for these addresses: only the latest few, of a
+    // callback's size, are kept for a sign-in to claim.
     const KEPT: usize = 16;
     let mut opened = OPENED.lock().unwrap();
-    opened.extend(
-        urls.into_iter()
-            .filter(|u| u.starts_with("picacho:") && u.len() <= 8192),
-    );
+    opened.extend(urls.into_iter().filter(|u| {
+        u.len() <= 8192
+            && SCHEMES
+                .iter()
+                .any(|s| u.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s)))
+    }));
     let extra = opened.len().saturating_sub(KEPT);
     opened.drain(..extra);
 }
@@ -518,7 +752,34 @@ impl Browser {
     /// Microsoft registers `http://localhost`; Google and Pinal accept the
     /// loopback address with any port.
     fn new(host: &str, path: &str) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        Self::on_port(host, path, None)
+    }
+    /// As `new`, listening on `port` where it is free (the one a kept
+    /// registration was made for), else on any.
+    fn on_port(host: &str, path: &str, port: Option<u16>) -> Result<Self> {
+        let v4 = match port.and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok()) {
+            Some(listener) => Ok(listener),
+            None => TcpListener::bind("127.0.0.1:0"),
+        };
+        match v4 {
+            Ok(listener) => Self::listening(listener, host, path),
+            // RFC 8252 §7.3: `[::1]` is as much a loopback redirect as
+            // 127.0.0.1, for a system without IPv4 loopback. Microsoft's
+            // `localhost` resolves to either, so it is kept as it is.
+            Err(v4) => {
+                let listener = TcpListener::bind("[::1]:0").map_err(|_| v4)?;
+                let host = if host == "localhost" { host } else { "[::1]" };
+                Self::listening(listener, host, path)
+            }
+        }
+    }
+    /// The IPv6 loopback callback (`http://[::1]:port/path`), for tests and
+    /// for systems that only have IPv6 loopback.
+    #[cfg(test)]
+    fn on_ipv6(path: &str) -> Result<Self> {
+        Self::listening(TcpListener::bind("[::1]:0")?, "[::1]", path)
+    }
+    fn listening(listener: TcpListener, host: &str, path: &str) -> Result<Self> {
         listener.set_nonblocking(true)?;
         let redirect = format!("http://{host}:{}{path}", listener.local_addr()?.port());
         Ok(Self::with(Some(listener), redirect))
@@ -724,44 +985,113 @@ fn identity_of(claims: &serde_json::Value) -> Identity {
     }
 }
 
+/// Who may have issued a sign-in's ID token (its `iss`).
+#[derive(Clone, Copy, Debug)]
+enum Issuer<'a> {
+    /// Exactly this issuer identifier (OpenID Connect Core §3.1.3.7 step
+    /// 2): a JMAP server's or an organization's, from its own metadata.
+    Exact(&'a str),
+    /// Google, which writes its issuer both with and without the scheme
+    /// (its OpenID Connect documentation, "Validating an ID token").
+    Google,
+    /// Microsoft's `common` endpoint, whose metadata names
+    /// `https://login.microsoftonline.com/{tenantid}/v2.0`: the token's
+    /// own tenant (its `tid` claim) stands for `{tenantid}`.
+    Microsoft,
+    /// None known (metadata that names no issuer): not checked.
+    Unknown,
+}
+impl Issuer<'_> {
+    fn accepts(self, claims: &serde_json::Value) -> bool {
+        let Some(iss) = claims["iss"].as_str() else {
+            return matches!(self, Self::Unknown);
+        };
+        match self {
+            Self::Exact(expected) => iss == expected,
+            Self::Google => matches!(iss, "https://accounts.google.com" | "accounts.google.com"),
+            Self::Microsoft => {
+                // A tenant is a GUID: one with a `/` would make another
+                // issuer's address of the template.
+                let tid = claims["tid"].as_str().unwrap_or_default();
+                !tid.is_empty()
+                    && tid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+                    && iss == format!("https://login.microsoftonline.com/{tid}/v2.0")
+            }
+            Self::Unknown => true,
+        }
+    }
+}
+/// How far another clock may be off: OpenID Connect Core §3.1.3.7 step 9
+/// allows "some small leeway, usually no more than a few minutes".
+const CLOCK_SKEW: i64 = 300;
+
 /// The ID token's claims checked as OpenID Connect Core §3.1.3.7 asks of
-/// a token straight from the token endpoint: issued to this client (`aud`,
-/// and `azp` with several audiences), not expired, with the `nonce` this
+/// a token straight from the token endpoint: from the expected issuer
+/// (`iss`), issued to this client (`aud`, and `azp` with several
+/// audiences or wherever it is given), not expired, with the `nonce` this
 /// sign-in sent (where one was), and naming a subject. Returns who signed
 /// in and the subject. No ID token at all is no identity, not an error.
 fn checked_identity(
     id_token: &str,
     client_id: &str,
+    issuer: Issuer<'_>,
     nonce: Option<&str>,
+) -> Result<(Identity, String)> {
+    checked_identity_at(id_token, client_id, issuer, nonce, chrono::Utc::now().timestamp())
+}
+fn checked_identity_at(
+    id_token: &str,
+    client_id: &str,
+    issuer: Issuer<'_>,
+    nonce: Option<&str>,
+    now: i64,
 ) -> Result<(Identity, String)> {
     if id_token.is_empty() {
         return Ok((Identity::default(), String::new()));
     }
     let claims = claims_of(id_token);
     ensure!(claims.is_object(), "The sign-in's ID token couldn't be read.");
+    // Step 2: the issuer must be the one signed in with, so a token from
+    // another server (a mix-up) isn't taken for this one's.
+    ensure!(
+        issuer.accepts(&claims),
+        "The sign-in's ID token came from another server ({}).",
+        claims["iss"].as_str().unwrap_or("none named")
+    );
     let audiences: Vec<&str> = match &claims["aud"] {
         serde_json::Value::String(a) => vec![a.as_str()],
         serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
         _ => Vec::new(),
     };
     if !client_id.is_empty() {
+        // Step 3: this client among the audiences.
         ensure!(
             audiences.contains(&client_id),
             "The sign-in's ID token was issued to another app."
         );
-        if audiences.len() > 1
-            && let Some(azp) = claims["azp"].as_str()
-        {
-            ensure!(azp == client_id, "The sign-in's ID token was issued to another app.");
-        }
-    }
-    if let Some(exp) = claims["exp"].as_i64() {
-        // A few minutes' leeway for clocks that disagree.
+        // Steps 4 and 5: with several audiences, the one it was given to
+        // (`azp`) must be said, and wherever it is said, be this client.
+        let azp = claims["azp"].as_str();
         ensure!(
-            exp + 300 >= chrono::Utc::now().timestamp(),
-            "The sign-in's ID token has expired. Check this device's clock."
+            audiences.len() == 1 || azp.is_some(),
+            "The sign-in's ID token doesn't say which of its apps it was issued to."
+        );
+        ensure!(
+            azp.is_none_or(|azp| azp == client_id),
+            "The sign-in's ID token was issued to another app."
         );
     }
+    // Step 9: `exp` is required, and must not have passed (give or take
+    // `CLOCK_SKEW`). `iat` isn't checked: step 10 leaves that to the client,
+    // and a clock that runs behind would only refuse good tokens.
+    let exp = claims["exp"]
+        .as_i64()
+        .or_else(|| claims["exp"].as_f64().map(|f| f as i64))
+        .context("The sign-in's ID token has no expiry.")?;
+    ensure!(
+        exp + CLOCK_SKEW >= now,
+        "The sign-in's ID token has expired. Check this device's clock."
+    );
     if let Some(nonce) = nonce {
         ensure!(
             claims["nonce"].as_str() == Some(nonce),
@@ -784,6 +1114,24 @@ pub struct Grant {
     /// sign-in, or the app's own), and where the code is redeemed.
     pub client_id: String,
     token: String,
+    /// The issuer the ID token must name: the server's own (from its
+    /// metadata), or Google's or Microsoft's.
+    issuer: Option<String>,
+    /// How the server's token endpoint takes a client secret.
+    client_auth: ClientAuth,
+    /// The scopes asked for, to compare with those granted.
+    scope: String,
+}
+impl Grant {
+    fn issuer(&self, provider: Provider, own_endpoints: bool) -> Issuer<'_> {
+        match (&self.issuer, provider) {
+            (Some(issuer), _) => Issuer::Exact(issuer),
+            (None, _) if own_endpoints => Issuer::Unknown,
+            (None, Provider::Gmail) => Issuer::Google,
+            (None, Provider::Outlook) => Issuer::Microsoft,
+            (None, _) => Issuer::Unknown,
+        }
+    }
 }
 impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -831,6 +1179,9 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         verifier: browser.verifier.clone(),
         client_id: account.client_id.clone(),
         token: String::new(),
+        issuer: None,
+        client_auth: ClientAuth::Post,
+        scope: scope.to_owned(),
     })
 }
 
@@ -839,13 +1190,18 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
 /// (Fastmail), else registered for this sign-in.
 fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     let metadata = jmap_metadata(&account.incoming_host, account.incoming_port)?;
-    let mut browser = Browser::new("127.0.0.1", "/callback")?;
-    browser.issuer = metadata.issuer.clone();
     let own = jmap_client(account);
+    let kept = metadata
+        .registration
+        .as_deref()
+        .filter(|_| own.id.is_empty())
+        .and_then(Registration::load);
+    let mut browser = Browser::on_port("127.0.0.1", "/callback", kept.and_then(|k| k.port()))?;
+    browser.issuer = metadata.issuer.clone();
     let client_id = if !own.id.is_empty() {
         own.id
     } else if let Some(endpoint) = &metadata.registration {
-        register(endpoint, &browser.redirect)?
+        registered(endpoint, &browser.redirect)?
     } else if !account.client_id.is_empty() {
         account.client_id.clone()
     } else {
@@ -878,6 +1234,9 @@ fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         verifier: browser.verifier.clone(),
         client_id,
         token: metadata.token,
+        issuer: metadata.issuer,
+        client_auth: metadata.client_auth,
+        scope,
     })
 }
 
@@ -890,12 +1249,19 @@ fn authorize_sso(
     cancel: Arc<AtomicBool>,
 ) -> Result<Grant> {
     let metadata = sso_metadata(&sso.issuer)?;
-    let mut browser = Browser::new("127.0.0.1", "/callback")?;
+    let scope = sso_scopes(&metadata.scopes, &sso.scope);
+    let kept = metadata.registration.as_deref().and_then(Registration::load);
+    // A client id that isn't the one Picacho registered is an
+    // administrator's registration, used as given.
+    let given = !account.client_id.is_empty()
+        && kept.as_ref().is_none_or(|k| k.client_id != account.client_id);
+    let port = kept.filter(|_| !given).and_then(|k| k.port());
+    let mut browser = Browser::on_port("127.0.0.1", "/callback", port)?;
     browser.issuer = metadata.issuer.clone();
-    let client_id = if !account.client_id.is_empty() {
+    let client_id = if given {
         account.client_id.clone()
     } else if let Some(endpoint) = &metadata.registration {
-        register(endpoint, &browser.redirect)?
+        registered(endpoint, &browser.redirect)?
     } else {
         bail!(
             "Your organization's sign-in doesn't let mail apps register themselves. Ask your administrator for a client id for Picacho (a public client with a http://127.0.0.1 redirect) and enter it under Server settings."
@@ -906,7 +1272,7 @@ fn authorize_sso(
         ("client_id", client_id.as_str()),
         ("redirect_uri", &browser.redirect),
         ("response_type", "code"),
-        ("scope", &sso_scopes(&metadata.scopes, &sso.scope)),
+        ("scope", &scope),
         ("state", &browser.state),
         ("code_challenge", &browser.challenge),
         ("code_challenge_method", "S256"),
@@ -922,6 +1288,39 @@ fn authorize_sso(
         verifier: browser.verifier.clone(),
         client_id,
         token: metadata.token,
+        issuer: metadata.issuer,
+        client_auth: metadata.client_auth,
+        scope,
+    })
+}
+
+/// The scopes without which the account's mail can't be reached, among
+/// those `requested`: Gmail's mail scope, Outlook's IMAP and SMTP ones,
+/// and JMAP's mail capability. Where a token response names its scope
+/// (RFC 6749 §3.3: it must when it differs from what was asked), the
+/// person may have unticked one (Google's granular consent).
+fn needed_scopes<'a>(account: &Account, requested: &'a str) -> Vec<&'a str> {
+    let wanted: &[&str] = match account.provider {
+        Provider::Gmail if account.sso.is_none() => &["https://mail.google.com/"],
+        Provider::Outlook if account.sso.is_none() => &[
+            "https://outlook.office.com/IMAP.AccessAsUser.All",
+            "https://outlook.office.com/SMTP.Send",
+        ],
+        Provider::Jmap => &[crate::sync::jmap::MAIL],
+        _ => &[],
+    };
+    requested
+        .split_whitespace()
+        .filter(|s| wanted.contains(s))
+        .collect()
+}
+/// Whether `granted` (a token response's `scope`) has `scope`. Scope
+/// tokens are case-sensitive (RFC 6749 §3.3), but Microsoft returns its
+/// resource's scopes in its own spelling of the name, so those compare
+/// without case.
+fn granted_scope(granted: &str, scope: &str) -> bool {
+    granted.split_whitespace().any(|g| {
+        g == scope || (scope.starts_with("https://outlook.office.com/") && g.eq_ignore_ascii_case(scope))
     })
 }
 
@@ -942,19 +1341,38 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     } else {
         account.client_id.as_str()
     };
-    let mut fields = vec![
-        ("client_id", client_id),
-        ("code", &grant.code),
+    let fields = [
+        ("code", grant.code.as_str()),
         ("redirect_uri", &grant.redirect),
         ("grant_type", "authorization_code"),
         ("code_verifier", &grant.verifier),
     ];
-    if !account.client_secret.is_empty() {
-        fields.push(("client_secret", &account.client_secret));
-    }
-    let (mut secret, value) = exchange(token, &fields)?;
+    let client = TokenClient {
+        id: client_id,
+        secret: &account.client_secret,
+        // Google's documentation sends the secret in the body.
+        auth: if jmap { grant.client_auth } else { ClientAuth::Post },
+    };
+    let (mut secret, value) = exchange(token, &fields, &client)?;
     secret.client_secret = account.client_secret.clone();
-    let (who, _) = checked_identity(value["id_token"].as_str().unwrap_or_default(), client_id, None)?;
+    if let Some(granted) = value["scope"].as_str() {
+        let needed = needed_scopes(account, &grant.scope);
+        let missing: Vec<&str> = needed
+            .into_iter()
+            .filter(|s| !granted_scope(granted, s))
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "The sign-in didn't allow access to mail ({} wasn't granted). Sign in again and allow Picacho access to your mail.",
+            missing.join(", ")
+        );
+    }
+    let (who, _) = checked_identity(
+        value["id_token"].as_str().unwrap_or_default(),
+        client_id,
+        grant.issuer(account.provider, jmap),
+        None,
+    )?;
     Ok((secret, who))
 }
 
@@ -971,6 +1389,10 @@ struct PinalEndpoints {
     authorize: url::Url,
     token: url::Url,
     userinfo: url::Url,
+    /// Where its tokens are given up (RFC 7009), where it says.
+    revocation: Option<url::Url>,
+    /// The issuer its ID tokens name (OpenID Connect Discovery §3).
+    issuer: Option<String>,
 }
 fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
     static FOUND: Mutex<Option<(String, PinalEndpoints)>> = Mutex::new(None);
@@ -1016,6 +1438,10 @@ fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
         authorize: endpoint("authorization_endpoint")?,
         token: endpoint("token_endpoint")?,
         userinfo: endpoint("userinfo_endpoint")?,
+        // Optional: one elsewhere is left unused rather than refusing the
+        // sign-in.
+        revocation: endpoint("revocation_endpoint").ok(),
+        issuer: config["issuer"].as_str().map(str::to_owned),
     };
     *FOUND.lock().unwrap() = Some((origin, found.clone()));
     Ok(found)
@@ -1115,16 +1541,25 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
     let (secret, value) = exchange(
         request.endpoints.token.as_str(),
         &[
-            ("client_id", client_id.as_str()),
             ("code", code),
             ("redirect_uri", &request.browser.redirect),
             ("grant_type", "authorization_code"),
             ("code_verifier", &request.browser.verifier),
         ],
+        &TokenClient {
+            id: &client_id,
+            secret: "",
+            auth: ClientAuth::Basic,
+        },
     )?;
     let (mut who, subject) = checked_identity(
         value["id_token"].as_str().unwrap_or_default(),
         &client_id,
+        request
+            .endpoints
+            .issuer
+            .as_deref()
+            .map_or(Issuer::Unknown, Issuer::Exact),
         Some(&request.nonce),
     )?;
     if who.email.is_empty() {
@@ -1204,8 +1639,46 @@ pub(crate) fn pinal_driven(
     pinal_redeem(&request, &code?)
 }
 
-fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_json::Value)> {
-    let response = http()?.post(endpoint).form(fields).send()?;
+/// Who asks the token endpoint: the client's id, its secret (empty for
+/// a public client) and how a secret is given.
+struct TokenClient<'a> {
+    id: &'a str,
+    secret: &'a str,
+    auth: ClientAuth,
+}
+/// A token request: `fields` and the client, which a public client names
+/// in the body (RFC 6749 §3.2.1) and a confidential one authenticates as
+/// its server asks (§2.3.1): with HTTP Basic, the id and secret each
+/// form-encoded first, or both in the body.
+fn token_request(
+    http: &reqwest::blocking::Client,
+    endpoint: &str,
+    fields: &[(&str, &str)],
+    client: &TokenClient<'_>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut fields = fields.to_vec();
+    let request = http.post(endpoint);
+    let request = if client.secret.is_empty() {
+        if !client.id.is_empty() {
+            fields.push(("client_id", client.id));
+        }
+        request
+    } else if client.auth == ClientAuth::Basic {
+        let encode = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+        request.basic_auth(encode(client.id), Some(encode(client.secret)))
+    } else {
+        fields.push(("client_id", client.id));
+        fields.push(("client_secret", client.secret));
+        request
+    };
+    request.form(&fields)
+}
+fn exchange(
+    endpoint: &str,
+    fields: &[(&str, &str)],
+    client: &TokenClient<'_>,
+) -> Result<(Secret, serde_json::Value)> {
+    let response = token_request(&http()?, endpoint, fields, client).send()?;
     let status = response.status();
     let value: serde_json::Value = bounded_json(response)?;
     // Do not include the whole provider response: it can contain credentials
@@ -1234,6 +1707,15 @@ fn exchange(endpoint: &str, fields: &[(&str, &str)]) -> Result<(Secret, serde_js
         .as_str()
         .context("Provider did not return an access token")?
         .to_string();
+    // RFC 6749 §5.1 and §7.1: the token's type is required, and only a
+    // bearer token (RFC 6750 §4, compared without case) is what the mail
+    // protocols take; another kind (DPoP, MAC) would be sent wrongly.
+    let kind = value["token_type"].as_str().unwrap_or_default();
+    ensure!(
+        kind.eq_ignore_ascii_case("bearer"),
+        "The sign-in issued a {} token, which Picacho can't use; it needs a bearer token.",
+        if kind.is_empty() { "untyped" } else { kind }
+    );
     let secret = Secret {
         access_token,
         refresh_token: value["refresh_token"].as_str().unwrap_or_default().into(),
@@ -1253,33 +1735,34 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
         );
     }
     let found_token;
-    let (token, scope) = if account.service == Service::Pinal {
+    let (token, scope, auth) = if account.service == Service::Pinal {
         found_token = pinal_endpoints(&http()?)?.token.to_string();
-        (found_token.as_str(), "")
+        (found_token.as_str(), "", ClientAuth::Basic)
     } else if account.provider == Provider::Jmap {
-        found_token = jmap_metadata(&account.incoming_host, account.incoming_port)?
-            .token
-            .to_string();
-        (found_token.as_str(), "")
+        let metadata = jmap_metadata(&account.incoming_host, account.incoming_port)?;
+        found_token = metadata.token;
+        (found_token.as_str(), "", metadata.client_auth)
     } else if let Some(sso) = &account.sso {
-        found_token = sso_metadata(&sso.issuer)?.token;
-        (found_token.as_str(), "")
+        let metadata = sso_metadata(&sso.issuer)?;
+        found_token = metadata.token;
+        (found_token.as_str(), "", metadata.client_auth)
     } else {
         let (_, token, scope) = endpoints(account.provider);
-        (token, scope)
+        (token, scope, ClientAuth::Post)
     };
     let mut fields = vec![
-        ("client_id", account.client_id.as_str()),
-        ("refresh_token", &secret.refresh_token),
+        ("refresh_token", secret.refresh_token.as_str()),
         ("grant_type", "refresh_token"),
     ];
     if account.provider == Provider::Outlook {
         fields.push(("scope", scope));
     }
-    if !secret.client_secret.is_empty() {
-        fields.push(("client_secret", &secret.client_secret));
-    }
-    let (next, _) = exchange(token, &fields)?;
+    let client = TokenClient {
+        id: &account.client_id,
+        secret: &secret.client_secret,
+        auth,
+    };
+    let (next, _) = exchange(token, &fields, &client)?;
     secret.access_token = next.access_token;
     secret.expires_at = next.expires_at;
     if !next.refresh_token.is_empty() {
@@ -1296,7 +1779,8 @@ mod tests {
         let origin = "https://api.fastmail.com";
         let own = serde_json::json!({"issuer": "https://api.fastmail.com/"});
         assert!(issued_by(&own, origin).is_ok());
-        assert!(issued_by(&serde_json::json!({}), origin).is_ok());
+        // RFC 8414 §3.3: an issuer is required, and must be the server's.
+        assert!(issued_by(&serde_json::json!({}), origin).is_err());
         let other = serde_json::json!({"issuer": "https://login.example.net"});
         assert!(issued_by(&other, origin).is_err());
     }
@@ -1333,16 +1817,34 @@ mod tests {
         assert!(jmap_client(&a).id.is_empty());
     }
     /// A small HTTP server answering `respond(method, path, body)` for each
-    /// of `count` requests.
+    /// of `count` requests. It gives up after 30 seconds without one, so a
+    /// test expecting more requests than are made fails instead of hanging.
     fn http_server(
         count: usize,
         respond: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for mut s in listener.incoming().take(count).flatten() {
+            let mut deadline = Instant::now() + Duration::from_secs(30);
+            let incoming = std::iter::from_fn(|| loop {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        deadline = Instant::now() + Duration::from_secs(30);
+                        return Some(s);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "the test made fewer requests than expected");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            });
+            for mut s in incoming.take(count) {
                 let mut buf = vec![0; 16384];
                 let n = s.read(&mut buf).unwrap();
                 let text = String::from_utf8_lossy(&buf[..n]).into_owned();
@@ -1381,27 +1883,18 @@ mod tests {
         assert!(seen[1].starts_with("GET /.well-known/oauth-authorization-server/realms/mail"));
         // RFC 8414's form (the path after the well-known part) is found,
         // and its endpoints and registration kept.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        drop(listener);
-        let doc = format!(
-            r#"{{"issuer":"{origin}/tenant","authorization_endpoint":"{origin}/auth","token_endpoint":"{origin}/token","registration_endpoint":"{origin}/register","scopes_supported":["openid","offline_access"]}}"#
-        );
-        let port: u16 = origin.rsplit(':').next().unwrap().parse().unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let server = std::thread::spawn(move || {
-            for mut s in listener.incoming().take(2).flatten() {
-                let mut buf = [0; 4096];
-                let n = s.read(&mut buf).unwrap();
-                let path = String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).unwrap_or("").to_owned();
-                let (status, body) = if path == "/.well-known/oauth-authorization-server/tenant" {
-                    (200, doc.clone())
-                } else {
-                    (404, "{}".to_owned())
-                };
-                write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let doc: Arc<Mutex<String>> = Arc::default();
+        let served = doc.clone();
+        let (origin, server) = http_server(2, move |_, path, _| {
+            if path == "/.well-known/oauth-authorization-server/tenant" {
+                (200, served.lock().unwrap().clone())
+            } else {
+                (404, "{}".to_owned())
             }
         });
+        *doc.lock().unwrap() = format!(
+            r#"{{"issuer":"{origin}/tenant","authorization_endpoint":"{origin}/auth","token_endpoint":"{origin}/token","registration_endpoint":"{origin}/register","scopes_supported":["openid","offline_access"]}}"#
+        );
         let m = sso_metadata(&format!("{origin}/tenant/")).unwrap();
         assert_eq!(m.token, format!("{origin}/token"));
         assert_eq!(m.registration, Some(format!("{origin}/register")));
@@ -1433,6 +1926,254 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// RFC 7009: removed accounts' tokens are given up wherever the issuer
+    /// says it can (Google; JMAP and organizations' issuers by metadata),
+    /// and not where it has no endpoint (Microsoft, metadata without one).
+    #[test]
+    fn tokens_are_revoked_where_the_issuer_advertises_it() {
+        let mut gmail = Account::new(Provider::Gmail);
+        gmail.oauth = true;
+        assert_eq!(revocation_endpoint(&gmail).as_deref(), Some("https://oauth2.googleapis.com/revoke"));
+        let mut outlook = Account::new(Provider::Outlook);
+        outlook.oauth = true;
+        assert_eq!(revocation_endpoint(&outlook), None);
+        let mut password = Account::new(Provider::Gmail);
+        password.oauth = false;
+        assert_eq!(revocation_endpoint(&password), None);
+        // An organization's issuer whose metadata names an endpoint, and
+        // one whose doesn't.
+        // The documents name the server's own origin, known once it listens.
+        let documents: Arc<Mutex<String>> = Arc::default();
+        let named = documents.clone();
+        let (origin, metadata) = http_server(2, move |_, path, _| {
+            let documents = named.lock().unwrap().clone();
+            let issuer = path.strip_suffix("/.well-known/openid-configuration").unwrap_or_default();
+            let revocation = if issuer == "/with" {
+                format!(r#","revocation_endpoint":"{documents}/with/revoke""#)
+            } else {
+                String::new()
+            };
+            (200, format!(r#"{{"issuer":"{documents}{issuer}","authorization_endpoint":"{documents}/a","token_endpoint":"{documents}/t"{revocation}}}"#))
+        });
+        *documents.lock().unwrap() = origin.clone();
+        let mut sso = Account::new(Provider::Imap);
+        sso.oauth = true;
+        sso.sso = Some(crate::manage::model::Sso { issuer: format!("{origin}/with"), scope: String::new() });
+        assert_eq!(revocation_endpoint(&sso), Some(format!("{origin}/with/revoke")));
+        sso.sso = Some(crate::manage::model::Sso { issuer: format!("{origin}/without"), scope: String::new() });
+        assert_eq!(revocation_endpoint(&sso), None);
+        metadata.join().unwrap();
+        // The request (RFC 7009 §2.1): the refresh token, hinted, with the
+        // client's id and, for a confidential client, its secret.
+        let (origin, server) = http_server(2, |method, path, _| {
+            assert_eq!((method, path), ("POST", "/revoke"));
+            (200, String::new())
+        });
+        let secret = Secret {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            client_secret: "cs".into(),
+            ..Default::default()
+        };
+        revoke(&format!("{origin}/revoke"), "picacho", &secret).unwrap();
+        let access_only = Secret {
+            access_token: "at".into(),
+            ..Default::default()
+        };
+        revoke(&format!("{origin}/revoke"), "picacho", &access_only).unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].ends_with("token=rt&token_type_hint=refresh_token&client_id=picacho&client_secret=cs"), "{seen:?}");
+        assert!(seen[1].ends_with("token=at&token_type_hint=access_token&client_id=picacho"), "{seen:?}");
+        // A refusal (§2.2.1) is an error for the caller to ignore or show.
+        let (origin, server) = http_server(1, |_, _, _| (400, r#"{"error":"unsupported_token_type"}"#.into()));
+        assert!(revoke(&format!("{origin}/revoke"), "picacho", &secret).is_err());
+        server.join().unwrap();
+    }
+
+    /// RFC 6749 §2.3.1: a secret goes in HTTP Basic, its parts form-encoded,
+    /// unless the server lists only `client_secret_post`; a public client
+    /// names itself in the body.
+    #[test]
+    fn token_requests_authenticate_the_client_as_the_server_asks() {
+        let http = reqwest::blocking::Client::new();
+        let fields = [("grant_type", "refresh_token"), ("refresh_token", "rt")];
+        let build = |client: TokenClient<'_>| {
+            let r = token_request(&http, "https://id.example/token", &fields, &client).build().unwrap();
+            let auth = r.headers().get("authorization").map(|v| v.to_str().unwrap().to_owned());
+            let body = String::from_utf8(r.body().unwrap().as_bytes().unwrap().to_vec()).unwrap();
+            (auth, body)
+        };
+        let (auth, body) = build(TokenClient { id: "app:1", secret: "sécret/+", auth: ClientAuth::Basic });
+        let expected = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("app%3A1:s%C3%A9cret%2F%2B"));
+        assert_eq!(auth.as_deref(), Some(expected.as_str()));
+        assert_eq!(body, "grant_type=refresh_token&refresh_token=rt");
+        let (auth, body) = build(TokenClient { id: "app", secret: "s", auth: ClientAuth::Post });
+        assert_eq!(auth, None);
+        assert_eq!(body, "grant_type=refresh_token&refresh_token=rt&client_id=app&client_secret=s");
+        let (auth, body) = build(TokenClient { id: "app", secret: "", auth: ClientAuth::Basic });
+        assert_eq!(auth, None);
+        assert_eq!(body, "grant_type=refresh_token&refresh_token=rt&client_id=app");
+        // The method comes from the server's metadata.
+        let doc = |methods: serde_json::Value| {
+            parse_metadata(&serde_json::json!({
+                "issuer": "https://id.example",
+                "authorization_endpoint": "https://id.example/a",
+                "token_endpoint": "https://id.example/t",
+                "token_endpoint_auth_methods_supported": methods,
+            }))
+            .unwrap()
+            .client_auth
+        };
+        assert_eq!(doc(serde_json::json!(["client_secret_post"])), ClientAuth::Post);
+        assert_eq!(doc(serde_json::json!(["client_secret_post", "client_secret_basic"])), ClientAuth::Basic);
+        assert_eq!(doc(serde_json::Value::Null), ClientAuth::Basic);
+    }
+
+    /// RFC 6749 §5.1: only bearer tokens are taken; §3.3: a granted scope
+    /// without mail access is refused at sign-in.
+    #[test]
+    fn token_type_and_granted_scope_are_checked() {
+        let (origin, server) = http_server(1, |_, _, _| {
+            (200, r#"{"access_token":"a","token_type":"Bearer","expires_in":60}"#.into())
+        });
+        let client = TokenClient { id: "app", secret: "", auth: ClientAuth::Basic };
+        assert!(exchange(&format!("{origin}/t"), &[], &client).is_ok());
+        server.join().unwrap();
+        let (origin, server) = http_server(1, |_, _, _| {
+            (200, r#"{"access_token":"a","token_type":"DPoP"}"#.into())
+        });
+        let error = exchange(&format!("{origin}/t"), &[], &client).unwrap_err();
+        assert!(format!("{error:#}").contains("DPoP"), "{error:#}");
+        server.join().unwrap();
+        let (origin, server) = http_server(1, |_, _, _| (200, r#"{"access_token":"a"}"#.into()));
+        assert!(exchange(&format!("{origin}/t"), &[], &client).is_err());
+        server.join().unwrap();
+        // Scopes: those mail needs, among those asked for.
+        let gmail = Account::new(Provider::Gmail);
+        let (_, _, asked) = endpoints(Provider::Gmail);
+        assert_eq!(needed_scopes(&gmail, asked), ["https://mail.google.com/"]);
+        assert!(granted_scope("openid https://mail.google.com/ email", "https://mail.google.com/"));
+        assert!(!granted_scope("openid email profile", "https://mail.google.com/"));
+        let outlook = Account::new(Provider::Outlook);
+        let (_, _, asked) = endpoints(Provider::Outlook);
+        assert_eq!(needed_scopes(&outlook, asked).len(), 2);
+        // Microsoft writes its scopes in its own case.
+        assert!(granted_scope(
+            "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send",
+            "https://outlook.office.com/imap.accessasuser.all"
+        ));
+        let jmap = Account::new(Provider::Jmap);
+        assert_eq!(needed_scopes(&jmap, "urn:ietf:params:jmap:mail offline_access"), [crate::sync::jmap::MAIL]);
+        // Not asked for (a server listing other scopes): not required.
+        assert!(needed_scopes(&jmap, "offline_access").is_empty());
+        assert!(needed_scopes(&Account::new(Provider::Imap), "openid mail").is_empty());
+    }
+
+    /// RFC 8414 §2 and RFC 9700 §2.1.1: PKCE must allow S256, and the
+    /// signing keys must be served over https.
+    #[test]
+    fn metadata_must_allow_s256_and_serve_keys_over_https() {
+        let doc = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "issuer": "https://id.example",
+                "authorization_endpoint": "https://id.example/a",
+                "token_endpoint": "https://id.example/t",
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            parse_metadata(&v)
+        };
+        assert!(doc(serde_json::json!({})).is_ok());
+        assert!(doc(serde_json::json!({"code_challenge_methods_supported": ["plain", "S256"]})).is_ok());
+        assert!(doc(serde_json::json!({"code_challenge_methods_supported": ["plain"]})).is_err());
+        assert!(doc(serde_json::json!({"code_challenge_methods_supported": []})).is_err());
+        assert!(doc(serde_json::json!({"jwks_uri": "https://id.example/keys"})).is_ok());
+        // Tests accept loopback http endpoints; a jwks_uri that isn't a URL
+        // at all is refused everywhere.
+        assert!(doc(serde_json::json!({"jwks_uri": "not a url"})).is_err());
+    }
+
+    /// RFC 7591 and RFC 7592: a registration is kept and used again; one for
+    /// another loopback port is updated in place; one the server forgot is
+    /// made again.
+    #[test]
+    fn dynamic_registrations_are_kept_and_reused() {
+        let origin_cell: Arc<Mutex<String>> = Arc::default();
+        let named = origin_cell.clone();
+        let forget = Arc::new(AtomicBool::new(false));
+        let forgotten = forget.clone();
+        let (origin, server) = http_server(4, move |method, path, body| {
+            let origin = named.lock().unwrap().clone();
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            match (method, path) {
+                ("POST", "/register") => (
+                    201,
+                    serde_json::json!({
+                        "client_id": format!("c-{}", v["redirect_uris"][0].as_str().unwrap().len()),
+                        "registration_access_token": "rat-1",
+                        "registration_client_uri": format!("{origin}/register/c"),
+                    })
+                    .to_string(),
+                ),
+                ("PUT", "/register/c") if forgotten.load(Ordering::Relaxed) => (401, "{}".into()),
+                ("PUT", "/register/c") => {
+                    assert_eq!(v["redirect_uris"][0], "http://127.0.0.1:6000/callback");
+                    (200, serde_json::json!({"client_id": v["client_id"]}).to_string())
+                }
+                other => panic!("{other:?}"),
+            }
+        });
+        *origin_cell.lock().unwrap() = origin.clone();
+        let endpoint = format!("{origin}/register");
+        // First sign-in: registered, and kept.
+        let first = registered(&endpoint, "http://127.0.0.1:5000/callback").unwrap();
+        let kept = Registration::load(&endpoint).unwrap();
+        assert_eq!((kept.client_id.as_str(), kept.port()), (first.as_str(), Some(5000)));
+        assert_eq!(kept.registration_access_token, "rat-1");
+        // Again on the same port: no request at all.
+        assert_eq!(registered(&endpoint, "http://127.0.0.1:5000/callback").unwrap(), first);
+        // On another port: updated, the same client, its token kept.
+        assert_eq!(registered(&endpoint, "http://127.0.0.1:6000/callback").unwrap(), first);
+        let kept = Registration::load(&endpoint).unwrap();
+        assert_eq!((kept.port(), kept.registration_access_token.as_str()), (Some(6000), "rat-1"));
+        // The server forgot it: registered again.
+        forget.store(true, Ordering::Relaxed);
+        let again = registered(&endpoint, "http://127.0.0.1:7000000/callback").unwrap();
+        assert_ne!(again, first);
+        let seen = server.join().unwrap();
+        let methods: Vec<&str> = seen.iter().map(|s| s.split(' ').next().unwrap()).collect();
+        assert_eq!(methods, ["POST", "PUT", "PUT", "POST"]);
+        // A management URI over plain http (outside tests) isn't kept.
+        let r = Registration::from_response(&serde_json::json!({"client_id": "x"}), "r").unwrap();
+        assert!(r.registration_client_uri.is_empty());
+    }
+
+    /// OpenID Connect RP-Initiated Logout 1.0 §2: the end-session address,
+    /// its own query kept, with the hint or the client id, and a state.
+    #[test]
+    fn logout_urls_name_the_session_to_end() {
+        let m = parse_metadata(&serde_json::json!({
+            "issuer": "https://id.example",
+            "authorization_endpoint": "https://id.example/a",
+            "token_endpoint": "https://id.example/t",
+            "end_session_endpoint": "https://id.example/logout?tenant=1",
+        }))
+        .unwrap();
+        let end = m.end_session.unwrap();
+        let url = logout_url(&end, "picacho", Some("eyJ.x.y")).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["tenant"], "1");
+        assert_eq!(q["id_token_hint"], "eyJ.x.y");
+        assert_eq!(q["client_id"], "picacho");
+        assert_eq!(q["state"].len(), 43);
+        assert!(!q.contains_key("post_logout_redirect_uri"));
+        // Without a hint the client id must say who asks.
+        assert!(logout_url(&end, "picacho", None).is_some());
+        assert!(logout_url(&end, "", None).is_none());
+        assert!(logout_url("not a url", "picacho", None).is_none());
+    }
+
     #[test]
     fn pkce_is_url_safe_and_correct_length() {
         let v = random_url_token();
@@ -1457,6 +2198,141 @@ mod tests {
         );
         assert_eq!(identity("garbage"), Identity::default());
     }
+    /// An unsigned ID token carrying `claims` (only its claims are read).
+    fn id_token(claims: serde_json::Value) -> String {
+        format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()))
+    }
+    const NOW: i64 = 1_800_000_000;
+
+    /// OpenID Connect Core §3.1.3.7, with tokens as Google issues them.
+    #[test]
+    fn id_tokens_from_google_are_checked() {
+        let google = |iss: &str| {
+            id_token(serde_json::json!({
+                "iss": iss, "aud": "picacho.apps.googleusercontent.com",
+                "azp": "picacho.apps.googleusercontent.com", "sub": "1093",
+                "email": "ana@gmail.com", "exp": NOW + 3600, "iat": NOW,
+            }))
+        };
+        let check = |token: &str| {
+            checked_identity_at(token, "picacho.apps.googleusercontent.com", Issuer::Google, None, NOW)
+        };
+        // Both of Google's issuer forms.
+        for iss in ["https://accounts.google.com", "accounts.google.com"] {
+            let (who, sub) = check(&google(iss)).unwrap();
+            assert_eq!((who.email.as_str(), sub.as_str()), ("ana@gmail.com", "1093"));
+        }
+        // Another issuer, or none, is refused.
+        assert!(check(&google("https://accounts.google.com.evil.example")).is_err());
+        let mut none: serde_json::Value = claims_of(&google("x"));
+        none.as_object_mut().unwrap().remove("iss");
+        assert!(check(&id_token(none)).is_err());
+    }
+
+    /// Microsoft's `common` endpoint: the issuer has the token's own tenant.
+    #[test]
+    fn id_tokens_from_microsoft_name_their_tenant() {
+        let microsoft = |iss: &str, tid: &str| {
+            id_token(serde_json::json!({
+                "iss": iss, "tid": tid, "aud": "client-guid", "sub": "AAAA",
+                "preferred_username": "ana@outlook.com", "exp": NOW + 3600,
+            }))
+        };
+        let check = |token: &str| checked_identity_at(token, "client-guid", Issuer::Microsoft, None, NOW);
+        // A personal account's tenant, and an organization's.
+        for tid in ["9188040d-6c67-4c5b-b112-36a304b66dad", "72f988bf-86f1-41af-91ab-2d7cd011db47"] {
+            let iss = format!("https://login.microsoftonline.com/{tid}/v2.0");
+            assert_eq!(check(&microsoft(&iss, tid)).unwrap().0.email, "ana@outlook.com");
+        }
+        let tid = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+        // The issuer of another tenant than the token's.
+        assert!(check(&microsoft("https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0", tid)).is_err());
+        // The template itself, or a tenant that isn't a tenant id.
+        assert!(check(&microsoft("https://login.microsoftonline.com/{tenantid}/v2.0", "{tenantid}")).is_err());
+        assert!(check(&microsoft("https://login.microsoftonline.com/x/y/v2.0", "x/y")).is_err());
+        // The v1 issuer (sts.windows.net) isn't the v2 endpoint's.
+        assert!(check(&microsoft(&format!("https://sts.windows.net/{tid}/"), tid)).is_err());
+    }
+
+    /// A JMAP server's (Fastmail) and an organization's (Keycloak) tokens:
+    /// the issuer their metadata names, exactly.
+    #[test]
+    fn id_tokens_from_jmap_servers_and_organizations_name_their_issuer() {
+        for (issuer, client) in [
+            ("https://api.fastmail.com", "35c941ae"),
+            ("https://login.example.edu/realms/staff", "picacho"),
+        ] {
+            let token = |iss: &str| {
+                id_token(serde_json::json!({
+                    "iss": iss, "aud": client, "sub": "u1",
+                    "email": "ana@example.edu", "exp": NOW + 60,
+                }))
+            };
+            assert!(checked_identity_at(&token(issuer), client, Issuer::Exact(issuer), None, NOW).is_ok());
+            assert!(checked_identity_at(&token("https://other.example"), client, Issuer::Exact(issuer), None, NOW).is_err());
+            // A grant from such a server checks against its metadata's
+            // issuer; metadata without one can't be checked against.
+            let grant = Grant {
+                code: String::new(),
+                redirect: String::new(),
+                verifier: String::new(),
+                client_id: client.into(),
+                token: String::new(),
+                issuer: Some(issuer.into()),
+                client_auth: ClientAuth::Basic,
+                scope: String::new(),
+            };
+            assert!(matches!(grant.issuer(Provider::Jmap, true), Issuer::Exact(i) if i == issuer));
+            let grant = Grant { issuer: None, ..grant };
+            assert!(matches!(grant.issuer(Provider::Imap, true), Issuer::Unknown));
+            assert!(matches!(grant.issuer(Provider::Gmail, false), Issuer::Google));
+            assert!(matches!(grant.issuer(Provider::Outlook, false), Issuer::Microsoft));
+        }
+    }
+
+    /// Audiences, `azp`, expiry with leeway, the nonce and the subject.
+    #[test]
+    fn id_token_audience_expiry_nonce_and_subject_are_enforced() {
+        let base = serde_json::json!({
+            "iss": "https://id.example", "aud": "me", "sub": "u1", "exp": NOW, "nonce": "n1",
+        });
+        let with = |changes: serde_json::Value| {
+            let mut claims = base.clone();
+            for (k, v) in changes.as_object().unwrap() {
+                if v.is_null() {
+                    claims.as_object_mut().unwrap().remove(k);
+                } else {
+                    claims[k] = v.clone();
+                }
+            }
+            id_token(claims)
+        };
+        let check = |token: &str, now: i64| {
+            checked_identity_at(token, "me", Issuer::Exact("https://id.example"), Some("n1"), now)
+        };
+        assert!(check(&with(serde_json::json!({})), NOW).is_ok());
+        // Clock skew: up to CLOCK_SKEW past `exp`, not beyond.
+        assert!(check(&with(serde_json::json!({})), NOW + CLOCK_SKEW).is_ok());
+        assert!(check(&with(serde_json::json!({})), NOW + CLOCK_SKEW + 1).is_err());
+        // No `exp` at all.
+        assert!(check(&with(serde_json::json!({"exp": null})), NOW).is_err());
+        // Another app's token.
+        assert!(check(&with(serde_json::json!({"aud": "other"})), NOW).is_err());
+        // Several audiences: `azp` must say this app.
+        assert!(check(&with(serde_json::json!({"aud": ["other", "me"]})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"aud": ["other", "me"], "azp": "other"})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"aud": ["other", "me"], "azp": "me"})), NOW).is_ok());
+        // One audience, with an `azp` for someone else.
+        assert!(check(&with(serde_json::json!({"azp": "other"})), NOW).is_err());
+        // The nonce sent, and a subject.
+        assert!(check(&with(serde_json::json!({"nonce": "n2"})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"nonce": null})), NOW).is_err());
+        assert!(check(&with(serde_json::json!({"sub": ""})), NOW).is_err());
+        // No ID token: no identity, and no error.
+        assert_eq!(check("", NOW).unwrap(), (Identity::default(), String::new()));
+        assert!(check("garbage", NOW).is_err());
+    }
+
     #[test]
     fn loopback_callback_ignores_forged_state() {
         let browser = Browser::new("127.0.0.1", "/callback").unwrap();
@@ -1487,6 +2363,22 @@ mod tests {
             "cancel stops waiting"
         );
     }
+    /// RFC 8252 §7.3: the IPv6 loopback address is a callback too.
+    #[test]
+    fn ipv6_loopback_callback_answers() {
+        // A system without IPv6 loopback can't run this.
+        let Ok(browser) = Browser::on_ipv6("/callback") else { return };
+        assert!(browser.redirect.starts_with("http://[::1]:"), "{}", browser.redirect);
+        let port = browser.listener.as_ref().unwrap().local_addr().unwrap().port();
+        let state = browser.state.clone();
+        let visit = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(("::1", port)).unwrap();
+            write!(s, "GET /callback?state={state}&code=v6 HTTP/1.1\r\nHost: [::1]\r\n\r\n").unwrap();
+            let _ = s.read(&mut [0; 512]);
+        });
+        assert_eq!(browser.wait(&AtomicBool::new(false)).unwrap(), "v6");
+        visit.join().unwrap();
+    }
     #[test]
     fn pinal_accounts_use_tokens_on_pinal_servers() {
         let a = pinal_account("sam@sonoran.exchange", "");
@@ -1507,6 +2399,15 @@ mod tests {
             format!("picacho://callback?state={}&code=real&iss=x", browser.state),
         ]);
         assert_eq!(browser.wait(&AtomicBool::new(false)).unwrap(), "real");
+        // RFC 8252 §7.1's reverse-DNS scheme answers the same way, and only
+        // with this sign-in's state.
+        opened(vec![
+            "tech.pinal.picacho:/callback?state=forged&code=no".into(),
+            "tech.pinal.picacho.evil:/callback?state=x&code=no".into(),
+            format!("tech.pinal.picacho:/callback?state={}&code=reverse", browser.state),
+        ]);
+        assert_eq!(browser.wait(&AtomicBool::new(false)).unwrap(), "reverse");
+        assert!(OPENED.lock().unwrap().iter().all(|u| !u.contains("evil")));
         opened(vec![format!(
             "picacho://callback?state={}&error=access_denied",
             browser.state

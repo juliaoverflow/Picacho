@@ -1,6 +1,7 @@
 //! Finds server settings from an email address, following the order used by
 //! Thunderbird: the provider's own autoconfig file, the public ISPDB, the
-//! domain's MX records, and finally well-known hostnames.
+//! domain's SRV records, Exchange's Autodiscover, the domain's MX records,
+//! and finally well-known hostnames.
 //!
 //! JMAP (RFC 8620 §2.2) comes first where the domain names a JMAP server
 //! itself, with an `_jmap._tcp` SRV record whose target is in the domain; a
@@ -33,6 +34,27 @@ pub struct Settings {
     /// The organization's single sign-on, where the domain's configuration
     /// says its servers take OAuth2 tokens (Thunderbird's `<oAuth2>`).
     pub sso: Option<crate::manage::model::Sso>,
+    /// The incoming server's user name, where the configuration's
+    /// `<username>` makes it something other than the address itself
+    /// (placeholders filled in: `%EMAILLOCALPART%` and the like).
+    pub username: Option<String>,
+}
+/// IMAP on the standard TLS port with nothing else known, for literals
+/// that fill in only some fields (`..Default::default()`).
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            provider: Provider::Imap,
+            incoming_host: String::new(),
+            incoming_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_tls: None,
+            incoming_starttls: false,
+            sso: None,
+            username: None,
+        }
+    }
 }
 impl Settings {
     /// A JMAP server, which sends mail too.
@@ -46,6 +68,7 @@ impl Settings {
             smtp_tls: None,
             incoming_starttls: false,
             sso: None,
+            username: None,
         }
     }
     fn hosted(provider: Provider) -> Self {
@@ -59,19 +82,18 @@ impl Settings {
             smtp_tls: a.smtp_tls,
             incoming_starttls: a.incoming_starttls,
             sso: None,
+            username: None,
         }
     }
 }
 
+/// An address's domain, in its ASCII form: international ones (`münchen.de`,
+/// RFC 5890) as their A-labels (`xn--mnchen-3ya.de`, UTS #46 processing),
+/// which DNS and the servers' certificates use.
 pub fn domain(email: &str) -> Option<String> {
     let (local, domain) = email.trim().rsplit_once('@')?;
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    (!local.is_empty()
-        && domain.contains('.')
-        && domain
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'))
-    .then_some(domain)
+    let domain = idna::domain_to_ascii(domain.trim_end_matches('.')).ok()?;
+    (!local.is_empty() && crate::sync::mta_sts::is_domain(&domain)).then_some(domain)
 }
 
 pub fn discover(email: &str) -> Option<Settings> {
@@ -88,9 +110,10 @@ pub fn discover(email: &str) -> Option<Settings> {
             format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml"),
             ispdb(domain),
         ]
-        .map(|url| s.spawn(move || fetch_config(&url, domain)));
+        .map(|url| s.spawn(move || fetch_config(&url, email)));
         let mx = s.spawn(|| mx_host(domain));
         let mail_srv = s.spawn(|| mail_srv(domain));
+        let autodiscover = s.spawn(|| autodiscover(email, domain));
         // The domain names its JMAP server, in the domain: that is what it
         // wants used. One elsewhere waits until the HTTPS sources are asked.
         let srv = srv.join().ok().flatten();
@@ -109,13 +132,17 @@ pub fn discover(email: &str) -> Option<Settings> {
         if let Ok(Some(found)) = mail_srv.join() {
             return Some(found);
         }
+        // Exchange's Autodiscover, for domains whose servers run it.
+        if let Ok(Some(found)) = autodiscover.join() {
+            return Some(found);
+        }
         if let Ok(Some(mx)) = mx.join() {
             if let Some(found) = known_mx(&mx) {
                 return Some(found);
             }
             for base in base_domains(&mx) {
                 if base != domain
-                    && let Some(found) = fetch_config(&ispdb(&base), domain)
+                    && let Some(found) = fetch_config(&ispdb(&base), email)
                 {
                     return Some(found);
                 }
@@ -180,6 +207,7 @@ fn mail_srv(domain: &str) -> Option<Settings> {
         smtp_tls: Some(smtp_tls),
         incoming_starttls,
         sso: None,
+        username: None,
     })
 }
 
@@ -301,7 +329,7 @@ fn base_domains(host: &str) -> Vec<String> {
     out
 }
 
-fn fetch_config(url: &str, domain: &str) -> Option<Settings> {
+fn fetch_config(url: &str, email: &str) -> Option<Settings> {
     let client = reqwest::blocking::Client::builder()
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(Duration::from_secs(5))
@@ -317,72 +345,88 @@ fn fetch_config(url: &str, domain: &str) -> Option<Settings> {
     }
     let mut body = String::new();
     response.take(256 * 1024).read_to_string(&mut body).ok()?;
-    parse_config(&body, domain)
+    parse_config(&body, email)
 }
 
-/// Parses a Mozilla autoconfig document. Only transports this client
-/// supports are accepted: TLS from the start or STARTTLS, never plain.
-/// Incoming servers with TLS from the start are preferred, then IMAP over
-/// POP3.
-pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
-    // (kind, host, port, STARTTLS)
-    let mut incoming: Option<(Provider, String, u16, bool)> = None;
+/// Parses a Mozilla autoconfig document (Thunderbird's `config-v1.1.xml`)
+/// as XML, so comments, CDATA and character entities read as XML says.
+/// Only transports this client supports are accepted: TLS from the start
+/// or STARTTLS, never plain. Incoming servers with TLS from the start are
+/// preferred, then IMAP over POP3. `email` fills in the placeholders.
+pub fn parse_config(xml: &str, email: &str) -> Option<Settings> {
+    // A document type declaration may define entities that expand without
+    // end; roxmltree refuses one that grows too large, and the document is
+    // at most 256 KiB (`fetch_config`).
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "clientConfig" {
+        return None;
+    }
+    let provider_node = child(root, "emailProvider")?;
+    let fill = |text: &str| substitute(text, email);
+    // (kind, host, port, STARTTLS, user name)
+    let mut incoming: Option<(Provider, String, u16, bool, Option<String>)> = None;
     // The incoming server signs in with tokens only (single sign-on).
     let mut oauth_only = false;
-    for (attrs, inner) in blocks(xml, "incomingServer") {
-        let kind = match attr(attrs, "type") {
+    for server in children(provider_node, "incomingServer") {
+        let kind = match server.attribute("type") {
             Some("imap") => Provider::Imap,
             Some("pop3") => Provider::Pop3,
             _ => continue,
         };
-        let starttls = match tag(inner, "socketType") {
+        let starttls = match text(server, "socketType").as_deref() {
             Some("SSL") => false,
             Some("STARTTLS") => true,
             _ => continue,
         };
-        let (Some(host), Some(port)) = (tag(inner, "hostname"), port(inner)) else {
+        let (Some(host), Some(port)) = (text(server, "hostname"), port(server)) else {
             continue;
         };
+        let host = fill(&host).to_ascii_lowercase();
         // A host name, nothing else: the document (from the web) names the
         // servers the password is sent to.
-        if !crate::sync::mta_sts::is_domain(&substitute(host, domain)) {
+        if !crate::sync::mta_sts::is_domain(&host) {
             continue;
         }
         // Rank: TLS from the start first, then IMAP.
         let rank = |kind: Provider, starttls: bool| (!starttls, kind == Provider::Imap);
         let better = match &incoming {
             None => true,
-            Some((existing, _, _, tls)) => rank(kind, starttls) > rank(*existing, *tls),
+            Some((existing, _, _, tls, _)) => rank(kind, starttls) > rank(*existing, *tls),
         };
         if better {
-            incoming = Some((kind, substitute(host, domain), port, starttls));
-            oauth_only = authentications(inner).iter().all(|a| a.eq_ignore_ascii_case("OAuth2"))
-                && !authentications(inner).is_empty();
+            let methods = authentications(server);
+            oauth_only = !methods.is_empty() && methods.iter().all(|a| a.eq_ignore_ascii_case("OAuth2"));
+            let username = text(server, "username").map(|u| fill(&u)).filter(|u| !u.is_empty());
+            incoming = Some((kind, host, port, starttls, username));
         }
     }
     // TLS from the start preferred over STARTTLS (RFC 8314 §3.3).
     let mut smtp: Option<(String, u16, bool)> = None;
-    for (attrs, inner) in blocks(xml, "outgoingServer") {
-        if attr(attrs, "type") != Some("smtp") {
+    for server in children(provider_node, "outgoingServer") {
+        if server.attribute("type") != Some("smtp") {
             continue;
         }
-        let (Some(host), Some(port)) = (tag(inner, "hostname"), port(inner)) else {
+        let (Some(host), Some(port)) = (text(server, "hostname"), port(server)) else {
             continue;
         };
-        if !crate::sync::mta_sts::is_domain(&substitute(host, domain)) {
+        let host = fill(&host).to_ascii_lowercase();
+        if !crate::sync::mta_sts::is_domain(&host) {
             continue;
         }
-        let tls = match tag(inner, "socketType") {
+        let tls = match text(server, "socketType").as_deref() {
             Some("STARTTLS") => false,
             Some("SSL") => true,
             _ => continue,
         };
         if smtp.as_ref().is_none_or(|(.., existing)| tls && !*existing) {
-            smtp = Some((substitute(host, domain), port, tls));
+            smtp = Some((host, port, tls));
         }
     }
-    let ((kind, incoming_host, incoming_port, incoming_starttls), (smtp_host, smtp_port, smtp_tls)) =
-        (incoming?, smtp?);
+    let (
+        (kind, incoming_host, incoming_port, incoming_starttls, username),
+        (smtp_host, smtp_port, smtp_tls),
+    ) = (incoming?, smtp?);
     let provider = if incoming_host.ends_with(".gmail.com") {
         Provider::Gmail
     } else if incoming_host.ends_with(".office365.com") || incoming_host.ends_with(".outlook.com") {
@@ -393,10 +437,12 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
     // Gmail and Outlook have their own sign-in; others' OAuth2 is the
     // organization's.
     let sso = if matches!(provider, Provider::Imap | Provider::Pop3) && oauth_only {
-        sso_of(xml)
+        sso_of(root)
     } else {
         None
     };
+    // The address itself is what the account signs in with anyway.
+    let username = username.filter(|u| !u.eq_ignore_ascii_case(email.trim()));
     Some(Settings {
         provider,
         incoming_host,
@@ -406,14 +452,14 @@ pub fn parse_config(xml: &str, domain: &str) -> Option<Settings> {
         smtp_tls: Some(smtp_tls),
         incoming_starttls,
         sso,
+        username,
     })
 }
 
 /// A server's `<authentication>` methods.
-fn authentications(server: &str) -> Vec<&str> {
-    blocks(server, "authentication")
-        .into_iter()
-        .map(|(_, inner)| inner.trim())
+fn authentications(server: roxmltree::Node<'_, '_>) -> Vec<String> {
+    children(server, "authentication")
+        .map(|n| n.text().unwrap_or_default().trim().to_owned())
         .collect()
 }
 /// The configuration's `<oAuth2>` block (Thunderbird's extension): the
@@ -423,13 +469,13 @@ fn authentications(server: &str) -> Vec<&str> {
 /// name the issuer's host only, with `authURL` under it (Keycloak's
 /// `/realms/<name>/protocol/openid-connect/auth`): the issuer is the
 /// authURL's path up to its protocol part, where it has one.
-fn sso_of(xml: &str) -> Option<crate::manage::model::Sso> {
-    let (_, inner) = blocks(xml, "oAuth2").into_iter().next()?;
-    let issuer = tag(inner, "issuer")?.trim();
-    let auth = tag(inner, "authURL").and_then(|u| url::Url::parse(u.trim()).ok());
+fn sso_of(root: roxmltree::Node<'_, '_>) -> Option<crate::manage::model::Sso> {
+    let block = child(root, "oAuth2")?;
+    let issuer = text(block, "issuer")?;
+    let auth = text(block, "authURL").and_then(|u| url::Url::parse(&u).ok());
     let issuer = if issuer.contains("://") {
-        issuer.to_owned()
-    } else if let Some(auth) = auth.filter(|a| a.host_str() == Some(issuer)) {
+        issuer.clone()
+    } else if let Some(auth) = auth.filter(|a| a.host_str() == Some(issuer.as_str())) {
         let path = auth.path();
         let base = ["/protocol/openid-connect/", "/oauth2/", "/oauth/", "/connect/", "/application/o/"]
             .iter()
@@ -442,45 +488,171 @@ fn sso_of(xml: &str) -> Option<crate::manage::model::Sso> {
     let parsed = url::Url::parse(&issuer).ok()?;
     (parsed.scheme() == "https" && parsed.host_str().is_some()).then(|| crate::manage::model::Sso {
         issuer: issuer.trim_end_matches('/').to_owned(),
-        scope: tag(inner, "scope").unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" "),
+        scope: text(block, "scope").unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" "),
     })
 }
-fn blocks<'a>(xml: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
-    let open = format!("<{name}");
-    let close = format!("</{name}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        rest = &rest[start + open.len()..];
-        let Some(end_attrs) = rest.find('>') else {
-            break;
+/// The child elements of `node` named `name`.
+fn children<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    name: &'static str,
+) -> impl Iterator<Item = roxmltree::Node<'a, 'input>> {
+    node.children()
+        .filter(move |n| n.is_element() && n.tag_name().name() == name)
+}
+fn child<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &'static str) -> Option<roxmltree::Node<'a, 'input>> {
+    children(node, name).next()
+}
+/// The text of `node`'s child `name`, trimmed: its text and CDATA, with
+/// entities expanded and comments left out.
+fn text(node: roxmltree::Node<'_, '_>, name: &'static str) -> Option<String> {
+    let element = child(node, name)?;
+    let joined: String = element
+        .children()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect();
+    Some(joined.trim().to_owned())
+}
+fn port(server: roxmltree::Node<'_, '_>) -> Option<u16> {
+    text(server, "port")?.parse().ok().filter(|p| *p > 0)
+}
+/// The placeholders Thunderbird's configurations use, filled in for
+/// `email`: `%EMAILADDRESS%`, `%EMAILLOCALPART%` and `%EMAILDOMAIN%`.
+fn substitute(text: &str, email: &str) -> String {
+    let email = email.trim();
+    let (local, domain) = email.rsplit_once('@').unwrap_or(("", email));
+    let domain = self::domain(email).unwrap_or_else(|| domain.to_ascii_lowercase());
+    text.replace("%EMAILADDRESS%", email)
+        .replace("%EMAILLOCALPART%", local)
+        .replace("%EMAILDOMAIN%", &domain)
+}
+
+/// Exchange's Autodiscover (the "POX" form, [MS-OXDSCLI] §3.1.5): an
+/// XML request posted to the domain's two well-known addresses, asking for
+/// the settings of mail clients that speak the standard protocols
+/// (`outlook/responseschema/2006a`). Only https is asked, with no redirect
+/// to another host followed: the answer names the servers the password
+/// goes to, and a redirect would let a network or a lookalike name them.
+fn autodiscover(email: &str, domain: &str) -> Option<Settings> {
+    let client = reqwest::blocking::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .build()
+        .ok()?;
+    let request = autodiscover_request(email);
+    for url in [
+        format!("https://{domain}/autodiscover/autodiscover.xml"),
+        format!("https://autodiscover.{domain}/autodiscover/autodiscover.xml"),
+    ] {
+        let Ok(response) = client
+            .post(&url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .body(request.clone())
+            .send()
+        else {
+            continue;
         };
-        let attrs = &rest[..end_attrs];
-        rest = &rest[end_attrs + 1..];
-        let Some(end) = rest.find(&close) else {
-            break;
-        };
-        out.push((attrs, &rest[..end]));
-        rest = &rest[end + close.len()..];
+        if !response.status().is_success() {
+            continue;
+        }
+        let mut body = String::new();
+        if response.take(256 * 1024).read_to_string(&mut body).is_err() {
+            continue;
+        }
+        if let Some(found) = parse_autodiscover(&body, email) {
+            return Some(found);
+        }
     }
-    out
+    None
 }
-fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
-    let rest = &attrs[attrs.find(&format!("{name}="))? + name.len() + 1..];
-    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    let rest = &rest[1..];
-    Some(&rest[..rest.find(quote)?])
+/// The Autodiscover request for `email`, escaped as XML text.
+fn autodiscover_request(email: &str) -> String {
+    let email = email
+        .trim()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">
+  <Request>
+    <EMailAddress>{email}</EMailAddress>
+    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+  </Request>
+</Autodiscover>"#
+    )
 }
-fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    let start = xml.find(&format!("<{name}>"))? + name.len() + 2;
-    let end = xml[start..].find(&format!("</{name}>"))?;
-    Some(xml[start..start + end].trim())
-}
-fn port(xml: &str) -> Option<u16> {
-    tag(xml, "port")?.parse().ok().filter(|p| *p > 0)
-}
-fn substitute(host: &str, domain: &str) -> String {
-    host.replace("%EMAILDOMAIN%", domain).to_ascii_lowercase()
+/// The IMAP, POP3 and SMTP settings in an Autodiscover answer
+/// ([MS-OXDSCLI] §2.2.4: `Protocol` elements of `Type` IMAP, POP3 and
+/// SMTP, each with `Server`, `Port` and `SSL`/`Encryption`). TLS is
+/// required: `Encryption` of TLS or SSL, or `SSL` on. On port 993, 995 or
+/// 465, TLS comes first; elsewhere, it is STARTTLS. An answer that only
+/// redirects (`Action` of redirectAddr/redirectUrl) is not followed.
+pub fn parse_autodiscover(xml: &str, email: &str) -> Option<Settings> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let account = doc
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "Account")?;
+    if child(account, "AccountType").is_some_and(|_| text(account, "AccountType").as_deref() != Some("email")) {
+        return None;
+    }
+    // (kind, host, port, starttls, login name)
+    let mut incoming: Option<(Provider, String, u16, bool, Option<String>)> = None;
+    let mut smtp: Option<(String, u16, bool)> = None;
+    for protocol in children(account, "Protocol") {
+        let Some(kind) = text(protocol, "Type") else { continue };
+        let (Some(host), Some(port)) = (
+            text(protocol, "Server").map(|h| h.trim_end_matches('.').to_ascii_lowercase()),
+            text(protocol, "Port").and_then(|p| p.parse::<u16>().ok()).filter(|p| *p > 0),
+        ) else {
+            continue;
+        };
+        if !crate::sync::mta_sts::is_domain(&host) {
+            continue;
+        }
+        let encrypted = match text(protocol, "Encryption").as_deref() {
+            Some(e) => matches!(e.to_ascii_lowercase().as_str(), "tls" | "ssl" | "auto"),
+            None => text(protocol, "SSL").is_none_or(|v| v.eq_ignore_ascii_case("on")),
+        };
+        if !encrypted {
+            continue;
+        }
+        let implicit = matches!(port, 993 | 995 | 465);
+        let login = text(protocol, "LoginName").filter(|l| !l.is_empty());
+        let rank = |kind: Provider, starttls: bool| (!starttls, kind == Provider::Imap);
+        match kind.to_ascii_uppercase().as_str() {
+            k @ ("IMAP" | "POP3") => {
+                let kind = if k == "IMAP" { Provider::Imap } else { Provider::Pop3 };
+                if incoming
+                    .as_ref()
+                    .is_none_or(|(existing, _, _, tls, _)| rank(kind, !implicit) > rank(*existing, *tls))
+                {
+                    incoming = Some((kind, host, port, !implicit, login));
+                }
+            }
+            "SMTP" => {
+                if smtp.as_ref().is_none_or(|(.., tls)| implicit && !*tls) {
+                    smtp = Some((host, port, implicit));
+                }
+            }
+            _ => {}
+        }
+    }
+    let ((provider, incoming_host, incoming_port, incoming_starttls, login), (smtp_host, smtp_port, smtp_tls)) =
+        (incoming?, smtp?);
+    Some(Settings {
+        provider,
+        incoming_host,
+        incoming_port,
+        smtp_host,
+        smtp_port,
+        smtp_tls: Some(smtp_tls),
+        incoming_starttls,
+        sso: None,
+        username: login.filter(|l| !l.eq_ignore_ascii_case(email.trim())),
+    })
 }
 
 /// The domain's most preferred mail server, through the system's DNS
@@ -582,6 +754,7 @@ fn probe(domain: &str) -> Option<Settings> {
         smtp_tls: None,
         incoming_starttls: matches!(incoming_port, 143 | 110),
         sso: None,
+        username: None,
     })
 }
 
@@ -614,7 +787,7 @@ mod tests {
     #[test]
     fn parses_autoconfig_and_prefers_tls_imap() {
         assert_eq!(
-            parse_config(FASTMAIL, "fastmail.com"),
+            parse_config(FASTMAIL, "a@fastmail.com"),
             Some(Settings {
                 provider: Provider::Imap,
                 incoming_host: "imap.fastmail.com".into(),
@@ -624,6 +797,7 @@ mod tests {
                 smtp_tls: Some(true),
                 incoming_starttls: false,
                 sso: None,
+                username: None,
             })
         );
         assert_eq!(parse_config("<html>not found</html>", "x.com"), None);
@@ -631,7 +805,7 @@ mod tests {
         let only = FASTMAIL
             .replace("<port>993</port>\n      <socketType>SSL</socketType>", "<port>143</port><socketType>STARTTLS</socketType>")
             .replace("<port>995</port><socketType>SSL</socketType>", "<port>110</port><socketType>plain</socketType>");
-        let found = parse_config(&only, "fastmail.com").unwrap();
+        let found = parse_config(&only, "a@fastmail.com").unwrap();
         assert_eq!((found.provider, found.incoming_port, found.incoming_starttls), (Provider::Imap, 143, true));
     }
 
@@ -653,7 +827,7 @@ mod tests {
     <authURL>https://login.example.edu/realms/staff/protocol/openid-connect/auth</authURL>
     <tokenURL>https://login.example.edu/realms/staff/protocol/openid-connect/token</tokenURL>
   </oAuth2></clientConfig>"#;
-        let found = parse_config(config, "example.edu").unwrap();
+        let found = parse_config(config, "ana@example.edu").unwrap();
         assert_eq!(found.provider, Provider::Imap);
         let sso = found.sso.unwrap();
         assert_eq!(sso.issuer, "https://login.example.edu/realms/staff");
@@ -664,13 +838,108 @@ mod tests {
             "<authentication>OAuth2</authentication><authentication>password-cleartext</authentication></incomingServer>",
         );
         assert_ne!(both, config);
-        assert!(parse_config(&both, "example.edu").unwrap().sso.is_none());
+        assert!(parse_config(&both, "ana@example.edu").unwrap().sso.is_none());
         // An issuer over plain http is ignored.
         let plain = config.replace("<issuer>login.example.edu</issuer>", "<issuer>http://login.example.edu</issuer>");
-        assert!(parse_config(&plain, "example.edu").unwrap().sso.is_none());
+        assert!(parse_config(&plain, "ana@example.edu").unwrap().sso.is_none());
         // Gmail's own sign-in isn't an organization's.
         let gmail = config.replace("imap.example.edu", "imap.gmail.com");
-        assert!(parse_config(&gmail, "example.edu").unwrap().sso.is_none());
+        assert!(parse_config(&gmail, "ana@example.edu").unwrap().sso.is_none());
+    }
+
+    /// A real XML parser: comments, CDATA and entities, and placeholders in
+    /// host names and the `<username>` template.
+    #[test]
+    fn autoconfig_is_read_as_xml_with_placeholders() {
+        let config = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- Thunderbird's format, as providers publish it. -->
+<clientConfig version="1.1">
+  <emailProvider id="example.org">
+    <domain>example.org</domain>
+    <!-- <incomingServer type="imap"><hostname>commented.example.org</hostname><port>993</port><socketType>SSL</socketType></incomingServer> -->
+    <incomingServer type="imap">
+      <hostname><!-- the IMAP host -->imap.%EMAILDOMAIN%</hostname>
+      <port>993</port>
+      <socketType>SSL</socketType>
+      <username>%EMAILLOCALPART%</username>
+      <authentication>password-cleartext</authentication>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname><![CDATA[smtp.example.org]]></hostname>
+      <port>&#52;65</port>
+      <socketType>SSL</socketType>
+      <username>%EMAILADDRESS%</username>
+    </outgoingServer>
+    <displayName>Example &amp; Co</displayName>
+  </emailProvider>
+</clientConfig>"#;
+        let found = parse_config(config, "Ana.B@Example.org").unwrap();
+        assert_eq!(found.incoming_host, "imap.example.org");
+        assert_eq!((found.smtp_host.as_str(), found.smtp_port), ("smtp.example.org", 465));
+        assert_eq!(found.username.as_deref(), Some("Ana.B"));
+        // A user name that is the address itself is no different name.
+        let address = config.replace("%EMAILLOCALPART%", "%EMAILADDRESS%");
+        assert_eq!(parse_config(&address, "ana@example.org").unwrap().username, None);
+        let fixed = config.replace("%EMAILLOCALPART%", "%EMAILLOCALPART%-mail@%EMAILDOMAIN%");
+        assert_eq!(parse_config(&fixed, "ana@example.org").unwrap().username.as_deref(), Some("ana-mail@example.org"));
+        // Not XML, or not an autoconfig document.
+        assert_eq!(parse_config("<clientConfig><emailProvider>", "a@example.org"), None);
+        assert_eq!(parse_config("<html><body>config</body></html>", "a@example.org"), None);
+        // Entities expanding without end are refused, not expanded.
+        let bomb = format!(
+            r#"<?xml version="1.0"?><!DOCTYPE c [<!ENTITY a "aaaaaaaaaa">{}]><clientConfig>&j;</clientConfig>"#,
+            (b'b'..=b'j')
+                .map(|c| {
+                    let prev = (c - 1) as char;
+                    format!(r#"<!ENTITY {} "{}">"#, c as char, format!("&{prev};").repeat(10))
+                })
+                .collect::<String>()
+        );
+        assert_eq!(parse_config(&bomb, "a@example.org"), None);
+    }
+
+    /// Exchange's Autodiscover (POX) answer for an IMAP/POP3/SMTP mailbox.
+    #[test]
+    fn exchange_autodiscover_answers_are_read() {
+        let answer = r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
+  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">
+    <User><DisplayName>Ana</DisplayName></User>
+    <Account>
+      <AccountType>email</AccountType>
+      <Action>settings</Action>
+      <Protocol><Type>EXCH</Type><Server>exch.example.com</Server></Protocol>
+      <Protocol><Type>POP3</Type><Server>pop.example.com</Server><Port>995</Port><SSL>on</SSL></Protocol>
+      <Protocol><Type>IMAP</Type><Server>mail.example.com</Server><Port>143</Port><SSL>off</SSL></Protocol>
+      <Protocol><Type>IMAP</Type><Server>mail.example.com</Server><Port>993</Port><SSL>on</SSL><LoginName>EXAMPLE\ana</LoginName></Protocol>
+      <Protocol><Type>SMTP</Type><Server>smtp.example.com</Server><Port>587</Port><Encryption>TLS</Encryption></Protocol>
+    </Account>
+  </Response>
+</Autodiscover>"#;
+        let found = parse_autodiscover(answer, "ana@example.com").unwrap();
+        assert_eq!(found.provider, Provider::Imap);
+        assert_eq!((found.incoming_host.as_str(), found.incoming_port, found.incoming_starttls), ("mail.example.com", 993, false));
+        assert_eq!((found.smtp_host.as_str(), found.smtp_port, found.smtp_tls), ("smtp.example.com", 587, Some(false)));
+        assert_eq!(found.username.as_deref(), Some("EXAMPLE\\ana"));
+        // Plain only: nothing usable.
+        let plain = answer.replace("<Port>993</Port><SSL>on</SSL>", "<Port>143</Port><SSL>off</SSL>").replace("<Port>995</Port><SSL>on</SSL>", "<Port>110</Port><SSL>off</SSL>");
+        assert_eq!(parse_autodiscover(&plain, "ana@example.com"), None);
+        // A redirect isn't settings.
+        let redirect = r#"<Autodiscover><Response><Account><AccountType>email</AccountType><Action>redirectAddr</Action><RedirectAddr>x@elsewhere.example</RedirectAddr></Account></Response></Autodiscover>"#;
+        assert_eq!(parse_autodiscover(redirect, "ana@example.com"), None);
+        // The request names the address, escaped.
+        assert!(autodiscover_request("a&b@example.com").contains("<EMailAddress>a&amp;b@example.com</EMailAddress>"));
+    }
+
+    /// RFC 5890: international domains in their ASCII form.
+    #[test]
+    fn international_domains_are_accepted_as_a_labels() {
+        assert_eq!(domain("jörg@Bücher.example"), Some("xn--bcher-kva.example".into()));
+        assert_eq!(domain("a@xn--bcher-kva.example."), Some("xn--bcher-kva.example".into()));
+        assert_eq!(domain("a@例え.テスト"), Some("xn--r8jz45g.xn--zckzah".into()));
+        assert_eq!(domain("a@exa mple.com"), None);
+        assert_eq!(domain("a@-bad-.com"), None);
+        assert_eq!(substitute("imap.%EMAILDOMAIN%", "j@Bücher.example"), "imap.xn--bcher-kva.example");
     }
 
     #[test]

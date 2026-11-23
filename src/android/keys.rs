@@ -590,6 +590,7 @@ fn assertion(response: &str, client_data_json: &[u8], challenge: &[u8]) -> Resul
         authenticator_data,
         signature,
         credential_id,
+        user_handle: bytes(&signed["userHandle"]).filter(|h| !h.is_empty() && h.len() <= 64),
     })
 }
 

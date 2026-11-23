@@ -87,6 +87,9 @@ keyring = "4"
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname"] }
 # Checks DKIM, SPF and DMARC. Pure-Rust crypto, without aws-lc's C build.
 mail-auth = { version = "0.15", default-features = false, features = ["rust-crypto", "dns-hickory", "arc"] }
+# mail-auth's resolver, with DNSSEC validation (ring, already linked) for the
+# separate resolver that checks TLSA, OPENPGPKEY and SMIMEA (sync/auth.rs).
+hickory-resolver = { version = "=0.26.3", features = ["dnssec-ring"] }
 # 0.17 and later limit MIME nesting; deeply nested parts used to overflow the stack.
 mailparse = "0.18"
 markdown = "1.0.0"

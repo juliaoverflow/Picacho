@@ -27,7 +27,13 @@ pub(crate) trait Context: Send {
 /// Starts a context with `service@host` (a host-based service name) using
 /// the system's Kerberos ticket.
 pub(crate) fn start(target: &str) -> Result<Box<dyn Context>> {
-    imp::start(target)
+    imp::start(target, None)
+}
+/// As `start`, with channel bindings (RFC 2744 §3.11): their application
+/// data only, no addresses, as RFC 5801 §5 has GS2 send its header and the
+/// TLS channel's binding data in. The server must have the same to accept.
+pub(crate) fn start_bound(target: &str, application_data: Vec<u8>) -> Result<Box<dyn Context>> {
+    imp::start(target, Some(application_data))
 }
 
 /// Explains a failure to start: usually no ticket, or one for another realm.
@@ -68,9 +74,12 @@ pub(crate) mod imp {
         }
     }
 
-    /// `gss_OID_desc` (`OM_uint32 length; void *elements`, aligned as C
-    /// lays it out on the systems other than macOS).
-    #[repr(C)]
+    /// `gss_OID_desc` (`OM_uint32 length; void *elements`), laid out as
+    /// each system's library has it: C's alignment, and on macOS Apple's
+    /// `#pragma pack(push, 2)` in <GSS/gssapi.h>, where the pointer
+    /// follows the length directly (12 bytes, not 16).
+    #[cfg_attr(not(target_os = "macos"), repr(C))]
+    #[cfg_attr(target_os = "macos", repr(C, packed(2)))]
     struct OidDesc {
         length: OmUint32,
         elements: *const c_void,
@@ -84,15 +93,19 @@ pub(crate) mod imp {
         length: 9,
         elements: KRB5_OID_BYTES.as_ptr() as *const c_void,
     };
-    /// The mechanism to ask for: Kerberos 5 by its OID, except where the
-    /// library packs its structures differently (Apple's), whose default
-    /// is Kerberos anyway.
+    // The layouts the libraries expect.
+    #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<OidDesc>() == 12);
+    #[cfg(all(not(target_os = "macos"), target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<OidDesc>() == 16);
+    #[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<ChannelBindings>() == 4 + 16 + 4 + 16 + 16);
+    #[cfg(all(not(target_os = "macos"), target_pointer_width = "64"))]
+    const _: () = assert!(std::mem::size_of::<ChannelBindings>() == 8 + 16 + 8 + 16 + 16);
+    /// The mechanism to ask for: Kerberos 5 by its OID (RFC 4752 §3.1),
+    /// not the library's default, which may be SPNEGO or another.
     fn mechanism() -> *mut c_void {
-        if cfg!(target_os = "macos") {
-            std::ptr::null_mut()
-        } else {
-            &KRB5_OID as *const OidDesc as *mut c_void
-        }
+        &KRB5_OID as *const OidDesc as *mut c_void
     }
 
     const COMPLETE: OmUint32 = 0;
@@ -316,17 +329,31 @@ pub(crate) mod imp {
         bytes
     }
 
+    /// `gss_channel_bindings_struct` (RFC 2744 §3.11): addresses of type
+    /// GSS_C_AF_NULLADDR (0) and empty, and the application data. Packed
+    /// to 2 on macOS, as Apple's header has it (see `OidDesc`).
+    #[cfg_attr(not(target_os = "macos"), repr(C))]
+    #[cfg_attr(target_os = "macos", repr(C, packed(2)))]
+    struct ChannelBindings {
+        initiator_addrtype: OmUint32,
+        initiator_address: Buffer,
+        acceptor_addrtype: OmUint32,
+        acceptor_address: Buffer,
+        application_data: Buffer,
+    }
     struct Gss {
         library: &'static Library,
         context: *mut c_void,
         target: *mut c_void,
         established: bool,
+        /// The channel bindings' application data, where there are any.
+        bindings: Option<Vec<u8>>,
     }
     // A context is used by one sign-in at a time, which may move between
     // threads; GSS-API contexts aren't tied to the thread that made them.
     unsafe impl Send for Gss {}
 
-    pub(super) fn start(target: &str) -> Result<Box<dyn Context>> {
+    pub(super) fn start(target: &str, bindings: Option<Vec<u8>>) -> Result<Box<dyn Context>> {
         let library = library()?;
         let mut minor = 0;
         let mut name = std::ptr::null_mut();
@@ -343,6 +370,7 @@ pub(crate) mod imp {
             context: std::ptr::null_mut(),
             target: name,
             established: false,
+            bindings,
         }))
     }
 
@@ -356,9 +384,20 @@ pub(crate) mod imp {
             let mut token = Buffer::of(input);
             let mut output = Buffer::empty();
             let mut flags = 0;
+            let mut bindings = self.bindings.as_ref().map(|data| ChannelBindings {
+                initiator_addrtype: 0,
+                initiator_address: Buffer::empty(),
+                acceptor_addrtype: 0,
+                acceptor_address: Buffer::empty(),
+                application_data: Buffer::of(data),
+            });
+            let bindings_ptr = bindings
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |b| b as *mut ChannelBindings as *mut c_void);
             // SAFETY: GSS_C_NO_CREDENTIAL (the default ticket) and
-            // GSS_C_NO_OID (the default mechanism, Kerberos); buffers live
-            // through the call, and the output is released by `take`.
+            // GSS_C_NO_OID (the default mechanism, Kerberos); buffers and
+            // the bindings live through the call, and the output is
+            // released by `take`.
             let major = unsafe {
                 (self.library.init_sec_context)(
                     &mut minor,
@@ -368,7 +407,7 @@ pub(crate) mod imp {
                     mechanism(),
                     MUTUAL | SEQUENCE | INTEG | CONF,
                     0,
-                    std::ptr::null_mut(),
+                    bindings_ptr,
                     if self.context.is_null() {
                         std::ptr::null_mut()
                     } else {
@@ -504,6 +543,9 @@ pub(crate) mod imp {
             library: &'static Library,
             accept: AcceptSecContext,
             context: *mut c_void,
+            /// The channel bindings' application data the client must
+            /// have used, where set.
+            pub(crate) bindings: Option<Vec<u8>>,
         }
         unsafe impl Send for Acceptor {}
         impl Acceptor {
@@ -518,6 +560,7 @@ pub(crate) mod imp {
                     library,
                     accept,
                     context: std::ptr::null_mut(),
+                    bindings: None,
                 })
             }
             /// A client token in; the token to send back, and whether done.
@@ -526,13 +569,23 @@ pub(crate) mod imp {
                 let mut token = Buffer::of(input);
                 let mut output = Buffer::empty();
                 let mut flags = 0;
+                let mut bindings = self.bindings.as_ref().map(|data| ChannelBindings {
+                    initiator_addrtype: 0,
+                    initiator_address: Buffer::empty(),
+                    acceptor_addrtype: 0,
+                    acceptor_address: Buffer::empty(),
+                    application_data: Buffer::of(data),
+                });
+                let bindings_ptr = bindings
+                    .as_mut()
+                    .map_or(std::ptr::null_mut(), |b| b as *mut ChannelBindings as *mut c_void);
                 let major = unsafe {
                     (self.accept)(
                         &mut minor,
                         &mut self.context,
                         std::ptr::null_mut(),
                         &mut token,
-                        std::ptr::null_mut(),
+                        bindings_ptr,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                         &mut output,
@@ -642,11 +695,36 @@ mod imp {
         /// The service principal: `imap/mail.example.com`.
         target: Vec<u16>,
         established: bool,
+        /// SEC_CHANNEL_BINDINGS followed by its application data, where
+        /// there are channel bindings.
+        bindings: Option<Vec<u8>>,
+    }
+    /// SSPI's channel bindings: the header, then the application data
+    /// right after it (its offset counts from the header's start).
+    fn sspi_bindings(data: &[u8]) -> Vec<u8> {
+        use windows_sys::Win32::Security::Authentication::Identity::SEC_CHANNEL_BINDINGS;
+        let header = std::mem::size_of::<SEC_CHANNEL_BINDINGS>();
+        let fields = SEC_CHANNEL_BINDINGS {
+            cbApplicationDataLength: data.len() as u32,
+            dwApplicationDataOffset: header as u32,
+            ..Default::default()
+        };
+        let mut out = vec![0u8; header];
+        // SAFETY: a plain C struct of u32s, copied as bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &fields as *const SEC_CHANNEL_BINDINGS as *const u8,
+                out.as_mut_ptr(),
+                header,
+            )
+        };
+        out.extend_from_slice(data);
+        out
     }
     // SSPI handles aren't tied to a thread.
     unsafe impl Send for Sspi {}
 
-    pub(super) fn start(target: &str) -> Result<Box<dyn Context>> {
+    pub(super) fn start(target: &str, bindings: Option<Vec<u8>>) -> Result<Box<dyn Context>> {
         // SSPI names services as `service/host`.
         let spn = target.replacen('@', "/", 1);
         let package = wide("Kerberos");
@@ -676,6 +754,7 @@ mod imp {
             context: None,
             target: wide(&spn),
             established: false,
+            bindings: bindings.as_deref().map(sspi_bindings),
         }))
     }
 
@@ -685,15 +764,31 @@ mod imp {
                 !self.established,
                 "The Kerberos sign-in was already complete."
             );
-            let mut in_buffer = SecBuffer {
-                cbBuffer: input.len() as u32,
-                BufferType: SECBUFFER_TOKEN,
-                pvBuffer: input.as_ptr() as *mut _,
+            let mut bindings = self.bindings.clone().unwrap_or_default();
+            let mut in_buffers = [
+                SecBuffer {
+                    cbBuffer: input.len() as u32,
+                    BufferType: SECBUFFER_TOKEN,
+                    pvBuffer: input.as_ptr() as *mut _,
+                },
+                SecBuffer {
+                    cbBuffer: bindings.len() as u32,
+                    BufferType: windows_sys::Win32::Security::Authentication::Identity::SECBUFFER_CHANNEL_BINDINGS,
+                    pvBuffer: bindings.as_mut_ptr() as *mut _,
+                },
+            ];
+            // The first call has no token, only the bindings (where any).
+            let first = self.context.is_none();
+            let (start, count) = match (first, self.bindings.is_some()) {
+                (true, true) => (1, 1),
+                (true, false) => (0, 0),
+                (false, true) => (0, 2),
+                (false, false) => (0, 1),
             };
             let in_desc = SecBufferDesc {
                 ulVersion: SECBUFFER_VERSION,
-                cBuffers: 1,
-                pBuffers: &mut in_buffer,
+                cBuffers: count,
+                pBuffers: in_buffers[start..].as_mut_ptr(),
             };
             let mut out_buffer = SecBuffer {
                 cbBuffer: 0,
@@ -725,11 +820,7 @@ mod imp {
                         | ISC_REQ_ALLOCATE_MEMORY,
                     0,
                     SECURITY_NATIVE_DREP,
-                    if previous.is_some() {
-                        &in_desc
-                    } else {
-                        std::ptr::null()
-                    },
+                    if count > 0 { &in_desc } else { std::ptr::null() },
                     0,
                     &mut next,
                     &mut out_desc,
@@ -873,7 +964,7 @@ mod imp {
 mod imp {
     use super::Context;
     use anyhow::{Result, bail};
-    pub(super) fn start(_target: &str) -> Result<Box<dyn Context>> {
+    pub(super) fn start(_target: &str, _bindings: Option<Vec<u8>>) -> Result<Box<dyn Context>> {
         bail!("Kerberos sign-in isn't available on phones and tablets.")
     }
 }
@@ -1038,6 +1129,50 @@ pub(crate) mod tests {
         assert_eq!(client.unwrap(&offer)?, [0x07, 0x00, 0x10, 0x00]);
         let answer = client.wrap(&[0x01, 0, 0, 0])?;
         assert_eq!(server.unwrap(&answer)?, [0x01, 0, 0, 0]);
+        // RFC 5801 §5: channel bindings (GS2's header and the TLS
+        // binding) must be the same on both sides to be accepted.
+        let bound = b"p=tls-server-end-point,,\x01\x02\x03".to_vec();
+        for (theirs, accepted) in [(bound.clone(), true), (b"p=tls-server-end-point,,\x09".to_vec(), false)] {
+            let mut client = start_bound("imap@localhost", bound.clone())?;
+            let mut server = imp::acceptor::Acceptor::new()?;
+            server.bindings = Some(theirs);
+            let (token, _) = client.step(&[])?;
+            let result = server.step(&token).and_then(|(back, _)| client.step(&back).map(|_| ()));
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+        }
+        // GS2-KRB5 end to end (RFC 5801): the SASL exchange's first
+        // message is its header and the unframed token; the server frames
+        // it again (RFC 2743 §3.1) and accepts it with the same bindings.
+        let binding = vec![0xAB; 32];
+        let mut sasl = crate::sync::sasl::Exchange::new(
+            crate::sync::sasl::Mechanism::Gs2Krb5Plus,
+            crate::sync::sasl::Credentials {
+                user: String::new(),
+                secret: String::new(),
+                host: "localhost".into(),
+                port: 993,
+                binding: binding.clone(),
+                service: "imap",
+            },
+        );
+        let first = sasl.initial().unwrap();
+        let header = b"p=tls-server-end-point,,";
+        let inner = first.strip_prefix(header.as_slice()).expect("the GS2 header");
+        let mut oid = vec![0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+        oid.extend_from_slice(inner);
+        let mut framed = vec![0x60];
+        match oid.len() {
+            n if n < 0x80 => framed.push(n as u8),
+            n if n < 0x100 => framed.extend([0x81, n as u8]),
+            n => framed.extend([0x82, (n >> 8) as u8, n as u8]),
+        }
+        framed.extend(oid);
+        let mut server = imp::acceptor::Acceptor::new()?;
+        server.bindings = Some([header.as_slice(), &binding].concat());
+        let (back, accepted) = server.step(&framed)?;
+        assert!(accepted);
+        assert!(sasl.step(&back)?.is_empty());
+        sasl.finish(None)?;
         // A service the realm doesn't have fails with Kerberos' own words.
         let mut wrong = start("imap@nowhere.invalid")?;
         let error = format!("{:#}", wrong.step(&[]).err().unwrap());
