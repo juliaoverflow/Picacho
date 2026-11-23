@@ -1166,23 +1166,29 @@ impl Backend {
     /// Keeps the key an Autocrypt header in a received message gives for
     /// its sender, if no key for them was imported by hand.
     fn learn_autocrypt(&self, raw: &[u8]) {
-        let Some(header) = crate::sync::keys::autocrypt_full(raw) else {
+        // Peer state (Autocrypt 1.1 §2.3), for every message that counts,
+        // with or without a header; received now, as it is processed.
+        use crate::manage::openpgp::{Peer, key_fingerprint, peer_preference_key};
+        let Some(message) = crate::sync::keys::autocrypt_message(raw, chrono::Utc::now().timestamp()) else {
             return;
         };
-        let (email, key) = (header.addr.clone(), header.key.clone());
-        // Peer state (Autocrypt 1.1 §2.3): an older message than the one
-        // a key was last taken from doesn't replace it.
-        use crate::manage::openpgp::{Peer, peer_preference_key};
-        let seen_key = peer_preference_key(&email);
-        let mut peer = Peer::from_preference(&self.store.preference(&seen_key).unwrap_or_default());
-        let last = peer.autocrypt_timestamp;
-        if header.date > 0 && header.date < last {
-            return;
+        let seen_key = peer_preference_key(&message.from);
+        let before = self.store.preference(&seen_key).unwrap_or_default();
+        let mut peer = Peer::from_preference(&before);
+        let youngest = peer.observe(
+            message.date,
+            message
+                .header
+                .as_ref()
+                .map(|h| (h.mutual, key_fingerprint(&h.key).unwrap_or_default())),
+        );
+        if peer.to_preference() != before {
+            let _ = self.store.set_preference(&seen_key, &peer.to_preference());
         }
-        peer.autocrypt_timestamp = header.date.max(last);
-        peer.last_seen = peer.last_seen.max(peer.autocrypt_timestamp);
-        peer.mutual = header.mutual;
-        let _ = self.store.set_preference(&seen_key, &peer.to_preference());
+        let Some(header) = message.header.filter(|_| youngest) else {
+            return;
+        };
+        let (email, key) = (header.addr, header.key);
         let ring = self.keyring();
         if ring.key_for(&email).is_some_and(|k| {
             use pgp::ser::Serialize as _;
@@ -1191,7 +1197,7 @@ impl Backend {
             return;
         }
         let mut next = crate::manage::openpgp::Keyring::clone(&ring);
-        if next.add_found(&email, &key).unwrap_or(false) {
+        if next.add_autocrypt(&email, &key).unwrap_or(false) {
             let _ = self.set_keyring(next);
         }
     }
@@ -2843,7 +2849,7 @@ impl Backend {
                 for (email, key) in gossip {
                     // Gossip never replaces a key already kept for someone.
                     if next.key_for(&email).is_none() {
-                        changed |= next.add_found(&email, &key).unwrap_or(false);
+                        changed |= next.add_autocrypt(&email, &key).unwrap_or(false);
                     }
                 }
                 if changed {
@@ -5242,6 +5248,58 @@ mod layout_tests {
         a.sync.proton_events_seconds = 0;
         b.watch_inbox(&a, |_| {});
         assert!(b.watching().is_empty());
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Autocrypt 1.1 §2.3 through `learn_autocrypt`: each counted message
+    /// updates the sender's peer state, last_seen without a header; an older
+    /// header changes neither the state nor the key kept.
+    #[test]
+    fn received_mail_updates_autocrypt_peer_state() -> Result<()> {
+        use crate::manage::openpgp::{Peer, key_fingerprint, peer_preference_key};
+        use base64::Engine as _;
+        use pgp::ser::Serialize as _;
+        let path = std::env::temp_dir().join(format!("picacho-peers-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(Store::open(&path)?));
+        let key = |uid: &str| {
+            pgp::composed::SignedPublicKey::from(crate::manage::openpgp::test_key(uid, ""))
+                .to_bytes()
+                .unwrap()
+        };
+        let (first, second) = (key("Ana <ana@example.org>"), key("Ana <ana@example.org>"));
+        let mail = |date: &str, key: Option<&[u8]>, mutual: bool| {
+            let header = key.map_or(String::new(), |k| {
+                format!(
+                    "Autocrypt: addr=ana@example.org;{} keydata={}\r\n",
+                    if mutual { " prefer-encrypt=mutual;" } else { "" },
+                    base64::engine::general_purpose::STANDARD.encode(k)
+                )
+            });
+            format!("From: Ana <ana@example.org>\r\nDate: {date}\r\n{header}Subject: x\r\n\r\nhi").into_bytes()
+        };
+        let peer = || Peer::from_preference(&b.store.preference(&peer_preference_key("ana@example.org")).unwrap_or_default());
+        let kept = || b.keyring().key_for("ana@example.org").map(|k| crate::manage::openpgp::key_fingerprint(&k.to_bytes().unwrap()).unwrap());
+        b.learn_autocrypt(&mail("Tue, 1 Oct 2024 10:00:00 +0000", Some(&first), true));
+        let october = 1_727_776_800;
+        assert_eq!(peer(), Peer { last_seen: october, autocrypt_timestamp: october, mutual: true, fingerprint: key_fingerprint(&first).unwrap() });
+        assert_eq!(kept(), key_fingerprint(&first));
+        assert_eq!(b.keyring().autocrypt, [key_fingerprint(&first).unwrap()]);
+        // Later mail without a header: last_seen only.
+        b.learn_autocrypt(&mail("Fri, 1 Nov 2024 10:00:00 +0000", None, false));
+        assert_eq!((peer().last_seen, peer().autocrypt_timestamp), (october + 31 * 86_400, october));
+        // An older message with another key: nothing changes.
+        b.learn_autocrypt(&mail("Sun, 1 Sep 2024 10:00:00 +0000", Some(&second), false));
+        assert!(peer().mutual);
+        assert_eq!(kept(), key_fingerprint(&first));
+        // A newer one: its key and preference.
+        b.learn_autocrypt(&mail("Sat, 2 Nov 2024 10:00:00 +0000", Some(&second), false));
+        assert!(!peer().mutual);
+        assert_eq!(peer().fingerprint, key_fingerprint(&second).unwrap());
+        assert_eq!(kept(), key_fingerprint(&second));
+        // From the future: as if received now.
+        b.learn_autocrypt(&mail("Fri, 1 Jan 2100 00:00:00 +0000", None, false));
+        assert!(peer().last_seen <= chrono::Utc::now().timestamp());
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }

@@ -20,7 +20,7 @@ use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
 mod autocrypt;
-pub use autocrypt::{Peer, peer_preference_key};
+pub use autocrypt::{Peer, key_fingerprint, peer_preference_key};
 
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]

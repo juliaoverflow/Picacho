@@ -185,14 +185,38 @@ pub struct Autocrypt {
     pub key: Vec<u8>,
     /// `prefer-encrypt=mutual`: the sender wants encrypted replies.
     pub mutual: bool,
-    /// The message's Date, Unix seconds (0 where it has none).
+    /// The message's effective date, Unix seconds (see `AutocryptMessage`).
     pub date: i64,
 }
 
-/// The Autocrypt header of a message for its sender (Autocrypt 1.1 §2.3):
-/// none from reports (multipart/report) or mail without a single From.
+/// The Autocrypt header of a message for its sender (Autocrypt 1.1 §2.3),
+/// where the message counts for Autocrypt and has exactly one valid one.
+#[cfg(test)]
 pub fn autocrypt_full(raw: &[u8]) -> Option<Autocrypt> {
-    use base64::Engine as _;
+    autocrypt_message(raw, i64::MAX)?.header
+}
+
+/// A received message as Autocrypt peer state sees it (Autocrypt 1.1
+/// §2.3, "Updating Autocrypt Peer State").
+#[derive(Debug, PartialEq, Eq)]
+pub struct AutocryptMessage {
+    /// The single From address, lowercased.
+    pub from: String,
+    /// The effective date: the Date, or `received` where the Date is later.
+    pub date: i64,
+    /// Its one valid Autocrypt header; `None` where it has none, or more
+    /// than one (which counts as none).
+    pub header: Option<Autocrypt>,
+}
+
+/// What a message received at `received` (Unix seconds) tells Autocrypt
+/// about its sender. `None` for messages peer state must ignore
+/// (Autocrypt 1.1 §2.3): reports (multipart/report), mail without exactly
+/// one From address, mailing-list mail (List-Id, RFC 2919; List-Post,
+/// RFC 2369), which a list's own software may have changed, and mail
+/// without a Date, which would count as new each time it is read (the
+/// §2.3 note allows ignoring it).
+pub fn autocrypt_message(raw: &[u8], received: i64) -> Option<AutocryptMessage> {
     use mailparse::MailHeaderMap;
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
     if headers
@@ -201,47 +225,63 @@ pub fn autocrypt_full(raw: &[u8]) -> Option<Autocrypt> {
     {
         return None;
     }
+    if headers.get_first_header("List-Id").is_some() || headers.get_first_header("List-Post").is_some() {
+        return None;
+    }
     let date = headers
         .get_first_value("Date")
-        .and_then(|d| mailparse::dateparse(&d).ok())
-        .unwrap_or(0);
+        .and_then(|d| mailparse::dateparse(&d).ok())?
+        .min(received);
     let from = mailparse::addrparse(&headers.get_first_value("From")?)
         .ok()?
         .extract_single_info()?
         .addr
         .to_lowercase();
-    for value in headers.get_all_values("Autocrypt") {
-        let mut addr = None;
-        let mut keydata = None;
-        let mut mutual = false;
-        let mut unknown_critical = false;
-        for attr in value.split(';') {
-            let Some((k, v)) = attr.split_once('=') else {
-                continue;
-            };
-            match k.trim() {
-                "addr" => addr = Some(v.trim().to_lowercase()),
-                "keydata" => keydata = Some(v.split_whitespace().collect::<String>()),
-                "prefer-encrypt" => mutual = v.trim().eq_ignore_ascii_case("mutual"),
-                // Attributes not starting with `_` must be understood.
-                other if !other.starts_with('_') => unknown_critical = true,
-                _ => {}
-            }
-        }
-        if unknown_critical || addr.as_deref() != Some(from.as_str()) {
+    let mut valid = headers
+        .get_all_values("Autocrypt")
+        .into_iter()
+        .filter_map(|value| autocrypt_value(&value, &from, date));
+    // §2.3: more than one valid header is an error, and all are discarded.
+    let header = match (valid.next(), valid.next()) {
+        (Some(one), None) => Some(one),
+        _ => None,
+    };
+    Some(AutocryptMessage { from, date, header })
+}
+
+/// One Autocrypt header's value, if valid for `from` (Autocrypt 1.1
+/// §2.1.1): `addr` is the From address, every critical attribute is
+/// understood, and `keydata` is base64.
+fn autocrypt_value(value: &str, from: &str, date: i64) -> Option<Autocrypt> {
+    use base64::Engine as _;
+    let mut addr = None;
+    let mut keydata = None;
+    let mut mutual = false;
+    for attr in value.split(';') {
+        let Some((k, v)) = attr.split_once('=') else {
             continue;
+        };
+        match k.trim() {
+            "addr" => addr = Some(v.trim().to_lowercase()),
+            "keydata" => keydata = Some(v.split_whitespace().collect::<String>()),
+            "prefer-encrypt" => mutual = v.trim().eq_ignore_ascii_case("mutual"),
+            // Attributes not starting with `_` must be understood.
+            other if !other.starts_with('_') => return None,
+            _ => {}
         }
-        let key = base64::engine::general_purpose::STANDARD
-            .decode(keydata?)
-            .ok()?;
-        return Some(Autocrypt {
-            addr: from,
-            key,
-            mutual,
-            date,
-        });
     }
-    None
+    if addr.as_deref() != Some(from) {
+        return None;
+    }
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(keydata?)
+        .ok()?;
+    Some(Autocrypt {
+        addr: from.to_owned(),
+        key,
+        mutual,
+        date,
+    })
 }
 
 /// The keys an encrypted message's sender passed along for its other
@@ -335,18 +375,53 @@ mod tests {
 
     #[test]
     fn autocrypt_headers_are_read_for_their_sender_only() {
-        let raw = b"From: Ana <ana@example.org>\r\nAutocrypt: addr=ana@example.org; prefer-encrypt=mutual; keydata=\r\n AAEC\r\n Aw==\r\nSubject: x\r\n\r\nbody";
+        let raw = b"Date: Tue, 1 Oct 2024 10:00:00 +0000\r\nFrom: Ana <ana@example.org>\r\nAutocrypt: addr=ana@example.org; prefer-encrypt=mutual; keydata=\r\n AAEC\r\n Aw==\r\nSubject: x\r\n\r\nbody";
         assert_eq!(
             autocrypt(raw),
             Some(("ana@example.org".into(), vec![0, 1, 2, 3]))
         );
-        let other = b"From: Mallory <m@evil.example>\r\nAutocrypt: addr=ana@example.org; keydata=AAEC\r\n\r\n";
+        let other = b"Date: Tue, 1 Oct 2024 10:00:00 +0000\r\nFrom: Mallory <m@evil.example>\r\nAutocrypt: addr=ana@example.org; keydata=AAEC\r\n\r\n";
         assert_eq!(autocrypt(other), None);
-        let critical = b"From: ana@example.org\r\nAutocrypt: addr=ana@example.org; future=1; keydata=AAEC\r\n\r\n";
+        let critical = b"Date: Tue, 1 Oct 2024 10:00:00 +0000\r\nFrom: ana@example.org\r\nAutocrypt: addr=ana@example.org; future=1; keydata=AAEC\r\n\r\n";
         assert_eq!(autocrypt(critical), None);
         let header = autocrypt_header("ana@example.org", &[0, 1, 2, 3]);
-        let back = format!("From: ana@example.org\r\nAutocrypt: {header}\r\n\r\n");
+        let back = format!("Date: Tue, 1 Oct 2024 10:00:00 +0000\r\nFrom: ana@example.org\r\nAutocrypt: {header}\r\n\r\n");
         assert_eq!(autocrypt(back.as_bytes()).unwrap().1, vec![0, 1, 2, 3]);
+    }
+
+    /// Autocrypt 1.1 §2.3: which messages count for peer state, their
+    /// effective date, and how many headers make a valid one.
+    #[test]
+    fn autocrypt_messages_follow_the_peer_state_rules() {
+        let sent = 1_727_776_800; // Tue, 1 Oct 2024 10:00:00 +0000
+        let head = "From: Ana <ana@example.org>\r\nDate: Tue, 1 Oct 2024 10:00:00 +0000\r\n";
+        let one = "Autocrypt: addr=ana@example.org; _note=x; keydata=AAEC\r\n";
+        let message = |extra: &str| format!("{head}{extra}Subject: x\r\n\r\nbody");
+        // The Date is the effective date; one received earlier than it was
+        // sent has the receipt time instead.
+        let m = autocrypt_message(message(one).as_bytes(), sent + 60).unwrap();
+        assert_eq!((m.from.as_str(), m.date), ("ana@example.org", sent));
+        assert_eq!(m.header.unwrap().key, vec![0, 1, 2]);
+        assert_eq!(autocrypt_message(message(one).as_bytes(), sent - 60).unwrap().date, sent - 60);
+        // Without a header it still counts (for last_seen).
+        let none = autocrypt_message(message("").as_bytes(), sent).unwrap();
+        assert!(none.header.is_none());
+        // Two valid headers: neither counts; an invalid second is skipped.
+        let two = format!("{one}Autocrypt: addr=ana@example.org; keydata=AQ==\r\n");
+        assert!(autocrypt_message(message(&two).as_bytes(), sent).unwrap().header.is_none());
+        let bad = format!("{one}Autocrypt: addr=ana@example.org; future=1; keydata=AQ==\r\n");
+        assert!(autocrypt_message(message(&bad).as_bytes(), sent).unwrap().header.is_some());
+        // Ignored altogether: mailing lists, reports, several From
+        // addresses, and mail without a Date.
+        for ignored in [
+            message(&format!("List-Id: <talk.example.org>\r\n{one}")),
+            message(&format!("List-Post: <mailto:talk@example.org>\r\n{one}")),
+            message(&format!("Content-Type: multipart/report; report-type=delivery-status\r\n{one}")),
+            format!("From: ana@example.org, bo@example.org\r\nDate: Tue, 1 Oct 2024 10:00:00 +0000\r\n{one}\r\n"),
+            format!("From: ana@example.org\r\n{one}\r\n"),
+        ] {
+            assert_eq!(autocrypt_message(ignored.as_bytes(), sent), None, "{ignored}");
+        }
     }
 
     /// RFC 7929 §7: a DNS-published key is the domain's word only when

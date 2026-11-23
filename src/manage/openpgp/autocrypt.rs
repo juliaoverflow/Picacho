@@ -55,6 +55,48 @@ impl Peer {
     pub fn to_preference(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+    /// Takes in a message from the peer with effective date `date`, and
+    /// its valid Autocrypt header's `prefer-encrypt=mutual` and key
+    /// fingerprint if it had one (Autocrypt 1.1 §2.3, "Updating Autocrypt
+    /// Peer State"). Timestamps only move forward. Returns whether the
+    /// header is now the youngest seen, so its key is the peer's.
+    pub fn observe(&mut self, date: i64, header: Option<(bool, String)>) -> bool {
+        // §2.3: a message older than the youngest Autocrypt header changes
+        // nothing.
+        if date < self.autocrypt_timestamp {
+            return false;
+        }
+        self.last_seen = self.last_seen.max(date);
+        let Some((mutual, fingerprint)) = header else {
+            return false;
+        };
+        self.autocrypt_timestamp = date;
+        self.mutual = mutual;
+        self.fingerprint = fingerprint;
+        true
+    }
+}
+
+/// How much older than last_seen the youngest Autocrypt header may be
+/// before its key is stale (Autocrypt 1.1 §2.3, "Preliminary
+/// Recommendation"): 35 days, in seconds.
+#[cfg_attr(not(test), allow(dead_code))]
+const STALE_AFTER: i64 = 35 * 24 * 60 * 60;
+
+impl Peer {
+    /// Whether the peer has since sent mail without Autocrypt for more than
+    /// 35 days (their app may no longer read encrypted mail), so encrypting
+    /// to them is discouraged (Autocrypt 1.1 §2.3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stale(&self) -> bool {
+        self.last_seen - self.autocrypt_timestamp > STALE_AFTER
+    }
+}
+
+/// The fingerprint of the first key in `data` (binary or armored).
+pub fn key_fingerprint(data: &[u8]) -> Option<String> {
+    let (mut keys, _) = SignedPublicKey::from_reader_many(data).ok()?;
+    keys.next()?.ok().map(|k| fingerprint(&k))
 }
 
 impl Keyring {
@@ -78,8 +120,26 @@ impl Keyring {
             && let Some(fp) = self.found_fingerprint(email)
         {
             self.dnssec.retain(|f| f != &fp);
+            // Found by a lookup too: no longer only Autocrypt's.
+            self.autocrypt.retain(|f| f != &fp);
             if source.domain_vouched() {
                 self.dnssec.push(fp);
+            }
+        }
+        Ok(added)
+    }
+    /// As `add_found`, for a key from an Autocrypt or Autocrypt-Gossip
+    /// header (Autocrypt 1.1 §2.3, §2.4): marked as Autocrypt's, so
+    /// `reset_peer` can forget it, unless it was already kept from a lookup.
+    pub fn add_autocrypt(&mut self, email: &str, data: &[u8]) -> Result<bool> {
+        let before = self.found_fingerprint(email);
+        let added = self.add_found(email, data)?;
+        if added
+            && let Some(fp) = self.found_fingerprint(email)
+        {
+            let from_lookup = before.as_deref() == Some(fp.as_str()) && !self.autocrypt.contains(&fp);
+            if !from_lookup && !self.autocrypt.contains(&fp) {
+                self.autocrypt.push(fp);
             }
         }
         Ok(added)
@@ -105,6 +165,58 @@ mod tests {
         SignedPublicKey::from(super::super::test_key(uid, ""))
             .to_bytes()
             .unwrap()
+    }
+
+    /// Autocrypt 1.1 §2.3: last_seen moves with every newer message;
+    /// autocrypt_timestamp, the key and prefer-encrypt only with a newer
+    /// valid header; nothing moves for a message older than that header.
+    #[test]
+    fn peer_state_updates_only_forward() {
+        let mut peer = Peer::default();
+        assert!(peer.observe(100, Some((true, "A".into()))));
+        assert_eq!((peer.last_seen, peer.autocrypt_timestamp, peer.mutual), (100, 100, true));
+        // Newer mail without a header: only last_seen.
+        assert!(!peer.observe(200, None));
+        assert_eq!((peer.last_seen, peer.autocrypt_timestamp), (200, 100));
+        // Older than the header: nothing, with or without a header.
+        assert!(!peer.observe(50, Some((false, "B".into()))));
+        assert!(!peer.observe(50, None));
+        assert_eq!(peer.fingerprint, "A");
+        // Between the header and last_seen, with a header: the key and
+        // preference change; last_seen stays the newest.
+        assert!(peer.observe(150, Some((false, "B".into()))));
+        assert_eq!(
+            peer,
+            Peer { last_seen: 200, autocrypt_timestamp: 150, mutual: false, fingerprint: "B".into() }
+        );
+    }
+
+    /// Autocrypt 1.1 §2.3: stale only when the header is more than 35
+    /// days older than last_seen.
+    #[test]
+    fn peer_keys_go_stale_after_35_days() {
+        let day = 24 * 60 * 60;
+        let peer = |ago: i64| Peer { last_seen: 100 * day, autocrypt_timestamp: 100 * day - ago, ..Peer::default() };
+        assert!(!peer(0).stale());
+        assert!(!peer(35 * day).stale());
+        assert!(peer(35 * day + 1).stale());
+    }
+
+    /// Keys from Autocrypt are marked as such; one a lookup also found
+    /// isn't, either way round.
+    #[test]
+    fn autocrypt_keys_are_marked_by_source() {
+        let ana = public_bytes("Ana <ana@example.org>");
+        let fp = key_fingerprint(&ana).unwrap();
+        let mut ring = Keyring::default();
+        assert!(ring.add_autocrypt("ana@example.org", &ana).unwrap());
+        assert_eq!(ring.autocrypt, [fp.clone()]);
+        assert!(ring.add_found_from("ana@example.org", &ana, Source::Wkd).unwrap());
+        assert!(ring.autocrypt.is_empty());
+        let mut ring = Keyring::default();
+        ring.add_found_from("ana@example.org", &ana, Source::KeysOpenpgpOrg).unwrap();
+        assert!(ring.add_autocrypt("ana@example.org", &ana).unwrap());
+        assert!(ring.autocrypt.is_empty());
     }
 
     /// Peer state and keyrings written before peer state had its fields
