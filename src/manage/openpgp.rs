@@ -19,6 +19,10 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
+// Not sent with yet: wired into `protect` next.
+#[allow(dead_code)]
+mod protected;
+
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]
 const KEYRING: &str = "openpgp:keyring";
