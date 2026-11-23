@@ -99,19 +99,21 @@ impl Connection {
     }
     /// As `append_heard`, keeping the message's own date as when it
     /// arrived (APPEND's date-time, RFC 3501 §6.3.11): imported mail sorts
-    /// by when it was sent, not when it was imported.
+    /// by when it was sent, not when it was imported. `received` (UTC
+    /// seconds; an mbox `From ` line's) is used where it has no usable Date.
     pub(super) fn append_dated(
         &mut self,
         mailbox: &str,
         raw: &[u8],
         flags: &[imap::types::Flag<'_>],
+        received: Option<i64>,
     ) -> imap::error::Result<Vec<u8>> {
         if let Some(tap) = &self.tap {
             tap.start();
         }
         let result = self
             .session
-            .append_with_flags_and_date(mailbox, raw, flags, message_date(raw));
+            .append_with_flags_and_date(mailbox, raw, flags, append_date(raw, received));
         let copy = self.tap.as_ref().and_then(|t| t.take()).unwrap_or_default();
         result.map(|()| copy)
     }
@@ -138,34 +140,35 @@ impl Connection {
         Ok(copy)
     }
     /// Appends several messages to `mailbox` (a wire name) in one command
-    /// (MULTIAPPEND, RFC 3502), each with `flags`; one APPEND each where
-    /// the server doesn't have it. Either all are added or, with
-    /// MULTIAPPEND, none. Returns what the server sent for each command.
+    /// (MULTIAPPEND, RFC 3502), each with its flags and dated as
+    /// `append_dated` dates it; one APPEND each where the server doesn't
+    /// have it. Either all are added or, with MULTIAPPEND, none. Returns
+    /// what the server sent for each command.
     pub(super) fn append_many(
         &mut self,
         mailbox: &str,
-        messages: &[&[u8]],
-        flags: &[imap::types::Flag<'_>],
+        messages: &[(&[u8], &[imap::types::Flag<'_>], Option<i64>)],
     ) -> Result<Vec<Vec<u8>>> {
         use crate::sync::stream::Part;
         if messages.len() < 2 || !self.extensions()?.multiappend || self.tap.is_none() {
             return messages
                 .iter()
-                .map(|raw| Ok(self.append_heard(mailbox, raw, flags)?))
+                .map(|(raw, flags, received)| Ok(self.append_dated(mailbox, raw, flags, *received)?))
                 .collect();
         }
-        let flags = flag_list(flags);
         let head = format!("APPEND {}", crate::sync::transport::quote(mailbox)?);
-        // Each with its own date, as `append_dated`.
         let each: Vec<String> = messages
             .iter()
-            .map(|raw| match message_date(raw) {
-                Some(d) => format!(" ({flags}) \"{}\" ", d.format("%d-%b-%Y %H:%M:%S %z")),
-                None => format!(" ({flags}) "),
+            .map(|(raw, flags, received)| {
+                let flags = flag_list(flags);
+                match append_date(raw, *received) {
+                    Some(d) => format!(" ({flags}) \"{}\" ", d.format("%d-%b-%Y %H:%M:%S %z")),
+                    None => format!(" ({flags}) "),
+                }
             })
             .collect();
         let mut parts = vec![Part::Text(&head)];
-        for (raw, each) in messages.iter().zip(&each) {
+        for ((raw, ..), each) in messages.iter().zip(&each) {
             parts.push(Part::Text(each));
             parts.push(Part::Literal(raw));
         }
@@ -817,15 +820,24 @@ fn connection_failed(error: &anyhow::Error) -> bool {
     })
 }
 
-/// A message's Date header as APPEND's date-time, if it has a sane one.
+/// APPEND's date-time for a message: its Date header, if it has a sane
+/// one, else `received` (UTC seconds) where sane; else none, and the
+/// server dates it now.
+fn append_date(raw: &[u8], received: Option<i64>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    // Not before 1971 nor in the future: a server refuses those.
+    let now = chrono::Utc::now().timestamp();
+    let sane = |t: i64| (31_536_000..=now + 86_400).contains(&t);
+    message_date(raw).filter(|d| sane(d.timestamp())).or_else(|| {
+        let at = received.filter(|t| sane(*t))?;
+        Some(chrono::DateTime::from_timestamp(at, 0)?.fixed_offset())
+    })
+}
+/// A message's Date header, if it reads as one.
 fn message_date(raw: &[u8]) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     use mailparse::MailHeaderMap as _;
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
     let date = headers.get_first_value("Date")?;
-    let parsed = chrono::DateTime::parse_from_rfc2822(date.trim()).ok()?;
-    // Not before 1971 nor in the future: a server refuses those.
-    let now = chrono::Utc::now().timestamp();
-    (31_536_000..=now + 86_400).contains(&parsed.timestamp()).then_some(parsed)
+    chrono::DateTime::parse_from_rfc2822(date.trim()).ok()
 }
 
 /// Flags as APPEND writes them, without \\Recent (servers set it).
@@ -917,5 +929,12 @@ mod url_tests {
         assert_eq!(status_size(b"* STATUS INBOX (MESSAGES 3 SIZE 9)\r\n"), Some(9));
         assert_eq!(status_size(b"a3 OK\r\n"), None);
         assert_eq!(flag_list(&[imap::types::Flag::Seen, imap::types::Flag::Recent]), "\\Seen");
+        // APPEND's date: Date where it reads, else the mbox line's time.
+        let dated = b"Date: Mon, 1 Jan 2024 10:00:00 +0100\r\n\r\nx";
+        assert_eq!(append_date(dated, Some(1)).unwrap().timestamp(), 1_704_099_600);
+        let undated = b"Date: someday\r\n\r\nx";
+        assert_eq!(append_date(undated, Some(1_704_103_200)).unwrap().timestamp(), 1_704_103_200);
+        assert_eq!(append_date(undated, None), None);
+        assert_eq!(append_date(undated, Some(5)), None);
     }
 }

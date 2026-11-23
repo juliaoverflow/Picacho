@@ -21,6 +21,10 @@ pub struct Moved {
     pub done: usize,
     /// Messages left out: unavailable offline, too large, or refused.
     pub skipped: usize,
+    /// Of those imported, how many the mbox file marked deleted (Status
+    /// D): imported anyway, without the mark, as their app hadn't removed
+    /// them.
+    pub marked_deleted: usize,
 }
 
 impl Moved {
@@ -33,6 +37,13 @@ impl Moved {
                 "; {} {} couldn't be",
                 self.skipped,
                 plural(self.skipped)
+            ));
+        }
+        if self.marked_deleted > 0 {
+            text.push_str(&format!(
+                "; {} marked deleted in the file {} kept",
+                self.marked_deleted,
+                if self.marked_deleted == 1 { "was" } else { "were" }
             ));
         }
         text
@@ -75,88 +86,302 @@ pub fn write_mbox_message(
     out.write_all(b"\n")
 }
 
-/// Splits an mbox file (mboxrd or mboxo) into its messages, with CRLF line
-/// ends as mail is sent. Quoting is undone where mboxrd added it. A message
-/// larger than an import may be comes as `None`, without its text.
+/// A message read from an mbox file, with what the file says about it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MboxMessage {
+    /// The message as it was sent, CRLF line ends.
+    pub raw: Vec<u8>,
+    /// When its `From ` line says it arrived (asctime, UTC unless the line
+    /// gives a zone), for messages without a usable Date header.
+    pub received: Option<i64>,
+}
+
+/// What mail apps note about a message in mbox's Status and X-Status
+/// headers (RFC 4155 §5's practice, as mutt, Thunderbird and Pine write
+/// them): R read, O old (seen as new, not read), A answered, F flagged,
+/// D deleted, T draft.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MboxStatus {
+    /// Neither header was there: nothing is known.
+    pub known: bool,
+    pub read: bool,
+    pub answered: bool,
+    pub flagged: bool,
+    pub deleted: bool,
+    pub draft: bool,
+}
+impl MboxStatus {
+    /// From a message's headers.
+    pub fn of(raw: &[u8]) -> Self {
+        use mailparse::MailHeaderMap as _;
+        let Ok((headers, _)) = mailparse::parse_headers(raw) else {
+            return Self::default();
+        };
+        let status = headers.get_first_value("Status");
+        let x_status = headers.get_first_value("X-Status");
+        if status.is_none() && x_status.is_none() {
+            return Self::default();
+        }
+        let letters: String = [status, x_status].into_iter().flatten().collect();
+        let has = |c: char| letters.contains(c);
+        Self {
+            known: true,
+            read: has('R'),
+            answered: has('A'),
+            flagged: has('F'),
+            deleted: has('D'),
+            draft: has('T'),
+        }
+    }
+}
+
+/// Splits an mbox file (mboxrd or mboxo, or mboxcl2 where Content-Length
+/// says where each message ends) into its messages, with CRLF line ends as
+/// mail is sent. Quoting is undone where mboxrd added it. A message larger
+/// than an import may be comes as `None`, without its text.
 pub fn read_mbox(
     input: impl Read,
-    mut each: impl FnMut(Option<Vec<u8>>) -> Result<()>,
+    mut each: impl FnMut(Option<MboxMessage>) -> Result<()>,
 ) -> Result<()> {
     let mut reader = BufReader::new(input);
-    // The message being read, and whether it outgrew the limit (its text
-    // is then dropped, not padded out to the limit to say so).
-    let mut current: Option<(Vec<u8>, bool)> = None;
-    let mut line = Vec::new();
-    let mut blank_before = true;
-    let finish = |(message, too_large): (Vec<u8>, bool),
-                  each: &mut dyn FnMut(Option<Vec<u8>>) -> Result<()>|
-     -> Result<()> {
-        if too_large {
-            return each(None);
-        }
-        // The blank line separating messages isn't part of the message.
-        let mut message = message;
-        if message.ends_with(b"\r\n\r\n") {
-            message.truncate(message.len() - 2);
-        }
-        if !message.iter().all(u8::is_ascii_whitespace) {
-            each(Some(message))?;
-        }
-        Ok(())
-    };
+    let mut lines = MboxLines::default();
+    let mut current: Option<Reading> = None;
     loop {
-        // A very long line's room isn't kept for the short ones after it.
-        if line.capacity() > 1024 * 1024 {
-            line = Vec::new();
-        }
-        line.clear();
-        // A line is read up to the import limit: a file without line breaks
-        // (not mail) isn't held in memory whole.
-        if (&mut reader)
-            .take(MAX_IMPORT as u64 + 1)
-            .read_until(b'\n', &mut line)?
-            == 0
-        {
+        let Some(line) = lines.next(&mut reader)? else {
             break;
-        }
+        };
         let text = line
             .strip_suffix(b"\n")
             .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-            .unwrap_or(&line);
-        if is_separator(text) && (blank_before || current.is_none()) {
+            .unwrap_or(&line)
+            .to_vec();
+        if is_separator(&text) && (lines.blank_before || current.is_none()) {
             if let Some(message) = current.take() {
-                finish(message, &mut each)?;
+                message.finish(&mut each)?;
             }
-            current = Some((Vec::new(), false));
-            blank_before = false;
+            current = Some(Reading::new(separator_date(&text)));
+            lines.blank_before = false;
             continue;
         }
-        blank_before = text.is_empty();
-        let Some((message, too_large)) = current.as_mut() else {
+        lines.blank_before = text.is_empty();
+        let Some(message) = current.as_mut() else {
             continue;
         };
-        if *too_large {
+        if message.too_large {
             continue;
         }
+        if message.in_headers {
+            if text.is_empty() {
+                message.in_headers = false;
+                message.push(&text);
+                // Content-Length (mboxcl2): the body is exactly that many
+                // bytes, unquoted, where it ends at a message boundary.
+                if let Some(n) = message.content_length
+                    && let Some(body) = lines.exact_body(&mut reader, n)?
+                {
+                    message.push_body(&body);
+                    if let Some(done) = current.take() {
+                        done.finish(&mut each)?;
+                    }
+                    lines.blank_before = true;
+                }
+                continue;
+            }
+            if let Some(value) = header_value(&text, b"Content-Length") {
+                message.content_length = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|n| *n <= MAX_IMPORT);
+            }
+            message.push(&text);
+            continue;
+        }
+        // Un-quoting (RFC 4155 §2): mboxrd adds one `>` to every line that
+        // starts with `>`s then `From `; mboxo only to `From ` itself. A
+        // file can't be told to be one or the other: the only telling
+        // lines, `>>From `, mean mboxrd if any are there, and without them
+        // both decode the same. So one `>` comes off every such line, which
+        // is right for mboxrd and for all but those lines of mboxo.
         let quotes = text.iter().take_while(|&&b| b == b'>').count();
         let text = if quotes > 0 && text[quotes..].starts_with(b"From ") {
             &text[1..]
         } else {
-            text
+            &text[..]
         };
-        if message.len() + text.len() <= MAX_IMPORT + 2 {
-            message.extend_from_slice(text);
-            message.extend_from_slice(b"\r\n");
-        } else {
-            // Over the limit: marked as too large, its text let go.
-            *message = Vec::new();
-            *too_large = true;
-        }
+        message.push(text);
     }
     if let Some(message) = current {
-        finish(message, &mut each)?;
+        message.finish(&mut each)?;
     }
     Ok(())
+}
+
+/// A message being read from an mbox file.
+struct Reading {
+    message: Vec<u8>,
+    received: Option<i64>,
+    /// It outgrew the limit: its text is dropped, not padded out to say so.
+    too_large: bool,
+    in_headers: bool,
+    content_length: Option<usize>,
+}
+impl Reading {
+    fn new(received: Option<i64>) -> Self {
+        Self {
+            message: Vec::new(),
+            received,
+            too_large: false,
+            in_headers: true,
+            content_length: None,
+        }
+    }
+    /// Adds a line (without its line end), ended with CRLF.
+    fn push(&mut self, text: &[u8]) {
+        if self.message.len() + text.len() <= MAX_IMPORT + 2 {
+            self.message.extend_from_slice(text);
+            self.message.extend_from_slice(b"\r\n");
+        } else {
+            self.message = Vec::new();
+            self.too_large = true;
+        }
+    }
+    /// Adds a body taken whole, its bare line feeds made CRLF.
+    fn push_body(&mut self, body: &[u8]) {
+        let body = crlf(body);
+        if self.message.len() + body.len() <= MAX_IMPORT + 2 {
+            self.message.extend_from_slice(&body);
+        } else {
+            self.message = Vec::new();
+            self.too_large = true;
+        }
+    }
+    fn finish(self, each: &mut dyn FnMut(Option<MboxMessage>) -> Result<()>) -> Result<()> {
+        if self.too_large {
+            return each(None);
+        }
+        // The blank line separating messages isn't part of the message.
+        let mut message = self.message;
+        if message.ends_with(b"\r\n\r\n") {
+            message.truncate(message.len() - 2);
+        }
+        if !message.iter().all(u8::is_ascii_whitespace) {
+            each(Some(MboxMessage {
+                raw: message,
+                received: self.received,
+            }))?;
+        }
+        Ok(())
+    }
+}
+
+/// An mbox file's lines, with what one line ahead says.
+#[derive(Default)]
+struct MboxLines {
+    line: Vec<u8>,
+    /// Bytes read ahead (for a Content-Length check) that didn't fit.
+    ahead: Vec<u8>,
+    blank_before: bool,
+}
+impl MboxLines {
+    /// The next line, its line end included; `None` at the end.
+    fn next(&mut self, reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
+        // A very long line's room isn't kept for the short ones after it.
+        if self.line.capacity() > 1024 * 1024 {
+            self.line = Vec::new();
+        }
+        self.line.clear();
+        if !self.ahead.is_empty() {
+            match memchr::memchr(b'\n', &self.ahead) {
+                Some(at) => {
+                    let rest = self.ahead.split_off(at + 1);
+                    let line = std::mem::replace(&mut self.ahead, rest);
+                    return Ok(Some(line));
+                }
+                None => self.line = std::mem::take(&mut self.ahead),
+            }
+        }
+        // A line is read up to the import limit: a file without line breaks
+        // (not mail) isn't held in memory whole.
+        let limit = (MAX_IMPORT as u64 + 1).saturating_sub(self.line.len() as u64);
+        reader.take(limit).read_until(b'\n', &mut self.line)?;
+        Ok((!self.line.is_empty()).then(|| self.line.clone()))
+    }
+    /// The next `n` bytes as a message's body, if they end where a message
+    /// does: at the end of the file, or followed by a blank line or
+    /// directly by a `From ` separator. Otherwise they are left to be read
+    /// as lines, and `None` says Content-Length can't be trusted.
+    fn exact_body(&mut self, reader: &mut impl BufRead, n: usize) -> Result<Option<Vec<u8>>> {
+        let mut body = std::mem::take(&mut self.ahead);
+        if body.len() < n {
+            let want = (n - body.len()) as u64;
+            reader.take(want).read_to_end(&mut body)?;
+        }
+        if body.len() < n {
+            // The file ends sooner than it says.
+            self.ahead = body;
+            return Ok(None);
+        }
+        let mut rest = body.split_off(n);
+        // What follows: up to two lines, enough to see a blank line and a
+        // separator.
+        while rest.iter().filter(|b| **b == b'\n').count() < 2 {
+            let before = rest.len();
+            reader.take(4096).read_until(b'\n', &mut rest)?;
+            if rest.len() == before {
+                break;
+            }
+        }
+        let after = rest.strip_prefix(b"\r\n").or_else(|| rest.strip_prefix(b"\n"));
+        let next_line = |bytes: &[u8]| {
+            let end = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+            let line = &bytes[..end];
+            is_separator(line.strip_suffix(b"\r").unwrap_or(line))
+        };
+        let ends = rest.is_empty()
+            || after.is_some_and(|a| a.is_empty() || next_line(a))
+            || next_line(&rest);
+        if ends {
+            self.ahead = rest;
+            Ok(Some(body))
+        } else {
+            body.extend_from_slice(&rest);
+            self.ahead = body;
+            Ok(None)
+        }
+    }
+}
+
+/// The value of header `name` on `line`, if the line is that header.
+fn header_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let (key, value) = line.split_at(line.iter().position(|b| *b == b':')?);
+    key.eq_ignore_ascii_case(name).then(|| &value[1..])
+}
+
+/// The time in a `From ` line's asctime date (`Wed Nov 23 10:00:00 2026`,
+/// perhaps with a zone such as `+0100` or `-0500` after it), as UTC
+/// seconds; without a zone it is taken as UTC.
+fn separator_date(line: &[u8]) -> Option<i64> {
+    let text = String::from_utf8_lossy(line.strip_prefix(b"From ")?);
+    let words: Vec<&str> = text.split_whitespace().skip(1).collect();
+    let year_at = words
+        .iter()
+        .position(|w| w.len() == 4 && w.bytes().all(|b| b.is_ascii_digit()))?;
+    if year_at < 3 {
+        return None;
+    }
+    // The weekday isn't read: some writers get it wrong, and it says
+    // nothing the rest doesn't.
+    let date = words[year_at - 3..=year_at].join(" ");
+    let naive = chrono::NaiveDateTime::parse_from_str(&date, "%b %e %H:%M:%S %Y").ok()?;
+    // A numeric zone after the year, where the writer gave one.
+    let offset = words
+        .get(year_at + 1)
+        .and_then(|z| {
+            chrono::DateTime::parse_from_str(&format!("2000-01-01 00:00:00 {z}"), "%Y-%m-%d %H:%M:%S %z").ok()
+        })
+        .map(|d| d.offset().local_minus_utc())
+        .unwrap_or(0);
+    Some(naive.and_utc().timestamp() - i64::from(offset))
 }
 
 /// Whether a line is an mbox separator (RFC 4155 §2: `From <sender>
@@ -270,8 +495,8 @@ impl Backend {
             && self
                 .with_imap(a, |c| Ok(c.extensions()?.multiappend))
                 .unwrap_or(false);
-        let mut batch: Vec<Vec<u8>> = Vec::new();
-        let flush = |batch: &mut Vec<Vec<u8>>, moved: &mut Moved| -> Result<()> {
+        let mut batch: Vec<Imported> = Vec::new();
+        let flush = |batch: &mut Vec<Imported>, moved: &mut Moved| -> Result<()> {
             if batch.is_empty() {
                 return Ok(());
             }
@@ -290,21 +515,25 @@ impl Backend {
             }
             Ok(())
         };
-        let mut add = |raw: Option<Vec<u8>>| -> Result<()> {
+        let mut add = |found: Option<MboxMessage>| -> Result<()> {
             if cancel.load(Ordering::Relaxed) {
                 bail!("The import was stopped.");
             }
-            let Some(raw) = raw else {
+            let Some(found) = found else {
                 moved.skipped += 1;
                 return Ok(());
             };
-            if raw.len() > MAX_IMPORT || mailparse::parse_headers(&raw).is_err() {
+            if found.raw.len() > MAX_IMPORT || mailparse::parse_headers(&found.raw).is_err() {
                 moved.skipped += 1;
                 return Ok(());
             }
+            let raw = Imported::from(found);
+            if raw.status.deleted {
+                moved.marked_deleted += 1;
+            }
             if batching {
                 batch.push(raw);
-                let bytes: usize = batch.iter().map(Vec::len).sum();
+                let bytes: usize = batch.iter().map(|m| m.raw.len()).sum();
                 if batch.len() >= BATCH_MESSAGES || bytes >= BATCH_BYTES {
                     flush(&mut batch, &mut moved)?;
                 }
@@ -329,7 +558,10 @@ impl Backend {
                 }
                 let raw = std::fs::read(path)?;
                 // Mail travels with CRLF; files saved elsewhere may use LF.
-                add(Some(crlf(&raw)))?;
+                add(Some(MboxMessage {
+                    raw: crlf(&raw),
+                    received: None,
+                }))?;
             }
         }
         drop(add);
@@ -338,14 +570,15 @@ impl Backend {
         Ok(moved)
     }
 
-    fn import_one(&self, a: &Account, mailbox: &Mailbox, raw: &[u8]) -> Result<()> {
+    fn import_one(&self, a: &Account, mailbox: &Mailbox, item: &Imported) -> Result<()> {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
+        let raw = &item.raw[..];
         match a.provider {
             Provider::Jmap => self.with_jmap(a, |s| {
                 let places = self.jmap_places(a, s, false)?;
                 let target = super::jmap::mailbox_id(&places, mailbox)?;
-                s.import(raw, &[&target], &["$seen"]).map(|_| ())
+                s.import(raw, &[&target], &item.keywords()).map(|_| ())
             }),
             Provider::Proton => self.with_proton(a, |s| {
                 let label = super::proton::label_for(&s.folders(), mailbox)?;
@@ -355,14 +588,14 @@ impl Backend {
             Provider::Pop3 => {
                 let id = format!("{}:import:{}", a.id, uuid::Uuid::new_v4());
                 let mut m = parse_message(raw, a, &id, mailbox.folder(), "", 0)?;
-                m.unread = false;
+                item.apply(&mut m);
                 self.store.save_messages(&[m])?;
                 self.store.save_raw(&id, raw)
             }
             _ => self.with_imap(a, |c| {
                 let remote = remote_name(c.names(false)?, a, mailbox)?;
                 let wire = c.wire(&remote);
-                c.append_dated(&wire, raw, &[imap::types::Flag::Seen])?;
+                c.append_dated(&wire, raw, &item.flags(), item.received)?;
                 Ok(())
             }),
         }
@@ -370,14 +603,19 @@ impl Backend {
 
     /// Adds several messages to `mailbox` on an IMAP server in one command
     /// where it can (MULTIAPPEND): all are added, or none.
-    fn import_batch(&self, a: &Account, mailbox: &Mailbox, raws: &[Vec<u8>]) -> Result<()> {
+    fn import_batch(&self, a: &Account, mailbox: &Mailbox, raws: &[Imported]) -> Result<()> {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_imap(a, |c| {
             let remote = remote_name(c.names(false)?, a, mailbox)?;
             let wire = c.wire(&remote);
-            let refs: Vec<&[u8]> = raws.iter().map(Vec::as_slice).collect();
-            let heard = c.append_many(&wire, &refs, &[imap::types::Flag::Seen])?;
+            let flags: Vec<Vec<imap::types::Flag<'static>>> = raws.iter().map(Imported::flags).collect();
+            let items: Vec<(&[u8], &[imap::types::Flag<'_>], Option<i64>)> = raws
+                .iter()
+                .zip(&flags)
+                .map(|(m, f)| (&m.raw[..], &f[..], m.received))
+                .collect();
+            let heard = c.append_many(&wire, &items)?;
             // Where they went (APPENDUID with a UID each): listed at once.
             if let [heard] = heard.as_slice()
                 && let Some((validity, uids)) = crate::sync::transport::append_uids(heard)
@@ -386,10 +624,10 @@ impl Backend {
                 let rows: Vec<Mail> = raws
                     .iter()
                     .zip(uids)
-                    .filter_map(|(raw, uid)| {
+                    .filter_map(|(item, uid)| {
                         let id = format!("{}:{remote}:{validity}:{uid}", a.id);
-                        let mut m = parse_message(raw, a, &id, mailbox.folder(), &remote, uid).ok()?;
-                        m.unread = false;
+                        let mut m = parse_message(&item.raw, a, &id, mailbox.folder(), &remote, uid).ok()?;
+                        item.apply(&mut m);
                         Some(m)
                     })
                     .collect();
@@ -397,6 +635,65 @@ impl Backend {
             }
             Ok(())
         })
+    }
+}
+
+/// A message to import, with the marks its mbox file gave it.
+struct Imported {
+    raw: Vec<u8>,
+    status: MboxStatus,
+    /// When it arrived, from its `From ` line, for an APPEND date where
+    /// the message has no usable Date.
+    received: Option<i64>,
+}
+impl From<MboxMessage> for Imported {
+    fn from(m: MboxMessage) -> Self {
+        Self {
+            status: MboxStatus::of(&m.raw),
+            raw: m.raw,
+            received: m.received,
+        }
+    }
+}
+impl Imported {
+    /// Read where the file says so, or says nothing (as imports always
+    /// were); unread where it says the message wasn't (Status without R).
+    fn read(&self) -> bool {
+        !self.status.known || self.status.read
+    }
+    /// APPEND's flags. `\Deleted` is never set: on the server it would
+    /// let the next expunge remove mail the person kept.
+    fn flags(&self) -> Vec<imap::types::Flag<'static>> {
+        use imap::types::Flag;
+        let s = self.status;
+        [
+            (self.read(), Flag::Seen),
+            (s.answered, Flag::Answered),
+            (s.flagged, Flag::Flagged),
+            (s.draft, Flag::Draft),
+        ]
+        .into_iter()
+        .filter_map(|(on, flag)| on.then_some(flag))
+        .collect()
+    }
+    /// The same as JMAP keywords (RFC 8621 §4.1.1).
+    fn keywords(&self) -> Vec<&'static str> {
+        let s = self.status;
+        [
+            (self.read(), "$seen"),
+            (s.answered, "$answered"),
+            (s.flagged, "$flagged"),
+            (s.draft, "$draft"),
+        ]
+        .into_iter()
+        .filter_map(|(on, k)| on.then_some(k))
+        .collect()
+    }
+    /// The same on a message cached here.
+    fn apply(&self, m: &mut Mail) {
+        m.unread = !self.read();
+        m.answered = self.status.answered;
+        m.starred = self.status.flagged;
     }
 }
 
@@ -423,6 +720,9 @@ mod tests {
     use super::*;
 
     fn messages(mbox: &[u8]) -> Vec<Vec<u8>> {
+        read(mbox).into_iter().map(|m| m.raw).collect()
+    }
+    fn read(mbox: &[u8]) -> Vec<MboxMessage> {
         let mut out = Vec::new();
         read_mbox(mbox, |m| {
             // A message too large to import, as an empty one.
@@ -479,7 +779,8 @@ mod tests {
             moved,
             Moved {
                 done: 2,
-                skipped: 0
+                skipped: 0,
+                marked_deleted: 0,
             }
         );
         let listed = b.store.messages(&a.id, archive.clone(), 10)?;
@@ -530,6 +831,61 @@ mod tests {
         Ok(())
     }
 
+    /// RFC 4155 §2: `>>From ` loses one `>` (mboxrd's quoting; mboxo
+    /// can't be told apart, see `read_mbox`), and the `From ` line's date
+    /// is kept, in UTC unless it gives a zone.
+    #[test]
+    fn quoting_comes_off_once_and_dates_are_kept() {
+        let file = b"From a@x Wed Nov 23 10:00:00 2026\nSubject: A\n\n>>From twice\n>From once\n\nFrom b@x Wed Nov 23 10:00:00 2026 +0100\nSubject: B\n\nb\n";
+        let got = read(file);
+        assert_eq!(got.len(), 2);
+        assert!(String::from_utf8_lossy(&got[0].raw).contains("\r\n>From twice\r\nFrom once\r\n"));
+        assert_eq!(got[0].received, Some(1_795_428_000));
+        assert_eq!(got[1].received, Some(1_795_428_000 - 3600));
+        assert_eq!(separator_date(b"From a@x Mon Jan  1 00:00:00 2024"), Some(1_704_067_200));
+    }
+
+    /// mboxcl2: a correct Content-Length is the body exactly, `From ` lines
+    /// and all, unquoted; a wrong one is ignored for that message only.
+    #[test]
+    fn content_length_is_trusted_only_where_it_fits() {
+        let body = "Hello\nFrom inside the body\n>From kept as is\n";
+        let file = format!(
+            "From a@x Wed Nov 23 10:00:00 2026\nSubject: A\nContent-Length: {}\n\n{body}\nFrom b@x Wed Nov 23 10:00:00 2026\nSubject: B\nContent-Length: 999\n\nshort\n\nFrom c@x Wed Nov 23 10:00:00 2026\nSubject: C\nContent-Length: 2\n\nlonger than two\n",
+            body.len()
+        );
+        let got = messages(file.as_bytes());
+        assert_eq!(got.len(), 3, "{got:?}");
+        let first = String::from_utf8_lossy(&got[0]);
+        assert!(first.ends_with("\r\n\r\nHello\r\nFrom inside the body\r\n>From kept as is\r\n"), "{first}");
+        assert!(String::from_utf8_lossy(&got[1]).ends_with("\r\n\r\nshort\r\n"));
+        assert!(String::from_utf8_lossy(&got[2]).ends_with("\r\n\r\nlonger than two\r\n"));
+    }
+
+    /// Status and X-Status give the flags an import sets; D is not one.
+    #[test]
+    fn status_headers_give_the_import_flags() {
+        use imap::types::Flag;
+        let item = |headers: &str| {
+            Imported::from(MboxMessage {
+                raw: format!("{headers}Subject: x\r\n\r\nx\r\n").into_bytes(),
+                received: None,
+            })
+        };
+        assert_eq!(item("").flags(), [Flag::Seen], "no Status: read, as before");
+        assert!(item("Status: O\r\n").flags().is_empty(), "seen as new, not read");
+        assert_eq!(
+            item("Status: RO\r\nX-Status: AFD\r\n").flags(),
+            [Flag::Seen, Flag::Answered, Flag::Flagged]
+        );
+        assert_eq!(item("Status: RO\r\nX-Status: T\r\n").keywords(), ["$seen", "$draft"]);
+        let deleted = item("Status: RO\r\nX-Status: D\r\n");
+        assert!(deleted.status.deleted && !deleted.flags().contains(&Flag::Deleted));
+        let mut m = Mail::default();
+        item("Status: O\r\nX-Status: F\r\n").apply(&mut m);
+        assert!(m.unread && m.starred && !m.answered);
+    }
+
     #[test]
     fn bare_line_feeds_become_crlf() {
         assert_eq!(crlf(b"a\nb\r\nc\n"), b"a\r\nb\r\nc\r\n");
@@ -540,7 +896,7 @@ mod tests {
         assert_eq!(
             Moved {
                 done: 1,
-                skipped: 0
+                ..Moved::default()
             }
             .notice("Exported"),
             "Exported 1 message"
@@ -548,10 +904,20 @@ mod tests {
         assert_eq!(
             Moved {
                 done: 3,
-                skipped: 2
+                skipped: 2,
+                marked_deleted: 0,
             }
             .notice("Imported"),
             "Imported 3 messages; 2 messages couldn't be"
+        );
+        assert_eq!(
+            Moved {
+                done: 2,
+                skipped: 0,
+                marked_deleted: 1,
+            }
+            .notice("Imported"),
+            "Imported 2 messages; 1 marked deleted in the file was kept"
         );
     }
 }

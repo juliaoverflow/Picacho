@@ -1853,8 +1853,15 @@ fn newer_extensions_save_round_trips() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("picacho-import-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir)?;
     let mbox = dir.join("mail.mbox");
+    // Marks from the file (Status, X-Status) go with each; without a
+    // Date, the `From ` line's time is the message's date.
     let one = |n: u32| {
-        format!("From qa@example.com Sat Nov 21 10:00:00 2026\nFrom: Ana <ana@example.com>\nSubject: Note {n}\nMessage-ID: <n{n}@example.com>\n\nBody {n}\n\n")
+        let status = match n {
+            2 => "Status: O\n",
+            3 => "Status: RO\nX-Status: FD\n",
+            _ => "",
+        };
+        format!("From qa@example.com Sat Nov 21 10:00:00 2026\nFrom: Ana <ana@example.com>\nSubject: Note {n}\nMessage-ID: <n{n}@example.com>\n{status}\nBody {n}\n\n")
     };
     std::fs::write(&mbox, format!("{}{}{}", one(1), one(2), one(3)))?;
     let moved = b.import_messages(
@@ -1863,7 +1870,7 @@ fn newer_extensions_save_round_trips() -> Result<()> {
         &[mbox],
         &std::sync::atomic::AtomicBool::new(false),
     )?;
-    assert_eq!((moved.done, moved.skipped), (3, 0));
+    assert_eq!((moved.done, moved.skipped, moved.marked_deleted), (3, 0, 1));
     // No QUOTA: the space every mailbox takes, without a limit, where the
     // IMAP parser reads STATUS=SIZE (Picacho-Patches imap-proto 0007).
     // Before it, nothing is shown, and nothing else fails.
@@ -1878,7 +1885,12 @@ fn newer_extensions_save_round_trips() -> Result<()> {
     let imported = server.join().unwrap();
     assert_eq!(imported, 3);
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.iter().filter(|c| c.starts_with("APPEND \"Work\"")).count(), 1, "{seen:?}");
+    let appends: Vec<&String> = seen.iter().filter(|c| c.starts_with("APPEND \"Work\"")).collect();
+    assert_eq!(appends.len(), 1, "{seen:?}");
+    assert_eq!(
+        appends[0],
+        "APPEND \"Work\" (\\Seen) \"21-Nov-2026 10:00:00 +0000\" {} () \"21-Nov-2026 10:00:00 +0000\" {} (\\Seen \\Flagged) \"21-Nov-2026 10:00:00 +0000\" {}"
+    );
     assert!(seen.iter().any(|c| c.starts_with("UID REPLACE")), "{seen:?}");
     assert!(!seen.iter().any(|c| c.starts_with("UID EXPUNGE")), "nothing to remove: {seen:?}");
     assert!(!seen.iter().any(|c| c == "AUTHENTICATE PLAIN"), "SASL-IR: {seen:?}");
