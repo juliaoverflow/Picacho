@@ -268,6 +268,35 @@ impl<T: Read + Write> PopSession<T> {
             .collect();
         Ok(self.caps.clone())
     }
+    /// The SASL mechanisms the server offers: CAPA's SASL line (RFC 2449
+    /// §6.3), else what a bare AUTH lists (a multi-line reply, as many
+    /// servers from before CAPA answer it; RFC 1734's practice). A server
+    /// refusing bare AUTH offers none this way.
+    pub(crate) fn mechanisms(&mut self) -> Result<Vec<String>> {
+        let listed: Vec<String> = self
+            .caps
+            .iter()
+            .filter_map(|c| c.strip_prefix("SASL "))
+            .flat_map(str::split_ascii_whitespace)
+            .map(str::to_owned)
+            .collect();
+        if !listed.is_empty() || self.has("SASL") {
+            return Ok(listed);
+        }
+        match self.command("AUTH") {
+            Ok(_) => {}
+            Err(e) if e.is::<Rejected>() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
+        let list = self.multiline(16 * 1024)?;
+        Ok(String::from_utf8_lossy(&list)
+            .lines()
+            .map(str::trim)
+            // One mechanism name a line (RFC 4422 §3.1's characters).
+            .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            .map(str::to_ascii_uppercase)
+            .collect())
+    }
     /// Signs in with AUTH and a SASL mechanism (RFC 5034).
     pub(crate) fn authenticate(&mut self, exchange: &mut sasl::Exchange) -> Result<()> {
         // The client's first message goes with the command (RFC 5034 §4),
@@ -456,6 +485,23 @@ impl<T: Read + Write> PopSession<T> {
         Ok(result)
     }
 }
+/// A system locale (`en_US.UTF-8`, `pt-BR`, `C`) as a language tag for
+/// POP3's LANG (RFC 6856 §3: RFC 5646 tags): language and region only.
+/// `None` for the POSIX locales, which name no language.
+fn language_tag(locale: &str) -> Option<String> {
+    let locale = locale.split(['.', '@']).next().unwrap_or_default();
+    let mut parts = locale.split(['_', '-']);
+    let language = parts.next().filter(|l| (2..=3).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphabetic()))?;
+    let mut tag = language.to_ascii_lowercase();
+    if let Some(region) = parts
+        .next()
+        .filter(|r| r.len() == 2 && r.bytes().all(|b| b.is_ascii_alphabetic()))
+    {
+        tag.push('-');
+        tag.push_str(&region.to_ascii_uppercase());
+    }
+    Some(tag)
+}
 /// A lasting identity for a message on a server without UIDL: a hash of
 /// the headers that don't change while it sits in the mailbox (its
 /// Message-ID, Date, From, To, Subject, and the first Received). Prefixed
@@ -548,11 +594,19 @@ pub(crate) fn pop_login(
     };
     let caps = s.capabilities()?;
     s.utf8();
-    let offered: Vec<&str> = caps
-        .iter()
-        .filter_map(|c| c.strip_prefix("SASL "))
-        .flat_map(str::split_ascii_whitespace)
-        .collect();
+    s.language(&sys_locale::get_locale().unwrap_or_default());
+    // Asked by bare AUTH only where it matters: a server without CAPA's
+    // SASL line, for an account that can't use a password.
+    let mechanisms = if a.oauth || a.kerberos || !(caps.is_empty() || caps.iter().any(|c| c == "USER")) {
+        s.mechanisms()?
+    } else {
+        caps.iter()
+            .filter_map(|c| c.strip_prefix("SASL "))
+            .flat_map(str::split_ascii_whitespace)
+            .map(str::to_owned)
+            .collect()
+    };
+    let offered: Vec<&str> = mechanisms.iter().map(String::as_str).collect();
     let credentials = sasl::Credentials {
         user: a.login().to_owned(),
         secret: password.to_owned(),
@@ -668,6 +722,19 @@ impl<T: Read + Write> PopSession<T> {
             self.utf8_on = self.command("UTF8").is_ok();
         }
     }
+    /// Asks the server to word its replies in the person's language (LANG,
+    /// RFC 6856 §3), where it lists LANG: its refusals are shown as it
+    /// words them. `locale` is the system's (`en_US`, `pt-BR`); its
+    /// language and region go as a language tag. Best effort: a server
+    /// that has no such language answers -ERR and keeps its own.
+    fn language(&mut self, locale: &str) {
+        if !self.has("LANG") {
+            return;
+        }
+        if let Some(tag) = language_tag(locale) {
+            let _ = self.command(&format!("LANG {tag}"));
+        }
+    }
     /// Asks CAPA again once signed in (RFC 2449 §5: the TRANSACTION
     /// state's capabilities may differ: TOP, UIDL, EXPIRE, LOGIN-DELAY).
     /// What was listed before stays where the server doesn't answer.
@@ -696,6 +763,33 @@ mod tests {
     }
     use super::*;
     use std::io::Cursor;
+    /// A server's replies, given in advance, and what was sent to it.
+    struct Script {
+        replies: Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+    impl Script {
+        fn new(replies: impl Into<Vec<u8>>) -> Self {
+            Self {
+                replies: Cursor::new(replies.into()),
+                sent: Vec::new(),
+            }
+        }
+    }
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.replies.read(buf)
+        }
+    }
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     #[test]
     fn rejects_truncated_oversized_and_ambiguous_status_lines() {
         for status in [
@@ -755,33 +849,12 @@ mod tests {
     /// in every session and different for different mail.
     #[test]
     fn stat_rset_and_identities_without_uidl() -> Result<()> {
-        struct Script {
-            replies: Cursor<Vec<u8>>,
-            sent: Vec<u8>,
-        }
-        impl Read for Script {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.replies.read(buf)
-            }
-        }
-        impl Write for Script {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.sent.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let a = "Message-ID: <a@x>\r\nSubject: One\r\n\r\n";
         let b = "Message-ID: <b@x>\r\nSubject: Two\r\n\r\n";
         let replies = format!(
             "+OK ready\r\n+OK\r\nUSER\r\nTOP\r\n.\r\n+OK 3 920\r\n+OK\r\n+OK 3 920\r\n+OK\r\n{a}.\r\n+OK\r\n{b}.\r\n+OK\r\n{a}.\r\n"
         );
-        let mut pop = PopSession::new(Script {
-            replies: Cursor::new(replies.into_bytes()),
-            sent: Vec::new(),
-        })?;
+        let mut pop = PopSession::new(Script::new(replies))?;
         pop.capabilities()?;
         assert_eq!(pop.stat()?, (3, 920));
         pop.rset()?;
@@ -794,6 +867,45 @@ mod tests {
         assert_eq!(header_identity(a.as_bytes()), ids[0].1);
         let sent = String::from_utf8(pop.reader.get_ref().sent.clone()).unwrap();
         assert_eq!(sent, "CAPA\r\nSTAT\r\nRSET\r\nSTAT\r\nTOP 1 0\r\nTOP 2 0\r\nTOP 3 0\r\n");
+        Ok(())
+    }
+    /// RFC 6856 §3: the system's language goes as a language tag, where
+    /// the server lists LANG.
+    #[test]
+    fn language_is_asked_for_where_listed() -> Result<()> {
+        assert_eq!(language_tag("en_US.UTF-8").as_deref(), Some("en-US"));
+        assert_eq!(language_tag("pt-BR").as_deref(), Some("pt-BR"));
+        assert_eq!(language_tag("de").as_deref(), Some("de"));
+        assert_eq!(language_tag("C"), None);
+        assert_eq!(language_tag("POSIX"), None);
+        let mut pop = PopSession::new(Script::new(
+            "+OK ready\r\n+OK\r\nLANG\r\n.\r\n+OK [LANG] Bienvenue\r\n",
+        ))?;
+        pop.capabilities()?;
+        pop.language("fr_FR.UTF-8");
+        assert_eq!(pop.reader.get_ref().sent, b"CAPA\r\nLANG fr-FR\r\n");
+        let mut pop = PopSession::new(Script::new("+OK ready\r\n+OK\r\nUSER\r\n.\r\n"))?;
+        pop.capabilities()?;
+        pop.language("fr_FR.UTF-8");
+        assert_eq!(pop.reader.get_ref().sent, b"CAPA\r\n");
+        Ok(())
+    }
+    /// A server without CAPA's SASL line lists its mechanisms for a bare
+    /// AUTH; one refusing it offers none.
+    #[test]
+    fn bare_auth_lists_mechanisms() -> Result<()> {
+        let mut pop = PopSession::new(Cursor::new(
+            b"+OK ready\r\n+OK\r\nTOP\r\n.\r\n+OK methods\r\nPLAIN\r\ngssapi\r\nbad name!\r\n.\r\n".to_vec(),
+        ))?;
+        pop.capabilities()?;
+        assert_eq!(pop.mechanisms()?, ["PLAIN", "GSSAPI"]);
+        let mut pop = PopSession::new(Cursor::new(b"+OK ready\r\n-ERR no\r\n-ERR what\r\n".to_vec()))?;
+        pop.capabilities()?;
+        assert!(pop.mechanisms()?.is_empty());
+        // CAPA's SASL line is enough: nothing is asked.
+        let mut pop = PopSession::new(Cursor::new(b"+OK ready\r\n+OK\r\nSASL SCRAM-SHA-256\r\n.\r\n".to_vec()))?;
+        pop.capabilities()?;
+        assert_eq!(pop.mechanisms()?, ["SCRAM-SHA-256"]);
         Ok(())
     }
     /// RFC 2449 §6.5 and §8: LOGIN-DELAY's seconds (not `USER`, said
