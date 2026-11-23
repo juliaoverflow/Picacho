@@ -767,9 +767,11 @@ impl Session {
         !self.event_source_url.is_empty() || !self.websocket_url.is_empty()
     }
 
-    /// Sends method calls in one request, returning each response's name
-    /// and arguments in order. A method's error fails the whole.
-    pub fn call(&self, calls: &[(&str, Value)]) -> Result<Vec<(String, Value)>> {
+    /// Sends method calls in one request, returning what the server
+    /// answered each, in the calls' order. One method's error is that
+    /// call's answer alone: the others' results still come back (RFC 8620
+    /// §3.6.2), so what an earlier call made isn't lost.
+    pub fn call(&self, calls: &[(&str, Value)]) -> Result<Vec<Answer>> {
         // More calls than the server takes at once go in several requests,
         // where none uses another's result.
         if calls.len() > self.max_calls {
@@ -879,33 +881,15 @@ impl Session {
         let responses = v["methodResponses"]
             .as_array()
             .context("The JMAP server's reply has no method responses.")?;
-        let mut out = Vec::with_capacity(responses.len());
-        for r in responses {
-            let name = r[0].as_str().unwrap_or_default().to_owned();
-            let args = r[1].clone();
-            if name == "error" {
-                // Which call it answers, by its call id ("c0"…).
-                let method = r[2]
-                    .as_str()
-                    .and_then(|id| id.strip_prefix('c'))
-                    .and_then(|i| i.parse::<usize>().ok())
-                    .and_then(|i| calls.get(i))
-                    .map(|(n, _)| (*n).to_owned())
-                    .unwrap_or_default();
-                bail!(MethodError::from_response(method, &args));
-            }
-            out.push((name, args));
-        }
-        Ok(out)
+        Ok(answers(calls, responses))
     }
     /// One method call's response arguments.
     fn one(&self, name: &str, args: Value) -> Result<Value> {
-        let mut responses = self.call(&[(name, args)])?;
-        ensure!(
-            !responses.is_empty(),
-            "The JMAP server didn't answer {name}."
-        );
-        Ok(responses.swap_remove(0).1)
+        self.call(&[(name, args)])?
+            .into_iter()
+            .next()
+            .with_context(|| format!("The JMAP server didn't answer {name}."))?
+            .into_value()
     }
 
     // Mailboxes.
@@ -951,7 +935,7 @@ impl Session {
         ) {
             Ok(v) => v,
             // Too old a state, or a server without it: read them all.
-            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) if must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let ids: Vec<&str> = ["created", "updated"]
@@ -1095,15 +1079,13 @@ impl Session {
             ),
         ])?;
         let query = responses
-            .iter()
-            .find(|(n, _)| n == "Email/query")
-            .map(|(_, v)| v)
-            .context("The JMAP server didn't answer the query.")?;
+            .first()
+            .context("The JMAP server didn't answer the query.")?
+            .value()?;
         let get = responses
-            .iter()
-            .find(|(n, _)| n == "Email/get")
-            .map(|(_, v)| v)
-            .context("The JMAP server didn't answer the query.")?;
+            .get(1)
+            .context("The JMAP server didn't answer the query.")?
+            .value()?;
         let order: Vec<&str> = query["ids"]
             .as_array()
             .map(|ids| ids.iter().filter_map(Value::as_str).collect())
@@ -1177,12 +1159,7 @@ impl Session {
             json!({ "accountId": self.account_id, "sinceState": since, "maxChanges": 500 }),
         ) {
             Ok(v) => v,
-            Err(e)
-                if e.downcast_ref::<MethodError>()
-                    .is_some_and(|m| m.is("cannotCalculateChanges")) =>
-            {
-                return Ok(None);
-            }
+            Err(e) if must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let ids = |key: &str| -> Vec<String> {
@@ -1558,17 +1535,18 @@ impl Session {
                 }),
             ),
         ])?;
-        let import = responses
-            .iter()
-            .find(|(n, _)| n == "Email/import")
-            .map(|(_, v)| v)
-            .context("The JMAP server didn't answer the send.")?;
-        let id = imported(import, "m")?;
-        let submission = responses
-            .iter()
-            .find(|(n, _)| n == "EmailSubmission/set")
-            .map(|(_, v)| v)
-            .context("The JMAP server didn't answer the send.")?;
+        let [import, submission] = <[Answer; 2]>::try_from(responses)
+            .map_err(|_| anyhow::anyhow!("The JMAP server didn't answer the send."))?;
+        let id = imported(import.value()?, "m")?;
+        // The submission refused as a whole (RFC 8620 §3.6.2): the copy
+        // the import added goes again, as for a refused creation.
+        let submission = match submission.into_value() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.destroy(&[id]);
+                return Err(e.context("The server didn't send the message."));
+            }
+        };
         if let Some(e) = submission["notCreated"].get("s") {
             // Not sent: the copy added for sending goes again.
             let _ = self.destroy(&[id]);
@@ -1665,7 +1643,7 @@ impl Session {
             json!({ "accountId": self.account_id, "sinceState": since, "maxChanges": 200 }),
         ) {
             Ok(v) => v,
-            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) if must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let ids = ["created", "updated"]
@@ -1828,7 +1806,7 @@ impl Session {
             json!({ "accountId": self.account_id, "sinceState": since, "maxChanges": 500 }),
         ) {
             Ok(v) => v,
-            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) if must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         if v["hasMoreChanges"].as_bool().unwrap_or(false) {
@@ -1868,7 +1846,7 @@ impl Session {
         }
         let v = match self.one("Email/queryChanges", args) {
             Ok(v) => v,
-            Err(e) if e.downcast_ref::<MethodError>().is_some() => return Ok(None),
+            Err(e) if must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let removed = v["removed"]
@@ -2581,8 +2559,94 @@ fn set_error(e: &Value) -> String {
     }
 }
 
-/// A method the server refused (RFC 8620 §3.6.2).
+/// What the server answered one method call (RFC 8620 §3.4): the
+/// responses carrying its call id, or the method's error.
 #[derive(Debug)]
+pub struct Answer {
+    method: String,
+    /// Its own response, and any it implied with the same call id (the
+    /// Email/set of an `onSuccessUpdateEmail`, RFC 8621 §7.5).
+    responses: Vec<(String, Value)>,
+    error: Option<MethodError>,
+}
+impl Answer {
+    /// The call's own response arguments, or its error.
+    pub fn value(&self) -> Result<&Value> {
+        if let Some(e) = &self.error {
+            return Err(e.to_error());
+        }
+        self.responses
+            .iter()
+            .find(|(n, _)| *n == self.method)
+            .or(self.responses.first())
+            .map(|(_, v)| v)
+            .with_context(|| format!("The JMAP server didn't answer {}.", self.method))
+    }
+    pub fn into_value(self) -> Result<Value> {
+        self.value().cloned()
+    }
+}
+/// Each call's answer, in the calls' order, from a reply's method responses:
+/// matched by call id (RFC 8620 §3.4), as a server may answer in another
+/// order or add implied responses with the same id.
+fn answers(calls: &[(&str, Value)], responses: &[Value]) -> Vec<Answer> {
+    let mut out: Vec<Answer> = calls
+        .iter()
+        .map(|(name, _)| Answer {
+            method: (*name).to_owned(),
+            responses: Vec::new(),
+            error: None,
+        })
+        .collect();
+    for r in responses {
+        let Some(i) = r[2]
+            .as_str()
+            .and_then(|id| id.strip_prefix('c'))
+            .and_then(|i| i.parse::<usize>().ok())
+            .filter(|i| r[2].as_str() == Some(format!("c{i}").as_str()))
+        else {
+            continue;
+        };
+        let Some(answer) = out.get_mut(i) else { continue };
+        let name = r[0].as_str().unwrap_or_default();
+        if name == "error" {
+            if answer.error.is_none() {
+                answer.error = Some(MethodError::from_response(answer.method.clone(), &r[1]));
+            }
+        } else {
+            answer.responses.push((name.to_owned(), r[1].clone()));
+        }
+    }
+    out
+}
+
+/// RFC 8620 §5.2: the server can't say what changed since a state (it is
+/// too old, or the server keeps no such history). Everything is read
+/// again rather than reported as a failure.
+#[derive(Debug)]
+pub struct CannotCalculateChanges {
+    /// The method that couldn't (`Email/changes`…).
+    pub method: String,
+}
+impl std::fmt::Display for CannotCalculateChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The JMAP server can't say what changed ({}), so everything is read again.", self.method)
+    }
+}
+impl std::error::Error for CannotCalculateChanges {}
+
+/// Whether a /changes or /queryChanges call failed in a way a full read
+/// recovers from: `cannotCalculateChanges` (RFC 8620 §5.2, §5.6), more
+/// changes than asked for (`tooManyChanges`, §5.6), or a server without
+/// the method at all (`unknownMethod`, §3.6.2). Other refusals are errors.
+pub fn must_resync(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<CannotCalculateChanges>().is_some()
+        || e.downcast_ref::<MethodError>()
+            .is_some_and(|m| m.is("tooManyChanges") || m.is("unknownMethod"))
+}
+
+/// A method the server refused (RFC 8620 §3.6.2).
+#[derive(Clone, Debug)]
 pub struct MethodError {
     /// The method refused (`Email/query`…); empty when unknown.
     pub method: String,
@@ -2609,6 +2673,15 @@ impl MethodError {
     /// Whether it is the error `kind`; servers differ in its case.
     pub fn is(&self, kind: &str) -> bool {
         self.kind.eq_ignore_ascii_case(kind)
+    }
+    /// As an error: `cannotCalculateChanges` is its own kind of error
+    /// (`CannotCalculateChanges`), which callers answer with a full read.
+    fn to_error(&self) -> anyhow::Error {
+        if self.is("cannotCalculateChanges") {
+            anyhow::Error::new(CannotCalculateChanges { method: self.method.clone() })
+        } else {
+            anyhow::Error::new(self.clone())
+        }
     }
 }
 impl std::fmt::Display for MethodError {
@@ -2673,6 +2746,44 @@ mod tests {
         assert_eq!(out, items.iter().map(|n| n * 2).collect::<Vec<_>>());
         assert!(most.load(Ordering::SeqCst) <= 3);
         assert!(bounded_parallel(&[] as &[usize], 4, |n| *n).is_empty());
+    }
+
+    /// Responses are matched to calls by call id, not by order or name; an
+    /// error answers its own call alone, and cannotCalculateChanges is its
+    /// own error, which asks for a full read (RFC 8620 §3.4, §5.2).
+    #[test]
+    fn answers_match_calls_by_id_and_keep_each_result() {
+        let calls = [
+            ("Email/import", json!({})),
+            ("EmailSubmission/set", json!({})),
+            ("Email/changes", json!({})),
+        ];
+        let responses = [
+            json!(["error", { "type": "cannotCalculateChanges" }, "c2"]),
+            json!(["EmailSubmission/set", { "created": { "s": { "id": "S1" } } }, "c1"]),
+            json!(["Email/set", { "updated": { "M1": null } }, "c1"]),
+            json!(["Email/import", { "created": { "m": { "id": "M1" } } }, "c0"]),
+            json!(["Email/get", { "list": [] }, "c9"]),
+            json!(["Email/get", { "list": [] }, "c01"]),
+        ];
+        let out = answers(&calls, &responses);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].value().unwrap()["created"]["m"]["id"], "M1");
+        assert_eq!(out[1].value().unwrap()["created"]["s"]["id"], "S1");
+        let e = out[2].value().unwrap_err();
+        assert!(e.downcast_ref::<CannotCalculateChanges>().is_some(), "{e:#}");
+        assert!(must_resync(&e));
+        // Other refusals stay MethodErrors, naming their method.
+        let out = answers(
+            &calls[..1],
+            &[json!(["error", { "type": "invalidArguments" }, "c0"])],
+        );
+        let e = out[0].value().unwrap_err();
+        assert!(!must_resync(&e));
+        assert!(e.to_string().contains("refused Email/import"), "{e}");
+        // A call the server didn't answer.
+        let out = answers(&calls[..1], &[]);
+        assert!(out[0].value().is_err());
     }
 
     #[test]

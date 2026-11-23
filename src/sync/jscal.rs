@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 // Calendars.
 
 /// A calendar on a JMAP server.
-/// A method refused for a reason worth handling: `cannotCalculateChanges`
-/// (the state is too old), `stateMismatch` (`ifInState` no longer holds).
+/// A method refused for a reason worth handling: `stateMismatch`
+/// (`ifInState` no longer holds), `unknownMethod`, `forbidden`…
 fn refused(e: &anyhow::Error, kind: &str) -> bool {
     e.downcast_ref::<crate::sync::jmap::MethodError>()
         .is_some_and(|m| m.is(kind))
@@ -41,7 +41,9 @@ fn changes(s: &Session, method: &str, account: &str, since: &str) -> Result<Opti
             json!({ "accountId": account, "sinceState": since, "maxChanges": 500 }),
         ) {
             Ok(v) => v,
-            Err(e) if refused(&e, "cannotCalculateChanges") => return Ok(None),
+            // RFC 8620 §5.2: too old a state, or a server without the
+            // method: everything is read again.
+            Err(e) if crate::sync::jmap::must_resync(&e) => return Ok(None),
             Err(e) => return Err(e),
         };
         let ids = |key: &str| -> Vec<String> {

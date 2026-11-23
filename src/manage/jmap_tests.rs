@@ -1769,3 +1769,52 @@ fn jmap_contact_photos_download_once_and_are_reused() -> Result<()> {
     assert_eq!(server.lock().unwrap().cards[3]["media"]["p"]["blobId"], "P3");
     Ok(())
 }
+
+/// A submission the server refuses as a whole (a method error, RFC 8620
+/// §3.6.2) still lets the import before it be seen, so its copy is removed
+/// rather than left behind in Drafts.
+#[test]
+fn jmap_refused_submission_leaves_no_orphaned_import() -> Result<()> {
+    let (cert, port, server, _running) = start(Server {
+        refuse: Some("EmailSubmission/set"),
+        ..Default::default()
+    })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let options = crate::sync::jmap::SendOptions::default();
+    let error = b
+        .send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &options)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("EmailSubmission/set"), "{error:#}");
+    let s = server.lock().unwrap();
+    assert!(s.calls.contains(&"Email/import".to_owned()), "{:?}", s.calls);
+    assert!(s.emails.is_empty(), "the imported copy is removed");
+    Ok(())
+}
+
+/// A server without ContactCard/changes (`unknownMethod`) has its cards
+/// read whole again, rather than failing the sync.
+#[test]
+fn jmap_contacts_without_changes_are_read_whole() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        ..Default::default()
+    };
+    fixture.cards.push(json!({ "@type": "Card", "id": "K0", "uid": "bo", "name": { "full": "Bo" } }));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    assert_eq!(b.connect_jmap_contacts(&a)?, 1);
+    server
+        .lock()
+        .unwrap()
+        .cards
+        .push(json!({ "@type": "Card", "id": "K1", "uid": "cy", "name": { "full": "Cy" } }));
+    assert_eq!(b.sync_contacts()?, 2);
+    Ok(())
+}
