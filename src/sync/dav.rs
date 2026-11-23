@@ -329,12 +329,14 @@ impl Client {
                 .use_preconfigured_tls(tls)
                 .timeout(Duration::from_secs(60))
                 .connect_timeout(Duration::from_secs(12))
-                // Same-host redirects only, so the password stays with this server.
+                // Same-host redirects only, so the password stays with this
+                // server; one elsewhere comes back as `Moved`, for discovery
+                // to decide on (RFC 6764 §5).
                 .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    let same = attempt
-                        .previous()
-                        .first()
-                        .is_some_and(|first| first.host_str() == attempt.url().host_str());
+                    let same = attempt.previous().first().is_some_and(|first| {
+                        first.host_str() == attempt.url().host_str()
+                            && first.port_or_known_default() == attempt.url().port_or_known_default()
+                    });
                     if same && attempt.previous().len() < 5 {
                         attempt.follow()
                     } else {
@@ -401,11 +403,63 @@ impl Client {
         if status == reqwest::StatusCode::NOT_FOUND {
             bail!(NotFound);
         }
+        if status.is_redirection()
+            && let Some(to) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| response.url().join(l).ok())
+        {
+            bail!(Moved(to));
+        }
         ensure!(
             status.is_success() || status.as_u16() == 207,
             "The server answered {status}."
         );
         Ok(response)
+    }
+
+    /// The user's principal (RFC 5397 `current-user-principal`), from the
+    /// address discovery starts at (`start_url`). A redirect to another
+    /// host is followed only within the same domain (RFC 6764 §5, §8: the
+    /// password goes along), at most a few times; a `.well-known` address
+    /// the server doesn't have is tried as `/` instead (RFC 6764 §6).
+    /// Without the property, the address itself (an older server's own
+    /// principal URL). Returns the address that answered and the principal.
+    pub fn principal(&self, start: &url::Url) -> Result<(url::Url, url::Url)> {
+        let mut at = start.clone();
+        let mut tried_root = false;
+        for _ in 0..5 {
+            match self.find_href(&at, "current-user-principal", DAV) {
+                Ok(found) => {
+                    let principal = found.unwrap_or_else(|| at.clone());
+                    return Ok((at, principal));
+                }
+                Err(e) => {
+                    if let Some(Moved(to)) = e.downcast_ref::<Moved>() {
+                        ensure!(
+                            to.scheme() == "https" || cfg!(test),
+                            "The server sent Picacho to an address without encryption."
+                        );
+                        ensure!(
+                            same_domain(start.host_str().unwrap_or(""), to.host_str().unwrap_or("")),
+                            "The server sent Picacho to {}, outside its domain; enter that address instead if it's right.",
+                            to.host_str().unwrap_or("another server")
+                        );
+                        at = to.clone();
+                        continue;
+                    }
+                    let well_known = at.path().starts_with("/.well-known/");
+                    if well_known && !tried_root && (e.is::<NotFound>() || e.to_string().contains("answered")) {
+                        tried_root = true;
+                        at.set_path("/");
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        bail!("The server redirected too many times.")
     }
 
     fn xml(&self, method: &str, url: &url::Url, depth: &str, body: &str) -> Result<String> {
@@ -663,19 +717,7 @@ impl Client {
     /// `addressbook-home-set`), from the server's address as `discover`
     /// finds it.
     pub fn home(&self, given: &str, service: &str, home_set: &str, namespace: &str) -> Result<url::Url> {
-        let given = given.trim();
-        let given = if given.contains("://") {
-            given.to_owned()
-        } else {
-            format!("https://{given}")
-        };
-        let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
-        if start.path() == "/" || start.path().is_empty() {
-            start.set_path(&format!("/.well-known/{service}"));
-        }
-        let principal = self
-            .find_href(&start, "current-user-principal", DAV)?
-            .unwrap_or_else(|| start.clone());
+        let (_, principal) = self.principal(&start_url(given, service)?)?;
         self.find_href(&principal, home_set, namespace)?
             .context("This server doesn't say where your collections go.")
     }
@@ -696,19 +738,7 @@ impl Client {
     }
     /// The account's scheduling outbox (`schedule-outbox-URL`, RFC 6638).
     pub fn outbox(&self, given: &str) -> Result<url::Url> {
-        let given = given.trim();
-        let given = if given.contains("://") {
-            given.to_owned()
-        } else {
-            format!("https://{given}")
-        };
-        let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
-        if start.path() == "/" || start.path().is_empty() {
-            start.set_path("/.well-known/caldav");
-        }
-        let principal = self
-            .find_href(&start, "current-user-principal", DAV)?
-            .unwrap_or_else(|| start.clone());
+        let (_, principal) = self.principal(&start_url(given, "caldav")?)?;
         self.find_href(&principal, "schedule-outbox-URL", CALDAV)?
             .context("This server can't say when people are free (no scheduling outbox).")
     }
@@ -940,19 +970,7 @@ impl Client {
     /// The account's scheduling inbox (`schedule-inbox-URL`, RFC 6638
     /// §2.2), where a scheduling server delivers invitations and answers.
     pub fn inbox(&self, given: &str) -> Result<url::Url> {
-        let given = given.trim();
-        let given = if given.contains("://") {
-            given.to_owned()
-        } else {
-            format!("https://{given}")
-        };
-        let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
-        if start.path() == "/" || start.path().is_empty() {
-            start.set_path("/.well-known/caldav");
-        }
-        let principal = self
-            .find_href(&start, "current-user-principal", DAV)?
-            .unwrap_or_else(|| start.clone());
+        let (_, principal) = self.principal(&start_url(given, "caldav")?)?;
         self.find_href(&principal, "schedule-inbox-URL", CALDAV)?
             .context("This server has no scheduling inbox.")
     }
@@ -1139,6 +1157,66 @@ impl std::fmt::Display for Forbidden {
 }
 impl std::error::Error for Forbidden {}
 
+/// The server sent the request elsewhere: a redirect to another host,
+/// which isn't followed with the password unasked.
+#[derive(Debug)]
+pub struct Moved(pub url::Url);
+impl std::fmt::Display for Moved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The server moved this to {}.", self.0.host_str().unwrap_or("another address"))
+    }
+}
+impl std::error::Error for Moved {}
+
+/// Whether `to` is in the same domain as `from`: the same host, one under
+/// it, or one under its parent domain where that is more than a
+/// top-level one (`p12-caldav.icloud.com` for `caldav.icloud.com`, not
+/// `evil.com` for `dav.example.com`'s `com`).
+fn same_domain(from: &str, to: &str) -> bool {
+    let (from, to) = (from.trim_end_matches('.').to_ascii_lowercase(), to.trim_end_matches('.').to_ascii_lowercase());
+    if from.is_empty() || to.is_empty() {
+        return false;
+    }
+    let under = |d: &str| to == d || to.ends_with(&format!(".{d}"));
+    // The parent only where it is clearly a registered domain: three or
+    // more labels left of a two-letter country code's second level
+    // (`co.uk`, `com.au`) aren't counted as one.
+    let parent = from.split_once('.').map(|(_, p)| p).filter(|p| {
+        let labels: Vec<&str> = p.split('.').collect();
+        labels.len() >= 2 && !(labels.len() == 2 && labels[1].len() == 2 && labels[0].len() <= 3)
+    });
+    under(&from) || parent.is_some_and(under)
+}
+
+/// Where discovery starts for the address `given` (RFC 6764): the address
+/// itself where it has a path; else the domain's SRV record (and TXT
+/// `path=`, §3–§4) where it names a host in the domain; else
+/// `/.well-known/<service>` (§5).
+pub fn start_url(given: &str, service: &str) -> Result<url::Url> {
+    let given = given.trim();
+    ensure!(!given.is_empty(), "Enter the server's address.");
+    let given = if given.contains("://") {
+        given.to_owned()
+    } else {
+        format!("https://{given}")
+    };
+    let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
+    ensure!(
+        start.scheme() == "https" || cfg!(test),
+        "The server's address must start with https://."
+    );
+    if start.path() == "/" || start.path().is_empty() {
+        if !cfg!(test)
+            && let Some(found) = start.host_str().and_then(|d| srv_start(service, d))
+        {
+            start = found;
+        } else {
+            start.set_path(&format!("/.well-known/{service}"));
+        }
+    }
+    Ok(start)
+}
+
 /// The server has no such resource.
 #[derive(Debug)]
 pub struct NotFound;
@@ -1161,34 +1239,10 @@ pub fn discover(
     home_set: &str,
     namespace: &str,
 ) -> Result<Vec<Collection>> {
-    let given = given.trim();
-    ensure!(!given.is_empty(), "Enter the server's address.");
-    let given = if given.contains("://") {
-        given.to_owned()
-    } else {
-        format!("https://{given}")
-    };
-    let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
-    ensure!(
-        start.scheme() == "https" || cfg!(test),
-        "The server's address must start with https://."
-    );
-    if start.path() == "/" || start.path().is_empty() {
-        // RFC 6764: the domain's `_caldavs._tcp` / `_carddavs._tcp` SRV
-        // record names its server, and a TXT `path=` its context path.
-        if !cfg!(test)
-            && let Some(found) = start.host_str().and_then(|d| srv_start(service, d))
-        {
-            start = found;
-        } else {
-            start.set_path(&format!("/.well-known/{service}"));
-        }
-    }
+    let start = start_url(given, service)?;
     let mut found = client.collections(&start, kind).unwrap_or_default();
     if found.is_empty() {
-        let principal = client
-            .find_href(&start, "current-user-principal", DAV)?
-            .unwrap_or_else(|| start.clone());
+        let (_, principal) = client.principal(&start)?;
         // RFC 4791 §6.2.1, RFC 6352 §7.1.1: a home set may list several
         // homes; the collections in each are the account's.
         let homes = client.find_hrefs(&principal, home_set, namespace)?;
@@ -1320,18 +1374,21 @@ pub fn test_server(
             let method = parts.next().unwrap().to_owned();
             let path = parts.next().unwrap().to_owned();
             let (status, text) = respond(&method, &path, &body);
+            // A redirect: its body is where to.
+            let (extra, text) = if status.starts_with('3') {
+                (format!("Location: {text}\r\n"), String::new())
+            } else if method == "OPTIONS" {
+                // A scheduling server's compliance classes.
+                ("DAV: 1, 3, calendar-access, calendar-auto-schedule, calendar-managed-attachments\r\n".to_owned(), text)
+            } else if method == "PUT" {
+                ("Schedule-Tag: \"s-1\"\r\n".to_owned(), text)
+            } else {
+                (String::new(), text)
+            };
             write!(
                 stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nETag: \"e-{}\"\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nETag: \"e-{}\"\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
                 seen.len(),
-                // OPTIONS: a scheduling server's compliance classes.
-                if method == "OPTIONS" {
-                    "DAV: 1, 3, calendar-access, calendar-auto-schedule, calendar-managed-attachments\r\n"
-                } else if method == "PUT" {
-                    "Schedule-Tag: \"s-1\"\r\n"
-                } else {
-                    ""
-                },
                 text.len()
             )
             .unwrap();
@@ -1442,6 +1499,46 @@ mod tests {
         let read = read_collection(&client, &collection, Some(&gone), &known, |_| Ok(vec![]), multiget)?;
         assert!(read.whole);
         assert_eq!(server.join().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// RFC 6764 §5: `.well-known` redirecting to another host in the same
+    /// domain is followed; one outside it isn't; a `.well-known` the server
+    /// lacks is tried as `/` (§6).
+    #[test]
+    fn well_known_redirects_and_falls_back_to_root() -> Result<()> {
+        assert!(same_domain("caldav.icloud.com", "p12-caldav.icloud.com"));
+        assert!(same_domain("example.com", "dav.example.com"));
+        assert!(!same_domain("dav.example.com", "evil.com"));
+        // The parent of `example.co.uk` is `co.uk`: only hosts under the
+        // address itself count there.
+        assert!(!same_domain("example.co.uk", "evil.co.uk"));
+        assert!(same_domain("example.co.uk", "dav.example.co.uk"));
+        assert!(!same_domain("localhost", "127.0.0.1"));
+        let principal = "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+        // Another port, the same host: redirected there and followed.
+        let (target, target_server) = test_server(1, move |_, path, _| {
+            assert_eq!(path, "/dav/");
+            ("207 Multi-Status", principal.into())
+        });
+        let (port, server) = test_server(3, move |_, path, _| match path {
+            "/.well-known/caldav" => ("301 Moved Permanently", format!("http://127.0.0.1:{target}/dav/")),
+            "/.well-known/carddav" => ("404 Not Found", String::new()),
+            "/" => ("207 Multi-Status", principal.into()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let client = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?;
+        let (at, p) = client.principal(&start_url(&format!("http://127.0.0.1:{port}"), "caldav")?)?;
+        assert_eq!((at.port(), p.path()), (Some(target), "/p/ana/"));
+        target_server.join().unwrap();
+        let (at, p) = client.principal(&start_url(&format!("http://127.0.0.1:{port}"), "carddav")?)?;
+        assert_eq!((at.path(), p.path()), ("/", "/p/ana/"));
+        assert_eq!(server.join().unwrap().len(), 3);
+        // Another host altogether: not followed with the password.
+        let (port, server) = test_server(1, move |_, _, _| ("302 Found", "http://localhost:1/dav/".into()));
+        let err = client.principal(&start_url(&format!("http://127.0.0.1:{port}"), "caldav")?).unwrap_err();
+        assert!(err.to_string().contains("outside its domain"), "{err}");
+        server.join().unwrap();
         Ok(())
     }
 
