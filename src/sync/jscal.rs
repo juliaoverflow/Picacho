@@ -456,6 +456,15 @@ pub fn from_jscalendar(v: &Value) -> Option<ical::Event> {
     if let Some(rule) = v["recurrenceRules"].as_array().and_then(|r| r.first()) {
         e.recurrence = rrule(rule, if all_day { None } else { zone }).unwrap_or_default();
     }
+    // RFC 8984 §4.5.2: reminders relative to the start, as `alarms` holds
+    // them (seconds before; negative after). Others stay in the JSON.
+    for (_, a) in v["alerts"].as_object().into_iter().flatten() {
+        if let Some(before) = alert_seconds_before(a)
+            && !e.alarms.contains(&before)
+        {
+            e.alarms.push(before);
+        }
+    }
     for (_, p) in v["participants"].as_object().into_iter().flatten() {
         let roles = &p["roles"];
         let person = ical::Attendee {
@@ -651,7 +660,46 @@ pub fn to_jscalendar(e: &ical::Event, overrides: &[ical::Event]) -> Map<String, 
         "recurrenceOverrides".into(),
         if over.is_empty() { Value::Null } else { Value::Object(over) },
     );
+    let alerts: Map<String, Value> = e
+        .alarms
+        .iter()
+        .enumerate()
+        .map(|(i, before)| (format!("a{}", i + 1), alert_before(*before)))
+        .collect();
+    p.insert(
+        "alerts".into(),
+        if alerts.is_empty() { Value::Null } else { Value::Object(alerts) },
+    );
     p
+}
+
+/// A reminder `before` seconds before the start (negative: after), as a
+/// JSCalendar alert (RFC 8984 §4.5.2: an OffsetTrigger's offset is a
+/// signed duration from the start).
+fn alert_before(before: i64) -> Value {
+    let offset = if before >= 0 {
+        format!("-{}", write_duration(before))
+    } else {
+        write_duration(-before)
+    };
+    json!({ "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": offset }, "action": "display" })
+}
+/// An alert's seconds before the start, where it is a display reminder
+/// relative to the start; others (`AbsoluteTrigger`, relative to the end,
+/// email) aren't `alarms`' and stay in the JSON.
+fn alert_seconds_before(a: &Value) -> Option<i64> {
+    let t = &a["trigger"];
+    if t["@type"].as_str().is_some_and(|k| k != "OffsetTrigger")
+        || t["relativeTo"].as_str().is_some_and(|r| r != "start")
+        || a["action"].as_str().is_some_and(|k| k != "display")
+    {
+        return None;
+    }
+    let offset = t["offset"].as_str()?;
+    match offset.strip_prefix('-') {
+        Some(rest) => duration(rest),
+        None => duration(offset.strip_prefix('+').unwrap_or(offset)).map(|s| -s),
+    }
 }
 
 /// The events of `calendars` (ids) overlapping `from`..`to`, with
@@ -767,15 +815,7 @@ pub fn save_event_in(
     };
     if let Some(current) = &current {
         merge_entries(&mut props, current, "participants", &["sendTo", "roles", "name", "participationStatus", "scheduleAgent", "@type"]);
-        if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("locations"), current["locations"].as_object())
-            && let Some((_, mine)) = new.iter_mut().next()
-            && let Some((_, theirs)) = old.iter().next()
-            && let (Some(mine), Some(theirs)) = (mine.as_object_mut(), theirs.as_object())
-        {
-            for (k, v) in theirs {
-                mine.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-        }
+        keep_unmodelled(&mut props, current, event);
     }
     let args = match id {
         Some(id) => {
@@ -808,6 +848,103 @@ pub fn save_event_in(
         .as_str()
         .context("The server didn't say which event it added.")?
         .to_owned())
+}
+
+/// What of the server's copy of an event (`current`) Picacho doesn't model
+/// is kept through an edit (RFC 8984: at minimum, round-tripped unchanged):
+///
+/// * locations: the first's other fields (coordinates, links…), and the
+///   others whole while the location shown is unchanged;
+/// * recurrence: rules after the first, and `excludedRecurrenceRules`, are
+///   never sent (so stay); the first rule's fields Picacho doesn't write
+///   (`rscale`, `skip`, `firstDayOfWeek`…) are kept while it is the same;
+/// * occurrence overrides: each one's patch keeps the properties Picacho
+///   doesn't write (an override's own alerts, participants…);
+/// * alerts: those that aren't a plain reminder before the start (an
+///   absolute time, relative to the end, by email…) are kept, and plain
+///   reminders that are unchanged keep their entry (`acknowledged`…).
+///
+/// Everything else (links, virtualLocations, localizations, timeZones,
+/// freeBusyStatus, privacy, color, keywords, categories…) isn't sent at
+/// all, so the server keeps it as it is.
+fn keep_unmodelled(props: &mut Map<String, Value>, current: &Value, event: &ical::Event) {
+    // Locations.
+    if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("locations"), current["locations"].as_object())
+        && let Some((_, mine)) = new.iter_mut().next()
+        && let Some((first_key, theirs)) = old.iter().next()
+        && let (Some(mine), Some(theirs)) = (mine.as_object_mut(), theirs.as_object())
+    {
+        let same_place = theirs.get("name") == mine.get("name");
+        for (k, v) in theirs {
+            mine.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if same_place {
+            // The location shown is as it was: every location as it was,
+            // under its own key.
+            let mut all = old.clone();
+            if let Some(first) = all.get_mut(first_key) {
+                *first = Value::Object(mine.clone());
+            }
+            *new = all;
+        }
+    }
+    // The first recurrence rule's own fields, and any after it.
+    if let (Some(Value::Array(new)), Some(old)) = (props.get_mut("recurrenceRules"), current["recurrenceRules"].as_array())
+        && let (Some(mine), Some(theirs)) = (new.first_mut(), old.first())
+    {
+        let zone = current["timeZone"].as_str();
+        let same = rrule(theirs, zone).as_deref() == Some(event.recurrence.as_str());
+        if same {
+            *mine = theirs.clone();
+        }
+        new.extend(old.iter().skip(1).cloned());
+    }
+    // Each override's other properties.
+    if let (Some(Value::Object(new)), Some(old)) = (props.get_mut("recurrenceOverrides"), current["recurrenceOverrides"].as_object()) {
+        for (at, mine) in new.iter_mut() {
+            let (Some(mine), Some(theirs)) = (mine.as_object_mut(), old.get(at).and_then(Value::as_object)) else {
+                continue;
+            };
+            if mine.get("excluded") == Some(&json!(true)) {
+                continue;
+            }
+            for (k, v) in theirs {
+                if k != "excluded" {
+                    mine.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
+    // Alerts.
+    let old_alerts = current["alerts"].as_object();
+    let mut alerts: Map<String, Value> = old_alerts
+        .into_iter()
+        .flatten()
+        .filter(|(_, a)| alert_seconds_before(a).is_none())
+        .map(|(k, a)| (k.clone(), a.clone()))
+        .collect();
+    for (i, before) in event.alarms.iter().enumerate() {
+        let kept = old_alerts
+            .into_iter()
+            .flatten()
+            .find(|(k, a)| alert_seconds_before(a) == Some(*before) && !alerts.contains_key(*k));
+        match kept {
+            Some((k, a)) => {
+                alerts.insert(k.clone(), a.clone());
+            }
+            None => {
+                let mut key = format!("a{}", i + 1);
+                while alerts.contains_key(&key) {
+                    key.push('x');
+                }
+                alerts.insert(key, alert_before(*before));
+            }
+        }
+    }
+    props.insert(
+        "alerts".into(),
+        if alerts.is_empty() { Value::Null } else { Value::Object(alerts) },
+    );
 }
 
 /// `{kind}/set` with `args`, changing `id` only while it is still at
@@ -1744,6 +1881,84 @@ mod tests {
         let written = Value::Object(to_jscalendar(&e, &[]));
         assert_eq!(written["participants"]["p1"]["scheduleAgent"], "client");
         assert_eq!(written["recurrenceOverrides"].as_object().unwrap().len(), 1);
+    }
+
+    /// Reminders read and write as JSCalendar alerts (RFC 8984 §4.5.2).
+    #[test]
+    fn jscalendar_alerts_are_reminders() {
+        let v = json!({
+            "@type": "Event", "uid": "a@x", "start": "2026-11-24T10:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+            "alerts": {
+                "ten": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT10M" } },
+                "after": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "PT5M" } },
+                "end": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT5M", "relativeTo": "end" } },
+                "at": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2026-11-24T08:00:00Z" } },
+            },
+        });
+        let mut e = from_jscalendar(&v).unwrap();
+        e.alarms.sort();
+        assert_eq!(e.alarms, [-300, 600]);
+        let written = Value::Object(to_jscalendar(&e, &[]));
+        let mut offsets: Vec<&str> = written["alerts"].as_object().unwrap().values().map(|a| a["trigger"]["offset"].as_str().unwrap()).collect();
+        offsets.sort();
+        assert_eq!(offsets, ["-PT10M", "PT5M"]);
+    }
+
+    /// An edit keeps what Picacho doesn't model (RFC 8984): other alerts,
+    /// later recurrence rules and the first rule's own fields, other
+    /// locations and their details, and overrides' other properties.
+    #[test]
+    fn jscalendar_edits_keep_what_is_not_modelled() {
+        let current = json!({
+            "@type": "Event", "uid": "a@x", "title": "Planning", "start": "2026-11-24T10:00:00", "timeZone": "Europe/Berlin", "duration": "PT1H",
+            "locations": {
+                "room": { "@type": "Location", "name": "Room 4", "coordinates": "geo:52.5,13.4" },
+                "parking": { "@type": "Location", "name": "Garage" },
+            },
+            "recurrenceRules": [
+                { "@type": "RecurrenceRule", "frequency": "weekly", "byDay": [{ "day": "tu" }], "firstDayOfWeek": "mo", "rscale": "gregorian" },
+                { "@type": "RecurrenceRule", "frequency": "monthly", "byMonthDay": [1] },
+            ],
+            "recurrenceOverrides": {
+                "2026-12-01T10:00:00": { "title": "Planning (moved)", "alerts": { "x": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2026-12-01T08:00:00Z" } } } },
+            },
+            "alerts": {
+                "mine": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT10M" }, "acknowledged": "2026-11-24T08:50:00Z" },
+                "mail": { "@type": "Alert", "action": "email", "trigger": { "@type": "OffsetTrigger", "offset": "-P1D" } },
+            },
+            "virtualLocations": { "v": { "@type": "VirtualLocation", "uri": "https://meet.example/x" } },
+            "privacy": "private", "color": "red", "keywords": { "work": true },
+        });
+        let mut e = from_jscalendar(&current).unwrap();
+        let (changed, excluded) = overrides(&current, &e);
+        e.exdates = excluded;
+        e.summary = "Planning, renamed".into();
+        let mut props = to_jscalendar(&e, &changed);
+        keep_unmodelled(&mut props, &current, &e);
+        let p = Value::Object(props);
+        assert_eq!(p["title"], "Planning, renamed");
+        // Locations, with their details.
+        assert_eq!(p["locations"]["room"]["coordinates"], "geo:52.5,13.4");
+        assert_eq!(p["locations"]["parking"]["name"], "Garage");
+        // Rules: the first's own fields and the second rule.
+        assert_eq!(p["recurrenceRules"][0]["rscale"], "gregorian");
+        assert_eq!(p["recurrenceRules"][0]["firstDayOfWeek"], "mo");
+        assert_eq!(p["recurrenceRules"][1]["frequency"], "monthly");
+        // The override's own alert.
+        assert_eq!(p["recurrenceOverrides"]["2026-12-01T10:00:00"]["alerts"]["x"]["trigger"]["@type"], "AbsoluteTrigger");
+        // The email alert stays; the reminder keeps its entry.
+        assert_eq!(p["alerts"]["mail"]["action"], "email");
+        assert_eq!(p["alerts"]["mine"]["acknowledged"], "2026-11-24T08:50:00Z");
+        // Not modelled at all: not sent, so the server keeps them.
+        for k in ["virtualLocations", "privacy", "color", "keywords", "links", "localizations", "timeZones"] {
+            assert!(p.get(k).is_none(), "{k} isn't sent");
+        }
+        // A reminder removed goes; the email one stays.
+        e.alarms.clear();
+        let mut props = to_jscalendar(&e, &changed);
+        keep_unmodelled(&mut props, &current, &e);
+        let alerts = props["alerts"].as_object().unwrap();
+        assert_eq!(alerts.keys().collect::<Vec<_>>(), ["mail"]);
     }
 
     #[test]
