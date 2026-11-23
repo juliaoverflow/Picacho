@@ -446,7 +446,18 @@ fn dated_vacation_of(c: &Command, filters: &mut Filters) -> bool {
         tests => tests,
     };
     let mut bounds = (None, None);
+    let mut zone = String::new();
     for t in tests {
+        // RFC 5260 §4.3: `:zone "+0100"` says whose day it is.
+        let mut args = t.args.clone();
+        if let Some(at) = args.iter().position(|a| *a == Arg::Tag("zone".into())) {
+            match args.get(at + 1) {
+                Some(Arg::Strings(z)) if z.len() == 1 && (zone.is_empty() || zone == z[0]) => zone = z[0].clone(),
+                _ => return false,
+            }
+            args.drain(at..at + 2);
+        }
+        let t = &Test { args, ..t.clone() };
         // currentdate :value "ge"|"le" "date" "YYYY-MM-DD"
         let strings: Vec<&str> = t
             .args
@@ -469,6 +480,7 @@ fn dated_vacation_of(c: &Command, filters: &mut Filters) -> bool {
     }
     vacation_of(action, filters);
     (filters.vacation.from, filters.vacation.until) = bounds;
+    filters.vacation.zone = zone;
     true
 }
 
@@ -484,8 +496,10 @@ fn vacation_of(c: &Command, filters: &mut Filters) {
                 v.days = (*n).clamp(1, 30) as u32;
                 i += 1;
             }
-            // RFC 6131 §2: the period in seconds; as days, rounded up.
+            // RFC 6131 §2: the period in seconds; `days` the nearest whole
+            // days above it, for where only days are shown.
             (Arg::Tag(t), Some(Arg::Number(n))) if t == "seconds" => {
+                v.seconds = Some((*n).min(u64::from(u32::MAX)) as u32);
                 v.days = n.div_ceil(86_400).clamp(1, 30) as u32;
                 i += 1;
             }
@@ -493,6 +507,17 @@ fn vacation_of(c: &Command, filters: &mut Filters) {
                 v.subject = s.first().cloned().unwrap_or_default();
                 i += 1;
             }
+            // RFC 5230 §4.4.
+            (Arg::Tag(t), Some(Arg::Strings(s))) if t == "from" => {
+                v.sender = s.first().cloned().unwrap_or_default();
+                i += 1;
+            }
+            // RFC 8580 §4: the folder a copy of the reply is kept in.
+            (Arg::Tag(t), Some(Arg::Strings(s))) if t == "fcc" => {
+                v.fcc = super::transport::encode_name(s.first().map_or("", String::as_str));
+                i += 1;
+            }
+            (Arg::Tag(t), _) if t == "mime" => v.mime = true,
             (Arg::Tag(_), Some(Arg::Strings(_))) => i += 1,
             (Arg::Strings(s), _) => v.body = s.first().cloned().unwrap_or_default(),
             _ => {}
@@ -583,13 +608,34 @@ mod tests {
                 days: 3,
                 from: Some("2026-12-20".into()),
                 until: Some("2027-01-05".into()),
+                ..Default::default()
             },
             include: None,
         };
-        let ext: Vec<String> = ["vacation", "date", "relational"].iter().map(|s| s.to_string()).collect();
+        let ext: Vec<String> = ["vacation", "date", "relational", "vacation-seconds", "fcc"].iter().map(|s| s.to_string()).collect();
         let read = read(&script(&filters, &ext, &[]).unwrap()).unwrap();
         assert_eq!(read.filters, filters);
         assert_eq!(read.left_out, 0);
+        // The reply's From, its zone, a period in seconds, MIME and a copy
+        // kept (RFC 5230 §4.4, §5.8; RFC 5260 §4.3; RFC 6131; RFC 8580).
+        let mut more = filters.clone();
+        more.vacation.sender = "Ana <ana@example.com>".into();
+        more.vacation.zone = "+0100".into();
+        more.vacation.seconds = Some(3600);
+        more.vacation.days = 1;
+        more.vacation.mime = true;
+        more.vacation.body = "Content-Type: text/plain\n\nBack soon.\n".into();
+        more.vacation.fcc = "Sent".into();
+        let text = script(&more, &ext, &[]).unwrap();
+        assert!(text.contains("currentdate :zone \"+0100\" :value \"ge\""), "{text}");
+        assert!(text.contains("vacation :seconds 3600 :handle"), "{text}");
+        assert!(text.contains(":from \"Ana <ana@example.com>\" :fcc \"Sent\" :mime "), "{text}");
+        assert!(text.contains("\"fcc\"") && text.contains("\"vacation-seconds\""));
+        assert_eq!(super::read(&text).unwrap().filters, more);
+        // Without the extensions, refused rather than written wrong.
+        assert!(script(&more, &ext[..3], &[]).is_err());
+        more.vacation.zone = "CET".into();
+        assert!(script(&more, &ext, &[]).is_err());
     }
 
     #[test]

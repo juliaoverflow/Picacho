@@ -162,6 +162,26 @@ pub struct Vacation {
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
+    /// The time zone `from` and `until` are days in (RFC 5260 §4.3
+    /// `:zone`, as `+0100`); the server's own where empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub zone: String,
+    /// The reply's From (RFC 5230 §4.4 `:from`); the server picks where
+    /// empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender: String,
+    /// Each sender gets the reply at most once in this many seconds, where
+    /// set (RFC 6131 `:seconds`, the `vacation-seconds` extension) rather
+    /// than in `days`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u32>,
+    /// `body` is a whole MIME entity, headers and all (RFC 5230 §5.8
+    /// `:mime`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mime: bool,
+    /// A copy of each reply goes to this folder (RFC 8580 `:fcc`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fcc: String,
 }
 /// Everything Picacho's script says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,12 +285,48 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         }
         if !tests.is_empty() {
             require.extend(["date", "relational"]);
+            // RFC 5260 §4.3: :zone "+hhmm" says whose day it is.
+            let zone = vacation.zone.trim();
+            if !zone.is_empty() {
+                let valid = zone.len() == 5
+                    && zone.starts_with(['+', '-'])
+                    && zone[1..].bytes().all(|b| b.is_ascii_digit());
+                ensure!(valid, "Enter the time zone like +0100.");
+                for t in &mut tests {
+                    *t = t.replacen("currentdate ", &format!("currentdate :zone {} ", string(zone)), 1);
+                }
+            }
         }
         // A fixed :handle (RFC 5230 §4.2): editing the reply's text
         // doesn't make it go again to everyone already answered.
-        let mut reply = format!(":days {} :handle \"picacho-vacation\"", vacation.days.clamp(1, 30));
+        let period = match vacation.seconds {
+            // RFC 6131 §2: :seconds in place of :days.
+            Some(s) => {
+                ensure!(has("vacation-seconds"), "This server can't send vacation replies more often than daily.");
+                require.push("vacation-seconds");
+                format!(":seconds {s}")
+            }
+            None => format!(":days {}", vacation.days.clamp(1, 30)),
+        };
+        let mut reply = format!("{period} :handle \"picacho-vacation\"");
         if !vacation.subject.trim().is_empty() {
             reply.push_str(&format!(" :subject {}", string(vacation.subject.trim())));
+        }
+        let sender = vacation.sender.trim();
+        if !sender.is_empty() {
+            ensure!(
+                sender.contains('@') && !sender.contains(['\r', '\n']),
+                "Enter the address the vacation reply comes from."
+            );
+            reply.push_str(&format!(" :from {}", string(sender)));
+        }
+        if !vacation.fcc.trim().is_empty() {
+            ensure!(has("fcc"), "This server can't keep copies of vacation replies.");
+            require.push("fcc");
+            reply.push_str(&format!(" :fcc {}", string(&super::transport::decode_name(vacation.fcc.trim()))));
+        }
+        if vacation.mime {
+            reply.push_str(" :mime");
         }
         if !addresses.is_empty() {
             let list: Vec<String> = addresses.iter().map(|a| string(a)).collect();
@@ -1071,6 +1127,7 @@ mod tests {
                 days: 7,
                 from: None,
                 until: Some("2026-12-31".into()),
+                ..Default::default()
             },
             include: None,
         };
