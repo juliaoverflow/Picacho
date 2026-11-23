@@ -98,6 +98,9 @@ pub struct Metadata {
     pub issuer: Option<String>,
     /// How the token endpoint wants a client with a secret to say so.
     pub client_auth: ClientAuth,
+    /// Where the browser's session with the issuer is ended (OpenID
+    /// Connect RP-Initiated Logout 1.0 §2.1), where it has that.
+    pub end_session: Option<String>,
 }
 /// How a client with a secret authenticates at the token endpoint
 /// (RFC 6749 §2.3.1, RFC 8414 §2 `token_endpoint_auth_methods_supported`).
@@ -153,6 +156,7 @@ pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
             .context("The server's sign-in settings have no https token endpoint.")?,
         registration: https("registration_endpoint"),
         revocation: https("revocation_endpoint"),
+        end_session: https("end_session_endpoint"),
         issuer: v["issuer"].as_str().map(str::to_owned),
         scopes: v["scopes_supported"]
             .as_array()
@@ -528,6 +532,34 @@ pub fn revoke(endpoint: &str, client_id: &str, secret: &Secret) -> Result<()> {
         .send()?
         .error_for_status()?;
     Ok(())
+}
+/// Where to send the browser to end its session with the issuer (OpenID
+/// Connect RP-Initiated Logout 1.0 §2): `end_session` with the ID token
+/// it issued as the hint, else this client's id (§2, required without a
+/// hint so the issuer knows who asks), and a `state`. No
+/// `post_logout_redirect_uri`: nothing listens for the browser's return.
+// Backend-only until the UI calls it:
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn logout_url(end_session: &str, client_id: &str, id_token_hint: Option<&str>) -> Option<url::Url> {
+    let mut url = url::Url::parse(end_session).ok()?;
+    if url.scheme() != "https" && !cfg!(test) {
+        return None;
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        match id_token_hint.filter(|t| !t.is_empty()) {
+            Some(hint) => {
+                query.append_pair("id_token_hint", hint);
+            }
+            None if client_id.is_empty() => return None,
+            None => {}
+        }
+        if !client_id.is_empty() {
+            query.append_pair("client_id", client_id);
+        }
+        query.append_pair("state", &random_url_token());
+    }
+    Some(url)
 }
 /// Where an account's tokens are given up (RFC 7009), if its issuer has
 /// such an endpoint: Google's own; a JMAP server's, an organization's
@@ -2115,6 +2147,31 @@ mod tests {
         // A management URI over plain http (outside tests) isn't kept.
         let r = Registration::from_response(&serde_json::json!({"client_id": "x"}), "r").unwrap();
         assert!(r.registration_client_uri.is_empty());
+    }
+
+    /// OpenID Connect RP-Initiated Logout 1.0 §2: the end-session address,
+    /// its own query kept, with the hint or the client id, and a state.
+    #[test]
+    fn logout_urls_name_the_session_to_end() {
+        let m = parse_metadata(&serde_json::json!({
+            "issuer": "https://id.example",
+            "authorization_endpoint": "https://id.example/a",
+            "token_endpoint": "https://id.example/t",
+            "end_session_endpoint": "https://id.example/logout?tenant=1",
+        }))
+        .unwrap();
+        let end = m.end_session.unwrap();
+        let url = logout_url(&end, "picacho", Some("eyJ.x.y")).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["tenant"], "1");
+        assert_eq!(q["id_token_hint"], "eyJ.x.y");
+        assert_eq!(q["client_id"], "picacho");
+        assert_eq!(q["state"].len(), 43);
+        assert!(!q.contains_key("post_logout_redirect_uri"));
+        // Without a hint the client id must say who asks.
+        assert!(logout_url(&end, "picacho", None).is_some());
+        assert!(logout_url(&end, "", None).is_none());
+        assert!(logout_url("not a url", "picacho", None).is_none());
     }
 
     #[test]
