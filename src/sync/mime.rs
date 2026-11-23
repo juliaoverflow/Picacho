@@ -170,6 +170,9 @@ pub fn parse_message(
     if !(automatic || report || null_path || required) {
         mail.set_receipt_to(receipt_addresses(&header("Disposition-Notification-To")));
     }
+    // A mailing list's identity and addresses (RFC 2919, RFC 2369).
+    mail.set_list_id(crate::manage::list_headers::list_id(&header("List-Id")));
+    mail.set_list_links(crate::manage::list_headers::links(&header));
     Ok(mail)
 }
 /// format=flowed text (RFC 3676 §4) as paragraphs: a line ending in a
@@ -706,6 +709,18 @@ mod tests {
         let raw = b"From: Ana <ana@example.com>\r\nDisposition-Notification-To: ana@example.com, Bo <bo@example.com>\r\nSubject: Hi\r\n\r\nBody";
         let m = parse_message(raw, &a, "x:INBOX:1:1", crate::manage::model::Folder::Inbox, "INBOX", 1)?;
         assert_eq!(m.receipt_to(), "ana@example.com, bo@example.com");
+        Ok(())
+    }
+    /// RFC 2919 and RFC 2369: a list message keeps its List-Id and links.
+    #[test]
+    fn list_headers_are_parsed() -> anyhow::Result<()> {
+        let a = crate::manage::model::Account::new(crate::manage::model::Provider::Imap);
+        let raw = b"From: list@example.org\r\nList-Id: Users <users.example.org>\r\nList-Post: <mailto:users@example.org>\r\nList-Help: <https://example.org/help>\r\nSubject: Hi\r\n\r\nBody";
+        let m = parse_message(raw, &a, "x:INBOX:1:1", crate::manage::model::Folder::Inbox, "INBOX", 1)?;
+        assert_eq!(m.list_id(), "users.example.org");
+        let kinds: Vec<_> = m.list_links().iter().map(|l| (l.kind, l.uri.as_str())).collect();
+        use crate::manage::list_headers::ListLinkKind as K;
+        assert_eq!(kinds, [(K::Help, "https://example.org/help"), (K::Post, "mailto:users@example.org")]);
         Ok(())
     }
     #[test]

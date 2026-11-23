@@ -1066,7 +1066,7 @@ fn starttls(socket: &mut Wire) -> Result<()> {
 /// References and In-Reply-To join conversations before bodies download,
 /// and Disposition-Notification-To says the sender asks for a read receipt.
 pub(crate) const LIST_HEADERS: &str =
-    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DISPOSITION-NOTIFICATION-TO)]";
+    "BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO CC SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO CONTENT-TYPE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DISPOSITION-NOTIFICATION-TO LIST-ID LIST-HELP LIST-SUBSCRIBE LIST-POST LIST-OWNER LIST-ARCHIVE)]";
 
 /// Extensions beyond IMAP4rev1 that the app uses where a server has them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

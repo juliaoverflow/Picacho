@@ -9,6 +9,9 @@ pub mod background;
 pub mod composing;
 pub mod crypto;
 pub mod forwarding;
+/// Mailing lists' List-Help, -Subscribe, -Post, -Owner, -Archive and
+/// List-Id headers (RFC 2369, RFC 2919).
+pub mod list_headers;
 pub mod local_ai;
 pub mod mail_kinds;
 /// Keeping memory small in the background (desktop).

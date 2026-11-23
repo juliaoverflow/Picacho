@@ -2519,6 +2519,12 @@ impl Backend {
                 next.list_unsubscribe = std::mem::take(&mut parsed.list_unsubscribe);
                 next.one_click = parsed.one_click;
             }
+            if next.list_id().is_empty() {
+                next.set_list_id(parsed.list_id());
+            }
+            if next.list_links().is_empty() {
+                next.set_list_links(parsed.list_links().to_vec());
+            }
             self.store.save_messages(&[next])?;
         }
         Ok(())
