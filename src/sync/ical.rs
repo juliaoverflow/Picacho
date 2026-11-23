@@ -68,6 +68,39 @@ pub struct Attendee {
     /// rewriting an event doesn't lose them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub extra: String,
+    /// SCHEDULE-STATUS (RFC 6638 §7.3): how the server's delivery to
+    /// them went, as its codes (`1.2`, `3.7`…). The server's to write; read
+    /// only, and left out of what is written back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule_status: Vec<String>,
+    /// SCHEDULE-AGENT (RFC 6638 §7.1) as written: SERVER, CLIENT or NONE,
+    /// uppercase; empty where not given (SERVER).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schedule_agent: String,
+    /// SCHEDULE-FORCE-SEND (RFC 6638 §7.2): REQUEST or REPLY, for the
+    /// server to send even where it thinks nothing changed. Sent once, so
+    /// not read back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub force_send: String,
+}
+
+impl Attendee {
+    /// Whether the server says it couldn't deliver to them (RFC 6638
+    /// §7.3, RFC 5545 §3.8.8.3: a status of class 3 or 5).
+    pub fn delivery_failed(&self) -> bool {
+        self.schedule_status.iter().any(|s| s.starts_with('3') || s.starts_with('5'))
+    }
+    /// The parameters RFC 6638 defines, as written in front of `extra`.
+    fn scheduling_params(&self) -> String {
+        let mut out = String::new();
+        if !self.schedule_agent.is_empty() {
+            out.push_str(&format!(";SCHEDULE-AGENT={}", self.schedule_agent));
+        }
+        if !self.force_send.is_empty() {
+            out.push_str(&format!(";SCHEDULE-FORCE-SEND={}", self.force_send));
+        }
+        out
+    }
 }
 
 /// One event.
@@ -998,13 +1031,13 @@ fn attendee(line: &str, value: &str, params: &[(String, String)]) -> Attendee {
         .to_owned();
     // The parameters Picacho doesn't edit, exactly as written: a list
     // value (RFC 5545 §3.2.11 DELEGATED-TO="mailto:a","mailto:b") stays a
-    // list. SCHEDULE-STATUS is the server's to set (RFC 6638 §7.3), kept
-    // apart.
+    // list. RFC 6638's parameters are kept apart: SCHEDULE-STATUS is the
+    // server's to set (§7.3), SCHEDULE-FORCE-SEND a one-time request (§7.2).
     let extra = raw_params(line)
         .into_iter()
         .filter(|p| {
             let k = p.split('=').next().unwrap_or("").trim().to_ascii_uppercase();
-            !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT")
+            !matches!(k.as_str(), "CN" | "PARTSTAT" | "SCHEDULE-STATUS" | "SCHEDULE-AGENT" | "SCHEDULE-FORCE-SEND")
         })
         .collect::<Vec<_>>()
         .join(";");
@@ -1013,6 +1046,12 @@ fn attendee(line: &str, value: &str, params: &[(String, String)]) -> Attendee {
         status: param(params, "PARTSTAT").map(PartStat::parse),
         email,
         extra,
+        // RFC 6638 §7.3: a list of statuses, quoted where several.
+        schedule_status: param(params, "SCHEDULE-STATUS")
+            .map(|s| s.split(',').map(|c| c.trim().trim_matches('"').to_owned()).filter(|c| !c.is_empty()).collect())
+            .unwrap_or_default(),
+        schedule_agent: param(params, "SCHEDULE-AGENT").unwrap_or_default().to_ascii_uppercase(),
+        force_send: String::new(),
     }
 }
 /// A parameter value as written: RFC 6868's escapes put in, quoted where
@@ -2252,6 +2291,30 @@ pub fn scheduled_by_client(text: &str) -> String {
     out
 }
 
+/// `text` with every ORGANIZER's and ATTENDEE's SCHEDULE-STATUS left out:
+/// RFC 6638 §3.2.3 has the server set it, and refuse a client's write
+/// that includes one it didn't (or ignore it), so one read with the event
+/// isn't sent back.
+pub fn without_schedule_status(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in unfold(text) {
+        let upper = line.to_ascii_uppercase();
+        if (upper.starts_with("ORGANIZER;") || upper.starts_with("ATTENDEE;")) && upper.contains("SCHEDULE-STATUS=") {
+            let colon = quote_aware_colon(&line).unwrap_or(line.len());
+            let name = &line[..line.find(';').unwrap_or(colon)];
+            let kept: Vec<&str> = raw_params(&line)
+                .into_iter()
+                .filter(|p| !p.trim().to_ascii_uppercase().starts_with("SCHEDULE-STATUS="))
+                .collect();
+            let head = std::iter::once(name).chain(kept).collect::<Vec<_>>().join(";");
+            out.push_str(&fold(&format!("{head}{}", &line[colon..])));
+        } else {
+            out.push_str(&fold(&line));
+        }
+    }
+    out
+}
+
 /// The UTC offset (seconds east) of `zone` at `t`.
 fn offset_at(zone: chrono_tz::Tz, t: i64) -> i32 {
     use chrono::Offset;
@@ -2592,7 +2655,7 @@ pub fn write_event(e: &Event) -> String {
     };
     if let Some(o) = e.organizer.as_ref().filter(|o| !o.email.is_empty()) {
         let extra = if o.extra.is_empty() { String::new() } else { format!(";{}", o.extra) };
-        lines.push(format!("ORGANIZER{extra}{}:mailto:{}", person(o), o.email));
+        lines.push(format!("ORGANIZER{extra}{}{}:mailto:{}", o.scheduling_params(), person(o), o.email));
     }
     for at in &e.attendees {
         // Its own parameters where it came with them; a new guest is a
@@ -2603,8 +2666,9 @@ pub fn write_event(e: &Event) -> String {
             at.extra.clone()
         };
         lines.push(format!(
-            "ATTENDEE;{extra};PARTSTAT={}{}:mailto:{}",
+            "ATTENDEE;{extra};PARTSTAT={}{}{}:mailto:{}",
             at.status.unwrap_or(PartStat::NeedsAction).as_str(),
+            at.scheduling_params(),
             person(at),
             at.email
         ));
@@ -2847,6 +2911,33 @@ mod tests {
         assert!(icloud.iter().any(|a| a.action == "AUDIO" && a.before == 7200));
         assert!(icloud.iter().any(|a| a.action == "NONE"));
         assert!(icloud.iter().any(|a| a.acknowledged && a.before == 86_400));
+    }
+
+    /// RFC 6638 §7: SCHEDULE-STATUS is read and never sent back;
+    /// SCHEDULE-AGENT stays as written; SCHEDULE-FORCE-SEND is written.
+    #[test]
+    fn scheduling_parameters() {
+        let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nDTSTART:20261124T090000Z\r\nORGANIZER;SCHEDULE-AGENT=SERVER:mailto:ana@x.example\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;SCHEDULE-STATUS=\"3.7,5.1\":mailto:gone@x.example\r\nATTENDEE;SCHEDULE-STATUS=1.2;SCHEDULE-AGENT=NONE:mailto:bo@x.example\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let e = parse(text).events.remove(0);
+        assert_eq!(e.attendees[0].schedule_status, ["3.7", "5.1"]);
+        assert!(e.attendees[0].delivery_failed() && !e.attendees[1].delivery_failed());
+        assert_eq!((e.organizer.as_ref().unwrap().schedule_agent.as_str(), e.attendees[1].schedule_agent.as_str()), ("SERVER", "NONE"));
+        // Sent as it came (its source): the server's status is taken out.
+        let stored = without_schedule_status(&to_store(&e));
+        assert!(!stored.contains("SCHEDULE-STATUS"), "{stored}");
+        assert!(stored.contains("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:gone@x.example") && stored.contains("ATTENDEE;SCHEDULE-AGENT=NONE:mailto:bo@x.example"), "{stored}");
+        // Written from fields: the agent kept, the status not, a forced send.
+        let mut edited = Event { source: String::new(), ..e };
+        edited.attendees[0].force_send = "REQUEST".into();
+        let written = to_store(&edited);
+        assert!(!written.contains("SCHEDULE-STATUS"));
+        assert!(written.contains("ORGANIZER;SCHEDULE-AGENT=SERVER:mailto:ana@x.example"), "{written}");
+        assert!(unfold(&written).iter().any(|l| l.starts_with("ATTENDEE;") && l.contains("SCHEDULE-FORCE-SEND=REQUEST") && l.ends_with("gone@x.example")), "{written}");
+        // An agent already named isn't overridden for Picacho's own.
+        let ours = parse(&scheduled_by_client(&written)).events.remove(0);
+        assert_eq!(ours.attendees[1].schedule_agent, "NONE");
+        assert_eq!(ours.organizer.unwrap().schedule_agent, "SERVER");
+        assert_eq!(scheduled_by_client(&written).matches("SCHEDULE-AGENT=CLIENT").count(), 1);
     }
 
     /// A guest's list parameter (RFC 5545 §3.2.4 DELEGATED-FROM) is
@@ -3255,8 +3346,11 @@ mod tests {
         // The people and their answers read the same, and doing it again
         // changes nothing.
         let back = parse(&text).events.remove(0);
-        assert_eq!(back.attendees, e.attendees);
-        assert_eq!(back.organizer, e.organizer);
+        // Read back with the agent now named (RFC 6638 §7.1), else the same.
+        let agentless = |a: &Attendee| Attendee { schedule_agent: String::new(), ..a.clone() };
+        assert!(back.attendees.iter().chain(&back.organizer).all(|a| a.schedule_agent == "CLIENT"));
+        assert_eq!(back.attendees.iter().map(agentless).collect::<Vec<_>>(), e.attendees);
+        assert_eq!(back.organizer.as_ref().map(agentless), e.organizer);
         assert_eq!(scheduled_by_client(&text), text);
         let server = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nATTENDEE;SCHEDULE-AGENT=SERVER:mailto:a@b.c\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert_eq!(scheduled_by_client(server), server);

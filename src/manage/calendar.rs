@@ -131,6 +131,20 @@ impl Backend {
             .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         self.store
             .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        // Who you are to the server (RFC 6638 §2.4.1), for telling your
+        // own events, and where it puts accepted invitations (§9.2), as
+        // the calendar new events go to unless one was chosen. Not every
+        // server schedules: not worth failing for.
+        if let Ok((addresses, default)) = caldav::scheduling_identity(&server, password, self.tls_connector()?) {
+            if !addresses.is_empty() {
+                self.store.set_preference(PARTICIPANTS, &serde_json::to_string(&addresses)?)?;
+            }
+            if let Some(href) = default.filter(|h| cals.iter().any(|c| &c.href == h))
+                && self.store.preference(DEFAULT).is_none_or(|d| d.is_empty())
+            {
+                self.store.set_preference(DEFAULT, &href)?;
+            }
+        }
         self.sync_calendar()
     }
     /// Lets the CalDAV server send invitations, updates and cancellations
@@ -1544,6 +1558,36 @@ impl Backend {
             .find(|s| s.event.uid == uid)
             .context("This event is no longer in your calendar.")?;
         self.invite(a, &stored.event, &stored.overrides, false)
+    }
+    /// Sends an event's invitations again, though nothing changed: by mail,
+    /// or on a scheduling server by saving it with SCHEDULE-FORCE-SEND
+    /// (RFC 6638 §7.2), since a server sends only on a change that
+    /// matters. For guests whose invitation got lost (SCHEDULE-STATUS 3.x
+    /// or 5.x, `Attendee::delivery_failed`).
+    pub fn resend_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if !self.server_schedules() || self.calendar_jmap(&self.calendar_server().context("No calendar server is set up.")?)?.is_some() {
+            return self.send_invitations(a, uid);
+        }
+        let mut stored = self.stored_event(uid).context("This event is no longer in your calendar.")?;
+        ensure!(self.organized_here(&stored.event), "Only the organizer sends the invitations.");
+        for g in std::iter::once(&mut stored.event).chain(&mut stored.overrides).flat_map(|e| &mut e.attendees) {
+            g.force_send = "REQUEST".into();
+        }
+        let count = stored.event.attendees.len();
+        // Written from its fields, so the parameter is in what's sent.
+        stored.event.source.clear();
+        let server = self.calendar_server().context("No calendar server is set up.")?;
+        let calendar = stored.calendar.clone();
+        let mut saved = self.calendar_save(&server, &calendar, &stored)?;
+        // Once: a later save mustn't send them all again.
+        for g in std::iter::once(&mut saved.event).chain(&mut saved.overrides).flat_map(|e| &mut e.attendees) {
+            g.force_send.clear();
+        }
+        let mut events = self.calendar_events();
+        events.retain(|s| s.event.uid != saved.event.uid);
+        events.push(saved);
+        self.save_events(events)?;
+        Ok(count)
     }
     /// Tells an event's guests it's cancelled (before deleting it).
     pub fn cancel_invitations(&self, a: &Account, uid: &str) -> Result<usize> {

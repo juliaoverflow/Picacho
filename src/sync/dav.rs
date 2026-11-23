@@ -517,8 +517,17 @@ impl Client {
             )?)
     }
 
+    /// Every href of a property at `url` (Depth 0) as written: for those
+    /// that aren't addresses on the server (RFC 6638 §2.4.1's `mailto:`).
+    pub fn hrefs(&self, url: &url::Url, property: &str, namespace: &str) -> Result<Vec<String>> {
+        let body = format!(
+            "<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"{namespace}\"><d:prop><c:{property}/></d:prop></d:propfind>"
+        );
+        let text = self.xml("PROPFIND", url, "0", &body)?;
+        Ok(hrefs_in(parse(&text)?.root(), property))
+    }
     /// A property's href at `url` (Depth 0).
-    fn find_href(
+    pub fn find_href(
         &self,
         url: &url::Url,
         property: &str,

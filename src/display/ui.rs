@@ -768,6 +768,9 @@ enum Action {
     ServerScheduling(bool),
     /// Looks up when the event's guests are busy around its time.
     CheckFreeBusy,
+    /// Sends the edited event's invitations again (its uid), for guests
+    /// the server couldn't reach (RFC 6638 SCHEDULE-STATUS).
+    ResendInvitations(String),
     /// Messages a JMAP server holds to send later: lists them (account
     /// id), or takes one back: (account id, submission id).
     ListHeld(String),
@@ -6451,6 +6454,7 @@ impl MailApp {
             | Action::DeleteTask(_)
             | Action::ServerScheduling(_)
             | Action::CheckFreeBusy
+            | Action::ResendInvitations(_)
             | Action::ListHeld(_)
             | Action::CancelHeld(..)) => self.calendar_action(action, w, cx),
             Action::RefreshAccount(id) if fwd::is_view(&id) => {

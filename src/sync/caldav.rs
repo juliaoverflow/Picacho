@@ -89,6 +89,29 @@ pub fn schedules(server: &Server, password: &str, tls: native_tls::TlsConnector)
         .any(|class| class == "calendar-auto-schedule"))
 }
 
+/// Who the account is to the scheduling server (RFC 6638 §2.4.1
+/// `calendar-user-address-set`: its addresses, `mailto:` taken off) and
+/// where invitations it accepts go (§9.2 `schedule-default-calendar-URL`
+/// on the inbox). Either empty where the server doesn't say.
+pub fn scheduling_identity(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<(Vec<String>, Option<String>)> {
+    let c = client(server, password, tls)?;
+    let (_, principal) = c.principal(&dav::start_url(&server.url, "caldav")?)?;
+    let addresses = c
+        .hrefs(&principal, "calendar-user-address-set", dav::CALDAV)?
+        .into_iter()
+        .filter_map(|u| {
+            let u = u.trim();
+            let lower = u.to_ascii_lowercase();
+            lower.starts_with("mailto:").then(|| u[7..].to_owned())
+        })
+        .collect();
+    let default = match c.inbox(&server.url) {
+        Ok(inbox) => c.find_href(&inbox, "schedule-default-calendar-URL", dav::CALDAV)?.map(|u| u.to_string()),
+        Err(_) => None,
+    };
+    Ok((addresses, default))
+}
+
 /// The account's calendars.
 pub fn calendars(
     server: &Server,
@@ -234,11 +257,72 @@ pub fn free_busy(
     let outbox = c.outbox(&server.url)?;
     let body = ical::free_busy_request(organizer, attendees, from, to);
     let text = c.post(&outbox, "text/calendar; charset=utf-8", body, &format!("mailto:{organizer}"), attendees)?;
-    // A schedule-response: each recipient's calendar-data.
-    let doc = roxmltree::Document::parse(&text).context("The server's answer couldn't be read.")?;
+    let answers = schedule_response(&text)?;
     let mut out = Vec::new();
-    for data in doc.descendants().filter(|n| n.tag_name().name() == "calendar-data") {
-        out.extend(ical::parse_free_busy(data.text().unwrap_or_default()));
+    let mut unknown = Vec::new();
+    for a in answers {
+        if a.delivered() {
+            out.extend(ical::parse_free_busy(&a.calendar_data));
+        } else {
+            unknown.push(a.recipient);
+        }
+    }
+    // Nobody answered: say why rather than show everyone free.
+    ensure!(
+        !out.is_empty() || unknown.is_empty(),
+        "The server couldn't say when {} {} free.",
+        unknown.join(", "),
+        if unknown.len() == 1 { "is" } else { "are" }
+    );
+    Ok(out)
+}
+
+/// One recipient's part of a scheduling answer (RFC 6638 §5.1.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScheduleAnswer {
+    /// Who, as an address (`mailto:` taken off).
+    pub recipient: String,
+    /// `request-status` (RFC 5545 §3.8.8.3): its code (`2.0`, `3.7`…) and
+    /// text.
+    pub code: String,
+    pub status: String,
+    /// What the server answered for them (a VFREEBUSY), where it did.
+    pub calendar_data: String,
+}
+impl ScheduleAnswer {
+    /// RFC 5545 §3.8.8.3: class 2 is success; 1 pending.
+    pub fn delivered(&self) -> bool {
+        self.code.starts_with('2') || self.code.starts_with('1')
+    }
+}
+
+/// A `schedule-response` (RFC 6638 §10.2): each `response`'s recipient,
+/// request-status and calendar-data.
+pub fn schedule_response(text: &str) -> Result<Vec<ScheduleAnswer>> {
+    let doc = roxmltree::Document::parse(text).context("The server's answer couldn't be read.")?;
+    let in_caldav = |n: &roxmltree::Node, name: &str| n.tag_name().name() == name && n.tag_name().namespace() == Some(dav::CALDAV);
+    let mut out = Vec::new();
+    for response in doc.descendants().filter(|n| in_caldav(n, "response")) {
+        let child = |name: &str| response.children().find(|c| in_caldav(c, name));
+        let recipient = child("recipient")
+            .and_then(|r| r.descendants().find(|h| h.tag_name().name() == "href" && h.tag_name().namespace() == Some(dav::DAV)))
+            .and_then(|h| h.text())
+            .unwrap_or_default()
+            .trim();
+        let recipient = recipient
+            .strip_prefix("mailto:")
+            .or_else(|| recipient.strip_prefix("MAILTO:"))
+            .unwrap_or(recipient)
+            .to_owned();
+        // "2.0;Success": the code, then its text.
+        let status = child("request-status").and_then(|s| s.text()).unwrap_or_default().trim();
+        let (code, words) = status.split_once(';').unwrap_or((status, ""));
+        out.push(ScheduleAnswer {
+            recipient,
+            code: code.trim().to_owned(),
+            status: words.trim().to_owned(),
+            calendar_data: child("calendar-data").and_then(|d| d.text()).unwrap_or_default().to_owned(),
+        });
     }
     Ok(out)
 }
@@ -509,6 +593,8 @@ pub fn save(
     } else {
         ical::scheduled_by_client(&text)
     };
+    // RFC 6638 §3.2.3: SCHEDULE-STATUS is the server's.
+    let text = ical::without_schedule_status(&text);
     if let Some(max) = max_size.filter(|m| *m > 0)
         && text.len() as u64 > max
     {
@@ -693,6 +779,43 @@ mod tests {
         remove_from_inbox(&srv, "secret", tls(), &items[0])?;
         let seen = server.join().unwrap();
         assert_eq!(seen.iter().filter(|(m, ..)| m == "PUT").count(), 1);
+        Ok(())
+    }
+
+    /// RFC 6638 §5.1.2, §10.2: each recipient's request-status is read;
+    /// those the server couldn't ask are left out of the busy times, and
+    /// all of them failing is an error, not "everyone is free". The
+    /// calendar user's addresses (§2.4.1) and default calendar (§9.2)
+    /// are read from the principal and inbox.
+    #[test]
+    fn scheduling_answers_and_identity() -> Result<()> {
+        let answer = "<C:schedule-response xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:response><C:recipient><D:href>mailto:bo@example.se</D:href></C:recipient><C:request-status>2.0;Success</C:request-status><C:calendar-data>BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nBEGIN:VFREEBUSY\r\nATTENDEE:mailto:bo@example.se\r\nFREEBUSY:20261124T090000Z/PT1H\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n</C:calendar-data></C:response><C:response><C:recipient><D:href>mailto:cy@elsewhere.example</D:href></C:recipient><C:request-status>3.7;Invalid calendar user</C:request-status></C:response></C:schedule-response>";
+        let parsed = schedule_response(answer)?;
+        assert_eq!(parsed.len(), 2);
+        assert_eq!((parsed[1].recipient.as_str(), parsed[1].code.as_str(), parsed[1].status.as_str()), ("cy@elsewhere.example", "3.7", "Invalid calendar user"));
+        assert!(parsed[0].delivered() && !parsed[1].delivered());
+        let principal = "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/p/ana/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal><c:calendar-user-address-set><d:href>mailto:ana@example.org</d:href><d:href>/p/ana/</d:href><d:href>MAILTO:a.lopez@example.org</d:href></c:calendar-user-address-set><c:schedule-outbox-URL><d:href>/out/</d:href></c:schedule-outbox-URL><c:schedule-inbox-URL><d:href>/in/</d:href></c:schedule-inbox-URL></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
+        let only_cy = answer.replace("2.0;Success", "5.3;No scheduling support");
+        let (port, server) = dav::test_server(8, move |method, path, _| match (method, path) {
+            ("PROPFIND", "/in/") => ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/in/</d:href><d:propstat><d:prop><c:schedule-default-calendar-URL><d:href>/cal/home/</d:href></c:schedule-default-calendar-URL></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into()),
+            ("PROPFIND", _) => ("207 Multi-Status", principal.into()),
+            ("POST", "/out/") => ("200 OK", only_cy.clone()),
+            _ => ("404 Not Found", String::new()),
+        });
+        let srv = Server { url: format!("http://127.0.0.1:{port}/p/ana/"), user: "ana".into(), ..Default::default() };
+        let tls = || native_tls::TlsConnector::new().unwrap();
+        let (addresses, default) = scheduling_identity(&srv, "secret", tls())?;
+        assert_eq!(addresses, ["ana@example.org", "a.lopez@example.org"]);
+        assert_eq!(default, Some(format!("http://127.0.0.1:{port}/cal/home/")));
+        // Nobody could be asked: said so.
+        let err = free_busy(&srv, "secret", tls(), "ana@example.org", &["bo@example.se".into(), "cy@elsewhere.example".into()], 0, 3600).unwrap_err();
+        assert!(err.to_string().contains("bo@example.se, cy@elsewhere.example are"), "{err}");
+        // The identity: principal and address set, then the inbox's
+        // principal, its URL and the inbox; free-busy: the outbox's
+        // principal and URL, and the POST.
+        let seen: Vec<String> = server.join().unwrap().iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+        assert_eq!(seen.iter().filter(|r| *r == "POST /out/").count(), 1);
+        assert_eq!(seen.len(), 8);
         Ok(())
     }
 
