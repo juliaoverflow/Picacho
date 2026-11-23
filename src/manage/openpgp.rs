@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 pub mod keys;
 mod nested;
 mod signers;
+mod v6;
 
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]
