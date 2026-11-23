@@ -1,0 +1,19 @@
+From: Ana <ana@example.org>
+To: bo@example.se
+Subject: Plans
+MIME-Version: 1.0
+Content-Disposition: attachment; filename="smime.p7m"
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"
+Content-Transfer-Encoding: base64
+
+MIIB1gYJKoZIhvcNAQcDoIIBxzCCAcMCAQAxggFOMIIBSgIBADAyMBoxGDAWBgNV
+BAMMD1BpY2FjaG8gVGVzdCBDQQIUB2tQHYp14iuZq0LV+Y+mcRF0f/kwDQYJKoZI
+hvcNAQEHMAAEggEAYQMTP1LfZMi7r+bZCLMAI83FO4hRs1lG6ZT/XybwjNpDjIqZ
+mmhNe+5bRQHKOrNhsNhN3XY2Chp/6Am1GrOCjdXhRJ9F4OxW2apyPbxM56II9DOK
+gzDdLoBOzQNuKzmpP6aOBgDmXfs6yAxCF4na1yksNdugP85fVV1xFI+rtTd/Ln29
+qCLcL/4z3TsuVc0ETfseIRebTYyJrvhzMbu0PVNnFZejYayGRdTOgliqs/L88+dC
+LKqIRYHXBao7HL34ftWIlRN1c03MoW//+Jj1oKgKY/gjtRwVjAmOgBfA4R1EmZRT
+gpboxTvDKLrlrRErXtUEzQkOPloPr93gOZ0SNzBsBgkqhkiG9w0BBwEwHQYJYIZI
+AWUDBAEqBBAIbWGBpxBF9ispht+b4pDygEAnNOpAT0DKVwP98Mnaz4s7eZDP9EcV
+jyFJXOR0/RamnziMxfmvVDOJmqpb5SM1SLl1OjwyK8THedITie07meLc
+
