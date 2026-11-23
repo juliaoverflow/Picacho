@@ -1225,8 +1225,10 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
 /// Every card in the account's address books, each with its id (in
 /// `href`, as `jmap:<id>`) and its own version (`etag`). Read in pieces
 /// the server takes (`maxObjectsInGet`). Returns the cards, the book new
-/// cards go to, and the ContactCard state they were read in.
-pub fn cards_in(s: &Session) -> Result<(Vec<Card>, String, String)> {
+/// cards go to, and the ContactCard state they were read in. Photos kept
+/// as blobs are reused from `known` (the cards as last read) where the
+/// blob is the same.
+pub fn cards_in(s: &Session, known: &[Card]) -> Result<(Vec<Card>, String, String)> {
     let account = s.contacts_account().context("This JMAP server has no contacts.")?;
     let books = address_books(s)?;
     // Every id by query, then the cards in pieces; a server without
@@ -1247,38 +1249,65 @@ pub fn cards_in(s: &Session) -> Result<(Vec<Card>, String, String)> {
         state = v["state"].as_str().unwrap_or_default().to_owned();
     }
     let mut out: Vec<Card> = list.iter().map(jmap_card).collect();
-    // Photos the server keeps as blobs (RFC 9610 §2.2: `media`'s `blobId`),
-    // inlined as the vCard path has them; a few hundred at most per read.
-    let mut fetched = 0;
-    for (card, raw) in out.iter_mut().zip(&list) {
-        if !card.photo.is_empty() || fetched >= 200 {
-            continue;
-        }
-        let Some((blob, kind)) = raw["media"].as_object().into_iter().flatten().find_map(|(_, m)| {
-            (m["kind"].as_str() == Some("photo"))
-                .then(|| Some((m["blobId"].as_str()?.to_owned(), m["mediaType"].as_str().unwrap_or("image/jpeg").to_owned())))
-                .flatten()
-        }) else {
-            continue;
-        };
-        fetched += 1;
-        if let Ok(bytes) = s.download_in(account, &blob, "photo", &kind, 1 << 20) {
-            use base64::Engine as _;
-            card.photo = format!(
-                "data:{kind};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            );
-            // Not a change of the photo: the card still came with a blob.
-            card.photo_blob = blob;
-            card.photo_read = card.photo.clone();
-        }
-    }
+    fill_photos(s, account, &mut out, &list, known);
     let book = books
         .iter()
         .find(|b| b.writable)
         .map(|b| format!("jmap:{}", b.id))
         .unwrap_or_default();
     Ok((out, book, state))
+}
+/// The most photos downloaded in one read; the rest come on later reads.
+const PHOTOS_PER_READ: usize = 200;
+/// A card's photo kept as a blob (RFC 9610 §2.2: `media`'s `blobId`):
+/// the blob id and its media type.
+fn photo_blob(raw: &Value) -> Option<(String, String)> {
+    raw["media"].as_object().into_iter().flatten().find_map(|(_, m)| {
+        (m["kind"].as_str() == Some("photo"))
+            .then(|| Some((m["blobId"].as_str()?.to_owned(), m["mediaType"].as_str().unwrap_or("image/jpeg").to_owned())))
+            .flatten()
+    })
+}
+/// Inlines the photos the server keeps as blobs, as the vCard path has
+/// them. A photo already read from the same blob is reused from `known`
+/// (RFC 8620 §6: a blob id names data that never changes); the others are
+/// downloaded several at once, up to `PHOTOS_PER_READ`.
+fn fill_photos(s: &Session, account: &str, cards: &mut [Card], raw: &[Value], known: &[Card]) {
+    use base64::Engine as _;
+    let cached: std::collections::HashMap<&str, &Card> = known
+        .iter()
+        .filter(|k| !k.photo_blob.is_empty() && !k.photo_read.is_empty())
+        .map(|k| (k.photo_blob.as_str(), k))
+        .collect();
+    let mut wanted: Vec<(usize, String, String)> = Vec::new();
+    for (i, (card, raw)) in cards.iter_mut().zip(raw).enumerate() {
+        if !card.photo.is_empty() {
+            continue;
+        }
+        let Some((blob, kind)) = photo_blob(raw) else { continue };
+        if let Some(k) = cached.get(blob.as_str()) {
+            // What was read from the blob, not a local edit of it.
+            card.photo = k.photo_read.clone();
+            card.photo_read = card.photo.clone();
+            card.photo_blob = blob;
+        } else if wanted.len() < PHOTOS_PER_READ {
+            wanted.push((i, blob, kind));
+        }
+    }
+    let downloaded = s.in_parallel(&wanted, |(_, blob, kind)| {
+        s.download_in(account, blob, "photo", kind, 1 << 20).ok()
+    });
+    for ((i, blob, kind), bytes) in wanted.into_iter().zip(downloaded) {
+        let Some(bytes) = bytes else { continue };
+        let card = &mut cards[i];
+        card.photo = format!(
+            "data:{kind};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        // Not a change of the photo: the card still came with a blob.
+        card.photo_blob = blob;
+        card.photo_read = card.photo.clone();
+    }
 }
 fn jmap_card(c: &Value) -> Card {
     let mut card = from_jscontact(c);
@@ -1290,8 +1319,9 @@ fn jmap_card(c: &Value) -> Card {
 }
 /// What changed among the cards since `since` (ContactCard/changes): the
 /// cards created or changed, the hrefs (`jmap:<id>`) of those gone, and the
-/// new state. `None` when the server can't say.
-pub fn card_changes(s: &Session, since: &str) -> Result<Option<CardChanges>> {
+/// new state. `None` when the server can't say. Photos are as `cards_in`
+/// reads them.
+pub fn card_changes(s: &Session, since: &str, known: &[Card]) -> Result<Option<CardChanges>> {
     let account = s.contacts_account().context("This JMAP server has no contacts.")?;
     let Some(changed) = changes(s, "ContactCard/changes", account, since)? else {
         return Ok(None);
@@ -1302,7 +1332,9 @@ pub fn card_changes(s: &Session, since: &str) -> Result<Option<CardChanges>> {
         .iter()
         .map(|id| format!("jmap:{id}"))
         .collect();
-    Ok(Some((list.iter().map(jmap_card).collect(), gone, changed.state)))
+    let mut cards: Vec<Card> = list.iter().map(jmap_card).collect();
+    fill_photos(s, account, &mut cards, &list, known);
+    Ok(Some((cards, gone, changed.state)))
 }
 
 /// Creates or changes a card; returns it as saved.

@@ -66,6 +66,8 @@ struct Server {
     dav_log: Vec<(u64, char, String, bool)>,
     /// The most results one /query returns, as a server's own limit.
     query_limit: usize,
+    /// Blob ids downloaded, in order.
+    downloads: Vec<String>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -734,6 +736,7 @@ impl Server {
             && let Some(rest) = path.strip_prefix("/download/u1/")
         {
             let blob = rest.split('/').next().unwrap();
+            self.downloads.push(blob.to_owned());
             return match self.blobs.get(blob) {
                 Some(b) => (200, b.clone()),
                 None => (404, Vec::new()),
@@ -1706,5 +1709,63 @@ fn jmap_calendars_and_contacts_sync_by_changes() -> Result<()> {
         let sets = s.calls.iter().filter(|c| *c == "ContactCard/set").count();
         assert_eq!(sets, 0, "not overwritten: {:?}", s.calls);
     }
+    Ok(())
+}
+
+/// Contact photos the server keeps as blobs are downloaded once, several
+/// at a time, and reused on later reads while the blob is the same.
+#[test]
+fn jmap_contact_photos_download_once_and_are_reused() -> Result<()> {
+    let mut fixture = Server {
+        modern: true,
+        dav_changes: true,
+        ..Default::default()
+    };
+    for i in 0..6 {
+        let blob = format!("P{i}");
+        fixture.blobs.insert(blob.clone(), format!("photo {i}").into_bytes());
+        fixture.cards.push(json!({
+            "@type": "Card", "id": format!("K{i}"), "uid": format!("u{i}"), "name": { "full": format!("Person {i}") },
+            "media": { "p": { "@type": "Media", "kind": "photo", "blobId": blob, "mediaType": "image/png" } },
+        }));
+    }
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    assert_eq!(b.connect_jmap_contacts(&a)?, 6);
+    {
+        let mut downloads = server.lock().unwrap().downloads.clone();
+        downloads.sort();
+        assert_eq!(downloads, ["P0", "P1", "P2", "P3", "P4", "P5"]);
+    }
+    let three = b.contacts().into_iter().find(|c| c.name == "Person 3").unwrap();
+    assert_eq!(three.photo_bytes().as_deref(), Some(&b"photo 3"[..]));
+    assert_eq!(three.photo_blob, "P3");
+    // Read again: the photos are already here.
+    {
+        let mut s = server.lock().unwrap();
+        s.downloads.clear();
+        // One photo is replaced by a new blob, which is downloaded.
+        s.blobs.insert("P9".into(), b"photo 9".to_vec());
+        s.cards[1]["media"]["p"]["blobId"] = json!("P9");
+        s.cards[3]["name"]["full"] = json!("Person 3b");
+        s.dav_state += 1;
+        let state = s.dav_state;
+        s.dav_log.push((state, 'k', "K1".into(), false));
+        s.dav_log.push((state, 'k', "K3".into(), false));
+    }
+    b.sync_contacts()?;
+    assert_eq!(server.lock().unwrap().downloads, ["P9"]);
+    let one = b.contacts().into_iter().find(|c| c.name == "Person 1").unwrap();
+    assert_eq!(one.photo_bytes().as_deref(), Some(&b"photo 9"[..]));
+    // Changed, but its photo is the same blob: not downloaded again.
+    let three = b.contacts().into_iter().find(|c| c.name == "Person 3b").unwrap();
+    assert_eq!(three.photo_bytes().as_deref(), Some(&b"photo 3"[..]));
+    // A photo kept from before isn't an edit: saving leaves `media` alone.
+    b.save_contact(three)?;
+    assert_eq!(server.lock().unwrap().cards[3]["media"]["p"]["blobId"], "P3");
     Ok(())
 }

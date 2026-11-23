@@ -331,6 +331,9 @@ pub struct Session {
     /// bytes (`maxCallsInRequest`, `maxSizeRequest`).
     max_calls: usize,
     max_request: usize,
+    /// RFC 8620 §2: the most requests the server takes at once from one
+    /// client (`maxConcurrentRequests`).
+    max_concurrent_requests: usize,
     /// The session resource's state when it was read. A response naming
     /// another one means the session changed (new addresses, limits or
     /// accounts): `stale` is set, and the session is read again.
@@ -662,6 +665,9 @@ impl Session {
             // RFC 8620 asks servers for at least 16 calls and 10 MB.
             max_calls: usize_of(&core["maxCallsInRequest"], 16),
             max_request: usize_of(&core["maxSizeRequest"], 10_000_000),
+            // RFC 8620 §2: servers SHOULD take at least 4; more than 8 at
+            // once is never needed here.
+            max_concurrent_requests: usize_of(&core["maxConcurrentRequests"], 4).min(8),
             session_state: v["state"].as_str().unwrap_or_default().to_owned(),
             stale: std::sync::atomic::AtomicBool::new(false),
             websocket_url: caps[WEBSOCKET]["url"]
@@ -1585,6 +1591,12 @@ impl Session {
     pub fn max_get(&self) -> usize {
         self.max_get.max(1)
     }
+    /// Runs `work` on each item, as many at once as the server takes
+    /// requests (RFC 8620 §2: `maxConcurrentRequests`), returning the
+    /// results in the items' order.
+    pub fn in_parallel<T: Sync, R: Send>(&self, items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+        bounded_parallel(items, self.max_concurrent_requests, work)
+    }
     /// The sign-in's calendar account, where the server has calendars.
     pub fn calendars_account(&self) -> Option<&str> {
         self.calendars_account
@@ -2404,8 +2416,36 @@ fn state_change_for(data: &str, account: &str) -> bool {
         .is_some_and(|types| types.contains_key("Email") || types.contains_key("Mailbox"))
 }
 
-/// Whether a method call's arguments use an earlier call's result (a
-/// back-reference, `#name`).
+/// Runs `work` on each item on at most `workers` threads at once, returning
+/// the results in the items' order.
+fn bounded_parallel<T: Sync, R: Send>(items: &[T], workers: usize, work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = workers.clamp(1, items.len().max(1));
+    if workers == 1 {
+        return items.iter().map(work).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = work(item);
+                    results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .map(|r| r.expect("every item was worked on"))
+        .collect()
+}
+
 /// Whether a call uses another's result: a back-reference (`#ids`), or a
 /// creation id another call made (`"#m"` as a value, RFC 8620 §5.3).
 fn uses_results(args: &Value) -> bool {
@@ -2613,6 +2653,26 @@ mod tests {
         assert!(read_events(endless.as_bytes(), &stop, "A1", &Default::default(), &mut || Ok(())).is_err());
         let long_line = format!("data: {}", "x".repeat(2 << 20));
         assert!(read_events(long_line.as_bytes(), &stop, "A1", &Default::default(), &mut || Ok(())).is_err());
+    }
+
+    /// Work runs on no more threads than asked, and results keep the
+    /// items' order.
+    #[test]
+    fn bounded_parallel_keeps_order_and_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let running = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..40).collect();
+        let out = bounded_parallel(&items, 3, |n| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(2));
+            running.fetch_sub(1, Ordering::SeqCst);
+            n * 2
+        });
+        assert_eq!(out, items.iter().map(|n| n * 2).collect::<Vec<_>>());
+        assert!(most.load(Ordering::SeqCst) <= 3);
+        assert!(bounded_parallel(&[] as &[usize], 4, |n| *n).is_empty());
     }
 
     #[test]

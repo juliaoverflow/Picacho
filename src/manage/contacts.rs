@@ -220,7 +220,7 @@ impl Backend {
             let known: Vec<Card> = self.contacts().into_iter().filter(from_server).collect();
             let (cards, book, state) = self.with_jmap_contacts(&a, |s| {
                 if let Some(since) = &since
-                    && let Some((changed, gone, state)) = crate::sync::jscal::card_changes(s, since)?
+                    && let Some((changed, gone, state)) = crate::sync::jscal::card_changes(s, since, &known)?
                 {
                     let gone: std::collections::HashSet<&str> = gone.iter().map(String::as_str).collect();
                     let replaced: std::collections::HashSet<&str> =
@@ -232,7 +232,7 @@ impl Backend {
                     cards.extend(changed);
                     return Ok((cards, String::new(), state));
                 }
-                crate::sync::jscal::cards_in(s)
+                crate::sync::jscal::cards_in(s, &known)
             })?;
             let mut changed = false;
             if !book.is_empty() && (server.book.is_empty() || !server.book.starts_with("jmap:")) {
