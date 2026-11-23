@@ -649,7 +649,7 @@ pub(crate) struct DnsKeys {
 /// The keys of a validated answer: none where DNSSEC found it bogus (forged
 /// or broken; not offered even as unverified), else all, marked as
 /// validated only when secure.
-fn dns_keys(keys: Vec<Vec<u8>>, validation: Validation) -> DnsKeys {
+pub(crate) fn dns_keys(keys: Vec<Vec<u8>>, validation: Validation) -> DnsKeys {
     match validation {
         Validation::Bogus => DnsKeys::default(),
         v => DnsKeys {

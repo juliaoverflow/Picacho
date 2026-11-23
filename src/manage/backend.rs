@@ -1152,8 +1152,8 @@ impl Backend {
         let mut found = Vec::new();
         for email in missing {
             let Ok(tls) = self.tls_connector() else { break };
-            if let Ok(Some((data, _))) = crate::sync::keys::lookup(email, tls)
-                && next.add_found(email, &data).unwrap_or(false)
+            if let Ok(Some((data, source))) = crate::sync::keys::lookup(email, tls)
+                && next.add_found_from(email, &data, source).unwrap_or(false)
             {
                 found.push(email.clone());
             }

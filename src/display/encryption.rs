@@ -487,7 +487,7 @@ impl MailApp {
                             .with_context(|| format!("No key was found for {email}."))?;
                         let mut ring = Keyring::clone(&b.keyring());
                         anyhow::ensure!(
-                            ring.add_found(&email, &found.0)?,
+                            ring.add_found_from(&email, &found.0, found.1)?,
                             "You already have a key for {email} that you imported yourself."
                         );
                         b.set_keyring(ring)?;

@@ -97,6 +97,26 @@ impl Source {
             Self::KeysOpenpgpOrg => "keys.openpgp.org",
         }
     }
+    /// Whether the address's domain itself vouches for a key from here:
+    /// only a DNS answer DNSSEC validated to the root (RFC 7929 §7, RFC
+    /// 8162 §9). Every other source is unverified until compared with the
+    /// key's owner.
+    pub fn domain_vouched(self) -> bool {
+        matches!(self, Self::Dane { dnssec_validated: true })
+    }
+}
+
+/// The key a DNS lookup gives (OPENPGPKEY, RFC 7929), and its source:
+/// validated or not as DNSSEC said. A bogus answer has no keys (see
+/// `auth::dns_keys`), so it gives none here, not even unverified.
+fn dane_found(found: super::auth::DnsKeys) -> Option<(Vec<u8>, Source)> {
+    let key = found.keys.into_iter().find(|k| !k.is_empty())?;
+    Some((
+        key,
+        Source::Dane {
+            dnssec_validated: found.dnssec_validated,
+        },
+    ))
 }
 
 /// Looks for `email`'s key on the network: its domain's WKD, then
@@ -131,14 +151,9 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
     // The domain's DNS (RFC 7929), where it publishes keys there; none
     // from an answer DNSSEC found bogus.
     if let Ok(found) = super::auth::openpgpkey(email)
-        && let Some(key) = found.keys.into_iter().find(|k| !k.is_empty())
+        && let Some(found) = dane_found(found)
     {
-        return Ok(Some((
-            key,
-            Source::Dane {
-                dnssec_validated: found.dnssec_validated,
-            },
-        )));
+        return Ok(Some(found));
     }
     let url = format!(
         "https://keys.openpgp.org/vks/v1/by-email/{}",
@@ -332,5 +347,24 @@ mod tests {
         let header = autocrypt_header("ana@example.org", &[0, 1, 2, 3]);
         let back = format!("From: ana@example.org\r\nAutocrypt: {header}\r\n\r\n");
         assert_eq!(autocrypt(back.as_bytes()).unwrap().1, vec![0, 1, 2, 3]);
+    }
+
+    /// RFC 7929 §7: a DNS-published key is the domain's word only when
+    /// DNSSEC validated the answer; an insecure one is unverified, and a
+    /// bogus one gives no key at all (the lookup goes on to the keyserver).
+    #[test]
+    fn dns_keys_are_trusted_only_when_dnssec_validated() {
+        use super::super::auth::{Validation, dns_keys};
+        let key = vec![vec![1u8, 2, 3]];
+        let secure = dane_found(dns_keys(key.clone(), Validation::Secure)).unwrap();
+        assert_eq!(secure, (key[0].clone(), Source::Dane { dnssec_validated: true }));
+        assert!(secure.1.domain_vouched());
+        let insecure = dane_found(dns_keys(key.clone(), Validation::Insecure)).unwrap();
+        assert_eq!(insecure.1, Source::Dane { dnssec_validated: false });
+        assert!(!insecure.1.domain_vouched());
+        assert_eq!(dane_found(dns_keys(key, Validation::Bogus)), None);
+        assert_eq!(dane_found(dns_keys(vec![Vec::new()], Validation::Secure)), None);
+        assert!(!Source::Wkd.domain_vouched());
+        assert!(!Source::KeysOpenpgpOrg.domain_vouched());
     }
 }

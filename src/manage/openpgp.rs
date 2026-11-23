@@ -19,6 +19,8 @@ use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::types::{KeyDetails, Password};
 use serde::{Deserialize, Serialize};
 
+mod autocrypt;
+
 /// The keychain entry holding the keyring.
 #[cfg_attr(test, allow(dead_code))]
 const KEYRING: &str = "openpgp:keyring";
@@ -40,6 +42,11 @@ pub struct Keyring {
     /// as checked: they no longer count as unverified.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified: Vec<String>,
+    /// Fingerprints of found keys the address's domain published in DNS
+    /// that DNSSEC validated (RFC 7929 §7): the domain vouches for them,
+    /// so they don't count as unverified either (see `checked`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dnssec: Vec<String>,
 }
 
 /// One key, as Settings lists it.
@@ -177,7 +184,7 @@ impl Keyring {
             let fp = fingerprint(&k);
             out.push(KeyInfo {
                 found: self.found.contains(&fp),
-                verified: !self.found.contains(&fp) || self.verified.contains(&fp),
+                verified: !self.found.contains(&fp) || self.checked(&fp),
                 fingerprint: fp,
                 users: users(&k),
                 secret: false,
@@ -267,7 +274,7 @@ impl Keyring {
             SignedPublicKey::from_string(k).is_ok_and(|(k, _)| {
                 let f = fingerprint(&k);
                 has_address(&k, email)
-                    && (!self.found.contains(&f) || (self.verified.contains(&f) && f != fp))
+                    && (!self.found.contains(&f) || (self.checked(&f) && f != fp))
             })
         });
         if kept {
@@ -297,6 +304,7 @@ impl Keyring {
             })
             .collect();
         self.verified.retain(|f| kept.contains(f));
+        self.dnssec.retain(|f| kept.contains(f));
         Ok(true)
     }
     /// Your public key for `email`, binary, as Autocrypt sends it.
@@ -349,7 +357,7 @@ impl Keyring {
             .filter(|e| {
                 self.key_for(e).is_some_and(|k| {
                     let fp = fingerprint(&k);
-                    self.found.contains(&fp) && !self.verified.contains(&fp)
+                    self.found.contains(&fp) && !self.checked(&fp)
                 })
             })
             .cloned()
@@ -359,6 +367,7 @@ impl Keyring {
     pub fn remove(&mut self, fp: &str) {
         self.found.retain(|f| f != fp);
         self.verified.retain(|f| f != fp);
+        self.dnssec.retain(|f| f != fp);
         self.secret.retain(|k| {
             SignedSecretKey::from_string(k)
                 .map(|(k, _)| fingerprint(&SignedPublicKey::from(k)) != fp)
