@@ -237,7 +237,7 @@ fn bcc_never_goes_out_but_stays_in_sent() -> Result<()> {
     Ok(())
 }
 
-fn keyring_for(people: &[&str]) -> Result<(crate::manage::openpgp::Keyring, Vec<pgp::composed::SignedSecretKey>)> {
+pub(super) fn keyring_for(people: &[&str]) -> Result<(crate::manage::openpgp::Keyring, Vec<pgp::composed::SignedSecretKey>)> {
     use crate::manage::openpgp::{Keyring, test_key};
     use pgp::composed::SignedPublicKey;
     let me = test_key("QA <qa@example.com>", "");
@@ -253,7 +253,7 @@ fn keyring_for(people: &[&str]) -> Result<(crate::manage::openpgp::Keyring, Vec<
 }
 
 /// Whether `key` opens `raw`.
-fn opens(raw: &[u8], key: &pgp::composed::SignedSecretKey) -> bool {
+pub(super) fn opens(raw: &[u8], key: &pgp::composed::SignedSecretKey) -> bool {
     let mut ring = crate::manage::openpgp::Keyring::default();
     ring.import(&key.to_armored_string(Default::default()).unwrap(), "").unwrap();
     crate::manage::openpgp::open(raw, &ring).is_some_and(|(_, v)| v.decrypted)
@@ -373,12 +373,22 @@ fn encrypted_bcc_is_refused_where_the_service_sends_one_copy() -> Result<()> {
         encrypt: true,
         ..Draft::default()
     };
-    for (provider, name) in [(Provider::Proton, "Proton"), (Provider::Jmap, "this JMAP server")] {
+    // Proton refuses; a JMAP server is sent a copy per Bcc recipient
+    // (`encrypted_bcc_over_jmap_goes_to_each_alone` in jmap_tests), so it
+    // goes on to the server and fails here only for want of one.
+    for (provider, name) in [(Provider::Proton, Some("Proton")), (Provider::Jmap, None)] {
         a.provider = provider;
         // Nothing listens on port 1: any network call would fail otherwise.
         a.incoming_port = 1;
         a.smtp_port = 1;
         let error = b.send(&a, &d).unwrap_err();
+        let Some(name) = name else {
+            assert!(
+                error.downcast_ref::<crate::sync::smtp::EncryptedBccUnsupported>().is_none(),
+                "{error:#}"
+            );
+            continue;
+        };
         let refusal = error
             .downcast_ref::<crate::sync::smtp::EncryptedBccUnsupported>()
             .unwrap_or_else(|| panic!("{error:#}"));

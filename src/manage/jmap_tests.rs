@@ -123,7 +123,7 @@ impl Server {
             "urn:ietf:params:jmap:mail": {},
             "urn:ietf:params:jmap:submission": {
                 "maxDelayedSend": 86400,
-                "submissionExtensions": { "DSN": [], "REQUIRETLS": [], "FUTURERELEASE": ["86400"] },
+                "submissionExtensions": { "DSN": [], "REQUIRETLS": [], "FUTURERELEASE": ["86400"], "DELIVERBY": ["600"] },
             },
             "urn:ietf:params:jmap:vacationresponse": {},
             "urn:ietf:params:jmap:mdn": {},
@@ -2878,5 +2878,89 @@ fn jmap_calendars_and_contacts_changes_copy_parse_and_sharing() -> Result<()> {
     let limits = jscal::collection_limits(&json!({ "maxCalendarsPerEvent": 1, "mayCreateCalendar": false }), "Calendar");
     assert_eq!(limits, jscal::CollectionLimits { max_per_item: Some(1), may_create: false });
     assert_eq!(jscal::collection_limits(&json!({}), "AddressBook"), jscal::CollectionLimits { max_per_item: None, may_create: true });
+    Ok(())
+}
+
+/// Encrypted with Bcc over JMAP (RFC 5322 §3.6.3, RFC 8621 §7.5): as over
+/// SMTP, To gets a copy encrypted to them, and each Bcc recipient a copy of
+/// their own, encrypted to them alone; each submission's copy is destroyed
+/// once sent, none has a Bcc field, and Sent gets one copy, with its Bcc.
+#[test]
+fn encrypted_bcc_over_jmap_goes_to_each_alone() -> Result<()> {
+    use super::smtp_tests::{keyring_for, opens};
+    let (cert, port, server, _running) = start(Server::default())?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let (ring, keys) = keyring_for(&["Ana <ana@example.com>", "Bo <bo@example.com>", "Di <di@example.com>"])?;
+    b.set_keyring(ring)?;
+    let d = Draft {
+        id: "jmap-bcc".into(),
+        account: a.id.clone(),
+        to: "Ana <ana@example.com>".into(),
+        bcc: "bo@example.com, di@example.com".into(),
+        subject: "Sealed".into(),
+        body: "Only for some.".into(),
+        encrypt: true,
+        ..Draft::default()
+    };
+    b.store.save_draft(&d)?;
+    b.send(&a, &d)?;
+    let s = server.lock().unwrap();
+    let rcpts: Vec<Vec<String>> = s.sent.iter().map(|(_, _, to)| to.clone()).collect();
+    assert_eq!(rcpts, [vec!["ana@example.com".to_owned()], vec!["bo@example.com".into()], vec!["di@example.com".into()]]);
+    // The submitted copies are gone; one copy is left, in Sent.
+    assert_eq!(s.emails.len(), 1, "{:?}", s.emails.iter().map(|e| &e.mailboxes).collect::<Vec<_>>());
+    assert_eq!(s.emails[0].mailboxes, ["s"]);
+    let filed = &s.blobs[&s.emails[0].blob];
+    assert!(filed.starts_with(b"Bcc: "), "{}", String::from_utf8_lossy(&filed[..80]));
+    // Each copy uploaded: only its recipient's key opens it, and it shows
+    // no Bcc. Uploads are kept by blob id, in the order they were sent.
+    let [ana, bo, di] = [&keys[0], &keys[1], &keys[2]];
+    let copies: Vec<&Vec<u8>> = s.blobs.values().filter(|raw| !raw.starts_with(b"Bcc: ")).collect();
+    assert_eq!(copies.len(), 3);
+    let opened = |key| copies.iter().filter(|raw| opens(raw, key)).count();
+    assert_eq!((opened(ana), opened(bo), opened(di)), (1, 1, 1));
+    for raw in &copies {
+        let text = String::from_utf8_lossy(raw);
+        // Encrypted copies show only their outer headers: To, no Bcc.
+        let headers = text.split("\r\n\r\n").next().unwrap_or_default().to_ascii_lowercase();
+        assert!(!headers.starts_with("bcc:") && !headers.contains("\r\nbcc:"), "{headers}");
+        assert!(text.contains("To: Ana <ana@example.com>"), "{text}");
+    }
+    Ok(())
+}
+
+/// A delivery time limit reaches a JMAP submission's envelope as BY (RFC
+/// 2852 §4 through RFC 8621 §7), at least the server's least by-time for
+/// R mode, and not with a message held for later.
+#[test]
+fn jmap_submissions_carry_the_delivery_time_limit() -> Result<()> {
+    let (cert, port, server, _running) = start(Server { modern: true, ..Default::default() })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let by = |a: &Account| crate::sync::jmap::SendOptions {
+        deliver_by: crate::sync::smtp::DeliverBy::of(a),
+        ..Default::default()
+    };
+    a.deliver_within_hours = 4;
+    a.deliver_late_notify = true;
+    b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &by(&a))?;
+    a.deliver_within_hours = 0;
+    b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &by(&a))?;
+    a.deliver_within_hours = 4;
+    let held = crate::sync::jmap::SendOptions {
+        hold_until: Some(chrono::Utc::now().timestamp() + 3600),
+        ..by(&a)
+    };
+    b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &held)?;
+    let s = server.lock().unwrap();
+    let params = |i: usize| s.envelopes[i]["mailFrom"]["parameters"].clone();
+    assert_eq!(params(0)["BY"], json!("14400;N"));
+    assert!(params(1).get("BY").is_none(), "{}", params(1));
+    assert!(params(2).get("BY").is_none() && params(2).get("HOLDUNTIL").is_some(), "{}", params(2));
     Ok(())
 }

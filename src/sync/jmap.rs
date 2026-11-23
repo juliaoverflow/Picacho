@@ -1914,6 +1914,19 @@ impl Session {
                 json!(when.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             );
         }
+        // RFC 2852 §4 through RFC 8621 §7's envelope parameters: the
+        // server's least by-time is its DELIVERBY argument. Not with a
+        // hold, whose wait would count against the limit.
+        if let Some(by) = options.deliver_by
+            && options.hold_until.is_none()
+            && self.submits_with("DELIVERBY")
+        {
+            let minimum = self.submission_extensions["DELIVERBY"]
+                .first()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            from_params.insert("BY".into(), json!(by.parameter(minimum)));
+        }
         let mail_from = if from_params.is_empty() {
             json!({ "email": from })
         } else {
@@ -3573,6 +3586,9 @@ pub struct SendOptions {
     /// `onSuccessDestroyEmail`), rather than filed in Sent. Backend-only
     /// until the UI calls it: no setting asks for this yet.
     pub keep_no_copy: bool,
+    /// A delivery time limit (DELIVERBY, RFC 2852), sent as the envelope's
+    /// BY parameter (RFC 8621 §7) where the server offers it.
+    pub deliver_by: Option<crate::sync::smtp::DeliverBy>,
 }
 
 /// A submission the server took.

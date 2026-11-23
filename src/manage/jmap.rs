@@ -1093,6 +1093,63 @@ impl Backend {
         })
     }
 
+    /// Encrypted with Bcc (RFC 5322 §3.6.3): as SMTP does, the To/Cc copy
+    /// is encrypted to them only, and each Bcc recipient gets a copy of
+    /// their own, encrypted to them alone and the sender, with the same
+    /// Message-ID. Each submission's copy is destroyed once sent (RFC 8621
+    /// §7.5, `onSuccessDestroyEmail`), and the sender's own copy, with its
+    /// Bcc field, is filed in Sent once. What was filed, and whether
+    /// delivery reports were asked for.
+    pub(super) fn send_jmap_bcc_apart(
+        &self,
+        a: &Account,
+        d: &Draft,
+        options: &jmap::SendOptions,
+    ) -> Result<(Vec<u8>, bool)> {
+        use crate::sync::smtp;
+        let visible = Draft { bcc: String::new(), ..d.clone() };
+        let message_id = smtp::new_message_id(&smtp::from_address(a, d)?);
+        let (ring, certs) = (self.keyring(), self.certificates());
+        let keys = smtp::Keys { ring: &ring, certs: &certs };
+        let options = jmap::SendOptions { keep_no_copy: true, ..options.clone() };
+        let submit = |only_to: Option<&str>| -> Result<(Vec<u8>, jmap::Submitted)> {
+            let message = smtp::build_to(a, &visible, false, only_to, Some(&message_id))?;
+            let raw = smtp::protected(&message, &visible, &keys)?;
+            let envelope = message.envelope();
+            let from = envelope.from().map(|f| f.to_string()).context("The message has no sender.")?;
+            let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
+            let submitted = self.send_jmap(a, &from, &to, &raw, &options)?;
+            self.note_submission(a, &message_id, &submitted.id);
+            Ok((raw, submitted))
+        };
+        let mut first: Option<(Vec<u8>, bool)> = None;
+        if !smtp::recipients(&d.to)?.is_empty() || !smtp::recipients(&d.cc)?.is_empty() {
+            let (raw, submitted) = submit(None)?;
+            first = Some((raw, submitted.receipts));
+        }
+        for (_, address) in smtp::recipients(&d.bcc)? {
+            let sent = submit(Some(&address));
+            let (raw, submitted) = match first {
+                Some(_) => sent.with_context(|| {
+                    format!("The message went to its other recipients, but not to {address}.")
+                })?,
+                None => sent?,
+            };
+            first.get_or_insert((raw, submitted.receipts));
+        }
+        let (raw, receipts) = first.context("Add at least one recipient.")?;
+        // The sender's copy shows whom it also went to. Sent once every
+        // copy is: from here on a failure is noted, never an error that
+        // would invite sending it again.
+        // Kept to try again with the next mail check, as other sent copies
+        // are.
+        let filed = smtp::with_bcc(raw, d)?;
+        if self.file_sent_copy_jmap(a, &filed).is_err() {
+            let _ = self.queue_sent_copy(&a.id, &filed);
+        }
+        Ok((filed, receipts))
+    }
+
     /// Messages the JMAP server holds to send later (handed over with
     /// HOLDUNTIL) or is still trying: (submission id, subject, when).
     pub fn held_submissions(&self, a: &Account) -> Result<Vec<HeldSubmission>> {

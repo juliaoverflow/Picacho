@@ -62,7 +62,7 @@ pub(crate) fn build(a: &Account, d: &Draft, draft: bool) -> Result<Message> {
 /// names that one address. RFC 5322 §3.6.3: a Bcc recipient's own copy
 /// of a message whose other copy has no Bcc field. `message_id`, when
 /// given, is the one all copies of the message share.
-fn build_to(
+pub(crate) fn build_to(
     a: &Account,
     d: &Draft,
     draft: bool,
@@ -744,6 +744,18 @@ impl std::fmt::Display for Refused {
 }
 impl std::error::Error for Refused {}
 
+/// The outgoing server refused to fetch a message by its IMAP URL (BURL,
+/// RFC 4468 §3), as the first transaction: nobody was sent it, so it can
+/// be sent again as itself.
+#[derive(Debug)]
+pub(crate) struct BurlRefused(pub(crate) Refused);
+impl std::fmt::Display for BurlRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for BurlRefused {}
+
 /// A stream whose reads may be told to wait longer than usual.
 trait Patience {
     fn wait_for(&mut self, wait: Option<Duration>);
@@ -1053,10 +1065,12 @@ impl<S: Read + Write + Patience> Session<S> {
         self.flush()?;
         let reply = self.final_reply()?;
         if !reply.positive() {
-            return Err(Refused(format!(
+            // RFC 4468 §3: a refused BURL ends the transaction with nothing
+            // delivered, so the message can still be sent another way.
+            return Err(BurlRefused(Refused(format!(
                 "The server couldn't fetch the message to send: {}",
                 reply.explained()
-            ))
+            )))
             .into());
         }
         Ok(reply)
@@ -1235,7 +1249,7 @@ pub(crate) fn new_message_id(address: &str) -> String {
 }
 /// The address a draft is sent from, as Message-IDs name its domain: the
 /// alias's, else the sending address's or the account's.
-fn from_address(a: &Account, d: &Draft) -> Result<String> {
+pub(crate) fn from_address(a: &Account, d: &Draft) -> Result<String> {
     if !d.send_as.trim().is_empty() {
         return Ok(d.send_as.trim().to_owned());
     }
@@ -1254,7 +1268,7 @@ fn message_id_of(message: &Message) -> String {
 /// `raw` with the draft's Bcc field added in front, for the sender's own
 /// copy; as it is without Bcc recipients. Outside any signature or
 /// encryption, which cover the body part only (RFC 3156 §5, RFC 8551).
-fn with_bcc(raw: Vec<u8>, d: &Draft) -> Result<Vec<u8>> {
+pub(crate) fn with_bcc(raw: Vec<u8>, d: &Draft) -> Result<Vec<u8>> {
     let mut list = lettre::message::Mailboxes::new();
     for (name, address) in recipients(&d.bcc)? {
         list.push(Mailbox::new(name, address.parse()?));
@@ -1510,9 +1524,22 @@ pub(crate) fn deliver_bytes(
             session.data(&bytes)
         };
         if sent == 0 {
+            if let Err(e) = &accepted
+                && e.downcast_ref::<BurlRefused>().is_some()
+            {
+                // Nothing was delivered: the caller may send it as itself.
+                let _ = session.command("QUIT");
+            }
             accepted.context(failed)?;
         } else {
-            accepted.context("The message went to some recipients only.")?;
+            // Some recipients already have it: a refused BURL now is a
+            // partial send, never one to repeat as a whole.
+            accepted
+                .map_err(|e| match e.downcast::<BurlRefused>() {
+                    Ok(BurlRefused(refused)) => anyhow::Error::new(refused),
+                    Err(e) => e,
+                })
+                .context("The message went to some recipients only.")?;
         }
         sent += 1;
     }
@@ -2636,6 +2663,22 @@ mod tests {
             replies: std::io::Cursor::new(replies.as_bytes().to_vec()),
             written: Vec::new(),
         })
+    }
+
+    /// RFC 4468 §3: a server refusing to fetch the URL is told apart from
+    /// other failures (nothing was delivered, so it can be sent as itself),
+    /// and an accepted BURL is an ordinary reply.
+    #[test]
+    fn refused_burl_is_its_own_error() {
+        let mut s = scripted("554 5.7.0 URL not authorized\r\n");
+        let e = s.burl("imap://ana@imap.example/Sent;UIDVALIDITY=1/;UID=2;urlauth=submit+ana:internal:00").unwrap_err();
+        assert!(e.downcast_ref::<BurlRefused>().is_some(), "{e:#}");
+        assert!(format!("{e:#}").contains("couldn't fetch the message"), "{e:#}");
+        let mut s = scripted("250 2.0.0 Queued\r\n");
+        assert!(s.burl("imap://x").is_ok());
+        // Any other refusal isn't one.
+        let mut s = scripted("554 5.3.4 Too big\r\n");
+        assert!(s.data(b"x").unwrap_err().downcast_ref::<BurlRefused>().is_none());
     }
 
     /// RFC 2034 and RFC 3463: once EHLO offers ENHANCEDSTATUSCODES, every

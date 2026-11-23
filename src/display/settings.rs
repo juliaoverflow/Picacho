@@ -1227,7 +1227,9 @@ impl MailApp {
                 Action::ToggleRequireTls(a.id.clone()),
                 cx,
             ))
-            .when(!matches!(a.provider, Provider::Proton | Provider::Jmap), |page| {
+            // A JMAP server takes it as its submissions' BY parameter
+            // (RFC 8621 §7); Proton has no such option.
+            .when(a.provider != Provider::Proton, |page| {
                 page.child(self.setting(
                     "Give up on delivery after",
                     "Where your outgoing server supports it (DELIVERBY), a message that can't be delivered in time comes back to you instead of arriving late. Servers that don't keep trying for days as usual.",
@@ -1250,7 +1252,7 @@ impl MailApp {
             // RFC 2852 §4: what a late message does, and a trace of its
             // way; only with a time limit.
             .when(
-                !matches!(a.provider, Provider::Proton | Provider::Jmap) && a.deliver_within_hours > 0,
+                a.provider != Provider::Proton && a.deliver_within_hours > 0,
                 |page| {
                     page.child(self.setting(
                         "If it's late",

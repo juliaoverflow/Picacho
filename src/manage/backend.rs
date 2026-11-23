@@ -3918,24 +3918,23 @@ impl Backend {
         }
     }
     fn send_held(&self, a: &Account, d: &Draft, hold_until: Option<i64>) -> Result<Vec<String>> {
-        // Encrypted with Bcc through Proton's or a JMAP server's API: one
-        // message goes to everyone, so it can't be kept from naming the Bcc
-        // recipients' keys (RFC 5322 §3.6.3). Refused before anything is
-        // sent or filed. A sending address with its own server sends by
-        // SMTP, which gives each Bcc recipient a copy of their own.
+        // Encrypted with Bcc through Proton's API: one message goes to
+        // everyone, so it can't be kept from naming the Bcc recipients' keys
+        // (RFC 5322 §3.6.3), and Proton rebuilds each submission from its
+        // Cc header and files each in Sent, so it can't be sent a copy per
+        // recipient either. Refused before anything is sent or filed. A
+        // JMAP server is sent a copy per Bcc recipient (`send_jmap_bcc_apart`);
+        // a sending address with its own server sends by SMTP, which does
+        // the same.
         let own_smtp = d.send_as.trim().is_empty()
             && a.identity(&d.identity).is_some_and(|i| i.smtp.is_some());
-        if a.provider.api_sending()
+        if a.provider == Provider::Proton
             && !own_smtp
             && d.encrypt
             && !crate::sync::smtp::recipients(&d.bcc)?.is_empty()
         {
             return Err(crate::sync::smtp::EncryptedBccUnsupported {
-                service: if a.provider == Provider::Proton {
-                    "Proton".into()
-                } else {
-                    "this JMAP server".into()
-                },
+                service: "Proton".into(),
             }
             .into());
         }
@@ -4009,6 +4008,31 @@ impl Backend {
             // Through Proton's API: it encrypts for the recipients it can,
             // signs, and files the message in Sent itself. A JMAP server
             // submits it and files it in Sent.
+            if a.provider == Provider::Jmap
+                && d.encrypt
+                && !crate::sync::smtp::recipients(&d.bcc)?.is_empty()
+            {
+                let options = crate::sync::jmap::SendOptions {
+                    require_tls: a.require_tls,
+                    receipts: a.delivery_receipts.then(|| d.id.clone()),
+                    hold_until,
+                    deliver_by: crate::sync::smtp::DeliverBy::of(a),
+                    ..Default::default()
+                };
+                if let Some(at) = hold_until {
+                    let ahead = (at - chrono::Utc::now().timestamp()).max(0) as u64;
+                    let can = self.with_jmap(a, |s| Ok(s.max_delayed_send() >= ahead))?;
+                    if !can {
+                        return Err(crate::sync::smtp::NoServerHold.into());
+                    }
+                }
+                let (raw, receipts) = self.send_jmap_bcc_apart(a, d, &options)?;
+                filed_already = true;
+                crate::sync::smtp::Delivered {
+                    raw,
+                    receipts_unsupported: a.delivery_receipts && !receipts,
+                }
+            } else {
             let message = crate::sync::smtp::build(a, d, false)?;
             let (ring, certs) = (self.keyring(), self.certificates());
             let raw = crate::sync::smtp::protected(
@@ -4029,6 +4053,7 @@ impl Backend {
                     require_tls: a.require_tls,
                     receipts: a.delivery_receipts.then(|| d.id.clone()),
                     hold_until,
+                    deliver_by: crate::sync::smtp::DeliverBy::of(a),
                     ..Default::default()
                 };
                 if let Some(at) = hold_until {
@@ -4051,11 +4076,17 @@ impl Backend {
                 raw,
                 receipts_unsupported: a.delivery_receipts && !receipts,
             }
+            }
         } else {
             let tls = self.tls_connector()?;
             let (ring, certs) = (self.keyring(), self.certificates());
             let keys = crate::sync::smtp::Keys { ring: &ring, certs: &certs };
             match self.send_by_reference(a, d, &endpoint, &secret, &tls, hold_until, &keys) {
+                // RFC 4468 §3: the server wouldn't fetch it, and nobody was
+                // sent it (the copy in Sent is gone again): send it as itself.
+                Some(Err(e)) if e.downcast_ref::<crate::sync::smtp::BurlRefused>().is_some() => {
+                    crate::sync::smtp::deliver(a, d, &endpoint, &secret, &tls, hold_until, &keys)?
+                }
                 Some(delivered) => {
                     filed_already = true;
                     delivered?
@@ -4339,7 +4370,7 @@ impl Backend {
             .collect();
         self.store.path.join("sent-copies").join(safe)
     }
-    fn queue_sent_copy(&self, account: &str, raw: &[u8]) -> Result<()> {
+    pub(super) fn queue_sent_copy(&self, account: &str, raw: &[u8]) -> Result<()> {
         let dir = self.sent_queue(account);
         std::fs::create_dir_all(&dir)?;
         // Named by when, so they are saved in the order they were sent.
