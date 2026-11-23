@@ -2934,6 +2934,28 @@ mod tests {
         assert!(to_store(&e).contains("CONFERENCE;VALUE=URI;FEATURE=PHONE;LABEL=\"Dial in; PIN 42\":tel:+1-555-0100"));
     }
 
+    /// An event cached by an earlier version (these properties still in
+    /// `kept`, its new fields empty) is written with each of them once.
+    #[test]
+    fn events_cached_before_the_new_fields_write_them_once() {
+        let old = Event {
+            uid: "o".into(),
+            summary: "Old".into(),
+            start: 1_800_000_000,
+            end: 1_800_003_600,
+            kept: "CATEGORIES:Work\r\nCLASS:PRIVATE\r\nGEO:1.5;2.5\r\nCOLOR:red\r\nCONFERENCE;VALUE=URI:https://x.example/c\r\n".into(),
+            ..Default::default()
+        };
+        let text = to_store(&old);
+        for p in ["CATEGORIES:", "CLASS:", "GEO:", "COLOR:", "CONFERENCE"] {
+            assert_eq!(text.matches(p).count(), 1, "{p} in {text}");
+        }
+        // Read again, they're fields, and still once each.
+        let back = parse(&text).events.remove(0);
+        assert_eq!((back.categories.len(), back.class.as_str(), back.conferences.len()), (1, "PRIVATE", 1));
+        assert!(back.kept.is_empty());
+    }
+
     /// Reminders in full (RFC 5545 §3.6.6): their action, repeats and
     /// recipients, the plain ones and those kept whole alike.
     #[test]
