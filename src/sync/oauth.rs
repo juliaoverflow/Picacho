@@ -942,6 +942,8 @@ pub struct Grant {
     issuer: Option<String>,
     /// How the server's token endpoint takes a client secret.
     client_auth: ClientAuth,
+    /// The scopes asked for, to compare with those granted.
+    scope: String,
 }
 impl Grant {
     fn issuer(&self, provider: Provider, own_endpoints: bool) -> Issuer<'_> {
@@ -1002,6 +1004,7 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         token: String::new(),
         issuer: None,
         client_auth: ClientAuth::Post,
+        scope: scope.to_owned(),
     })
 }
 
@@ -1051,6 +1054,7 @@ fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         token: metadata.token,
         issuer: metadata.issuer,
         client_auth: metadata.client_auth,
+        scope,
     })
 }
 
@@ -1063,6 +1067,7 @@ fn authorize_sso(
     cancel: Arc<AtomicBool>,
 ) -> Result<Grant> {
     let metadata = sso_metadata(&sso.issuer)?;
+    let scope = sso_scopes(&metadata.scopes, &sso.scope);
     let mut browser = Browser::new("127.0.0.1", "/callback")?;
     browser.issuer = metadata.issuer.clone();
     let client_id = if !account.client_id.is_empty() {
@@ -1079,7 +1084,7 @@ fn authorize_sso(
         ("client_id", client_id.as_str()),
         ("redirect_uri", &browser.redirect),
         ("response_type", "code"),
-        ("scope", &sso_scopes(&metadata.scopes, &sso.scope)),
+        ("scope", &scope),
         ("state", &browser.state),
         ("code_challenge", &browser.challenge),
         ("code_challenge_method", "S256"),
@@ -1097,6 +1102,37 @@ fn authorize_sso(
         token: metadata.token,
         issuer: metadata.issuer,
         client_auth: metadata.client_auth,
+        scope,
+    })
+}
+
+/// The scopes without which the account's mail can't be reached, among
+/// those `requested`: Gmail's mail scope, Outlook's IMAP and SMTP ones,
+/// and JMAP's mail capability. Where a token response names its scope
+/// (RFC 6749 §3.3: it must when it differs from what was asked), the
+/// person may have unticked one (Google's granular consent).
+fn needed_scopes<'a>(account: &Account, requested: &'a str) -> Vec<&'a str> {
+    let wanted: &[&str] = match account.provider {
+        Provider::Gmail if account.sso.is_none() => &["https://mail.google.com/"],
+        Provider::Outlook if account.sso.is_none() => &[
+            "https://outlook.office.com/IMAP.AccessAsUser.All",
+            "https://outlook.office.com/SMTP.Send",
+        ],
+        Provider::Jmap => &[crate::sync::jmap::MAIL],
+        _ => &[],
+    };
+    requested
+        .split_whitespace()
+        .filter(|s| wanted.contains(s))
+        .collect()
+}
+/// Whether `granted` (a token response's `scope`) has `scope`. Scope
+/// tokens are case-sensitive (RFC 6749 §3.3), but Microsoft returns its
+/// resource's scopes in its own spelling of the name, so those compare
+/// without case.
+fn granted_scope(granted: &str, scope: &str) -> bool {
+    granted.split_whitespace().any(|g| {
+        g == scope || (scope.starts_with("https://outlook.office.com/") && g.eq_ignore_ascii_case(scope))
     })
 }
 
@@ -1131,6 +1167,18 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     };
     let (mut secret, value) = exchange(token, &fields, &client)?;
     secret.client_secret = account.client_secret.clone();
+    if let Some(granted) = value["scope"].as_str() {
+        let needed = needed_scopes(account, &grant.scope);
+        let missing: Vec<&str> = needed
+            .into_iter()
+            .filter(|s| !granted_scope(granted, s))
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "The sign-in didn't allow access to mail ({} wasn't granted). Sign in again and allow Picacho access to your mail.",
+            missing.join(", ")
+        );
+    }
     let (who, _) = checked_identity(
         value["id_token"].as_str().unwrap_or_default(),
         client_id,
@@ -1471,6 +1519,15 @@ fn exchange(
         .as_str()
         .context("Provider did not return an access token")?
         .to_string();
+    // RFC 6749 §5.1 and §7.1: the token's type is required, and only a
+    // bearer token (RFC 6750 §4, compared without case) is what the mail
+    // protocols take; another kind (DPoP, MAC) would be sent wrongly.
+    let kind = value["token_type"].as_str().unwrap_or_default();
+    ensure!(
+        kind.eq_ignore_ascii_case("bearer"),
+        "The sign-in issued a {} token, which Picacho can't use; it needs a bearer token.",
+        if kind.is_empty() { "untyped" } else { kind }
+    );
     let secret = Secret {
         access_token,
         refresh_token: value["refresh_token"].as_str().unwrap_or_default().into(),
@@ -1572,16 +1629,34 @@ mod tests {
         assert!(jmap_client(&a).id.is_empty());
     }
     /// A small HTTP server answering `respond(method, path, body)` for each
-    /// of `count` requests.
+    /// of `count` requests. It gives up after 30 seconds without one, so a
+    /// test expecting more requests than are made fails instead of hanging.
     fn http_server(
         count: usize,
         respond: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for mut s in listener.incoming().take(count).flatten() {
+            let mut deadline = Instant::now() + Duration::from_secs(30);
+            let incoming = std::iter::from_fn(|| loop {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        deadline = Instant::now() + Duration::from_secs(30);
+                        return Some(s);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "the test made fewer requests than expected");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            });
+            for mut s in incoming.take(count) {
                 let mut buf = vec![0; 16384];
                 let n = s.read(&mut buf).unwrap();
                 let text = String::from_utf8_lossy(&buf[..n]).into_owned();
@@ -1620,27 +1695,18 @@ mod tests {
         assert!(seen[1].starts_with("GET /.well-known/oauth-authorization-server/realms/mail"));
         // RFC 8414's form (the path after the well-known part) is found,
         // and its endpoints and registration kept.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        drop(listener);
-        let doc = format!(
-            r#"{{"issuer":"{origin}/tenant","authorization_endpoint":"{origin}/auth","token_endpoint":"{origin}/token","registration_endpoint":"{origin}/register","scopes_supported":["openid","offline_access"]}}"#
-        );
-        let port: u16 = origin.rsplit(':').next().unwrap().parse().unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let server = std::thread::spawn(move || {
-            for mut s in listener.incoming().take(2).flatten() {
-                let mut buf = [0; 4096];
-                let n = s.read(&mut buf).unwrap();
-                let path = String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).unwrap_or("").to_owned();
-                let (status, body) = if path == "/.well-known/oauth-authorization-server/tenant" {
-                    (200, doc.clone())
-                } else {
-                    (404, "{}".to_owned())
-                };
-                write!(s, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let doc: Arc<Mutex<String>> = Arc::default();
+        let served = doc.clone();
+        let (origin, server) = http_server(2, move |_, path, _| {
+            if path == "/.well-known/oauth-authorization-server/tenant" {
+                (200, served.lock().unwrap().clone())
+            } else {
+                (404, "{}".to_owned())
             }
         });
+        *doc.lock().unwrap() = format!(
+            r#"{{"issuer":"{origin}/tenant","authorization_endpoint":"{origin}/auth","token_endpoint":"{origin}/token","registration_endpoint":"{origin}/register","scopes_supported":["openid","offline_access"]}}"#
+        );
         let m = sso_metadata(&format!("{origin}/tenant/")).unwrap();
         assert_eq!(m.token, format!("{origin}/token"));
         assert_eq!(m.registration, Some(format!("{origin}/register")));
@@ -1688,24 +1754,20 @@ mod tests {
         assert_eq!(revocation_endpoint(&password), None);
         // An organization's issuer whose metadata names an endpoint, and
         // one whose doesn't.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let documents = origin.clone();
-        let metadata = std::thread::spawn(move || {
-            for mut s in listener.incoming().take(2).flatten() {
-                let mut buf = [0; 4096];
-                let n = s.read(&mut buf).unwrap();
-                let path = String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).unwrap_or("").to_owned();
-                let issuer = path.strip_suffix("/.well-known/openid-configuration").unwrap_or_default();
-                let revocation = if issuer == "/with" {
-                    format!(r#","revocation_endpoint":"{documents}/with/revoke""#)
-                } else {
-                    String::new()
-                };
-                let body = format!(r#"{{"issuer":"{documents}{issuer}","authorization_endpoint":"{documents}/a","token_endpoint":"{documents}/t"{revocation}}}"#);
-                write!(s, "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
+        // The documents name the server's own origin, known once it listens.
+        let documents: Arc<Mutex<String>> = Arc::default();
+        let named = documents.clone();
+        let (origin, metadata) = http_server(2, move |_, path, _| {
+            let documents = named.lock().unwrap().clone();
+            let issuer = path.strip_suffix("/.well-known/openid-configuration").unwrap_or_default();
+            let revocation = if issuer == "/with" {
+                format!(r#","revocation_endpoint":"{documents}/with/revoke""#)
+            } else {
+                String::new()
+            };
+            (200, format!(r#"{{"issuer":"{documents}{issuer}","authorization_endpoint":"{documents}/a","token_endpoint":"{documents}/t"{revocation}}}"#))
         });
+        *documents.lock().unwrap() = origin.clone();
         let mut sso = Account::new(Provider::Imap);
         sso.oauth = true;
         sso.sso = Some(crate::manage::model::Sso { issuer: format!("{origin}/with"), scope: String::new() });
@@ -1777,6 +1839,46 @@ mod tests {
         assert_eq!(doc(serde_json::json!(["client_secret_post"])), ClientAuth::Post);
         assert_eq!(doc(serde_json::json!(["client_secret_post", "client_secret_basic"])), ClientAuth::Basic);
         assert_eq!(doc(serde_json::Value::Null), ClientAuth::Basic);
+    }
+
+    /// RFC 6749 §5.1: only bearer tokens are taken; §3.3: a granted scope
+    /// without mail access is refused at sign-in.
+    #[test]
+    fn token_type_and_granted_scope_are_checked() {
+        let (origin, server) = http_server(1, |_, _, _| {
+            (200, r#"{"access_token":"a","token_type":"Bearer","expires_in":60}"#.into())
+        });
+        let client = TokenClient { id: "app", secret: "", auth: ClientAuth::Basic };
+        assert!(exchange(&format!("{origin}/t"), &[], &client).is_ok());
+        server.join().unwrap();
+        let (origin, server) = http_server(1, |_, _, _| {
+            (200, r#"{"access_token":"a","token_type":"DPoP"}"#.into())
+        });
+        let error = exchange(&format!("{origin}/t"), &[], &client).unwrap_err();
+        assert!(format!("{error:#}").contains("DPoP"), "{error:#}");
+        server.join().unwrap();
+        let (origin, server) = http_server(1, |_, _, _| (200, r#"{"access_token":"a"}"#.into()));
+        assert!(exchange(&format!("{origin}/t"), &[], &client).is_err());
+        server.join().unwrap();
+        // Scopes: those mail needs, among those asked for.
+        let gmail = Account::new(Provider::Gmail);
+        let (_, _, asked) = endpoints(Provider::Gmail);
+        assert_eq!(needed_scopes(&gmail, asked), ["https://mail.google.com/"]);
+        assert!(granted_scope("openid https://mail.google.com/ email", "https://mail.google.com/"));
+        assert!(!granted_scope("openid email profile", "https://mail.google.com/"));
+        let outlook = Account::new(Provider::Outlook);
+        let (_, _, asked) = endpoints(Provider::Outlook);
+        assert_eq!(needed_scopes(&outlook, asked).len(), 2);
+        // Microsoft writes its scopes in its own case.
+        assert!(granted_scope(
+            "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send",
+            "https://outlook.office.com/imap.accessasuser.all"
+        ));
+        let jmap = Account::new(Provider::Jmap);
+        assert_eq!(needed_scopes(&jmap, "urn:ietf:params:jmap:mail offline_access"), [crate::sync::jmap::MAIL]);
+        // Not asked for (a server listing other scopes): not required.
+        assert!(needed_scopes(&jmap, "offline_access").is_empty());
+        assert!(needed_scopes(&Account::new(Provider::Imap), "openid mail").is_empty());
     }
 
     /// RFC 8414 §2 and RFC 9700 §2.1.1: PKCE must allow S256, and the
@@ -1910,6 +2012,7 @@ mod tests {
                 token: String::new(),
                 issuer: Some(issuer.into()),
                 client_auth: ClientAuth::Basic,
+                scope: String::new(),
             };
             assert!(matches!(grant.issuer(Provider::Jmap, true), Issuer::Exact(i) if i == issuer));
             let grant = Grant { issuer: None, ..grant };
