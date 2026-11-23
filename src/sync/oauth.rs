@@ -342,28 +342,69 @@ fn endpoints(provider: Provider) -> (&'static str, &'static str, &'static str) {
         ),
     }
 }
-/// Gives up a refresh token (RFC 7009) at `endpoint`, so it can't be used
-/// once the account is removed here. Best effort: a server that can't is
-/// left alone; the token expires there in time.
-pub fn revoke(endpoint: &str, client_id: &str, token: &str) {
-    if token.is_empty() || !endpoint.starts_with("https://") {
-        return;
+/// Gives up a token (RFC 7009 §2.1) at `endpoint`, so it can't be used
+/// once the account is removed here: the refresh token where there is one
+/// (which also ends its access tokens, §2.1), else the access token. A
+/// client with a secret authenticates with it (§2.1: confidential clients
+/// must). Best effort: a server that can't is left alone; the token
+/// expires there in time.
+pub fn revoke(endpoint: &str, client_id: &str, secret: &Secret) -> Result<()> {
+    ensure!(
+        endpoint.starts_with("https://") || cfg!(test),
+        "Tokens are only given up over https."
+    );
+    let (token, hint) = if !secret.refresh_token.is_empty() {
+        (secret.refresh_token.as_str(), "refresh_token")
+    } else {
+        (secret.access_token.as_str(), "access_token")
+    };
+    if token.is_empty() {
+        return Ok(());
     }
-    let Ok(client) = http() else { return };
-    let _ = client
+    let mut fields = vec![("token", token), ("token_type_hint", hint)];
+    if !client_id.is_empty() {
+        fields.push(("client_id", client_id));
+    }
+    if !secret.client_secret.is_empty() {
+        fields.push(("client_secret", &secret.client_secret));
+    }
+    // §2.2: 200 whether or not the token was still good; §2.2.1's
+    // `unsupported_token_type` and the like are errors.
+    http()?
         .post(endpoint)
-        .form(&[
-            ("token", token),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", client_id),
-        ])
-        .timeout(std::time::Duration::from_secs(10))
-        .send();
+        .form(&fields)
+        .timeout(Duration::from_secs(10))
+        .send()?
+        .error_for_status()?;
+    Ok(())
 }
-/// Google's revocation endpoint; Microsoft's identity platform has none
-/// (tokens are revoked from the account's own page).
-pub fn provider_revocation(provider: Provider) -> Option<&'static str> {
-    (provider == Provider::Gmail).then_some("https://oauth2.googleapis.com/revoke")
+/// Where an account's tokens are given up (RFC 7009), if its issuer has
+/// such an endpoint: Google's own; a JMAP server's, an organization's
+/// identity provider's or Pinal's, from its metadata's
+/// `revocation_endpoint` (RFC 8414 §2). Microsoft's identity platform has
+/// none (tokens are revoked from the account's own page).
+pub fn revocation_endpoint(account: &Account) -> Option<String> {
+    if !account.oauth {
+        return None;
+    }
+    if account.service == Service::Pinal {
+        return pinal_endpoints(&http().ok()?)
+            .ok()?
+            .revocation
+            .map(|u| u.to_string());
+    }
+    if let Some(sso) = &account.sso {
+        return sso_metadata(&sso.issuer).ok()?.revocation;
+    }
+    match account.provider {
+        Provider::Gmail => Some("https://oauth2.googleapis.com/revoke".into()),
+        Provider::Jmap => {
+            jmap_metadata(&account.incoming_host, account.incoming_port)
+                .ok()?
+                .revocation
+        }
+        _ => None,
+    }
 }
 fn random_url_token() -> String {
     URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
@@ -1062,6 +1103,8 @@ struct PinalEndpoints {
     authorize: url::Url,
     token: url::Url,
     userinfo: url::Url,
+    /// Where its tokens are given up (RFC 7009), where it says.
+    revocation: Option<url::Url>,
     /// The issuer its ID tokens name (OpenID Connect Discovery §3).
     issuer: Option<String>,
 }
@@ -1109,6 +1152,9 @@ fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
         authorize: endpoint("authorization_endpoint")?,
         token: endpoint("token_endpoint")?,
         userinfo: endpoint("userinfo_endpoint")?,
+        // Optional: one elsewhere is left unused rather than refusing the
+        // sign-in.
+        revocation: endpoint("revocation_endpoint").ok(),
         issuer: config["issuer"].as_str().map(str::to_owned),
     };
     *FOUND.lock().unwrap() = Some((origin, found.clone()));
@@ -1529,6 +1575,74 @@ mod tests {
         });
         let id = register(&format!("{origin}/register"), "http://127.0.0.1:5555/callback").unwrap();
         assert_eq!(id, "registered-1");
+        server.join().unwrap();
+    }
+
+    /// RFC 7009: removed accounts' tokens are given up wherever the issuer
+    /// says it can (Google; JMAP and organizations' issuers by metadata),
+    /// and not where it has no endpoint (Microsoft, metadata without one).
+    #[test]
+    fn tokens_are_revoked_where_the_issuer_advertises_it() {
+        let mut gmail = Account::new(Provider::Gmail);
+        gmail.oauth = true;
+        assert_eq!(revocation_endpoint(&gmail).as_deref(), Some("https://oauth2.googleapis.com/revoke"));
+        let mut outlook = Account::new(Provider::Outlook);
+        outlook.oauth = true;
+        assert_eq!(revocation_endpoint(&outlook), None);
+        let mut password = Account::new(Provider::Gmail);
+        password.oauth = false;
+        assert_eq!(revocation_endpoint(&password), None);
+        // An organization's issuer whose metadata names an endpoint, and
+        // one whose doesn't.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let documents = origin.clone();
+        let metadata = std::thread::spawn(move || {
+            for mut s in listener.incoming().take(2).flatten() {
+                let mut buf = [0; 4096];
+                let n = s.read(&mut buf).unwrap();
+                let path = String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).unwrap_or("").to_owned();
+                let issuer = path.strip_suffix("/.well-known/openid-configuration").unwrap_or_default();
+                let revocation = if issuer == "/with" {
+                    format!(r#","revocation_endpoint":"{documents}/with/revoke""#)
+                } else {
+                    String::new()
+                };
+                let body = format!(r#"{{"issuer":"{documents}{issuer}","authorization_endpoint":"{documents}/a","token_endpoint":"{documents}/t"{revocation}}}"#);
+                write!(s, "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let mut sso = Account::new(Provider::Imap);
+        sso.oauth = true;
+        sso.sso = Some(crate::manage::model::Sso { issuer: format!("{origin}/with"), scope: String::new() });
+        assert_eq!(revocation_endpoint(&sso), Some(format!("{origin}/with/revoke")));
+        sso.sso = Some(crate::manage::model::Sso { issuer: format!("{origin}/without"), scope: String::new() });
+        assert_eq!(revocation_endpoint(&sso), None);
+        metadata.join().unwrap();
+        // The request (RFC 7009 §2.1): the refresh token, hinted, with the
+        // client's id and, for a confidential client, its secret.
+        let (origin, server) = http_server(2, |method, path, _| {
+            assert_eq!((method, path), ("POST", "/revoke"));
+            (200, String::new())
+        });
+        let secret = Secret {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            client_secret: "cs".into(),
+            ..Default::default()
+        };
+        revoke(&format!("{origin}/revoke"), "picacho", &secret).unwrap();
+        let access_only = Secret {
+            access_token: "at".into(),
+            ..Default::default()
+        };
+        revoke(&format!("{origin}/revoke"), "picacho", &access_only).unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].ends_with("token=rt&token_type_hint=refresh_token&client_id=picacho&client_secret=cs"), "{seen:?}");
+        assert!(seen[1].ends_with("token=at&token_type_hint=access_token&client_id=picacho"), "{seen:?}");
+        // A refusal (§2.2.1) is an error for the caller to ignore or show.
+        let (origin, server) = http_server(1, |_, _, _| (400, r#"{"error":"unsupported_token_type"}"#.into()));
+        assert!(revoke(&format!("{origin}/revoke"), "picacho", &secret).is_err());
         server.join().unwrap();
     }
 

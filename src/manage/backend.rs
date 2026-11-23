@@ -869,17 +869,18 @@ impl Backend {
         );
         let lock = self.account_lock(id);
         let _operation = lock.lock().unwrap();
-        // Its sign-in given up at the provider, so the token kept by it is
-        // no use to anyone (RFC 7009); best effort, in the background.
+        // Its sign-in given up at the issuer, so the token kept by it is
+        // no use to anyone (RFC 7009); best effort, in the background, as
+        // finding the endpoint may mean fetching the issuer's metadata.
         if let Some(a) = self.store.accounts().ok().and_then(|all| all.into_iter().find(|a| a.id == id))
             && a.oauth
             && a.credentials_of.is_empty()
             && let Ok(secret) = self.credentials(&a)
-            && let Some(endpoint) = crate::sync::oauth::provider_revocation(a.provider)
         {
-            let client_id = a.client_id.clone();
             std::thread::spawn(move || {
-                crate::sync::oauth::revoke(endpoint, &client_id, &secret.refresh_token)
+                if let Some(endpoint) = crate::sync::oauth::revocation_endpoint(&a) {
+                    let _ = crate::sync::oauth::revoke(&endpoint, &a.client_id, &secret);
+                }
             });
         }
         self.disconnect(id);
