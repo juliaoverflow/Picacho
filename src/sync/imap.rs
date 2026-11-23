@@ -143,8 +143,7 @@ pub(crate) fn imap_login_interruptible(
     let mut client = imap::Client::new(stream);
     client.greeting_read = true;
     let offered = auth_mechanisms(&caps);
-    // RFC 4959: the first message goes with AUTHENTICATE, saving a round trip.
-    let initial_response = caps.iter().any(|c| c == "SASL-IR");
+    let initial_response = initial_response_allowed(&caps);
     let credentials = |user: &str, secret: &str| sasl::Credentials {
         user: user.to_owned(),
         secret: secret.to_owned(),
@@ -350,6 +349,13 @@ fn read_line(stream: &mut impl std::io::Read) -> Result<String> {
         bytes.push(byte[0]);
     }
     Ok(String::from_utf8_lossy(&bytes).trim_end().to_owned())
+}
+/// Whether the first SASL message may go with AUTHENTICATE, saving a
+/// round trip (SASL-IR, RFC 4959). IMAP4rev2 has it built in (RFC 9051
+/// §6.2.2: rev2 servers accept an initial response), so a server listing
+/// IMAP4rev2 takes it even where it doesn't list SASL-IR.
+fn initial_response_allowed(caps: &[String]) -> bool {
+    caps.iter().any(|c| c == "SASL-IR" || c == "IMAP4REV2")
 }
 /// The SASL mechanisms in a capability list ("AUTH=PLAIN"…).
 fn auth_mechanisms(caps: &[String]) -> Vec<String> {
@@ -2238,6 +2244,13 @@ mod extension_tests {
         assert!(keyword("$MDNSent").is_err());
         assert_eq!(gmail_label("Caf&AOk-").unwrap(), "\"Caf&AOk-\"");
         assert!(gmail_label("\\Starred").is_err());
+    }
+    #[test]
+    fn initial_responses_go_with_sasl_ir_or_rev2() {
+        let caps = |list: &str| list.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert!(initial_response_allowed(&caps("IMAP4REV1 SASL-IR AUTH=PLAIN")));
+        assert!(initial_response_allowed(&caps("IMAP4REV2 AUTH=PLAIN")));
+        assert!(!initial_response_allowed(&caps("IMAP4REV1 AUTH=PLAIN")));
     }
     #[test]
     fn read_only_selects_are_recognized() {

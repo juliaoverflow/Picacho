@@ -2236,3 +2236,53 @@ fn mdn_sent_is_kept_locally_where_the_server_cannot() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 9051 §6.2.2: an IMAP4rev2 server takes AUTHENTICATE's initial
+/// response (RFC 4959) without listing SASL-IR, so sign-in is one round trip.
+#[test]
+fn imap4rev2_sign_in_sends_the_initial_response() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let Some(mut p) = Peer::accept(&listener, &acceptor) else {
+            return seen;
+        };
+        while let Some((tag, command, _)) = p.command() {
+            let upper = command.to_ascii_uppercase();
+            seen.push(command.clone());
+            if upper == "CAPABILITY" {
+                p.send("* CAPABILITY IMAP4rev2 AUTH=PLAIN LOGINDISABLED\r\n");
+            } else if let Some(initial) = command.strip_prefix("AUTHENTICATE PLAIN ") {
+                assert_eq!(
+                    crate::sync::sasl::decode(initial).unwrap(),
+                    b"\0qa@example.com\0fixture-password"
+                );
+            } else if upper == "AUTHENTICATE PLAIN" {
+                panic!("The initial response was held back: {command}");
+            } else if upper.starts_with("LIST") {
+                p.send("* LIST () \"/\" INBOX\r\n");
+            } else if upper == "NAMESPACE" {
+                p.send("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+            } else if upper.starts_with("CREATE") || upper.starts_with("SUBSCRIBE") {
+            } else if upper == "LOGOUT" {
+                p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                break;
+            } else {
+                panic!("Unexpected IMAP command: {command}");
+            }
+            p.ok(&tag);
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.create_remote_folder(&a, None, "Travel")?;
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    assert!(seen.iter().any(|c| c.starts_with("AUTHENTICATE PLAIN ")), "{seen:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
