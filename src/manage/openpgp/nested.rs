@@ -295,6 +295,55 @@ mod tests {
         assert_eq!(open(&sealed, &p.bos).unwrap().1.signature, Signature::Bad);
     }
 
+    /// RFC 3156 §6.2: signed and encrypted in one OpenPGP message (as
+    /// GnuPG's `--sign --encrypt` and Thunderbird make), compressed or not,
+    /// opens with its signature checked. Picacho itself still writes §6.1.
+    #[test]
+    fn combined_sign_and_encrypt_is_read() {
+        let p = people();
+        let signing = p
+            .ana
+            .secret_subkeys
+            .iter()
+            .find(|s| s.signatures.iter().any(|g| g.key_flags().sign()))
+            .unwrap();
+        let bo_public = SignedPublicKey::from(p.bo.clone());
+        let combined = |compressed: bool| {
+            let mut builder = MessageBuilder::from_bytes("", BODY.to_vec())
+                .seipd_v1(rand08::thread_rng(), SymmetricKeyAlgorithm::AES256);
+            if compressed {
+                builder.compression(pgp::types::CompressionAlgorithm::ZLIB);
+            }
+            builder
+                .sign(&signing.key, Password::empty(), HashAlgorithm::Sha256)
+                .encrypt_to_key(rand08::thread_rng(), &encryption_subkey(&bo_public).unwrap().key)
+                .unwrap();
+            pgp_mime(&builder.to_vec(rand08::thread_rng()).unwrap())
+        };
+        for compressed in [false, true] {
+            let (readable, verdict) = open(&combined(compressed), &p.bos).unwrap();
+            assert!(verdict.decrypted);
+            assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()), "compressed: {compressed}");
+            assert_eq!(body_of(&readable), "Meet at noon.");
+        }
+        // Sent from someone else's address: Ana's word, not the sender's.
+        let resent = String::from_utf8_lossy(&combined(false))
+            .replacen("From: Ana <ana@example.org>", "From: Bank <alerts@bank.example>", 1);
+        assert_eq!(
+            open(resent.as_bytes(), &p.bos).unwrap().1.signature,
+            Signature::OtherSender("Ana <ana@example.org>".into())
+        );
+        // Q1: Picacho writes §6.1, multipart/signed inside the encryption.
+        let both = Protect { sign: true, encrypt: true, ..Default::default() };
+        let sent = protect(MESSAGE, "ana@example.org", &["bo@example.se".into()], both, &p.anas).unwrap();
+        let (armored, _) = crate::manage::crypto::encrypted_part(&sent).unwrap();
+        let (message, _) = Message::from_string(&armored).unwrap();
+        let mut opened = unwrap_message(message, std::slice::from_ref(&p.bo), &mut 0).unwrap();
+        assert!(!opened.is_signed(), "no OpenPGP signature packets: §6.1, not §6.2");
+        let inner = opened.as_data_vec().unwrap();
+        assert!(String::from_utf8_lossy(&inner).starts_with("Content-Type: multipart/signed"));
+    }
+
     /// Past `MAX_NESTING` layers a message isn't opened, at the packet level
     /// and at the MIME level.
     #[test]
