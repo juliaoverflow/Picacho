@@ -290,6 +290,57 @@ impl<T: Read + Write> PopSession<T> {
         self.command("QUIT")?;
         Ok(())
     }
+    /// How many messages the mailbox has and their total size in octets
+    /// (STAT, RFC 1939 §5: `+OK nn mm`).
+    pub(crate) fn stat(&mut self) -> Result<(u32, u64)> {
+        let line = self.command("STAT")?;
+        let mut words = line.split_ascii_whitespace().skip(1);
+        let count = words.next().and_then(|n| n.parse().ok());
+        let size = words.next().and_then(|n| n.parse().ok());
+        count.zip(size).context("Invalid POP3 STAT reply")
+    }
+    /// Unmarks every message marked for deletion in this session (RSET,
+    /// RFC 1939 §5), so QUIT removes nothing.
+    pub(crate) fn rset(&mut self) -> Result<()> {
+        self.command("RSET")?;
+        Ok(())
+    }
+    /// Each message's lasting identity, by message number, oldest first:
+    /// UIDL's (RFC 1939 §7) where the server has it; otherwise one made
+    /// from a hash of the message's headers (`header_identity`), read with
+    /// TOP (or RETR, where there is no TOP). Messages with the same headers
+    /// are told apart by how many came before them.
+    pub(crate) fn identities(&mut self, max_header: usize) -> Result<Vec<(u32, String)>> {
+        // A server listing capabilities without UIDL lacks it; one without
+        // CAPA may still have it.
+        if self.caps.is_empty() || self.has("UIDL") {
+            match self.uidl() {
+                Ok(ids) => return Ok(ids),
+                Err(e) if self.caps.is_empty() && rejection(&e).is_some() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let (count, _) = self.stat()?;
+        let mut out = Vec::with_capacity(count as usize);
+        let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for number in 1..=count {
+            let header = match self.top(number, max_header)? {
+                Some(header) => header,
+                // Without TOP the whole message is read for it; only its
+                // headers are hashed.
+                None => {
+                    self.command(&format!("RETR {number}"))?;
+                    self.multiline(crate::manage::crypto::MAX_MESSAGE)?
+                }
+            };
+            let base = header_identity(&header);
+            let n = seen.entry(base.clone()).or_default();
+            *n += 1;
+            let id = if *n == 1 { base } else { format!("{base}-{n}") };
+            out.push((number, id));
+        }
+        Ok(out)
+    }
     pub(crate) fn uidl(&mut self) -> Result<Vec<(u32, String)>> {
         self.command("UIDL")?;
         let bytes = self.multiline(4 * 1024 * 1024)?;
@@ -322,6 +373,34 @@ impl<T: Read + Write> PopSession<T> {
         result.sort_unstable_by_key(|(number, _)| *number);
         Ok(result)
     }
+}
+/// A lasting identity for a message on a server without UIDL: a hash of
+/// the headers that don't change while it sits in the mailbox (its
+/// Message-ID, Date, From, To, Subject, and the first Received). Prefixed
+/// so it can't be taken for a UIDL identity; 70 printable characters at
+/// most, as UIDL's (RFC 1939 §7).
+pub(crate) fn header_identity(header: &[u8]) -> String {
+    use sha2::Digest as _;
+    let (headers, _) = mailparse::parse_headers(header).unwrap_or_default();
+    let mut hash = sha2::Sha256::new();
+    for name in ["Message-ID", "Date", "From", "To", "Subject", "Received"] {
+        let value = headers
+            .iter()
+            .find(|h| h.get_key_ref().eq_ignore_ascii_case(name))
+            .map(|h| h.get_value_raw().to_vec())
+            .unwrap_or_default();
+        hash.update(name.as_bytes());
+        hash.update(b":");
+        hash.update(&value);
+        hash.update(b"\n");
+    }
+    // Without any of those, the header block as a whole.
+    if headers.is_empty() {
+        hash.update(header);
+    }
+    let digest = hash.finalize();
+    let hex: String = digest.iter().take(20).map(|b| format!("{b:02x}")).collect();
+    format!("hdr-{hex}")
 }
 /// Connects with TLS from the start, or (`Account::incoming_starttls`)
 /// in the clear and upgrades with STLS (RFC 2595) before anything else: a
@@ -587,6 +666,52 @@ mod tests {
         );
         let seen = server.join().unwrap();
         assert_eq!(seen, ["CAPA"], "no USER, PASS or AUTH was sent");
+        Ok(())
+    }
+    /// RFC 1939 §5: STAT's counts and RSET; without UIDL, each
+    /// message's identity comes from a hash of its headers (TOP), the same
+    /// in every session and different for different mail.
+    #[test]
+    fn stat_rset_and_identities_without_uidl() -> Result<()> {
+        struct Script {
+            replies: Cursor<Vec<u8>>,
+            sent: Vec<u8>,
+        }
+        impl Read for Script {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.replies.read(buf)
+            }
+        }
+        impl Write for Script {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.sent.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let a = "Message-ID: <a@x>\r\nSubject: One\r\n\r\n";
+        let b = "Message-ID: <b@x>\r\nSubject: Two\r\n\r\n";
+        let replies = format!(
+            "+OK ready\r\n+OK\r\nUSER\r\nTOP\r\n.\r\n+OK 3 920\r\n+OK\r\n+OK 3 920\r\n+OK\r\n{a}.\r\n+OK\r\n{b}.\r\n+OK\r\n{a}.\r\n"
+        );
+        let mut pop = PopSession::new(Script {
+            replies: Cursor::new(replies.into_bytes()),
+            sent: Vec::new(),
+        })?;
+        pop.capabilities()?;
+        assert_eq!(pop.stat()?, (3, 920));
+        pop.rset()?;
+        let ids = pop.identities(4096)?;
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|(_, id)| id.starts_with("hdr-") && id.len() <= 70));
+        assert_ne!(ids[0].1, ids[1].1);
+        // The same headers again: told apart, the same way every session.
+        assert_eq!(ids[2].1, format!("{}-2", ids[0].1));
+        assert_eq!(header_identity(a.as_bytes()), ids[0].1);
+        let sent = String::from_utf8(pop.reader.get_ref().sent.clone()).unwrap();
+        assert_eq!(sent, "CAPA\r\nSTAT\r\nRSET\r\nSTAT\r\nTOP 1 0\r\nTOP 2 0\r\nTOP 3 0\r\n");
         Ok(())
     }
     #[test]

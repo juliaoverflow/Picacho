@@ -645,6 +645,8 @@ impl Backend {
     fn check_login(&self, account: &Account, secret: &mut Secret) -> Result<()> {
         if account.provider == Provider::Pop3 {
             let mut pop = self.pop_login(account, pop_secret(account, secret))?;
+            // The mailbox opens, not just the sign-in (STAT, RFC 1939 §5).
+            pop.stat()?;
             let _ = pop.command("QUIT");
             return Ok(());
         }
@@ -1923,7 +1925,7 @@ impl Backend {
             return Ok(Catalog::default());
         }
         let mut pop = self.pop_login(a, password)?;
-        let ids = pop.uidl()?;
+        let ids = pop.identities(256 * 1024)?;
         let prefix = format!("{}:pop:", a.id);
         let cached = self.store.cached_ids(&a.id, &prefix)?;
         let missing: Vec<&(u32, String)> = ids
@@ -2209,7 +2211,7 @@ impl Backend {
             .context("This message isn't from this POP3 account.")?;
         let secret = self.credentials(a)?;
         let mut pop = self.pop_login(a, pop_secret(a, &secret))?;
-        let ids = pop.uidl()?;
+        let ids = pop.identities(256 * 1024)?;
         // Message numbers last only for a session: find it by UIDL.
         let (number, _) = ids
             .iter()
@@ -2237,7 +2239,7 @@ impl Backend {
             return self.store.newest(&a.id, folder, limit);
         }
         let mut pop = self.pop_login(a, password)?;
-        let ids = pop.uidl()?;
+        let ids = pop.identities(256 * 1024)?;
         let mut erased = self.pop_erased(&a.id);
         // Forget deletions of mail no longer on the server.
         let before = erased.len();
@@ -3209,7 +3211,12 @@ impl Backend {
     ) -> Result<()> {
         for (number, _) in deleting {
             // A refused DELE (already marked, say) leaves the rest to go.
-            pop.dele(*number)?;
+            if let Err(e) = pop.dele(*number) {
+                // Anything else is unknown: unmark what was marked (RSET,
+                // RFC 1939 §5), so a QUIT can't remove only some of them.
+                let _ = pop.rset();
+                return Err(e);
+            }
         }
         pop.quit()
             .context("The POP3 server didn't confirm deleting downloaded mail; it is checked again next time.")
