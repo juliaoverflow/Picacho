@@ -666,7 +666,9 @@ impl MailApp {
             }
             let previews = self.attached_previews.clone();
             for (i, a) in m.attachments().iter().enumerate() {
+                // RFC 6532 §3.7: message/global is an attached message too.
                 let is_message = a.mime.eq_ignore_ascii_case("message/rfc822")
+                    || a.mime.eq_ignore_ascii_case("message/global")
                     || a.name.to_ascii_lowercase().ends_with(".eml");
                 let preview = previews.get(&(m.id.clone(), i)).cloned();
                 content = content.child(

@@ -278,17 +278,32 @@ pub(crate) fn flowed(text: &str) -> String {
 /// One attached file. A forwarded message (message/rfc822) goes as it is
 /// (7bit or 8bit, as RFC 2046 asks of messages), so recipients' apps open it
 /// as a message; when its lines are too long for that, it is encoded like any
-/// other file.
+/// other file. One whose headers are in UTF-8 (an internationalized message)
+/// goes as message/global (RFC 6532 §3.7), which may be encoded like any
+/// other part where message/rfc822 may not.
 fn attachment_part(name: String, bytes: Vec<u8>, kind: header::ContentType) -> SinglePart {
     use lettre::message::{Body, header::ContentTransferEncoding};
     if kind == header::ContentType::parse("message/rfc822").unwrap() {
+        let head_end = memchr::memmem::find(&bytes, b"\r\n\r\n")
+            .or_else(|| memchr::memmem::find(&bytes, b"\n\n"))
+            .unwrap_or(bytes.len());
+        if !bytes[..head_end].is_ascii() && std::str::from_utf8(&bytes[..head_end]).is_ok() {
+            let global = header::ContentType::parse("message/global").unwrap();
+            return Attachment::new(name).body(bytes, global);
+        }
         let encoding = if bytes.is_ascii() {
             ContentTransferEncoding::SevenBit
         } else {
             ContentTransferEncoding::EightBit
         };
+        // UTF-8 text is given as text: as bytes, lettre takes any non-ASCII
+        // as binary and refuses 8bit for it.
+        let text: lettre::message::MaybeString = match String::from_utf8(bytes) {
+            Ok(text) => text.into(),
+            Err(e) => e.into_bytes().into(),
+        };
         // Refused, it hands the bytes back: no copy is kept for trying.
-        return match Body::new_with_encoding(bytes, encoding) {
+        return match Body::new_with_encoding(text, encoding) {
             Ok(body) => SinglePart::builder()
                 .header(kind)
                 .header(header::ContentDisposition::attachment(&name))
@@ -1627,8 +1642,15 @@ pub(crate) fn deliver_raw(
     if limits.size_offered {
         mail.push_str(&format!(" SIZE={size}"));
     }
-    if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) {
+    // RFC 6531 §3.4 and RFC 6532 §3: UTF-8 addresses, or headers in UTF-8
+    // (such as a message/global-disposition-notification, RFC 6533 §6),
+    // need SMTPUTF8.
+    let head_end = memchr::memmem::find(bytes, b"\r\n\r\n").unwrap_or(bytes.len());
+    let utf8_report = has_global_part(bytes);
+    if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) || utf8_report {
         ensure!(limits.utf8, "{} can't send to this address (no SMTPUTF8).", endpoint.host);
+        mail.push_str(" SMTPUTF8");
+    } else if !bytes[..head_end].is_ascii() && limits.utf8 {
         mail.push_str(" SMTPUTF8");
     }
     // 8-bit content only where the server takes it (RFC 6152 §3).
@@ -1797,8 +1819,16 @@ pub(crate) fn receipt(
         now.format("%a, %b %-d %Y at %-H:%M"),
         m.subject.replace(['\r', '\n'], " ")
     ));
+    // RFC 6533 §6: a report naming an address or message id that isn't
+    // ASCII is message/global-disposition-notification, its addresses of
+    // type utf-8 (which reads UTF-8 as is, as message/global does).
+    let international = !a.email.is_ascii()
+        || !original.is_ascii()
+        || !original_recipient.is_ascii();
     out.push_str(&format!(
-        "--{boundary}\r\nContent-Type: message/disposition-notification\r\n\r\n"
+        "--{boundary}\r\nContent-Type: message/{}disposition-notification\r\n{}\r\n",
+        if international { "global-" } else { "" },
+        if international { "Content-Transfer-Encoding: 8bit\r\n" } else { "" },
     ));
     out.push_str(&format!(
         "Reporting-UA: Picacho; Picacho {}\r\n",
@@ -1812,13 +1842,24 @@ pub(crate) fn receipt(
     if original_recipient.contains(';') {
         out.push_str(&format!("Original-Recipient: {}\r\n", original_recipient.trim()));
     }
-    out.push_str(&format!("Final-Recipient: rfc822;{}\r\n", a.email));
+    let address_type = if a.email.is_ascii() { "rfc822" } else { "utf-8" };
+    out.push_str(&format!("Final-Recipient: {address_type};{}\r\n", a.email));
     if !original.is_empty() {
         out.push_str(&format!("Original-Message-ID: {original}\r\n"));
     }
     out.push_str("Disposition: manual-action/MDN-sent-manually; displayed\r\n");
     out.push_str(&format!("--{boundary}--\r\n"));
     out.into_bytes()
+}
+/// Whether a message has a part of a message/global type (RFC 6532 §3.7,
+/// RFC 6533 §6) among its own parts, whose UTF-8 needs SMTPUTF8. Only the
+/// top-level parts' own headers are looked at, not what they contain.
+fn has_global_part(bytes: &[u8]) -> bool {
+    let Ok(mail) = mailparse::parse_mail(bytes) else {
+        return false;
+    };
+    let global = |m: &mailparse::ParsedMail| m.ctype.mimetype.to_ascii_lowercase().starts_with("message/global");
+    global(&mail) || mail.subparts.iter().any(global)
 }
 /// Whether a message can't go as 7- or 8-bit text (RFC 6152): it has a
 /// NUL, a bare CR or LF, or a line over 998 octets.
@@ -2058,6 +2099,7 @@ mod tests {
     /// or reply.
     #[test]
     fn sender_values_cannot_inject_headers() -> Result<()> {
+        // (See also `international_receipts_are_global_reports`.)
         let mut a = Account::new(crate::manage::model::Provider::Imap);
         a.email = "me@example.com".into();
         let m = crate::manage::model::Mail {
@@ -2078,6 +2120,51 @@ mod tests {
         let sent = String::from_utf8_lossy(&build(&a, &d, false)?.formatted()).into_owned();
         assert!(!sent.contains("\r\nBcc:"), "{sent}");
         Ok(())
+    }
+
+    /// RFC 6532 §3.7: a forwarded message whose headers are in UTF-8 is
+    /// attached as message/global; an ASCII one stays message/rfc822, as
+    /// it is.
+    #[test]
+    fn internationalized_forwards_are_message_global() {
+        let kind = header::ContentType::parse("message/rfc822").unwrap();
+        let formatted = |part: SinglePart| String::from_utf8_lossy(&part.formatted()).into_owned();
+        let global = formatted(attachment_part(
+            "fwd.eml".into(),
+            "From: Jörg <jörg@bücher.example>\r\nSubject: Grüße\r\n\r\nHallo\r\n".as_bytes().to_vec(),
+            kind.clone(),
+        ));
+        assert!(global.contains("Content-Type: message/global"), "{global}");
+        let plain = formatted(attachment_part(
+            "fwd.eml".into(),
+            b"From: ana@example.com\r\nSubject: Hi\r\n\r\nHall\xc3\xb6\r\n".to_vec(),
+            kind,
+        ));
+        assert!(plain.contains("Content-Type: message/rfc822"), "{plain}");
+        assert!(plain.contains("Content-Transfer-Encoding: 8bit"), "{plain}");
+    }
+
+    /// RFC 6533 §6: a read receipt naming non-ASCII addresses is a
+    /// message/global-disposition-notification with utf-8 addresses; an
+    /// ASCII one stays message/disposition-notification.
+    #[test]
+    fn international_receipts_are_global_reports() {
+        let mut a = Account::new(crate::manage::model::Provider::Imap);
+        a.email = "jörg@bücher.example".into();
+        let m = crate::manage::model::Mail {
+            message_id: "<id@example.com>".into(),
+            subject: "Grüße".into(),
+            ..Default::default()
+        };
+        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com", "")).unwrap();
+        assert!(raw.contains("Content-Type: message/global-disposition-notification\r\n"), "{raw}");
+        assert!(raw.contains("Final-Recipient: utf-8;jörg@bücher.example\r\n"), "{raw}");
+        assert!(has_global_part(raw.as_bytes()));
+        a.email = "me@example.com".into();
+        let raw = String::from_utf8(receipt(&a, &m, "ana@example.com", "rfc822;me@example.com")).unwrap();
+        assert!(raw.contains("Content-Type: message/disposition-notification\r\n"), "{raw}");
+        assert!(raw.contains("Final-Recipient: rfc822;me@example.com\r\n"), "{raw}");
+        assert!(!has_global_part(raw.as_bytes()));
     }
 
     /// Mail sent as an alias asks for read receipts at the alias and
