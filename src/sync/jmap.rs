@@ -435,6 +435,10 @@ pub struct Session {
     /// The Sieve extensions of the account's filters, where it has JMAP
     /// for Sieve Scripts.
     sieve: Option<Vec<String>>,
+    /// RFC 9661 §1.3.1: the largest script in bytes (`maxSizeScript`), the
+    /// longest script name (`maxSizeScriptName`), and how many scripts the
+    /// account may keep (`maxNumberScripts`); `None` where unlimited.
+    sieve_limits: (Option<usize>, Option<usize>, Option<usize>),
 }
 
 /// A mail account's limits (RFC 8621 §1.3.1), where it says.
@@ -835,6 +839,11 @@ impl Session {
                     .filter_map(|e| e.as_str().map(str::to_owned))
                     .collect()
             }),
+            sieve_limits: {
+                let caps = &account[SIEVE];
+                let n = |k: &str| caps[k].as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
+                (n("maxSizeScript"), n("maxSizeScriptName"), n("maxNumberScripts"))
+            },
             account_id,
             mailboxes: Mutex::new(Vec::new()),
             capabilities: caps
@@ -3002,7 +3011,70 @@ impl Session {
     /// and saving then both name (RFC 9661 §2.2, §2.3): it goes up once.
     pub fn sieve_upload(&self, text: &str) -> Result<String> {
         self.require_sieve()?;
+        if let Some(most) = self.sieve_limits.0 {
+            ensure!(
+                text.len() <= most,
+                "These filters are larger than the server keeps ({most} bytes at most). Remove some rules."
+            );
+        }
         self.upload_inline(text.as_bytes(), "application/sieve")
+    }
+    /// The ids of the scripts matching `filter` (SieveScript/query, RFC
+    /// 9661 §2.4: by `name` or `isActive`), by name.
+    // Backend-only until the UI calls it: finding scripts by
+    // SieveScript/query.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn query_sieve(&self, filter: Value) -> Result<Vec<String>> {
+        self.require_sieve()?;
+        let v = self.one(
+            "SieveScript/query",
+            json!({ "accountId": self.account_id, "filter": filter, "sort": [{ "property": "name" }] }),
+        )?;
+        Ok(v["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect())
+    }
+    /// Renames a script (RFC 9661 §2.3: its `name`).
+    // Backend-only until the UI calls it: renaming a Sieve script.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn sieve_rename(&self, id: &str, name: &str) -> Result<()> {
+        self.require_sieve()?;
+        self.check_sieve_name(name)?;
+        let v = self.one(
+            "SieveScript/set",
+            json!({ "accountId": self.account_id, "update": { id: { "name": name } } }),
+        )?;
+        if let Some(e) = v["notUpdated"].get(id) {
+            if e["type"] == "alreadyExists" {
+                bail!("A filter script named “{name}” is already on the server.");
+            }
+            bail!("The server didn't rename the filters: {}", set_error(e));
+        }
+        Ok(())
+    }
+    /// Removes a script (RFC 9661 §2.3). The active one can't be removed:
+    /// another is made active, or none, first.
+    // Backend-only until the UI calls it: removing a Sieve script.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn sieve_destroy(&self, id: &str) -> Result<()> {
+        self.require_sieve()?;
+        let v = self.one(
+            "SieveScript/set",
+            json!({ "accountId": self.account_id, "destroy": [id] }),
+        )?;
+        if let Some(e) = v["notDestroyed"].get(id)
+            && e["type"] != "notFound"
+        {
+            if e["type"] == "sieveIsActive" {
+                bail!("These are the filters in use; turn them off before removing them.");
+            }
+            bail!("The server didn't remove the filters: {}", set_error(e));
+        }
+        Ok(())
+    }
+    fn check_sieve_name(&self, name: &str) -> Result<()> {
+        if let Some(most) = self.sieve_limits.1 {
+            ensure!(name.len() <= most, "This server takes filter names of up to {most} bytes.");
+        }
+        Ok(())
     }
     /// Checks a script the server would run (uploaded as `blob`), without
     /// saving it.
@@ -3024,6 +3096,15 @@ impl Session {
     /// `existing`, its id if it is there) and makes it the active one.
     pub fn sieve_put(&self, name: &str, blob: &str, existing: Option<&str>) -> Result<()> {
         self.require_sieve()?;
+        if existing.is_none() {
+            self.check_sieve_name(name)?;
+            if let Some(most) = self.sieve_limits.2 {
+                ensure!(
+                    self.sieve_scripts()?.len() < most,
+                    "The server keeps at most {most} filter scripts, and has that many. Remove one first."
+                );
+            }
+        }
         let (args, key, activate) = match existing {
             Some(id) => (
                 json!({ "update": { id: { "blobId": blob } } }),

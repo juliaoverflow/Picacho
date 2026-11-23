@@ -94,6 +94,8 @@ struct Server {
     mail_caps: Option<Value>,
     /// Read receipts the server sent (MDN/send's MDN objects).
     mdns: Vec<Value>,
+    /// The Sieve capability's maxSizeScript, where set (else 64 KiB).
+    sieve_max_size: Option<usize>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -827,6 +829,40 @@ impl Server {
                     .collect();
                 vec![(name.into(), json!({ "list": list, "state": "x" }))]
             }
+            "SieveScript/query" => {
+                let ids: Vec<&String> = self
+                    .scripts
+                    .iter()
+                    .filter(|x| args["filter"]["isActive"].as_bool().is_none_or(|on| x.3 == on))
+                    .filter(|x| args["filter"]["name"].as_str().is_none_or(|n| x.1 == n))
+                    .map(|x| &x.0)
+                    .collect();
+                vec![(name.into(), json!({ "ids": ids, "queryState": "sq" }))]
+            }
+            "SieveScript/set" if args.get("destroy").is_some() || args["update"].as_object().is_some_and(|u| u.values().any(|p| p.get("name").is_some())) => {
+                let mut out = json!({ "updated": {}, "destroyed": [] });
+                for (id, p) in args["update"].as_object().into_iter().flatten() {
+                    let new = p["name"].as_str().unwrap().to_owned();
+                    if self.scripts.iter().any(|x| x.1 == new && x.0 != *id) {
+                        out["notUpdated"][id] = json!({ "type": "alreadyExists" });
+                        continue;
+                    }
+                    self.scripts.iter_mut().find(|x| x.0 == *id).unwrap().1 = new;
+                    out["updated"][id] = Value::Null;
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    let id = id.as_str().unwrap();
+                    match self.scripts.iter().find(|x| x.0 == id) {
+                        Some(x) if x.3 => out["notDestroyed"][id] = json!({ "type": "sieveIsActive" }),
+                        Some(_) => {
+                            self.scripts.retain(|x| x.0 != id);
+                            out["destroyed"].as_array_mut().unwrap().push(json!(id));
+                        }
+                        None => out["notDestroyed"][id] = json!({ "type": "notFound" }),
+                    }
+                }
+                vec![(name.into(), out)]
+            }
             "SieveScript/validate" => {
                 let text = String::from_utf8_lossy(&self.blobs[args["blobId"].as_str().unwrap()])
                     .into_owned();
@@ -944,7 +980,8 @@ impl Server {
                     "accounts": { "u1": { "name": "qa@example.com", "accountCapabilities": {
                         "urn:ietf:params:jmap:mail": self.mail_caps.clone().unwrap_or(json!({})), "urn:ietf:params:jmap:submission": {},
                         "urn:ietf:params:jmap:sieve": {
-                            "sieveExtensions": ["fileinto", "vacation", "imap4flags", "include"] } } } },
+                            "sieveExtensions": ["fileinto", "vacation", "imap4flags", "include"],
+                            "maxSizeScript": self.sieve_max_size.unwrap_or(65536), "maxNumberScripts": 5 } } } },
                     "primaryAccounts": { "urn:ietf:params:jmap:mail": "u1" },
                     "username": "qa@example.com",
                     "apiUrl": format!("{base}/api"),
@@ -2598,5 +2635,39 @@ fn jmap_read_receipts_carry_every_field() -> Result<()> {
     assert_eq!(r.disposition, "displayed");
     assert!(r.automatic);
     assert_eq!(r.reporting_ua.as_deref(), Some("Other/2"));
+    Ok(())
+}
+
+/// Sieve scripts over JMAP (RFC 9661): found by query, renamed, removed
+/// (not the active one), and a script larger than the server keeps is
+/// refused before it is uploaded.
+#[test]
+fn jmap_sieve_query_rename_destroy_and_limits() -> Result<()> {
+    let mut fixture = Server {
+        sieve_max_size: Some(40),
+        ..Default::default()
+    };
+    fixture.blobs.insert("B-v".into(), b"require \"fileinto\";".to_vec());
+    fixture.scripts.push(("V".into(), "vendor".into(), "B-v".into(), true));
+    fixture.scripts.push(("O".into(), "old".into(), "B-v".into(), false));
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.with_jmap(&a, |s| {
+        assert_eq!(s.query_sieve(json!({ "isActive": true }))?, ["V"]);
+        s.sieve_rename("O", "older")?;
+        assert!(s.sieve_rename("O", "vendor").is_err(), "the name is taken");
+        assert!(s.sieve_destroy("V").is_err(), "the active one stays");
+        s.sieve_destroy("O")?;
+        let before = server.lock().unwrap().blobs.len();
+        let e = s.sieve_upload(&"x".repeat(41)).unwrap_err();
+        assert!(e.to_string().contains("larger"), "{e}");
+        assert_eq!(server.lock().unwrap().blobs.len(), before, "not uploaded");
+        Ok(())
+    })?;
+    let s = server.lock().unwrap();
+    assert_eq!(s.scripts.iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), ["vendor"]);
     Ok(())
 }
