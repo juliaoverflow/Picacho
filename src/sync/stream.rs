@@ -107,7 +107,7 @@ pub(crate) struct ImapStream {
 /// literals as entry names and values but not as the mailbox name.
 ///
 /// A stopgap: once imap-proto reads literals there itself
-/// (docs/imap-proto-resp_other-literals.patch), `Framer` goes.
+/// (docs/imap-proto-resp_other-literals.patch, docs/imap-proto-patches.md), `Framer` goes.
 const REWRITTEN: [&str; 13] = [
     "NAMESPACE",
     "QUOTA",

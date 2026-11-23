@@ -43,6 +43,8 @@ pub(super) struct Connection {
     pub(super) statuses: std::collections::HashMap<String, crate::sync::transport::FolderStatus>,
     /// Rights by mailbox, as MYRIGHTS gave them and when.
     rights: std::collections::HashMap<String, (Option<String>, Instant)>,
+    /// Each mailbox's own APPENDLIMIT, once asked (`None`: no limit there).
+    append_limits: std::collections::HashMap<String, Option<u64>>,
     selected: Option<Selected>,
     used: Instant,
     /// What ENABLE turned on (QRESYNC, UTF8=ACCEPT, UIDONLY).
@@ -63,6 +65,7 @@ impl Connection {
             subscribed_only: false,
             statuses: std::collections::HashMap::new(),
             rights: std::collections::HashMap::new(),
+            append_limits: std::collections::HashMap::new(),
             selected: None,
             used: Instant::now(),
             enabled: Default::default(),
@@ -299,6 +302,28 @@ impl Connection {
             .session
             .run_command_and_check_ok(format!("SUBSCRIBE {wire}"));
         crate::sync::transport::resolve_in(self.names(true)?, provider, folder)
+    }
+    /// The largest message `mailbox` takes (RFC 7889): its own APPENDLIMIT
+    /// where the server says per mailbox (STATUS … (APPENDLIMIT), which a
+    /// server listing APPENDLIMIT without a number gives), else the
+    /// server's (`APPENDLIMIT=n`). Asked once per connection.
+    pub(super) fn append_limit(&mut self, mailbox: &str) -> Result<Option<u64>> {
+        let ext = self.extensions()?;
+        if !ext.append_limit_status || !crate::sync::transport::reads_status_appendlimit() {
+            return Ok(ext.append_limit);
+        }
+        if let Some(limit) = self.append_limits.get(mailbox) {
+            return Ok(*limit);
+        }
+        let wire = self.mailbox(mailbox)?;
+        let limit = match self.heard(&format!("STATUS {wire} (APPENDLIMIT)")) {
+            Ok(heard) => crate::sync::transport::status_append_limit(&heard).unwrap_or(ext.append_limit),
+            // A mailbox that can't say: the server's limit, if any.
+            Err(imap::error::Error::No(_) | imap::error::Error::Bad(_)) => ext.append_limit,
+            Err(e) => return Err(e.into()),
+        };
+        self.append_limits.insert(mailbox.to_owned(), limit);
+        Ok(limit)
     }
     /// The space every mailbox takes, from STATUS=SIZE (RFC 8438), in KiB:
     /// storage used where the server has no QUOTA to say.

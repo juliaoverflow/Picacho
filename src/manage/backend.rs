@@ -4072,12 +4072,12 @@ impl Backend {
     /// with its Message-ID is already there (an earlier try may have
     /// succeeded without its reply arriving).
     fn file_sent_copy(&self, c: &mut Connection, a: &Account, raw: &[u8]) -> Result<()> {
-        if let Some(limit) = c.extensions()?.append_limit
+        let sent = c.standard_folder(a.provider, Folder::Sent)?;
+        if let Some(limit) = c.append_limit(&sent)?
             && raw.len() as u64 > limit
         {
             return Err(TooLargeForSent(limit).into());
         }
-        let sent = c.standard_folder(a.provider, Folder::Sent)?;
         let id = message_id_of(raw);
         if !id.is_empty() {
             c.select(&sent)?;
@@ -4156,12 +4156,12 @@ impl Backend {
         let original = self.catenated_original(a, d, &raw);
         // Filed and authorized; nothing has been sent yet.
         let filed = self.with_imap(a, |c| {
-            if let Some(limit) = c.extensions()?.append_limit
+            let sent = c.standard_folder(a.provider, Folder::Sent)?;
+            if let Some(limit) = c.append_limit(&sent)?
                 && raw.len() as u64 > limit
             {
                 bail!(TooLargeForSent(limit));
             }
-            let sent = c.standard_folder(a.provider, Folder::Sent)?;
             let wire = c.wire(&sent);
             let flags = [imap::types::Flag::Seen];
             let catenated = match &original {
@@ -4639,7 +4639,7 @@ impl Backend {
             }
             locals.extend(found);
             // Drafts written or changed here.
-            let limit = c.extensions()?.append_limit;
+            let limit = c.append_limit(&mailbox)?;
             // UIDs only grow: anything uploaded from here on is above this.
             let mut floor = on_server.last().copied().unwrap_or(0);
             for d in &locals {

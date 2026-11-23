@@ -1091,6 +1091,9 @@ pub(crate) struct Extensions {
     pub(crate) special_use: bool,
     /// RFC 7889: the largest message the server accepts (APPENDLIMIT).
     pub(crate) append_limit: Option<u64>,
+    /// RFC 7889 §3: APPENDLIMIT listed without a number: each mailbox says
+    /// its own, in STATUS.
+    pub(crate) append_limit_status: bool,
     /// RFC 7162: removed UIDs reported on SELECT (VANISHED), QRESYNC.
     pub(crate) qresync: bool,
     /// RFC 4731: compact search results (ESEARCH, `RETURN (ALL)`).
@@ -1184,6 +1187,39 @@ pub(crate) fn reads_status_size() -> bool {
         Ok((_, imap_proto::Response::MailboxData(_)))
     )
 }
+/// Whether the IMAP parser reads APPENDLIMIT in STATUS replies (RFC 7889
+/// §4; docs/imap-proto-status-appendlimit.patch). Without it such a reply
+/// ends the session, so a mailbox's own limit isn't asked.
+pub(crate) fn reads_status_appendlimit() -> bool {
+    matches!(
+        imap_proto::parse_response(b"* STATUS INBOX (APPENDLIMIT 1)\r\n"),
+        Ok((_, imap_proto::Response::MailboxData(_)))
+    )
+}
+/// APPENDLIMIT in a STATUS reply: `* STATUS "Sent" (APPENDLIMIT 1048576)`.
+/// `Some(None)` where it says NIL (no limit there), `None` where it
+/// doesn't say.
+pub(crate) fn status_append_limit(heard: &[u8]) -> Option<Option<u64>> {
+    let text = String::from_utf8_lossy(heard);
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("* ")?;
+        if !rest.get(..7)?.eq_ignore_ascii_case("STATUS ") {
+            return None;
+        }
+        // The list is the line's last parenthesized group.
+        let open = rest.rfind('(')?;
+        let list = rest[open + 1..].trim_end().strip_suffix(')')?;
+        let words: Vec<&str> = list.split_ascii_whitespace().collect();
+        let value = words
+            .chunks(2)
+            .find(|c| c.len() == 2 && c[0].eq_ignore_ascii_case("APPENDLIMIT"))?[1];
+        if value.eq_ignore_ascii_case("NIL") {
+            Some(None)
+        } else {
+            value.parse().ok().map(Some)
+        }
+    })
+}
 /// Whether the IMAP parser keeps GENURLAUTH replies (imap-proto 0007).
 pub(crate) fn reads_urlauth() -> bool {
     matches!(
@@ -1225,6 +1261,7 @@ pub(crate) fn extensions(session: &mut ImapSession) -> Result<Extensions> {
         acl: caps.has_str("ACL"),
         special_use: rev2 || caps.has_str("SPECIAL-USE"),
         append_limit,
+        append_limit_status: atoms.iter().any(|a| a.eq_ignore_ascii_case("APPENDLIMIT")),
         qresync: caps.has_str("QRESYNC"),
         esearch: rev2 || caps.has_str("ESEARCH"),
         sort: caps.has_str("SORT"),
@@ -2286,6 +2323,12 @@ mod extension_tests {
         assert!(initial_response_allowed(&caps("IMAP4REV1 SASL-IR AUTH=PLAIN")));
         assert!(initial_response_allowed(&caps("IMAP4REV2 AUTH=PLAIN")));
         assert!(!initial_response_allowed(&caps("IMAP4REV1 AUTH=PLAIN")));
+    }
+    #[test]
+    fn mailbox_append_limits_are_read() {
+        assert_eq!(status_append_limit(b"* STATUS \"Sent\" (APPENDLIMIT 1048576)\r\na1 OK\r\n"), Some(Some(1048576)));
+        assert_eq!(status_append_limit(b"* STATUS Archive (MESSAGES 2 APPENDLIMIT NIL)\r\n"), Some(None));
+        assert_eq!(status_append_limit(b"* STATUS INBOX (MESSAGES 2)\r\n"), None);
     }
     #[test]
     fn read_only_selects_are_recognized() {

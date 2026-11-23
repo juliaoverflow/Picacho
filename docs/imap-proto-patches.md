@@ -1,4 +1,8 @@
-# Draft imap-proto patch 0008: literals in extension replies
+# Draft imap-proto patches
+
+Two patches for Picacho-Patches' `imap-proto` are drafted here. Each applies on its own to `imap-proto/crate` with patches 0001 to 0007, using `patch -p1` from `crate/`.
+
+## 0008: literals in extension replies
 
 `imap-proto-resp_other-literals.patch` is a draft of the proper fix for
 literals in untagged extension replies (NAMESPACE, QUOTA, ACL, MYRIGHTS, ID,
@@ -27,3 +31,16 @@ How to land it:
    (src/sync/imap.rs). Keep the mock test
    `extension_replies_with_literals_are_read`, but expect the line-broken
    NAMESPACE prefix to be read and not refused.
+
+## 0009: APPENDLIMIT in STATUS
+
+`imap-proto-status-appendlimit.patch` parses STATUS's `APPENDLIMIT n` or
+`APPENDLIMIT NIL` (RFC 7889 §4) as `StatusAttribute::AppendLimit`. A server
+that lists `APPENDLIMIT` without a number sets each mailbox's own limit
+(RFC 7889 §3). Without this patch, that reply ends the session.
+
+The client already asks a mailbox for its limit (`Connection::append_limit`).
+It does so only once `reads_status_appendlimit()` reports that the parser
+reads the reply, so nothing has to change in Picacho when the patch lands
+besides running `cargo update -p imap-proto`. The patch adds the test
+`test_status_appendlimit`.
