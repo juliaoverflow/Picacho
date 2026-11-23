@@ -668,3 +668,64 @@ fn deliver_by_mode_and_trace_reach_mail_from() -> Result<()> {
     }
     Ok(())
 }
+
+/// RFC 3461 §4.1, §4.3: the account's NOTIFY and RET choices reach the
+/// envelope; the defaults are every report and the headers only.
+#[test]
+fn delivery_report_options_reach_the_envelope() -> Result<()> {
+    use crate::manage::model::DsnOptions;
+    for (options, ret, notify) in [
+        (DsnOptions::default(), "RET=HDRS", "NOTIFY=SUCCESS,FAILURE,DELAY"),
+        (
+            DsnOptions { success: false, delay: false, return_full: true, ..DsnOptions::default() },
+            "RET=FULL",
+            "NOTIFY=FAILURE",
+        ),
+        (
+            DsnOptions { success: false, failure: false, delay: false, return_full: false },
+            "RET=HDRS",
+            "NOTIFY=NEVER",
+        ),
+    ] {
+        let fixture = SmtpFixture::start("250-fixture\r\n250-DSN\r\n250 AUTH PLAIN\r\n", no_script())?;
+        let (b, mut a, path) = smtp_account(&fixture)?;
+        a.delivery_receipts = true;
+        a.dsn = options;
+        let d = Draft {
+            id: "dsn".into(),
+            account: a.id.clone(),
+            to: "ana@example.com".into(),
+            subject: "Report".into(),
+            body: "Hi".into(),
+            ..Draft::default()
+        };
+        b.store.save_draft(&d)?;
+        b.send(&a, &d)?;
+        let seen = fixture.finish();
+        let t = &seen.transactions[0];
+        assert!(t.mail.contains(&format!(" {ret} ENVID=dsn")), "{}", t.mail);
+        assert!(t.rcpt[0].contains(&format!(" {notify} ")), "{:?}", t.rcpt);
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+/// A delivery report kept here reads as one; other mail doesn't.
+#[test]
+fn downloaded_delivery_reports_are_read() -> Result<()> {
+    let (b, a, path) = backend(&[])?;
+    let raw = b"From: MAILER-DAEMON@mx.example\r\nSubject: Undelivered\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=z\r\n\r\n--z\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; mx.example\r\nOriginal-Envelope-Id: d1\r\n\r\nFinal-Recipient: rfc822; gone@example.org\r\nAction: failed\r\nStatus: 5.1.1\r\n\r\n--z--\r\n";
+    let m = parse_message(raw, &a, "bounce-1", Folder::Inbox, "INBOX", 1)?;
+    b.store.save_download(&m, raw)?;
+    let report = b.delivery_report(&m).flatten().context("a report")?;
+    assert_eq!(report.envelope_id, "d1");
+    assert_eq!(report.recipients[0].status, Some((5, 1, 1)));
+    let plain = b"From: a@example.com\r\nSubject: hi\r\n\r\nHello\r\n";
+    let other = parse_message(plain, &a, "plain-1", Folder::Inbox, "INBOX", 2)?;
+    b.store.save_download(&other, plain)?;
+    assert_eq!(b.delivery_report(&other), Some(None));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

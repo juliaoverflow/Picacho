@@ -342,6 +342,10 @@ pub struct Account {
     /// where the sending server supports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub delivery_receipts: bool,
+    /// With `delivery_receipts`: what reports are asked for and how much
+    /// of the message a failure report returns (RFC 3461 NOTIFY and RET).
+    #[serde(default, skip_serializing_if = "DsnOptions::is_default")]
+    pub dsn: DsnOptions,
     /// Only send where every server on the way must use TLS (REQUIRETLS,
     /// RFC 8689): the outgoing server has to offer it, and mail that can't
     /// go encrypted the whole way bounces rather than going in the clear.
@@ -532,6 +536,7 @@ impl Account {
             reply_to: String::new(),
             read_receipts: false,
             delivery_receipts: false,
+            dsn: DsnOptions::default(),
             require_tls: false,
             deliver_within_hours: 0,
             deliver_late_notify: false,
@@ -1407,6 +1412,56 @@ pub struct Draft {
     /// where the outgoing server has MT-PRIORITY (RFC 6710), given to it.
     #[serde(default, skip_serializing_if = "Priority::is_normal")]
     pub priority: Priority,
+}
+/// Delivery report options (RFC 3461 §4.1, §4.3). The defaults ask for
+/// every report and only the headers back, as Picacho always did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DsnOptions {
+    /// Report delivery (NOTIFY=SUCCESS).
+    pub success: bool,
+    /// Report failure (NOTIFY=FAILURE).
+    pub failure: bool,
+    /// Report a delay (NOTIFY=DELAY).
+    pub delay: bool,
+    /// A failure report returns the whole message (RET=FULL) rather than
+    /// its headers (RET=HDRS).
+    pub return_full: bool,
+}
+impl Default for DsnOptions {
+    fn default() -> Self {
+        Self {
+            success: true,
+            failure: true,
+            delay: true,
+            return_full: false,
+        }
+    }
+}
+impl DsnOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    /// The NOTIFY value (RFC 3461 §4.1): the reports asked for, or NEVER.
+    pub fn notify(&self) -> String {
+        let asked: Vec<&str> = [
+            (self.success, "SUCCESS"),
+            (self.failure, "FAILURE"),
+            (self.delay, "DELAY"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        if asked.is_empty() {
+            "NEVER".into()
+        } else {
+            asked.join(",")
+        }
+    }
+    /// The RET value (RFC 3461 §4.3).
+    pub fn ret(&self) -> &'static str {
+        if self.return_full { "FULL" } else { "HDRS" }
+    }
 }
 /// A message's urgency.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

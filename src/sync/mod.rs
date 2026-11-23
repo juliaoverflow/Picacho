@@ -2,6 +2,7 @@
 //! Protocol helpers never depend on Display and never mutate the message database.
 pub mod auth;
 pub mod caldav;
+pub(crate) mod dsn;
 pub mod carddav;
 pub mod dav;
 pub mod discover;

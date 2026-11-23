@@ -640,7 +640,7 @@ impl Reply {
 }
 
 /// An enhanced status code at the start of a reply line: `5.1.1 …`.
-fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
+pub(crate) fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
     let code = line.split_whitespace().next()?;
     let mut parts = code.split('.');
     fn digits(p: &str, most: usize) -> Option<&str> {
@@ -655,7 +655,7 @@ fn enhanced_code(line: &str) -> Option<(u8, u16, u16)> {
 
 /// What an enhanced status code (RFC 3463, and the IANA registry) means,
 /// for the codes people most often meet.
-fn meaning(class: u8, subject: u16, detail: u16) -> Option<&'static str> {
+pub(crate) fn meaning(class: u8, subject: u16, detail: u16) -> Option<&'static str> {
     if class == 2 {
         return None;
     }
@@ -1330,8 +1330,9 @@ pub(crate) fn deliver_bytes(
     }
     let receipts = a.delivery_receipts && limits.dsn;
     if receipts {
-        // RFC 3461: return headers only, identified by the draft.
-        mail.push_str(&format!(" RET=HDRS ENVID={}", xtext(&d.id)));
+        // RFC 3461 §4.3, §4.4: what a failure returns (the headers unless
+        // asked otherwise), identified by the draft.
+        mail.push_str(&format!(" RET={} ENVID={}", a.dsn.ret(), xtext(&d.id)));
     }
     if a.require_tls {
         mail.push_str(" REQUIRETLS");
@@ -1364,7 +1365,8 @@ pub(crate) fn deliver_bytes(
     let rcpt = |to: &lettre::Address| {
         let mut line = format!("RCPT TO:<{}>", ascii_domain(to.as_ref()));
         if receipts {
-            line.push_str(" NOTIFY=SUCCESS,FAILURE,DELAY");
+            // RFC 3461 §4.1: the reports the account asks for.
+            line.push_str(&format!(" NOTIFY={}", a.dsn.notify()));
             // The address as written, so a report names it (RFC 3461 §4.2).
             // Non-ASCII ones would need RFC 6533's utf-8-addr form; left out.
             let to: &str = to.as_ref();

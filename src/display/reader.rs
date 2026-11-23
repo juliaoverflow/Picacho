@@ -575,6 +575,7 @@ impl MailApp {
             .children((!locked).then(|| self.codes_banner(m, cx)).flatten())
             .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) })
             .children((!locked).then(|| self.invitation_card(m, cx)).flatten())
+            .children((!locked).then(|| self.delivery_report_card(m)).flatten())
             .children((!locked).then(|| self.setup_message_card(m, cx)).flatten());
         if !locked && !self.invitations.contains_key(&m.id) {
             let m = m.clone();
@@ -582,6 +583,7 @@ impl MailApp {
             cx.defer(move |cx| {
                 let _ = view.update(cx, |this, cx| {
                     this.check_invitation(&m, cx);
+                    this.check_delivery_report(&m, cx);
                     this.complete_jmap_thread(&m, cx);
                 });
             });
@@ -824,6 +826,93 @@ const OPEN_FADE: Duration = Duration::from_millis(220);
 impl MailApp {
     /// Locked messages use the same toolbar, scrolling region and pane sizing
     /// as readable mail. Keeping the shell shared prevents layout drift.
+    /// Reads a downloaded message once for a delivery report (RFC 3464,
+    /// RFC 6533), from its cached source: nothing is fetched for it.
+    fn check_delivery_report(&mut self, m: &Mail, cx: &mut Context<Self>) {
+        if self.delivery_reports.contains_key(&m.id) {
+            return;
+        }
+        // Until its source is downloaded there's nothing to read; it is
+        // looked at again once there is.
+        let Some(report) = self.backend.delivery_report(m) else {
+            return;
+        };
+        let found = report.is_some();
+        self.delivery_reports.insert(m.id.clone(), report);
+        if found {
+            cx.notify();
+        }
+    }
+    /// What a delivery report says of each recipient, above its text: who,
+    /// what happened, the status code, and the server's words, muted.
+    fn delivery_report_card(&self, m: &Mail) -> Option<AnyElement> {
+        use crate::sync::dsn::Action as Outcome;
+        let report = self.delivery_reports.get(&m.id)?.as_ref()?;
+        let c = self.colors();
+        let rows = report.recipients.iter().take(50).enumerate().map(|(i, r)| {
+            let outcome = match r.action {
+                Outcome::Failed => "Failed",
+                Outcome::Delayed => "Delayed",
+                Outcome::Delivered => "Delivered",
+                Outcome::Relayed => "Relayed",
+                Outcome::Expanded => "Expanded",
+                Outcome::Other => "Unknown",
+            };
+            let status = r
+                .status
+                .map(|(class, subject, detail)| format!(" {class}.{subject}.{detail}"))
+                .unwrap_or_default();
+            div()
+                .id(SharedString::from(format!("delivery-report-{i}")))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().font_weight(FontWeight::MEDIUM).child(r.recipient.clone()))
+                        .child(
+                            div()
+                                .text_color(rgb(if r.action == Outcome::Failed { c.danger } else { c.muted }))
+                                .child(format!("{outcome}{status}")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(r.summary()),
+                )
+                .when(!r.diagnostic.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(c.muted))
+                            .child(r.diagnostic.clone()),
+                    )
+                })
+        });
+        Some(
+            div()
+                .id("delivery-report")
+                .debug_selector(|| "delivery-report".into())
+                .role(Role::Region)
+                .aria_label("Delivery report")
+                .m_3()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
+                .child(div().font_weight(FontWeight::MEDIUM).child("Delivery report"))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
     fn unlock_panel(&self, account: &str, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let unlocking = self.unlocking.contains(account);

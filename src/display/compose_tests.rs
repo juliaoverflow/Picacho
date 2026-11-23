@@ -433,3 +433,30 @@ fn pasting_rich_text_offers_the_other_formatting(cx: &mut TestAppContext) {
     assert!(!composer.read_with(cx, |c, _| c.draft.formatted));
     assert_eq!(label(cx), Some("Paste with formatting"));
 }
+
+/// With delivery receipts on, Settings offers which reports to ask for
+/// (RFC 3461 NOTIFY) and the whole message back (RET); with a time limit,
+/// what a late message does and a trace (RFC 2852). Each switch is kept.
+#[gpui::test]
+fn delivery_report_and_time_limit_options_are_in_settings(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let work = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+    act(&view, Action::AccountSettings(work.clone()), cx);
+    frame(cx);
+    let selector = |name: &str| -> &'static str { Box::leak(format!("{name}-{work}").into_boxed_str()) };
+    assert!(cx.debug_bounds(selector("dsn-failure")).is_none());
+    assert!(cx.debug_bounds(selector("deliver-by-trace")).is_none());
+    act(&view, Action::ToggleDeliveryReceipts(work.clone()), cx);
+    act(&view, Action::SetDeliverWithin(work.clone(), 4), cx);
+    frame(cx);
+    for name in ["dsn-success", "dsn-failure", "dsn-delay", "dsn-full", "deliver-by-trace"] {
+        assert!(cx.debug_bounds(selector(name)).is_some(), "{name}");
+    }
+    act(&view, Action::SetDsn(work.clone(), DsnChange::Success), cx);
+    act(&view, Action::SetDsn(work.clone(), DsnChange::ReturnFull), cx);
+    act(&view, Action::SetDeliverLateNotify(work.clone(), true), cx);
+    act(&view, Action::ToggleDeliverByTrace(work.clone()), cx);
+    let saved = store.accounts().unwrap().into_iter().find(|a| a.id == work).unwrap();
+    assert!(!saved.dsn.success && saved.dsn.failure && saved.dsn.delay && saved.dsn.return_full);
+    assert!(saved.deliver_late_notify && saved.deliver_by_trace);
+}

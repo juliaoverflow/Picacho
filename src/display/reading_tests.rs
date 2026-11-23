@@ -686,3 +686,35 @@ fn a_long_press_selects_a_word_in_an_email_and_offers_to_copy_it(cx: &mut TestAp
         );
     });
 }
+
+/// A downloaded delivery report (RFC 3464) shows each recipient's outcome
+/// above its text; an ordinary message shows no such panel.
+#[gpui::test]
+fn delivery_reports_show_each_recipients_outcome(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let ids = view.update_in(cx, |this, _, _| {
+        this.messages.iter().take(2).map(|m| m.id.clone()).collect::<Vec<_>>()
+    });
+    let source = b"From: MAILER-DAEMON@mx.example\r\nSubject: Undelivered\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=z\r\n\r\n--z\r\nContent-Type: text/plain\r\n\r\nIt failed.\r\n--z\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; mx.example\r\n\r\nFinal-Recipient: rfc822; gone@example.org\r\nAction: failed\r\nStatus: 5.1.1\r\nDiagnostic-Code: smtp; 550 5.1.1 User unknown\r\n\r\n--z--\r\n";
+    store.save_raw(&ids[0], source).unwrap();
+    view.update_in(cx, |this, _, cx| this.reload_cached(cx));
+    let show = |cx: &mut VisualTestContext, id: &str| {
+        view.update_in(cx, |this, _, cx| {
+            this.selected = Some(id.to_owned());
+            cx.notify();
+        });
+        for _ in 0..4 {
+            frame(cx);
+            cx.run_until_parked();
+        }
+    };
+    show(cx, &ids[0]);
+    assert!(cx.debug_bounds("delivery-report").is_some());
+    view.read_with(cx, |this, _| {
+        let report = this.delivery_reports[&ids[0]].as_ref().unwrap();
+        assert_eq!(report.recipients[0].recipient, "gone@example.org");
+        assert_eq!(report.recipients[0].diagnostic, "550 5.1.1 User unknown");
+    });
+    show(cx, &ids[1]);
+    assert!(cx.debug_bounds("delivery-report").is_none());
+}

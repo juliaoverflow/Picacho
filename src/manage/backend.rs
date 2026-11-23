@@ -2668,6 +2668,13 @@ impl Backend {
             .raw(&m.id)?
             .context("The original message is not available offline.")
     }
+    /// What a delivery report (DSN, RFC 3464) says of each recipient:
+    /// `None` until `m`'s source is downloaded, then `Some(None)` where it
+    /// isn't a report. For the reader to show each recipient's outcome.
+    pub fn delivery_report(&self, m: &Mail) -> Option<Option<crate::sync::dsn::DeliveryReport>> {
+        let raw = self.store.raw(&m.id).ok()??;
+        Some(crate::sync::dsn::parse(&raw))
+    }
     pub fn read(&self, a: &Account, m: &Mail) -> Result<Mail> {
         // Already downloaded: there is nothing to ask the server, so don't
         // wait for the account's connection, which a sync or a background
