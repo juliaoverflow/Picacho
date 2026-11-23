@@ -268,6 +268,144 @@ pub struct Client {
     http: reqwest::blocking::Client,
     user: String,
     password: String,
+    /// The server's Digest challenge (RFC 7616), once it has asked for
+    /// Digest rather than Basic, and how many requests it has signed.
+    digest: std::sync::Mutex<Option<(Digest, u32)>>,
+}
+
+/// A WWW-Authenticate Digest challenge (RFC 7616 §3.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Digest {
+    realm: String,
+    nonce: String,
+    opaque: Option<String>,
+    /// SHA-256 or MD5 (RFC 7616 §3.3 `algorithm`), and its `-sess` form.
+    sha256: bool,
+    session: bool,
+    /// `qop=auth` offered; else the RFC 2069 form without it.
+    qop: bool,
+    /// The user name hashed (RFC 7616 §3.4.4 `userhash`).
+    userhash: bool,
+}
+impl Digest {
+    /// The strongest Digest challenge among a 401's WWW-Authenticate
+    /// headers: SHA-256 before MD5 (RFC 7616 §3.7). `None` without one.
+    fn choose<'a>(headers: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut found: Vec<Self> = headers.filter_map(Self::parse).collect();
+        found.sort_by_key(|d| !d.sha256);
+        found.into_iter().next()
+    }
+    fn parse(header: &str) -> Option<Self> {
+        let rest = header.trim();
+        let (scheme, params) = rest.split_once(char::is_whitespace)?;
+        if !scheme.eq_ignore_ascii_case("Digest") {
+            return None;
+        }
+        let mut d = Digest::default();
+        let mut algorithm = "MD5".to_owned();
+        for (k, v) in auth_params(params) {
+            match k.to_ascii_lowercase().as_str() {
+                "realm" => d.realm = v,
+                "nonce" => d.nonce = v,
+                "opaque" => d.opaque = Some(v),
+                "algorithm" => algorithm = v.to_ascii_uppercase(),
+                "qop" => d.qop = v.split(',').any(|q| q.trim().eq_ignore_ascii_case("auth")),
+                "userhash" => d.userhash = v.eq_ignore_ascii_case("true"),
+                _ => {}
+            }
+        }
+        d.session = algorithm.ends_with("-SESS");
+        d.sha256 = match algorithm.trim_end_matches("-SESS") {
+            "SHA-256" => true,
+            "MD5" => false,
+            // SHA-512-256 and others: not ones Picacho has.
+            _ => return None,
+        };
+        (!d.nonce.is_empty()).then_some(d)
+    }
+    fn hash(&self, text: &str) -> String {
+        use sha2::Digest as _;
+        if self.sha256 {
+            hex(&sha2::Sha256::digest(text.as_bytes()))
+        } else {
+            hex(&md5::Md5::digest(text.as_bytes()))
+        }
+    }
+    /// The Authorization header for `method` on `uri` (RFC 7616 §3.4), the
+    /// `count`th request on this nonce, with client nonce `cnonce`.
+    fn authorization(&self, user: &str, password: &str, method: &str, uri: &str, count: u32, cnonce: &str) -> String {
+        let nc = format!("{count:08x}");
+        let mut a1 = self.hash(&format!("{user}:{}:{password}", self.realm));
+        if self.session {
+            a1 = self.hash(&format!("{a1}:{}:{cnonce}", self.nonce));
+        }
+        let a2 = self.hash(&format!("{method}:{uri}"));
+        let response = if self.qop {
+            self.hash(&format!("{a1}:{}:{nc}:{cnonce}:auth:{a2}", self.nonce))
+        } else {
+            self.hash(&format!("{a1}:{}:{a2}", self.nonce))
+        };
+        let quoted = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+        let username = if self.userhash { self.hash(&format!("{user}:{}", self.realm)) } else { quoted(user) };
+        let algorithm = format!("{}{}", if self.sha256 { "SHA-256" } else { "MD5" }, if self.session { "-sess" } else { "" });
+        let mut out = format!(
+            "Digest username=\"{username}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", algorithm={algorithm}, response=\"{response}\"",
+            quoted(&self.realm),
+            quoted(&self.nonce),
+            quoted(uri)
+        );
+        if self.qop {
+            out.push_str(&format!(", qop=auth, nc={nc}, cnonce=\"{cnonce}\""));
+        }
+        if let Some(o) = &self.opaque {
+            out.push_str(&format!(", opaque=\"{}\"", quoted(o)));
+        }
+        if self.userhash {
+            out.push_str(", userhash=true");
+        }
+        out
+    }
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+/// The `name=value` pairs of an authentication challenge (RFC 9110
+/// §11.2), values unquoted.
+fn auth_params(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace() || *c == ',') {
+            chars.next();
+        }
+        let name: String = std::iter::from_fn(|| chars.next_if(|c| *c != '=' && *c != ',' && !c.is_whitespace())).collect();
+        if name.is_empty() {
+            break;
+        }
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.next_if_eq(&'=').is_none() {
+            continue;
+        }
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut value = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => value.extend(chars.next()),
+                    '"' => break,
+                    c => value.push(c),
+                }
+            }
+        } else {
+            value = std::iter::from_fn(|| chars.next_if(|c| *c != ',')).collect::<String>().trim().to_owned();
+        }
+        out.push((name, value));
+    }
+    out
 }
 
 /// The namespace an element Picacho reads belongs in (RFC 4918 §14,
@@ -392,7 +530,55 @@ impl Client {
                 .build()?,
             user: user.to_owned(),
             password: password.to_owned(),
+            digest: Default::default(),
         })
+    }
+    /// `request` signed: Digest once the server asked for it (RFC 7616);
+    /// else Basic (RFC 7617).
+    fn signed(&self, request: reqwest::blocking::RequestBuilder, method: &str, url: &url::Url) -> reqwest::blocking::RequestBuilder {
+        let mut digest = self.digest.lock().unwrap_or_else(|e| e.into_inner());
+        match digest.as_mut() {
+            Some((challenge, count)) => {
+                *count += 1;
+                let uri = match url.query() {
+                    Some(q) => format!("{}?{q}", url.path()),
+                    None => url.path().to_owned(),
+                };
+                let cnonce = uuid::Uuid::new_v4().simple().to_string();
+                request.header(
+                    reqwest::header::AUTHORIZATION,
+                    challenge.authorization(&self.user, &self.password, method, &uri, *count, &cnonce),
+                )
+            }
+            None => request.basic_auth(&self.user, Some(&self.password)),
+        }
+    }
+    /// After a 401: whether the server wants Digest with a challenge not
+    /// tried yet (a first one, or a stale nonce, RFC 7616 §3.3), which is
+    /// then used. False where trying again wouldn't help.
+    fn take_challenge(&self, response: &reqwest::blocking::Response) -> bool {
+        let Some(challenge) = Digest::choose(
+            response
+                .headers()
+                .get_all(reqwest::header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        ) else {
+            return false;
+        };
+        let mut digest = self.digest.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = response
+            .headers()
+            .get_all(reqwest::header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|h| auth_params(h.split_once(' ').map_or("", |(_, p)| p)).iter().any(|(k, v)| k.eq_ignore_ascii_case("stale") && v.eq_ignore_ascii_case("true")));
+        let new = digest.as_ref().is_none_or(|(d, _)| d.nonce != challenge.nonce);
+        if new && (digest.is_none() || stale) {
+            *digest = Some((challenge, 0));
+            return true;
+        }
+        false
     }
 
     fn send(
@@ -402,17 +588,22 @@ impl Client {
         headers: &[(&str, &str)],
         body: String,
     ) -> Result<reqwest::blocking::Response> {
+        let name = method;
         let method = reqwest::Method::from_bytes(method.as_bytes())?;
-        let mut request = self
-            .http
-            .request(method, url.clone())
-            .basic_auth(&self.user, Some(&self.password));
-        for (k, v) in headers {
-            request = request.header(*k, *v);
+        let attempt = |body: String| {
+            let mut request = self.signed(self.http.request(method.clone(), url.clone()), name, url);
+            for (k, v) in headers {
+                request = request.header(*k, *v);
+            }
+            request.body(body).send().with_context(|| {
+                format!("Couldn't reach {}", url.host_str().unwrap_or("the server"))
+            })
+        };
+        let mut response = attempt(body.clone())?;
+        // RFC 7616 §3.3: asked for Digest (or a fresh nonce), once more.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.take_challenge(&response) {
+            response = attempt(body)?;
         }
-        let response = request.body(body).send().with_context(|| {
-            format!("Couldn't reach {}", url.host_str().unwrap_or("the server"))
-        })?;
         let status = response.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -1064,10 +1255,7 @@ impl Client {
                 q.append_pair("rid", &rids.join(","));
             }
         }
-        let mut request = self
-            .http
-            .post(url.clone())
-            .basic_auth(&self.user, Some(&self.password));
+        let mut request = self.signed(self.http.post(url.clone()), "POST", &url);
         match change {
             AttachmentChange::Add { name, content_type, data } | AttachmentChange::Update { name, content_type, data, .. } => {
                 request = request
@@ -1533,8 +1721,13 @@ pub fn test_server(
                 if line.to_ascii_lowercase().starts_with("if-schedule-tag-match:") {
                     conditions.push_str(&line);
                 }
-                // "ana:secret", base64.
+                // "ana:secret", base64; or a Digest answer, which the test
+                // checks itself (it's passed on with the body).
                 auth |= line.contains("Basic YW5hOnNlY3JldA==");
+                if line.to_ascii_lowercase().starts_with("authorization: digest ") {
+                    auth = true;
+                    conditions.push_str(&line);
+                }
                 if line == "\r\n" {
                     break;
                 }
@@ -1548,7 +1741,10 @@ pub fn test_server(
             let path = parts.next().unwrap().to_owned();
             let (status, text) = respond(&method, &path, &body);
             // A redirect: its body is where to.
-            let (extra, text) = if status.starts_with('3') {
+            let (extra, text) = if status.starts_with("401") {
+                // A challenge: its body is the WWW-Authenticate value.
+                (format!("WWW-Authenticate: {text}\r\n"), String::new())
+            } else if status.starts_with('3') {
                 (format!("Location: {text}\r\n"), String::new())
             } else if method == "OPTIONS" {
                 // A scheduling server's compliance classes.
@@ -1672,6 +1868,49 @@ mod tests {
         let read = read_collection(&client, &collection, Some(&gone), &known, |_| Ok(vec![]), multiget)?;
         assert!(read.whole);
         assert_eq!(server.join().unwrap().len(), 3);
+        Ok(())
+    }
+
+    /// RFC 7616 §3.9.1's own example, SHA-256 and MD5: the response the RFC
+    /// gives; and a server asking for Digest is answered with it.
+    #[test]
+    fn digest_authentication() -> Result<()> {
+        let challenges = [
+            "Digest realm=\"http-auth@example.org\", qop=\"auth, auth-int\", algorithm=MD5, nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\"",
+            "Digest realm=\"http-auth@example.org\", qop=\"auth, auth-int\", algorithm=SHA-256, nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\"",
+        ];
+        let chosen = Digest::choose(challenges.into_iter()).unwrap();
+        assert!(chosen.sha256 && chosen.qop && !chosen.session);
+        let cnonce = "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ";
+        let sha = chosen.authorization("Mufasa", "Circle of Life", "GET", "/dir/index.html", 1, cnonce);
+        assert!(sha.contains("response=\"753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1\""), "{sha}");
+        assert!(sha.contains("nc=00000001") && sha.contains("opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\""));
+        let md5 = Digest::parse(challenges[0]).unwrap().authorization("Mufasa", "Circle of Life", "GET", "/dir/index.html", 1, cnonce);
+        assert!(md5.contains("response=\"8ca523f5e9506fed4657c9700eebdbec\""), "{md5}");
+        assert!(Digest::parse("Basic realm=\"x\"").is_none());
+        assert!(Digest::parse("Digest realm=\"x\", nonce=\"n\", algorithm=SHA-512-256").is_none());
+        // A server that wants Digest: asked again with it, and later
+        // requests go with it (the count rising) from the start.
+        let (port, server) = test_server(3, |_, _, body| {
+            if body.to_ascii_lowercase().contains("authorization: digest ") {
+                assert!(body.contains("username=\"ana\"") && body.contains("algorithm=SHA-256"), "{body}");
+                ("207 Multi-Status", "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/</d:href><d:propstat><d:prop><d:quota-available-bytes>5</d:quota-available-bytes></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>".into())
+            } else {
+                ("401 Unauthorized", "Digest realm=\"dav\", qop=\"auth\", algorithm=SHA-256, nonce=\"abc\"".into())
+            }
+        });
+        let client = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?;
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))?;
+        assert_eq!(client.quota(&url)?, Some((0, 5)));
+        assert_eq!(client.quota(&url)?, Some((0, 5)));
+        let seen = server.join().unwrap();
+        assert!(seen[2].2.contains("nc=00000002"), "{}", seen[2].2);
+        // A wrong password stays a sign-in error, not a loop.
+        let (port, server) = test_server(2, |_, _, _| ("401 Unauthorized", "Digest realm=\"dav\", qop=\"auth\", nonce=\"abc\"".into()));
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/"))?;
+        let err = Client::new("ana", "secret", native_tls::TlsConnector::new()?)?.quota(&url).unwrap_err();
+        assert!(err.to_string().contains("user name and password"), "{err}");
+        assert_eq!(server.join().unwrap().len(), 2);
         Ok(())
     }
 
