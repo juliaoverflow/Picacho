@@ -595,6 +595,14 @@ impl Backend {
                         changed(mailbox_of(&names, a.provider, &name));
                     }
                 }
+                // Folders made, renamed, deleted or (un)subscribed elsewhere
+                // (NOTIFY's MailboxName and SubscriptionChange, RFC 5465
+                // §5.4–5.5): the Inbox's check is asked for because every
+                // check lists the folders again and saves them. However
+                // many LIST lines came, once.
+                if mailbox_list_changed(heard) {
+                    changed(Mailbox::Standard(Folder::Inbox));
+                }
             }
             // Any line ends the wait, keepalives too ("* OK still here"
             // in each server's words); only mailbox data is a change.
@@ -630,8 +638,11 @@ fn mailbox_of(names: &[Name], provider: Provider, remote: &str) -> Mailbox {
 /// Whether what a server sent during IDLE reports a change in the watched
 /// mailbox: untagged mailbox data (`* 3 EXISTS`, `* 2 EXPUNGE`, `* 5
 /// FETCH`…), not status lines (`* OK`, `* NO`, `* BYE`), NOTIFY's STATUS
-/// about other mailboxes, the `+ idling` go-ahead, or the tagged reply that
-/// ends the IDLE. A copy cut off at its limit is taken to.
+/// about other mailboxes, an annotation changed elsewhere (unsolicited
+/// METADATA, RFC 5464 §4.4.2: no message changed), NOTIFY's LIST about
+/// folders (handled as such: `mailbox_list_changed`), the `+ idling`
+/// go-ahead, or the tagged reply that ends the IDLE. A copy cut off at its
+/// limit is taken to.
 fn reports_change(heard: &[u8]) -> bool {
     if heard.len() >= crate::sync::stream::Tap::LIMIT {
         return true;
@@ -640,7 +651,7 @@ fn reports_change(heard: &[u8]) -> bool {
         let mut words = line.split_ascii_whitespace();
         words.next() == Some("*")
             && words.next().is_some_and(|w| {
-                !["OK", "NO", "BAD", "BYE", "PREAUTH", "STATUS"]
+                !["OK", "NO", "BAD", "BYE", "PREAUTH", "STATUS", "METADATA", "LIST"]
                     .iter()
                     .any(|s| s.eq_ignore_ascii_case(w))
             })
@@ -657,6 +668,8 @@ mod tests {
         assert!(!reports_change(quiet));
         assert!(!reports_change(b"+ idling\r\n* BYE going down\r\n"));
         assert!(!reports_change(b"* STATUS Work (MESSAGES 4)\r\n"));
+        assert!(!reports_change(b"* METADATA INBOX /private/vendor/tech.pinal.picacho/snoozed\r\n"));
+        assert!(!reports_change(b"* LIST () \"/\" Work\r\n"));
         assert!(reports_change(b"+ idling\r\n* 4 EXISTS\r\na7 OK done\r\n"));
         assert!(reports_change(b"* 2 EXPUNGE\r\n"));
         assert!(reports_change(b"* VANISHED 4\r\n"));

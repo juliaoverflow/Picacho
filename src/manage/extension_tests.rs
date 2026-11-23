@@ -2512,3 +2512,115 @@ fn mailbox_access_lists() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// RFC 5465 §5.4–5.5: the inbox's watch asks to hear of folders made,
+/// renamed, deleted or (un)subscribed elsewhere (asking again without them
+/// where the server can't, [BADEVENT]). A burst of LIST lines, its own
+/// mailbox's among them, asks for one check, and that check lists the
+/// folders again: a folder deleted elsewhere is gone from those kept here.
+#[test]
+fn folder_changes_heard_while_idle_relist_the_folders() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let renamed = Arc::new(AtomicBool::new(false));
+    let gone = renamed.clone();
+    // Two connections: the watch's, then the check's (which logs out last).
+    let mut logouts = 0;
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut idles = 0;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                seen.push(command.clone());
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 IDLE NOTIFY\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Work\r\n");
+                    if !gone.load(std::sync::atomic::Ordering::SeqCst) {
+                        p.send("* LIST () \"/\" Old\r\n");
+                    }
+                } else if upper.starts_with("EXAMINE") || upper.starts_with("SELECT") {
+                    p.send("* 0 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 1] next\r\n");
+                } else if upper.starts_with("NOTIFY SET") && upper.contains("MAILBOXNAME") {
+                    p.send(&format!("{tag} NO [BADEVENT (MessageNew MessageExpunge FlagChange MailboxName)] not that\r\n"));
+                    continue;
+                } else if upper.starts_with("NOTIFY SET") {
+                } else if upper.starts_with("UID SEARCH") {
+                    p.send("* SEARCH\r\n");
+                } else if upper == "IDLE" {
+                    p.send("+ idling\r\n");
+                    idles += 1;
+                    if idles == 1 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        // Elsewhere: Old deleted, Work renamed and back, and
+                        // a LIST about the watched mailbox itself.
+                        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        p.send("* LIST (\\NonExistent) \"/\" Old\r\n* LIST () \"/\" Work\r\n* LIST () \"/\" INBOX\r\n");
+                    }
+                    match p.line() {
+                        Some(done) => {
+                            seen.push(done.trim_end().to_owned());
+                            p.ok(&tag);
+                        }
+                        // The watch stopped by closing its connection.
+                        None => {
+                            logouts += 1;
+                            if logouts == 2 {
+                                break 'connections;
+                            }
+                            continue 'connections;
+                        }
+                    }
+                    continue;
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    logouts += 1;
+                    if logouts == 2 {
+                        break 'connections;
+                    }
+                    continue 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        seen
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let b = Arc::new(b);
+    // Folders as an earlier check kept them.
+    b.store.save_folders(&a.id, &custom_folders(&[
+        crate::sync::transport::Name::for_test("Work", "/", &[]),
+        crate::sync::transport::Name::for_test("Old", "/", &[]),
+    ]))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    b.watch_inbox(&a, move |m| {
+        let _ = tx.send(m);
+    });
+    let asked = rx.recv_timeout(Duration::from_secs(10)).expect("a check was asked for");
+    assert_eq!(asked, Mailbox::Standard(Folder::Inbox));
+    // One burst, one check.
+    std::thread::sleep(Duration::from_millis(300));
+    let more: Vec<Mailbox> = rx.try_iter().collect();
+    assert!(more.is_empty(), "the burst asked for one check: {more:?}");
+    // That check lists the folders again: Old is gone. (The fixture
+    // serves one connection at a time: the watch's ends first.)
+    b.stop_watching(&a.id);
+    b.sync(&a, asked, 50)?;
+    let kept: Vec<String> = b.store.folders(&a.id).into_iter().map(|f| f.name).collect();
+    assert_eq!(kept, ["Work"]);
+    b.disconnect(&a.id);
+    let seen = server.join().unwrap();
+    let notify: Vec<&String> = seen.iter().filter(|c| c.starts_with("NOTIFY SET")).collect();
+    assert_eq!(notify.len(), 2, "{seen:?}");
+    assert!(notify[0].contains("MailboxName SubscriptionChange"), "{notify:?}");
+    assert!(!notify[1].contains("MailboxName"), "{notify:?}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

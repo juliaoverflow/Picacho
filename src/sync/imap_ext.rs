@@ -792,24 +792,41 @@ pub(crate) fn notify_personal(session: &mut ImapSession, condstore: bool) -> Res
     } else {
         "MessageNew MessageExpunge"
     };
-    let command = format!(
-        "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
-         (PERSONAL ({others}))"
-    );
-    match session.run_command_and_check_ok(&command) {
-        Ok(()) => Ok(true),
-        // [BADEVENT]: the server named what it can report; ask again
-        // for the essentials alone.
-        Err(imap::error::Error::No(e) | imap::error::Error::Bad(e))
-            if e.to_ascii_uppercase().contains("BADEVENT") =>
-        {
-            super::imap::optional(session.run_command_and_check_ok(
-                "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge)) \
-                 (PERSONAL (MessageNew MessageExpunge))",
-            ))
+    // Folders made, renamed or deleted, and subscriptions changed, come as
+    // untagged LIST lines (MailboxName, SubscriptionChange; RFC 5465 §5.4
+    // and §5.5); see `mailbox_list_changed`.
+    let commands = [
+        format!(
+            "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
+             (PERSONAL ({others} MailboxName SubscriptionChange))"
+        ),
+        format!(
+            "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge FlagChange)) \
+             (PERSONAL ({others}))"
+        ),
+        "NOTIFY SET STATUS (SELECTED (MessageNew MessageExpunge)) \
+         (PERSONAL (MessageNew MessageExpunge))"
+            .to_owned(),
+    ];
+    for command in &commands {
+        match session.run_command_and_check_ok(command) {
+            Ok(()) => return Ok(true),
+            // [BADEVENT] (RFC 5465 §6): the server can't report one of
+            // those; ask again for less.
+            Err(imap::error::Error::No(e) | imap::error::Error::Bad(e))
+                if e.to_ascii_uppercase().contains("BADEVENT") => {}
+            Err(e) => return super::imap::optional(Err(e)),
         }
-        Err(e) => super::imap::optional(Err(e)),
     }
+    Ok(false)
+}
+/// Whether a NOTIFY session heard a mailbox made, renamed, deleted or
+/// (un)subscribed (an untagged LIST line, RFC 5465 §5.4 and §5.5): the
+/// folder list should be read again. One answer for however many lines.
+pub(crate) fn mailbox_list_changed(heard: &[u8]) -> bool {
+    String::from_utf8_lossy(heard).lines().any(|line| {
+        line.get(..7).is_some_and(|start| start.eq_ignore_ascii_case("* LIST "))
+    })
 }
 /// Whether a NOTIFY session lost events ([NOTIFICATIONOVERFLOW], RFC 5465
 /// §5.8): the server stopped notifying, and every mailbox may have
@@ -1168,6 +1185,8 @@ mod tests {
         assert_eq!(after_closed(data), b"* 1 EXISTS\r\n");
         assert_eq!(after_closed(b"* 1 EXISTS\r\n"), b"* 1 EXISTS\r\n");
         assert!(notification_overflow(b"* OK [NOTIFICATIONOVERFLOW] lost\r\n"));
+        assert!(mailbox_list_changed(b"* LIST () \"/\" \"Projects/2027\"\r\n* list (\\NonExistent) \"/\" Old\r\n"));
+        assert!(!mailbox_list_changed(b"* STATUS Work (MESSAGES 4)\r\n* 3 EXISTS\r\n"));
         assert!(!notification_overflow(b"* OK still here\r\n"));
     }
     use super::*;
