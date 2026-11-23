@@ -325,28 +325,136 @@ fn issued_by(v: &serde_json::Value, origin: &str) -> Result<()> {
         )),
     }
 }
+/// Picacho's registration with a server (RFC 7591 §3.2.1), kept in the
+/// keychain for the next sign-in there, so each one doesn't add another
+/// client to the server: the client id, the loopback address it was
+/// registered for, and where and with what it can be read and changed
+/// (RFC 7592 §3), where the server allows that.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Registration {
+    client_id: String,
+    redirect: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registration_access_token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    registration_client_uri: String,
+}
+impl Registration {
+    /// The keychain entry for registrations at `endpoint`.
+    fn key(endpoint: &str) -> String {
+        format!("oauth-registration:{endpoint}")
+    }
+    fn load(endpoint: &str) -> Option<Self> {
+        #[cfg(test)]
+        let text = TEST_REGISTRATIONS.lock().unwrap().get(endpoint).cloned();
+        #[cfg(not(test))]
+        let text = crate::manage::store::read_secret_text(&Self::key(endpoint)).ok().flatten();
+        serde_json::from_str(&text?).ok()
+    }
+    /// Kept, best effort: one that can't be is registered again next time.
+    fn save(&self, endpoint: &str) {
+        let Ok(text) = serde_json::to_string(self) else { return };
+        #[cfg(test)]
+        {
+            let _ = Self::key(endpoint);
+            TEST_REGISTRATIONS.lock().unwrap().insert(endpoint.to_owned(), text);
+        }
+        #[cfg(not(test))]
+        let _ = crate::manage::store::write_secret_text(&Self::key(endpoint), &text);
+    }
+    /// The loopback port it was registered with, to listen on again.
+    fn port(&self) -> Option<u16> {
+        url::Url::parse(&self.redirect).ok()?.port()
+    }
+    fn from_response(v: &serde_json::Value, redirect: &str) -> Result<Self> {
+        let text = |key: &str| v[key].as_str().unwrap_or_default().to_owned();
+        let client_id = text("client_id");
+        ensure!(!client_id.is_empty(), "The server registered Picacho without a client id.");
+        // RFC 7592 §3: the management URI must be https, as the access
+        // token is sent to it.
+        let uri = text("registration_client_uri");
+        let managed = uri.starts_with("https://") || (cfg!(test) && !uri.is_empty());
+        Ok(Self {
+            client_id,
+            redirect: redirect.to_owned(),
+            registration_access_token: if managed { text("registration_access_token") } else { String::new() },
+            registration_client_uri: if managed { uri } else { String::new() },
+        })
+    }
+}
+#[cfg(test)]
+static TEST_REGISTRATIONS: Mutex<std::collections::BTreeMap<String, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// What Picacho registers as: a native public client, without a secret
+/// (RFC 8252 §8.4), for `redirect`.
+fn client_metadata(redirect: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "Picacho",
+        "application_type": "native",
+        "redirect_uris": [redirect],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+}
 /// Registers Picacho with a server that allows apps to (RFC 7591), for
-/// `redirect`: a public client, without a secret (RFC 8252).
+/// `redirect`, and keeps the registration.
 fn register(endpoint: &str, redirect: &str) -> Result<String> {
     let v: serde_json::Value = http()?
         .post(endpoint)
-        .json(&serde_json::json!({
-            "client_name": "Picacho",
-            "application_type": "native",
-            "redirect_uris": [redirect],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-        }))
+        .json(&client_metadata(redirect))
         .send()
         .context("Couldn't reach the server to register Picacho for sign-in.")?
         .error_for_status()
         .context("The server didn't register Picacho for browser sign-in.")?
         .and_then_bounded_json()?;
-    Ok(v["client_id"]
-        .as_str()
-        .context("The server registered Picacho without a client id.")?
-        .to_owned())
+    let registration = Registration::from_response(&v, redirect)?;
+    registration.save(endpoint);
+    Ok(registration.client_id)
+}
+/// The client id to sign in with at a server that registers apps: the one
+/// kept from an earlier sign-in where it is still good for `redirect`, else
+/// a new registration. A kept one registered for another port (the one it
+/// had was taken) is changed to this one where the server lets Picacho
+/// (RFC 7592 §2.2); one the server no longer knows (401, 404: §2.1) is
+/// registered again.
+fn registered(endpoint: &str, redirect: &str) -> Result<String> {
+    let Some(kept) = Registration::load(endpoint) else {
+        return register(endpoint, redirect);
+    };
+    if kept.redirect == redirect {
+        return Ok(kept.client_id);
+    }
+    if kept.registration_client_uri.is_empty() {
+        return register(endpoint, redirect);
+    }
+    // §2.2: the whole metadata again, with the client id, and the new
+    // redirect in place of the old.
+    let mut metadata = client_metadata(redirect);
+    metadata["client_id"] = kept.client_id.clone().into();
+    let updated = http()?
+        .put(&kept.registration_client_uri)
+        .bearer_auth(&kept.registration_access_token)
+        .json(&metadata)
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(|r| Ok(r.error_for_status()?))
+        .and_then(bounded_json)
+        .and_then(|v| Registration::from_response(&v, redirect));
+    match updated {
+        Ok(mut registration) if registration.client_id == kept.client_id => {
+            // §2.2: the server may issue a new access token; else the old
+            // one stays good.
+            if registration.registration_access_token.is_empty() {
+                registration.registration_access_token = kept.registration_access_token;
+                registration.registration_client_uri = kept.registration_client_uri;
+            }
+            registration.save(endpoint);
+            Ok(registration.client_id)
+        }
+        _ => register(endpoint, redirect),
+    }
 }
 fn pinal_accounts() -> String {
     let origin = setting(
@@ -602,7 +710,15 @@ impl Browser {
     /// Microsoft registers `http://localhost`; Google and Pinal accept the
     /// loopback address with any port.
     fn new(host: &str, path: &str) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        Self::on_port(host, path, None)
+    }
+    /// As `new`, listening on `port` where it is free (the one a kept
+    /// registration was made for), else on any.
+    fn on_port(host: &str, path: &str, port: Option<u16>) -> Result<Self> {
+        let listener = match port.and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok()) {
+            Some(listener) => listener,
+            None => TcpListener::bind("127.0.0.1:0")?,
+        };
         listener.set_nonblocking(true)?;
         let redirect = format!("http://{host}:{}{path}", listener.local_addr()?.port());
         Ok(Self::with(Some(listener), redirect))
@@ -1013,13 +1129,18 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
 /// (Fastmail), else registered for this sign-in.
 fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     let metadata = jmap_metadata(&account.incoming_host, account.incoming_port)?;
-    let mut browser = Browser::new("127.0.0.1", "/callback")?;
-    browser.issuer = metadata.issuer.clone();
     let own = jmap_client(account);
+    let kept = metadata
+        .registration
+        .as_deref()
+        .filter(|_| own.id.is_empty())
+        .and_then(Registration::load);
+    let mut browser = Browser::on_port("127.0.0.1", "/callback", kept.and_then(|k| k.port()))?;
+    browser.issuer = metadata.issuer.clone();
     let client_id = if !own.id.is_empty() {
         own.id
     } else if let Some(endpoint) = &metadata.registration {
-        register(endpoint, &browser.redirect)?
+        registered(endpoint, &browser.redirect)?
     } else if !account.client_id.is_empty() {
         account.client_id.clone()
     } else {
@@ -1068,12 +1189,18 @@ fn authorize_sso(
 ) -> Result<Grant> {
     let metadata = sso_metadata(&sso.issuer)?;
     let scope = sso_scopes(&metadata.scopes, &sso.scope);
-    let mut browser = Browser::new("127.0.0.1", "/callback")?;
+    let kept = metadata.registration.as_deref().and_then(Registration::load);
+    // A client id that isn't the one Picacho registered is an
+    // administrator's registration, used as given.
+    let given = !account.client_id.is_empty()
+        && kept.as_ref().is_none_or(|k| k.client_id != account.client_id);
+    let port = kept.filter(|_| !given).and_then(|k| k.port());
+    let mut browser = Browser::on_port("127.0.0.1", "/callback", port)?;
     browser.issuer = metadata.issuer.clone();
-    let client_id = if !account.client_id.is_empty() {
+    let client_id = if given {
         account.client_id.clone()
     } else if let Some(endpoint) = &metadata.registration {
-        register(endpoint, &browser.redirect)?
+        registered(endpoint, &browser.redirect)?
     } else {
         bail!(
             "Your organization's sign-in doesn't let mail apps register themselves. Ask your administrator for a client id for Picacho (a public client with a http://127.0.0.1 redirect) and enter it under Server settings."
@@ -1904,6 +2031,61 @@ mod tests {
         // Tests accept loopback http endpoints; a jwks_uri that isn't a URL
         // at all is refused everywhere.
         assert!(doc(serde_json::json!({"jwks_uri": "not a url"})).is_err());
+    }
+
+    /// RFC 7591 and RFC 7592: a registration is kept and used again; one for
+    /// another loopback port is updated in place; one the server forgot is
+    /// made again.
+    #[test]
+    fn dynamic_registrations_are_kept_and_reused() {
+        let origin_cell: Arc<Mutex<String>> = Arc::default();
+        let named = origin_cell.clone();
+        let forget = Arc::new(AtomicBool::new(false));
+        let forgotten = forget.clone();
+        let (origin, server) = http_server(4, move |method, path, body| {
+            let origin = named.lock().unwrap().clone();
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            match (method, path) {
+                ("POST", "/register") => (
+                    201,
+                    serde_json::json!({
+                        "client_id": format!("c-{}", v["redirect_uris"][0].as_str().unwrap().len()),
+                        "registration_access_token": "rat-1",
+                        "registration_client_uri": format!("{origin}/register/c"),
+                    })
+                    .to_string(),
+                ),
+                ("PUT", "/register/c") if forgotten.load(Ordering::Relaxed) => (401, "{}".into()),
+                ("PUT", "/register/c") => {
+                    assert_eq!(v["redirect_uris"][0], "http://127.0.0.1:6000/callback");
+                    (200, serde_json::json!({"client_id": v["client_id"]}).to_string())
+                }
+                other => panic!("{other:?}"),
+            }
+        });
+        *origin_cell.lock().unwrap() = origin.clone();
+        let endpoint = format!("{origin}/register");
+        // First sign-in: registered, and kept.
+        let first = registered(&endpoint, "http://127.0.0.1:5000/callback").unwrap();
+        let kept = Registration::load(&endpoint).unwrap();
+        assert_eq!((kept.client_id.as_str(), kept.port()), (first.as_str(), Some(5000)));
+        assert_eq!(kept.registration_access_token, "rat-1");
+        // Again on the same port: no request at all.
+        assert_eq!(registered(&endpoint, "http://127.0.0.1:5000/callback").unwrap(), first);
+        // On another port: updated, the same client, its token kept.
+        assert_eq!(registered(&endpoint, "http://127.0.0.1:6000/callback").unwrap(), first);
+        let kept = Registration::load(&endpoint).unwrap();
+        assert_eq!((kept.port(), kept.registration_access_token.as_str()), (Some(6000), "rat-1"));
+        // The server forgot it: registered again.
+        forget.store(true, Ordering::Relaxed);
+        let again = registered(&endpoint, "http://127.0.0.1:7000000/callback").unwrap();
+        assert_ne!(again, first);
+        let seen = server.join().unwrap();
+        let methods: Vec<&str> = seen.iter().map(|s| s.split(' ').next().unwrap()).collect();
+        assert_eq!(methods, ["POST", "PUT", "PUT", "POST"]);
+        // A management URI over plain http (outside tests) isn't kept.
+        let r = Registration::from_response(&serde_json::json!({"client_id": "x"}), "r").unwrap();
+        assert!(r.registration_client_uri.is_empty());
     }
 
     #[test]
