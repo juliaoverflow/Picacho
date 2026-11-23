@@ -557,77 +557,6 @@ fn outer_headers(raw: &[u8]) -> Vec<u8> {
     from_latin1(&out)
 }
 
-/// The Subject a protected-headers part (draft-autocrypt-lamps-protected-
-/// headers, RFC 9788's "v1") carries in its own header, if it has one.
-fn protected_subject(part: &[u8]) -> Option<Vec<(String, String)>> {
-    let parsed = mailparse::parse_headers(part).ok()?.0;
-    use mailparse::MailHeaderMap;
-    let content_type = parsed.get_first_value("Content-Type")?;
-    if !content_type
-        .to_ascii_lowercase()
-        .contains("protected-headers")
-    {
-        return None;
-    }
-    // RFC 9788 §4.10: a legacy display part repeats the headers in the
-    // body for old readers; the real headers are those on the part.
-    let found: Vec<(String, String)> = PROTECTED
-        .iter()
-        .filter_map(|name| parsed.get_first_value(name).map(|v| (name.to_string(), v)))
-        .collect();
-    (!found.is_empty()).then_some(found)
-}
-
-/// `outer` (headers as text, CRLF) with the protected headers put back:
-/// each replaces the outer one of its name, or is added.
-fn with_headers(outer: &str, headers: &[(String, String)]) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in outer.split_inclusive('\n') {
-        if !line.starts_with([' ', '\t']) {
-            let name = line
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            skipping = headers.iter().any(|(n, _)| *n == name);
-        }
-        if !skipping {
-            out.push_str(line);
-        }
-    }
-    for (name, value) in headers {
-        let title: String = name
-            .split('-')
-            .map(|w| {
-                let mut c = w.chars();
-                c.next()
-                    .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
-            .join("-");
-        out.push_str(&format!("{title}: {}\r\n", encode_header(value)));
-    }
-    out
-}
-
-/// A header value, encoded as RFC 2047 UTF-8 when it isn't plain ASCII.
-fn encode_header(text: &str) -> String {
-    crate::sync::mime::encoded_words(text)
-}
-
-/// Headers moved inside the encryption with the subject: what says which
-/// conversation the mail is part of. Routing headers stay outside.
-const PROTECTED: [&str; 5] = [
-    "subject",
-    "in-reply-to",
-    "references",
-    "reply-to",
-    "keywords",
-];
-
 /// What a protected message's Subject says outside the encryption.
 pub const HIDDEN_SUBJECT: &str = "...";
 
@@ -798,26 +727,16 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
                 }
             }
         }
-        let protected = protected_subject(&inner);
-        let outer = match &protected {
-            Some(headers) => with_headers(&outer, headers),
-            None => outer,
-        };
-        let mut full = from_latin1(&outer);
+        let outer = from_latin1(&outer);
+        let mut full = outer.clone();
         full.extend_from_slice(&inner);
         // A multipart/signed message inside the encryption (sign, then encrypt).
         if let Some((content, sig)) = signed_parts(&full) {
             signature = check(&sig, &content, &public, from.as_deref());
-            let mut readable = outer_headers(&full);
-            // Hidden headers signed with the text sit on the signed part,
-            // not the encrypted one: the subject read "..." whenever the
-            // message was signed as well.
-            if let Some(headers) = protected_subject(&content) {
-                readable = from_latin1(&with_headers(&latin1(&readable), &headers));
-            }
-            readable.extend_from_slice(&content);
+            // RFC 9788 §4.5: the Cryptographic Payload is the signed part,
+            // whose headers are the protected ones.
             return Some((
-                readable,
+                protected::readable(&outer_headers(&full), &content),
                 Verdict {
                     decrypted: true,
                     signature,
@@ -825,7 +744,7 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
             ));
         }
         return Some((
-            full,
+            protected::readable(&outer, &inner),
             Verdict {
                 decrypted: true,
                 signature,
@@ -835,10 +754,8 @@ pub fn open(raw: &[u8], ring: &Keyring) -> Option<(Vec<u8>, Verdict)> {
     match signed_parts(raw) {
         Some((content, sig)) => {
             let signature = check(&sig, &content, &ring.public_keys(), from.as_deref());
-            let mut readable = outer_headers(raw);
-            readable.extend_from_slice(&content);
             Some((
-                readable,
+                protected::readable(&outer_headers(raw), &content),
                 Verdict {
                     decrypted: false,
                     signature,

@@ -162,6 +162,97 @@ pub(super) fn compose(
     (from_latin1(&new_part), from_latin1(&new_outer))
 }
 
+/// The header section of `part` (text), and where its body starts.
+fn head_of(part: &str) -> (&str, usize) {
+    if part.starts_with("\r\n") {
+        return ("", 2);
+    }
+    if part.starts_with('\n') {
+        return ("", 1);
+    }
+    match (part.find("\r\n\r\n"), part.find("\n\n")) {
+        (Some(c), l) if l.is_none_or(|l| c <= l) => (&part[..c + 2], c + 4),
+        (_, Some(l)) => (&part[..l + 1], l + 2),
+        _ => (part, part.len()),
+    }
+}
+
+/// RFC 9788 §4.1: whether a payload root's Content-Type says it has
+/// Header Protection (hp="clear" or hp="cipher"), or the older draft's
+/// protected-headers="v1" (RFC 9788 Appendix F.3).
+fn has_header_protection(head: &str) -> bool {
+    let Some(field) = fields(head).into_iter().find(|f| f.name == "content-type") else {
+        return false;
+    };
+    let value = field.lines.split_once(':').map_or("", |(_, v)| v);
+    let ct = mailparse::parse_content_type(&value.replace("\r\n", ""));
+    let hp = ct.params.get("hp").map(|v| v.to_ascii_lowercase());
+    matches!(hp.as_deref(), Some("clear" | "cipher"))
+        || ct.params.get("protected-headers").is_some_and(|v| v.eq_ignore_ascii_case("v1"))
+}
+
+/// The address of the first `name` field in `head`, if it has one.
+fn first_address(head: &str, name: &str) -> Option<String> {
+    let field = fields(head).into_iter().find(|f| f.name == name)?;
+    let value = field.lines.split_once(':')?.1.replace("\r\n", "");
+    let address = crate::sync::mime::receipt_address(&value);
+    (!address.is_empty()).then_some(address)
+}
+
+/// RFC 9788 §4.4.5: whether two addr-specs match: the domains as ASCII
+/// (IDNA A-labels) compared case-insensitively, then the local parts,
+/// case-insensitively.
+fn same_address(a: Option<&str>, b: Option<&str>) -> bool {
+    let ascii = |address: &str| -> Option<(String, String)> {
+        let (local, domain) = address.trim().rsplit_once('@')?;
+        let domain = idna::domain_to_ascii(domain).ok()?;
+        Some((local.to_lowercase(), domain.to_ascii_lowercase()))
+    };
+    match (a.and_then(ascii), b.and_then(ascii)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The message to show for an opened one: `outer` (its outer header
+/// fields, CRLF) and `payload` (the root of its Cryptographic Payload).
+/// RFC 9788 §4 and §4.5: with Header Protection, a field the payload
+/// carries is shown as it is there, in place of any outer one of its
+/// name, and the HP-Outer fields, which record what went outside, aren't
+/// shown. Without, the outer fields as they are, then the payload.
+pub(super) fn readable(outer: &[u8], payload: &[u8]) -> Vec<u8> {
+    let payload_text = latin1(payload);
+    let (head, body_at) = head_of(&payload_text);
+    if !has_header_protection(head) {
+        let mut out = outer.to_vec();
+        out.extend_from_slice(payload);
+        return out;
+    }
+    let mut inner = fields(head);
+    // RFC 9788 §4.4.3: a protected From whose address isn't the outer
+    // one's isn't shown in its place: the outer From is what the
+    // sender's server vouched for.
+    let outer_from = first_address(&latin1(outer), "from");
+    let inner_from = first_address(head, "from");
+    if outer_from.is_some() && !same_address(outer_from.as_deref(), inner_from.as_deref()) {
+        inner.retain(|f| f.name != "from");
+    }
+    let carried = |name: &str| {
+        !name.starts_with("content-") && name != "mime-version" && inner.iter().any(|f| f.name == name)
+    };
+    let mut out: String = fields(&latin1(outer))
+        .into_iter()
+        .filter(|f| !carried(&f.name))
+        .map(|f| f.lines)
+        .collect();
+    for field in inner.iter().filter(|f| f.name != "hp-outer") {
+        out.push_str(&field.lines);
+    }
+    out.push_str("\r\n");
+    out.push_str(&payload_text[body_at.min(payload_text.len())..]);
+    from_latin1(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,7 +423,48 @@ mod tests {
         assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
         let readable = String::from_utf8_lossy(&readable);
         assert!(readable.contains("hp=\"cipher\""), "{readable}");
-        assert!(readable.contains("HP-Outer: Subject: Plans\r\n"), "{readable}");
+        // RFC 9788 §4.2: HP-Outer is for the reader, not shown; each field
+        // is shown once.
+        assert!(!readable.contains("HP-Outer"), "{readable}");
+        assert_eq!(values(&readable, "Subject"), ["Plans"], "{readable}");
+        assert_eq!(values(&readable, "From").len(), 1, "{readable}");
+        // The signed part inside the encryption carries the HP-Outer list.
+        let (armored, _) = crate::manage::crypto::encrypted_part(&sent).unwrap();
+        let (message, _) = pgp::composed::Message::from_string(&armored).unwrap();
+        let key = &bos.secret_keys()[0];
+        let mut opened = message.decrypt(&pgp::types::Password::empty(), key).unwrap();
+        let payload = String::from_utf8(opened.as_data_vec().unwrap()).unwrap();
+        assert!(payload.contains("HP-Outer: Subject: Plans\r\n"), "{payload}");
+        assert!(payload.contains("HP-Outer: From: Ana <ana@example.org>\r\n"), "{payload}");
+    }
+
+    /// RFC 9788 §4 and §4.5: with Header Protection, the payload's fields
+    /// are shown in place of the outer ones, HP-Outer isn't, and outer
+    /// fields the payload doesn't carry (added in transit) stay. Without
+    /// it, nothing of the payload's header replaces anything outside.
+    #[test]
+    fn readable_messages_show_the_protected_headers() {
+        let outer = b"From: Ana <ana@example.org>\r\nSubject: ...\r\nReceived: by mx\r\nMIME-Version: 1.0\r\n";
+        let payload = b"Subject: Plans\r\nFrom: Ana Lima <ANA@EXAMPLE.ORG>\r\nHP-Outer: Subject: ...\r\nContent-Type: text/plain; hp=\"cipher\"\r\n\r\nHi\r\n";
+        let shown = String::from_utf8(readable(outer, payload)).unwrap();
+        assert_eq!(values(&shown, "Subject"), ["Plans"], "{shown}");
+        assert_eq!(values(&shown, "From"), ["Ana Lima <ANA@EXAMPLE.ORG>"], "{shown}");
+        assert_eq!(values(&shown, "Received"), ["by mx"], "{shown}");
+        assert!(values(&shown, "HP-Outer").is_empty(), "{shown}");
+        assert!(shown.ends_with("\r\n\r\nHi\r\n"), "{shown}");
+        // A protected From for another address isn't shown in place of the
+        // outer one (RFC 9788 §4.4.3).
+        let other = String::from_utf8_lossy(payload).replace("ANA@EXAMPLE.ORG", "boss@bank.example");
+        let shown = String::from_utf8(readable(outer, other.as_bytes())).unwrap();
+        assert_eq!(values(&shown, "From"), ["Ana <ana@example.org>"], "{shown}");
+        assert_eq!(values(&shown, "Subject"), ["Plans"], "{shown}");
+        // No hp parameter: a Subject in the payload's header is just a
+        // header there, and the outer one is what's shown.
+        let plain = b"Subject: Not me\r\nContent-Type: text/plain\r\n\r\nHi\r\n";
+        let shown = String::from_utf8(readable(outer, plain)).unwrap();
+        assert_eq!(values(&shown, "Subject")[0], "...", "{shown}");
+        assert!(same_address(Some("ana@bücher.example"), Some("ANA@xn--bcher-kva.example")));
+        assert!(!same_address(Some("ana@example.org"), Some("ana@example.org.evil")));
     }
 
     /// The parameters go at the end of a folded Content-Type, so a

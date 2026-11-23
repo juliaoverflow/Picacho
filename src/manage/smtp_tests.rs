@@ -310,8 +310,9 @@ fn encrypted_bcc_recipients_each_get_their_own_copy() -> Result<()> {
         let (inner, _) = crate::manage::openpgp::open(&t.message, &ring).context("opens")?;
         let inner = String::from_utf8_lossy(&inner);
         assert!(inner.contains("hp=\"cipher\""), "{inner}");
-        assert!(inner.contains("HP-Outer: To: Ana <ana@example.com>"), "{inner}");
+        assert!(inner.contains("\r\nTo: Ana <ana@example.com>\r\n"), "{inner}");
         assert!(!inner.to_ascii_lowercase().contains("bcc:"), "{inner}");
+        assert!(!inner.contains("bo@example.com") && !inner.contains("di@example.com"), "{inner}");
     }
     for t in &seen.transactions {
         let headers = t.headers();
