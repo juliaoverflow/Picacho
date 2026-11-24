@@ -707,6 +707,8 @@ enum Action {
     CreateKey,
     /// Chooses how long new and renewed OpenPGP keys last.
     SetKeyExpiry(encryption::KeyExpiry),
+    /// Chooses the OpenPGP version of new keys: v4 unless v6 is chosen.
+    SetKeyVersion(crate::manage::openpgp::KeyVersion),
     /// Renews your OpenPGP key with this fingerprint for the chosen time.
     RenewKey(String),
     /// Takes in the key an Autocrypt Setup Message carries, with the code typed.
@@ -1767,6 +1769,8 @@ pub struct MailApp {
     key_check_input: Entity<InputState>,
     /// How long new and renewed OpenPGP keys last.
     key_expiry: encryption::KeyExpiry,
+    /// The OpenPGP version of new keys (v4 by default).
+    key_version: crate::manage::openpgp::KeyVersion,
     /// Invitations found in messages, by message id (None: none found, or
     /// still looking).
     invitations: HashMap<String, Option<calendar::Invitation>>,
@@ -2769,6 +2773,7 @@ impl MailApp {
             key_checking: None,
             key_check_input,
             key_expiry: encryption::KeyExpiry::default(),
+            key_version: crate::manage::openpgp::KeyVersion::default(),
             invitations: HashMap::new(),
             delivery_reports: HashMap::new(),
             invitation_busy: None,
@@ -6470,6 +6475,7 @@ impl MailApp {
             action @ (Action::ImportKeys
             | Action::CreateKey
             | Action::SetKeyExpiry(_)
+            | Action::SetKeyVersion(_)
             | Action::RenewKey(_)
             | Action::ImportSetupMessage(_)
             | Action::RemoveKey(_)

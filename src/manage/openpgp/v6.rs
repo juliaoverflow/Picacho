@@ -193,6 +193,252 @@ fn v6_keys_sign_encrypt_expire_and_revoke() {
     assert!(bos.key_for("ana@example.org").is_none());
 }
 
+/// The SEIPD version (RFC 9580 §5.13) of the PGP/MIME message `sent`,
+/// and the version of each of its PKESK packets (§5.1).
+fn encryption_versions(sent: &[u8]) -> (usize, Vec<pgp::types::PkeskVersion>) {
+    use pgp::composed::{Edata, Esk};
+    use pgp::packet::{ProtectedDataConfig, SymEncryptedProtectedDataConfig};
+    let (armored, _) = crate::manage::crypto::encrypted_part(sent).unwrap();
+    let (encrypted, _) = Message::from_string(&armored).unwrap();
+    let Message::Encrypted { esk, edata, .. } = &encrypted else { panic!("encrypted: {encrypted:?}") };
+    let Edata::SymEncryptedProtectedData { reader } = edata else { panic!("SEIPD: {edata:?}") };
+    let seipd = match reader.config() {
+        ProtectedDataConfig::Seipd(SymEncryptedProtectedDataConfig::V1) => 1,
+        ProtectedDataConfig::Seipd(SymEncryptedProtectedDataConfig::V2 { .. }) => 2,
+        other => panic!("not SEIPD: {other:?}"),
+    };
+    let pkesks = esk
+        .iter()
+        .map(|e| match e {
+            Esk::PublicKeyEncryptedSessionKey(p) => p.version(),
+            other => panic!("not a PKESK: {other:?}"),
+        })
+        .collect();
+    (seipd, pkesks)
+}
+
+/// Two keyrings, Ana's and Bo's, each with its own secret key and the
+/// other's public key.
+fn exchanged(ana: &Keyring, bo: &Keyring) -> (Keyring, Keyring) {
+    let public = |ring: &Keyring| {
+        SignedPublicKey::from(ring.secret_keys()[0].clone()).to_armored_string(ArmorOptions::default()).unwrap()
+    };
+    let (mut anas, mut bos) = (ana.clone(), bo.clone());
+    anas.import(&public(bo), "").unwrap();
+    bos.import(&public(ana), "").unwrap();
+    (anas, bos)
+}
+
+const PLANS: &[u8] =
+    b"From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nSubject: Plans\r\nContent-Type: text/plain\r\n\r\nMeet at noon.\r\n";
+
+/// A v6 key Picacho makes (RFC 9580 §5.5.2.3) is Ed25519 and X25519, not
+/// the legacy EdDSA and ECDH of v4 keys, with its preferences on its
+/// direct-key signature: AEAD ciphersuites (§5.2.3.15) and Features
+/// saying it reads SEIPD v1 and v2 (§5.2.3.32). Mail it signs and
+/// encrypts to another such key opens, with SEIPD v2 and v6 PKESKs
+/// (§10.3.2.1), and its signature is good.
+#[test]
+fn v6_keys_picacho_makes_sign_and_encrypt_mail_picacho_opens() {
+    use pgp::crypto::{aead::AeadAlgorithm, public_key::PublicKeyAlgorithm, sym::SymmetricKeyAlgorithm};
+    let mut ana = Keyring::default();
+    let fp = ana.create("Ana", "ana@example.org", None, super::KeyVersion::V6).unwrap();
+    let mut bo = Keyring::default();
+    bo.create("Bo", "bo@example.se", None, super::KeyVersion::V6).unwrap();
+
+    let key = SignedPublicKey::from(ana.own_key("ana@example.org").unwrap());
+    key.verify_bindings().unwrap();
+    assert_eq!(fp.len(), 64, "a v6 fingerprint is 32 bytes (§5.5.4.3)");
+    assert_eq!(key.primary_key.version(), KeyVersion::V6);
+    assert_eq!(key.primary_key.algorithm(), PublicKeyAlgorithm::Ed25519);
+    let algorithms: Vec<_> = key.public_subkeys.iter().map(|s| (s.key.version(), s.key.algorithm())).collect();
+    assert_eq!(
+        algorithms,
+        [(KeyVersion::V6, PublicKeyAlgorithm::Ed25519), (KeyVersion::V6, PublicKeyAlgorithm::X25519)]
+    );
+    let [direct] = key.details.direct_signatures.as_slice() else { panic!("one direct-key signature") };
+    let features = direct.features().unwrap();
+    assert!(features.seipd_v1() && features.seipd_v2());
+    assert_eq!(
+        direct.preferred_aead_algs(),
+        [(SymmetricKeyAlgorithm::AES256, AeadAlgorithm::Ocb), (SymmetricKeyAlgorithm::AES128, AeadAlgorithm::Ocb)]
+    );
+    assert_eq!(direct.preferred_symmetric_algs(), [SymmetricKeyAlgorithm::AES256, SymmetricKeyAlgorithm::AES128]);
+    assert!(reads_seipd_v2(&key));
+    assert_eq!(super::keys::expires(&key), None, "never, unless asked");
+
+    let (anas, bos) = exchanged(&ana, &bo);
+    let both = Protect { sign: true, encrypt: true, ..Default::default() };
+    let sent = protect(PLANS, "ana@example.org", &["bo@example.se".into()], both, &anas).unwrap();
+    let (seipd, pkesks) = encryption_versions(&sent);
+    assert_eq!(seipd, 2);
+    assert_eq!(pkesks, [pgp::types::PkeskVersion::V6; 2], "to Bo, and to Ana for Sent");
+    let (readable, verdict) = open(&sent, &bos).unwrap();
+    assert!(verdict.decrypted);
+    assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+    assert!(readable.ends_with(b"Meet at noon."));
+    assert!(open(&sent, &anas).unwrap().0.ends_with(b"Meet at noon."), "Ana's copy in Sent");
+
+    // Signed only: a v6 signature (§5.2: a v6 key makes v6 signatures).
+    let signed = Protect { sign: true, ..Default::default() };
+    let sent = protect(PLANS, "ana@example.org", &["bo@example.se".into()], signed, &anas).unwrap();
+    assert_eq!(open(&sent, &bos).unwrap().1.signature, Signature::Good("Ana <ana@example.org>".into()));
+}
+
+/// A v6 key Picacho makes to expire does (RFC 9580 §5.2.3.13), with the
+/// expiry on its direct-key signature, where a v6 key keeps it
+/// (§5.2.3.10), and on its subkeys' bindings; renewed, it lasts longer,
+/// or for ever, and still signs and encrypts.
+#[test]
+fn v6_keys_picacho_makes_expire_and_renew() {
+    let two_years = std::time::Duration::from_secs(2 * 365 * 86_400);
+    let mut ana = Keyring::default();
+    let fp = ana.create("Ana", "ana@example.org", Some(two_years), super::KeyVersion::V6).unwrap();
+    let wanted = chrono::Utc::now().timestamp() + two_years.as_secs() as i64;
+    assert!((ana.list()[0].expires.unwrap() - wanted).abs() <= 2);
+    let key = SignedPublicKey::from(ana.own_key("ana@example.org").unwrap());
+    key.verify_bindings().unwrap();
+    assert_eq!(key.primary_key.version(), KeyVersion::V6);
+    let [direct] = key.details.direct_signatures.as_slice() else { panic!("replaced, not superseded") };
+    assert!(direct.key_expiration_time().is_some());
+    assert!(direct.features().unwrap().seipd_v2(), "its preferences kept");
+    for sub in &key.public_subkeys {
+        let [binding] = sub.signatures.as_slice() else { panic!("one binding") };
+        let lasts = binding.key_expiration_time().unwrap().as_secs();
+        assert!((i64::from(sub.key.created_at().as_secs()) + i64::from(lasts) - wanted).abs() <= 2);
+    }
+
+    // Renewed for five years from now, then for ever.
+    let five_years = std::time::Duration::from_secs(5 * 365 * 86_400);
+    ana.renew(&fp, Some(five_years)).unwrap();
+    let wanted = chrono::Utc::now().timestamp() + five_years.as_secs() as i64;
+    assert!((ana.list()[0].expires.unwrap() - wanted).abs() <= 2);
+    let key = SignedPublicKey::from(ana.own_key("ana@example.org").unwrap());
+    key.verify_bindings().unwrap();
+    assert!(reads_seipd_v2(&key), "the renewed direct-key signature keeps the features");
+    ana.renew(&fp, None).unwrap();
+    assert_eq!(ana.list()[0].expires, None);
+
+    let mut bo = Keyring::default();
+    bo.create("Bo", "bo@example.se", None, super::KeyVersion::V6).unwrap();
+    let (anas, bos) = exchanged(&ana, &bo);
+    assert!(bos.key_for("ana@example.org").is_some());
+    let both = Protect { sign: true, encrypt: true, ..Default::default() };
+    let sent = protect(PLANS, "ana@example.org", &["bo@example.se".into()], both, &anas).unwrap();
+    let (_, verdict) = open(&sent, &bos).unwrap();
+    assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+}
+
+/// Keys are v4 unless v6 is asked for, made as before: legacy EdDSA and
+/// ECDH over Curve25519, which every OpenPGP app reads, with no direct-key
+/// signature, and mail between two of them uses SEIPD v1 (they don't say
+/// they read v2, §5.2.3.32).
+#[test]
+fn new_keys_stay_v4_by_default() {
+    use pgp::crypto::public_key::PublicKeyAlgorithm;
+    assert_eq!(super::KeyVersion::default(), super::KeyVersion::V4);
+    let mut ana = Keyring::default();
+    let fp = ana.create("Ana", "ana@example.org", None, super::KeyVersion::default()).unwrap();
+    assert_eq!(fp.len(), 40, "a v4 fingerprint is 20 bytes (§5.5.4.2)");
+    let key = SignedPublicKey::from(ana.own_key("ana@example.org").unwrap());
+    assert_eq!(key.primary_key.version(), KeyVersion::V4);
+    assert_eq!(key.primary_key.algorithm(), PublicKeyAlgorithm::EdDSALegacy);
+    let algorithms: Vec<_> = key.public_subkeys.iter().map(|s| (s.key.version(), s.key.algorithm())).collect();
+    assert_eq!(
+        algorithms,
+        [(KeyVersion::V4, PublicKeyAlgorithm::EdDSALegacy), (KeyVersion::V4, PublicKeyAlgorithm::ECDH)]
+    );
+    assert!(key.details.direct_signatures.is_empty());
+    assert!(!reads_seipd_v2(&key));
+
+    let mut bo = Keyring::default();
+    bo.create("Bo", "bo@example.se", None, super::KeyVersion::default()).unwrap();
+    let (anas, bos) = exchanged(&ana, &bo);
+    let both = Protect { sign: true, encrypt: true, ..Default::default() };
+    let sent = protect(PLANS, "ana@example.org", &["bo@example.se".into()], both, &anas).unwrap();
+    assert_eq!(encryption_versions(&sent), (1, vec![pgp::types::PkeskVersion::V3; 2]));
+    assert_eq!(open(&sent, &bos).unwrap().1.signature, Signature::Good("Ana <ana@example.org>".into()));
+}
+
+/// Mail to a v6 recipient, from a v4 sender whose own key says it reads
+/// SEIPD v2 too, is SEIPD v2 with v6 PKESKs (RFC 9580 §10.3.2.1, §13.7).
+/// Mail to a v6 and a v4 recipient whose key doesn't say so is one
+/// SEIPD v1 message with v3 PKESKs, which both open: §10.3.2.1 doesn't
+/// let v3 and v6 PKESKs share a payload, and a v6 key reads v1 too.
+#[test]
+fn mixed_v4_and_v6_recipients_get_seipd_v1_and_v6_alone_gets_v2() {
+    let mut ana = Keyring::default();
+    ana.create("Ana", "ana@example.org", None, super::KeyVersion::V6).unwrap();
+    let mut bo = Keyring::default();
+    bo.create("Bo", "bo@example.se", None, super::KeyVersion::V6).unwrap();
+    let mut cy = Keyring::default();
+    cy.create("Cy", "cy@example.net", None, super::KeyVersion::V4).unwrap();
+    let public = |ring: &Keyring| {
+        SignedPublicKey::from(ring.secret_keys()[0].clone()).to_armored_string(ArmorOptions::default()).unwrap()
+    };
+    let mut anas = ana.clone();
+    anas.import(&public(&bo), "").unwrap();
+    anas.import(&public(&cy), "").unwrap();
+    for ring in [&mut bo, &mut cy] {
+        ring.import(&public(&ana), "").unwrap();
+    }
+    let both = Protect { sign: true, encrypt: true, ..Default::default() };
+    let message = |to: &str| {
+        format!("From: Ana <ana@example.org>\r\nTo: {to}\r\nSubject: Plans\r\nContent-Type: text/plain\r\n\r\nMeet at noon.\r\n")
+    };
+
+    // To Bo alone: both keys say they read SEIPD v2.
+    let sent = protect(message("bo@example.se").as_bytes(), "ana@example.org", &["bo@example.se".into()], both, &anas)
+        .unwrap();
+    assert_eq!(encryption_versions(&sent), (2, vec![pgp::types::PkeskVersion::V6; 2]));
+    assert!(open(&sent, &bo).unwrap().0.ends_with(b"Meet at noon."));
+
+    // To Bo and Cy, whose v4 key doesn't: SEIPD v1, read by all three.
+    let to = ["bo@example.se".to_owned(), "cy@example.net".to_owned()];
+    let sent = protect(message("bo@example.se, cy@example.net").as_bytes(), "ana@example.org", &to, both, &anas)
+        .unwrap();
+    assert_eq!(encryption_versions(&sent), (1, vec![pgp::types::PkeskVersion::V3; 3]));
+    for (ring, who) in [(&bo, "Bo"), (&cy, "Cy"), (&anas, "Ana, in Sent")] {
+        let (readable, verdict) = open(&sent, ring).unwrap_or_else(|| panic!("{who} opens it"));
+        assert!(verdict.decrypted, "{who}");
+        assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()), "{who}");
+        assert!(readable.ends_with(b"Meet at noon."), "{who}");
+    }
+}
+
+/// RFC 9580 §13.7: a v6 key with no Features subpacket reads SEIPD v2;
+/// §5.2.3.15: a key that lists no AEAD ciphersuite still takes AES-128
+/// with OCB, which mail to it then uses. The RFC's sample certificate
+/// (Appendix A.3) lists AES-256 and AES-128 with OCB, and gets AES-256.
+#[test]
+fn v6_keys_without_features_read_seipd_v2_with_the_implied_suite() {
+    use pgp::crypto::{aead::AeadAlgorithm, sym::SymmetricKeyAlgorithm};
+    use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+    let ana = v6_key("Ana <ana@example.org>");
+    // Its direct-key signature made again without features or AEAD
+    // preferences.
+    let primary = &ana.primary_key;
+    let mut config = SignatureConfig::from_key(rand08::thread_rng(), primary, SignatureType::Key).unwrap();
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::SignatureCreationTime(pgp::types::Timestamp::now())).unwrap(),
+        Subpacket::regular(SubpacketData::IssuerFingerprint(primary.fingerprint())).unwrap(),
+    ];
+    let bare = config.sign_key(primary, &Password::empty(), primary.public_key()).unwrap();
+    let mut public = SignedPublicKey::from(ana.clone());
+    public.details.direct_signatures = vec![bare];
+    assert!(
+        public.details.users.iter().flat_map(|u| u.signatures.iter()).all(|s| s.features().is_none()),
+        "a v6 key's user id binding has none"
+    );
+    public.verify_bindings().unwrap();
+    assert!(super::reads_seipd_v2(&public));
+    assert_eq!(super::seipd_v2_suite(&[public.clone()]), (SymmetricKeyAlgorithm::AES128, AeadAlgorithm::Ocb));
+
+    let (sample, _) = SignedPublicKey::from_string(A3_CERTIFICATE).unwrap();
+    assert_eq!(super::seipd_v2_suite(&[sample.clone()]), (SymmetricKeyAlgorithm::AES256, AeadAlgorithm::Ocb));
+    assert_eq!(super::seipd_v2_suite(&[sample, public]), (SymmetricKeyAlgorithm::AES128, AeadAlgorithm::Ocb));
+}
+
 /// A v6 key with a signing and an encryption subkey, for `uid`.
 fn v6_key(uid: &str) -> SignedSecretKey {
     use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};

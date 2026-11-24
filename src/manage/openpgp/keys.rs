@@ -492,14 +492,14 @@ mod tests {
     #[test]
     fn new_keys_expire_only_when_asked() {
         let mut ring = Keyring::default();
-        let fp = ring.create("Ana", "ana@example.org", None).unwrap();
+        let fp = ring.create("Ana", "ana@example.org", None, super::super::KeyVersion::V4).unwrap();
         assert_eq!(ring.list()[0].expires, None);
         let key = ring.own_key("ana@example.org").unwrap();
         assert!(key.secret_subkeys.iter().all(|s| newest(&s.signatures).unwrap().key_expiration_time().is_none()));
         ring.remove(&fp);
 
         let two_years = std::time::Duration::from_secs(2 * 365 * 86_400);
-        ring.create("Ana", "ana@example.org", Some(two_years)).unwrap();
+        ring.create("Ana", "ana@example.org", Some(two_years), super::super::KeyVersion::V4).unwrap();
         let info = &ring.list()[0];
         let wanted = chrono::Utc::now().timestamp() + two_years.as_secs() as i64;
         assert!((info.expires.unwrap() - wanted).abs() <= 2);

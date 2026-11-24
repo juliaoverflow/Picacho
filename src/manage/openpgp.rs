@@ -1118,12 +1118,15 @@ pub fn protect(
             };
         }
         // RFC 9580's AEAD encryption (SEIPD v2) where every recipient's key
-        // says it reads it; else SEIPD v1, which every OpenPGP app reads.
+        // says it reads it; else SEIPD v1, which every OpenPGP app reads
+        // (§13.7). One message for all: §10.3.2.1 doesn't let v3 and v6
+        // PKESKs share a payload, so one v4-only recipient means v1.
         let armored = if keys.iter().all(reads_seipd_v2) {
+            let (sym, aead) = seipd_v2_suite(&keys);
             let mut builder = MessageBuilder::from_bytes("", content).seipd_v2(
                 rand08::thread_rng(),
-                SymmetricKeyAlgorithm::AES256,
-                pgp::crypto::aead::AeadAlgorithm::Ocb,
+                sym,
+                aead,
                 pgp::crypto::aead::ChunkSize::default(),
             );
             add_recipients!(builder);
@@ -1154,22 +1157,53 @@ fn newest_self_signature(key: &SignedPublicKey) -> Option<&pgp::packet::Signatur
         .chain(key.details.direct_signatures.iter())
         .max_by_key(|s| s.created().map(|t| t.as_secs()))
 }
-/// Whether a key says it reads AEAD-encrypted data (SEIPD v2, RFC 9580
-/// §5.13.2) with AES-256 in OCB mode.
+/// The self-signature whose preferences count for a key: for a v6 key its
+/// newest direct-key signature, where RFC 9580 §5.2.3.10 and §10.1.1 keep
+/// a v6 key's features and preferences (its user ids' bindings may be
+/// newer and say none); else the newest self-signature.
+fn preference_signature(key: &SignedPublicKey) -> Option<&pgp::packet::Signature> {
+    let direct = || {
+        key.details
+            .direct_signatures
+            .iter()
+            .max_by_key(|s| s.created().map(|t| t.as_secs()))
+    };
+    match key.primary_key.version() {
+        pgp::types::KeyVersion::V6 => direct().or_else(|| newest_self_signature(key)),
+        _ => newest_self_signature(key),
+    }
+}
+/// Whether a key reads AEAD-encrypted data (SEIPD v2, RFC 9580 §5.13.2):
+/// its Features say so (§5.2.3.32), or it is a v6 key with no Features
+/// subpacket (§13.7).
 fn reads_seipd_v2(key: &SignedPublicKey) -> bool {
-    newest_self_signature(key).is_some_and(|s| {
-        s.features().is_some_and(|f| f.seipd_v2())
-            && s.preferred_aead_algs().iter().any(|(sym, aead)| {
-                *sym == SymmetricKeyAlgorithm::AES256 && *aead == pgp::crypto::aead::AeadAlgorithm::Ocb
-            })
-    })
+    let signature = preference_signature(key);
+    match signature.and_then(|s| s.features()) {
+        Some(features) => features.seipd_v2(),
+        None => key.primary_key.version() == pgp::types::KeyVersion::V6,
+    }
+}
+/// The SEIPD v2 ciphersuite for `keys`, which all read SEIPD v2: AES-256
+/// with OCB where every key lists it, else AES-128 with OCB, which every
+/// key takes even unlisted (RFC 9580 §5.2.3.15).
+fn seipd_v2_suite(keys: &[SignedPublicKey]) -> (SymmetricKeyAlgorithm, pgp::crypto::aead::AeadAlgorithm) {
+    use pgp::crypto::aead::AeadAlgorithm;
+    let strong = (SymmetricKeyAlgorithm::AES256, AeadAlgorithm::Ocb);
+    let all_list_strong = keys
+        .iter()
+        .all(|k| preference_signature(k).is_some_and(|s| s.preferred_aead_algs().contains(&strong)));
+    if all_list_strong {
+        strong
+    } else {
+        (SymmetricKeyAlgorithm::AES128, AeadAlgorithm::Ocb)
+    }
 }
 /// The strongest cipher every recipient lists (RFC 9580 §13.2), AES-256
 /// where all take it or none says; AES-128 is every key's fallback.
 fn preferred_cipher(keys: &[SignedPublicKey]) -> SymmetricKeyAlgorithm {
     let lists: Vec<&[SymmetricKeyAlgorithm]> = keys
         .iter()
-        .filter_map(newest_self_signature)
+        .filter_map(preference_signature)
         .map(|s| s.preferred_symmetric_algs())
         .filter(|l| !l.is_empty())
         .collect();
@@ -1204,11 +1238,28 @@ fn encryption_subkey(key: &SignedPublicKey) -> Option<&pgp::composed::SignedPubl
     })
 }
 
-/// A new key of yours for `name <email>`, as GnuPG makes them (Ed25519
-/// certifying primary, Ed25519 signing and Curve25519 encryption subkeys;
-/// version 4, which every OpenPGP app reads). It expires `lasts` from now
-/// (RFC 9580 §5.2.3.13, see `keys::set_expiry`), or never with `None`.
-pub fn generate_key(name: &str, email: &str, lasts: Option<std::time::Duration>) -> Result<SignedSecretKey> {
+/// The OpenPGP version of a key Picacho makes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyVersion {
+    /// Version 4 (RFC 9580 §5.5.2.2), which every OpenPGP app reads.
+    #[default]
+    V4,
+    /// Version 6 (RFC 9580 §5.5.2.3), which GnuPG 2.4 and older and most
+    /// mail apps can't use yet.
+    V6,
+}
+
+/// A new key of yours for `name <email>`. Version 4 is made as GnuPG makes
+/// them (Ed25519 certifying primary, Ed25519 signing and Curve25519
+/// encryption subkeys); version 6 as `v6_key_params` says. It expires
+/// `lasts` from now (RFC 9580 §5.2.3.13, see `keys::set_expiry`), or never
+/// with `None`.
+pub fn generate_key(
+    name: &str,
+    email: &str,
+    lasts: Option<std::time::Duration>,
+    version: KeyVersion,
+) -> Result<SignedSecretKey> {
     use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
     use pgp::crypto::ecc_curve::ECCCurve;
     ensure!(email.contains('@'), "Enter the address the key is for.");
@@ -1218,6 +1269,12 @@ pub fn generate_key(name: &str, email: &str, lasts: Option<std::time::Duration>)
     } else {
         format!("{} <{}>", name.trim(), email.trim())
     };
+    if version == KeyVersion::V6 {
+        let key = v6_key_params(uid)?
+            .generate(rand08::thread_rng())
+            .context("The key couldn't be made.")?;
+        return keys::expiring(key, lasts);
+    }
     let mut sign = SubkeyParamsBuilder::default();
     sign.key_type(KeyType::Ed25519Legacy)
         .can_sign(true)
@@ -1247,6 +1304,55 @@ pub fn generate_key(name: &str, email: &str, lasts: Option<std::time::Duration>)
         .generate(rand08::thread_rng())
         .context("The key couldn't be made.")?;
     keys::expiring(key, lasts)
+}
+/// A version 6 key for `uid` (RFC 9580 §5.5.2.3): an Ed25519 certifying
+/// primary key, an Ed25519 signing subkey and an X25519 encryption subkey
+/// (the v6 algorithms of §5.5.5.9 and §5.5.5.7, not the legacy EdDSA and
+/// ECDH ones). Its preferences go on its direct-key signature (§5.2.3.10,
+/// as pgp does for v6 keys): AES-256 then AES-128 for SEIPD v1
+/// (§5.2.3.14), AES-256 then AES-128 with OCB for SEIPD v2 (§5.2.3.15),
+/// and the Features subpacket saying it reads both (§5.2.3.32), so
+/// senders whose keys all say so use AEAD.
+fn v6_key_params(uid: String) -> Result<pgp::composed::SecretKeyParams> {
+    use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
+    use pgp::crypto::aead::AeadAlgorithm;
+    use pgp::types::KeyVersion::V6;
+    let mut sign = SubkeyParamsBuilder::default();
+    sign.version(V6)
+        .key_type(KeyType::Ed25519)
+        .can_sign(true)
+        .can_encrypt(EncryptionCaps::None);
+    let mut encrypt = SubkeyParamsBuilder::default();
+    encrypt
+        .version(V6)
+        .key_type(KeyType::X25519)
+        .can_sign(false)
+        .can_encrypt(EncryptionCaps::All);
+    let mut params = SecretKeyParamsBuilder::default();
+    params
+        .version(V6)
+        .key_type(KeyType::Ed25519)
+        .can_certify(true)
+        .can_sign(false)
+        .can_encrypt(EncryptionCaps::None)
+        .primary_user_id(uid)
+        .preferred_symmetric_algorithms(
+            vec![SymmetricKeyAlgorithm::AES256, SymmetricKeyAlgorithm::AES128].into(),
+        )
+        .preferred_aead_algorithms(
+            vec![
+                (SymmetricKeyAlgorithm::AES256, AeadAlgorithm::Ocb),
+                (SymmetricKeyAlgorithm::AES128, AeadAlgorithm::Ocb),
+            ]
+            .into(),
+        )
+        .feature_seipd_v1(true)
+        .feature_seipd_v2(true)
+        .subkeys(vec![
+            sign.build().context("The key couldn't be made.")?,
+            encrypt.build().context("The key couldn't be made.")?,
+        ]);
+    params.build().context("The key couldn't be made.")
 }
 /// The armored, password-encrypted key an Autocrypt Setup Message
 /// carries (Autocrypt 1.1 §4.4: a message with `Autocrypt-Setup-Message:
@@ -1300,10 +1406,17 @@ impl Keyring {
         }
         self.import(&text, "")
     }
-    /// Makes a new key of yours for `email`, expiring `lasts` from now or
-    /// never, and keeps it (see `generate_key`). Returns its fingerprint.
-    pub fn create(&mut self, name: &str, email: &str, lasts: Option<std::time::Duration>) -> Result<String> {
-        let key = generate_key(name, email, lasts)?;
+    /// Makes a new key of yours for `email`, of `version` and expiring
+    /// `lasts` from now or never, and keeps it (see `generate_key`).
+    /// Returns its fingerprint.
+    pub fn create(
+        &mut self,
+        name: &str,
+        email: &str,
+        lasts: Option<std::time::Duration>,
+        version: KeyVersion,
+    ) -> Result<String> {
+        let key = generate_key(name, email, lasts, version)?;
         let fp = fingerprint(&SignedPublicKey::from(key.clone()));
         self.secret.push(key.to_armored_string(ArmorOptions::default())?);
         Ok(fp)
