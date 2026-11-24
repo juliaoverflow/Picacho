@@ -731,6 +731,10 @@ enum Action {
     ImportCertificates,
     /// Imports the certificates this certs-only S/MIME message carries.
     ImportCarriedCertificates(String),
+    /// Adds certificate revocation lists (CRL files) for S/MIME.
+    AddCrls,
+    /// Removes the added revocation list with this id.
+    RemoveCrl(String),
     /// Forgets the S/MIME certificate with this fingerprint.
     RemoveCertificate(String),
     /// Answers the invitation in this message.
@@ -6487,6 +6491,8 @@ impl MailApp {
             | Action::FindKey
             | Action::ImportCertificates
             | Action::ImportCarriedCertificates(_)
+            | Action::AddCrls
+            | Action::RemoveCrl(_)
             | Action::RemoveCertificate(_)) => {
                 self.encryption_action(action, w, cx)
             }

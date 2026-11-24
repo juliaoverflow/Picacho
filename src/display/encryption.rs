@@ -355,6 +355,7 @@ impl MailApp {
                     cx,
                 )),
             ))
+            .child(self.crl_setting(cx))
             .when_some(self.key_error.clone(), |page, e| {
                 page.child(
                     div()
@@ -448,6 +449,88 @@ impl MailApp {
                 )))
                 .into_any_element(),
         )
+    }
+
+    /// Settings → Encryption → S/MIME: the revocation lists (RFC 5280 §5)
+    /// you added, each removable, and a button to add more.
+    fn crl_setting(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let lists = self.backend.crl_list();
+        let now = chrono::Utc::now().timestamp();
+        self.setting(
+            "Revocation lists (CRL)",
+            "Lists of withdrawn certificates, as your organization or a certificate authority publishes them (.crl or .pem). Signatures are then checked against them; a copy of each is kept here, so update it by adding the new one.",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .max_w(px(520.))
+                .child(
+                    div()
+                        .id("smime-crls")
+                        .role(Role::List)
+                        .aria_label("Revocation lists")
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(lists.into_iter().map(|list| {
+                            let stale = list.next_update.is_some_and(|t| t < now);
+                            let next = list
+                                .next_update
+                                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                                .map(|t| t.format("%b %-d, %Y").to_string());
+                            let detail = format!(
+                                "{} revoked{}",
+                                list.revoked,
+                                match (next, stale) {
+                                    (Some(d), true) => format!(" · out of date since {d}: add a newer one"),
+                                    (Some(d), false) => format!(" · next update {d}"),
+                                    (None, _) => String::new(),
+                                }
+                            );
+                            let issuer = if list.issuer.is_empty() { "An unnamed issuer".to_owned() } else { list.issuer.clone() };
+                            div()
+                                .id(SharedString::from(format!("smime-crl-{}", list.id)))
+                                .role(Role::ListItem)
+                                .aria_label(format!("{issuer}, {detail}"))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(div().text_size(px(13.)).truncate().child(issuer))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .truncate()
+                                                .text_color(rgb(if stale { c.danger } else { c.muted }))
+                                                .child(detail),
+                                        ),
+                                )
+                                .child(self.button(
+                                    format!("smime-crl-remove-{}", list.id),
+                                    "Remove",
+                                    "trash",
+                                    Action::RemoveCrl(list.id.clone()),
+                                    false,
+                                    cx,
+                                ))
+                        })),
+                )
+                .child(div().flex().child(self.button(
+                    "smime-crl-add",
+                    "Add Revocation Lists…",
+                    "upload",
+                    Action::AddCrls,
+                    false,
+                    cx,
+                ))),
+        )
+        .into_any_element()
     }
 
     /// In your key's row: the button saving its revocation certificate, and
@@ -891,6 +974,48 @@ impl MailApp {
                     },
                 );
             }
+            Action::AddCrls => {
+                let picker = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: true,
+                    prompt: Some("Add".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    let Ok(Ok(Some(paths))) = picker.await else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        this.key_error = None;
+                        this.task(
+                            cx,
+                            move |b| {
+                                let mut added = 0;
+                                for path in &paths {
+                                    let data = std::fs::read(path)?;
+                                    added += b
+                                        .add_crl_file(&data)
+                                        .with_context(|| format!("{} couldn't be added.", path.display()))?;
+                                }
+                                Ok(added)
+                            },
+                            |this, result, cx| match result {
+                                Ok(n) => this.notice(
+                                    format!("Added {n} revocation {}", if n == 1 { "list" } else { "lists" }),
+                                    false,
+                                    cx,
+                                ),
+                                Err(e) => this.key_error = Some(format!("{e:#}")),
+                            },
+                        );
+                    });
+                })
+                .detach();
+            }
+            Action::RemoveCrl(id) => match self.backend.remove_crl_file(&id) {
+                Ok(()) => self.notice("Revocation list removed", false, cx),
+                Err(e) => self.key_error = Some(format!("{e:#}")),
+            },
             Action::RemoveCertificate(fp) => {
                 let mut certs =
                     crate::manage::smime::Certificates::clone(&self.backend.certificates());
@@ -1265,6 +1390,32 @@ mod tests {
         let [ana] = listed.as_slice() else { panic!("one certificate: {listed:?}") };
         assert!(!ana.own && ana.emails == ["ana@example.org"]);
         assert!(status.starts_with("Imported 1 certificate; 1 certificate"), "{status}");
+    }
+
+    /// Settings → Encryption → S/MIME: revocation lists are added from
+    /// files, listed, and removed.
+    #[gpui::test]
+    fn revocation_lists_are_added_and_removed_in_settings(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Encryption), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("smime-crl-add").is_some());
+        act(&view, Action::AddCrls, cx);
+        let file = std::path::PathBuf::from(format!("{}/tests/fixtures/smime/crl-bo-revoked.pem", env!("CARGO_MANIFEST_DIR")));
+        cx.simulate_path_prompt_response(move |_| Some(vec![file]));
+        cx.run_until_parked();
+        let (lists, files) = view.read_with(cx, |this, _| (this.backend.crl_list(), this.backend.crl_files()));
+        let [list] = lists.as_slice() else { panic!("one list: {lists:?}") };
+        assert_eq!((list.issuer.as_str(), list.revoked), ("Picacho Test CA", 1));
+        assert_eq!(files.len(), 1);
+        let remove: &'static str = format!("smime-crl-remove-{}", list.id).leak();
+        frame(cx);
+        assert!(cx.debug_bounds(remove).is_some(), "listed with a Remove button");
+        act(&view, Action::RemoveCrl(list.id.clone()), cx);
+        assert!(view.read_with(cx, |this, _| this.backend.crl_files().is_empty()));
+        frame(cx);
+        assert!(cx.debug_bounds(remove).is_none());
     }
 
     #[test]

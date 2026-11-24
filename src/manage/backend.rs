@@ -36,6 +36,8 @@ pub use remote_search::ServerResults;
 mod large;
 #[path = "extras.rs"]
 mod extras;
+#[path = "crl_files.rs"]
+pub mod crl_files;
 #[path = "archive.rs"]
 pub mod archive;
 #[path = "contacts.rs"]
@@ -1276,7 +1278,15 @@ impl Backend {
         raw: &[u8],
     ) -> Option<(crate::manage::crypto::Protection, Vec<u8>)> {
         let certs = self.certificates();
-        let (readable, verdict, signer) = crate::manage::smime::open(raw, &certs)?;
+        // RFC 5280 §5: with revocation lists added, each signer is checked
+        // against them; lists that can't be loaded leave it unchecked.
+        let checked = self
+            .smime_crl_check()
+            .and_then(|crls| crate::manage::smime::open_checking_revocation(raw, &certs, &crls).ok());
+        let (readable, verdict, signer) = match checked {
+            Some(opened) => opened?,
+            None => crate::manage::smime::open(raw, &certs)?,
+        };
         if let Some(signer) = &signer {
             let mut next = crate::manage::smime::Certificates::clone(&certs);
             // The address the message says it is from: a certificate is
