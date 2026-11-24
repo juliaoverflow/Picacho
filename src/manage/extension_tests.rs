@@ -1501,6 +1501,7 @@ fn listing_fixture(capabilities: &'static str) -> Result<()> {
             exists: 4,
             modseq: Some(12),
             days: a.sync.days,
+            ..Default::default()
         }),
     )?;
     assert!(b.with_imap(&a, |c| Ok(b.unchanged(c, &a, "Receipts")))?);

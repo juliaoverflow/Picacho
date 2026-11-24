@@ -2028,6 +2028,18 @@ impl Store {
             .optional()?;
         Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
     }
+    /// RFC 8474 §4.1: the account's mailboxes with a known MAILBOXID, as
+    /// (name, id), for recognizing a rename made elsewhere.
+    pub fn mailbox_ids(&self, account: &str) -> Result<Vec<(String, String)>> {
+        let db = self.read();
+        let mut q = db.prepare(
+            "SELECT remote, json_extract(data,'$.mailbox_id') FROM mailbox_state WHERE account=?1 AND json_extract(data,'$.mailbox_id') <> ''",
+        )?;
+        let rows = q
+            .query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
     /// Saved only after the mail it describes has been committed.
     pub fn save_mailbox_state(
         &self,
@@ -2926,7 +2938,7 @@ mod tests {
         let other = mail("INBOX", 3);
         s.save_messages(&[a.clone(), b.clone(), neighbour.clone(), other.clone()])?;
         s.save_raw(&a.id, b"From: a@example.com\r\n\r\nDownloaded.\r\n")?;
-        let state = MailboxState { validity: 7, uid_next: 3, exists: 2, modseq: Some(9), days: 30 };
+        let state = MailboxState { validity: 7, uid_next: 3, exists: 2, modseq: Some(9), days: 30, ..Default::default() };
         s.save_mailbox_state("demo", old, Some(&state))?;
         let sighting = format!(r#"[{{"mail_id":"{}"}}]"#, a.id);
         for table in ["parcel_scan", "receipt_scan"] {
@@ -3315,6 +3327,10 @@ pub struct MailboxState {
     pub modseq: Option<u64>,
     /// The account's sync window (days) these results used.
     pub days: u32,
+    /// RFC 8474 §4.1: the mailbox's MAILBOXID, where the server has
+    /// OBJECTID; how a rename made elsewhere is recognized.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mailbox_id: String,
 }
 /// Inputs validated before a mailbox snapshot is committed.
 pub struct MailboxSnapshot<'a> {
@@ -3515,7 +3531,7 @@ mod snapshot_tests {
     fn unchanged_saves_write_nothing() -> Result<()> {
         let path = std::env::temp_dir().join(format!("picacho-noop-{}", uuid::Uuid::new_v4()));
         let store = Store::open(&path)?;
-        let state = MailboxState { validity: 1, uid_next: 9, exists: 8, modseq: Some(3), days: 0 };
+        let state = MailboxState { validity: 1, uid_next: 9, exists: 8, modseq: Some(3), days: 0, ..Default::default() };
         store.set_preference("folders:a", "[]")?;
         store.save_mailbox_state("a", "INBOX", Some(&state))?;
         let wal = path.join("mail.sqlite3-wal");

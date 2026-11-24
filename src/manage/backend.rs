@@ -1567,6 +1567,21 @@ impl Backend {
             && saved.exists == now.messages
             && saved.days == a.sync.days
     }
+    /// The name `remote` had before another client renamed it: a cached
+    /// mailbox with the same MAILBOXID and UIDVALIDITY (RFC 8474 §4.1, RFC
+    /// 3501 §6.3.5) that the server no longer lists.
+    fn renamed_from(&self, c: &mut Connection, a: &Account, remote: &str, selected: &Selected) -> Option<String> {
+        let listed: std::collections::HashSet<String> =
+            c.names(false).ok()?.iter().map(|n| n.name.clone()).collect();
+        let (old, _) = self
+            .store
+            .mailbox_ids(&a.id)
+            .ok()?
+            .into_iter()
+            .find(|(name, id)| *id == selected.mailbox_id && name != remote && !listed.contains(name))?;
+        let saved = self.store.mailbox_state(&a.id, &old).ok()??;
+        (saved.validity == selected.validity).then_some(old)
+    }
     /// Brings one server mailbox's cache up to date. After a first full
     /// synchronization, later ones ask only for what changed: messages past
     /// the last UIDNEXT, flags changed since the last HIGHESTMODSEQ (or the
@@ -1604,6 +1619,19 @@ impl Backend {
             }
             None => (c.select(remote)?, None),
         };
+        // RFC 8474 §4.1: a mailbox seen here for the first time whose
+        // MAILBOXID is one a cached mailbox had, under a name no longer
+        // listed, is that mailbox renamed elsewhere. Its cache follows it
+        // (RFC 3501 §6.3.5: same UIDVALIDITY and UIDs) and the check starts
+        // again from that state, rather than downloading it all again.
+        if state.is_none()
+            && !selected.mailbox_id.is_empty()
+            && let Some(old) = self.renamed_from(c, a, remote, &selected)
+        {
+            self.store.rename_mailbox(&a.id, &old, remote)?;
+            self.forget_layout(a, &Mailbox::Remote(old));
+            return self.sync_remote(c, a, mailbox, remote, limit);
+        }
         let Some((state, uid_next)) = state.zip(selected.uid_next).filter(|(state, next)| {
             state.validity == selected.validity
                 && state.days == a.sync.days
@@ -1695,6 +1723,7 @@ impl Backend {
                 exists: selected.exists,
                 modseq: selected.modseq,
                 days: a.sync.days,
+                mailbox_id: selected.mailbox_id.clone(),
             }),
         )?;
         self.extend_layout(a, mailbox, validity, fresh.iter().map(|m| m.uid), &vanished);
@@ -2177,6 +2206,7 @@ impl Backend {
                 exists: selected.exists,
                 modseq: selected.modseq,
                 days: a.sync.days,
+                mailbox_id: selected.mailbox_id.clone(),
             });
             self.store
                 .save_mailbox_state(&a.id, remote, state.as_ref())?;

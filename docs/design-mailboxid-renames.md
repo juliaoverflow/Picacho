@@ -1,8 +1,12 @@
 # Design note: keeping cached mail across folder renames (MAILBOXID, RFC 8474)
 
-Status: design only, not implemented. The supervisor decided to leave it as
-a design. It needs one owner across the store, parcels, receipts, drafts
-and offline code.
+Status: implemented. Parts 1 and 2 are `Store::rename_mailbox`, used by
+`rename_remote_folder`. Part 3 reads MAILBOXID from SELECT
+(`transport::mailbox_id`), keeps it in `MailboxState`, and re-keys in
+`sync_remote` (`renamed_from`). MAILBOXID is read from SELECT, not LIST-STATUS,
+because the vendored imap-proto refuses unknown STATUS items. So a rename made
+elsewhere is caught when the new name is first checked, not by the listing
+itself.
 
 ## The problem, and what it costs today
 

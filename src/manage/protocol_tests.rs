@@ -1271,6 +1271,107 @@ fn imap_mail_moves_into_server_folders() -> Result<()> {
     Ok(())
 }
 
+/// RFC 8474 §4.1 with RFC 3501 §6.3.5: a folder another client renamed
+/// is recognized by its MAILBOXID when it is first checked under its new
+/// name. Its cache follows it, sources included, and nothing of it is
+/// downloaded again. A folder with another MAILBOXID is just new.
+#[test]
+fn folders_renamed_elsewhere_keep_their_cache_by_mailboxid() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut commands = Vec::new();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut r = BufReader::new(acceptor.accept(socket).unwrap());
+        r.get_mut().write_all(b"* OK local IMAP ready\r\n").unwrap();
+        let mut selected = String::new();
+        loop {
+            let mut line = String::new();
+            if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            let upper = command.to_ascii_uppercase();
+            commands.push(command.to_owned());
+            let mut out = String::new();
+            if upper.starts_with("LOGIN") {
+            } else if upper == "CAPABILITY" {
+                out.push_str("* CAPABILITY IMAP4rev1 OBJECTID\r\n");
+            } else if upper.starts_with("LIST") {
+                out.push_str("* LIST () \"/\" \"INBOX\"\r\n");
+                out.push_str("* LIST () \"/\" \"New\"\r\n");
+                out.push_str("* LIST () \"/\" \"Fresh\"\r\n");
+            } else if upper.starts_with("SELECT") {
+                selected = command.split('"').nth(1).unwrap_or_default().to_owned();
+                let id = if selected == "New" { "F1" } else { "F9" };
+                out.push_str(&format!(
+                    "* 2 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n* OK [UIDNEXT 3] next\r\n* OK [MAILBOXID ({id})] id\r\n"
+                ));
+            } else if upper.starts_with("UID SEARCH") {
+                out.push_str("* SEARCH 1 2\r\n");
+            } else if upper.starts_with("UID FETCH") {
+                // Flags only, never a body: everything is cached already.
+                assert!(!upper.contains("BODY"), "{command}");
+                if selected == "New" {
+                    out.push_str("* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n* 2 FETCH (UID 2 FLAGS ())\r\n");
+                }
+            } else if upper.starts_with("LOGOUT") {
+                r.get_mut().write_all(format!("* BYE\r\n{tag} OK done\r\n").as_bytes()).unwrap();
+                break;
+            } else if upper.starts_with("NOOP") || upper.starts_with("ENABLE") || upper.starts_with("ID") {
+            } else {
+                // Other reads (headers of a new folder) are answered empty.
+            }
+            out.push_str(&format!("{tag} OK done\r\n"));
+            r.get_mut().write_all(out.as_bytes()).unwrap();
+        }
+        commands
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let mail = |uid: u32| Mail {
+        id: format!("{}:Old:42:{uid}", a.id),
+        account: a.id.clone(),
+        folder: Folder::Other,
+        remote_folder: "Old".into(),
+        uid,
+        date: 1_700_000_000 + i64::from(uid),
+        ..Mail::default()
+    };
+    b.store.save_messages(&[mail(1), mail(2)])?;
+    b.store.save_raw(&mail(1).id, b"From: a@example.com\r\n\r\nKept.\r\n")?;
+    b.store.save_mailbox_state(
+        &a.id,
+        "Old",
+        Some(&crate::manage::store::MailboxState {
+            validity: 42,
+            uid_next: 3,
+            exists: 2,
+            days: a.sync.days,
+            mailbox_id: "F1".into(),
+            ..Default::default()
+        }),
+    )?;
+    b.sync(&a, Mailbox::Remote("New".into()), 50)?;
+    let kept = format!("{}:New:42:1", a.id);
+    assert!(b.store.message(&kept)?.is_some(), "the cache follows the rename");
+    assert!(b.store.raw(&kept)?.is_some(), "its source too");
+    assert!(b.store.message(&mail(1).id)?.is_none());
+    assert_eq!(b.store.mailbox_state(&a.id, "New")?.unwrap().mailbox_id, "F1");
+    b.disconnect(&a.id);
+    let commands = server.join().unwrap();
+    assert!(
+        !commands.iter().any(|c| c.to_ascii_uppercase().contains("BODY")),
+        "nothing downloaded again: {commands:?}"
+    );
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 /// The commands an undo server heard, for a fixture that lists INBOX,
 /// Archive (or Gmail's All Mail) and Trash, and finds `<moved@example.com>`
 /// at UID 31 in whichever mailbox is selected.

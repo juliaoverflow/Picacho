@@ -1852,6 +1852,9 @@ pub(crate) struct Selected {
     pub(crate) alerts: Vec<String>,
     /// The mailbox was opened read-only ([READ-ONLY]).
     pub(crate) read_only: bool,
+    /// RFC 8474 §4.1: the mailbox's permanent id ([MAILBOXID (...)]),
+    /// which a rename keeps; empty where the server has no OBJECTID.
+    pub(crate) mailbox_id: String,
 }
 
 /// A mailbox name as an IMAP quoted string.
@@ -1916,12 +1919,32 @@ pub(crate) fn selected_from(data: &[u8], name: &str, condstore: bool) -> Result<
             _ => {}
         }
     }
+    selected.mailbox_id = mailbox_id(data).unwrap_or_default();
     selected.validity = validity
         .filter(|v| *v > 0)
         .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
     // UIDNEXT 0 is not a valid UID; treat it as missing.
     selected.uid_next = selected.uid_next.filter(|n| *n > 0);
     Ok(selected)
+}
+
+/// RFC 8474 §4.1: the MAILBOXID response code a SELECT's reply carries
+/// (`* OK [MAILBOXID (F2212ea87-6097-4256-9d51-71338625)] Ok`). The IMAP
+/// parser passes response codes it doesn't know through as text, so it is
+/// read from that text. The id is 1 to 255 characters from objectid's
+/// alphabet (letters, digits, '-' and '_', §4).
+pub(crate) fn mailbox_id(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    text.lines().find_map(|line| {
+        let upper = line.to_ascii_uppercase();
+        let at = upper.find("[MAILBOXID (")? + "[MAILBOXID (".len();
+        let rest = &line[at..];
+        let id = &rest[..rest.find(')')?];
+        (!id.is_empty()
+            && id.len() <= 255
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .then(|| id.to_owned())
+    })
 }
 
 /// Whether a SELECT's tagged reply, in `heard` (all the server sent for
@@ -2476,6 +2499,13 @@ mod extension_tests {
     #[test]
     fn read_only_selects_are_recognized() {
         assert!(opened_read_only(b"* 1 EXISTS\r\na3 OK [READ-ONLY] EXAMINE done\r\n"));
+        // RFC 8474 §4.1.
+        assert_eq!(
+            mailbox_id(b"* 2 EXISTS\r\n* OK [MAILBOXID (F2212ea87-6097_x)] Ok\r\na1 OK done\r\n").as_deref(),
+            Some("F2212ea87-6097_x")
+        );
+        assert_eq!(mailbox_id(b"* OK [UIDVALIDITY 3] Ok\r\n"), None);
+        assert_eq!(mailbox_id(b"* OK [MAILBOXID (bad id!)] Ok\r\n"), None);
         assert!(opened_read_only(b"a3 ok [read-only] done\r\n"));
         assert!(!opened_read_only(b"* OK [READ-ONLY] old\r\na3 OK [READ-WRITE] done\r\n"));
         assert!(!opened_read_only(b""));
