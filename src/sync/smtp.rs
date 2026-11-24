@@ -1624,7 +1624,10 @@ pub(crate) fn protected(message: &Message, d: &Draft, keys: &Keys) -> Result<Vec
         let envelope = message.envelope();
         let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
         let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
-        return crate::manage::smime::protect_with(keys.certs, &raw, &from, &to, d.sign, d.encrypt);
+        // RFC 9788 §5.2.1: hide-subject applies to S/MIME as to OpenPGP.
+        return crate::manage::smime::protect_with_options(
+            keys.certs, &raw, &from, &to, d.sign, d.encrypt, d.encrypt_subject,
+        );
     }
     // Mail from an address with a key tells recipients' apps that key
     // (Autocrypt 1.1 §2.1: in every message, signed or not).

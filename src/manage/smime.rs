@@ -641,13 +641,36 @@ fn header_fields(head: &str) -> Vec<(String, String)> {
     out
 }
 
+/// `outer` (a header section) with its Subject reading "..." (RFC 9788
+/// §5.2.1 step 2, the obscured value §3.4 recommends); without one, a
+/// Subject "..." is added, so no client shows an empty one.
+fn obscured_subject(outer: &[u8]) -> Vec<u8> {
+    let latin1 = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() };
+    let mut out = String::new();
+    let mut done = false;
+    for (name, field) in header_fields(&latin1(outer)) {
+        if name == "subject" {
+            if !done {
+                out.push_str("Subject: ...\r\n");
+                done = true;
+            }
+        } else {
+            out.push_str(&field);
+        }
+    }
+    if !done {
+        out.push_str("Subject: ...\r\n");
+    }
+    out.chars().map(|c| c as u8).collect()
+}
+
 /// RFC 9788 §5.2.1: the MIME part about to be signed or encrypted, with
 /// the message's user-facing header fields copied into it and its
 /// Content-Type marked hp="clear" (signed only) or hp="cipher"
 /// (encrypted). Encrypted, every non-structural field left outside is
 /// recorded in an HP-Outer field (§2.2), so a reader knows none were made
 /// confidential. The outer header section stays as it is.
-fn protected_part(part: &[u8], outer: &[u8], encrypt: bool) -> Vec<u8> {
+fn protected_part(part: &[u8], outer: &[u8], encrypt: bool, hide_subject: bool) -> Vec<u8> {
     let latin1 = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() };
     let part = latin1(part);
     let outer = latin1(outer);
@@ -686,6 +709,12 @@ fn protected_part(part: &[u8], outer: &[u8], encrypt: bool) -> Vec<u8> {
             // RFC 9788 §1.1.1 (RFC 9787): MIME-Version and Content-* are
             // structural, and Bcc isn't sent at all.
             if name == "bcc" || name == "mime-version" || name.starts_with("content-") {
+                continue;
+            }
+            // RFC 9788 §2.2: HP-Outer records the outer field as sent, so
+            // an obscured Subject is recorded obscured.
+            if hide_subject && name == "subject" {
+                new_head.push_str("HP-Outer: Subject: ...\r\n");
                 continue;
             }
             new_head.push_str(&format!("HP-Outer: {field}"));
@@ -752,6 +781,23 @@ pub fn protect_with(
     sign: bool,
     encrypt: bool,
 ) -> Result<Vec<u8>> {
+    protect_with_options(certs, raw, from, to, sign, encrypt, false)
+}
+
+/// As `protect_with`, and with `hide_subject`, when encrypting, the real
+/// Subject only inside (RFC 9788 §5.2.1 step 2): outside it reads "...",
+/// and the inner HP-Outer records that. Signed only, nothing is hidden:
+/// there is nothing to hide it in.
+pub fn protect_with_options(
+    certs: &Certificates,
+    raw: &[u8],
+    from: &str,
+    to: &[String],
+    sign: bool,
+    encrypt: bool,
+    hide_subject: bool,
+) -> Result<Vec<u8>> {
+    let hide_subject = hide_subject && encrypt;
     let (mut part, outer) = split(raw);
     while part.ends_with(b"\r\n") {
         part.truncate(part.len() - 2);
@@ -759,7 +805,10 @@ pub fn protect_with(
     let own = certs.own_for(from);
     // RFC 9788 §5.2: the user-facing header fields are protected too,
     // signed (and encrypted) with the body.
-    let mut content = protected_part(&part, &outer, encrypt);
+    let mut content = protected_part(&part, &outer, encrypt, hide_subject);
+    // RFC 9788 §5.2.1 step 2: the outer Subject is obscured once the
+    // inner part keeps the real one.
+    let outer = if hide_subject { obscured_subject(&outer) } else { outer };
     if sign {
         let (cert, chain, key) = own.as_ref().with_context(|| {
             format!("There's no S/MIME certificate of yours for {from}. Import one in Settings → Encryption, or turn off Sign.")
@@ -2094,7 +2143,7 @@ mod tests {
     #[test]
     fn signed_part_carries_the_rfc_9788_headers_without_bcc() {
         let (part, outer) = split(WITH_BCC);
-        let inner = protected_part(&part, &outer, false);
+        let inner = protected_part(&part, &outer, false, false);
         let text = String::from_utf8_lossy(&inner);
         let head = &text[..text.find("\r\n\r\n").unwrap() + 2];
         assert!(head.starts_with("Content-Type: text/plain; charset=utf-8; hp=\"clear\"\r\n"), "{head}");
@@ -2112,7 +2161,7 @@ mod tests {
     #[test]
     fn encrypted_part_records_outer_fields_as_hp_outer() {
         let (part, outer) = split(WITH_BCC);
-        let inner = protected_part(&part, &outer, true);
+        let inner = protected_part(&part, &outer, true, false);
         let text = String::from_utf8_lossy(&inner);
         let head = &text[..text.find("\r\n\r\n").unwrap() + 2];
         assert!(head.contains("; hp=\"cipher\"\r\n"));
@@ -2120,7 +2169,7 @@ mod tests {
         assert!(!head.to_lowercase().contains("bcc"), "{head}");
         assert!(!head.contains("HP-Outer: MIME-Version") && !head.contains("HP-Outer: Content-Type"));
         // A part without a Content-Type gets the default one, marked.
-        let bare = protected_part(b"\r\nHi.", b"Subject: Hi\r\n", true);
+        let bare = protected_part(b"\r\nHi.", b"Subject: Hi\r\n", true, false);
         assert!(String::from_utf8_lossy(&bare).starts_with("Content-Type: text/plain; charset=us-ascii; hp=\"cipher\"\r\n"));
     }
 
@@ -2378,6 +2427,41 @@ mod tests {
         let (readable, verdict, _) = open_with(&message, &fixture_identity("ana"), &test_authority()).unwrap();
         assert!(verdict.decrypted);
         assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
+    }
+
+    /// RFC 9788 §5.2.1 step 2 for S/MIME: with hide-subject, encrypted
+    /// mail reads "..." outside, keeps the real Subject inside, and its
+    /// HP-Outer records the obscured one; opened, the real one shows.
+    /// Signed only, or with hide-subject off, nothing changes.
+    #[test]
+    fn hidden_subjects_are_obscured_outside_and_kept_inside() {
+        let ana = fixture_identity("ana");
+        let subject_of = |raw: &[u8]| -> String {
+            use mailparse::MailHeaderMap as _;
+            mailparse::parse_headers(raw).unwrap().0.get_first_value("Subject").unwrap_or_default()
+        };
+        let hidden = protect_with_options(&ana, WITH_BCC, "ana@example.org", &[], true, true, true).unwrap();
+        assert_eq!(subject_of(&hidden), "...");
+        assert!(!String::from_utf8_lossy(&hidden).contains("Plans"), "the real subject isn't outside");
+        let (readable, verdict, _) = open_with(&hidden, &ana, &test_authority()).unwrap();
+        assert!(verdict.decrypted);
+        assert_eq!(subject_of(&readable), "Plans");
+        let text = String::from_utf8_lossy(&readable);
+        assert!(!text.contains("HP-Outer"), "{text}");
+        // Inside, before it is shown: the real Subject, and HP-Outer saying
+        // what went outside.
+        let (part, outer) = split(WITH_BCC);
+        let inner = String::from_utf8(protected_part(&part, &outer, true, true)).unwrap();
+        assert!(inner.contains("\r\nSubject: Plans\r\n"), "{inner}");
+        assert!(inner.contains("HP-Outer: Subject: ...\r\n") && !inner.contains("HP-Outer: Subject: Plans"), "{inner}");
+        // Off: as before.
+        let shown = protect_with_options(&ana, WITH_BCC, "ana@example.org", &[], true, true, false).unwrap();
+        assert_eq!(subject_of(&shown), "Plans");
+        // Signed only: nothing to hide it in.
+        let signed = protect_with_options(&ana, WITH_BCC, "ana@example.org", &[], true, false, true).unwrap();
+        assert_eq!(subject_of(&signed), "Plans");
+        let (_, verdict, _) = open_with(&signed, &ana, &test_authority()).unwrap();
+        assert!(matches!(verdict.signature, Signature::Good(_) | Signature::Untrusted(_)), "{verdict:?}");
     }
 
     /// RFC 9788 §4.4.2, as for OpenPGP: a protected From for another

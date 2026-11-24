@@ -2493,7 +2493,9 @@ impl Composer {
                         cx.notify();
                     },
                 ))
-                .when(self.draft.encrypt && !smime, |d| {
+                // RFC 9788: OpenPGP and S/MIME both hide it in the
+                // encrypted part.
+                .when(self.draft.encrypt, |d| {
                     d.child(self.icon_button(
                         "encrypt-subject",
                         "eye-off",
@@ -2524,9 +2526,6 @@ impl Composer {
                         cx,
                         |t, _, cx| {
                             t.draft.smime = !t.draft.smime;
-                            if t.draft.smime {
-                                t.draft.encrypt_subject = false;
-                            }
                             t.changed(cx);
                             cx.notify();
                         },
