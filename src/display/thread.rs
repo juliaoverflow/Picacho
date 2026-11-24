@@ -54,54 +54,164 @@ pub(super) fn may_be_conversation(subject: &str, key: &str) -> bool {
 /// THREAD within a mailbox); otherwise messages join by References, or by
 /// subject when at least one is a reply (so newsletters that reuse a
 /// subject stay apart).
-pub(super) fn conversation(messages: &[crate::manage::model::Mail], m: &crate::manage::model::Mail) -> Vec<usize> {
-    use crate::manage::model::Mail;
-    use std::collections::HashSet;
-        let key = conversation_subject(&m.subject);
-        let replyish = |x: &Mail, key: &str| {
-            !x.references().is_empty() || x.subject.trim().to_lowercase() != key
-        };
-        let linked = |a: &Mail, b: &Mail| {
-            !b.message_id.is_empty() && a.references().contains(b.message_id.as_str())
-        };
-        // Permanent server thread ids (not IMAP THREAD's, which only
-        // cover one mailbox) settle it either way.
-        let permanent = |x: &Mail| !x.thread_id().is_empty() && !x.thread_id().starts_with("t:");
-        let server = |x: &Mail| -> Option<bool> {
-            if x.thread_id().is_empty() || m.thread_id().is_empty() {
-                return None;
-            }
-            if x.thread_id() == m.thread_id() {
-                Some(true)
-            } else if permanent(x) && permanent(m) {
-                Some(false)
-            } else {
-                None
-            }
-        };
-        let mut seen = HashSet::new();
-        let mut rows: Vec<usize> = messages
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| x.account == m.account && !x.pending)
-            .filter(|(_, x)| {
-                if let Some(same) = server(x) {
-                    return same || x.id == m.id;
-                }
-                x.id == m.id
-                    || linked(x, m)
-                    || linked(m, x)
-                    || (key.chars().count() > 2
-                        && may_be_conversation(&x.subject, &key)
-                        && conversation_subject(&x.subject) == key
-                        && (replyish(x, &key) || replyish(m, &key)))
-            })
-            // The same message under several labels or folders shows once.
-            .filter(|(_, x)| x.message_id.is_empty() || seen.insert(x.message_id.clone()))
-            .map(|(i, _)| i)
-            .collect();
-        rows.sort_by_key(|i| messages[*i].date);
+pub(super) fn conversation(messages: &[Mail], m: &Mail) -> Vec<usize> {
+    let key = conversation_subject(&m.subject);
+    let mut rows = members(messages, m, &key, 0..messages.len());
+    rows.sort_by_key(|i| messages[*i].date);
     rows
+}
+
+use crate::manage::model::Mail;
+use std::collections::{HashMap, HashSet};
+
+/// Of `candidates` (indexes into `messages`, in order), those in `m`'s
+/// conversation (`key` being its `conversation_subject`), each message
+/// once however many labels or folders it's under: `conversation`'s rule,
+/// which grouping the list (`group`) shares.
+fn members(messages: &[Mail], m: &Mail, key: &str, candidates: impl Iterator<Item = usize>) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    candidates
+        .filter(|&i| belongs(m, key, &messages[i]))
+        // The same message under several labels or folders shows once.
+        .filter(|&i| {
+            let x = &messages[i];
+            x.message_id.is_empty() || seen.insert(x.message_id.as_str())
+        })
+        .collect()
+}
+
+/// Whether `x` is in `m`'s conversation (`key` being `m`'s
+/// `conversation_subject`).
+fn belongs(m: &Mail, key: &str, x: &Mail) -> bool {
+    if x.account != m.account || x.pending {
+        return false;
+    }
+    let replyish = |x: &Mail| !x.references().is_empty() || x.subject.trim().to_lowercase() != key;
+    let linked = |a: &Mail, b: &Mail| !b.message_id.is_empty() && a.references().contains(b.message_id.as_str());
+    // Permanent server thread ids (not IMAP THREAD's, which only cover
+    // one mailbox) settle it either way.
+    let permanent = |x: &Mail| !x.thread_id().is_empty() && !x.thread_id().starts_with("t:");
+    if !x.thread_id().is_empty() && !m.thread_id().is_empty() {
+        if x.thread_id() == m.thread_id() {
+            return true;
+        }
+        if permanent(x) && permanent(m) {
+            return x.id == m.id;
+        }
+    }
+    x.id == m.id
+        || linked(x, m)
+        || linked(m, x)
+        || (key.chars().count() > 2
+            && may_be_conversation(&x.subject, key)
+            && conversation_subject(&x.subject) == key
+            && (replyish(x) || replyish(m)))
+}
+
+/// The Message-IDs a References (or In-Reply-To) header names, without
+/// their angle brackets.
+fn referenced(references: &str) -> impl Iterator<Item = &str> {
+    references
+        .split(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == ',')
+        .filter(|r| !r.is_empty())
+}
+
+/// Messages with one conversation subject: all of them, and those that
+/// are replies.
+type SubjectRows = (Vec<usize>, Vec<usize>);
+
+/// The list's rows grouped by conversation, as the reader gathers them:
+/// of `rows` (indexes into `messages`, in the order shown), the first of
+/// each conversation, and how many messages each kept row's conversation
+/// holds (among all of `messages`, which is what opening it shows).
+///
+/// Each kept row's conversation is `conversation`'s for it, found through
+/// indexes of thread ids, Message-IDs, references and subjects rather
+/// than by going through every message for every row.
+pub(super) fn group(messages: &[Mail], rows: &[usize]) -> (Vec<usize>, HashMap<usize, usize>) {
+    let trim = |id: &str| id.trim().trim_matches(|c| c == '<' || c == '>').to_owned();
+    let mut by_thread: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    let mut by_id: HashMap<(&str, String), Vec<usize>> = HashMap::new();
+    let mut referring: HashMap<(&str, String), Vec<usize>> = HashMap::new();
+    // By subject: every message with it, and those that are replies.
+    let mut by_subject: HashMap<(&str, String), SubjectRows> = HashMap::new();
+    let mut subjects: Vec<String> = Vec::with_capacity(messages.len());
+    for (i, x) in messages.iter().enumerate() {
+        let key = conversation_subject(&x.subject);
+        if x.pending {
+            subjects.push(key);
+            continue;
+        }
+        let account = x.account.as_str();
+        if !x.thread_id().is_empty() {
+            by_thread.entry((account, x.thread_id())).or_default().push(i);
+        }
+        if !x.message_id.is_empty() {
+            by_id.entry((account, trim(&x.message_id))).or_default().push(i);
+        }
+        for r in referenced(x.references()) {
+            referring.entry((account, r.to_owned())).or_default().push(i);
+        }
+        if key.chars().count() > 2 {
+            let entry = by_subject.entry((account, key.clone())).or_default();
+            entry.0.push(i);
+            if !x.references().is_empty() || x.subject.trim().to_lowercase() != key {
+                entry.1.push(i);
+            }
+        }
+        subjects.push(key);
+    }
+    let mut taken: HashSet<usize> = HashSet::new();
+    let mut kept = Vec::new();
+    let mut counts = HashMap::new();
+    let mut candidates: Vec<usize> = Vec::new();
+    for &row in rows {
+        if taken.contains(&row) {
+            continue;
+        }
+        kept.push(row);
+        let m = &messages[row];
+        if m.pending {
+            continue;
+        }
+        let account = m.account.as_str();
+        let key = &subjects[row];
+        candidates.clear();
+        candidates.push(row);
+        if !m.thread_id().is_empty()
+            && let Some(v) = by_thread.get(&(account, m.thread_id()))
+        {
+            candidates.extend(v);
+        }
+        if !m.message_id.is_empty()
+            && let Some(v) = referring.get(&(account, trim(&m.message_id)))
+        {
+            candidates.extend(v);
+        }
+        for r in referenced(m.references()) {
+            if let Some(v) = by_id.get(&(account, r.to_owned())) {
+                candidates.extend(v);
+            }
+        }
+        if let Some((all, replies)) = by_subject.get(&(account, key.clone())) {
+            let replyish = !m.references().is_empty() || m.subject.trim().to_lowercase() != *key;
+            candidates.extend(if replyish { all } else { replies });
+        }
+        // In the list's order, as `conversation` goes through them.
+        candidates.sort_unstable();
+        candidates.dedup();
+        let found = members(messages, m, key, candidates.iter().copied());
+        // Other copies of the members (labels, folders) go with them.
+        for &i in &candidates {
+            if belongs(m, key, &messages[i]) {
+                taken.insert(i);
+            }
+        }
+        if found.len() > 1 {
+            counts.insert(row, found.len());
+        }
+    }
+    (kept, counts)
 }
 
 /// Splits a plain-text reply into what was written now and the quoted
@@ -262,5 +372,60 @@ mod tests {
             ["Ana", "me", "bo"]
         );
         assert_eq!(short_names("Ana Diaz <ana@x.com>", &own), ["Ana Diaz"]);
+    }
+
+    fn mail(id: &str, subject: &str, refs: &str, date: i64) -> Mail {
+        let mut m = Mail {
+            id: id.into(),
+            account: "a".into(),
+            subject: subject.into(),
+            message_id: format!("<{id}@x>"),
+            date,
+            ..Mail::default()
+        };
+        m.set_references(refs);
+        m
+    }
+
+    /// The list groups as the reader gathers: each kept row stands for its
+    /// own conversation, counted as opening it shows.
+    #[test]
+    fn the_list_groups_conversations_as_the_reader_does() {
+        let mut gmail = mail("g2", "Trip", "", 7);
+        gmail.set_thread_id("gm:1");
+        let mut gmail_start = mail("g1", "Plans", "", 6);
+        gmail_start.set_thread_id("gm:1");
+        let mut other_thread = mail("g3", "Re: Trip", "", 5);
+        other_thread.set_thread_id("gm:2");
+        let messages = vec![
+            mail("3", "Re: Lunch", "<1@x> <2@x>", 9),
+            mail("2", "Re: Lunch", "<1@x>", 8),
+            gmail,
+            gmail_start,
+            other_thread,
+            mail("4", "Weekly digest", "", 4),
+            mail("5", "Weekly digest", "", 3),
+            mail("6", "Re: Lunch", "", 2),
+            mail("1", "Lunch", "", 1),
+        ];
+        let rows: Vec<usize> = (0..messages.len()).collect();
+        let (kept, counts) = group(&messages, &rows);
+        assert_eq!(kept, vec![0, 2, 4, 5, 6]);
+        for &row in &kept {
+            let whole = conversation(&messages, &messages[row]).len();
+            assert_eq!(counts.get(&row).copied().unwrap_or(1), whole, "row {row}");
+        }
+        assert_eq!(counts.get(&0), Some(&4), "by References and by a reply's subject");
+        assert_eq!(counts.get(&2), Some(&2), "by Gmail's thread, whatever the subjects");
+        assert_eq!(counts.get(&5), None, "newsletters reusing a subject stay apart");
+        // The same message under two labels counts once, and is one row.
+        let mut copy = mail("2", "Re: Lunch", "<1@x>", 8);
+        copy.id = "2-label".into();
+        let mut with_copy = messages.clone();
+        with_copy.insert(2, copy);
+        let rows: Vec<usize> = (0..with_copy.len()).collect();
+        let (kept, counts) = group(&with_copy, &rows);
+        assert!(!kept.contains(&2));
+        assert_eq!(counts.get(&0), Some(&4));
     }
 }

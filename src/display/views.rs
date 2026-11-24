@@ -221,6 +221,16 @@ impl MailApp {
         let place: Place =
             serde_json::from_str(&self.backend.store.preference(PLACE_PREFERENCE)?).ok()?;
         let id = place.account.as_str();
+        if !self.place_exists(id, &place.mailbox) {
+            return None;
+        }
+        // Subscriptions are listed per account and for All Accounts.
+        let subscriptions_listed = !place.subscriptions || id == ALL_MAIL || !fwd::is_view(id);
+        subscriptions_listed.then_some(place)
+    }
+    /// Whether mailbox `mailbox` of account or view `id` is listed in the
+    /// sidebar, to be opened again.
+    pub(super) fn place_exists(&self, id: &str, mailbox: &Mailbox) -> bool {
         let listed = if id == ALL_MAIL {
             self.shows_all_mail()
         } else if fwd::is_view(id) {
@@ -228,25 +238,18 @@ impl MailApp {
         } else {
             self.accounts.iter().any(|a| a.id == id)
         };
-        if !listed {
-            return None;
-        }
-        let mailbox_listed = match &place.mailbox {
-            Mailbox::Standard(folder) if fwd::is_view(id) => {
-                Self::view_folders(id).contains(folder)
+        listed
+            && match mailbox {
+                Mailbox::Standard(folder) if fwd::is_view(id) => Self::view_folders(id).contains(folder),
+                Mailbox::Standard(folder) => *folder != Folder::Other,
+                Mailbox::Remote(name) => {
+                    !fwd::is_view(id)
+                        && self
+                            .folders
+                            .get(id)
+                            .is_some_and(|folders| folders.iter().any(|f| &f.name == name))
+                }
             }
-            Mailbox::Standard(folder) => *folder != Folder::Other,
-            Mailbox::Remote(name) => {
-                !fwd::is_view(id)
-                    && self
-                        .folders
-                        .get(id)
-                        .is_some_and(|folders| folders.iter().any(|f| &f.name == name))
-            }
-        };
-        // Subscriptions are listed per account and for All Accounts.
-        let subscriptions_listed = !place.subscriptions || id == ALL_MAIL || !fwd::is_view(id);
-        (mailbox_listed && subscriptions_listed).then_some(place)
     }
     /// Opens the place saved last; false when there is none to open.
     pub(super) fn restore_place(&mut self, w: &mut Window, cx: &mut Context<Self>) -> bool {

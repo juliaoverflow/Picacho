@@ -108,6 +108,8 @@ pub enum Command {
         x: f32,
         y: f32,
     },
+    /// Bring the element with this id into view (Find in Message).
+    Reveal(String),
 }
 
 pub struct Update {
@@ -444,6 +446,7 @@ fn run(
                     relayout |= width > 0;
                 }
                 Command::Context { x, y } => contexts.push((x / zoom, y / zoom)),
+                Command::Reveal(id) => fragment = Some(id),
                 Command::Thumbnail {
                     width: w,
                     max_height,

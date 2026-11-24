@@ -55,7 +55,13 @@ fn main() -> anyhow::Result<()> {
         });
     // Picacho may be running already, perhaps with no window (in the
     // background): show that one rather than open the cache twice.
-    let listener = match display::instance::claim(&path) {
+    // A `mailto:` address or an email file to open (Picacho as the default
+    // email app, or opened from the file manager).
+    let requests: Vec<String> = std::env::args()
+        .skip(1)
+        .filter_map(|a| display::launch::request(&a))
+        .collect();
+    let listener = match display::instance::claim(&path, &requests) {
         Some(display::instance::Claim::Forwarded) => return Ok(()),
         // Running already but not answering: opening the cache too would
         // have two processes check the same accounts.
@@ -65,6 +71,9 @@ fn main() -> anyhow::Result<()> {
         Some(display::instance::Claim::Primary(listener)) => Some(listener),
         None => None,
     };
+    for r in requests {
+        display::launch::push(r);
+    }
     let store = std::sync::Arc::new(manage::store::Store::open(&path)?);
     display::run(store, listener);
     Ok(())

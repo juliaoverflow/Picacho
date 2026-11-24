@@ -122,6 +122,8 @@ pub struct HtmlView {
     /// What screen readers are given of the email (its painted strips say
     /// nothing): its text, and its links (text, address).
     accessible: Option<(SharedString, Vec<(String, String)>)>,
+    /// An element to bring into view once the document is laid out.
+    pending_reveal: Option<String>,
 }
 impl EventEmitter<HtmlContextMenu> for HtmlView {}
 impl EventEmitter<HtmlLink> for HtmlView {}
@@ -183,6 +185,7 @@ impl HtmlView {
             hovered: None,
             text_zoom: 1.,
             accessible: None,
+            pending_reveal: None,
         }
     }
     /// Shows emails larger or smaller (WCAG 1.4.4), now and from now on.
@@ -307,6 +310,15 @@ impl HtmlView {
             let _ = window.drop_image(image);
         }
     }
+    /// Brings the element with this id into view, once laid out (Find in
+    /// Message): the view emits `HtmlReveal` for its owner to scroll.
+    pub fn reveal_element(&mut self, id: String) {
+        if self.laid_out {
+            self.send(Command::Reveal(id));
+        } else {
+            self.pending_reveal = Some(id);
+        }
+    }
     fn send(&self, command: Command) {
         if let Some(worker) = &self.worker {
             let _ = worker.send(command);
@@ -334,6 +346,9 @@ impl HtmlView {
                 self.selection = selection;
                 self.page = page;
                 self.scrollers = scrollers;
+                if let Some(id) = self.pending_reveal.take() {
+                    self.send(Command::Reveal(id));
+                }
                 cx.notify();
             }
             Output::Reveal { top, bottom, start } => {

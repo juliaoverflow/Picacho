@@ -73,6 +73,7 @@ impl MailApp {
             Page::Calendar => "Calendar".into(),
             Page::Encryption => "Encryption".into(),
             Page::LocalAi => "Local AI".into(),
+            Page::Organizing => "Rules & Layout".into(),
             Page::About => "About Picacho".into(),
             Page::Account(id) => self
                 .accounts
@@ -171,6 +172,7 @@ impl MailApp {
                 row("mobile-settings-calendar", "clock", Page::Calendar),
                 row("mobile-settings-encryption", "lock", Page::Encryption),
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
+                row("mobile-settings-organizing", "filter", Page::Organizing),
             ]))
             .child(self.group_label("Mailboxes"))
             .child(self.group(mailboxes))

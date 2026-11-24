@@ -13,6 +13,38 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Group by Conversation in the message list (grouped as the reader gathers
+  a conversation), compact rows, and the reader
+  below the list; Pin to Top and Mute Conversation; dragging messages onto
+  sidebar folders.
+- Find in Message (⌘F / Ctrl+F) with highlighted matches; ⌥⌘F searches the
+  mailbox.
+- Print (through the browser's print dialog) and Save as PDF.
+- Attachments open with the system's app, Quick Look (macOS), Open With…
+  (Windows) and Show in Folder; images preview in the reader.
+- A local full-text index of downloaded mail (SQLite FTS5) covering whole
+  messages and their attachments' text (text files, HTML, attached emails,
+  PDFs, Word, Excel, PowerPoint and OpenDocument files): words find
+  message text also beside `from:`-style operators, servers are asked about
+  mail downloaded only in part, and Search All Mail on This Computer lists
+  every account's matches as results of their own; Saved Searches in the
+  sidebar.
+- Blocked senders and rules applied by Picacho to new inbox mail, for every
+  service, by the window and in the background; Apply Rules Now for mail
+  already in the inboxes (Settings → Rules & Layout).
+- Signatures per mailbox, and templates in the composer.
+- Calendar and Contacts as views of their own, the calendar's Day, Week and
+  Month grids, and custom repeat rules.
+- Publishing your OpenPGP key on keys.openpgp.org.
+- Picacho as the default email app (`mailto:`) and for `.eml` files on
+  macOS, Linux and Windows; Android takes `mailto:` links, email files and
+  the Share sheet.
+- Mark as Read, Archive, Delete and Reply buttons on new-mail notifications,
+  and Mark All as Read, Archive All and Delete All on ones for several
+  messages (Linux, Windows, macOS, Android), also while Picacho runs in the
+  background.
+- Keyboard shortcuts changed in `shortcuts.txt`.
+
 - IMAP and POP3 servers that only offer STARTTLS (ports 143 and 110): the
   connection is upgraded before anything is sent, and never used plain.
   Found by autoconfig and port probing, or chosen in manual setup.

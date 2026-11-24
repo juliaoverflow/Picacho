@@ -272,7 +272,10 @@ public final class PicachoActivity extends GpuiInputActivity {
         opened(this, intent);
     }
 
-    /** Hands a tapped notification's target to Rust, once. */
+    /**
+     * Hands a tapped notification's target to Rust, once; and what another
+     * app handed Picacho (a mailto: link, an email file, a share), once.
+     */
     private static void opened(android.content.Context context, Intent intent) {
         String target = Notifier.targetOf(context, intent);
         if (target != null) {
@@ -280,7 +283,15 @@ public final class PicachoActivity extends GpuiInputActivity {
             intent.removeExtra(Notifier.EXTRA_KEY);
             Native.open(target);
         }
+        if (intent != null && !intent.getBooleanExtra(HANDLED, false)) {
+            for (String request : Shared.requests(context, intent)) {
+                Native.launch(request);
+            }
+            intent.putExtra(HANDLED, true);
+        }
     }
+    /** Marks an intent whose share or link was handed to Rust already. */
+    private static final String HANDLED = "tech.pinal.picacho.HANDLED";
 
     @Override
     protected void onDestroy() {

@@ -160,6 +160,48 @@ impl Search {
             .iter()
             .all(|t| t.matches(m, self.kinds.as_deref()) != t.negated)
     }
+    /// The words and phrases searched for anywhere (not `field:` terms),
+    /// for the local full-text index: those a message must hold, and those
+    /// it mustn't (`-word`).
+    pub fn text_terms(&self) -> (Vec<String>, Vec<String>) {
+        let mut with = Vec::new();
+        let mut without = Vec::new();
+        for t in self.terms.iter().filter(|t| t.field == Field::Any) {
+            if t.negated {
+                without.push(t.value.clone());
+            } else {
+                with.push(t.value.clone());
+            }
+        }
+        (with, without)
+    }
+    /// Whether `m` matches every term but the words and phrases searched
+    /// for anywhere: for mail whose text the local full-text index found
+    /// them in (`text_terms`), which its preview may not show.
+    pub fn matches_besides_text(&self, m: &Mail) -> bool {
+        self.terms
+            .iter()
+            .filter(|t| t.field != Field::Any)
+            .all(|t| t.matches(m, self.kinds.as_deref()) != t.negated)
+    }
+    /// The search's words and phrases alone (`-word` too), written as a
+    /// query: what a server is asked for, for mail whose text isn't here to
+    /// search. Empty when it has none.
+    pub fn text_query(&self) -> String {
+        self.terms
+            .iter()
+            .filter(|t| t.field == Field::Any && !t.value.is_empty())
+            .map(|t| {
+                let sign = if t.negated { "-" } else { "" };
+                if t.value.contains(char::is_whitespace) {
+                    format!("{sign}\"{}\"", t.value.replace('"', ""))
+                } else {
+                    format!("{sign}{}", t.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
     /// Whether a message is the kinds of mail asked for (`has:otp`,
     /// `has:package-update`, `has:receipt`): what a server's search can't
     /// tell, checked on what it found.
@@ -742,5 +784,24 @@ mod tests {
         assert!(!hit("https://shop.example"));
         assert!(!hit("is:pinned"));
         assert!(!hit("-"), "a lone dash is a word");
+    }
+
+    #[test]
+    fn words_apart_from_operators() {
+        let s = Search::parse("from:shop invoice \"due date\" -draft is:unread");
+        assert_eq!(
+            s.text_terms(),
+            (vec!["invoice".to_string(), "due date".to_string()], vec!["draft".to_string()])
+        );
+        assert_eq!(s.text_query(), "invoice \"due date\" -draft");
+        // The preview doesn't say "invoice", so the search alone misses it;
+        // found in its text, the operators still decide.
+        assert!(!s.matches(&mail()));
+        assert!(s.matches_besides_text(&mail()));
+        let mut read = mail();
+        read.unread = false;
+        assert!(!s.matches_besides_text(&read));
+        assert!(!Search::parse("from:someone-else invoice").matches_besides_text(&mail()));
+        assert_eq!(Search::parse("from:shop").text_terms(), (vec![], vec![]));
     }
 }

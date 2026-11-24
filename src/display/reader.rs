@@ -350,6 +350,14 @@ impl MailApp {
             ))
             .child(div().flex_1())
             .child(self.button(
+                "print",
+                "@Print · ⌘P",
+                "print",
+                Action::Tools(super::tools::ToolAction::Print(m.id.clone())),
+                false,
+                cx,
+            ))
+            .child(self.button(
                 "open-window",
                 "@Open in new window · ⌘O",
                 "popout",
@@ -589,6 +597,13 @@ impl MailApp {
                 });
             });
         }
+        if self.find.open && !locked {
+            content = content.child(self.find_bar(cx));
+        }
+        // Find in Message shows a plain email as HTML, to mark what it finds.
+        let find_plain = (self.find_query(cx).is_some() && !(options.html && m.html.is_some()))
+            .then(|| m.body.clone())
+            .flatten();
         if locked {
             self.html_view.update(cx, |view, cx| view.clear(cx));
             content = content.child(self.unlock_panel(&m.account, cx));
@@ -606,10 +621,22 @@ impl MailApp {
                 let masked = mask.as_ref().map(|k| k.apply(shown));
                 let shown = masked.as_deref().unwrap_or(shown);
                 let shown = self.hide_codes_html(m, shown);
-                let shown = shown.as_ref();
+                let marked = self.find_marked(shown.as_ref(), false, cx);
+                let shown = marked.as_deref().unwrap_or(shown.as_ref());
                 self.html_view.update(cx, |view, cx| {
                     view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
+                if marked.is_some() {
+                    self.reveal_find(cx);
+                }
+                content = content.child(self.html_view.clone());
+            } else if let Some(text) = find_plain {
+                has_quotes = false;
+                let marked = self.find_marked(&text, true, cx).unwrap_or_default();
+                self.html_view.update(cx, |view, cx| {
+                    view.set_content(&marked, &m.inline, options.block_remote, dark, self.clean_links, cx)
+                });
+                self.reveal_find(cx);
                 content = content.child(self.html_view.clone());
             } else {
                 self.html_view.update(cx, |view, cx| view.clear(cx));
@@ -701,6 +728,7 @@ impl MailApp {
                                 cx,
                             ))
                         })
+                        .children(self.attachment_buttons(i, a, cx))
                         .child(self.button(
                             format!("attachment-{i}"),
                             "Save",
@@ -710,6 +738,7 @@ impl MailApp {
                             cx,
                         )),
                 );
+                content = content.children(self.image_preview(i));
                 if let Some(text) = preview {
                     content = content.child(
                         div()

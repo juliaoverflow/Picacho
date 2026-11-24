@@ -195,6 +195,61 @@ impl Store {
              -- (under the write lock, which a scan of the account held).
              CREATE INDEX IF NOT EXISTS remote_folder ON messages(account, json_extract(data,'$.remote_folder'));"
         ))?;
+        // The local full-text index of messages' subjects, people, text and
+        // attachments' text (FTS5, contentless: the text itself stays in
+        // `messages`), kept by triggers. Its rows are tied to messages by id
+        // in `message_text_ids`: `messages` has no INTEGER PRIMARY KEY, so
+        // its rowids change with VACUUM. Attachments' text is read from
+        // downloaded sources into `message_attachment_text` (see
+        // `index_attachments`), so the triggers can index it again with the
+        // rest when a message changes. An index from before attachments were
+        // indexed is made again (`index_texts` fills it).
+        let indexes_attachments: i64 = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('message_text') WHERE name='attachments'",
+            [],
+            |r| r.get(0),
+        )?;
+        if indexes_attachments == 0 {
+            db.execute_batch(
+                "DROP TRIGGER IF EXISTS message_text_insert;
+                 DROP TRIGGER IF EXISTS message_text_delete;
+                 DROP TRIGGER IF EXISTS message_text_renamed;
+                 DROP TRIGGER IF EXISTS message_text_update;
+                 DROP TABLE IF EXISTS message_text;
+                 DROP TABLE IF EXISTS message_text_ids;",
+            )?;
+        }
+        db.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS message_text USING fts5(subject, people, body, attachments, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2');
+             CREATE TABLE IF NOT EXISTS message_text_ids (id TEXT PRIMARY KEY, rid INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS message_text_rid ON message_text_ids(rid);
+             CREATE TABLE IF NOT EXISTS message_attachment_text (id TEXT PRIMARY KEY, text TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS message_text_insert AFTER INSERT ON messages BEGIN
+               DELETE FROM message_text WHERE rowid=(SELECT rid FROM message_text_ids WHERE id=NEW.id);
+               DELETE FROM message_text_ids WHERE id=NEW.id;
+               INSERT INTO message_text(subject, people, body, attachments) VALUES ({TEXT_COLUMNS_NEW});
+               INSERT INTO message_text_ids VALUES (NEW.id, last_insert_rowid());
+             END;
+             CREATE TRIGGER IF NOT EXISTS message_text_delete AFTER DELETE ON messages BEGIN
+               DELETE FROM message_text WHERE rowid=(SELECT rid FROM message_text_ids WHERE id=OLD.id);
+               DELETE FROM message_text_ids WHERE id=OLD.id;
+               DELETE FROM message_attachment_text WHERE id=OLD.id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS message_text_renamed AFTER UPDATE OF id ON messages BEGIN
+               UPDATE message_text_ids SET id=NEW.id WHERE id=OLD.id;
+               UPDATE OR REPLACE message_attachment_text SET id=NEW.id WHERE id=OLD.id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS message_text_update AFTER UPDATE OF data ON messages
+               WHEN json_extract(OLD.data,'$.body') IS NOT json_extract(NEW.data,'$.body')
+                 OR json_extract(OLD.data,'$.subject') IS NOT json_extract(NEW.data,'$.subject')
+                 OR json_extract(OLD.data,'$.snippet') IS NOT json_extract(NEW.data,'$.snippet')
+             BEGIN
+               DELETE FROM message_text WHERE rowid IN (SELECT rid FROM message_text_ids WHERE id IN (OLD.id, NEW.id));
+               DELETE FROM message_text_ids WHERE id IN (OLD.id, NEW.id);
+               INSERT INTO message_text(subject, people, body, attachments) VALUES ({TEXT_COLUMNS_NEW});
+               INSERT INTO message_text_ids VALUES (NEW.id, last_insert_rowid());
+             END;"
+        ))?;
         // Other connections write too (preferences); taking the write lock
         // when a transaction begins means one that reads first can't find
         // the database changed under it when it comes to write.
@@ -380,6 +435,106 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Mail>> {
         self.query_messages(account, mailbox.into(), limit, false)
+    }
+    /// Adds up to `batch` cached messages not yet in the full-text index
+    /// (cached before it, or by an earlier build) to it. Returns how many;
+    /// 0 once every message is in it.
+    pub fn index_texts(&self, batch: usize) -> Result<usize> {
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        let ids: Vec<String> = {
+            let mut q = tx.prepare(
+                "SELECT m.id FROM messages m LEFT JOIN message_text_ids t ON t.id=m.id WHERE t.id IS NULL LIMIT ?1",
+            )?;
+            q.query_map([batch as i64], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for id in &ids {
+            index_text(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+    /// Reads the text of up to `batch` downloaded messages' attachments
+    /// that haven't been read yet (`attachment_text::extract`), and indexes
+    /// it with the rest of each message. Returns how many messages were
+    /// read; 0 once every downloaded message with attachments has been.
+    pub fn index_attachments(&self, batch: usize) -> Result<usize> {
+        // Read without the write lock: inflating and parsing sources takes
+        // a while, and checks and downloads write meanwhile.
+        let found: Vec<(String, String)> = {
+            let db = self.read();
+            let mut q = db.prepare(&format!(
+                "SELECT m.id, {SOURCE_COLUMNS} FROM messages m LEFT JOIN message_attachment_text a ON a.id=m.id
+                 WHERE a.id IS NULL AND json_extract(m.data,'$.has_attachments') AND {DOWNLOADED_M} LIMIT ?1"
+            ))?;
+            let rows = q
+                .query_map([batch as i64], |r| Ok((r.get::<_, String>(0)?, source_columns(r, 1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(q);
+            drop(db);
+            rows.into_iter()
+                .map(|(id, (raw, source))| {
+                    // A source that can't be read has no text to find.
+                    let text = unpack(raw, source)
+                        .ok()
+                        .flatten()
+                        .map(|raw| crate::manage::attachment_text::extract(&raw))
+                        .unwrap_or_default();
+                    (id, text)
+                })
+                .collect()
+        };
+        if found.is_empty() {
+            return Ok(0);
+        }
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        {
+            let mut keep = tx.prepare_cached(
+                "INSERT OR REPLACE INTO message_attachment_text (id, text) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM messages WHERE id=?1)",
+            )?;
+            for (id, text) in &found {
+                if keep.execute(params![id, text])? > 0 && !text.is_empty() {
+                    index_text(&tx, id)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(found.len())
+    }
+    /// Messages whose subject, people, text or attachments' text hold every
+    /// one of `words` (each a phrase, its last word's start enough) and
+    /// none of `without`, in any account, best matches first: the local
+    /// full-text search, which needs no server.
+    pub fn search_texts(&self, words: &[String], without: &[String], limit: usize) -> Result<Vec<String>> {
+        let Some(query) = fts_query(words, without) else {
+            return Ok(Vec::new());
+        };
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT t.id FROM message_text f JOIN message_text_ids t ON t.rid=f.rowid WHERE message_text MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let ids = q
+            .query_map(params![query, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+    /// Whether some of `account`'s mail in `mailbox` (any of it, for All
+    /// Mail and Starred) has only its headers and preview here: its text
+    /// is in no local index, so only a server's search finds it.
+    pub fn has_undownloaded(&self, account: &str, mailbox: &Mailbox) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        let which = if mailbox.folder().is_virtual() { "1" } else { "folder=?2" };
+        Ok(self
+            .read()
+            .query_row(
+                &format!("SELECT 1 FROM messages WHERE account=?1 AND {which} AND {NOT_DOWNLOADED} LIMIT 1"),
+                params![account, mailbox.key()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
     /// Every cached message in a mailbox, newest first, without bodies: the
     /// catalog a message list shows. Opening a message reads its body.
@@ -3087,6 +3242,88 @@ mod tests {
         std::fs::remove_dir_all(p)?;
         Ok(())
     }
+    /// The full-text index follows messages as they are saved, changed and
+    /// deleted, and takes in messages cached before it.
+    #[test]
+    fn message_text_is_searchable_on_this_computer() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("picacho-fts-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&p)?;
+        let mail = |id: &str, subject: &str, body: &str| Mail {
+            id: id.into(),
+            account: "a".into(),
+            subject: subject.into(),
+            from: "ana@example.com".into(),
+            body: Some(body.into()),
+            date: 1,
+            ..Mail::default()
+        };
+        let words = |w: &[&str]| w.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let search = |w: &[&str]| store.search_texts(&words(w), &[], 10);
+        // Text far past the start of a long message is found too.
+        let long = format!("{}needle at the end", "filler words here ".repeat(10_000));
+        store.save_messages(&[
+            mail("1", "Lunch", "Shall we try the ramen place on Friday?"),
+            mail("2", "Invoice", "Your invoice for October is attached."),
+            mail("3", "Logs", &long),
+        ])?;
+        assert_eq!(search(&["ramen"])?, vec!["1".to_string()]);
+        assert_eq!(search(&["octo"])?, vec!["2".to_string()]);
+        assert_eq!(search(&["ana@example.com", "invoice"])?, vec!["2".to_string()]);
+        assert_eq!(search(&["needle"])?, vec!["3".to_string()]);
+        // A phrase, and words left out.
+        assert_eq!(search(&["ramen place"])?, vec!["1".to_string()]);
+        assert!(search(&["place ramen"])?.is_empty());
+        assert_eq!(
+            store.search_texts(&words(&["ana"]), &words(&["ramen", "needle"]), 10)?,
+            vec!["2".to_string()]
+        );
+        // Nothing to look for, or only punctuation: nothing found, no error.
+        assert!(search(&[])?.is_empty());
+        assert!(search(&["\"*"])?.is_empty());
+        // Changed text is found as it is now.
+        store.save_messages(&[mail("1", "Lunch", "Pizza instead?")])?;
+        assert!(search(&["ramen"])?.is_empty());
+        assert_eq!(search(&["pizza"])?, vec!["1".to_string()]);
+        store.delete_ids("a", &["1".to_string()])?;
+        assert!(search(&["pizza"])?.is_empty());
+        // Cached before the index: taken in by `index_texts`.
+        store.write().execute_batch("DELETE FROM message_text; DELETE FROM message_text_ids;")?;
+        assert!(search(&["invoice"])?.is_empty());
+        assert_eq!(store.index_texts(100)?, 2);
+        assert_eq!(store.index_texts(100)?, 0);
+        assert_eq!(search(&["invoice"])?, vec!["2".to_string()]);
+        // Attachments' text, once the message is downloaded.
+        let raw = "From: ana@example.com\r\nSubject: Report\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--b\r\nContent-Type: text/csv; name=\"q3.csv\"\r\nContent-Disposition: attachment; filename=\"q3.csv\"\r\n\r\nregion,revenue\r\nPatagonia,1200\r\n--b--\r\n";
+        let mut report = mail("4", "Report", "See attached.");
+        report.has_attachments = true;
+        store.save_messages(&[report.clone()])?;
+        assert!(search(&["patagonia"])?.is_empty());
+        assert_eq!(store.index_attachments(10)?, 0, "not downloaded yet");
+        store.save_raw("4", raw.as_bytes())?;
+        assert_eq!(store.index_attachments(10)?, 1);
+        assert_eq!(store.index_attachments(10)?, 0, "read once");
+        assert_eq!(search(&["patagonia"])?, vec!["4".to_string()]);
+        assert_eq!(search(&["q3.csv"])?, vec!["4".to_string()]);
+        // Kept when the message changes, gone with it.
+        store.save_messages(&[Mail { subject: "Report (final)".into(), ..report }])?;
+        assert_eq!(search(&["patagonia", "final"])?, vec!["4".to_string()]);
+        store.delete_ids("a", &["4".to_string()])?;
+        assert!(search(&["patagonia"])?.is_empty());
+        drop(store);
+        // An index from before attachments were indexed is made again.
+        {
+            let db = rusqlite::Connection::open(p.join("mail.sqlite3"))?;
+            db.execute_batch(
+                "DROP TABLE message_text; CREATE VIRTUAL TABLE message_text USING fts5(subject, people, body, content='', contentless_delete=1);",
+            )?;
+        }
+        let store = Store::open(&p)?;
+        assert!(store.index_texts(100)? > 0);
+        assert_eq!(store.search_texts(&words(&["invoice"]), &[], 10)?, vec!["2".to_string()]);
+        drop(store);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
     /// Removing an account forgets its preferences, not other accounts'.
     #[test]
     fn removing_an_account_forgets_its_preferences() -> Result<()> {
@@ -3341,6 +3578,60 @@ pub struct MailboxSnapshot<'a> {
     pub ids: &'a [String],
     pub starred_only: bool,
 }
+/// What the full-text index takes of a message row (`data`): its subject,
+/// the people on it, its whole text (or its preview where the text isn't
+/// downloaded), and its attachments' text where it was read
+/// (`message_attachment_text`).
+const TEXT_COLUMNS: &str = "coalesce(json_extract(data,'$.subject'),''), coalesce(json_extract(data,'$.sender'),'')||' '||coalesce(json_extract(data,'$.from'),'')||' '||coalesce(json_extract(data,'$.to'),'')||' '||coalesce(json_extract(data,'$.cc'),''), coalesce(json_extract(data,'$.body'), json_extract(data,'$.snippet'), ''), coalesce((SELECT text FROM message_attachment_text a WHERE a.id=messages.id),'')";
+/// The same, of a trigger's NEW row.
+const TEXT_COLUMNS_NEW: &str = "coalesce(json_extract(NEW.data,'$.subject'),''), coalesce(json_extract(NEW.data,'$.sender'),'')||' '||coalesce(json_extract(NEW.data,'$.from'),'')||' '||coalesce(json_extract(NEW.data,'$.to'),'')||' '||coalesce(json_extract(NEW.data,'$.cc'),''), coalesce(json_extract(NEW.data,'$.body'), json_extract(NEW.data,'$.snippet'), ''), coalesce((SELECT text FROM message_attachment_text a WHERE a.id=NEW.id),'')";
+
+/// `DOWNLOADED`, of the row named `m`.
+const DOWNLOADED_M: &str = "(m.raw IS NOT NULL OR m.source IS NOT NULL)";
+
+/// Puts message `id` in the full-text index as it is now, in place of what
+/// the index had of it.
+fn index_text(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
+    let mut forget = tx.prepare_cached(
+        "DELETE FROM message_text WHERE rowid=(SELECT rid FROM message_text_ids WHERE id=?1)",
+    )?;
+    forget.execute([id])?;
+    let mut add = tx.prepare_cached(&format!(
+        "INSERT INTO message_text(subject, people, body, attachments) SELECT {TEXT_COLUMNS} FROM messages WHERE id=?1"
+    ))?;
+    if add.execute([id])? == 0 {
+        tx.execute("DELETE FROM message_text_ids WHERE id=?1", [id])?;
+        return Ok(());
+    }
+    let mut link = tx.prepare_cached("INSERT OR REPLACE INTO message_text_ids VALUES (?1, ?2)")?;
+    link.execute(params![id, tx.last_insert_rowid()])?;
+    Ok(())
+}
+
+/// An FTS5 query for messages with every one of `words` and none of
+/// `without`: each a phrase (quoted, so that nothing in it is taken as
+/// FTS5's syntax), whose last word may be the start of one. None without
+/// any word to look for: FTS5's NOT needs something to take away from.
+fn fts_query(words: &[String], without: &[String]) -> Option<String> {
+    let phrase = |w: &String| -> Option<String> {
+        // Only what the tokenizer would keep counts: a phrase of nothing
+        // but punctuation matches nothing, and `""*` is an error.
+        w.chars()
+            .any(char::is_alphanumeric)
+            .then(|| format!("\"{}\"*", w.replace('"', "\"\"")))
+    };
+    let words: Vec<String> = words.iter().filter_map(phrase).collect();
+    if words.is_empty() {
+        return None;
+    }
+    let mut query = words.join(" AND ");
+    for w in without.iter().filter_map(phrase) {
+        query.push_str(" NOT ");
+        query.push_str(&w);
+    }
+    Some(query)
+}
+
 fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<()> {
     // Compiled once per connection, not once per message.
     let mut q = tx.prepare_cached("INSERT INTO messages(id,account,folder,date,data) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET folder=excluded.folder,date=excluded.date,data=excluded.data WHERE folder IS NOT excluded.folder OR date IS NOT excluded.date OR data IS NOT excluded.data")?;
@@ -3500,7 +3791,10 @@ mod snapshot_tests {
         assert_eq!(pragma("auto_vacuum")?, 2);
         assert_eq!(pragma("freelist_count")?, 0);
         let after = std::fs::metadata(path.join("mail.sqlite3"))?.len();
-        assert!(after < before / 2, "{before} -> {after}");
+        // The pages the moved sources freed are given back (what's kept,
+        // the text and its full-text index, stays).
+        let freed = (free * pragma("page_size")?) as u64;
+        assert!(before.saturating_sub(after) >= freed * 3 / 4, "{before} -> {after}, {freed} free");
         assert!(!store.compact_on_quit()?, "once");
         assert_eq!(store.raw(&format!("{}:7", a.id))?.map(|s| s.len()), Some(big_source_len(7)));
         // Mail deleted later, in a database that gives pages back when

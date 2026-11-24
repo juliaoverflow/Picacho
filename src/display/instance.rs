@@ -22,6 +22,9 @@ const SHOW: &str = "show";
 /// What the background process sends to learn whether a Picacho is running,
 /// without asking it to show anything.
 const PING: &str = "ping";
+/// Before a request a launch passes on (`launch::request`): a `mailto:`
+/// address or an email file to open.
+const OPEN: &str = "open ";
 
 /// The outcome of [`claim`].
 pub enum Claim {
@@ -34,9 +37,9 @@ pub enum Claim {
     Busy,
 }
 
-/// The most a launch's message may be: a key and a word. Anything longer
-/// is read no further.
-const MAX_LINE: u64 = 128;
+/// The most a launch's message may be: a key and a word, or a request to
+/// open. Anything longer is read no further.
+const MAX_LINE: u64 = 128 + super::launch::MAX_REQUEST as u64;
 /// How long a launch has to say it, in all.
 const SAY_WITHIN: Duration = Duration::from_secs(2);
 
@@ -103,9 +106,16 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-pub fn claim(dir: &Path) -> Option<Claim> {
+pub fn claim(dir: &Path, requests: &[String]) -> Option<Claim> {
     let path = socket_path(dir);
-    if forward(&path, SHOW).is_ok() {
+    // What this launch was to open goes to the running Picacho first.
+    let pass_on = |path: &Path| -> std::io::Result<()> {
+        for r in requests {
+            forward(path, &format!("{OPEN}{r}"))?;
+        }
+        forward(path, SHOW)
+    };
+    if pass_on(&path).is_ok() {
         return Some(Claim::Forwarded);
     }
     private_dir(dir).ok()?;
@@ -121,7 +131,7 @@ pub fn claim(dir: &Path) -> Option<Claim> {
             let start = std::time::Instant::now();
             while start.elapsed() < STARTING {
                 std::thread::sleep(Duration::from_millis(100));
-                if forward(&path, SHOW).is_ok() {
+                if pass_on(&path).is_ok() {
                     return Some(Claim::Forwarded);
                 }
                 if let Ok(Some(held)) = lock(dir) {
@@ -235,6 +245,14 @@ impl Listener {
                         Some((key, rest)) if key == self.key => rest.to_owned(),
                         _ => continue,
                     };
+                    if let Some(request) = line.strip_prefix(OPEN) {
+                        // Checked again: anyone who can reach the socket
+                        // could send anything.
+                        if let Some(request) = super::launch::request(request) {
+                            super::launch::push(request);
+                        }
+                        continue;
+                    }
                     if line.trim() == SHOW && !show() {
                         // The app is gone.
                         break;
@@ -318,8 +336,12 @@ mod tests {
         a.write_all(b"show\nmore").unwrap();
         assert_eq!(read_message(b).as_deref(), Some("show"));
         let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        a.write_all(&[b'x'; 4096]).unwrap();
+        // Written from another thread: more than a socket's buffer may hold.
+        let writer = std::thread::spawn(move || {
+            let _ = a.write_all(&vec![b'x'; 2 * MAX_LINE as usize]);
+        });
         assert_eq!(read_message(b).map(|l| l.len()), Some(MAX_LINE as usize));
+        let _ = writer.join();
         // Saying nothing: given up on after the deadline.
         let (_a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let start = std::time::Instant::now();

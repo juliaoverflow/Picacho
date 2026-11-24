@@ -57,6 +57,7 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let backend = super::ui::new_backend(store.clone());
+    let backend_for_notifications = backend.clone();
     let announce: background::Announce = Box::new(super::notify::announce);
     let monitor = match Monitor::start(backend, announce) {
         Ok(monitor) => monitor,
@@ -66,6 +67,18 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
         }
     };
     let (commands, requests) = futures::channel::mpsc::unbounded::<TrayCommand>();
+    // Notifications shown from here: a tap, or Reply, opens the window with
+    // it; their other buttons act here (`notify::Background`).
+    let opens = commands.clone();
+    super::notify::set_background(super::notify::Background {
+        backend: backend_for_notifications,
+        open: Some(Box::new(move |target| {
+            if let Ok(json) = serde_json::to_string(&target) {
+                super::launch::push(format!("{}{json}", super::launch::NOTIFICATION));
+            }
+            let _ = opens.unbounded_send(TrayCommand::Open);
+        })),
+    });
     let launches = commands.clone();
     let socket = listener.serve(move || launches.unbounded_send(TrayCommand::Open).is_ok());
     let state = State {
@@ -92,8 +105,16 @@ impl State {
         self.monitor.stop_and_wait(CHECK_WAIT);
         self.store.flush();
         instance::release(&self.socket);
+        // What later launches asked to open goes to the window's process.
+        let mut args: Vec<std::ffi::OsString> = vec![DATA_DIR_FLAG.into(), self.dir.into_os_string()];
+        args.extend(super::launch::take().into_iter().map(|r| {
+            match r.strip_prefix("file:") {
+                Some(path) => path.into(),
+                None => r.into(),
+            }
+        }));
         if command == TrayCommand::Open
-            && let Err(e) = spawn(&[DATA_DIR_FLAG.into(), self.dir.into_os_string()])
+            && let Err(e) = spawn(&args)
         {
             eprintln!("Picacho: could not open the mail window: {e}");
         }

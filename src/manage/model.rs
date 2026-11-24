@@ -1484,6 +1484,12 @@ pub struct Draft {
     /// where the outgoing server has MT-PRIORITY (RFC 6710), given to it.
     #[serde(default, skip_serializing_if = "Priority::is_normal")]
     pub priority: Priority,
+    /// An HTML signature, as written in Settings: the body holds its text
+    /// (`composing::signature_text`) after the `-- ` line, and a formatted
+    /// message's HTML shows the signature's own HTML in its place while
+    /// that text is there unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature_html: String,
 }
 /// Delivery report options (RFC 3461 §4.1, §4.3). The defaults ask for
 /// every report and only the headers back, as Picacho always did.

@@ -72,6 +72,8 @@ pub(super) enum ComposerEvent {
     /// The draft passed its checks and should be sent at this time
     /// (seconds since the epoch): Send Later.
     Schedule(i64),
+    /// Keep this as a template (Settings → Composing lists them).
+    SaveTemplate(crate::manage::composing::Template),
 }
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -159,6 +161,8 @@ pub(super) struct Composer {
     from_filter: Entity<InputState>,
     /// Send Later's menu is open.
     later_open: bool,
+    /// The templates menu is open.
+    templates_open: bool,
     /// Send Later's date and time picker, while its menu is open.
     later_picker: Option<Entity<DateTimePicker>>,
     later_subscription: Option<Subscription>,
@@ -324,6 +328,7 @@ impl Composer {
             from_closed: None,
             from_filter,
             later_open: false,
+            templates_open: false,
             later_picker: None,
             later_subscription: None,
             when: None,
@@ -1287,6 +1292,168 @@ impl Composer {
             .children(self.later_picker.clone())
     }
 
+    /// The templates menu: each template, then keeping this message as one.
+    fn templates_menu(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        let row = |id: String, label: String| {
+            div()
+                .id(SharedString::from(id))
+                .h(px(30.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .hover(move |s| s.bg(rgb(c.soft)))
+                .child(div().flex_1().min_w_0().truncate().child(label))
+        };
+        let mut menu = div()
+            .id("templates-menu")
+            .debug_selector(|| "templates-menu".into())
+            .absolute()
+            .bottom(px(48.))
+            .left(px(12.))
+            .w(px(300.))
+            .max_h(px(360.))
+            .overflow_y_scroll()
+            .p_2()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.raised))
+            .shadow_lg()
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.templates_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(c.muted))
+                    .child("TEMPLATES"),
+            );
+        if self.options.templates.is_empty() {
+            menu = menu.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child("No templates yet. Write a message you send often, then save it here."),
+            );
+        }
+        for (i, t) in self.options.templates.iter().enumerate() {
+            let template = t.clone();
+            menu = menu.child(row(format!("template-{i}"), t.name.clone()).on_click(cx.listener(
+                move |this, _, w, cx| {
+                    this.templates_open = false;
+                    this.insert_template(&template, w, cx);
+                },
+            )));
+        }
+        menu.child(div().h(px(1.)).my_1().bg(rgb(c.border))).child(
+            row("template-save".into(), "Save This Message as a Template".into()).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.templates_open = false;
+                    let subject = this.subject.read(cx).value().to_string();
+                    let body = this.body.read(cx).value().to_string();
+                    // Without the signature and quoted history below it.
+                    let body = body
+                        .split("\n-- \n")
+                        .next()
+                        .unwrap_or("")
+                        .trim_end()
+                        .to_owned();
+                    if body.trim().is_empty() && subject.trim().is_empty() {
+                        this.error = Some("Write something first, then save it as a template".into());
+                        cx.notify();
+                        return;
+                    }
+                    let name = if subject.trim().is_empty() {
+                        body.lines().next().unwrap_or("Template").chars().take(40).collect()
+                    } else {
+                        subject.clone()
+                    };
+                    cx.emit(ComposerEvent::SaveTemplate(crate::manage::composing::Template {
+                        name,
+                        subject,
+                        body,
+                    }));
+                    cx.notify();
+                }),
+            ),
+        )
+    }
+
+    /// Puts a template in the draft: its subject where there is none yet,
+    /// its text at the top of the body, with its placeholders filled in.
+    pub(super) fn insert_template(
+        &mut self,
+        t: &crate::manage::composing::Template,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::manage::composing::fill_placeholders;
+        let mut values = self.placeholders(cx);
+        if self.subject.read(cx).value().trim().is_empty() && !t.subject.is_empty() {
+            let subject = fill_placeholders(&t.subject, &values);
+            values.subject = subject.clone();
+            self.subject.update(cx, |s, cx| s.set_text(subject, window, cx));
+        }
+        self.insert_reply_text(&fill_placeholders(&t.body, &values), window, cx);
+    }
+
+    /// What a template's placeholders stand for now: the first recipient
+    /// (named as in To, else as in Contacts), the sender, today and the
+    /// subject.
+    fn placeholders(&self, cx: &App) -> crate::manage::composing::Placeholders {
+        let to = self.recipients[TO].read(cx).value().to_string();
+        let (mut name, email) = crate::sync::smtp::recipients(&to)
+            .ok()
+            .and_then(|list| list.into_iter().next())
+            .map(|(name, email)| (name.unwrap_or_default(), email))
+            .unwrap_or_default();
+        if name.trim().is_empty() && !email.is_empty() {
+            name = self
+                .contacts
+                .iter()
+                .find(|(_, e)| e.eq_ignore_ascii_case(&email))
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default();
+        }
+        let my_email = self.from_address();
+        let my_name = if let Some(i) = self.send_identity()
+            && !i.name.trim().is_empty()
+        {
+            i.name.clone()
+        } else {
+            self.accounts
+                .iter()
+                .find(|a| a.id == self.draft.account)
+                .map(|a| a.name.clone())
+                .unwrap_or_default()
+        };
+        let now = chrono::Local::now();
+        crate::manage::composing::Placeholders {
+            name: name.trim().trim_matches('"').to_owned(),
+            email,
+            my_name,
+            my_email,
+            date: now.format("%B %-d, %Y").to_string(),
+            time: now.format("%-I:%M %p").to_string(),
+            weekday: now.format("%A").to_string(),
+            subject: self.subject.read(cx).value().to_string(),
+        }
+    }
+
     /// Fills the recipient and subject fields, as typing would (tests).
     #[cfg(test)]
     pub(super) fn fill(&mut self, to: &str, subject: &str, w: &mut Window, cx: &mut Context<Self>) {
@@ -1740,18 +1907,67 @@ impl Composer {
 
     /// Sends as an account (`alias` and `identity` None), as an alias
     /// through `account`, or as one of the account's other addresses.
+    /// The signature goes with it: the previous sender's, where the body
+    /// still has it as it was put there, becomes the new sender's.
     fn choose_sender(
         &mut self,
         account: String,
         alias: Option<String>,
         identity: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let before = self.signature();
         self.draft.account = account;
         self.draft.send_as = alias.unwrap_or_default();
         self.draft.identity = identity.unwrap_or_default();
         self.from_open = false;
+        self.swap_signature(before, window, cx);
         self.changed(cx);
+    }
+
+    /// The address the draft goes from: its alias, the account's other
+    /// address it is sent as, or the account's own.
+    fn from_address(&self) -> String {
+        if !self.draft.send_as.trim().is_empty() {
+            return self.draft.send_as.trim().to_owned();
+        }
+        if let Some(i) = self.send_identity() {
+            return i.email.clone();
+        }
+        self.accounts
+            .iter()
+            .find(|a| a.id == self.draft.account)
+            .map(|a| a.email.clone())
+            .unwrap_or_default()
+    }
+
+    /// The signature the draft's sender gets; none for replies and
+    /// forwards when they get none.
+    fn signature(&self) -> crate::manage::composing::Signature {
+        let answering = !self.draft.original.is_empty() || !self.draft.reply_id.is_empty();
+        if answering && !self.options.signature_on_replies {
+            return Default::default();
+        }
+        self.options.signature(&self.draft.account, &self.from_address())
+    }
+
+    /// Replaces signature `before` in the body with the sender's own
+    /// (`composing::swap_signature`): not where it was changed by hand.
+    fn swap_signature(
+        &mut self,
+        before: crate::manage::composing::Signature,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let after = self.signature();
+        let body = self.body.read(cx).value().to_string();
+        let Some(swapped) = crate::manage::composing::swap_signature(&body, &before.block(), &after.block()) else {
+            return;
+        };
+        self.draft.body = swapped.clone();
+        self.draft.signature_html = after.html;
+        self.body.update(cx, |s, cx| s.set_text(swapped, window, cx));
     }
 
     fn sender_row(&self, cx: &Context<Self>) -> Option<Div> {
@@ -1928,8 +2144,8 @@ impl Composer {
                             )
                         }),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.choose_sender(account.clone(), alias.clone(), chosen.clone(), cx)
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    this.choose_sender(account.clone(), alias.clone(), chosen.clone(), w, cx)
                 }))
         };
         let heading = |text: String| {
@@ -2472,6 +2688,20 @@ impl Composer {
                 cx,
                 |t, _, cx| t.attach(cx),
             ))
+            .child(self.icon_button(
+                "templates",
+                "template",
+                "Templates",
+                self.templates_open,
+                cx,
+                |t, _, cx| {
+                    t.templates_open = !t.templates_open;
+                    cx.notify();
+                },
+            ))
+            .when(self.templates_open, |d| {
+                d.child(deferred(self.templates_menu(cx)).with_priority(2))
+            })
             .child(if self.mobile {
                 self.rich_text_toggle(cx)
             } else {

@@ -7,7 +7,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.Log;
 import java.io.File;
 
@@ -22,6 +24,13 @@ public final class MailService extends Service {
     private static final String TAG = "picacho";
     /** The notification's Stop action: stop until Picacho is opened again. */
     static final String ACTION_STOP = "tech.pinal.picacho.action.STOP";
+    /** A new-mail notification's button: Mark as Read, Archive or Delete. */
+    static final String ACTION_QUICK = "tech.pinal.picacho.action.QUICK";
+    /**
+     * How long the service stays after a button started it while checking in
+     * the background is off: long enough for the change to reach the server.
+     */
+    private static final long QUICK_STAY_MS = 60_000;
     /** The setting, as last told by the app, for starting at boot. */
     private static final String PREFERENCES = "background";
     private static final String ENABLED = "enabled";
@@ -70,6 +79,19 @@ public final class MailService extends Service {
         }
         // Each startForegroundService asks for it again.
         goForeground();
+        if (intent != null && ACTION_QUICK.equals(intent.getAction())) {
+            Notifier.cancel(this, intent.getIntExtra(Notifier.EXTRA_NOTIFICATION, 0));
+            // Only Picacho's own notifications (see Notifier.EXTRA_KEY).
+            String target = Notifier.targetOf(this, intent);
+            if (target != null) {
+                Native.quick(target);
+            }
+            if (!enabled(this)) {
+                // Started only for this: gone again once it's done.
+                new Handler(Looper.getMainLooper()).postDelayed(this::stopSelf, QUICK_STAY_MS);
+                return START_NOT_STICKY;
+            }
+        }
         return START_STICKY;
     }
 

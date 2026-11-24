@@ -13,12 +13,18 @@ pub mod forwarding;
 /// List-Id headers (RFC 2369, RFC 2919).
 pub mod list_headers;
 pub mod local_ai;
+/// The text of attachments, for the local full-text index.
+pub mod attachment_text;
 pub mod mail_kinds;
 /// Keeping memory small in the background (desktop).
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub mod memory;
 pub mod model;
 pub mod openpgp;
+/// Pinned and muted mail, saved searches, blocked senders and rules kept here.
+pub mod organize;
+/// Saving a message as a PDF.
+pub mod pdf;
 pub mod protected_reply;
 pub mod smime;
 /// Tracking numbers in mail, for the reader and each account's Summary.

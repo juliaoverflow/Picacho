@@ -159,6 +159,12 @@ impl Process {
         }
         let backend = display::new_backend(Arc::new(Store::open(path)?));
         self.backend = Some(backend.clone());
+        // Notification buttons pressed while the activity's window isn't up
+        // act here; taps and Reply open the activity themselves (Notifier).
+        display::notify::set_background(display::notify::Background {
+            backend: backend.clone(),
+            open: None,
+        });
         Ok(backend)
     }
 
@@ -202,18 +208,21 @@ pub fn set_background(on: bool) {
 /// Shows a notification (`Notifier.show`). `key` picks the notification:
 /// one with the same key replaces it. Tapping it opens Picacho and hands
 /// `target` (`notify::Target`'s JSON; empty for none) back through
-/// `Native.open`.
-pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str) {
+/// `Native.open`. `actions` are its buttons, a line each: the action's
+/// key, its label and its own target, tab-separated. Reply opens Picacho
+/// with its target; the others reach `Native.quick` through the service.
+pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str, actions: &str) {
     with_java("Notifier.show", |env, java| {
         let title = env.new_string(title)?;
         let text = env.new_string(text)?;
         let sub_text = env.new_string(sub_text)?;
         let target = env.new_string(target)?;
+        let actions = env.new_string(actions)?;
         env.call_static_method(
             &java.notifier,
             jni_str!("show"),
             jni_sig!(
-                "(Landroid/content/Context;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+                "(Landroid/content/Context;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
             ),
             &[
                 JValue::Object(java.context.as_obj()),
@@ -222,6 +231,7 @@ pub fn notify(key: &str, title: &str, text: &str, sub_text: &str, target: &str) 
                 JValue::Object(&text),
                 JValue::Object(&sub_text),
                 JValue::Object(&target),
+                JValue::Object(&actions),
             ],
         )
         .map(drop)
@@ -566,6 +576,51 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_open<'caller>(
     native(env, |_| {
         if !target.is_null() {
             display::notify::clicked(&target.to_string());
+        }
+        Ok(())
+    });
+}
+
+/// `Native.quick(String target)`: a button on a new-mail notification was
+/// pressed (Mark as Read, Archive, Delete; `target` carries which, as its
+/// `action`), reaching `MailService`. The window acts on it when it's up,
+/// otherwise the service's backend does (`notify::quick`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_quick<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    target: JString<'caller>,
+) {
+    native(env, |_| {
+        if !target.is_null() {
+            let target = target.to_string();
+            if let Ok(t) = serde_json::from_str::<display::notify::Target>(&target)
+                && let Some(action) = t.action.clone()
+            {
+                let plain = display::notify::Target { action: None, ..t };
+                if let Ok(json) = serde_json::to_string(&plain) {
+                    display::notify::quick(&json, &action);
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+/// `Native.launch(String request)`: another app handed Picacho a `mailto:`
+/// link, an email file or a share (`Shared.java`); the window takes it
+/// (`display::launch`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_launch<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    request: JString<'caller>,
+) {
+    native(env, |_| {
+        if !request.is_null()
+            && let Some(request) = display::launch::request(&request.to_string())
+        {
+            display::launch::push(request);
         }
         Ok(())
     });

@@ -42,6 +42,8 @@ pub mod crl_files;
 pub mod dav_accounts;
 #[path = "archive.rs"]
 pub mod archive;
+#[path = "opened.rs"]
+pub mod opened;
 #[path = "contacts.rs"]
 pub mod contacts;
 #[path = "calendar.rs"]
@@ -3209,6 +3211,7 @@ impl Backend {
         if mails.is_empty() {
             return Ok(());
         }
+        self.remove_opened_attachments(mails);
         if a.provider == Provider::Pop3 {
             // Copies stay on the server unless the account deletes them with
             // local deletions (`SyncSettings::pop_delete_with_local`), at the
@@ -4518,6 +4521,7 @@ impl Backend {
     /// short. Run when the app starts, off the interface's thread.
     pub fn tidy_files(&self) {
         self.remove_stale_partials();
+        self.tidy_opened_attachments();
         let Ok(queues) = std::fs::read_dir(self.store.path.join("sent-copies")) else {
             return;
         };

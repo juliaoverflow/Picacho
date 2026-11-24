@@ -41,12 +41,21 @@ rustls-native-certs = "0.8"
 # for the reader's word selection (the same dictionaries Blitz's text uses).
 icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
 anyrender = "0.14"
+# Print and Save as PDF (display/html/print.rs): the email, laid out and
+# painted by Blitz as the reader shows it, written as vector PDF pages with
+# its fonts (subset) and images.
+krilla = { version = "0.8", default-features = false, features = ["raster-images"] }
+# Fonts' character maps, so text in those PDFs can be copied and searched;
+# the version krilla uses.
+skrifa = "0.42"
 anyrender_vello_cpu = { version = "0.18", default-features = false }
 peniko = "0.6"
 # The font collection the HTML reader shares across emails (see
 # display/html/document.rs); blitz's `system-fonts` already builds its backends.
 fontique = { version = "0.12", default-features = false }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga", "pnm", "qoi", "hdr"] }
+# Previewing SVG attachments in the reader (display/tools.rs).
+resvg = { version = "0.46", default-features = false }
 bytemuck = "1"
 chrono = { version = "0.4", features = ["serde"] }
 # Time zones named in calendar invitations (sync/ical.rs).
@@ -105,7 +114,7 @@ mime_guess = "2"
 # as blogspot.com, whose subdomains belong to different people.
 psl = "2"
 native-tls = "0.2"
-notify-rust = "4"
+notify-rust = "4.19"
 open = "5"
 pgp = "0.21"
 # S/MIME (manage/smime.rs): PKCS#7 and PKCS#12, from the OpenSSL already
@@ -333,7 +342,8 @@ core-graphics = "0.24"
 objc = "0.2"
 # Local AI runs its models with Core ML.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSPrintInfo", "NSPrintOperation", "NSView", "NSResponder", "NSGraphicsContext"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue", "NSObject"] }
 objc2-core-ml = { version = "0.3", default-features = false, features = ["std", "MLModel", "MLModel_MLModelCompilation", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLMultiArray", "MLFeatureValue", "MLModelConfiguration"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -373,6 +383,9 @@ ksni = { version = "0.3", features = ["blocking"] }
 # glibc's allocator settings and malloc_trim, to keep the background's
 # memory small (manage/memory.rs).
 libc = "0.2"
+# The desktop portal's print dialog (Print) and Open With dialog (OpenURI
+# with `ask`), also inside Flatpak; the version GPUI already uses.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "open_uri", "print"] }
 
 [patch.crates-io]
 # Patched crates, one folder each with its patches and README:

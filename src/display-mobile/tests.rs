@@ -1279,6 +1279,8 @@ fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
             account: account.clone(),
             mailbox: Folder::Inbox.into(),
             message: Some(new.clone()),
+            messages: Vec::new(),
+            action: None,
         };
         this.open_notified(target, w, cx)
     });

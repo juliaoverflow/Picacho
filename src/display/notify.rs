@@ -5,10 +5,19 @@
 //! Tapping one opens what it tells of (its `Target`): the message in its
 //! mailbox, or the mailbox. The tap reaches `clicked`, and the window takes
 //! it with `take_clicked` (see `MailApp::open_notified`).
+//!
+//! New mail's notifications have buttons (Linux, Windows, macOS, Android):
+//! Mark as Read, Archive, Delete and Reply for one message; Mark All as
+//! Read, Archive All and Delete All for several. A button reaches `quick`;
+//! the window acts on it (`MailApp::quick_action`), or, while there is no
+//! window, the background process or Android's service does (`Background`).
 
-use crate::manage::model::{Folder, Mailbox};
+use crate::manage::{
+    backend::{Backend, Change},
+    model::{Folder, Mailbox},
+};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Where tapping a notification goes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +28,15 @@ pub struct Target {
     /// The message to open: its id, or its Message-ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Every message announced (several new messages): what the buttons
+    /// act on. Empty when it's `message` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<String>,
+    /// A button pressed, where the press travels with the target: Reply,
+    /// which opens Picacho (Android's activity, or the window the
+    /// background process starts) with a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 impl Target {
@@ -27,8 +45,141 @@ impl Target {
             account: account.to_owned(),
             mailbox: folder.into(),
             message: message.filter(|m| !m.is_empty()).map(str::to_owned),
+            messages: Vec::new(),
+            action: None,
         }
     }
+    /// The messages a button acts on: every one announced, or the one.
+    pub fn message_ids(&self) -> Vec<String> {
+        if self.messages.is_empty() {
+            self.message.iter().cloned().collect()
+        } else {
+            self.messages.clone()
+        }
+    }
+}
+
+/// The most messages a notification's buttons act on: more are left as
+/// they are (and the notification says how many arrived).
+const MOST_MESSAGES: usize = 50;
+
+/// What a button other than Reply changes.
+pub fn quick_change(action: &str) -> Option<Change> {
+    Some(match action {
+        "read" => Change::Read(true),
+        "archive" => Change::Move(Folder::Archive),
+        "trash" => Change::Move(Folder::Trash),
+        _ => return None,
+    })
+}
+
+/// Acting on taps and buttons while no window is there to: the background
+/// process's, or Android's service's. `open` starts the window with a
+/// target to open, or a reply to write (`Target::action`); without it
+/// (Android, whose taps open the activity themselves) they're kept for
+/// the window.
+pub struct Background {
+    pub backend: Arc<Backend>,
+    pub open: Option<Box<dyn Fn(Target) + Send + Sync>>,
+}
+
+/// Whether taps go to the background's `open` rather than wait for a
+/// window.
+fn opens_in_background() -> bool {
+    !window_listening()
+        && BACKGROUND
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|b| b.open.is_some())
+}
+static BACKGROUND: Mutex<Option<Background>> = Mutex::new(None);
+
+/// Taps and buttons go to `background` while no window takes them. Ones
+/// that came before it (a button that started Android's service) are
+/// acted on now.
+pub fn set_background(background: Background) {
+    // Under BACKGROUND's lock, as `in_background` keeps them: none is
+    // kept after this has looked.
+    let pending = {
+        let mut b = BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+        *b = Some(background);
+        if window_listening() { Vec::new() } else { take_quick() }
+    };
+    for (target, action) in pending {
+        in_background(target, &action);
+    }
+}
+
+/// Whether a window takes taps and buttons now.
+fn window_listening() -> bool {
+    WAKE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|w| !w.is_closed())
+}
+
+/// A tap or button with no window to take it: Reply and taps open one;
+/// the others change the messages here and on the server.
+fn in_background(target: Target, action: &str) {
+    let background = BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(b) = background.as_ref() else {
+        // Nothing yet to act with: kept for the window, or for
+        // `set_background`.
+        QUICK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((target, action.to_owned()));
+        return;
+    };
+    let Some(change) = quick_change(action) else {
+        let mut target = target;
+        if action != "default" {
+            target.action = Some(action.to_owned());
+        }
+        match &b.open {
+            Some(open) => open(target),
+            // Kept for the window: Reply as its target says.
+            None => {
+                drop(background);
+                *CLICKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(target);
+            }
+        }
+        return;
+    };
+    let backend = b.backend.clone();
+    drop(background);
+    std::thread::spawn(move || {
+        if let Err(e) = act(&backend, &target, change) {
+            eprintln!("Picacho: a notification's button couldn't act: {e:#}");
+        }
+    });
+}
+
+/// Makes `change` to the messages `target` announced, as the window does.
+pub fn act(backend: &Backend, target: &Target, change: Change) -> anyhow::Result<()> {
+    let store = &backend.store;
+    let a = store
+        .accounts()?
+        .into_iter()
+        .find(|a| a.id == target.account)
+        .ok_or_else(|| anyhow::anyhow!("The account is gone"))?;
+    let mails: Vec<_> = target
+        .message_ids()
+        .iter()
+        .filter_map(|id| {
+            store
+                .message(id)
+                .ok()
+                .flatten()
+                .or_else(|| store.by_message_id(id).ok().flatten())
+        })
+        .filter(|m| m.account == a.id)
+        .collect();
+    if mails.is_empty() {
+        return Ok(());
+    }
+    backend.change_many(&a, &mails, change)
 }
 
 /// The notification tapped last, until the window takes it.
@@ -43,10 +194,61 @@ pub fn clicked(target: &str) {
     let Ok(target) = serde_json::from_str::<Target>(target) else {
         return;
     };
+    // No window: the background process opens one with it.
+    if opens_in_background() {
+        in_background(target, "default");
+        return;
+    }
     *CLICKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(target);
     if let Some(wake) = WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         let _ = wake.unbounded_send(());
     }
+}
+
+/// Buttons a new message's notification offers: their action keys and
+/// labels, for one message and for several.
+const QUICK_ONE: [(&str, &str); 4] = [
+    ("read", "Mark as Read"),
+    ("archive", "Archive"),
+    ("trash", "Delete"),
+    ("reply", "Reply"),
+];
+const QUICK_SEVERAL: [(&str, &str); 3] = [
+    ("read", "Mark All as Read"),
+    ("archive", "Archive All"),
+    ("trash", "Delete All"),
+];
+/// Whether `action` is one of the buttons.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos")), allow(dead_code))]
+fn is_quick(action: &str) -> bool {
+    QUICK_ONE.iter().any(|(k, _)| *k == action)
+}
+/// Notification buttons pressed, until the window takes them: the
+/// notification's target and the button's key.
+static QUICK: Mutex<Vec<(Target, String)>> = Mutex::new(Vec::new());
+
+/// A button on a notification was pressed (`target` as `Target`'s JSON):
+/// the window acts on it, or the background process or service does.
+pub fn quick(target: &str, action: &str) {
+    let Ok(target) = serde_json::from_str::<Target>(target) else {
+        return;
+    };
+    if !window_listening() {
+        in_background(target, action);
+        return;
+    }
+    QUICK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((target, action.to_owned()));
+    if let Some(wake) = WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let _ = wake.unbounded_send(());
+    }
+}
+
+/// Notification buttons pressed that the window hasn't acted on.
+pub fn take_quick() -> Vec<(Target, String)> {
+    std::mem::take(&mut *QUICK.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The notification tapped last, if the window hasn't taken it.
@@ -63,11 +265,13 @@ pub fn clicks() -> futures::channel::mpsc::UnboundedReceiver<()> {
 }
 
 /// Announces new messages in one account. `latest` is (sender, subject),
-/// and `message` the latest's id, which tapping opens.
+/// and `message` the latest's id, which tapping opens; `messages` are all
+/// of them, which its buttons act on.
 pub fn new_mail(
     account: &str,
     account_id: &str,
     message: &str,
+    messages: &[&str],
     latest: (&str, &str),
     count: usize,
 ) {
@@ -80,12 +284,22 @@ pub fn new_mail(
         )
     };
     // A newer announcement for the account replaces the last (Android).
-    show(
+    let mut target = Target::new(account_id, Folder::Inbox, Some(message));
+    if messages.len() > 1 {
+        target.messages = messages
+            .iter()
+            .take(MOST_MESSAGES)
+            .map(|m| (*m).to_owned())
+            .collect();
+    }
+    let buttons: &[(&str, &str)] = if messages.len() > 1 { &QUICK_SEVERAL } else { &QUICK_ONE };
+    show_with(
         format!("mail:{account}"),
         title,
         account.to_owned(),
         body,
-        Some(Target::new(account_id, Folder::Inbox, Some(message))),
+        Some(target),
+        buttons,
     );
 }
 
@@ -98,10 +312,11 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
             account,
             account_id,
             message,
+            messages,
             sender,
             subject,
             count,
-        } => new_mail(account, account_id, message, (sender, subject), count),
+        } => new_mail(account, account_id, message, messages, (sender, subject), count),
         BackFromSnooze {
             account,
             account_id,
@@ -191,11 +406,47 @@ pub fn reminder(uid: &str, title: &str, body: &str) {
 /// `key` names the notification where the system can replace one;
 /// `target` is where tapping it goes.
 fn show(key: String, title: String, account: String, body: String, target: Option<Target>) {
+    show_with(key, title, account, body, target, &[]);
+}
+
+/// As `show`, with `buttons` (action keys and labels) for acting on the
+/// messages it tells of.
+fn show_with(
+    key: String,
+    title: String,
+    account: String,
+    body: String,
+    target: Option<Target>,
+    buttons: &[(&'static str, &'static str)],
+) {
+    let buttons: Vec<(&'static str, &'static str)> = if target.is_some() { buttons.to_vec() } else { Vec::new() };
+    // Android's buttons each carry their own target: Reply opens the app
+    // with it, the others reach the service (`Native.quick`).
+    #[cfg(target_os = "android")]
+    let actions: String = target
+        .as_ref()
+        .map(|t| {
+            buttons
+                .iter()
+                .filter_map(|(key, label)| {
+                    let mut t = t.clone();
+                    t.action = Some((*key).to_owned());
+                    Some(format!("{key}\t{label}\t{}", serde_json::to_string(&t).ok()?))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     let target = target
         .and_then(|t| serde_json::to_string(&t).ok())
         .unwrap_or_default();
     #[cfg(target_os = "android")]
-    std::thread::spawn(move || crate::android::notify(&key, &title, &body, &account, &target));
+    {
+        let _ = buttons;
+        std::thread::spawn(move || {
+            crate::android::notify(&key, &title, &body, &account, &target, &actions)
+        });
+    }
     #[cfg(not(target_os = "android"))]
     std::thread::spawn(move || {
         let _ = key;
@@ -203,9 +454,9 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
         // Linux, a D-Bus connection) until it is clicked or dismissed, which
         // a notification center can put off for days. At most `WAITING` wait;
         // past them a notification still shows, without opening on a click.
-        #[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
         let waiting = Waiting::take();
-        #[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
         let target = if waiting.is_some() { target } else { String::new() };
         #[cfg(target_os = "macos")]
         {
@@ -232,20 +483,39 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
         if !target.is_empty() {
             note.action("default", "Open");
         }
+        // Buttons only where a press can be heard (`Waiting`).
+        #[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
+        if !target.is_empty() {
+            for (key, label) in &buttons {
+                note.action(key, label);
+            }
+        }
+        // macOS shows several as a menu on one button.
+        #[cfg(target_os = "macos")]
+        if buttons.len() > 1 {
+            use notify_rust::NsNotificationExt;
+            note.actions_label("Actions");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos")))]
+        let _ = buttons;
         let shown = note
             .appname("Picacho")
             .summary(&title)
             .subtitle(&account)
             .body(&body)
             .show();
-        // Waits (on this thread) until it is clicked or closed.
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        // Waits (on this thread) until it is clicked or closed. On macOS the
+        // notification is delivered by this wait (or, without a target, as
+        // its handle is dropped); a click on it is "default".
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
         if let Ok(handle) = shown
             && !target.is_empty()
         {
             handle.wait_for_action(|action| {
                 if action == "default" {
                     clicked(&target);
+                } else if is_quick(action) {
+                    quick(&target, action);
                 }
             });
         }
@@ -256,22 +526,26 @@ fn show(key: String, title: String, account: String, body: String, target: Optio
             && !target.is_empty()
         {
             let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
-                if matches!(response, notify_rust::NotificationResponse::Default) {
-                    clicked(&target);
+                match response {
+                    notify_rust::NotificationResponse::Default => clicked(&target),
+                    notify_rust::NotificationResponse::Action(action) if is_quick(action) => {
+                        quick(&target, action)
+                    }
+                    _ => {}
                 }
             });
         }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos")))]
         let _ = (shown, target);
     });
 }
 
 /// A place among the notifications waiting for a click (see `show`).
-#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
 struct Waiting;
-#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
 static WAITING_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
 impl Waiting {
     const MOST: usize = 32;
     fn take() -> Option<Self> {
@@ -282,9 +556,34 @@ impl Waiting {
             .map(|_| Waiting)
     }
 }
-#[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
 impl Drop for Waiting {
     fn drop(&mut self) {
         WAITING_NOW.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targets_name_every_message_and_older_ones_still_read() {
+        let mut t = Target::new("a", Folder::Inbox, Some("m3"));
+        assert_eq!(t.message_ids(), vec!["m3".to_string()]);
+        t.messages = vec!["m1".into(), "m2".into(), "m3".into()];
+        assert_eq!(t.message_ids().len(), 3);
+        t.action = Some("reply".into());
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<Target>(&json).unwrap(), t);
+        // As a notification shown by an earlier version carries it.
+        // Without them it's written as before, and read either way.
+        let plain = serde_json::to_string(&Target::new("a", Folder::Inbox, Some("m"))).unwrap();
+        assert!(!plain.contains("messages") && !plain.contains("action"), "{plain}");
+        let old: Target = serde_json::from_str(&plain).unwrap();
+        assert!(old.messages.is_empty() && old.action.is_none());
+        assert_eq!(quick_change("archive"), Some(Change::Move(Folder::Archive)));
+        assert_eq!(quick_change("reply"), None);
+        assert!(is_quick("trash") && !is_quick("default"));
     }
 }

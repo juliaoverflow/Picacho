@@ -197,7 +197,7 @@ pub(crate) fn build_to(
     } else {
         InlineImages::default()
     };
-    let html = || SinglePart::html(html_body_with(&d.body, &inline));
+    let html = || SinglePart::html(html_body_signed(&d.body, &d.signature_html, &inline));
     // Without attachments, the text alone: a multipart/mixed wrapper made
     // every message look like it had some.
     if d.attachments.is_empty() {
@@ -2066,19 +2066,52 @@ pub(crate) fn html_body(markdown: &str) -> String {
 /// parts by `cid:` (RFC 2392). One not among them (its attachment removed,
 /// or never there) shows its alt text: a `file:` address never goes out,
 /// so no local file name or path does either.
+#[cfg(test)]
 fn html_body_with(markdown: &str, inline: &InlineImages) -> String {
+    html_body_signed(markdown, "", inline)
+}
+/// As `html_body_with`, with an HTML signature (`Draft::signature_html`)
+/// in place of its text where the body has that text unchanged after a
+/// `-- ` line. Elsewhere, or changed, the text is what goes.
+fn html_body_signed(markdown: &str, signature_html: &str, inline: &InlineImages) -> String {
     // Each placed picture's address becomes a placeholder the compiler
     // lets through (it drops `cid:` as an unknown protocol); after, the
     // placeholder becomes the `cid:` address.
     let placeholder = |i: usize| format!("https://inline.invalid/{i}");
-    let markdown = rewrite_file_images(markdown, true, |name| {
-        inline
-            .images
-            .iter()
-            .position(|image| image.name == name)
-            .map(placeholder)
-    });
-    let mut html = html_compiled(&markdown);
+    let rewrite = |markdown: &str| {
+        rewrite_file_images(markdown, true, |name| {
+            inline
+                .images
+                .iter()
+                .position(|image| image.name == name)
+                .map(placeholder)
+        })
+    };
+    let signed = (!signature_html.trim().is_empty())
+        .then(|| {
+            let block = format!(
+                "{}{}",
+                crate::manage::composing::DELIMITER,
+                crate::manage::composing::signature_text(signature_html)
+            );
+            let at = markdown
+                .match_indices(&block)
+                .map(|(i, _)| i)
+                .find(|&i| i == 0 || markdown[..i].ends_with('\n'))?;
+            let after = &markdown[at + block.len()..];
+            // The whole text, to its line's end.
+            (after.is_empty() || after.starts_with('\n')).then_some((at, after))
+        })
+        .flatten();
+    let mut html = match signed {
+        Some((at, after)) => html_document(&format!(
+            "{}<div class=\"picacho-signature\">-- <br>{}</div>{}",
+            html_content(&rewrite(&markdown[..at])),
+            safe_signature_html(signature_html),
+            html_content(&rewrite(after)),
+        )),
+        None => html_compiled(&rewrite(markdown)),
+    };
     for (i, image) in inline.images.iter().enumerate() {
         html = html.replace(
             &format!("src=\"{}\"", placeholder(i)),
@@ -2138,6 +2171,40 @@ fn rewrite_file_images(
 }
 /// The compiled HTML document of a Markdown body.
 fn html_compiled(markdown: &str) -> String {
+    html_document(&html_content(markdown))
+}
+/// An HTML signature as sent: without scripts, frames, forms, event
+/// handlers or `javascript:` addresses, which no mail app runs anyway.
+fn safe_signature_html(html: &str) -> String {
+    static UNSAFE: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
+        let mut res: Vec<regex::Regex> = ["script", "style", "iframe", "object", "embed", "form", "template"]
+            .iter()
+            .map(|tag| regex::Regex::new(&format!(r"(?is)<{tag}\b.*?</\s*{tag}\s*>")).unwrap())
+            .collect();
+        res.extend([
+            regex::Regex::new(r"(?is)</?(script|iframe|object|embed|form|input|button|textarea|select|meta|link|base|template)\b[^>]*>").unwrap(),
+            regex::Regex::new(r#"(?is)\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap(),
+            regex::Regex::new(r#"(?is)(href|src)\s*=\s*(["']?)\s*(javascript|vbscript|data:text/html)[^"'\s>]*(["']?)"#).unwrap(),
+        ]);
+        res
+    });
+    let mut out = html.to_owned();
+    let last = UNSAFE.len() - 1;
+    for (i, re) in UNSAFE.iter().enumerate() {
+        out = re.replace_all(&out, if i == last { "$1=\"#\"" } else { "" }).into_owned();
+    }
+    out
+}
+/// A body's HTML in the document every formatted message is sent in.
+fn html_document(content: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>\
+<body><div style=\"font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
+font-size:14px;line-height:1.5\">{content}</div></body></html>"
+    )
+}
+/// The HTML of a Markdown body, without the document around it.
+fn html_content(markdown: &str) -> String {
     let options = markdown::Options {
         parse: markdown::ParseOptions::gfm(),
         compile: markdown::CompileOptions {
@@ -2148,13 +2215,8 @@ fn html_compiled(markdown: &str) -> String {
         },
     };
     // Single line breaks are kept, as people expect from an email editor.
-    let content = markdown::to_html_with_options(&hard_breaks(markdown), &options)
-        .unwrap_or_else(|_| markdown::to_html(markdown));
-    format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>\
-<body><div style=\"font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
-font-size:14px;line-height:1.5\">{content}</div></body></html>"
-    )
+    markdown::to_html_with_options(&hard_breaks(markdown), &options)
+        .unwrap_or_else(|_| markdown::to_html(markdown))
 }
 
 /// Ends each line inside a paragraph with Markdown's hard break, so a single
@@ -2211,6 +2273,27 @@ mod tests {
         assert!(html.contains("<em>there</em><br />"));
         assert!(html.contains("<li>one</li>"));
         assert!(!html.contains("<script>"));
+    }
+
+    /// An HTML signature goes as its HTML where the body has its text
+    /// unchanged; scripts and handlers in it don't.
+    #[test]
+    fn html_signatures_go_as_written() {
+        let sig = "<div style=\"color:#336\"><b>Sam Lee</b><br>Acme</div><script>x()</script><img src=\"https://acme.test/logo.png\" onload=\"y()\">";
+        let text = crate::manage::composing::signature_text(sig);
+        let body = format!("**Hi**\n\n-- \n{text}\n\nOn Monday, Ana wrote:\n> hello");
+        let html = html_body_signed(&body, sig, &InlineImages::default());
+        assert!(html.contains("<strong>Hi</strong>"));
+        assert!(html.contains("-- <br><div style=\"color:#336\"><b>Sam Lee</b><br>Acme</div>"));
+        assert!(html.contains("<img src=\"https://acme.test/logo.png\">"));
+        assert!(!html.contains("script") && !html.contains("onload"));
+        assert!(html.contains("<blockquote>"));
+        assert_eq!(html.matches("Sam Lee").count(), 1);
+        // Its text changed: the text goes.
+        let edited = body.replace("Acme", "Acme Ltd");
+        let html = html_body_signed(&edited, sig, &InlineImages::default());
+        assert!(!html.contains("<b>Sam Lee</b>") && html.contains("Acme Ltd"));
+        assert_eq!(safe_signature_html("<a href=\"javascript:alert(1)\">x</a>"), "<a href=\"#\">x</a>");
     }
 
     /// RFC 1870 §4: the size declared for DATA counts bare CR and LF as

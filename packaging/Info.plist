@@ -18,6 +18,17 @@
   <key>CFBundleURLTypes</key><array><dict>
     <key>CFBundleURLName</key><string>tech.pinal.picacho.sign-in</string>
     <key>CFBundleURLSchemes</key><array><string>picacho</string><string>tech.pinal.picacho</string></array>
+  </dict><dict>
+    <!-- Picacho as the default email app (Mail's Settings → Default email reader). -->
+    <key>CFBundleURLName</key><string>tech.pinal.picacho.mailto</string>
+    <key>CFBundleURLSchemes</key><array><string>mailto</string></array>
+  </dict></array>
+  <key>CFBundleDocumentTypes</key><array><dict>
+    <key>CFBundleTypeName</key><string>Email Message</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>LSItemContentTypes</key><array><string>com.apple.mail.email</string><string>public.email-message</string></array>
+    <key>CFBundleTypeExtensions</key><array><string>eml</string></array>
   </dict></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

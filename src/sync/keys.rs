@@ -170,6 +170,58 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
     }
 }
 
+/// What publishing a key on keys.openpgp.org did, by address: those it
+/// lists already, and those it sent a confirmation email to (it lists an
+/// address only once its owner follows the link in that email).
+#[derive(Debug, Default)]
+pub struct Published {
+    pub listed: Vec<String>,
+    pub confirming: Vec<String>,
+}
+
+/// Uploads a public key (armored) to keys.openpgp.org, and asks it to
+/// confirm `addresses` of it that it doesn't list yet (VKS API v1).
+pub fn publish(armored: &str, addresses: &[String], tls: native_tls::TlsConnector) -> Result<Published> {
+    let client = http(tls)?;
+    let response = client
+        .post("https://keys.openpgp.org/vks/v1/upload")
+        .json(&serde_json::json!({ "keytext": armored }))
+        .send()
+        .context("keys.openpgp.org couldn't be reached.")?;
+    let status = response.status();
+    let answer: serde_json::Value = serde_json::from_slice(&limited(response)?).unwrap_or_default();
+    if !status.is_success() {
+        let why = answer["error"].as_str().unwrap_or("it refused the key");
+        bail!("keys.openpgp.org answered {}: {why}", status.as_u16());
+    }
+    let token = answer["token"].as_str().context("keys.openpgp.org didn't answer as expected.")?;
+    let mut out = Published::default();
+    let mut ask = Vec::new();
+    if let Some(states) = answer["status"].as_object() {
+        for (address, state) in states {
+            let wanted = addresses.iter().any(|a| a.eq_ignore_ascii_case(address));
+            match state.as_str() {
+                Some("published") => out.listed.push(address.clone()),
+                Some("unpublished") if wanted => ask.push(address.clone()),
+                Some("pending") if wanted => out.confirming.push(address.clone()),
+                _ => {}
+            }
+        }
+    }
+    if !ask.is_empty() {
+        let response = client
+            .post("https://keys.openpgp.org/vks/v1/request-verify")
+            .json(&serde_json::json!({ "token": token, "addresses": ask, "locale": ["en"] }))
+            .send()
+            .context("keys.openpgp.org couldn't be reached.")?;
+        if !response.status().is_success() {
+            bail!("keys.openpgp.org couldn't send the confirmation email ({}).", response.status().as_u16());
+        }
+        out.confirming.extend(ask);
+    }
+    Ok(out)
+}
+
 /// An Autocrypt header's address and key (RFC-like Level 1: `addr=`,
 /// optional `prefer-encrypt=`, and `keydata=` base64), from a message's
 /// headers. The header must be for the message's From address.

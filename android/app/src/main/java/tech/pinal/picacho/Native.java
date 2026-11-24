@@ -49,6 +49,19 @@ final class Native {
     static native void open(String target);
 
     /**
+     * A new-mail notification's button was pressed (Mark as Read, Archive,
+     * Delete): {@code target} names the messages and the button (see
+     * Notifier).
+     */
+    static native void quick(String target);
+
+    /**
+     * Another app handed Picacho something to open (see {@link Shared}): a
+     * mailto: link, an email file's path, or "attach:" and a shared file's.
+     */
+    static native void launch(String request);
+
+    /**
      * An answer to a request Rust made ({@link VerifyActivity}, {@link Passkeys}):
      * {@code value} is the answer, or null when there is nothing more.
      */

@@ -297,14 +297,26 @@ impl MailApp {
                 page.child(self.setting(
                     "Share your public key",
                     "Save it to send to people who'll write to you encrypted, or check your signatures.",
-                    div().flex().child(self.button(
-                        "openpgp-export",
-                        "Save Public Keys…",
-                        "download",
-                        Action::ExportPublicKeys,
-                        false,
-                        cx,
-                    )),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(self.button(
+                            "openpgp-export",
+                            "Save Public Keys…",
+                            "download",
+                            Action::ExportPublicKeys,
+                            false,
+                            cx,
+                        ))
+                        .child(self.button(
+                            "openpgp-publish",
+                            "Publish on keys.openpgp.org",
+                            "upload",
+                            Action::Tools(super::tools::ToolAction::PublishKeys),
+                            false,
+                            cx,
+                        )),
                 ))
             })
             // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.

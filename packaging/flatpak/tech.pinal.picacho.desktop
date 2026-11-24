@@ -3,9 +3,11 @@ Type=Application
 Name=Picacho
 GenericName=Email Client
 Comment=Fast, native email for every inbox you have
-Exec=picacho
+Exec=picacho %U
 Icon=tech.pinal.picacho
 StartupWMClass=tech.pinal.picacho
 Terminal=false
 Categories=Network;Email;
 Keywords=mail;email;inbox;imap;
+# Picacho as the default email app (mailto: links), and email files.
+MimeType=x-scheme-handler/mailto;message/rfc822;

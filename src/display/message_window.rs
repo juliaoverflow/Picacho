@@ -452,6 +452,31 @@ impl MailApp {
         } else {
             mail
         };
+        self.show_mail_window(mail, w, cx);
+    }
+
+    /// Opens an email file (.eml) in a message window of its own, as when
+    /// one is opened from the system's file manager.
+    pub(super) fn open_eml_file(&mut self, path: &std::path::Path, w: &mut Window, cx: &mut Context<Self>) {
+        let parsed = std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| {
+                let mut account = Account::new(Provider::Imap);
+                account.id = String::new();
+                let id = format!("file:{}", path.display());
+                crate::sync::mime::parse_message(&raw, &account, &id, Folder::Inbox, "", 0)
+            });
+        match parsed {
+            Ok(mut mail) => {
+                mail.unread = false;
+                self.show_mail_window(mail, w, cx);
+            }
+            Err(e) => self.notice(format!("Couldn't open {}: {e:#}", path.display()), true, cx),
+        }
+    }
+
+    fn show_mail_window(&mut self, mail: Mail, w: &mut Window, cx: &mut Context<Self>) {
+        let id = mail.id.clone();
         let options = self.reading_options(&mail);
         let (app, main, colors, dark) = (
             cx.weak_entity(),

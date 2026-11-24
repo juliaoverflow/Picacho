@@ -2,6 +2,8 @@
 mod assets;
 mod desktop;
 pub mod notify;
+/// `mailto:` addresses and email files Picacho was opened with.
+pub mod launch;
 pub(crate) mod ui;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use ui::run;
@@ -22,5 +24,7 @@ pub mod verify;
 /// What Windows needs of Picacho itself, and its delay-loaded DLLs.
 #[cfg(windows)]
 pub mod windows;
+/// Open With… for attachments on macOS and Linux.
+pub(crate) mod open_with;
 
 mod html;

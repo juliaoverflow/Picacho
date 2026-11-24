@@ -84,6 +84,16 @@ mod summary;
 mod summary_tests;
 #[path = "thread.rs"]
 mod thread;
+#[path = "organize.rs"]
+mod organize;
+#[path = "tools.rs"]
+mod tools;
+#[path = "shortcuts.rs"]
+mod shortcuts;
+#[path = "templates.rs"]
+mod templates;
+#[path = "calendar_views.rs"]
+mod calendar_views;
 #[path = "tree.rs"]
 mod tree;
 #[path = "views.rs"]
@@ -175,7 +185,13 @@ actions!(
         Hide,
         HideOthers,
         ShowAll,
-        OpenInWindow
+        OpenInWindow,
+        /// Find in Message (⌘F / Ctrl+F); the mailbox search where no
+        /// message is open.
+        FindInMessage,
+        PrintMessage,
+        SaveAsPdf,
+        ToggleThreads
     ]
 );
 
@@ -621,6 +637,9 @@ enum Page {
     Calendar,
     Encryption,
     LocalAi,
+    /// Rules & Layout: blocked senders, rules applied here, saved
+    /// searches, list density, the reader's place, shortcuts.
+    Organizing,
     Account(String),
     /// About Picacho: a page of Settings on a phone, a dialog elsewhere.
     About,
@@ -1213,6 +1232,14 @@ enum Action {
     Receipt(String, bool),
     /// Server-side filters and vacation replies in an account's Settings.
     Filters(filters::FilterAction),
+    /// Pins, mutes, saved searches, blocked senders, rules and layout.
+    Organize(organize::OrgAction),
+    /// Find in Message, printing, PDFs and opening attachments.
+    Tools(tools::ToolAction),
+    /// Signatures per mailbox and templates.
+    Templates(templates::TemplateAction),
+    /// Calendar and Contacts views, the calendar's grids, custom repeats.
+    Calendar(calendar_views::CalAction),
 }
 
 /// A conversation's rows for one message at one list revision.
@@ -1537,6 +1564,39 @@ pub struct MailApp {
     /// Server-side filters by account, as loaded in Settings.
     filters: HashMap<String, filters::FiltersUi>,
     filter_inputs: filters::FilterInputs,
+    /// Pinned and muted mail, saved searches, blocked senders, rules and
+    /// layout (`manage::organize`), and Settings' fields for them.
+    org: crate::manage::organize::Organizing,
+    org_ui: organize::OrgUi,
+    /// Rows standing for a conversation, by message index: how many
+    /// messages it holds (Group by Conversation).
+    thread_counts: HashMap<usize, usize>,
+    /// Find in Message.
+    find: tools::Find,
+    /// Attached images shown in the reader: (message, attachment index).
+    image_previews: HashMap<(String, usize), Arc<gpui::Image>>,
+    /// Messages found in the local full-text index for a search: (query,
+    /// ids), or the query being looked up.
+    body_matches: Option<(String, Option<Arc<HashSet<String>>>)>,
+    /// Servers asked for a search's words, for mail whose text isn't here:
+    /// (query, whether they're still being asked).
+    undownloaded_search: Option<(String, bool)>,
+    /// The full-text index is being completed (`index_texts`), and was
+    /// asked to go through again once done.
+    indexing: bool,
+    index_again: bool,
+    /// Search All Mail on This Computer's results are shown, and where
+    /// they were opened from.
+    local_results: Option<organize::LocalResults>,
+    /// Apply Rules Now is running.
+    applying_rules: bool,
+    /// Settings → Composing: the mailbox whose signature is edited (None:
+    /// every mailbox's), and the template being named.
+    templates: templates::TemplatesUi,
+    /// Calendar or Contacts shown in place of the list and reader.
+    app_view: Option<calendar_views::AppView>,
+    /// The calendar's view (agenda or grids) and custom repeat form.
+    cal: calendar_views::CalViews,
     /// What each account's server says about itself (METADATA).
     server_notes: HashMap<String, crate::manage::backend::ServerNotes>,
     /// JMAP accounts shared with each account's sign-in, as last looked
@@ -2037,10 +2097,29 @@ impl MailApp {
                 this.apply_filter(cx);
                 this.scroll_list_to_top();
                 this.load_mail_kinds(cx);
+                this.search_texts_soon(cx);
                 cx.notify();
             }
         })]);
         let filter_inputs = filters::FilterInputs::new(window, cx);
+        let org = crate::manage::organize::Organizing::load(&backend.store);
+        let org_ui = organize::OrgUi::new(window, cx);
+        let find = tools::Find::new(window, cx);
+        subscriptions.push(cx.subscribe_in(&find.input, window, |this, _, event, w, cx| {
+            match event {
+                InputEvent::Change => {
+                    this.find.current = 0;
+                    this.find.reveal.set(true);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.tool_action(tools::ToolAction::FindNext, w, cx);
+                }
+                _ => {}
+            }
+        }));
+        let templates = templates::TemplatesUi::new(window, cx);
+        let cal = calendar_views::CalViews::new(window, cx);
         let rename_input = input("Folder name", false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
@@ -2297,11 +2376,7 @@ impl MailApp {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
                     let _ = this.update(cx, |this, cx| {
                         if this.signature_revision == revision {
-                            let options = ComposeOptions {
-                                signature,
-                                ..this.compose_options.clone()
-                            };
-                            this.save_compose_options(options, cx);
+                            this.save_signature(signature, cx);
                         }
                     });
                 })
@@ -2465,14 +2540,38 @@ impl MailApp {
             let mut clicks = crate::display::notify::clicks();
             cx.spawn_in(window, async move |this, cx| {
                 use futures::StreamExt;
+                // Buttons pressed before the window was up (Android's,
+                // kept until something could act on them) first.
+                let _ = this.update_in(cx, |this, w, cx| {
+                    for (target, action) in crate::display::notify::take_quick() {
+                        this.quick_action(target, &action, w, cx);
+                    }
+                });
                 while clicks.next().await.is_some() {
                     let opened = this.update_in(cx, |this, w, cx| {
                         if let Some(target) = crate::display::notify::take_clicked() {
                             w.activate_window();
                             this.open_notified(target, w, cx);
                         }
+                        for (target, action) in crate::display::notify::take_quick() {
+                            this.quick_action(target, &action, w, cx);
+                        }
                     });
                     if opened.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // What later launches (or the system) ask Picacho to open: drawn
+        // again, the window takes it.
+        {
+            let mut wakes = crate::display::launch::wakes();
+            cx.spawn(async move |this, cx| {
+                use futures::StreamExt;
+                while wakes.next().await.is_some() {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
                 }
@@ -2865,6 +2964,20 @@ impl MailApp {
             server_search: None,
             filters: HashMap::new(),
             filter_inputs,
+            org,
+            org_ui,
+            thread_counts: HashMap::new(),
+            find,
+            image_previews: HashMap::new(),
+            body_matches: None,
+            undownloaded_search: None,
+            indexing: false,
+            index_again: false,
+            local_results: None,
+            applying_rules: false,
+            templates,
+            app_view: None,
+            cal,
             server_notes: HashMap::new(),
             jmap_shared: HashMap::new(),
             shared_looking: HashSet::new(),
@@ -2877,6 +2990,7 @@ impl MailApp {
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
         this.pack_saved_sources(cx);
+        this.index_texts(cx);
         // Interrupted downloads and Sent copies a crash left, off this thread.
         this.task(
             cx,
@@ -3061,6 +3175,9 @@ impl MailApp {
         }
     }
     fn mailbox_label(&self) -> String {
+        if self.local_results.is_some() {
+            return "Results on This Computer".into();
+        }
         if self.folder != Folder::Other {
             return self.folder.label().into();
         }
@@ -3163,6 +3280,13 @@ impl MailApp {
             .map(|s| s.ids.clone());
         let filter = self.filter_by;
         let open = self.selected.clone();
+        // Messages whose downloaded text matched, from the local index.
+        let typed = Self::value(&self.search, cx).trim().to_owned();
+        let body = self
+            .body_matches
+            .as_ref()
+            .filter(|(q, _)| *q == typed)
+            .and_then(|(_, ids)| ids.clone());
         let (subs_open, scope) = (self.subs_open, &self.scope);
         let extras = &self.thread_extras;
         let keep = |m: &Mail| {
@@ -3183,7 +3307,13 @@ impl MailApp {
                     // Found by the server's search, in its own syntax; what
                     // it can't tell (code mail, package updates) told here.
                     Some(ids) => ids.contains(&m.id) && search.matches_kinds(m),
-                    None => search.matches(m),
+                    // Words found in its text (or by a server, for mail not
+                    // downloaded) by the local index: the operators decide.
+                    None => {
+                        search.matches(m)
+                            || (body.as_ref().is_some_and(|b| b.contains(&m.id))
+                                && search.matches_besides_text(m))
+                    }
                 }
                 // Views leave out mail of aliases shown on their own, or list
                 // only an alias's mail.
@@ -3192,9 +3322,16 @@ impl MailApp {
         };
         // Matching text is what costs: spread it over the cores.
         self.visible = matching_rows(&self.messages, !query.is_empty(), keep);
+        // Mail a search found on a server is added at the list's end.
+        if !query.is_empty() {
+            let messages = &self.messages;
+            self.visible
+                .sort_by(|&a, &b| Mail::newest_first(&messages[a], &messages[b]));
+        }
         if self.oldest_first {
             self.visible.reverse();
         }
+        self.organize_rows();
         if !self.selection.is_empty() {
             let present: HashSet<&String> = self.messages.iter().map(|m| &m.id).collect();
             self.selection.retain(|id| present.contains(id));
@@ -3373,9 +3510,11 @@ impl MailApp {
     }
     /// Remembers unread inbox mail and announces any that is new since the
     /// last check. The first check after launch only records what is there.
-    fn note_inbox(&mut self, id: &str, messages: &[Mail]) {
+    /// Returns the new mail, for blocked senders, muted conversations and
+    /// rules to apply to (`apply_arrival_rules`).
+    fn note_inbox(&mut self, id: &str, messages: &[Mail]) -> Vec<Mail> {
         let Some(a) = self.accounts.iter().find(|a| a.id == id) else {
-            return;
+            return Vec::new();
         };
         let first = !self.known.contains_key(id);
         let known = self.known.entry(id.to_owned()).or_default();
@@ -3387,6 +3526,9 @@ impl MailApp {
         let present: HashSet<&String> = messages.iter().map(|m| &m.id).collect();
         known.retain(|m| present.contains(m));
         known.extend(messages.iter().filter(|m| m.unread).map(|m| m.id.clone()));
+        let arrived: Vec<Mail> = fresh.iter().map(|m| (*m).clone()).collect();
+        // Blocked, muted and filed away by a rule: not announced.
+        let fresh: Vec<&Mail> = fresh.into_iter().filter(|m| !self.org.silenced(m)).collect();
         // Proton's pushes announce mail for accounts that take them.
         if first
             || fresh.is_empty()
@@ -3395,19 +3537,22 @@ impl MailApp {
             || self.active
             || self.retired
         {
-            return;
+            return arrived;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
             // A sign-in code in the subject isn't shown on the lock screen.
             let subject = self.hide_codes(latest, &latest.subject);
+            let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
             crate::display::notify::new_mail(
                 &a.email,
                 &a.id,
                 &latest.id,
+                &ids,
                 (&latest.sender, &subject),
                 fresh.len(),
             );
         }
+        arrived
     }
     /// One worker per account avoids starving healthy accounts behind a slow
     /// server. Batches release the account lock between network operations.
@@ -3442,6 +3587,8 @@ impl MailApp {
                         if !more {
                             this.downloading.remove(&a.id);
                             this.download.active = !this.downloading.is_empty();
+                            // What downloaded has attachments to index.
+                            this.index_texts(cx);
                         }
                         // Proton's subscriptions are found as its mail
                         // downloads (its list doesn't say): show them as
@@ -4148,6 +4295,7 @@ impl MailApp {
                 Action::SearchFor(search_term("reply-to", &email)),
             ));
         }
+        entries.extend(self.org_entries(m));
         entries
     }
     fn filter_entries(&self) -> Vec<Entry> {
@@ -4171,6 +4319,7 @@ impl MailApp {
             self.oldest_first,
             Action::OldestFirst(true),
         ));
+        entries.extend(self.org_filter_entries());
         entries
     }
     fn notice(&mut self, text: impl Into<String>, error: bool, cx: &mut Context<Self>) {
@@ -4438,7 +4587,8 @@ impl MailApp {
                         this.encrypted.insert(id.clone());
                     }
                     if inbox {
-                        this.note_inbox(&id, &messages);
+                        let arrived = this.note_inbox(&id, &messages);
+                        this.apply_arrival_rules(&id, arrived, cx);
                         // Drafts written on other devices appear, and ones
                         // written here reach them, with the inbox's checks
                         // (not Refresh's, which fetches only new mail).
@@ -4498,7 +4648,9 @@ impl MailApp {
     ) {
         self.html_view.update(cx, |view, cx| view.clear(cx));
         Self::set(&self.unlock_input, "", w, cx);
+        self.local_results = None;
         self.subs_open = false;
+        self.app_view = None;
         self.leave_summary();
         self.subs_sender = None;
         self.subs_return.set(None);
@@ -4768,6 +4920,14 @@ impl MailApp {
             || self.retired
             || !self.accounts.iter().any(|a| a.id == target.account)
         {
+            return;
+        }
+        // A button whose press opened Picacho (Reply, from Android's
+        // notification or the background process's).
+        if let Some(action) = target.action.clone() {
+            let target = crate::display::notify::Target { action: None, ..target };
+            w.activate_window();
+            self.quick_action(target, &action, w, cx);
             return;
         }
         self.menu = None;
@@ -5632,6 +5792,10 @@ impl MailApp {
         if self.cancel_rename(w, cx) || self.cancel_parcel_edit(w, cx) {
             return;
         }
+        if self.modal.is_none() && self.find.open {
+            self.tool_action(tools::ToolAction::FindClose, w, cx);
+            return;
+        }
         if self.modal.is_none() {
             if self.selecting {
                 self.selection.clear();
@@ -6360,6 +6524,11 @@ impl MailApp {
             entries.push(entry("Copy Message Text", "copy", Action::CopyText(body)));
         }
         entries.push(entry("Show Raw", "code", Action::ShowOriginal));
+        entries.push(entry("Find in Message…", "search", Action::Tools(tools::ToolAction::FindOpen)));
+        if let Some(id) = self.selected.clone() {
+            entries.push(entry("Print…", "print", Action::Tools(tools::ToolAction::Print(id.clone()))));
+            entries.push(entry("Save as PDF…", "download", Action::Tools(tools::ToolAction::SavePdf(id))));
+        }
         // The text zoom, for touch screens that have no ⌘+ and ⌘−.
         entries.push(Entry::Separator);
         let zoom = self.text_zoom();
@@ -6411,7 +6580,8 @@ impl MailApp {
                         cx,
                         move |b| {
                             let bytes = b.attachment(&account, &m, a.part)?;
-                            std::fs::write(&path, bytes)?;
+                            std::fs::write(&path, &bytes)?;
+                            b.note_saved_attachment(&m, a.part, &path, &bytes);
                             Ok(())
                         },
                         |this, result, cx| match result {
@@ -7341,6 +7511,8 @@ impl MailApp {
                     account,
                     mailbox,
                     message: Some(id),
+                    messages: Vec::new(),
+                    action: None,
                 },
                 w,
                 cx,
@@ -7687,6 +7859,10 @@ impl MailApp {
             }
             Action::Receipt(id, send) => self.answer_receipt(id, send, cx),
             Action::Filters(action) => self.filter_action(action, w, cx),
+            Action::Organize(action) => self.org_action(action, w, cx),
+            Action::Tools(action) => self.tool_action(action, w, cx),
+            Action::Templates(action) => self.template_action(action, w, cx),
+            Action::Calendar(action) => self.cal_action(action, w, cx),
         }
         self.sync_selecting();
         cx.notify();
@@ -8108,6 +8284,12 @@ impl MailApp {
         }
     }
     fn close_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        // Search All Mail on This Computer's results go with their search.
+        if self.local_results.is_some() {
+            self.org_action(organize::OrgAction::CloseLocalResults, w, cx);
+            self.focus.focus(w, cx);
+            return;
+        }
         self.search_open = false;
         if !Self::value(&self.search, cx).is_empty() {
             Self::set(&self.search, "", w, cx);
@@ -8353,6 +8535,15 @@ impl MailApp {
                         .child(fmt_count(count)),
                 )
             })
+            // Messages dragged from the list move here.
+            .drag_over::<organize::MailDrag>(move |s, _, _, _| s.bg(rgb(c.soft)).text_color(rgb(c.accent)))
+            .on_drop({
+                let account = account.to_owned();
+                let mailbox = mailbox.clone();
+                cx.listener(move |this, d: &organize::MailDrag, _, cx| {
+                    this.drop_mail(&account, &mailbox, d, cx)
+                })
+            })
             .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
                 if editing {
                     return;
@@ -8436,6 +8627,8 @@ impl MailApp {
                 .tooltip(|w, cx| Tooltip::new("Add an account, folder or separator").build(w, cx))
                 .on_click(cx.listener(|this, _, w, cx| this.handle(Action::AddMenu, w, cx))),
         );
+        list = list.child(self.app_view_links(false, cx));
+        list = list.children(self.saved_searches_sidebar(cx));
         list = list.child(self.tree_end("sidebar-end", cx));
         div()
             .flex_1()
@@ -8531,6 +8724,7 @@ impl MailApp {
         for el in self.rail_nodes(&self.tree, &row, cx) {
             rail = rail.child(el);
         }
+        rail = rail.child(self.app_view_links(true, cx));
         panes::scroll_frame(
             rail.child(
                 self.rail_button(
@@ -8957,15 +9151,17 @@ impl MailApp {
                     .h(px(32.))
                     .gap_1()
                     .pl_1()
-                    .child(
-                        div()
+                    .child(match self.local_results_title(cx) {
+                        Some(title) => title,
+                        None => div()
                             .min_w_0()
                             .truncate()
                             .text_size(px(17.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.mailbox_label()),
-                    )
-                    .when(unread > 0, |d| {
+                            .child(self.mailbox_label())
+                            .into_any_element(),
+                    })
+                    .when(unread > 0 && self.local_results.is_none(), |d| {
                         d.child(
                             div()
                                 .id("unread-count")
@@ -9124,6 +9320,7 @@ impl MailApp {
                 header = header.child(self.search_hints(cx));
             }
             header = header.children(self.server_search_bar(cx));
+            header = header.children(self.search_extras(cx));
         }
         if self.selecting {
             header = header.child(
@@ -9328,8 +9525,9 @@ impl MailApp {
         let c = self.colors();
         let m = &self.messages[index];
         if m.pending {
-            return placeholder_row(&m.id, c).into_any_element();
+            return placeholder_row(&m.id, c).h(px(self.row_height())).into_any_element();
         }
+        let compact = self.org.density == crate::manage::organize::Density::Compact;
         let id = m.id.clone();
         let selected = self.selected.as_ref() == Some(&m.id);
         let checked = self.selection.contains(&m.id);
@@ -9439,12 +9637,12 @@ impl MailApp {
             .aria_size_of_set(self.messages.len())
             .group(row_group.clone())
             .relative()
-            .h(px(ROW_HEIGHT))
+            .h(px(self.row_height()))
             .w_full()
             .pl(px(14.))
             // Room for the list's scrollbar.
             .pr(px(18.))
-            .py(px(11.))
+            .py(px(if compact { 10. } else { 11. }))
             .border_b_1()
             .border_color(rgb(c.border))
             .flex()
@@ -9535,6 +9733,7 @@ impl MailApp {
                                     })
                                     .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
+                            .child(self.row_marks(index, m))
                             // Replied to, forwarded (here or in other apps)
                             // and snoozed.
                             .when(m.answered, |d| d.child(icon_el("answered", 13., c.muted)))
@@ -9582,15 +9781,41 @@ impl MailApp {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .h(px(16.))
-                            .truncate()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(preview(&self.hide_codes(m, &m.snippet))),
-                    ),
+                    .when(!compact, |d| {
+                        d.child(
+                            div()
+                                .h(px(16.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(preview(&self.hide_codes(m, &m.snippet))),
+                        )
+                    }),
             )
+            .when(!drafts, |d| {
+                // Dragged onto a sidebar folder, the row (or the selection
+                // it's part of) moves there.
+                let ids: Vec<String> = if checked && self.selection.len() > 1 {
+                    self.selection.iter().cloned().collect()
+                } else {
+                    vec![id.clone()]
+                };
+                let label = if ids.len() > 1 {
+                    format!("{} messages", ids.len())
+                } else {
+                    self.hide_codes(m, &m.subject).into_owned()
+                };
+                d.on_drag(
+                    organize::MailDrag { ids, label },
+                    move |drag: &organize::MailDrag, offset, _, cx| {
+                        cx.new(|_| organize::MailDragPreview {
+                            label: drag.label.clone().into(),
+                            c,
+                            offset,
+                        })
+                    },
+                )
+            })
             .on_mouse_down(MouseButton::Right, {
                 // Built on demand: rows render often, menus open rarely.
                 let id = id.clone();
@@ -10164,7 +10389,9 @@ impl MailApp {
             .children(
                 [
                     ("New message", "⌘ N"),
-                    ("Search mail", "⌘ F"),
+                    ("Find in message / search mailbox", "⌘ F / ⌘ ⌥ F"),
+                    ("Print message", "⌘ P"),
+                    ("Group by conversation", "⌘ ⇧ T"),
                     ("Refresh mailbox", "⌘ R"),
                     ("Next / previous message", "⌥ ↓ / ⌥ ↑"),
                     ("Open message in new window", "⌘ O"),
@@ -11259,6 +11486,11 @@ impl Render for MailApp {
                 None => self.compose_mailto(&link, window, cx),
             }
         }
+        // What Picacho was opened with: `mailto:` addresses, email files,
+        // files shared to it.
+        if !self.onboarding && !self.retired {
+            self.take_launch_requests(window, cx);
+        }
         self.sync_nickname_input(window, cx);
         if std::mem::take(&mut self.menu_focus_pending) && self.menu.is_some() {
             window.focus(&self.menu_focus, cx);
@@ -11358,6 +11590,30 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &Refresh, w, cx| this.handle(Action::Refresh, w, cx)))
             .on_action(cx.listener(|this, _: &Search, w, cx| {
                 this.handle(Action::OpenSearch, w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindInMessage, w, cx| {
+                if this.modal.is_none() {
+                    this.handle(Action::Tools(tools::ToolAction::FindOpen), w, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrintMessage, w, cx| {
+                if this.modal.is_none()
+                    && let Some(id) = this.selected.clone()
+                {
+                    this.handle(Action::Tools(tools::ToolAction::Print(id)), w, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SaveAsPdf, w, cx| {
+                if this.modal.is_none()
+                    && let Some(id) = this.selected.clone()
+                {
+                    this.handle(Action::Tools(tools::ToolAction::SavePdf(id)), w, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleThreads, w, cx| {
+                if this.modal.is_none() {
+                    this.handle(Action::Organize(organize::OrgAction::ToggleThreaded), w, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &Close, w, cx| this.close(w, cx)))
             .on_action(cx.listener(|this, _: &Next, _, cx| {
@@ -11506,9 +11762,11 @@ impl MailApp {
         } else {
             self.selected.is_some()
         };
-        // The Summary takes the list's and the reader's place.
-        let show_list = (!single || !open) && !self.summary_open;
-        let show_reader = (!single || open) && !self.summary_open;
+        // The Summary, Calendar and Contacts take the list's and the
+        // reader's place.
+        let app_view = self.app_view.filter(|_| !self.summary_open);
+        let show_list = (!single || !open) && !self.summary_open && app_view.is_none();
+        let show_reader = (!single || open) && !self.summary_open && app_view.is_none();
         let list_corners = Corners {
             bottom_left: if show_sidebar {
                 px(0.)
@@ -11534,6 +11792,13 @@ impl MailApp {
         let layout = self.layout(f32::from(width), compact);
         self.window_width.set(f32::from(width));
         let resizable = !single;
+        // Settings → Rules & Layout: the reader below the list.
+        let below = !single
+            && !self.subs_open
+            && !self.summary_open
+            && app_view.is_none()
+            && self.org.layout == crate::manage::organize::ReaderLayout::Below;
+        let content_height = window::content_size(window).height - px(TITLEBAR_HEIGHT);
         d.child(self.topbar(window, cx))
             .child(
                 div()
@@ -11559,7 +11824,42 @@ impl MailApp {
                         };
                         d.child(self.summary_page(single, corners, cx))
                     })
-                    .when(show_list, |d| {
+                    .when_some(app_view, |d, view| {
+                        let corners = Corners {
+                            bottom_left: if show_sidebar { px(0.) } else { corners.bottom_left },
+                            bottom_right: corners.bottom_right,
+                            ..Corners::default()
+                        };
+                        d.child(self.app_view_page(view, corners, cx))
+                    })
+                    .when(below, |d| {
+                        let list_height = (content_height * 0.42).max(px(180.));
+                        d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .h(list_height)
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .border_b_1()
+                                        .border_color(rgb(c.border))
+                                        .child(self.message_list(true, Corners::default(), cx)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .flex()
+                                        .child(self.reader_pane(None, reader_corners, window, cx)),
+                                ),
+                        )
+                    })
+                    .when(show_list && !below, |d| {
                         d.child(if self.subs_open {
                             self.subscription_list(single, list_corners, cx)
                                 .into_any_element()
@@ -11567,10 +11867,10 @@ impl MailApp {
                             self.message_list(single, list_corners, cx).into_any_element()
                         })
                     })
-                    .when(show_reader && resizable, |d| {
+                    .when(show_reader && resizable && !below, |d| {
                         d.child(self.resize_handle(Pane::Reader, cx))
                     })
-                    .when(show_reader, |d| {
+                    .when(show_reader && !below, |d| {
                         d.child(if self.subs_open {
                             // A collapsed reader still gives a sender's mail room.
                             let room = if self.reader_collapsed {
@@ -11902,6 +12202,10 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "forwarded",
         "keyboard",
         "grip",
+        "bell-off",
+        "print",
+        "external",
+        "template",
     ]
     .contains(&name)
     {
@@ -12156,56 +12460,15 @@ pub(super) fn key<A: gpui::Action>(
 
 /// The main and detached windows' key bindings.
 fn app_bindings(cx: &App) -> Vec<KeyBinding> {
-    vec![
-        key(cx, "secondary-q", Quit, Some("Mail")),
-        key(cx, "secondary-w", CloseWindow, Some("Mail")),
-        key(cx, "secondary-,", ShowAccounts, Some("Mail")),
-        key(cx, "secondary-n", Compose, Some("Mail")),
-        key(cx, "secondary-f", Search, Some("Mail")),
-        key(cx, "secondary-=", ZoomIn, Some("Mail")),
-        key(cx, "secondary-+", ZoomIn, Some("Mail")),
-        key(cx, "secondary--", ZoomOut, Some("Mail")),
-        key(cx, "secondary-0", ActualSize, Some("Mail")),
-        key(cx, "secondary-r", Refresh, Some("Mail")),
-        key(cx, "escape", Close, Some("Mail")),
-        key(cx, "alt-down", Next, Some("Mail")),
-        key(cx, "alt-up", Previous, Some("Mail")),
-        key(cx, "secondary-shift-a", Archive, Some("Mail")),
-        key(cx, "secondary-backspace", DeleteMail, Some("Mail")),
-        key(cx, "secondary-shift-r", Reply, Some("Mail")),
-        key(cx, "secondary-alt-r", ReplyAll, Some("Mail")),
-        key(cx, "secondary-shift-f", ForwardMail, Some("Mail")),
-        key(cx, "secondary-shift-u", ToggleRead, Some("Mail")),
-        key(cx, "secondary-shift-j", MoveToSpam, Some("Mail")),
-        key(cx, "secondary-shift-s", ToggleStar, Some("Mail")),
-        key(cx, "secondary-shift-l", ToggleTheme, Some("Mail")),
-        key(cx, "secondary-enter", SendMail, Some("Mail")),
-        key(cx, 
-            if cfg!(target_os = "macos") {
-                "ctrl-cmd-s"
-            } else {
-                "ctrl-alt-s"
-            },
-            ToggleSidebar,
-            Some("Mail"),
-        ),
-        key(cx, "secondary-a", SelectAllMail, Some("Mail")),
-        key(cx, "secondary-z", gpui_component::input::Undo, Some("Mail")),
-        key(cx, "secondary-1", GoInbox, Some("Mail")),
-        key(cx, "secondary-2", GoStarred, Some("Mail")),
-        key(cx, "secondary-3", GoSent, Some("Mail")),
-        key(cx, "secondary-4", GoDrafts, Some("Mail")),
-        key(cx, "secondary-5", GoArchive, Some("Mail")),
-        key(cx, "secondary-6", GoSpam, Some("Mail")),
-        key(cx, "secondary-7", GoTrash, Some("Mail")),
-        key(cx, "secondary-8", GoAllMail, Some("Mail")),
-        key(cx, "secondary-m", Minimize, Some("Mail")),
-        key(cx, "secondary-o", OpenInWindow, Some("Mail")),
+    // The main window's, as the shortcuts file changes them.
+    let mut bindings = shortcuts::bindings(cx);
+    bindings.extend([
         key(cx, "secondary-w", CloseWindow, Some("Detached")),
         key(cx, "escape", Close, Some("Detached")),
         key(cx, "cmd-h", Hide, None),
         key(cx, "alt-cmd-h", HideOthers, None),
-    ]
+    ]);
+    bindings
 }
 
 /// The app's backend for `store`, announcing the provider's own notices
@@ -12238,7 +12501,21 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
             } else {
                 subject
             };
-            crate::display::notify::new_mail(&a.email, &a.id, message, (sender, subject), 1)
+            // Blocked, muted, or filed away by a rule: not announced. (The
+            // rules themselves apply once the inbox is checked.)
+            let org = crate::manage::organize::Organizing::load(&settings);
+            let pushed = crate::manage::model::Mail {
+                id: message.to_owned(),
+                account: a.id.clone(),
+                sender: sender.to_owned(),
+                from: sender.to_owned(),
+                subject: subject.to_owned(),
+                ..Default::default()
+            };
+            if org.silenced(&pushed) {
+                return;
+            }
+            crate::display::notify::new_mail(&a.email, &a.id, message, &[message], (sender, subject), 1)
         }
         crate::manage::backend::ProtonPushed::Notice { from, body } => {
             crate::display::notify::account_notice(&a.email, &a.id, from, body)
@@ -12280,7 +12557,7 @@ pub fn run_on(app: Application, backend: Arc<Backend>) {
 /// Sets up the app, then runs `open` to open its window.
 fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
     let app = app.with_assets(crate::display::assets::Assets);
-    app.on_open_urls(crate::sync::oauth::opened);
+    app.on_open_urls(crate::display::launch::opened);
     super::desktop::register();
     let launch = move |cx: &mut gpui::App| {
         gpui_component::init(cx);
@@ -12417,6 +12694,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Check for New Mail", Refresh),
                 MenuItem::separator(),
+                MenuItem::action("Print…", PrintMessage),
+                MenuItem::action("Save as PDF…", SaveAsPdf),
+                MenuItem::separator(),
                 MenuItem::action("Close Window", CloseWindow),
             ],
         ),
@@ -12431,7 +12711,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
                 MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
                 MenuItem::separator(),
-                MenuItem::action("Find", Search),
+                MenuItem::action("Find in Message", FindInMessage),
+                MenuItem::action("Search Mailbox", Search),
             ],
         ),
         menu(
@@ -12441,6 +12722,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Unread", ShowUnread),
                 MenuItem::action("Starred", ShowStarred),
                 MenuItem::action("Has Attachments", ShowAttachments),
+                MenuItem::separator(),
+                MenuItem::action("Group by Conversation", ToggleThreads),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Dark Mode", ToggleTheme),
@@ -14102,17 +14385,7 @@ mod tests {
 /// direction-changing characters (U+202E shows "doc\u{202E}fdp.exe" as
 /// "docexe.pdf"), and not hidden by a leading dot.
 fn safe_file_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let cleaned: String = base
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-        })
-        .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
-        .collect();
-    let cleaned = cleaned.trim().trim_start_matches('.').trim();
-    if cleaned.is_empty() { "attachment".into() } else { cleaned.to_owned() }
+    crate::manage::backend::opened::safe_file_name(name)
 }
 
 #[cfg(test)]

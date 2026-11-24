@@ -601,6 +601,116 @@ impl Backend {
         }
     }
 
+    /// The source of `m` to hand to another account or a draft: Pinal
+    /// Mail's own encryption opened, as exports are, since nothing else
+    /// can read it; any other message exactly as delivered.
+    fn portable(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
+        let raw = self.original(a, m)?;
+        if a.service != Service::Pinal {
+            return Ok(raw);
+        }
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        Ok(self.plaintext(a, &raw)?.1)
+    }
+
+    /// Moves messages of account `from` into `mailbox` of account `to`:
+    /// each is added there as imports are (IMAP APPEND, JMAP Email/import,
+    /// Proton's import, this computer for POP3), keeping its date and its
+    /// read, starred and answered marks, and once added is removed from
+    /// `from`: deleted for good, or on Gmail (which deletes only from
+    /// Trash) moved to its Trash. Starred adds starred mail to the inbox,
+    /// All Mail to Archive; one that couldn't be added stays where it was.
+    pub fn move_to_account(&self, from: &Account, mails: &[Mail], to: &Account, mailbox: &Mailbox) -> Result<Moved> {
+        ensure!(from.id != to.id, "These messages are already in this account.");
+        ensure!(
+            mails.iter().all(|m| m.account == from.id),
+            "Message belongs to another account"
+        );
+        let (target, star) = match mailbox {
+            Mailbox::Standard(Folder::Starred) => (Mailbox::Standard(Folder::Inbox), true),
+            Mailbox::Standard(Folder::All) => (Mailbox::Standard(Folder::Archive), false),
+            other => (other.clone(), false),
+        };
+        ensure!(
+            !matches!(target, Mailbox::Standard(Folder::Drafts | Folder::Other)),
+            "Mail can't be moved into this mailbox."
+        );
+        let mut moved = Moved::default();
+        let mut added = Vec::new();
+        let mut first_error = None;
+        for m in mails {
+            let result = self.portable(from, m).and_then(|raw| {
+                let item = Imported::of_mail(m, crlf(&raw), star);
+                self.import_one(to, &target, &item)
+            });
+            match result {
+                Ok(()) => {
+                    moved.done += 1;
+                    added.push(m.clone());
+                }
+                Err(e) => {
+                    moved.skipped += 1;
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_error
+            && added.is_empty()
+        {
+            return Err(e);
+        }
+        if !added.is_empty() {
+            if from.provider == Provider::Gmail {
+                let (trash, elsewhere): (Vec<Mail>, Vec<Mail>) = added
+                    .into_iter()
+                    .partition(|m| matches!(m.folder, Folder::Trash | Folder::Junk));
+                self.change_many(from, &elsewhere, Change::Move(Folder::Trash))?;
+                self.delete_forever(from, &trash)?;
+            } else {
+                self.delete_forever(from, &added)?;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Starts a new draft in account `to` from each of `mails` (of account
+    /// `from`): its recipients, subject, text and attachments, to send
+    /// again or as a new message. The messages themselves stay. Returns the
+    /// new drafts' ids.
+    pub fn copy_as_drafts(&self, from: &Account, mails: &[Mail], to: &Account) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        let mut first_error = None;
+        for m in mails {
+            let id = uuid::Uuid::new_v4().to_string();
+            let result = self.original(from, m).and_then(|raw| {
+                // Pinal Mail's, signed or encrypted to you: the draft holds
+                // what it says.
+                let raw = {
+                    let lock = self.account_lock(&from.id);
+                    let _operation = lock.lock().unwrap();
+                    self.plaintext(from, &raw).map(|(_, plain)| plain).unwrap_or(raw)
+                };
+                let mut d = self.draft_from(to, &id, &raw)?;
+                // A new message, answering nothing.
+                d.reply_id.clear();
+                d.references.clear();
+                d.bcc.clear();
+                self.store.save_draft(&d)
+            });
+            match result {
+                Ok(()) => ids.push(id),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) if ids.is_empty() => Err(e),
+            _ => Ok(ids),
+        }
+    }
+
     /// Adds several messages to `mailbox` on an IMAP server in one command
     /// where it can (MULTIAPPEND): all are added, or none.
     fn import_batch(&self, a: &Account, mailbox: &Mailbox, raws: &[Imported]) -> Result<()> {
@@ -656,6 +766,21 @@ impl From<MboxMessage> for Imported {
     }
 }
 impl Imported {
+    /// A message moving from another account, with its marks there.
+    fn of_mail(m: &Mail, raw: Vec<u8>, star: bool) -> Self {
+        Self {
+            raw,
+            status: MboxStatus {
+                known: true,
+                read: !m.unread,
+                answered: m.answered,
+                flagged: m.starred || star,
+                deleted: false,
+                draft: false,
+            },
+            received: (m.date > 0).then_some(m.date),
+        }
+    }
     /// Read where the file says so, or says nothing (as imports always
     /// were); unread where it says the message wasn't (Status without R).
     fn read(&self) -> bool {
@@ -795,6 +920,50 @@ mod tests {
             b.import_messages(&a, &Mailbox::Standard(Folder::Starred), &[], &stop)
                 .is_err()
         );
+        drop(b);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    /// Mail dropped on another account's mailbox is added there with its
+    /// marks and leaves its own; dropped on Drafts, it starts a draft and
+    /// stays.
+    #[test]
+    fn mail_moves_to_another_account_and_starts_drafts() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("picacho-transfer-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(crate::manage::store::Store::open(&path)?));
+        let mut from = Account::new(Provider::Pop3);
+        from.email = "one@example.com".into();
+        let mut to = Account::new(Provider::Pop3);
+        to.email = "two@example.com".into();
+        assert_ne!(from.id, to.id);
+        let eml = path.join("one.eml");
+        std::fs::write(
+            &eml,
+            b"From: Ana <ana@example.org>\r\nTo: one@example.com\r\nSubject: Moving\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\nIn-Reply-To: <0@x>\r\n\r\nThe text\r\n",
+        )?;
+        let inbox = Mailbox::Standard(Folder::Inbox);
+        b.import_messages(&from, &inbox, &[eml], &AtomicBool::new(false))?;
+        let mut m = b.store.messages(&from.id, inbox.clone(), 10)?.remove(0);
+        m.starred = true;
+        m.unread = true;
+        b.store.save_messages(&[m.clone()])?;
+
+        let ids = b.copy_as_drafts(&from, &[m.clone()], &to)?;
+        let d = b.store.draft(&ids[0])?.expect("the draft");
+        assert_eq!((d.account.as_str(), d.subject.as_str()), (to.id.as_str(), "Moving"));
+        assert!(d.body.contains("The text") && d.reply_id.is_empty());
+        assert_eq!(b.store.messages(&from.id, inbox.clone(), 10)?.len(), 1, "the message stays");
+
+        let archive = Mailbox::Standard(Folder::Archive);
+        assert!(b.move_to_account(&from, &[m.clone()], &from, &archive).is_err());
+        let moved = b.move_to_account(&from, &[m], &to, &archive)?;
+        assert_eq!((moved.done, moved.skipped), (1, 0));
+        assert!(b.store.messages(&from.id, inbox, 10)?.is_empty());
+        let there = b.store.messages(&to.id, archive, 10)?;
+        assert_eq!(there.len(), 1);
+        assert!(there[0].starred && there[0].unread);
+        assert_eq!(there[0].subject, "Moving");
         drop(b);
         std::fs::remove_dir_all(path)?;
         Ok(())

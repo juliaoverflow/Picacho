@@ -136,7 +136,7 @@ impl MailApp {
     /// `intro` (a suggested reply) starts the body, above the signature and
     /// quote.
     #[allow(clippy::too_many_arguments)]
-    fn compose_with(
+    pub(super) fn compose_with(
         &mut self,
         mode: u8,
         original: Option<Mail>,
@@ -196,13 +196,24 @@ impl MailApp {
             .as_ref()
             .map(|a| a.email.clone())
             .unwrap_or_default();
-        let signature = options.signature.trim();
-        let sign = |reply: bool| -> String {
-            if signature.is_empty() || (reply && !options.signature_on_replies) {
-                String::new()
+        // The sending address's signature, or its mailbox's, or everyone's.
+        // An HTML signature's HTML is kept with the draft, for its HTML.
+        let sign = |reply: bool, draft: &mut Draft| -> String {
+            let address = if !draft.send_as.is_empty() {
+                draft.send_as.clone()
             } else {
-                format!("\n\n-- \n{signature}")
+                account
+                    .as_ref()
+                    .and_then(|a| a.identities.iter().find(|i| i.id == draft.identity))
+                    .map(|i| i.email.clone())
+                    .unwrap_or_else(|| own.clone())
+            };
+            if reply && !options.signature_on_replies {
+                return String::new();
             }
+            let signature = options.signature(&draft.account, &address);
+            draft.signature_html = signature.html.clone();
+            signature.block()
         };
         let mut draft = Draft {
             id: uuid::Uuid::new_v4().to_string(),
@@ -214,7 +225,7 @@ impl MailApp {
             ..Draft::default()
         };
         match &original {
-            None => draft.body = sign(false),
+            None => draft.body = sign(false, &mut draft),
             Some(m) => {
                 let forward = mode >= 3;
                 // RFC 9788 §6.1: the real subject, not a hidden one's "...".
@@ -321,7 +332,8 @@ impl MailApp {
                 } else {
                     String::new()
                 };
-                draft.body = format!("{}{quote}", sign(true));
+                let signature = sign(true, &mut draft);
+                draft.body = format!("{signature}{quote}");
             }
         }
         if let Some(to) = to {
@@ -561,6 +573,7 @@ impl MailApp {
                 self.handle(Action::NewAliasFor(service.clone(), mailbox.clone()), w, cx);
             }
             ComposerEvent::Schedule(at) => self.schedule_send(composer, *at, cx),
+            ComposerEvent::SaveTemplate(t) => self.save_template(t.clone(), cx),
         }
         cx.notify();
     }
@@ -1103,6 +1116,7 @@ impl MailApp {
                     this.pending_new_alias = Some((service.clone(), mailbox.clone()));
                 }
                 ComposerEvent::Schedule(at) => this.schedule_send(composer, *at, cx),
+                ComposerEvent::SaveTemplate(t) => this.save_template(t.clone(), cx),
             }
             cx.notify();
         });

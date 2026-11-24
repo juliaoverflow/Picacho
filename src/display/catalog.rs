@@ -260,13 +260,13 @@ impl MailApp {
         if offset <= px(0.) {
             return None;
         }
-        let index = (offset / px(ROW_HEIGHT)).floor() as usize;
+        let index = (offset / px(self.row_height())).floor() as usize;
         let id = self.messages.get(*self.visible.get(index)?)?.id.clone();
-        Some((id, offset - px(ROW_HEIGHT) * index as f32))
+        Some((id, offset - px(self.row_height()) * index as f32))
     }
     pub(super) fn restore_scroll(&self, (id, within): (String, Pixels)) {
         if let Some(index) = self.visible.iter().position(|i| self.messages[*i].id == id) {
-            let y = px(ROW_HEIGHT) * index as f32 + within;
+            let y = px(self.row_height()) * index as f32 + within;
             self.list_scroll
                 .0
                 .borrow()

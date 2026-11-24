@@ -171,6 +171,18 @@ impl AssetSource for Assets {
             "mail/grip.svg" => Some(
                 "<g fill='currentColor' stroke='none'><circle cx='9' cy='6' r='1.6'/><circle cx='15' cy='6' r='1.6'/><circle cx='9' cy='12' r='1.6'/><circle cx='15' cy='12' r='1.6'/><circle cx='9' cy='18' r='1.6'/><circle cx='15' cy='18' r='1.6'/></g>",
             ),
+            "mail/bell-off.svg" => Some(
+                "<path d='M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5M17 17H3s3-2 3-9a4.7 4.7 0 0 1 .3-1.7M10.3 21a1.9 1.9 0 0 0 3.4 0M2 2l20 20'/>",
+            ),
+            "mail/print.svg" => Some(
+                "<path d='M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2'/><rect x='6' y='14' width='12' height='8'/>",
+            ),
+            "mail/external.svg" => Some(
+                "<path d='M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/>",
+            ),
+            "mail/template.svg" => Some(
+                "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M3 9h18M9 21V9'/>",
+            ),
             "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
             "mail/tag.svg" => Some(
                 "<path d='M12.6 2.6A2 2 0 0 0 11.2 2H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.7 8.7a2.4 2.4 0 0 0 3.4 0l6.6-6.6a2.4 2.4 0 0 0 0-3.4Z'/><circle cx='7.5' cy='7.5' r='.5'/>",

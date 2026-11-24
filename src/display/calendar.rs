@@ -166,7 +166,7 @@ pub(super) enum Repeat {
 }
 
 impl Repeat {
-    fn of(rule: &str) -> Self {
+    pub(super) fn of(rule: &str) -> Self {
         match rule.trim().to_ascii_uppercase().as_str() {
             "" => Self::Never,
             "FREQ=DAILY" => Self::Daily,
@@ -2208,7 +2208,8 @@ impl MailApp {
                                         })
                                         .collect(),
                                     cx,
-                                )),
+                                ))
+                                .child(self.custom_repeat_form(cx)),
                         )
                     })
                     .child(
@@ -2256,6 +2257,22 @@ impl MailApp {
                             }),
                     ),
             );
+        }
+        // Day, Week and Month grids, in place of the agenda.
+        page = page.children(self.calendar_grid(cx));
+        if self.cal.view != super::calendar_views::CalendarView::Agenda {
+            return page
+                .when(default.is_some() && self.event_editing.is_none(), |d| {
+                    d.child(div().flex().child(self.button(
+                        "event-new",
+                        "New Event",
+                        "plus",
+                        Action::NewEvent,
+                        false,
+                        cx,
+                    )))
+                })
+                .into_any_element();
         }
         // Coming events.
         let now = chrono::Utc::now().timestamp();

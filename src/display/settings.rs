@@ -395,6 +395,13 @@ impl MailApp {
                 Page::LocalAi,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-organizing".into(),
+                "Rules & Layout".into(),
+                icon_el("filter", 15., c.muted).into_any_element(),
+                Page::Organizing,
+                cx,
+            ))
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -1038,12 +1045,23 @@ impl MailApp {
                 }),
             ))
             .child(self.section("Signature"))
+            .children(self.signature_chooser(cx))
             .child(
                 div()
                     .id("signature")
                     .debug_selector(|| "signature".into())
                     .h(px(110.))
                     .child(textarea_field(Textarea::new(&self.signature_input), c, false).h_full()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if crate::manage::composing::is_html(&self.signature_input.read(cx).value()) {
+                        "HTML: formatted messages show it as written, plain-text ones its text. Changing From in a message changes its signature too."
+                    } else {
+                        "Markdown (**bold**, [links](https://…), ![pictures](https://…)), or paste HTML. Changing From in a message changes its signature too."
+                    }),
             )
             .child(row(
                 "Sign replies and forwards",
@@ -1052,6 +1070,7 @@ impl MailApp {
                     o.signature_on_replies = !o.signature_on_replies
                 }),
             ))
+            .child(self.templates_settings(cx))
             .into_any_element()
     }
     pub(super) fn account_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
@@ -2392,6 +2411,7 @@ impl MailApp {
             Page::Calendar => self.calendar_page(cx),
             Page::Encryption => self.encryption_page(cx),
             Page::LocalAi => self.local_ai_page(cx),
+            Page::Organizing => self.organizing_page(cx),
             Page::About if self.mobile.on => self.mobile_about_page(cx),
             Page::About => self.general_page(cx),
         }

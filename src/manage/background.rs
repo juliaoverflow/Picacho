@@ -69,6 +69,8 @@ pub enum Announcement<'a> {
         account: &'a str,
         account_id: &'a str,
         message: &'a str,
+        /// Every new message's id, for the notification's buttons.
+        messages: &'a [&'a str],
         sender: &'a str,
         subject: &'a str,
         count: usize,
@@ -287,16 +289,32 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
                     without_returning(&mut fresh, later.returning.remove(&a.id));
                     // An account added since the monitor started: what it
                     // has now was there before, like the window's first check.
+                    if first || shared.stopped() {
+                        continue;
+                    }
+                    // Blocked senders, muted conversations and rules, as
+                    // the window applies them; what they file away or mark
+                    // read isn't announced.
+                    let org = super::organize::Organizing::load(store);
+                    if !fresh.is_empty() && org.applies_to_arrivals() {
+                        let arrived: Vec<Mail> = fresh.iter().map(|m| (*m).clone()).collect();
+                        if let Err(e) = super::organize::apply_to_arrivals(backend, a, &arrived) {
+                            eprintln!("Picacho: a rule couldn't be applied to {}: {e:#}", a.email);
+                        }
+                        fresh.retain(|m| !org.silenced(m));
+                    }
                     // Proton's pushes announce mail for accounts that take them.
-                    if first || !a.sync.notify || a.pushes_new_mail() || shared.stopped() {
+                    if !a.sync.notify || a.pushes_new_mail() || shared.stopped() {
                         continue;
                     }
                     if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
                         let subject = codes.hide(store, &latest.subject);
+                        let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
                         announce(Announcement::NewMail {
                             account: &a.email,
                             account_id: &a.id,
                             message: &latest.id,
+                            messages: &ids,
                             sender: &latest.sender,
                             subject: &subject,
                             count: fresh.len(),

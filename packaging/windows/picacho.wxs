@@ -68,6 +68,30 @@
       <?endif?>
     </DirectoryRef>
 
+    <!-- Picacho in Windows' Default apps: the mailto: protocol and .eml
+         files (Capabilities registered under RegisteredApplications), so it
+         can be chosen as the email app; Windows asks the person, never the
+         installer, to make it the default. -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="DefaultApp" Guid="B2E7C4A1-6D38-4F95-8C0B-1A9E3D5F7C26">
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto" Value="URL:MailTo Protocol" Type="string" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto" Name="URL Protocol" Value="" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml" Value="Email Message" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.eml\OpenWithProgids" Name="Picacho.eml" Value="" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationName" Value="Picacho" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationDescription" Value="Fast, native email for every inbox you have" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\URLAssociations" Name="mailto" Value="Picacho.mailto" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\FileAssociations" Name=".eml" Value="Picacho.eml" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Clients\Mail\Picacho" Value="Picacho" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Clients\Mail\Picacho\Capabilities" Name="ApplicationName" Value="Picacho" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\RegisteredApplications" Name="Picacho" Value="Software\Pinal Tech\Picacho\Capabilities" Type="string" />
+      </Component>
+    </DirectoryRef>
+
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="5A1E3C7B-2F94-4D06-A8B3-6E0C9D2F1A84">
         <Shortcut Id="PicachoShortcut"
@@ -88,6 +112,7 @@
     <Feature Id="Picacho" Title="Picacho" Level="1">
       <ComponentRef Id="PicachoExe" />
       <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DefaultApp" />
       <?if $(var.WebView2Loader) = "yes" ?>
       <ComponentRef Id="WebView2Loader" />
       <?endif?>

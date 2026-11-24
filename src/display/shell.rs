@@ -100,6 +100,10 @@ pub(super) fn open(cx: &mut App) {
     if let Some(window) = shown {
         let _ = window.update(cx, |_, w, _| w.activate_window());
         cx.activate(true);
+        // Drawn again, it takes what a later launch asked to open.
+        if let Some(view) = cx.global::<Shell>().view.as_ref().and_then(|v| v.upgrade()) {
+            view.update(cx, |_, cx| cx.notify());
+        }
         return;
     }
     let backend = cx.global::<Shell>().backend.clone();
