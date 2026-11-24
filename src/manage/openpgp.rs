@@ -1118,12 +1118,15 @@ pub fn protect(
             };
         }
         // RFC 9580's AEAD encryption (SEIPD v2) where every recipient's key
-        // says it reads it; else SEIPD v1, which every OpenPGP app reads.
+        // says it reads it; else SEIPD v1, which every OpenPGP app reads
+        // (§13.7). One message for all: §10.3.2.1 doesn't let v3 and v6
+        // PKESKs share a payload, so one v4-only recipient means v1.
         let armored = if keys.iter().all(reads_seipd_v2) {
+            let (sym, aead) = seipd_v2_suite(&keys);
             let mut builder = MessageBuilder::from_bytes("", content).seipd_v2(
                 rand08::thread_rng(),
-                SymmetricKeyAlgorithm::AES256,
-                pgp::crypto::aead::AeadAlgorithm::Ocb,
+                sym,
+                aead,
                 pgp::crypto::aead::ChunkSize::default(),
             );
             add_recipients!(builder);
@@ -1154,22 +1157,53 @@ fn newest_self_signature(key: &SignedPublicKey) -> Option<&pgp::packet::Signatur
         .chain(key.details.direct_signatures.iter())
         .max_by_key(|s| s.created().map(|t| t.as_secs()))
 }
-/// Whether a key says it reads AEAD-encrypted data (SEIPD v2, RFC 9580
-/// §5.13.2) with AES-256 in OCB mode.
+/// The self-signature whose preferences count for a key: for a v6 key its
+/// newest direct-key signature, where RFC 9580 §5.2.3.10 and §10.1.1 keep
+/// a v6 key's features and preferences (its user ids' bindings may be
+/// newer and say none); else the newest self-signature.
+fn preference_signature(key: &SignedPublicKey) -> Option<&pgp::packet::Signature> {
+    let direct = || {
+        key.details
+            .direct_signatures
+            .iter()
+            .max_by_key(|s| s.created().map(|t| t.as_secs()))
+    };
+    match key.primary_key.version() {
+        pgp::types::KeyVersion::V6 => direct().or_else(|| newest_self_signature(key)),
+        _ => newest_self_signature(key),
+    }
+}
+/// Whether a key reads AEAD-encrypted data (SEIPD v2, RFC 9580 §5.13.2):
+/// its Features say so (§5.2.3.32), or it is a v6 key with no Features
+/// subpacket (§13.7).
 fn reads_seipd_v2(key: &SignedPublicKey) -> bool {
-    newest_self_signature(key).is_some_and(|s| {
-        s.features().is_some_and(|f| f.seipd_v2())
-            && s.preferred_aead_algs().iter().any(|(sym, aead)| {
-                *sym == SymmetricKeyAlgorithm::AES256 && *aead == pgp::crypto::aead::AeadAlgorithm::Ocb
-            })
-    })
+    let signature = preference_signature(key);
+    match signature.and_then(|s| s.features()) {
+        Some(features) => features.seipd_v2(),
+        None => key.primary_key.version() == pgp::types::KeyVersion::V6,
+    }
+}
+/// The SEIPD v2 ciphersuite for `keys`, which all read SEIPD v2: AES-256
+/// with OCB where every key lists it, else AES-128 with OCB, which every
+/// key takes even unlisted (RFC 9580 §5.2.3.15).
+fn seipd_v2_suite(keys: &[SignedPublicKey]) -> (SymmetricKeyAlgorithm, pgp::crypto::aead::AeadAlgorithm) {
+    use pgp::crypto::aead::AeadAlgorithm;
+    let strong = (SymmetricKeyAlgorithm::AES256, AeadAlgorithm::Ocb);
+    let all_list_strong = keys
+        .iter()
+        .all(|k| preference_signature(k).is_some_and(|s| s.preferred_aead_algs().contains(&strong)));
+    if all_list_strong {
+        strong
+    } else {
+        (SymmetricKeyAlgorithm::AES128, AeadAlgorithm::Ocb)
+    }
 }
 /// The strongest cipher every recipient lists (RFC 9580 §13.2), AES-256
 /// where all take it or none says; AES-128 is every key's fallback.
 fn preferred_cipher(keys: &[SignedPublicKey]) -> SymmetricKeyAlgorithm {
     let lists: Vec<&[SymmetricKeyAlgorithm]> = keys
         .iter()
-        .filter_map(newest_self_signature)
+        .filter_map(preference_signature)
         .map(|s| s.preferred_symmetric_algs())
         .filter(|l| !l.is_empty())
         .collect();
