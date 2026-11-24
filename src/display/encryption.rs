@@ -53,6 +53,24 @@ fn signer_result_label(result: crate::manage::smime::SignerResult) -> (&'static 
     }
 }
 
+/// Adds the certificates a certs-only message carries (RFC 8551 §3.6, as
+/// PEM) to others' certificates, as an imported file is. Returns how many
+/// were imported and how many were skipped: a certificate naming no email
+/// address (an authority's, sent along with a person's) is of no use for
+/// mail.
+fn import_carried_certificates(
+    certs: &mut crate::manage::smime::Certificates,
+    carried: &[String],
+) -> (usize, usize) {
+    let mut imported = 0;
+    for pem in carried {
+        if certs.import_certificate(pem.as_bytes()).is_ok() {
+            imported += 1;
+        }
+    }
+    (imported, carried.len() - imported)
+}
+
 /// "expires Mar 3, 2027" or "expired Mar 3, 2025", for a key that does.
 fn expiry_text(expires: Option<i64>) -> Option<String> {
     let at = expires?;
@@ -383,6 +401,53 @@ impl MailApp {
                     .child(div().min_w_0().truncate().text_color(rgb(c.muted)).child(result))
             }))
             .into_any_element()
+    }
+
+    /// Above a certs-only S/MIME message (RFC 8551 §3.6): how many
+    /// certificates it carries, that importing them vouches for nothing,
+    /// and a button to import them.
+    pub(super) fn carried_certificates_card(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
+        let count = self.backend.smime_verdict(&m.id)?.certificates.len();
+        if count == 0 {
+            return None;
+        }
+        let c = self.colors();
+        Some(
+            div()
+                .id("smime-carried-certificates")
+                .debug_selector(|| "smime-carried-certificates".into())
+                .role(Role::Region)
+                .aria_label("Certificates in this message")
+                .m_3()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
+                .child(div().font_weight(FontWeight::MEDIUM).child(if count == 1 {
+                    "This message carries 1 certificate".to_owned()
+                } else {
+                    format!("This message carries {count} certificates")
+                }))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Imported, they let you write to their owners encrypted. Importing vouches for nothing: anyone can send a certificate, and a signature by one is trusted only when an authority your system trusts issued it."),
+                )
+                .child(div().flex().child(self.button(
+                    "smime-import-carried",
+                    "Import Certificates",
+                    "upload",
+                    Action::ImportCarriedCertificates(m.id.clone()),
+                    false,
+                    cx,
+                )))
+                .into_any_element(),
+        )
     }
 
     /// In your key's row: the button saving its revocation certificate, and
@@ -786,6 +851,46 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::ImportCarriedCertificates(id) => {
+                let Some(m) = self.messages.iter().find(|m| m.id == id).cloned() else {
+                    return;
+                };
+                let Some(a) = self.account_of(&m) else { return };
+                self.task(
+                    cx,
+                    move |b| {
+                        // Changing the certificates forgets what was read
+                        // with them: read again where it was.
+                        let verdict = match b.smime_verdict(&m.id) {
+                            Some(v) => v,
+                            None => {
+                                b.read(&a, &m)?;
+                                b.smime_verdict(&m.id).unwrap_or_default()
+                            }
+                        };
+                        let mut certs = crate::manage::smime::Certificates::clone(&b.certificates());
+                        let (imported, skipped) = import_carried_certificates(&mut certs, &verdict.certificates);
+                        if imported > 0 {
+                            b.set_certificates(certs)?;
+                        }
+                        Ok((imported, skipped))
+                    },
+                    |this, result, cx| match result {
+                        Ok((imported, skipped)) => {
+                            let noun = |n: usize| if n == 1 { "certificate" } else { "certificates" };
+                            let mut text = format!("Imported {imported} {}", noun(imported));
+                            if skipped > 0 {
+                                text.push_str(&format!(
+                                    "; {skipped} {} without an email address (an authority's) left out",
+                                    noun(skipped)
+                                ));
+                            }
+                            this.notice(text, imported == 0, cx)
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
             Action::RemoveCertificate(fp) => {
                 let mut certs =
                     crate::manage::smime::Certificates::clone(&self.backend.certificates());
@@ -1143,6 +1248,33 @@ mod tests {
         assert_eq!(listed, [("ana@example.org", Untrusted), ("bo@example.se", Untrusted)]);
         assert!(details.signature.is_some());
         assert!(cx.debug_bounds("smime-signers").is_some(), "listed under the signature");
+    }
+
+    /// RFC 8551 §3.6: a certs-only message shows how many certificates it
+    /// carries; Import Certificates adds them as others', leaving out the
+    /// authority's, which names no address.
+    #[gpui::test]
+    fn certs_only_messages_offer_their_certificates(cx: &mut gpui::TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        let id = open_with_source(&view, &store, &smime_fixture("certs-only.eml"), cx);
+        assert!(cx.debug_bounds("smime-carried-certificates").is_some(), "the note is shown");
+        assert!(view.read_with(cx, |this, _| this.backend.certificates().list().is_empty()));
+        act(&view, Action::ImportCarriedCertificates(id), cx);
+        let (listed, status) =
+            view.read_with(cx, |this, _| (this.backend.certificates().list(), this.status.clone()));
+        let [ana] = listed.as_slice() else { panic!("one certificate: {listed:?}") };
+        assert!(!ana.own && ana.emails == ["ana@example.org"]);
+        assert!(status.starts_with("Imported 1 certificate; 1 certificate"), "{status}");
+    }
+
+    #[test]
+    fn carried_certificates_are_imported_as_others() {
+        let pem = |name: &str| String::from_utf8(smime_fixture(name)).unwrap();
+        let mut certs = crate::manage::smime::Certificates::default();
+        let carried = [pem("ana.pem"), pem("ca.pem"), pem("bo.pem")];
+        assert_eq!(import_carried_certificates(&mut certs, &carried), (2, 1));
+        assert!(certs.own.is_empty() && certs.others.len() == 2);
+        assert!(certs.has_cert("bo@example.se"));
     }
 
     /// One signer: the signature line says it all, with no list.

@@ -729,6 +729,8 @@ enum Action {
     /// Looks up the OpenPGP key for the address in the field.
     FindKey,
     ImportCertificates,
+    /// Imports the certificates this certs-only S/MIME message carries.
+    ImportCarriedCertificates(String),
     /// Forgets the S/MIME certificate with this fingerprint.
     RemoveCertificate(String),
     /// Answers the invitation in this message.
@@ -6484,6 +6486,7 @@ impl MailApp {
             | Action::SaveRevocationCertificate(_)
             | Action::FindKey
             | Action::ImportCertificates
+            | Action::ImportCarriedCertificates(_)
             | Action::RemoveCertificate(_)) => {
                 self.encryption_action(action, w, cx)
             }

@@ -576,7 +576,8 @@ impl MailApp {
             .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) })
             .children((!locked).then(|| self.invitation_card(m, cx)).flatten())
             .children((!locked).then(|| self.delivery_report_card(m)).flatten())
-            .children((!locked).then(|| self.setup_message_card(m, cx)).flatten());
+            .children((!locked).then(|| self.setup_message_card(m, cx)).flatten())
+            .children((!locked).then(|| self.carried_certificates_card(m, cx)).flatten());
         if !locked && !self.invitations.contains_key(&m.id) {
             let m = m.clone();
             let view = cx.entity().downgrade();
