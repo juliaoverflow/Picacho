@@ -518,6 +518,32 @@ fn viewport_units_and_resolution_queries_see_the_window() {
     assert_eq!(bx(&email, "v").2, 376., "layout stays in CSS pixels");
 }
 
+/// Media Queries 5 §11.3, §11.4: an email's prefers-reduced-motion and
+/// prefers-contrast styles apply when the reader asks for them, and not
+/// otherwise; boolean and keyword forms both.
+#[test]
+fn reduced_motion_and_contrast_queries_see_the_readers_preferences() {
+    let html = "<style>#m,#c,#b{width:10px}#n{width:5px}\
+        @media (prefers-reduced-motion: reduce){#m{width:20px}}\
+        @media (prefers-contrast: more){#c{width:30px}}\
+        @media (prefers-contrast){#b{width:40px}}\
+        @media (prefers-reduced-motion: no-preference){#n{width:50px}}</style>\
+        <div id='m'>m</div><div id='c'>c</div><div id='b'>b</div><div id='n'>n</div>";
+    let mut plain = EmailDocument::new(html, true);
+    plain.set_preferences(blitz_dom::MediaPreferences::default());
+    plain.layout(400);
+    assert_eq!([bx(&plain, "m").2, bx(&plain, "c").2, bx(&plain, "b").2], [10., 10., 10.]);
+    assert_eq!(bx(&plain, "n").2, 50., "no-preference matches by default");
+    let mut asked = EmailDocument::new(html, true);
+    asked.set_preferences(blitz_dom::MediaPreferences {
+        reduced_motion: true,
+        contrast: blitz_dom::Contrast::More,
+    });
+    asked.layout(400);
+    assert_eq!([bx(&asked, "m").2, bx(&asked, "c").2, bx(&asked, "b").2], [20., 30., 40.]);
+    assert_eq!(bx(&asked, "n").2, 5.);
+}
+
 #[test]
 fn links_are_light_in_native_dark() {
     let mut email = EmailDocument::with_tone(

@@ -19,7 +19,7 @@ mod calendar;
 #[path = "jmap_extras.rs"]
 mod jmap_extras;
 #[path = "motion.rs"]
-mod motion;
+pub(crate) mod motion;
 #[cfg(test)]
 #[path = "compose_tests.rs"]
 mod compose_tests;
@@ -728,6 +728,8 @@ enum Action {
     SaveRevocationCertificate(String),
     /// Settings → General → Reduce motion.
     SetMotion(motion::Motion),
+    /// Settings → General → Contrast in emails (prefers-contrast).
+    SetContrast(motion::Contrast),
     /// Looks up the OpenPGP key for the address in the field.
     FindKey,
     ImportCertificates,
@@ -1291,6 +1293,8 @@ pub struct MailApp {
     focus: FocusHandle,
     /// Settings → General → Reduce motion.
     motion: motion::Motion,
+    /// What emails' prefers-contrast sees (see `motion::Contrast`).
+    contrast: motion::Contrast,
     /// The open popup menu's, so the keyboard lands in it.
     menu_focus: FocusHandle,
     /// The menu just opened: focus it once it's drawn.
@@ -1932,6 +1936,8 @@ impl MailApp {
     pub fn with_backend(backend: Arc<Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = backend.store.clone();
         let motion = motion::Motion::from_key(&store.preference(motion::Motion::PREFERENCE).unwrap_or_default());
+        let contrast =
+            motion::Contrast::from_key(&store.preference(motion::Contrast::PREFERENCE).unwrap_or_default());
         let accounts = store.accounts().unwrap_or_default();
         let forwarding = fwd::load(&store);
         let all_mail = fwd::all_mail_enabled(&store);
@@ -2526,6 +2532,7 @@ impl MailApp {
             search,
             focus: cx.focus_handle(),
             motion,
+            contrast,
             menu_focus: cx.focus_handle(),
             menu_focus_pending: false,
             pending_link: None,
@@ -2953,14 +2960,18 @@ impl MailApp {
     /// Reads the system's Reduce motion again (off the UI thread: on
     /// desktops it asks a system tool), and applies it if it changed.
     fn refresh_system_motion(&mut self, cx: &mut Context<Self>) {
+        let (choice, contrast) = (self.motion, self.contrast);
         cx.spawn(async move |this, cx| {
-            let reduced = cx
+            // Both may run commands (defaults, gsettings): off the window.
+            let (reduced, more) = cx
                 .background_executor()
-                .spawn(async { motion::system_reduces_motion() })
+                .spawn(async move { (choice.reduced(), contrast.more()) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.motion == motion::Motion::System {
+                if this.motion == choice && this.contrast == contrast {
                     Self::set_motion(reduced, cx);
+                    // Media Queries 5 §11.3, §11.4: as emails see them.
+                    motion::set_email_preferences(reduced, more);
                 }
             });
         })
@@ -2973,12 +2984,14 @@ impl MailApp {
     }
     /// Tells GPUI, and the spinners, whether to reduce motion.
     fn apply_motion(&mut self, cx: &mut Context<Self>) {
-        if self.motion == motion::Motion::System {
+        if self.motion == motion::Motion::System || self.contrast == motion::Contrast::System {
             // Read without holding up the window.
             self.refresh_system_motion(cx);
             return;
         }
-        Self::set_motion(self.motion.reduced(), cx);
+        let reduced = self.motion.reduced();
+        Self::set_motion(reduced, cx);
+        motion::set_email_preferences(reduced, self.contrast.more());
     }
     fn set_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
         use crate::manage::background::TRAY_PREFERENCE;
@@ -7167,6 +7180,11 @@ impl MailApp {
             Action::SetMotion(m) => {
                 self.motion = m;
                 self.backend.store.set_preference_soon(motion::Motion::PREFERENCE, m.key());
+                self.apply_motion(cx);
+            }
+            Action::SetContrast(c) => {
+                self.contrast = c;
+                self.backend.store.set_preference_soon(motion::Contrast::PREFERENCE, c.key());
                 self.apply_motion(cx);
             }
             Action::SetCleanLinks(on) => {

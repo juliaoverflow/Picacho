@@ -109,6 +109,16 @@ pub fn animations_off() -> bool {
     asked != 0 && on == 0
 }
 
+/// Whether Windows' high contrast (contrast themes) is on.
+pub fn high_contrast() -> bool {
+    use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SystemParametersInfoW};
+    let mut hc = HIGHCONTRASTW { cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32, ..Default::default() };
+    // SAFETY: SPI_GETHIGHCONTRAST fills the HIGHCONTRASTW whose size it is told.
+    let asked = unsafe { SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, (&raw mut hc).cast(), 0) };
+    asked != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+}
+
 /// Limits `path` to the current user (and SYSTEM, which Windows' own
 /// services need), as the data directory's 0700 does on Unix: its access
 /// list stops inheriting from the parent, which on a roaming or shared

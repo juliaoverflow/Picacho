@@ -558,6 +558,19 @@ impl MailApp {
                 )
                 .max_w(px(320.)),
             ))
+            .child(self.setting(
+                "Contrast in emails",
+                "Emails that style themselves for more contrast (prefers-contrast) use those styles. Automatic follows your system's high-contrast setting.",
+                self.segmented(
+                    "email-contrast",
+                    [super::motion::Contrast::System, super::motion::Contrast::More, super::motion::Contrast::Standard]
+                        .into_iter()
+                        .map(|c| (c.label().to_owned(), Action::SetContrast(c), self.contrast == c))
+                        .collect(),
+                    cx,
+                )
+                .max_w(px(320.)),
+            ))
             .child(self.section("Mailboxes"))
             .child(self.toggle_row(
                 "All Accounts",

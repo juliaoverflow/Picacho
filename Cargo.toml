@@ -355,6 +355,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # High contrast's state (display/motion.rs, prefers-contrast in emails).
+    "Win32_UI_Accessibility",
 ] }
 windows-registry = "0.6"
 
@@ -387,6 +389,12 @@ blitz-dom = { path = "../Picacho-Patches/blitz-dom/crate" }
 # Inline boxes paint gradient backgrounds (emails' dark styles); SVG images
 # are drawn in layers the dark recoloring recognizes (`is_image_layer`).
 blitz-paint = { path = "../Picacho-Patches/blitz-paint/crate" }
+# prefers-reduced-motion and prefers-contrast media queries (Media Queries 5
+# §11.3, §11.4), which blitz-dom's `set_media_preferences` sets.
+# TEMPORARY, as blitz-dom above: the local feat/stylo-media-preferences
+# branch until it is merged; then the git dependency like stylo_derive's.
+stylo = { path = "../Picacho-Patches/stylo/crate" }
+stylo_atoms = { path = "../Picacho-Patches/stylo_atoms/crate" }
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,

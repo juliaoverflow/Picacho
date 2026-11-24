@@ -304,6 +304,9 @@ pub(super) struct EmailDocument {
     /// and its scale, which resolution media queries see.
     screen_height: u32,
     screen_scale: f32,
+    /// What its media queries see of the reader's preferences, when not
+    /// the app's (`motion::email_preferences`): tests set their own.
+    preferences: Option<blitz_dom::MediaPreferences>,
 }
 impl Drop for EmailDocument {
     fn drop(&mut self) {
@@ -375,6 +378,7 @@ impl EmailDocument {
             text_zoom: 1.,
             screen_height: 600,
             screen_scale: 1.,
+            preferences: None,
         };
         if blocked {
             email.prepare_blocked_images();
@@ -638,6 +642,11 @@ impl EmailDocument {
             .and_then(super::openable_url)
             .map(String::from)
     }
+    /// Media queries see these preferences rather than the app's.
+    #[cfg(test)]
+    pub(super) fn set_preferences(&mut self, preferences: blitz_dom::MediaPreferences) {
+        self.preferences = Some(preferences);
+    }
     /// The window's height and scale, for `vh` units and media queries.
     pub(super) fn set_screen(&mut self, height: u32, scale: f32) {
         self.screen_height = height.max(1);
@@ -656,6 +665,11 @@ impl EmailDocument {
         ));
         self.doc
             .set_media_device_pixel_ratio(Some(self.screen_scale));
+        // Media Queries 5 §11.3, §11.4: the reader's settings.
+        let preferences = self
+            .preferences
+            .unwrap_or_else(crate::display::ui::motion::email_preferences);
+        self.doc.set_media_preferences(preferences);
     }
     /// Styles and lays the document out. Animations and transitions are
     /// settled at their end rather than played, so that nothing is left

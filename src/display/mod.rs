@@ -2,7 +2,7 @@
 mod assets;
 mod desktop;
 pub mod notify;
-mod ui;
+pub(crate) mod ui;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use ui::run;
 #[cfg(any(target_os = "android", target_os = "ios"))]

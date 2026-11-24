@@ -126,6 +126,111 @@ pub fn system_reduces_motion() -> bool {
     false
 }
 
+/// What Settings → General → Contrast in emails says: an email's own
+/// `prefers-contrast` styles (Media Queries 5 §11.4) follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Contrast {
+    /// Follow the system's high-contrast setting.
+    #[default]
+    System,
+    /// Always ask emails for more contrast.
+    More,
+    /// Never: emails show their usual styles.
+    Standard,
+}
+
+impl Contrast {
+    pub const PREFERENCE: &str = "email_contrast";
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::More => "more",
+            Self::Standard => "standard",
+        }
+    }
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "more" => Self::More,
+            "standard" => Self::Standard,
+            _ => Self::System,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "Automatic",
+            Self::More => "More",
+            Self::Standard => "Standard",
+        }
+    }
+    /// Whether emails are asked for more contrast with this choice.
+    pub fn more(self) -> bool {
+        match self {
+            Self::System => system_prefers_contrast(),
+            Self::More => true,
+            Self::Standard => false,
+        }
+    }
+}
+
+/// Whether the system asks for more contrast: macOS's Increase contrast,
+/// Windows' contrast themes, GNOME's high contrast. Elsewhere, not known.
+#[cfg(not(any(target_os = "android", target_os = "ios", test)))]
+pub fn system_prefers_contrast() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        output(
+            "defaults",
+            &["read", "com.apple.universalaccess", "increaseContrast"],
+        )
+        .is_some_and(|v| v == "1")
+    }
+    #[cfg(windows)]
+    {
+        crate::display::windows::high_contrast()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        output(
+            "gsettings",
+            &["get", "org.gnome.desktop.a11y.interface", "high-contrast"],
+        )
+        .is_some_and(|v| v == "true")
+    }
+}
+
+/// Not known on phones yet (Android's and iOS's own settings would need
+/// platform calls): emails show their usual styles unless asked.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+pub fn system_prefers_contrast() -> bool {
+    false
+}
+
+/// What emails' media queries see (`prefers-reduced-motion`,
+/// `prefers-contrast`): set by the window as its settings change, read by
+/// the HTML renderer's worker threads.
+static EMAIL_REDUCED_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static EMAIL_MORE_CONTRAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_email_preferences(reduced_motion: bool, more_contrast: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    EMAIL_REDUCED_MOTION.store(reduced_motion, Relaxed);
+    EMAIL_MORE_CONTRAST.store(more_contrast, Relaxed);
+}
+
+/// Media Queries 5 §11.3, §11.4: what an email's `prefers-reduced-motion`
+/// and `prefers-contrast` queries see.
+pub fn email_preferences() -> blitz_dom::MediaPreferences {
+    use std::sync::atomic::Ordering::Relaxed;
+    blitz_dom::MediaPreferences {
+        reduced_motion: EMAIL_REDUCED_MOTION.load(Relaxed),
+        contrast: if EMAIL_MORE_CONTRAST.load(Relaxed) {
+            blitz_dom::Contrast::More
+        } else {
+            blitz_dom::Contrast::NoPreference
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +243,14 @@ mod tests {
         assert!(Motion::Reduced.reduced());
         assert!(!Motion::Full.reduced());
         assert_eq!(Motion::from_key(""), Motion::System);
+    }
+
+    #[test]
+    fn contrast_choices_round_trip() {
+        for c in [Contrast::System, Contrast::More, Contrast::Standard] {
+            assert_eq!(Contrast::from_key(c.key()), c);
+        }
+        assert!(Contrast::More.more() && !Contrast::Standard.more());
+        assert_eq!(Contrast::from_key("junk"), Contrast::System);
     }
 }
