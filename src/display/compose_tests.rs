@@ -485,3 +485,89 @@ fn pasted_pictures_are_placed_in_formatted_drafts(cx: &mut TestAppContext) {
     });
     assert_eq!(body(cx), "![Pasted image (2)](<file:Pasted image (2).png>)");
 }
+
+/// An encrypted message whose subject was hidden (RFC 9788 §5.2.1): its
+/// outer Subject reads "...", and the reader shows the real one.
+const SEALED: &[u8] = b"From: Ana <ana@example.org>\r\nTo: qa@example.com\r\nSubject: ...\r\nMessage-ID: <sealed@example.org>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=b\r\n\r\n--b\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--b\r\nContent-Type: application/octet-stream\r\n\r\n-----BEGIN PGP MESSAGE-----\r\n\r\nwcBMA0\r\n-----END PGP MESSAGE-----\r\n--b--\r\n";
+
+/// A message `SEALED` stands for, read as decrypted: its real subject and
+/// text, as the reader keeps them.
+fn sealed_message(view: &Entity<MailApp>, store: &crate::manage::store::Store, cx: &mut VisualTestContext) -> String {
+    view.update(cx, |this, _| {
+        let m = &mut this.messages[2];
+        m.message_id = "<sealed@example.org>".into();
+        // Cached as an encrypted message is: its outside, "...".
+        m.subject = "...".into();
+        store.save_messages(std::slice::from_ref(m)).unwrap();
+        store.save_raw(&m.id, SEALED).unwrap();
+        // Decrypted here, as the reader would have it.
+        let mut opened = m.clone();
+        opened.subject = "Plans".into();
+        opened.body = Some("Meet at noon.\nAt the usual place.".into());
+        this.backend.keep_readable_for_test(opened.clone());
+        *m = opened;
+        m.id.clone()
+    })
+}
+
+/// RFC 9788 §6.1: a reply to encrypted mail starts encrypted, its subject
+/// hidden as the original's was, and says the real subject inside; a
+/// reply to unencrypted mail starts as before.
+#[gpui::test]
+fn replies_to_encrypted_mail_start_encrypted_with_the_subject_hidden(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let id = sealed_message(&view, &store, cx);
+    act(&view, Action::Select(id.clone()), cx);
+    act(&view, Action::Reply(false), cx);
+    view.read_with(cx, |this, cx| {
+        let draft = &this.composers.last().unwrap().read(cx).draft;
+        assert!(draft.encrypt && draft.encrypt_subject, "{draft:?}");
+        assert_eq!(draft.subject, "Re: Plans");
+    });
+    // A forward too.
+    act(&view, Action::Forward, cx);
+    view.read_with(cx, |this, cx| {
+        let draft = &this.composers.last().unwrap().read(cx).draft;
+        assert!(draft.encrypt && draft.encrypt_subject && draft.forwarding, "{draft:?}");
+    });
+    let plain = view.read_with(cx, |this, _| this.messages[3].id.clone());
+    act(&view, Action::Select(plain), cx);
+    act(&view, Action::Reply(false), cx);
+    view.read_with(cx, |this, cx| {
+        let draft = &this.composers.last().unwrap().read(cx).draft;
+        assert!(!draft.encrypt && !draft.encrypt_subject, "unchanged: {draft:?}");
+    });
+}
+
+/// RFC 9788 §6.1: turned unencrypted, such a reply asks first; sent, its
+/// subject reads "..." and it carries none of the original's text.
+#[gpui::test]
+fn unencrypted_replies_to_encrypted_mail_leave_out_its_text_and_subject(cx: &mut TestAppContext) {
+    let (view, cx, store) = two_accounts(cx);
+    let id = sealed_message(&view, &store, cx);
+    act(&view, Action::Select(id.clone()), cx);
+    act(&view, Action::Reply(false), cx);
+    let composer = view.read_with(cx, |this, _| this.composers.last().unwrap().clone());
+    composer.update_in(cx, |c, w, cx| {
+        c.draft.encrypt = false;
+        c.draft.body = format!("Sounds good.{}", c.draft.body);
+        c.reload_fields(w, cx);
+    });
+    composer.update_in(cx, |c, w, cx| c.request_send_at(None, w, cx));
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt(), "asked before going unencrypted");
+    cx.simulate_prompt_answer("Send Without the Quote");
+    cx.run_until_parked();
+    composer.read_with(cx, |c, _| {
+        assert_eq!(c.draft.subject, "...");
+        assert!(c.draft.body.starts_with("Sounds good."), "{}", c.draft.body);
+        assert!(!c.draft.body.contains("Meet at noon") && !c.draft.body.contains("> "), "{}", c.draft.body);
+        assert!(!c.draft.encrypt);
+    });
+    // Kept encrypted, nothing is asked or changed.
+    act(&view, Action::Reply(false), cx);
+    let again = view.read_with(cx, |this, _| this.composers.last().unwrap().clone());
+    again.update_in(cx, |c, w, cx| c.request_send_at(None, w, cx));
+    cx.run_until_parked();
+    assert!(!cx.has_pending_prompt());
+}

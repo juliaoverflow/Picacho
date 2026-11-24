@@ -19,6 +19,7 @@ pub mod mail_kinds;
 pub mod memory;
 pub mod model;
 pub mod openpgp;
+pub mod protected_reply;
 pub mod smime;
 /// Tracking numbers in mail, for the reader and each account's Summary.
 pub mod parcels;

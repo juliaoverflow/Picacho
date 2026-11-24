@@ -1060,6 +1060,31 @@ impl Backend {
         s.mail_key.clear();
         self.save_credentials(&a.id, &s)
     }
+    /// RFC 9788 §6.1: how `m` came protected, for answering it (see
+    /// `protected_reply`), from its source as stored. A message whose
+    /// source isn't here yet counts as unprotected unless the reader saw
+    /// it decrypted.
+    pub fn answering(&self, m: &Mail) -> crate::manage::protected_reply::Original {
+        let decrypted = self.readable.lock().unwrap().contains_key(&m.id)
+            || self.verdict(&m.id).is_some_and(|v| v.decrypted)
+            || self.smime_verdict(&m.id).is_some_and(|v| v.decrypted);
+        match self.store.raw(&m.id).ok().flatten() {
+            Some(raw) => crate::manage::protected_reply::Original::of(&raw),
+            None => crate::manage::protected_reply::Original {
+                encrypted: decrypted,
+                hidden_subject: false,
+            },
+        }
+    }
+    /// The subject `m` really has: as decrypted here, where it was (a
+    /// hidden one reads "..." outside, RFC 9788 §5.2.1), else as listed.
+    pub fn real_subject(&self, m: &Mail) -> String {
+        self.readable
+            .lock()
+            .unwrap()
+            .get(&m.id)
+            .map_or_else(|| m.subject.clone(), |r| r.subject.clone())
+    }
     /// Puts what lists show of decrypted messages (previews, attachments)
     /// back on messages reloaded from the disk cache, but not their text:
     /// a list holds messages without bodies (see `with_readable` for the
@@ -2942,6 +2967,12 @@ impl Backend {
     /// and inline images; the rest keep what lists show, and are decrypted
     /// again from the cached source when opened. Reading through an
     /// encrypted mailbox no longer keeps every message read in memory.
+    /// As decryption leaves it, for tests whose fixtures can't be
+    /// decrypted here.
+    #[cfg(test)]
+    pub(crate) fn keep_readable_for_test(&self, mail: Mail) {
+        self.keep_readable(mail);
+    }
     fn keep_readable(&self, mail: Mail) {
         const READABLE_BODIES: usize = 32;
         let mut readable = self.readable.lock().unwrap();

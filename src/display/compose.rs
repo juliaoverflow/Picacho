@@ -217,10 +217,17 @@ impl MailApp {
             None => draft.body = sign(false),
             Some(m) => {
                 let forward = mode >= 3;
-                draft.subject = reply_subject(&m.subject, forward);
+                // RFC 9788 §6.1: the real subject, not a hidden one's "...".
+                draft.subject = reply_subject(&self.backend.real_subject(m), forward);
                 // Marked answered or forwarded once this is sent.
                 draft.original = m.id.clone();
                 draft.forwarding = forward;
+                // RFC 9788 §6.1: as protected as what it answers.
+                let start = self.backend.answering(m).start();
+                if start.encrypt {
+                    draft.encrypt = true;
+                    draft.encrypt_subject = start.hide_subject;
+                }
                 // Answer as the alias the message was sent to.
                 let aliases = fwd::sendable(&self.forwarding);
                 if let Some(alias) = alias_addressed(m, &aliases) {

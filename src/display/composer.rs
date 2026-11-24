@@ -966,6 +966,28 @@ impl Composer {
                 return;
             }
         }
+        // RFC 9788 §6.1: an answer to encrypted mail, about to go
+        // unencrypted, mustn't carry the original's text or hidden subject.
+        // Asked first; sent, those are left out (see `send_in_clear`).
+        if !d.encrypt && self.answers_encrypted(&d) {
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "Send unencrypted?",
+                Some(crate::manage::protected_reply::WARNING),
+                &["Send Without the Quote", "Keep Editing"],
+                cx,
+            );
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(0) = answer.await {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.send_in_clear(window, cx);
+                        cx.emit(event());
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
         let mut doubts = vec![];
         if self.options.warn_empty_subject && d.subject.trim().is_empty() {
             doubts.push("This message has no subject.");
@@ -1000,6 +1022,36 @@ impl Composer {
             }
         })
         .detach();
+    }
+
+    /// Whether `d` answers a message that came encrypted (RFC 9788 §6.1).
+    fn answers_encrypted(&self, d: &Draft) -> bool {
+        !d.original.is_empty()
+            && self
+                .backend
+                .store
+                .message(&d.original)
+                .ok()
+                .flatten()
+                .is_some_and(|m| self.backend.answering(&m).encrypted)
+    }
+
+    /// RFC 9788 §6.1, for an answer to encrypted mail sent in the clear:
+    /// the original's hidden subject becomes "...", and the quote of it is
+    /// left out. Shown in the fields too, so what goes is what is seen.
+    pub(super) fn send_in_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let d = self.snapshot(cx);
+        let Some(original) = self.backend.store.message(&d.original).ok().flatten() else {
+            return;
+        };
+        let original = self.backend.answering(&original);
+        let clear = crate::manage::protected_reply::cleartext(&original, &d.subject, &d.body);
+        self.draft.subject = clear.subject;
+        self.draft.body = clear.body;
+        self.draft.encrypt = false;
+        self.draft.encrypt_subject = false;
+        self.reload_fields(window, cx);
+        self.changed(cx);
     }
 
     /// Opens Send Later's picker, at the time already chosen if any.
