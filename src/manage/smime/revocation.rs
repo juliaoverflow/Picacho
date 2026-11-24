@@ -226,6 +226,111 @@ pub fn crl_status(
     Status::Unknown(why)
 }
 
+/// The OCSP responders' URLs of `cert` (its Authority Information Access,
+/// RFC 5280 §4.2.2.1, id-ad-ocsp), over HTTP.
+pub fn ocsp_urls(cert: &openssl::x509::X509Ref) -> Vec<String> {
+    cert.ocsp_responders()
+        .map(|list| list.iter().map(|u| u.to_string()).filter(|u| checked_url(u).is_ok()).collect())
+        .unwrap_or_default()
+}
+
+/// How old an OCSP answer may be and still count (RFC 6960 §4.2.2.1:
+/// thisUpdate). openssl's crate has no way to put a nonce in the request
+/// (RFC 8954), so freshness is what keeps an old "good" from being
+/// replayed after a revocation.
+const OCSP_MAX_AGE: u32 = 7 * 86_400;
+/// Clock difference allowed either way.
+const OCSP_SLACK: u32 = 5 * 60;
+
+/// RFC 6960: `cert`'s status from its issuer's OCSP responder at `url`.
+/// The answer must be signed by the issuer or a responder it delegated to
+/// (§4.2.2.2, which OCSP_basic_verify checks against `issuer`), be about
+/// this very certificate, and be recent; anything else is Unknown.
+pub fn ocsp_status(
+    cert: &openssl::x509::X509Ref,
+    issuer: &openssl::x509::X509Ref,
+    url: &str,
+    fetcher: &dyn RevocationFetcher,
+) -> Status {
+    use openssl::ocsp::{OcspCertId, OcspCertStatus, OcspFlag, OcspRequest, OcspResponse, OcspResponseStatus};
+    let unknown = |why: &str| Status::Unknown(format!("{url}: {why}"));
+    let id = || OcspCertId::from_cert(openssl::hash::MessageDigest::sha1(), cert, issuer);
+    let request = (|| -> Result<Vec<u8>> {
+        let mut request = OcspRequest::new()?;
+        request.add_id(id()?)?;
+        Ok(request.to_der()?)
+    })();
+    let Ok(request) = request else {
+        return unknown("the request couldn't be made");
+    };
+    let answer = match fetcher.post_ocsp(url, &request) {
+        Ok(answer) => answer,
+        Err(e) => return Status::Unknown(format!("{e:#}")),
+    };
+    let Ok(response) = OcspResponse::from_der(&answer) else {
+        return unknown("the answer isn't an OCSP response");
+    };
+    if response.status() != OcspResponseStatus::SUCCESSFUL {
+        return unknown("the responder couldn't answer");
+    }
+    let Ok(basic) = response.basic() else {
+        return unknown("the answer is incomplete");
+    };
+    // §4.2.2.2: signed by the issuer itself, or by a certificate it
+    // issued for answering OCSP (id-kp-OCSPSigning).
+    let verified = (|| -> Result<()> {
+        let mut store = openssl::x509::store::X509StoreBuilder::new()?;
+        store.add_cert(issuer.to_owned())?;
+        let mut certs = openssl::stack::Stack::new()?;
+        certs.push(issuer.to_owned())?;
+        basic.verify(&certs, &store.build(), OcspFlag::TRUST_OTHER)?;
+        Ok(())
+    })();
+    if verified.is_err() {
+        return unknown("the answer isn't signed by the certificate's issuer");
+    }
+    let Ok(id) = id() else {
+        return unknown("the request couldn't be made");
+    };
+    let Some(status) = basic.find_status(&id) else {
+        return unknown("the answer isn't about this certificate");
+    };
+    if status.check_validity(OCSP_SLACK, Some(OCSP_MAX_AGE)).is_err() {
+        return unknown("the answer is out of date");
+    }
+    match status.status {
+        OcspCertStatus::GOOD => Status::Good,
+        OcspCertStatus::REVOKED => Status::Revoked,
+        _ => unknown("the responder doesn't know this certificate"),
+    }
+}
+
+/// RFC 5280 §6.3 and RFC 6960, together: OCSP first where the certificate
+/// names a responder (an answer about it alone, and current), else, or
+/// when OCSP can't say, its issuer's CRL. Both need `fetcher`; without one
+/// only a kept, current CRL is used.
+pub fn status(
+    cert: &openssl::x509::X509Ref,
+    issuer: &openssl::x509::X509Ref,
+    cache: &CrlCache,
+    fetcher: Option<&dyn RevocationFetcher>,
+    now: i64,
+) -> Status {
+    let mut ocsp = None;
+    if let Some(fetcher) = fetcher {
+        for url in ocsp_urls(cert) {
+            match ocsp_status(cert, issuer, &url, fetcher) {
+                Status::Unknown(why) => ocsp = Some(why),
+                known => return known,
+            }
+        }
+    }
+    match crl_status(cert, issuer, &[], cache, fetcher, now) {
+        Status::Unknown(why) => Status::Unknown(ocsp.unwrap_or(why)),
+        known => known,
+    }
+}
+
 /// A fetcher for tests: canned answers by URL, and a record of what was
 /// asked. A URL with no answer fails, as an unreachable server does.
 #[cfg(test)]
@@ -341,6 +446,96 @@ mod tests {
         // The fixtures name no distribution point of their own.
         assert!(crl_urls(&bo).is_empty());
         assert!(matches!(crl_status(&bo, &ca, &[], &cache(), Some(&revoking), now), Status::Unknown(_)));
+    }
+
+    /// An OCSP responder for tests: answers each request with `openssl
+    /// ocsp`, signed by `signer`, from an index naming `revoked` (serials)
+    /// as revoked and `known` as valid; others are unknown.
+    struct Responder {
+        signer: &'static str,
+        revoked: Vec<String>,
+        known: Vec<String>,
+        /// Answers for this request instead (a stale or mismatched one).
+        canned: Option<Vec<u8>>,
+    }
+    impl RevocationFetcher for Responder {
+        fn get(&self, url: &str) -> Result<Vec<u8>> {
+            bail!("no CRL at {url}")
+        }
+        fn post_ocsp(&self, url: &str, der: &[u8]) -> Result<Vec<u8>> {
+            checked_url(url)?;
+            if let Some(answer) = &self.canned {
+                return Ok(answer.clone());
+            }
+            let dir = std::env::temp_dir().join(format!("picacho-ocsp-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir)?;
+            let f = |n: &str| format!("{}/tests/fixtures/smime/{n}", env!("CARGO_MANIFEST_DIR"));
+            let mut index = String::new();
+            for serial in &self.revoked {
+                index.push_str(&format!("R\t21261030230737Z\t261101000000Z\t{serial}\tunknown\t/CN=x\n"));
+            }
+            for serial in &self.known {
+                index.push_str(&format!("V\t21261030230737Z\t\t{serial}\tunknown\t/CN=x\n"));
+            }
+            std::fs::write(dir.join("index.txt"), index)?;
+            std::fs::write(dir.join("req.der"), der)?;
+            let status = std::process::Command::new("timeout")
+                .args(["30", "openssl", "ocsp", "-index"])
+                .arg(dir.join("index.txt"))
+                .args(["-rsigner", &f(&format!("{}.pem", self.signer)), "-rkey", &f(&format!("{}.key", self.signer))])
+                .args(["-CA", &f("ca.pem"), "-ndays", "1", "-reqin"])
+                .arg(dir.join("req.der"))
+                .arg("-respout")
+                .arg(dir.join("resp.der"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            ensure!(status.success(), "openssl ocsp failed");
+            let answer = std::fs::read(dir.join("resp.der"))?;
+            let _ = std::fs::remove_dir_all(&dir);
+            Ok(answer)
+        }
+    }
+    fn serial(c: &openssl::x509::X509) -> String {
+        c.serial_number().to_bn().unwrap().to_hex_str().unwrap().to_string()
+    }
+    const OCSP: &str = "http://ocsp.example.org/";
+
+    /// RFC 6960: an answer signed by the issuer about this certificate
+    /// says good or revoked; one the responder doesn't know is unknown.
+    #[test]
+    fn ocsp_answers_signed_by_the_issuer_say_good_or_revoked() {
+        let (ca, bo, ana) = (cert("ca.pem"), cert("bo.pem"), cert("ana.pem"));
+        let responder = Responder { signer: "ca", revoked: vec![serial(&bo)], known: vec![serial(&ana)], canned: None };
+        assert_eq!(ocsp_status(&bo, &ca, OCSP, &responder), Status::Revoked);
+        assert_eq!(ocsp_status(&ana, &ca, OCSP, &responder), Status::Good);
+        let none = Responder { signer: "ca", revoked: vec![], known: vec![], canned: None };
+        assert!(matches!(ocsp_status(&ana, &ca, OCSP, &none), Status::Unknown(_)));
+    }
+
+    /// §4.2.2.2: an answer signed by anyone else, one about another
+    /// certificate, or one that isn't OCSP at all: unknown, never revoked.
+    #[test]
+    fn ocsp_answers_that_cant_be_trusted_are_unknown() {
+        let (ca, bo, ana) = (cert("ca.pem"), cert("bo.pem"), cert("ana.pem"));
+        // Signed by Ana's key, not the authority's.
+        let forged = Responder { signer: "ana", revoked: vec![serial(&bo)], known: vec![], canned: None };
+        assert!(matches!(ocsp_status(&bo, &ca, OCSP, &forged), Status::Unknown(_)));
+        // A genuine answer, but about Bo, given for Ana.
+        let honest = Responder { signer: "ca", revoked: vec![serial(&bo)], known: vec![], canned: None };
+        let request = {
+            use openssl::ocsp::{OcspCertId, OcspRequest};
+            let mut r = OcspRequest::new().unwrap();
+            r.add_id(OcspCertId::from_cert(openssl::hash::MessageDigest::sha1(), &bo, &ca).unwrap()).unwrap();
+            r.to_der().unwrap()
+        };
+        let about_bo = honest.post_ocsp(OCSP, &request).unwrap();
+        let swapped = Responder { canned: Some(about_bo), ..honest };
+        assert!(matches!(ocsp_status(&ana, &ca, OCSP, &swapped), Status::Unknown(_)));
+        let junk = Responder { signer: "ca", revoked: vec![], known: vec![], canned: Some(b"<html>".to_vec()) };
+        assert!(matches!(ocsp_status(&bo, &ca, OCSP, &junk), Status::Unknown(_)));
+        // Unreachable.
+        assert!(matches!(ocsp_status(&bo, &ca, OCSP, &FakeFetcher::default()), Status::Unknown(_)));
     }
 
     #[test]
