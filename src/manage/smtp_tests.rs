@@ -369,6 +369,68 @@ fn encrypted_mail_to_bcc_alone_goes_to_each() -> Result<()> {
     Ok(())
 }
 
+/// S/MIME with Bcc, to an RSA recipient (Ana) and an EC one (Bo, ECDH as
+/// RFC 5753 describes): To's copy and each Bcc copy open for their own
+/// recipient and the sender, and no recipient opens another's.
+#[test]
+fn smime_bcc_copies_open_only_for_their_own_recipient() -> Result<()> {
+    use crate::manage::smime::{Certificates, open, test_identity};
+    let fixture = SmtpFixture::start("250-fixture\r\n250 AUTH PLAIN\r\n", no_script())?;
+    let (b, a, path) = smtp_account(&fixture)?;
+    let smime_fixture = |name: &str| -> Result<String> {
+        let path = format!("{}/tests/fixtures/smime/{name}", env!("CARGO_MANIFEST_DIR"));
+        Ok(std::fs::read_to_string(path)?)
+    };
+    // A fixture person's certificate and key, as `import_identity` keeps them.
+    let person = |name: &str| -> Result<Certificates> {
+        let key = openssl::pkey::PKey::private_key_from_pem(smime_fixture(&format!("{name}.key"))?.as_bytes())?;
+        let key = String::from_utf8(key.private_key_to_pem_pkcs8()?)?;
+        Ok(Certificates { own: vec![(smime_fixture(&format!("{name}.pem"))?, key)], others: Vec::new() })
+    };
+    let (ana, bo) = (person("ana")?, person("bo")?);
+    let mut di = Certificates::default();
+    di.import_identity(&test_identity("di@example.com", ""), "")?;
+    let mut mine = Certificates::default();
+    mine.import_identity(&test_identity("qa@example.com", ""), "")?;
+    mine.others.push(smime_fixture("ana.pem")?);
+    mine.others.push(smime_fixture("bo.pem")?);
+    mine.others.push(di.own[0].0.clone());
+    b.set_certificates(mine.clone())?;
+    let d = Draft {
+        id: "smime-bcc".into(),
+        account: a.id.clone(),
+        to: "Ana <ana@example.org>".into(),
+        bcc: "bo@example.se, di@example.com".into(),
+        subject: "Sealed with Bcc".into(),
+        body: "Only for some.".into(),
+        sign: true,
+        encrypt: true,
+        smime: true,
+        ..Draft::default()
+    };
+    b.store.save_draft(&d)?;
+    b.send(&a, &d)?;
+    let seen = fixture.finish();
+    assert_eq!(seen.transactions.len(), 3, "{seen:?}");
+    let opens = |raw: &[u8], certs: &Certificates| {
+        open(raw, certs).is_some_and(|(readable, verdict, _)| {
+            verdict.decrypted && String::from_utf8_lossy(&readable).contains("Only for some.")
+        })
+    };
+    let people = [("ana@example.org", &ana), ("bo@example.se", &bo), ("di@example.com", &di)];
+    for (t, (address, _)) in seen.transactions.iter().zip(&people) {
+        assert_eq!(t.rcpt, [format!("RCPT TO:<{address}>")]);
+        assert!(t.headers().contains("smime-type=enveloped-data"), "{}", t.headers());
+        for (other, certs) in &people {
+            assert_eq!(opens(&t.message, certs), other == address, "{address}'s copy, opened by {other}");
+        }
+        assert!(opens(&t.message, &mine), "{address}'s copy, by the sender");
+    }
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 /// Encrypted mail with Bcc through Proton's or a JMAP server's API is
 /// refused before anything is sent, with its own error; without Encrypt,
 /// or without Bcc, the refusal doesn't apply.
