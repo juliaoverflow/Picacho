@@ -724,11 +724,19 @@ enum Action {
     /// Compares the fingerprint in the field with this key's.
     MatchFingerprint(String),
     ExportPublicKeys,
+    /// Saves a revocation certificate for your OpenPGP key with this fingerprint.
+    SaveRevocationCertificate(String),
     /// Settings → General → Reduce motion.
     SetMotion(motion::Motion),
     /// Looks up the OpenPGP key for the address in the field.
     FindKey,
     ImportCertificates,
+    /// Imports the certificates this certs-only S/MIME message carries.
+    ImportCarriedCertificates(String),
+    /// Adds certificate revocation lists (CRL files) for S/MIME.
+    AddCrls,
+    /// Removes the added revocation list with this id.
+    RemoveCrl(String),
     /// Forgets the S/MIME certificate with this fingerprint.
     RemoveCertificate(String),
     /// Answers the invitation in this message.
@@ -6126,6 +6134,7 @@ impl MailApp {
                         details.signature_good = good;
                         details.signature = Some(line);
                     }
+                    details.signers = encryption::listed_signers(&verdict);
                 }
                 Ok(Original::new(details, &raw))
             },
@@ -6484,8 +6493,12 @@ impl MailApp {
             | Action::CheckKey(_)
             | Action::MatchFingerprint(_)
             | Action::ExportPublicKeys
+            | Action::SaveRevocationCertificate(_)
             | Action::FindKey
             | Action::ImportCertificates
+            | Action::ImportCarriedCertificates(_)
+            | Action::AddCrls
+            | Action::RemoveCrl(_)
             | Action::RemoveCertificate(_)) => {
                 self.encryption_action(action, w, cx)
             }

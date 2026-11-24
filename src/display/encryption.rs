@@ -33,6 +33,44 @@ impl KeyExpiry {
     }
 }
 
+/// The signers the message details list one by one: an S/MIME message's,
+/// when it has more than one (RFC 5652 §5.1); with one, the signature
+/// line says it all.
+pub(super) fn listed_signers(verdict: &crate::manage::smime::Verdict) -> Vec<crate::manage::smime::Signer> {
+    if verdict.signers.len() > 1 { verdict.signers.clone() } else { Vec::new() }
+}
+
+/// One signer's result, as the message details list it, and whether it is
+/// good.
+fn signer_result_label(result: crate::manage::smime::SignerResult) -> (&'static str, bool) {
+    use crate::manage::smime::SignerResult;
+    match result {
+        SignerResult::Good => ("Good", true),
+        SignerResult::Untrusted => ("Untrusted: no trusted authority vouches for the certificate", false),
+        SignerResult::Unverified => ("Unverified: the message doesn't include the certificate", false),
+        SignerResult::Revoked => ("Revoked: the certificate was withdrawn", false),
+        SignerResult::Bad => ("Bad: the signature doesn't match", false),
+    }
+}
+
+/// Adds the certificates a certs-only message carries (RFC 8551 §3.6, as
+/// PEM) to others' certificates, as an imported file is. Returns how many
+/// were imported and how many were skipped: a certificate naming no email
+/// address (an authority's, sent along with a person's) is of no use for
+/// mail.
+fn import_carried_certificates(
+    certs: &mut crate::manage::smime::Certificates,
+    carried: &[String],
+) -> (usize, usize) {
+    let mut imported = 0;
+    for pem in carried {
+        if certs.import_certificate(pem.as_bytes()).is_ok() {
+            imported += 1;
+        }
+    }
+    (imported, carried.len() - imported)
+}
+
 /// "expires Mar 3, 2027" or "expired Mar 3, 2025", for a key that does.
 fn expiry_text(expires: Option<i64>) -> Option<String> {
     let at = expires?;
@@ -62,9 +100,10 @@ impl MailApp {
                 .id(SharedString::from(format!("openpgp-key-{fp}")))
                 .role(Role::ListItem)
                 .aria_label(format!(
-                    "{}, {}",
+                    "{}, {}{}",
                     key.users.join(", "),
-                    if key.secret { "your key" } else { "public key" }
+                    if key.secret { "your key" } else { "public key" },
+                    if key.revoked { ", revoked" } else { "" }
                 ))
                 .flex()
                 .items_center()
@@ -99,10 +138,11 @@ impl MailApp {
                         .child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(c.muted))
+                                .text_color(rgb(if key.revoked { c.danger } else { c.muted }))
                                 .truncate()
                                 .child(format!(
-                                    "{}{} · {short}",
+                                    "{}{}{} · {short}",
+                                    if key.revoked { "Revoked · " } else { "" },
                                     expiry_text(key.expires).map(|e| format!("{e} · ")).unwrap_or_default(),
                                     if key.secret {
                                         "Your key"
@@ -114,9 +154,12 @@ impl MailApp {
                                         "Public key"
                                     }
                                 )),
-                        ),
+                        )
+                        .when(key.secret && !key.revoked, |d| {
+                            d.child(self.revocation_certificate_control(&fp, cx))
+                        }),
                 )
-                .when(key.secret, |row| {
+                .when(key.secret && !key.revoked, |row| {
                     // Renewing for "Never" takes the end date away.
                     let label = if self.key_expiry == KeyExpiry::Never {
                         "Remove Expiry"
@@ -313,6 +356,7 @@ impl MailApp {
                     cx,
                 )),
             ))
+            .child(self.crl_setting(cx))
             .when_some(self.key_error.clone(), |page, e| {
                 page.child(
                     div()
@@ -323,6 +367,199 @@ impl MailApp {
                         .child(e),
                 )
             })
+            .into_any_element()
+    }
+
+    /// Under the message details' signature line: each S/MIME signer's
+    /// address and result, one per line.
+    pub(super) fn signer_list(&self, signers: &[crate::manage::smime::Signer]) -> AnyElement {
+        let c = self.colors();
+        div()
+            .id("smime-signers")
+            .debug_selector(|| "smime-signers".into())
+            .role(Role::List)
+            .aria_label("Signers")
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .children(signers.iter().enumerate().map(|(i, signer)| {
+                let (result, good) = signer_result_label(signer.result);
+                div()
+                    .id(("smime-signer", i))
+                    .role(Role::ListItem)
+                    .aria_label(format!("{}: {result}", signer.address))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .min_w_0()
+                    .child(icon_el(if good { "lock" } else { "warning" }, 12., if good { 0x1e8e3e } else { c.danger }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(c.text))
+                            .child(signer.address.clone()),
+                    )
+                    .child(div().min_w_0().truncate().text_color(rgb(c.muted)).child(result))
+            }))
+            .into_any_element()
+    }
+
+    /// Above a certs-only S/MIME message (RFC 8551 §3.6): how many
+    /// certificates it carries, that importing them vouches for nothing,
+    /// and a button to import them.
+    pub(super) fn carried_certificates_card(&self, m: &Mail, cx: &Context<Self>) -> Option<AnyElement> {
+        let count = self.backend.smime_verdict(&m.id)?.certificates.len();
+        if count == 0 {
+            return None;
+        }
+        let c = self.colors();
+        Some(
+            div()
+                .id("smime-carried-certificates")
+                .debug_selector(|| "smime-carried-certificates".into())
+                .role(Role::Region)
+                .aria_label("Certificates in this message")
+                .m_3()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
+                .child(div().font_weight(FontWeight::MEDIUM).child(if count == 1 {
+                    "This message carries 1 certificate".to_owned()
+                } else {
+                    format!("This message carries {count} certificates")
+                }))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child("Imported, they let you write to their owners encrypted. Importing vouches for nothing: anyone can send a certificate, and a signature by one is trusted only when an authority your system trusts issued it."),
+                )
+                .child(div().flex().child(self.button(
+                    "smime-import-carried",
+                    "Import Certificates",
+                    "upload",
+                    Action::ImportCarriedCertificates(m.id.clone()),
+                    false,
+                    cx,
+                )))
+                .into_any_element(),
+        )
+    }
+
+    /// Settings → Encryption → S/MIME: the revocation lists (RFC 5280 §5)
+    /// you added, each removable, and a button to add more.
+    fn crl_setting(&self, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        let lists = self.backend.crl_list();
+        let now = chrono::Utc::now().timestamp();
+        self.setting(
+            "Revocation lists (CRL)",
+            "Lists of withdrawn certificates, as your organization or a certificate authority publishes them (.crl or .pem). Signatures are then checked against them; a copy of each is kept here, so update it by adding the new one.",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .max_w(px(520.))
+                .child(
+                    div()
+                        .id("smime-crls")
+                        .role(Role::List)
+                        .aria_label("Revocation lists")
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(lists.into_iter().map(|list| {
+                            let stale = list.next_update.is_some_and(|t| t < now);
+                            let next = list
+                                .next_update
+                                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                                .map(|t| t.format("%b %-d, %Y").to_string());
+                            let detail = format!(
+                                "{} revoked{}",
+                                list.revoked,
+                                match (next, stale) {
+                                    (Some(d), true) => format!(" · out of date since {d}: add a newer one"),
+                                    (Some(d), false) => format!(" · next update {d}"),
+                                    (None, _) => String::new(),
+                                }
+                            );
+                            let issuer = if list.issuer.is_empty() { "An unnamed issuer".to_owned() } else { list.issuer.clone() };
+                            div()
+                                .id(SharedString::from(format!("smime-crl-{}", list.id)))
+                                .role(Role::ListItem)
+                                .aria_label(format!("{issuer}, {detail}"))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(div().text_size(px(13.)).truncate().child(issuer))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .truncate()
+                                                .text_color(rgb(if stale { c.danger } else { c.muted }))
+                                                .child(detail),
+                                        ),
+                                )
+                                .child(self.button(
+                                    format!("smime-crl-remove-{}", list.id),
+                                    "Remove",
+                                    "trash",
+                                    Action::RemoveCrl(list.id.clone()),
+                                    false,
+                                    cx,
+                                ))
+                        })),
+                )
+                .child(div().flex().child(self.button(
+                    "smime-crl-add",
+                    "Add Revocation Lists…",
+                    "upload",
+                    Action::AddCrls,
+                    false,
+                    cx,
+                ))),
+        )
+        .into_any_element()
+    }
+
+    /// In your key's row: the button saving its revocation certificate, and
+    /// what that certificate does.
+    fn revocation_certificate_control(&self, fp: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        div()
+            .mt_1()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(self.button(
+                format!("openpgp-revocation-{fp}"),
+                "Save Revocation Certificate…",
+                "download",
+                Action::SaveRevocationCertificate(fp.to_owned()),
+                false,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.muted))
+                    .child("Keep it somewhere safe, away from this device. Importing it, here or in any app, revokes this key for good: use it only if the key is lost or someone else may have it."),
+            )
             .into_any_element()
     }
 
@@ -560,6 +797,30 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::SaveRevocationCertificate(fp) => {
+                let ring = self.backend.keyring();
+                // The fingerprint is ASCII hex: its last eight, as a key ID.
+                let short = fp.get(fp.len().saturating_sub(8)..).unwrap_or_default().to_owned();
+                let picker = cx.prompt_for_new_path(
+                    &self.save_start(),
+                    Some(&format!("revocation-certificate-{short}.asc")),
+                );
+                cx.spawn(async move |this, cx| {
+                    let Ok(Ok(Some(path))) = picker.await else {
+                        return;
+                    };
+                    // RFC 9580 §5.2.3.31: made ahead of time, it gives no
+                    // reason ("no reason specified").
+                    let result = ring
+                        .revocation_certificate(&fp, crate::manage::openpgp::keys::RevocationReason::Unspecified, "")
+                        .and_then(|text| Ok(std::fs::write(&path, text)?));
+                    let _ = this.update(cx, |this, cx| match result {
+                        Ok(()) => this.notice("Revocation certificate saved. Keep it somewhere safe.", false, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    });
+                })
+                .detach();
+            }
             Action::FindKey => {
                 let email = self.key_lookup.read(cx).value().trim().to_owned();
                 // A fingerprint (40 or 64 hex digits, spaces allowed): by
@@ -676,6 +937,88 @@ impl MailApp {
                 })
                 .detach();
             }
+            Action::ImportCarriedCertificates(id) => {
+                let Some(m) = self.messages.iter().find(|m| m.id == id).cloned() else {
+                    return;
+                };
+                let Some(a) = self.account_of(&m) else { return };
+                self.task(
+                    cx,
+                    move |b| {
+                        // Changing the certificates forgets what was read
+                        // with them: read again where it was.
+                        let verdict = match b.smime_verdict(&m.id) {
+                            Some(v) => v,
+                            None => {
+                                b.read(&a, &m)?;
+                                b.smime_verdict(&m.id).unwrap_or_default()
+                            }
+                        };
+                        let mut certs = crate::manage::smime::Certificates::clone(&b.certificates());
+                        let (imported, skipped) = import_carried_certificates(&mut certs, &verdict.certificates);
+                        if imported > 0 {
+                            b.set_certificates(certs)?;
+                        }
+                        Ok((imported, skipped))
+                    },
+                    |this, result, cx| match result {
+                        Ok((imported, skipped)) => {
+                            let noun = |n: usize| if n == 1 { "certificate" } else { "certificates" };
+                            let mut text = format!("Imported {imported} {}", noun(imported));
+                            if skipped > 0 {
+                                text.push_str(&format!(
+                                    "; {skipped} {} without an email address (an authority's) left out",
+                                    noun(skipped)
+                                ));
+                            }
+                            this.notice(text, imported == 0, cx)
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
+            Action::AddCrls => {
+                let picker = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: true,
+                    prompt: Some("Add".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    let Ok(Ok(Some(paths))) = picker.await else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        this.key_error = None;
+                        this.task(
+                            cx,
+                            move |b| {
+                                let mut added = 0;
+                                for path in &paths {
+                                    let data = std::fs::read(path)?;
+                                    added += b
+                                        .add_crl_file(&data)
+                                        .with_context(|| format!("{} couldn't be added.", path.display()))?;
+                                }
+                                Ok(added)
+                            },
+                            |this, result, cx| match result {
+                                Ok(n) => this.notice(
+                                    format!("Added {n} revocation {}", if n == 1 { "list" } else { "lists" }),
+                                    false,
+                                    cx,
+                                ),
+                                Err(e) => this.key_error = Some(format!("{e:#}")),
+                            },
+                        );
+                    });
+                })
+                .detach();
+            }
+            Action::RemoveCrl(id) => match self.backend.remove_crl_file(&id) {
+                Ok(()) => self.notice("Revocation list removed", false, cx),
+                Err(e) => self.key_error = Some(format!("{e:#}")),
+            },
             Action::RemoveCertificate(fp) => {
                 let mut certs =
                     crate::manage::smime::Certificates::clone(&self.backend.certificates());
@@ -1030,6 +1373,156 @@ mod tests {
         act(&view, Action::CreateKey, cx);
         cx.run_until_parked();
         assert_eq!(version_made(cx).0, pgp::types::KeyVersion::V6);
+    }
+
+    /// Settings → Encryption: your key's row saves a revocation certificate
+    /// (RFC 9580 §5.2.1.11) to the file chosen; imported through Import
+    /// Keys, it revokes the key, whose row then says so and no longer
+    /// offers one.
+    #[gpui::test]
+    fn revocation_certificates_are_saved_and_imported_from_settings(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Encryption), cx);
+        act(&view, Action::CreateKey, cx);
+        let fp = view.read_with(cx, |this, _| this.backend.keyring().list()[0].fingerprint.clone());
+        let button: &'static str = format!("openpgp-revocation-{fp}").leak();
+        frame(cx);
+        assert!(cx.debug_bounds(button).is_some(), "offered on your key");
+
+        let dir = std::env::temp_dir().join(format!("picacho-revocation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("revoke.asc");
+        act(&view, Action::SaveRevocationCertificate(fp.clone()), cx);
+        let chosen = file.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{saved}");
+        // Saving it changes nothing yet.
+        assert!(!view.read_with(cx, |this, _| this.backend.keyring().list()[0].revoked));
+
+        act(&view, Action::ImportKeys, cx);
+        let chosen = file.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![chosen]));
+        cx.run_until_parked();
+        let keys = view.read_with(cx, |this, _| this.backend.keyring().list());
+        let [key] = keys.as_slice() else { panic!("one key: {keys:?}") };
+        assert!(key.secret && key.revoked, "{key:?}");
+        frame(cx);
+        assert!(cx.debug_bounds(button).is_none(), "nothing more to revoke");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An S/MIME fixture (tests/fixtures/smime/make.sh).
+    fn smime_fixture(name: &str) -> Vec<u8> {
+        let path = format!("{}/tests/fixtures/smime/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Opens a demo message whose source is `raw`, and its details.
+    fn open_with_source(
+        view: &Entity<MailApp>,
+        store: &crate::manage::store::Store,
+        raw: &[u8],
+        cx: &mut gpui::VisualTestContext,
+    ) -> String {
+        let id = view.read_with(cx, |this, _| this.messages[0].id.clone());
+        store.save_raw(&id, raw).unwrap();
+        act(view, Action::Select(id.clone()), cx);
+        act(view, Action::ToggleDetails, cx);
+        for _ in 0..4 {
+            frame(cx);
+            cx.run_until_parked();
+        }
+        id
+    }
+
+    /// RFC 5652 §5.1: a message signed by two lists each signer's address
+    /// and result under the signature line.
+    #[gpui::test]
+    fn each_smime_signer_is_listed_in_the_message_details(cx: &mut gpui::TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        open_with_source(&view, &store, &smime_fixture("two-signers.eml"), cx);
+        let details = view.read_with(cx, |this, _| {
+            this.details.as_ref().and_then(|d| d.result.clone()).unwrap().unwrap().details.clone()
+        });
+        let mut listed: Vec<_> = details.signers.iter().map(|s| (s.address.as_str(), s.result)).collect();
+        listed.sort_by_key(|s| s.0);
+        // The fixtures' authority isn't one the system trusts.
+        use crate::manage::smime::SignerResult::Untrusted;
+        assert_eq!(listed, [("ana@example.org", Untrusted), ("bo@example.se", Untrusted)]);
+        assert!(details.signature.is_some());
+        assert!(cx.debug_bounds("smime-signers").is_some(), "listed under the signature");
+    }
+
+    /// RFC 8551 §3.6: a certs-only message shows how many certificates it
+    /// carries; Import Certificates adds them as others', leaving out the
+    /// authority's, which names no address.
+    #[gpui::test]
+    fn certs_only_messages_offer_their_certificates(cx: &mut gpui::TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        let id = open_with_source(&view, &store, &smime_fixture("certs-only.eml"), cx);
+        assert!(cx.debug_bounds("smime-carried-certificates").is_some(), "the note is shown");
+        assert!(view.read_with(cx, |this, _| this.backend.certificates().list().is_empty()));
+        act(&view, Action::ImportCarriedCertificates(id), cx);
+        let (listed, status) =
+            view.read_with(cx, |this, _| (this.backend.certificates().list(), this.status.clone()));
+        let [ana] = listed.as_slice() else { panic!("one certificate: {listed:?}") };
+        assert!(!ana.own && ana.emails == ["ana@example.org"]);
+        assert!(status.starts_with("Imported 1 certificate; 1 certificate"), "{status}");
+    }
+
+    /// Settings → Encryption → S/MIME: revocation lists are added from
+    /// files, listed, and removed.
+    #[gpui::test]
+    fn revocation_lists_are_added_and_removed_in_settings(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Encryption), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("smime-crl-add").is_some());
+        act(&view, Action::AddCrls, cx);
+        let file = std::path::PathBuf::from(format!("{}/tests/fixtures/smime/crl-bo-revoked.pem", env!("CARGO_MANIFEST_DIR")));
+        cx.simulate_path_prompt_response(move |_| Some(vec![file]));
+        cx.run_until_parked();
+        let (lists, files) = view.read_with(cx, |this, _| (this.backend.crl_list(), this.backend.crl_files()));
+        let [list] = lists.as_slice() else { panic!("one list: {lists:?}") };
+        assert_eq!((list.issuer.as_str(), list.revoked), ("Picacho Test CA", 1));
+        assert_eq!(files.len(), 1);
+        let remove: &'static str = format!("smime-crl-remove-{}", list.id).leak();
+        frame(cx);
+        assert!(cx.debug_bounds(remove).is_some(), "listed with a Remove button");
+        act(&view, Action::RemoveCrl(list.id.clone()), cx);
+        assert!(view.read_with(cx, |this, _| this.backend.crl_files().is_empty()));
+        frame(cx);
+        assert!(cx.debug_bounds(remove).is_none());
+    }
+
+    #[test]
+    fn carried_certificates_are_imported_as_others() {
+        let pem = |name: &str| String::from_utf8(smime_fixture(name)).unwrap();
+        let mut certs = crate::manage::smime::Certificates::default();
+        let carried = [pem("ana.pem"), pem("ca.pem"), pem("bo.pem")];
+        assert_eq!(import_carried_certificates(&mut certs, &carried), (2, 1));
+        assert!(certs.own.is_empty() && certs.others.len() == 2);
+        assert!(certs.has_cert("bo@example.se"));
+    }
+
+    /// One signer: the signature line says it all, with no list.
+    #[test]
+    fn signers_are_listed_only_when_there_are_several() {
+        use crate::manage::smime::{Signer, SignerResult, Verdict};
+        let signer = |address: &str, result| Signer { address: address.into(), result };
+        let mut verdict = Verdict { signers: vec![signer("ana@example.org", SignerResult::Good)], ..Verdict::default() };
+        assert!(listed_signers(&verdict).is_empty());
+        verdict.signers.push(signer("bo@example.se", SignerResult::Revoked));
+        assert_eq!(listed_signers(&verdict), verdict.signers);
+        assert_eq!(signer_result_label(SignerResult::Good), ("Good", true));
+        for result in [SignerResult::Untrusted, SignerResult::Unverified, SignerResult::Revoked, SignerResult::Bad] {
+            let (label, good) = signer_result_label(result);
+            assert!(!good && label.starts_with(&format!("{result:?}")), "{label}");
+        }
     }
 
     #[test]

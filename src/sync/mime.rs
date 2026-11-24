@@ -879,6 +879,9 @@ pub struct Details {
     pub signature: Option<String>,
     /// Whether that signature checked out.
     pub signature_good: bool,
+    /// An S/MIME message's signers, each with its own result (RFC 5652
+    /// §5.1 lets one message carry several), when there is more than one.
+    pub signers: Vec<crate::manage::smime::Signer>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
