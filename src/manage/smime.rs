@@ -10,6 +10,7 @@
 use crate::manage::store;
 mod capabilities;
 mod der;
+pub mod revocation;
 pub use capabilities::learn_capabilities;
 use anyhow::{Context, Result, bail, ensure};
 use openssl::cms::{CMSOptions, CmsContentInfo};
