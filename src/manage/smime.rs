@@ -11,7 +11,6 @@ use crate::manage::store;
 mod der;
 use anyhow::{Context, Result, bail, ensure};
 use openssl::cms::{CMSOptions, CmsContentInfo};
-use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
 use openssl::pkey::{PKey, Private};
 use openssl::stack::Stack;
 use openssl::symm::Cipher;
@@ -425,23 +424,6 @@ fn split(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (bytes(&part), bytes(&outer))
 }
 
-/// `to_smime`'s output with CRLF line ends, without its MIME-Version line
-/// (the message keeps its own).
-fn as_part(smime: Vec<u8>) -> Vec<u8> {
-    // One char per byte (Latin-1), so every byte comes back as it was: as
-    // UTF-8, signed text in another charset was changed after signing, and
-    // its signature then failed for everyone.
-    let text: String = smime.iter().map(|&b| b as char).collect();
-    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
-    text.lines()
-        .skip_while(|l| l.starts_with("MIME-Version"))
-        .collect::<Vec<_>>()
-        .join("\r\n")
-        .chars()
-        .map(|c| c as u8)
-        .collect()
-}
-
 /// OIDs' content octets for the signing writer.
 mod oids {
     /// RFC 5652 §5.1, §11.1, §11.2, §11.3; RFC 8551 §2.5.2.
@@ -791,14 +773,54 @@ pub fn protect_with(
         if let Some((cert, _, _)) = &own {
             recipients.push(cert.clone())?;
         }
-        let flags = Pkcs7Flags::BINARY;
-        let enveloped = Pkcs7::encrypt(&recipients, &content, Cipher::aes_256_cbc(), flags)?;
-        content = as_part(enveloped.to_smime(&content, flags)?);
+        content = encrypt_part(&recipients, &content, ContentCipher::Aes256Cbc)?;
     }
     let mut out = outer;
     out.extend_from_slice(b"MIME-Version: 1.0\r\n");
     out.extend_from_slice(&content);
     if !out.ends_with(b"\r\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    Ok(out)
+}
+
+/// RFC 8551 §2.7: the content-encryption algorithm a message is sent with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentCipher {
+    /// AES-256 CBC (RFC 3565), as EnvelopedData (RFC 5652 §6).
+    Aes256Cbc,
+    /// AES-256 GCM (RFC 5084), as AuthEnvelopedData (RFC 5083).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Aes256Gcm,
+}
+
+/// Encrypts `content` (a MIME part, CRLF line ends) to `recipients` as an
+/// application/pkcs7-mime part (RFC 8551 §3.3, §3.4). CMS_encrypt gives
+/// each RSA certificate a KeyTransRecipientInfo (RFC 5652 §6.2.1) and each
+/// EC one a KeyAgreeRecipientInfo, ECDH as RFC 5753 §3.1 describes; an
+/// AEAD cipher (AES-GCM) makes the result AuthEnvelopedData (RFC 5083),
+/// which OpenSSL does from 3.0 on. Pkcs7::encrypt, used before, could only
+/// encrypt to RSA certificates.
+fn encrypt_part(recipients: &Stack<X509>, content: &[u8], cipher: ContentCipher) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let (openssl_cipher, smime_type) = match cipher {
+        ContentCipher::Aes256Cbc => (Cipher::aes_256_cbc(), "enveloped-data"),
+        ContentCipher::Aes256Gcm => (Cipher::aes_256_gcm(), "authEnveloped-data"),
+    };
+    // BINARY: the content is already canonical (RFC 8551 §3.1.1), so its
+    // line ends aren't translated again.
+    let enveloped = CmsContentInfo::encrypt(recipients, content, openssl_cipher, CMSOptions::BINARY)
+        .context("The message couldn't be encrypted with S/MIME.")?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(enveloped.to_der()?);
+    // RFC 8551 §3.2.1, §3.2.2: the smime-type names the CMS type, and the
+    // name and filename end in .p7m.
+    let mut out = format!(
+        "Content-Type: application/pkcs7-mime; smime-type={smime_type}; name=\"smime.p7m\"\r\n\
+         Content-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"smime.p7m\"\r\n\r\n"
+    )
+    .into_bytes();
+    for line in encoded.as_bytes().chunks(64) {
+        out.extend_from_slice(line);
         out.extend_from_slice(b"\r\n");
     }
     Ok(out)
@@ -1380,6 +1402,7 @@ pub fn test_identity(email: &str, password: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
 
     const MESSAGE: &[u8] = b"From: Ana <ana@example.org>\r\nTo: bo@example.se\r\nSubject: Plans\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
 
@@ -2103,15 +2126,132 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), names(head).len(), "no field twice");
-        // Encrypted to Ana's own (RSA) certificate: Pkcs7::encrypt, which
-        // sending uses, can't encrypt to Bo's EC one.
-        let encrypted = protect_with(&ana, WITH_BCC, "ana@example.org", &[], true, true).unwrap();
-        let (readable, verdict, _) = open_with(&encrypted, &ana, &test_authority()).unwrap();
+        // Encrypted to Bo's EC certificate (ECDH, RFC 5753) and Ana's own
+        // RSA one: CMS_encrypt, which sending uses, takes both.
+        let mut ana = ana;
+        ana.others.push(String::from_utf8(fixture("bo.pem")).unwrap());
+        let encrypted =
+            protect_with(&ana, WITH_BCC, "ana@example.org", &["bo@example.se".into()], true, true).unwrap();
+        for reader in [&bo, &ana] {
+            let (readable, verdict, _) = open_with(&encrypted, reader, &test_authority()).unwrap();
+            assert!(verdict.decrypted);
+            assert_eq!(verdict.signature, Signature::Good("ana@example.org".into()));
+            let text = String::from_utf8_lossy(&readable);
+            assert!(!text.contains("HP-Outer") && !text.contains("hp=\"cipher\"; hp"), "{text}");
+            let parsed = mailparse::parse_mail(&readable).unwrap();
+            assert_eq!(parsed.get_body().unwrap().trim(), "Meet at noon.");
+        }
+    }
+
+    /// Runs `openssl cms -decrypt` on `message` with the fixture `who`'s
+    /// certificate and key, under a deadline: what it decrypted, or `None`
+    /// where it couldn't.
+    fn openssl_cli_decrypts(message: &[u8], who: &str) -> Option<String> {
+        let dir = std::env::temp_dir().join(format!("picacho-smime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("encrypted.eml");
+        std::fs::write(&path, message).unwrap();
+        let fixtures = format!("{}/tests/fixtures/smime", env!("CARGO_MANIFEST_DIR"));
+        let output = std::process::Command::new("timeout")
+            .args(["30", "openssl", "cms", "-decrypt", "-in"])
+            .arg(&path)
+            .args(["-recip", &format!("{fixtures}/{who}.pem"), "-inkey", &format!("{fixtures}/{who}.key")])
+            .stderr(std::process::Stdio::null())
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let output = output.ok().filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// RFC 8551 §3.3 with RFC 5753's ECDH: mail encrypted to an EC
+    /// recipient (Bo), an RSA one (Ana) and both opens for each recipient,
+    /// here and with `openssl cms -decrypt`, and for no one else.
+    #[test]
+    fn encrypted_mail_opens_for_ec_rsa_and_mixed_recipients() {
+        // A sender with no identity of their own, so only the recipients'
+        // certificates are encrypted to.
+        let sender = Certificates {
+            others: vec![
+                String::from_utf8(fixture("ana.pem")).unwrap(),
+                String::from_utf8(fixture("bo.pem")).unwrap(),
+            ],
+            ..Certificates::default()
+        };
+        for (to, readers, outsiders) in [
+            (vec!["bo@example.se"], vec!["bo"], vec!["ana"]),
+            (vec!["ana@example.org"], vec!["ana"], vec!["bo"]),
+            (vec!["ana@example.org", "bo@example.se"], vec!["ana", "bo"], vec![]),
+        ] {
+            let to: Vec<String> = to.into_iter().map(String::from).collect();
+            let sent = protect_with(&sender, MESSAGE, "cy@example.com", &to, false, true).unwrap();
+            let text = String::from_utf8_lossy(&sent);
+            assert!(
+                text.contains("Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name=\"smime.p7m\"")
+                    && !text.contains("Meet at noon"),
+                "{text}"
+            );
+            for who in &readers {
+                let (readable, verdict, _) = open_with(&sent, &fixture_identity(who), &test_authority()).unwrap();
+                assert!(verdict.decrypted, "{to:?}: {who}");
+                let parsed = mailparse::parse_mail(&readable).unwrap();
+                assert_eq!(parsed.get_body().unwrap().trim(), "Meet at noon.", "{to:?}: {who}");
+                let cli = openssl_cli_decrypts(&sent, who).unwrap_or_else(|| panic!("{to:?}: openssl, {who}"));
+                assert!(cli.contains("Meet at noon.") && cli.contains("hp=\"cipher\""), "{cli}");
+            }
+            for who in &outsiders {
+                assert!(open_with(&sent, &fixture_identity(who), &test_authority()).is_none(), "{to:?}: {who}");
+                assert!(openssl_cli_decrypts(&sent, who).is_none(), "{to:?}: openssl, {who}");
+            }
+        }
+    }
+
+    /// RFC 8551 §3.4 and RFC 5083: with AES-256 GCM, CMS_encrypt writes
+    /// AuthEnvelopedData, sent as authEnveloped-data, which opens for an
+    /// RSA and an EC recipient, here and with `openssl cms -decrypt`.
+    #[test]
+    fn aes_gcm_encryption_writes_auth_enveloped_data() {
+        let mut recipients = Stack::new().unwrap();
+        recipients.push(X509::from_pem(&fixture("ana.pem")).unwrap()).unwrap();
+        recipients.push(X509::from_pem(&fixture("bo.pem")).unwrap()).unwrap();
+        let part = b"Content-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
+        let encrypted = encrypt_part(&recipients, part, ContentCipher::Aes256Gcm).unwrap();
+        let text = String::from_utf8_lossy(&encrypted);
+        assert!(text.starts_with("Content-Type: application/pkcs7-mime; smime-type=authEnveloped-data;"), "{text}");
+        let message = [b"From: ana@example.org\r\nMIME-Version: 1.0\r\n".as_slice(), &encrypted].concat();
+        let der = CmsContentInfo::smime_read_cms(&message).unwrap().to_der().unwrap();
+        // RFC 5083 §1.1: id-ct-authEnvelopedData, 1.2.840.113549.1.9.16.1.23.
+        let auth_enveloped: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x17];
+        assert_eq!(der::content_info(&der).unwrap().0, auth_enveloped);
+        for who in ["ana", "bo"] {
+            let (readable, verdict, _) = open_with(&message, &fixture_identity(who), &test_authority()).unwrap();
+            assert!(verdict.decrypted && String::from_utf8_lossy(&readable).contains("Meet at noon."), "{who}");
+            assert!(openssl_cli_decrypts(&message, who).is_some_and(|t| t.contains("Meet at noon.")), "{who}");
+        }
+        // AES-256 CBC: EnvelopedData (RFC 5652 §6), id-envelopedData.
+        let encrypted = encrypt_part(&recipients, part, ContentCipher::Aes256Cbc).unwrap();
+        let message = [b"MIME-Version: 1.0\r\n".as_slice(), &encrypted].concat();
+        let der = CmsContentInfo::smime_read_cms(&message).unwrap().to_der().unwrap();
+        let enveloped: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x03];
+        assert_eq!(der::content_info(&der).unwrap().0, enveloped);
+    }
+
+    /// Mail Picacho sent before, with Pkcs7::encrypt (EnvelopedData, RSA
+    /// key transport, AES-256 CBC), still opens.
+    #[test]
+    fn mail_encrypted_with_pkcs7_encrypt_still_opens() {
+        let mut recipients = Stack::new().unwrap();
+        recipients.push(X509::from_pem(&fixture("ana.pem")).unwrap()).unwrap();
+        let part = b"Content-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
+        let flags = Pkcs7Flags::BINARY;
+        let enveloped = Pkcs7::encrypt(&recipients, part, Cipher::aes_256_cbc(), flags).unwrap();
+        let message = [
+            b"From: Ana <ana@example.org>\r\nTo: bo@example.se\r\n".as_slice(),
+            &enveloped.to_smime(part, flags).unwrap(),
+        ]
+        .concat();
+        let (readable, verdict, _) = open_with(&message, &fixture_identity("ana"), &test_authority()).unwrap();
         assert!(verdict.decrypted);
-        let text = String::from_utf8_lossy(&readable);
-        assert!(!text.contains("HP-Outer") && !text.contains("hp=\"cipher\"; hp"), "{text}");
-        let parsed = mailparse::parse_mail(&readable).unwrap();
-        assert_eq!(parsed.get_body().unwrap().trim(), "Meet at noon.");
+        assert!(String::from_utf8_lossy(&readable).contains("Meet at noon."));
     }
 
     /// RFC 9788 §4.4.2, as for OpenPGP: a protected From for another
