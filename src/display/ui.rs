@@ -1099,11 +1099,11 @@ enum Action {
     Discover,
     SetupBack,
     RetrySignIn,
-    /// Types an API token or app password instead of signing in with the
-    /// browser (true), or goes back to the browser (false).
+    /// Types the service's API token (Fastmail) or app password (Google)
+    /// instead of signing in with the browser (true), or goes back (false).
     UseToken(bool),
-    /// Sign In Again with an API token or app password instead of the
-    /// browser (true), or with the browser again (false).
+    /// Sign In Again with the service's API token or app password instead
+    /// of the browser (true), or with the browser again (false).
     ReconnectWithToken(bool),
     Manual,
     Finish,

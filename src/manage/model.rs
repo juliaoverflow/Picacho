@@ -118,11 +118,11 @@ impl Service {
             _ => SignIn::Password,
         }
     }
-    /// What can be typed instead of signing in with the browser, where the
-    /// service takes one: Fastmail's API token (JMAP Bearer), and Google's
-    /// and Microsoft's app passwords (IMAP and SMTP). `None` where the
-    /// browser is the only way in (Pinal), or where sign-in isn't the
-    /// browser's to begin with.
+    /// What can be typed instead of signing in with the browser, named as
+    /// the service names it: Fastmail's API token (JMAP Bearer), Google's
+    /// app password (IMAP and SMTP). `None` where the browser is the only
+    /// way in: Pinal, and Microsoft, which is retiring app passwords for
+    /// most accounts and whose work accounts usually refuse them.
     pub fn token_instead(self) -> Option<&'static str> {
         self.token_offer(self.sign_in() == SignIn::Browser)
     }
@@ -134,7 +134,7 @@ impl Service {
         }
         match self {
             Self::Fastmail => Some("API token"),
-            Self::Gmail | Self::Outlook => Some("app password"),
+            Self::Gmail => Some("app password"),
             _ => None,
         }
     }
@@ -1759,15 +1759,14 @@ pub fn demo_mail() -> Vec<Mail> {
 
 #[cfg(test)]
 mod tests {
-    /// Where the browser is how a service signs in, an API token (Fastmail,
-    /// JMAP) or app password (Google, Microsoft: IMAP and SMTP) is offered
-    /// instead; nothing for services without one, or that are typed already.
+    /// Where the browser is how a service signs in, Fastmail offers an API
+    /// token and Google an app password instead; Microsoft and services
+    /// without one, or typed already, offer nothing.
     #[test]
     fn tokens_are_offered_instead_of_the_browser_where_taken() {
         assert_eq!(Service::Fastmail.token_offer(true), Some("API token"));
         assert_eq!(Service::Gmail.token_offer(true), Some("app password"));
-        assert_eq!(Service::Outlook.token_offer(true), Some("app password"));
-        for none in [Service::Pinal, Service::ICloud, Service::Zoho, Service::Proton, Service::Other] {
+        for none in [Service::Outlook, Service::Pinal, Service::ICloud, Service::Zoho, Service::Proton, Service::Other] {
             assert_eq!(none.token_offer(true), None, "{none:?}");
         }
         // Without browser sign-in in this build, the token is the only way,
