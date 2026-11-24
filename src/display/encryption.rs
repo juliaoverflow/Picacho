@@ -33,6 +33,26 @@ impl KeyExpiry {
     }
 }
 
+/// The signers the message details list one by one: an S/MIME message's,
+/// when it has more than one (RFC 5652 §5.1); with one, the signature
+/// line says it all.
+pub(super) fn listed_signers(verdict: &crate::manage::smime::Verdict) -> Vec<crate::manage::smime::Signer> {
+    if verdict.signers.len() > 1 { verdict.signers.clone() } else { Vec::new() }
+}
+
+/// One signer's result, as the message details list it, and whether it is
+/// good.
+fn signer_result_label(result: crate::manage::smime::SignerResult) -> (&'static str, bool) {
+    use crate::manage::smime::SignerResult;
+    match result {
+        SignerResult::Good => ("Good", true),
+        SignerResult::Untrusted => ("Untrusted: no trusted authority vouches for the certificate", false),
+        SignerResult::Unverified => ("Unverified: the message doesn't include the certificate", false),
+        SignerResult::Revoked => ("Revoked: the certificate was withdrawn", false),
+        SignerResult::Bad => ("Bad: the signature doesn't match", false),
+    }
+}
+
 /// "expires Mar 3, 2027" or "expired Mar 3, 2025", for a key that does.
 fn expiry_text(expires: Option<i64>) -> Option<String> {
     let at = expires?;
@@ -327,6 +347,41 @@ impl MailApp {
                         .child(e),
                 )
             })
+            .into_any_element()
+    }
+
+    /// Under the message details' signature line: each S/MIME signer's
+    /// address and result, one per line.
+    pub(super) fn signer_list(&self, signers: &[crate::manage::smime::Signer]) -> AnyElement {
+        let c = self.colors();
+        div()
+            .id("smime-signers")
+            .debug_selector(|| "smime-signers".into())
+            .role(Role::List)
+            .aria_label("Signers")
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .children(signers.iter().enumerate().map(|(i, signer)| {
+                let (result, good) = signer_result_label(signer.result);
+                div()
+                    .id(("smime-signer", i))
+                    .role(Role::ListItem)
+                    .aria_label(format!("{}: {result}", signer.address))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .min_w_0()
+                    .child(icon_el(if good { "lock" } else { "warning" }, 12., if good { 0x1e8e3e } else { c.danger }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(c.text))
+                            .child(signer.address.clone()),
+                    )
+                    .child(div().min_w_0().truncate().text_color(rgb(c.muted)).child(result))
+            }))
             .into_any_element()
     }
 
@@ -1046,6 +1101,64 @@ mod tests {
         frame(cx);
         assert!(cx.debug_bounds(button).is_none(), "nothing more to revoke");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An S/MIME fixture (tests/fixtures/smime/make.sh).
+    fn smime_fixture(name: &str) -> Vec<u8> {
+        let path = format!("{}/tests/fixtures/smime/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Opens a demo message whose source is `raw`, and its details.
+    fn open_with_source(
+        view: &Entity<MailApp>,
+        store: &crate::manage::store::Store,
+        raw: &[u8],
+        cx: &mut gpui::VisualTestContext,
+    ) -> String {
+        let id = view.read_with(cx, |this, _| this.messages[0].id.clone());
+        store.save_raw(&id, raw).unwrap();
+        act(view, Action::Select(id.clone()), cx);
+        act(view, Action::ToggleDetails, cx);
+        for _ in 0..4 {
+            frame(cx);
+            cx.run_until_parked();
+        }
+        id
+    }
+
+    /// RFC 5652 §5.1: a message signed by two lists each signer's address
+    /// and result under the signature line.
+    #[gpui::test]
+    fn each_smime_signer_is_listed_in_the_message_details(cx: &mut gpui::TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        open_with_source(&view, &store, &smime_fixture("two-signers.eml"), cx);
+        let details = view.read_with(cx, |this, _| {
+            this.details.as_ref().and_then(|d| d.result.clone()).unwrap().unwrap().details.clone()
+        });
+        let mut listed: Vec<_> = details.signers.iter().map(|s| (s.address.as_str(), s.result)).collect();
+        listed.sort_by_key(|s| s.0);
+        // The fixtures' authority isn't one the system trusts.
+        use crate::manage::smime::SignerResult::Untrusted;
+        assert_eq!(listed, [("ana@example.org", Untrusted), ("bo@example.se", Untrusted)]);
+        assert!(details.signature.is_some());
+        assert!(cx.debug_bounds("smime-signers").is_some(), "listed under the signature");
+    }
+
+    /// One signer: the signature line says it all, with no list.
+    #[test]
+    fn signers_are_listed_only_when_there_are_several() {
+        use crate::manage::smime::{Signer, SignerResult, Verdict};
+        let signer = |address: &str, result| Signer { address: address.into(), result };
+        let mut verdict = Verdict { signers: vec![signer("ana@example.org", SignerResult::Good)], ..Verdict::default() };
+        assert!(listed_signers(&verdict).is_empty());
+        verdict.signers.push(signer("bo@example.se", SignerResult::Revoked));
+        assert_eq!(listed_signers(&verdict), verdict.signers);
+        assert_eq!(signer_result_label(SignerResult::Good), ("Good", true));
+        for result in [SignerResult::Untrusted, SignerResult::Unverified, SignerResult::Revoked, SignerResult::Bad] {
+            let (label, good) = signer_result_label(result);
+            assert!(!good && label.starts_with(&format!("{result:?}")), "{label}");
+        }
     }
 
     #[test]

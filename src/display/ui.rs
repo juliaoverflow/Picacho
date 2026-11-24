@@ -6123,6 +6123,7 @@ impl MailApp {
                         details.signature_good = good;
                         details.signature = Some(line);
                     }
+                    details.signers = encryption::listed_signers(&verdict);
                 }
                 Ok(Original::new(details, &raw))
             },

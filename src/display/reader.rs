@@ -1279,6 +1279,9 @@ impl MailApp {
                         .into_any_element(),
                     );
                 }
+                if !d.signers.is_empty() {
+                    panel_rows.push(row("signers:", self.signer_list(&d.signers)).into_any_element());
+                }
                 let checks: Vec<(&str, &Option<String>)> =
                     vec![("SPF", &d.spf), ("DKIM", &d.dkim), ("DMARC", &d.dmarc)];
                 if !d.checked {
