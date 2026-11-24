@@ -82,6 +82,9 @@ pub struct KeyInfo {
     /// When the key expires (or expired), as seconds since 1970; `None`
     /// when it never does (see `keys::expires`).
     pub expires: Option<i64>,
+    /// The key carries a Key Revocation signature (RFC 9580 §5.2.1.11):
+    /// it is no longer encrypted to nor trusted (see `key_for`).
+    pub revoked: bool,
 }
 
 /// What a message's OpenPGP protection turned out to be when read.
@@ -235,6 +238,7 @@ impl Keyring {
                     found: false,
                     verified: true,
                     expires: keys::expires(&public),
+                    revoked: !public.details.revocation_signatures.is_empty(),
                 }
             })
             .collect();
@@ -246,6 +250,7 @@ impl Keyring {
             let fp = fingerprint(&k);
             out.push(KeyInfo {
                 expires: keys::expires(&k),
+                revoked: !k.details.revocation_signatures.is_empty(),
                 found: self.found.contains(&fp),
                 verified: !self.found.contains(&fp) || self.checked(&fp),
                 fingerprint: fp,
@@ -288,6 +293,12 @@ impl Keyring {
                 let key = key.context("That public key couldn't be read.")?;
                 key.verify_bindings()
                     .context("That key's signatures don't check out.")?;
+                // A revocation certificate for one of your own keys goes
+                // onto that key, rather than beside it as someone's.
+                if self.revoke_own(&key)? {
+                    added += 1;
+                    continue;
+                }
                 let fp = fingerprint(&key);
                 // The same key again: merged with what was kept, so a copy
                 // from elsewhere never drops a revocation or a user id.

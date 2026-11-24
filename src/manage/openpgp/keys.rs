@@ -64,7 +64,6 @@ fn revocation_signature(key: &SignedSecretKey, reason: RevocationReason, text: &
 /// and merges the revocation into the copy it has. Publishing it, or
 /// sending it to the people who have the key, marks the key revoked for
 /// them; made ahead of time, it can be kept to use if the key is lost.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn revocation_certificate(key: &SignedSecretKey, reason: RevocationReason, text: &str) -> Result<String> {
     let mut public = SignedPublicKey::from(key.clone());
     public.details.revocation_signatures.push(revocation_signature(key, reason, text)?);
@@ -255,11 +254,9 @@ impl Keyring {
         self.secret[at] = set_expiry(&key, lasts)?.to_armored_string(ArmorOptions::default())?;
         Ok(())
     }
-    // Backend-only until the UI calls it:
     /// A revocation certificate (see `revocation_certificate`) for your key
     /// with fingerprint `fp`. The keyring itself is unchanged: the key is
     /// revoked once the certificate is imported.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn revocation_certificate(&self, fp: &str, reason: RevocationReason, text: &str) -> Result<String> {
         let key = self
             .secret_keys()
@@ -267,6 +264,32 @@ impl Keyring {
             .find(|k| fingerprint(&SignedPublicKey::from(k.clone())) == fp)
             .context("That isn't one of your keys.")?;
         revocation_certificate(&key, reason, text)
+    }
+    /// Where `public` (its signatures already verified) is one of your own
+    /// keys carrying Key Revocation signatures (RFC 9580 §5.2.1.11), as a
+    /// revocation certificate does: adds them to your secret key, which
+    /// then lists as revoked and is no longer encrypted to. Returns whether
+    /// it was one of yours; a copy of your key without revocations isn't
+    /// taken here.
+    pub(super) fn revoke_own(&mut self, public: &SignedPublicKey) -> Result<bool> {
+        use pgp::composed::Deserializable as _;
+        if public.details.revocation_signatures.is_empty() {
+            return Ok(false);
+        }
+        let fp = fingerprint(public);
+        let Some((at, mut key)) = self.secret.iter().enumerate().find_map(|(at, k)| {
+            let (k, _) = SignedSecretKey::from_string(k).ok()?;
+            (fingerprint(&SignedPublicKey::from(k.clone())) == fp).then_some((at, k))
+        }) else {
+            return Ok(false);
+        };
+        for signature in &public.details.revocation_signatures {
+            if !key.details.revocation_signatures.contains(signature) {
+                key.details.revocation_signatures.push(signature.clone());
+            }
+        }
+        self.secret[at] = key.to_armored_string(ArmorOptions::default())?;
+        Ok(true)
     }
 }
 
@@ -323,6 +346,37 @@ mod tests {
         assert_eq!(bos.list().len(), 2);
         assert!(bos.key_for("ana@example.org").is_none());
         assert_eq!(open(&signed, &bos).unwrap().1.signature, Signature::UnknownKey);
+    }
+
+    /// RFC 9580 §5.2.1.11: a revocation certificate imported where the
+    /// secret key is goes onto it, and the key lists as revoked, in the
+    /// keyring that made it as in one that has the public key alone.
+    #[test]
+    fn imported_revocation_certificates_revoke_your_own_key_and_list_it() {
+        let mut ring = Keyring::default();
+        let fp = ring.create("Ana", "ana@example.org", None).unwrap();
+        assert!(!ring.list()[0].revoked);
+        let certificate = ring.revocation_certificate(&fp, RevocationReason::Unspecified, "").unwrap();
+        let mut bos = Keyring::default();
+        let public = SignedPublicKey::from(ring.own_key("ana@example.org").unwrap());
+        bos.import(&public.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+        assert!(!bos.list()[0].revoked);
+
+        assert_eq!(ring.import(&certificate, "").unwrap(), 1);
+        let [listed]: [_; 1] = ring.list().try_into().unwrap_or_else(|l| panic!("one key: {l:?}"));
+        assert!(listed.secret && listed.revoked, "{listed:?}");
+        assert!(ring.public.is_empty(), "not kept again as someone else's");
+        assert!(ring.key_for("ana@example.org").is_none());
+        // Exported, your public key now carries the revocation.
+        let exported = SignedPublicKey::from(ring.secret_keys().remove(0));
+        assert_eq!(exported.details.revocation_signatures.len(), 1);
+        exported.verify_bindings().unwrap();
+        // Imported twice, it is there once.
+        ring.import(&certificate, "").unwrap();
+        assert_eq!(SignedPublicKey::from(ring.secret_keys().remove(0)).details.revocation_signatures.len(), 1);
+
+        bos.import(&certificate, "").unwrap();
+        assert!(bos.list()[0].revoked && !bos.list()[0].secret);
     }
 
     /// A key as `test_key` makes them, but made `days` ago.

@@ -62,9 +62,10 @@ impl MailApp {
                 .id(SharedString::from(format!("openpgp-key-{fp}")))
                 .role(Role::ListItem)
                 .aria_label(format!(
-                    "{}, {}",
+                    "{}, {}{}",
                     key.users.join(", "),
-                    if key.secret { "your key" } else { "public key" }
+                    if key.secret { "your key" } else { "public key" },
+                    if key.revoked { ", revoked" } else { "" }
                 ))
                 .flex()
                 .items_center()
@@ -99,10 +100,11 @@ impl MailApp {
                         .child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(c.muted))
+                                .text_color(rgb(if key.revoked { c.danger } else { c.muted }))
                                 .truncate()
                                 .child(format!(
-                                    "{}{} · {short}",
+                                    "{}{}{} · {short}",
+                                    if key.revoked { "Revoked · " } else { "" },
                                     expiry_text(key.expires).map(|e| format!("{e} · ")).unwrap_or_default(),
                                     if key.secret {
                                         "Your key"
@@ -114,9 +116,12 @@ impl MailApp {
                                         "Public key"
                                     }
                                 )),
-                        ),
+                        )
+                        .when(key.secret && !key.revoked, |d| {
+                            d.child(self.revocation_certificate_control(&fp, cx))
+                        }),
                 )
-                .when(key.secret, |row| {
+                .when(key.secret && !key.revoked, |row| {
                     // Renewing for "Never" takes the end date away.
                     let label = if self.key_expiry == KeyExpiry::Never {
                         "Remove Expiry"
@@ -322,6 +327,35 @@ impl MailApp {
                         .child(e),
                 )
             })
+            .into_any_element()
+    }
+
+    /// In your key's row: the button saving its revocation certificate, and
+    /// what that certificate does.
+    fn revocation_certificate_control(&self, fp: &str, cx: &Context<Self>) -> AnyElement {
+        let c = self.colors();
+        div()
+            .mt_1()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(self.button(
+                format!("openpgp-revocation-{fp}"),
+                "Save Revocation Certificate…",
+                "download",
+                Action::SaveRevocationCertificate(fp.to_owned()),
+                false,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.))
+                    .text_size(px(11.))
+                    .text_color(rgb(c.muted))
+                    .child("Keep it somewhere safe, away from this device. Importing it, here or in any app, revokes this key for good: use it only if the key is lost or someone else may have it."),
+            )
             .into_any_element()
     }
 
@@ -552,6 +586,30 @@ impl MailApp {
                     let result = std::fs::write(&path, text);
                     let _ = this.update(cx, |this, cx| match result {
                         Ok(()) => this.notice("Public key saved", false, cx),
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    });
+                })
+                .detach();
+            }
+            Action::SaveRevocationCertificate(fp) => {
+                let ring = self.backend.keyring();
+                // The fingerprint is ASCII hex: its last eight, as a key ID.
+                let short = fp.get(fp.len().saturating_sub(8)..).unwrap_or_default().to_owned();
+                let picker = cx.prompt_for_new_path(
+                    &self.save_start(),
+                    Some(&format!("revocation-certificate-{short}.asc")),
+                );
+                cx.spawn(async move |this, cx| {
+                    let Ok(Ok(Some(path))) = picker.await else {
+                        return;
+                    };
+                    // RFC 9580 §5.2.3.31: made ahead of time, it gives no
+                    // reason ("no reason specified").
+                    let result = ring
+                        .revocation_certificate(&fp, crate::manage::openpgp::keys::RevocationReason::Unspecified, "")
+                        .and_then(|text| Ok(std::fs::write(&path, text)?));
+                    let _ = this.update(cx, |this, cx| match result {
+                        Ok(()) => this.notice("Revocation certificate saved. Keep it somewhere safe.", false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     });
                 })
@@ -949,6 +1007,45 @@ mod tests {
             cx.debug_bounds(renew).is_none(),
             "nothing to remove on a key that never expires"
         );
+    }
+
+    /// Settings → Encryption: your key's row saves a revocation certificate
+    /// (RFC 9580 §5.2.1.11) to the file chosen; imported through Import
+    /// Keys, it revokes the key, whose row then says so and no longer
+    /// offers one.
+    #[gpui::test]
+    fn revocation_certificates_are_saved_and_imported_from_settings(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Encryption), cx);
+        act(&view, Action::CreateKey, cx);
+        let fp = view.read_with(cx, |this, _| this.backend.keyring().list()[0].fingerprint.clone());
+        let button: &'static str = format!("openpgp-revocation-{fp}").leak();
+        frame(cx);
+        assert!(cx.debug_bounds(button).is_some(), "offered on your key");
+
+        let dir = std::env::temp_dir().join(format!("picacho-revocation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("revoke.asc");
+        act(&view, Action::SaveRevocationCertificate(fp.clone()), cx);
+        let chosen = file.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("BEGIN PGP PUBLIC KEY BLOCK"), "{saved}");
+        // Saving it changes nothing yet.
+        assert!(!view.read_with(cx, |this, _| this.backend.keyring().list()[0].revoked));
+
+        act(&view, Action::ImportKeys, cx);
+        let chosen = file.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![chosen]));
+        cx.run_until_parked();
+        let keys = view.read_with(cx, |this, _| this.backend.keyring().list());
+        let [key] = keys.as_slice() else { panic!("one key: {keys:?}") };
+        assert!(key.secret && key.revoked, "{key:?}");
+        frame(cx);
+        assert!(cx.debug_bounds(button).is_none(), "nothing more to revoke");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

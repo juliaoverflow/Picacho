@@ -722,6 +722,8 @@ enum Action {
     /// Compares the fingerprint in the field with this key's.
     MatchFingerprint(String),
     ExportPublicKeys,
+    /// Saves a revocation certificate for your OpenPGP key with this fingerprint.
+    SaveRevocationCertificate(String),
     /// Settings → General → Reduce motion.
     SetMotion(motion::Motion),
     /// Looks up the OpenPGP key for the address in the field.
@@ -6478,6 +6480,7 @@ impl MailApp {
             | Action::CheckKey(_)
             | Action::MatchFingerprint(_)
             | Action::ExportPublicKeys
+            | Action::SaveRevocationCertificate(_)
             | Action::FindKey
             | Action::ImportCertificates
             | Action::RemoveCertificate(_)) => {
