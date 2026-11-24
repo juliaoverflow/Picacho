@@ -171,7 +171,7 @@ impl Signature {
 
 /// A certificate's email addresses: its subject's emailAddress and its
 /// subjectAltName rfc822Name entries.
-fn emails(cert: &X509) -> Vec<String> {
+pub(crate) fn emails(cert: &X509) -> Vec<String> {
     let mut out: Vec<String> = cert
         .subject_alt_names()
         .map(|names| {
@@ -391,7 +391,7 @@ impl Certificates {
     }
     /// Every certificate kept, yours and others': a signature whose
     /// certificate the message doesn't carry is checked with these.
-    fn known(&self) -> Vec<X509> {
+    pub(crate) fn known(&self) -> Vec<X509> {
         let mut out: Vec<X509> = self.identities().into_iter().map(|(c, _, _)| c).collect();
         out.extend(self.others());
         out

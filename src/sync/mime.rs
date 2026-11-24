@@ -874,7 +874,8 @@ pub struct Details {
     pub return_path: Option<String>,
     /// Whether `auth::check` has run: the checks look the sender's records
     /// up in DNS, so they wait until asked for.
-    pub checked: bool,    /// What the sender's OpenPGP signature says, when the message has one
+    pub checked: bool,
+    /// What the sender's OpenPGP signature says, when the message has one
     /// (checked against your keyring when it was read).
     pub signature: Option<String>,
     /// Whether that signature checked out.
@@ -882,6 +883,10 @@ pub struct Details {
     /// An S/MIME message's signers, each with its own result (RFC 5652
     /// §5.1 lets one message carry several), when there is more than one.
     pub signers: Vec<crate::manage::smime::Signer>,
+    /// RFC 5280 §6.3, RFC 6960: whether an S/MIME signer's certificate was
+    /// found revoked, when asked (Check sender): a line saying so, and
+    /// whether all was well.
+    pub revocation: Option<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

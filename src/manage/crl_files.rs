@@ -111,6 +111,57 @@ impl Backend {
         self.smime_verdicts.lock().unwrap().clear();
         Ok(crls.len())
     }
+    /// RFC 5280 §6.3 and RFC 6960, when the user asks (fetching tells a
+    /// third party the message was opened): each S/MIME signer of `id`
+    /// whose signature checked out, looked up by OCSP or its issuer's CRL
+    /// through `fetcher` (tests give a fake). Lists fetched are kept, and
+    /// a revoked signer marks the message's verdict Revoked. A line for
+    /// the details, and whether every signer is known good; `None` when
+    /// the message isn't S/MIME-signed.
+    pub fn check_revocation(
+        &self,
+        id: &str,
+        fetcher: &dyn crate::manage::smime::revocation::RevocationFetcher,
+    ) -> Option<(String, bool)> {
+        use crate::manage::smime::revocation::{CrlCache, Status, status};
+        let verdict = self.smime_verdict(id)?;
+        if verdict.checked.is_empty() {
+            return None;
+        }
+        let carried: Vec<openssl::x509::X509> =
+            verdict.carried.iter().filter_map(|d| openssl::x509::X509::from_der(d).ok()).collect();
+        let known = self.certificates().known();
+        let cache = CrlCache { folder: self.store.path.join("crls-fetched") };
+        let now = chrono::Utc::now().timestamp();
+        let (mut revoked, mut unknown) = (Vec::new(), Vec::new());
+        for der in &verdict.checked {
+            let Ok(cert) = openssl::x509::X509::from_der(der) else { continue };
+            let who = crate::manage::smime::emails(&cert).into_iter().next().unwrap_or_default();
+            // Its issuer: among what the message carried, or what's known.
+            let issuer = carried.iter().chain(known.iter()).find(|i| {
+                i.issued(&cert) == openssl::x509::X509VerifyResult::OK && i.to_der().ok().as_deref() != Some(der)
+            });
+            let Some(issuer) = issuer else {
+                unknown.push(format!("{who}: its issuer's certificate isn't here"));
+                continue;
+            };
+            match status(&cert, issuer, &cache, Some(fetcher), now) {
+                Status::Good => {}
+                Status::Revoked => revoked.push(who),
+                Status::Unknown(why) => unknown.push(format!("{who}: {why}")),
+            }
+        }
+        if let Some(first) = revoked.first() {
+            if let Some(v) = self.smime_verdicts.lock().unwrap().get_mut(id) {
+                v.signature = crate::manage::smime::Signature::Revoked(first.clone());
+            }
+            return Some((format!("Revoked: {}'s certificate has been revoked.", revoked.join(", ")), false));
+        }
+        if !unknown.is_empty() {
+            return Some((format!("Revocation couldn't be checked ({}).", unknown.join("; ")), false));
+        }
+        Some(("Not revoked: checked with the certificate's issuer.".into(), true))
+    }
     /// Removes the list with this id (see `CrlInfo::id`).
     pub fn remove_crl_file(&self, id: &str) -> Result<()> {
         ensure!(
@@ -192,6 +243,26 @@ mod tests {
         let id = b.crl_list()[0].id.clone();
         b.remove_crl_file(&id).unwrap();
         assert!(b.smime_crl_check().is_none() && b.smime_verdict("m").is_none());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Check sender's revocation step (RFC 5280 §6.3, RFC 6960): with
+    /// nothing to ask (the fixtures name no responder or list), every
+    /// signer is unknown, never revoked, and the verdict is untouched;
+    /// mail that isn't S/MIME-signed has nothing to check.
+    #[test]
+    fn revocation_is_checked_per_signer_and_unknown_is_never_revoked() {
+        let (b, path) = backend();
+        b.open_smime(Some("m"), &fixture("two-signers.eml")).unwrap();
+        let before = b.smime_verdict("m").unwrap();
+        assert_eq!(before.checked.len(), 2, "both signers' certificates are kept for it");
+        let fetcher = crate::manage::smime::revocation::FakeFetcher::default();
+        let (line, good) = b.check_revocation("m", &fetcher).unwrap();
+        assert!(!good && line.starts_with("Revocation couldn't be checked"), "{line}");
+        assert!(line.contains("ana@example.org") && line.contains("bo@example.se"), "{line}");
+        assert_eq!(b.smime_verdict("m").unwrap(), before, "unknown changes nothing");
+        assert!(fetcher.asked.lock().unwrap().is_empty(), "nothing named, nothing asked");
+        assert!(b.check_revocation("other", &fetcher).is_none());
         std::fs::remove_dir_all(path).unwrap();
     }
 }

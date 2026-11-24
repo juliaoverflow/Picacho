@@ -1283,6 +1283,26 @@ impl MailApp {
                 if !d.signers.is_empty() {
                     panel_rows.push(row("signers:", self.signer_list(&d.signers)).into_any_element());
                 }
+                // RFC 5280 §6.3, RFC 6960: what Check sender found of the
+                // S/MIME signers' revocation.
+                if let Some((line, good)) = &d.revocation {
+                    let (icon, color) = if *good { ("lock", 0x1e8e3e) } else { ("warning", c.danger) };
+                    panel_rows.push(
+                        row(
+                            "revocation:",
+                            div()
+                                .id("smime-revocation")
+                                .debug_selector(|| "smime-revocation".into())
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon_el(icon, 13., color))
+                                .child(div().text_color(rgb(c.text)).child(line.clone()))
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    );
+                }
                 let checks: Vec<(&str, &Option<String>)> =
                     vec![("SPF", &d.spf), ("DKIM", &d.dkim), ("DMARC", &d.dmarc)];
                 if !d.checked {

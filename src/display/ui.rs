@@ -6162,10 +6162,20 @@ impl MailApp {
         }
         self.sender_checking = Some(id.clone());
         let (raw, mut details) = (original.raw.clone(), original.details.clone());
+        let message = id.clone();
         self.task(
             cx,
-            move |_| {
+            move |b| {
                 crate::sync::auth::check(&raw, &mut details);
+                // RFC 5280 §6.3, RFC 6960: an S/MIME signer's revocation is
+                // asked here, with the sender's other checks, not on reading:
+                // asking tells a third party the message was opened. Tests
+                // stay off the network.
+                if !cfg!(test)
+                    && let Ok(fetcher) = crate::manage::smime::revocation::HttpFetcher::new()
+                {
+                    details.revocation = b.check_revocation(&message, &fetcher);
+                }
                 Ok(Original::new(details, &raw))
             },
             move |this, result, cx| {
