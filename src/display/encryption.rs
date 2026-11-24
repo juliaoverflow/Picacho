@@ -2,7 +2,7 @@
 //! write to. Keys are imported from armored files (`.asc`) exported by
 //! GnuPG, Thunderbird, Proton or another app, and kept in the keychain.
 use super::*;
-use crate::manage::openpgp::Keyring;
+use crate::manage::openpgp::{KeyVersion, Keyring};
 use anyhow::Context as _;
 
 /// How long a new or renewed OpenPGP key lasts (RFC 9580 §5.2.3.13).
@@ -461,7 +461,7 @@ impl MailApp {
                             ring.own_key(&email).is_none(),
                             "You already have a key for {email}."
                         );
-                        let fp = ring.create(&name, &email, lasts)?;
+                        let fp = ring.create(&name, &email, lasts, KeyVersion::default())?;
                         b.set_keyring(ring)?;
                         Ok(fp)
                     },
