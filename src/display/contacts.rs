@@ -52,8 +52,18 @@ impl MailApp {
                 self.setting(
                     &server.url,
                     &format!(
-                        "Signed in as {}. Read {synced}; read again each time Picacho starts.",
-                        server.user
+                        "Signed in as {}{}. Read {synced}; read again each time Picacho starts.",
+                        server.user,
+                        // Kept apart from mail, signing in as a mail account does.
+                        match self
+                            .backend
+                            .contacts_mail_account()
+                            .filter(|_| server.jmap_account.is_empty())
+                            .and_then(|id| self.accounts.iter().find(|a| a.id == id))
+                        {
+                            Some(a) => format!(", with your {} account's sign-in", a.email),
+                            None => String::new(),
+                        }
                     ),
                     div()
                         .flex()
@@ -300,7 +310,8 @@ impl MailApp {
                     return;
                 };
                 self.contacts_run(cx, move |b| {
-                    let n = b.connect_jmap_contacts(&a)?;
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let n = b.use_mail_account_for_contacts(&a, cancel)?;
                     Ok(format!("Read {n} contacts from {}", a.email))
                 });
             }

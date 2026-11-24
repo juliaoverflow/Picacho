@@ -19,6 +19,15 @@ pub struct Server {
     /// (`calendar-auto-schedule`); off unless chosen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub server_schedules: bool,
+    /// Signs in as one of the mail accounts does (by its id): with its
+    /// OAuth token (RFC 6750 Bearer) where it has one, else its password.
+    /// The calendars stay apart from mail all the same; only the sign-in is
+    /// shared.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mail_account: String,
+    /// The secret given is an OAuth access token, sent as Bearer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bearer: bool,
 }
 
 /// A calendar on the server.
@@ -76,7 +85,11 @@ pub struct Stored {
 }
 
 fn client(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<dav::Client> {
-    dav::Client::new(&server.user, password, tls)
+    if server.bearer {
+        dav::Client::with_token(&server.user, password, tls)
+    } else {
+        dav::Client::new(&server.user, password, tls)
+    }
 }
 
 /// Whether the server schedules (RFC 6638 §2: `calendar-auto-schedule` in

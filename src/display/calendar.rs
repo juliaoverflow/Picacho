@@ -1036,12 +1036,15 @@ impl MailApp {
                     })
                 });
             }
+            // Calendars from a mail account's provider, signed in as it is
+            // (Google asks once for calendar access in the browser).
             Action::ConnectJmapCalendar(id) => {
                 let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
                     return;
                 };
                 self.calendar_run(cx, move |b| {
-                    let n = b.connect_jmap_calendar(&a)?;
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let n = b.use_mail_account_for_calendar(&a, cancel)?;
                     Ok(format!("Read {n} events from {}", a.email))
                 });
             }
@@ -1617,10 +1620,12 @@ impl MailApp {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let c = self.colors();
+        // Calendars and contacts are kept apart from mail; a mail account's
+        // provider can serve them, as an option (see `dav_accounts`).
         let accounts: Vec<&Account> = self
             .accounts
             .iter()
-            .filter(|a| a.provider == crate::manage::model::Provider::Jmap)
+            .filter(|a| crate::manage::backend::dav_accounts::MailProvider::of(a).is_some())
             .collect();
         if accounts.is_empty() {
             return None;
@@ -1635,7 +1640,7 @@ impl MailApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child("Or use those kept with your mail, signed in as the account already is:"),
+                        .child("Or use your email provider's, signed in as the account already is (Google asks once for access):"),
                 )
                 .child(div().flex().flex_wrap().gap_2().children(accounts.into_iter().map(|a| {
                     self.button(
@@ -1738,9 +1743,14 @@ impl MailApp {
             self.setting(
                 &server.url,
                 &format!(
-                    "{} {}. Read {synced}; read again each time Picacho starts.",
+                    "{} {}{}. Read {synced}; read again each time Picacho starts.",
                     if over_jmap { "The calendars of" } else { "Signed in as" },
-                    server.user
+                    server.user,
+                    // Kept apart from mail, signing in as a mail account does.
+                    match self.backend.calendar_mail_account().and_then(|id| self.accounts.iter().find(|a| a.id == id)) {
+                        Some(a) if !over_jmap => format!(", with your {} account's sign-in", a.email),
+                        _ => String::new(),
+                    }
                 ),
                 div()
                     .flex()

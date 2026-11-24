@@ -824,6 +824,22 @@ pub struct Server {
     /// saved by its own book's, not the one new cards go to.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub books: std::collections::BTreeMap<String, BookLimits>,
+    /// Signs in as one of the mail accounts does (by its id), as
+    /// `caldav::Server::mail_account`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mail_account: String,
+    /// The secret given is an OAuth access token, sent as Bearer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bearer: bool,
+}
+/// The DAV client for `server`, signed in with `password`, or with it as a
+/// Bearer token where the server takes one.
+fn client(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<dav::Client> {
+    if server.bearer {
+        dav::Client::with_token(&server.user, password, tls)
+    } else {
+        dav::Client::new(&server.user, password, tls)
+    }
 }
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -926,7 +942,7 @@ fn xml_text(text: &str) -> String {
 /// organization's) that list only what is asked for.
 pub fn search(server: &Server, password: &str, tls: native_tls::TlsConnector, text: &str, limit: u32) -> Result<Vec<Card>> {
     ensure!(!text.trim().is_empty(), "Write something to look for.");
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     let books = dav::discover(&client, &server.url, "carddav", "addressbook", "addressbook-home-set", dav::CARDDAV)?;
     let query = search_query(&["FN", "NICKNAME", "EMAIL"], text.trim(), Some(limit));
     let mut out = Vec::new();
@@ -983,7 +999,7 @@ pub fn fetch_changes(
     tls: native_tls::TlsConnector,
     known: &[Card],
 ) -> Result<Fetched> {
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     let books = dav::discover(
         &client,
         &server.url,
@@ -1052,7 +1068,7 @@ pub fn fetch_changes(
 /// Makes an address book named `name` in the account's address book home.
 /// Returns its address.
 pub fn create_book(server: &Server, password: &str, tls: native_tls::TlsConnector, name: &str) -> Result<String> {
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     let home = client.home(&server.url, "carddav", "addressbook-home-set", dav::CARDDAV)?;
     let href = dav::new_href(&home, &uuid::Uuid::new_v4().to_string(), "x")?;
     let href = url::Url::parse(&format!("{}/", href.as_str().trim_end_matches(".x")))?;
@@ -1062,7 +1078,7 @@ pub fn create_book(server: &Server, password: &str, tls: native_tls::TlsConnecto
 
 /// The address books, by href and name, for choosing among them.
 pub fn books(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<Vec<(String, String, bool)>> {
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     Ok(dav::discover(
         &client,
         &server.url,
@@ -1078,18 +1094,18 @@ pub fn books(server: &Server, password: &str, tls: native_tls::TlsConnector) -> 
 /// The account's storage on the contacts server, used and left in
 /// octets, where it says (RFC 4331 on the address book home).
 pub fn quota(server: &Server, password: &str, tls: native_tls::TlsConnector) -> Result<Option<(u64, u64)>> {
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     let home = client.home(&server.url, "carddav", "addressbook-home-set", dav::CARDDAV)?;
     client.quota(&home)
 }
 /// Renames an address book (PROPPATCH).
 pub fn rename_book(server: &Server, password: &str, tls: native_tls::TlsConnector, href: &str, name: &str) -> Result<()> {
     ensure!(!name.trim().is_empty(), "Give the address book a name.");
-    dav::Client::new(&server.user, password, tls)?.rename_collection(&url::Url::parse(href)?, name.trim(), "")
+    client(server, password, tls)?.rename_collection(&url::Url::parse(href)?, name.trim(), "")
 }
 /// Deletes an address book and its cards.
 pub fn delete_book(server: &Server, password: &str, tls: native_tls::TlsConnector, href: &str) -> Result<()> {
-    dav::Client::new(&server.user, password, tls)?.delete_collection(&url::Url::parse(href)?)
+    client(server, password, tls)?.delete_collection(&url::Url::parse(href)?)
 }
 
 /// Saves a card on the server: a new one in `book`, or a change to the
@@ -1101,7 +1117,7 @@ pub fn save(
     tls: native_tls::TlsConnector,
     card: &Card,
 ) -> Result<Card> {
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     let mut saved = card.clone();
     let href = if card.href.is_empty() {
         ensure!(
@@ -1141,7 +1157,7 @@ pub fn delete(
     if card.href.is_empty() {
         return Ok(());
     }
-    let client = dav::Client::new(&server.user, password, tls)?;
+    let client = client(server, password, tls)?;
     client.delete(&url::Url::parse(&card.href)?, &card.etag)
 }
 

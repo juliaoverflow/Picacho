@@ -55,6 +55,12 @@ impl Backend {
         if let Some(s) = &self.test_secret {
             return Ok(s.password.clone());
         }
+        // Signed in as a mail account is, as for calendars.
+        if let Some(server) = self.contacts_server()
+            && !server.mail_account.is_empty()
+        {
+            return self.mail_account_secret(&server.mail_account);
+        }
         store::read_secret_text(PASSWORD)?
             .context("The contacts server's password is missing. Set it up again.")
     }
@@ -69,7 +75,9 @@ impl Backend {
         server.max_size = fetched.max_size;
         server.books = fetched.books;
         #[cfg(not(test))]
-        store::write_secret_text(PASSWORD, password)?;
+        if server.mail_account.is_empty() {
+            store::write_secret_text(PASSWORD, password)?;
+        }
         self.store
             .set_preference(SERVER, &serde_json::to_string(&server)?)?;
         self.replace_server_cards(cards)

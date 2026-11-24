@@ -1142,15 +1142,35 @@ impl std::fmt::Debug for Grant {
 /// Signs in to Gmail or Outlook in the browser. The account's email may be
 /// empty: the provider's ID token says which account was chosen.
 pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
+    authorize_with(account, &[], cancel)
+}
+
+/// Google's calendar and contacts scopes (CalDAV, CardDAV): asked only
+/// when the person chooses to use their Google account for calendars or
+/// contacts, never at sign-in.
+pub const GOOGLE_CALENDAR: &str = "https://www.googleapis.com/auth/calendar";
+pub const GOOGLE_CONTACTS: &str = "https://www.googleapis.com/auth/carddav";
+
+/// As `authorize`, asking for `more` scopes besides the mail ones (Google's
+/// incremental authorization, `include_granted_scopes`): the token that
+/// comes back reaches both, so calendars or contacts can use the mail
+/// account's sign-in. Google accounts only.
+pub fn authorize_with(account: &Account, more: &[&str], cancel: Arc<AtomicBool>) -> Result<Grant> {
     if account.provider == Provider::Jmap {
         return authorize_jmap(account, cancel);
     }
     if let Some(sso) = &account.sso {
         return authorize_sso(account, sso, cancel);
     }
+    ensure!(
+        more.is_empty() || account.provider == Provider::Gmail,
+        "Only Google accounts are asked for calendar or contacts access this way."
+    );
     let microsoft = account.provider == Provider::Outlook;
     let browser = Browser::new(if microsoft { "localhost" } else { "127.0.0.1" }, "/")?;
-    let (auth, _, scope) = endpoints(account.provider);
+    let (auth, _, base) = endpoints(account.provider);
+    let joined = std::iter::once(base).chain(more.iter().copied()).collect::<Vec<_>>().join(" ");
+    let scope = joined.as_str();
     let mut url = url::Url::parse(auth)?;
     url.query_pairs_mut().extend_pairs([
         ("client_id", account.client_id.as_str()),
@@ -1168,6 +1188,9 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
     if account.provider == Provider::Gmail {
         url.query_pairs_mut()
             .extend_pairs([("access_type", "offline"), ("prompt", "consent")]);
+        if !more.is_empty() {
+            url.query_pairs_mut().append_pair("include_granted_scopes", "true");
+        }
     } else {
         url.query_pairs_mut()
             .append_pair("prompt", "select_account");
@@ -1356,14 +1379,21 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     let (mut secret, value) = exchange(token, &fields, &client)?;
     secret.client_secret = account.client_secret.clone();
     if let Some(granted) = value["scope"].as_str() {
-        let needed = needed_scopes(account, &grant.scope);
+        let mut needed = needed_scopes(account, &grant.scope);
+        // Calendar or contacts access, where it was asked for.
+        needed.extend(
+            grant
+                .scope
+                .split_whitespace()
+                .filter(|s| [GOOGLE_CALENDAR, GOOGLE_CONTACTS].contains(s)),
+        );
         let missing: Vec<&str> = needed
             .into_iter()
             .filter(|s| !granted_scope(granted, s))
             .collect();
         ensure!(
             missing.is_empty(),
-            "The sign-in didn't allow access to mail ({} wasn't granted). Sign in again and allow Picacho access to your mail.",
+            "The sign-in didn't allow everything Picacho asked for ({} wasn't granted). Sign in again and allow it.",
             missing.join(", ")
         );
     }

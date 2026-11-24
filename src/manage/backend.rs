@@ -38,6 +38,8 @@ mod large;
 mod extras;
 #[path = "crl_files.rs"]
 pub mod crl_files;
+#[path = "dav_accounts.rs"]
+pub mod dav_accounts;
 #[path = "archive.rs"]
 pub mod archive;
 #[path = "contacts.rs"]
