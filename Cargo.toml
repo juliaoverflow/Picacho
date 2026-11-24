@@ -391,7 +391,7 @@ blitz-dom = { path = "../Picacho-Patches/blitz-dom/crate" }
 blitz-paint = { path = "../Picacho-Patches/blitz-paint/crate" }
 # prefers-reduced-motion and prefers-contrast media queries (Media Queries 5
 # §11.3, §11.4), which blitz-dom's `set_media_preferences` sets.
-# TEMPORARY, as blitz-dom above: the local feat/stylo-media-preferences
+# TEMPORARY, as blitz-dom above: the local fix/blitz-table-block-children
 # branch until it is merged; then the git dependency like stylo_derive's.
 stylo = { path = "../Picacho-Patches/stylo/crate" }
 stylo_atoms = { path = "../Picacho-Patches/stylo_atoms/crate" }
