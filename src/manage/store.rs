@@ -562,6 +562,149 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         Ok(ids)
     }
+    /// RFC 3501 §6.3.5 (RFC 9051 §6.3.6): a renamed IMAP folder keeps its
+    /// UIDVALIDITY and UIDs, so its cache can follow it instead of being
+    /// downloaded again. Re-keys every reference to the folder's messages
+    /// (ids `{account}:{old}:{validity}:{uid}`) to `new`, in one
+    /// transaction: the messages (id, remote folder, mailbox key, thread
+    /// ids), their parcel and receipt findings, the folder's sync state,
+    /// drafts answering them, changes queued offline (including moves into
+    /// `old`), reading choices, and snoozed mail waiting in it. Nothing
+    /// survives naming the old prefix. See docs/design-mailboxid-renames.md.
+    pub fn rename_mailbox(&self, account: &str, old: &str, new: &str) -> Result<()> {
+        let from = format!("{account}:{old}:");
+        let to = format!("{account}:{new}:");
+        let end = format!("{from}\u{10FFFF}");
+        let rekey = |id: &str| -> Option<String> { id.strip_prefix(&from).map(|rest| format!("{to}{rest}")) };
+        let (thread_from, thread_to) = (format!("t:{old}:"), format!("t:{new}:"));
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        // Messages: read whole (their JSON holds the id, folder and thread),
+        // rewritten, and the source columns carried over untouched.
+        let rows: Vec<(String, String)> = {
+            let mut q = tx.prepare("SELECT id, data FROM messages WHERE id >= ?2 AND id < ?3 AND account=?1")?;
+            q.query_map(params![account, from, end], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (id, data) in rows {
+            let mut m: Mail = serde_json::from_str(&data)?;
+            let Some(next) = rekey(&id) else { continue };
+            m.id = next.clone();
+            if m.remote_folder == old {
+                m.remote_folder = new.to_owned();
+            }
+            if let Some(rest) = m.thread_id().strip_prefix(&thread_from) {
+                let thread = format!("{thread_to}{rest}");
+                m.set_thread_id(thread);
+            }
+            tx.execute(
+                "UPDATE messages SET id=?2, folder=?3, data=?4 WHERE id=?1",
+                params![id, next, m.mailbox().key(), serde_json::to_string(&m)?],
+            )?;
+        }
+        // Parcel and receipt findings: keyed by message id, and naming it
+        // in their sightings (`mail_id`).
+        for table in ["parcel_scan", "receipt_scan"] {
+            let rows: Vec<(String, String)> = {
+                let mut q = tx.prepare(&format!("SELECT id, data FROM {table} WHERE id >= ?2 AND id < ?3 AND account=?1"))?;
+                q.query_map(params![account, from, end], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (id, data) in rows {
+                let Some(next) = rekey(&id) else { continue };
+                let data = data.replace(&format!("\"{from}"), &format!("\"{to}"));
+                tx.execute(&format!("UPDATE {table} SET id=?2, data=?3 WHERE id=?1"), params![id, next, data])?;
+            }
+        }
+        // The folder's sync state (UIDVALIDITY, MODSEQ, …) moves with it.
+        tx.execute(
+            "UPDATE OR REPLACE mailbox_state SET remote=?3 WHERE account=?1 AND remote=?2",
+            params![account, old, new],
+        )?;
+        // Drafts answering one of its messages.
+        let drafts: Vec<(String, String)> = {
+            let mut q = tx.prepare("SELECT id, data FROM drafts WHERE account=?1")?;
+            q.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (id, data) in drafts {
+            let mut d: Draft = serde_json::from_str(&data)?;
+            if let Some(next) = rekey(&d.original) {
+                d.original = next;
+                tx.execute("UPDATE drafts SET data=?2 WHERE id=?1", params![id, serde_json::to_string(&d)?])?;
+            }
+        }
+        // Changes queued offline replay against the new name, with the same
+        // UIDs; a move into the old name moves into the new one.
+        let queued: Vec<(i64, String)> = {
+            let mut q = tx.prepare("SELECT seq, data FROM offline_changes WHERE account=?1")?;
+            q.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (seq, data) in queued {
+            let mut change: crate::manage::backend::offline::QueuedChange = serde_json::from_str(&data)?;
+            let mut touched = false;
+            for m in &mut change.mails {
+                if let Some(next) = rekey(&m.id) {
+                    m.id = next;
+                    touched = true;
+                }
+                if m.remote_folder == old {
+                    m.remote_folder = new.to_owned();
+                    touched = true;
+                }
+            }
+            if let crate::manage::backend::Change::MoveTo(target) = &mut change.change
+                && target.as_str() == old
+            {
+                *target = new.to_owned();
+                touched = true;
+            }
+            if touched {
+                tx.execute("UPDATE offline_changes SET data=?2 WHERE seq=?1", params![seq, serde_json::to_string(&change)?])?;
+            }
+        }
+        // Reading choices, keyed by (account, message id).
+        let readings: Vec<(String, String)> = {
+            let lo = format!("reading:[{},", serde_json::to_string(account)?);
+            let hi = format!("{lo}\u{10FFFF}");
+            let mut q = tx.prepare("SELECT key, value FROM preferences WHERE key >= ?1 AND key < ?2")?;
+            q.query_map(params![lo, hi], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (key, value) in readings {
+            let Ok((acct, id)) = serde_json::from_str::<(String, String)>(&key["reading:".len()..]) else { continue };
+            if let Some(next) = rekey(&id) {
+                tx.execute("DELETE FROM preferences WHERE key=?1", [&key])?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO preferences VALUES (?1, ?2)",
+                    params![crate::manage::reading::message_key(&acct, &next), value],
+                )?;
+            }
+        }
+        // Snoozed mail waits in a folder by name.
+        let snooze_key = format!("snoozed:{account}");
+        let snoozed: Option<String> = {
+            use rusqlite::OptionalExtension;
+            tx.query_row("SELECT value FROM preferences WHERE key=?1", [&snooze_key], |r| r.get(0)).optional()?
+        };
+        if let Some(value) = snoozed
+            && let Ok(mut list) = serde_json::from_str::<Vec<crate::manage::backend::snooze::Snoozed>>(&value)
+            && list.iter().any(|s| s.folder == old)
+        {
+            for s in &mut list {
+                if s.folder == old {
+                    s.folder = new.to_owned();
+                }
+            }
+            tx.execute(
+                "UPDATE preferences SET value=?2 WHERE key=?1",
+                params![snooze_key, serde_json::to_string(&list)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     /// Moves the cached rows of server folder `old` to `new` (a rename),
     /// in the database itself rather than reading each message whole.
     pub fn rename_remote(&self, account: &str, old: &str, new: &str) -> Result<()> {
@@ -2754,6 +2897,105 @@ mod tests {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
         let s = Store::open(&p)?;
         Ok((p, s))
+    }
+
+    /// RFC 3501 §6.3.5: a renamed folder keeps its UIDs, so its cache
+    /// follows it (docs/design-mailboxid-renames.md's test plan): messages
+    /// with their downloaded source, findings, sync state, drafts, offline
+    /// changes (a move into the folder included), reading choices, thread
+    /// ids and snoozes. Afterwards nothing names the old prefix, and mail
+    /// of other folders, and of a folder whose name only starts the same,
+    /// is untouched.
+    #[test]
+    fn renamed_folders_keep_their_cache() -> Result<()> {
+        let (p, s) = temp_store()?;
+        let (old, new) = ("Projects/2026", "Archive/2026");
+        let mail = |remote: &str, uid: u32| {
+            let mut m = demo_mail().remove(0);
+            m.id = format!("demo:{remote}:7:{uid}");
+            m.account = "demo".into();
+            m.folder = Folder::Other;
+            m.remote_folder = remote.into();
+            m.uid = uid;
+            m
+        };
+        let mut a = mail(old, 1);
+        a.set_thread_id(format!("t:{old}:7:1"));
+        let b = mail(old, 2);
+        let neighbour = mail("Projects/2026-old", 1);
+        let other = mail("INBOX", 3);
+        s.save_messages(&[a.clone(), b.clone(), neighbour.clone(), other.clone()])?;
+        s.save_raw(&a.id, b"From: a@example.com\r\n\r\nDownloaded.\r\n")?;
+        let state = MailboxState { validity: 7, uid_next: 3, exists: 2, modseq: Some(9), days: 30 };
+        s.save_mailbox_state("demo", old, Some(&state))?;
+        let sighting = format!(r#"[{{"mail_id":"{}"}}]"#, a.id);
+        for table in ["parcel_scan", "receipt_scan"] {
+            s.write().execute(
+                &format!("INSERT INTO {table} (id, account, state, version, data) VALUES (?1,'demo',1,1,?2)"),
+                params![a.id, sighting],
+            )?;
+        }
+        s.save_draft(&Draft { id: "d1".into(), account: "demo".into(), original: b.id.clone(), ..Draft::default() })?;
+        let queued = |mails: Vec<Mail>, change| crate::manage::backend::offline::QueuedChange { mails, change, at: 1 };
+        use crate::manage::backend::Change;
+        s.queue_change("demo", 1, &serde_json::to_string(&queued(vec![a.clone()], Change::Read(true)))?)?;
+        s.queue_change("demo", 1, &serde_json::to_string(&queued(vec![other.clone()], Change::MoveTo(old.into())))?)?;
+        s.set_preference(&crate::manage::reading::message_key("demo", &b.id), "remote")?;
+        let snoozed = vec![crate::manage::backend::snooze::Snoozed {
+            message_id: "<s@x>".into(),
+            subject: "s".into(),
+            sender: "x".into(),
+            until: 1,
+            folder: old.into(),
+            ids: vec![],
+        }];
+        s.set_preference("snoozed:demo", &serde_json::to_string(&snoozed)?)?;
+
+        s.rename_mailbox("demo", old, new)?;
+
+        let a2 = format!("demo:{new}:7:1");
+        let moved = s.message(&a2)?.expect("re-keyed");
+        assert_eq!((moved.remote_folder.as_str(), moved.mailbox()), (new, Mailbox::Remote(new.into())));
+        assert_eq!(moved.thread_id(), format!("t:{new}:7:1"));
+        assert!(s.raw(&a2)?.is_some(), "the downloaded source stays: nothing to fetch again");
+        assert!(s.message(&format!("demo:{new}:7:2"))?.is_some());
+        assert!(s.message(&neighbour.id)?.is_some() && s.message(&other.id)?.is_some());
+        assert_eq!(s.mailbox_state("demo", new)?, Some(state));
+        assert!(s.mailbox_state("demo", old)?.is_none());
+        assert_eq!(s.drafts("demo")?[0].original, format!("demo:{new}:7:2"));
+        let changes: Vec<String> = s.queued_changes("demo")?.into_iter().map(|(_, d)| d).collect();
+        assert!(changes[0].contains(&a2), "{}", changes[0]);
+        assert!(changes[1].contains(&format!("\"MoveTo\":\"{new}\"")), "{}", changes[1]);
+        assert_eq!(
+            s.preference(&crate::manage::reading::message_key("demo", &format!("demo:{new}:7:2"))).as_deref(),
+            Some("remote")
+        );
+        assert!(s.preference("snoozed:demo").unwrap().contains(new));
+        // Nothing names the old prefix anywhere.
+        let prefix = format!("demo:{old}:%");
+        let db = s.read();
+        for (table, column) in [
+            ("messages", "id"),
+            ("messages", "data"),
+            ("parcel_scan", "id"),
+            ("parcel_scan", "data"),
+            ("receipt_scan", "id"),
+            ("receipt_scan", "data"),
+            ("drafts", "data"),
+            ("offline_changes", "data"),
+            ("preferences", "key"),
+        ] {
+            let n: i64 = db.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} LIKE ?1 OR {column} LIKE ?2"),
+                params![prefix, format!("%\"{prefix}")],
+                |r| r.get(0),
+            )?;
+            assert_eq!(n, 0, "{table}.{column} still names {old}");
+        }
+        drop(db);
+        drop(s);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
     }
     /// Starred and All Mail are marked read in the cache without reading
     /// their mail whole; only the unread are listed for the server, and

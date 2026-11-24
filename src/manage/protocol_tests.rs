@@ -1134,11 +1134,18 @@ fn imap_folder_create_and_rename() -> Result<()> {
         ..Mail::default()
     };
     b.store.save_messages(std::slice::from_ref(&cached))?;
+    b.store.save_raw(&cached.id, b"From: a@example.com\r\n\r\nKept.\r\n")?;
     let renamed = b.rename_remote_folder(&a, "Projects", "Work")?;
     assert_eq!(renamed.moved[0], ("Projects".into(), "Work".into()));
     assert!(renamed.moved.contains(&("Projects/2024".into(), "Work/2024".into())));
     assert!(renamed.folders.iter().any(|f| f.name == "Work/2025"));
-    assert!(b.store.message(&cached.id)?.is_none(), "its cached mail is forgotten");
+    // RFC 3501 §6.3.5: its UIDs survive, so its cache follows it, the
+    // folder inside it included, source and all.
+    assert!(b.store.message(&cached.id)?.is_none(), "not under the old name");
+    let kept = format!("{}:Work/2024:1:1", a.id);
+    let moved = b.store.message(&kept)?.expect("kept under the new name");
+    assert_eq!(moved.remote_folder, "Work/2024");
+    assert!(b.store.raw(&kept)?.is_some(), "nothing to download again");
     let standard = b.rename_remote_folder(&a, "Trash", "Bin").unwrap_err();
     assert!(format!("{standard:#}").contains("standard"), "{standard:#}");
     // Keeping the name changes nothing on the server.

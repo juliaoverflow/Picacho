@@ -22,9 +22,9 @@ use connection::{Connection, Limits};
 mod watch;
 use watch::{ProtonNotice, Watcher};
 #[path = "offline.rs"]
-mod offline;
+pub(crate) mod offline;
 #[path = "snooze.rs"]
-mod snooze;
+pub(crate) mod snooze;
 pub use snooze::Snoozed;
 #[path = "undo.rs"]
 mod undo;
@@ -3109,8 +3109,17 @@ impl Backend {
             })
         })?;
         self.store.save_folders(&a.id, &change.folders)?;
-        for (old, _) in &change.moved {
-            self.store.forget_mailbox(&a.id, old)?;
+        // RFC 3501 §6.3.5: the server keeps UIDVALIDITY and UIDs across a
+        // rename, so the cache follows the folder (and the folders inside
+        // it) rather than being downloaded again. Should that fail, it is
+        // forgotten, as it was before, and fetched again on the next check.
+        for (old, new) in &change.moved {
+            if self.store.rename_mailbox(&a.id, old, new).is_err() {
+                self.store.forget_mailbox(&a.id, old)?;
+            }
+            // Laid out again from the store, under the new name.
+            self.forget_layout(a, &Mailbox::Remote(old.clone()));
+            self.forget_layout(a, &Mailbox::Remote(new.clone()));
         }
         Ok(change)
     }
