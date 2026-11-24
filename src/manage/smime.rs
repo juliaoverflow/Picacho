@@ -70,6 +70,11 @@ pub struct Verdict {
     /// The SMIMECapabilities (RFC 8551 §2.5.2) each signer whose signature
     /// matches announced, for `learn_capabilities`.
     pub capabilities: Vec<capabilities::Capabilities>,
+    /// Each signer whose signature matches, by its certificate (DER), with
+    /// the certificates the message carried: what revocation is checked
+    /// for, and where (RFC 5280 §4.2.1.13), when the user asks.
+    pub checked: Vec<Vec<u8>>,
+    pub carried: Vec<Vec<u8>>,
 }
 
 impl Verdict {
@@ -1118,6 +1123,7 @@ fn open_checked(
                 }
                 let (content, signers) = check_signers(&der, None, store, crls, &known)?;
                 verdict.capabilities.extend(capabilities::of_signers(&der, &signers));
+            note_certificates(&mut verdict, &der, &signers);
                 (content, Some(signers))
             } else if oid == der::COMPRESSED_DATA {
                 // RFC 3274: one level, at most, so a small message can't
@@ -1137,6 +1143,7 @@ fn open_checked(
             let der = CmsContentInfo::from_der(&signature).ok()?.to_der().ok()?;
             let (_, signers) = check_signers(&der, Some(&content), store, crls, &known)?;
             verdict.capabilities.extend(capabilities::of_signers(&der, &signers));
+            note_certificates(&mut verdict, &der, &signers);
             (content, Some(signers))
         } else {
             break;
@@ -1337,6 +1344,29 @@ fn check_signers(
         out.push((Signer { address, result }, cert));
     }
     Some((content, out))
+}
+
+/// Keeps, for a revocation check the user may ask for, the certificates of
+/// `signers` whose signatures matched, and those `der` (a SignedData)
+/// carried, which hold their issuers.
+fn note_certificates(verdict: &mut Verdict, der: &[u8], signers: &[(Signer, Option<X509>)]) {
+    for (signer, cert) in signers {
+        if matches!(signer.result, SignerResult::Good | SignerResult::Untrusted)
+            && let Some(der) = cert.as_ref().and_then(|c| c.to_der().ok())
+            && !verdict.checked.contains(&der)
+        {
+            verdict.checked.push(der);
+        }
+    }
+    if let Ok(signed) = der::SignedData::parse(der)
+        && let Ok(certificates) = signed.certificates()
+    {
+        for c in certificates {
+            if !verdict.carried.iter().any(|k| k.as_slice() == c) {
+                verdict.carried.push(c.to_vec());
+            }
+        }
+    }
 }
 
 /// One signer's SignedData, checked first against trusted authorities, then
