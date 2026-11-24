@@ -233,6 +233,7 @@ impl MailApp {
                                 cx,
                             )),
                     )
+                    .child(self.key_version_choice(cx))
                     .child(div().flex().gap_2().child(self.button(
                         "openpgp-import",
                         "Import Keys…",
@@ -453,6 +454,7 @@ impl MailApp {
                 self.key_error = None;
                 let (name, email) = (a.name.clone(), a.email.clone());
                 let lasts = self.key_expiry.lasts();
+                let version = self.key_version;
                 self.task(
                     cx,
                     move |b| {
@@ -461,7 +463,7 @@ impl MailApp {
                             ring.own_key(&email).is_none(),
                             "You already have a key for {email}."
                         );
-                        let fp = ring.create(&name, &email, lasts, KeyVersion::default())?;
+                        let fp = ring.create(&name, &email, lasts, version)?;
                         b.set_keyring(ring)?;
                         Ok(fp)
                     },
@@ -472,6 +474,7 @@ impl MailApp {
                 );
             }
             Action::SetKeyExpiry(choice) => self.key_expiry = choice,
+            Action::SetKeyVersion(choice) => self.key_version = choice,
             Action::RenewKey(fp) => {
                 self.key_error = None;
                 let mut ring = Keyring::clone(&self.backend.keyring());
@@ -895,6 +898,49 @@ impl MailApp {
     }
 }
 
+// --- Key type for Create a Key ---------------------------------------------
+
+impl MailApp {
+    /// The version of the key Create a Key makes: Standard (v4, RFC 9580
+    /// §5.5.2.2) unless Modern (v6, §5.5.2.3) is chosen, as GnuPG 2.4 and
+    /// older and most mail apps can't use v6 keys yet.
+    fn key_version_choice(&self, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let choices = [(KeyVersion::V4, "Standard (v4)"), (KeyVersion::V6, "Modern (v6)")];
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .flex_shrink_0()
+                            .child("Key type:"),
+                    )
+                    .child(self.segmented(
+                        "openpgp-key-version",
+                        choices
+                            .into_iter()
+                            .map(|(v, label)| (label.to_owned(), Action::SetKeyVersion(v), self.key_version == v))
+                            .collect(),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child("Modern keys aren't yet readable by many mail apps. Choose Standard unless your correspondents use OpenPGP v6."),
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{act, frame, two_accounts};
@@ -949,6 +995,41 @@ mod tests {
             cx.debug_bounds(renew).is_none(),
             "nothing to remove on a key that never expires"
         );
+    }
+
+    /// Settings → Encryption: Create a Key makes a Standard (v4) key unless
+    /// Modern (v6) is chosen in the Key type choice beside the expiry one.
+    #[gpui::test]
+    fn create_a_key_makes_v4_unless_modern_is_chosen(cx: &mut gpui::TestAppContext) {
+        use pgp::types::KeyDetails as _;
+        let (view, cx, _) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Encryption), cx);
+        frame(cx);
+        assert!(view.read_with(cx, |this, _| this.key_version == KeyVersion::V4));
+        assert!(cx.debug_bounds("openpgp-key-version-0").is_some(), "Standard (v4) is shown");
+        assert!(cx.debug_bounds("openpgp-key-version-1").is_some(), "Modern (v6) is shown");
+        let version_made = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |this, _| {
+                let ring = this.backend.keyring();
+                let keys = ring.secret_keys();
+                let [key] = keys.as_slice() else { panic!("one key: {}", keys.len()) };
+                (key.primary_key.version(), ring.list()[0].fingerprint.clone())
+            })
+        };
+
+        act(&view, Action::CreateKey, cx);
+        cx.run_until_parked();
+        let (version, fp) = version_made(cx);
+        assert_eq!(version, pgp::types::KeyVersion::V4);
+        act(&view, Action::RemoveKey(fp), cx);
+        cx.run_until_parked();
+
+        act(&view, Action::SetKeyVersion(KeyVersion::V6), cx);
+        frame(cx);
+        act(&view, Action::CreateKey, cx);
+        cx.run_until_parked();
+        assert_eq!(version_made(cx).0, pgp::types::KeyVersion::V6);
     }
 
     #[test]
