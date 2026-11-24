@@ -8,7 +8,9 @@
 //! authorities; one that checks out, but by a certificate they don't vouch
 //! for, is shown as such rather than as good.
 use crate::manage::store;
+mod capabilities;
 mod der;
+pub use capabilities::learn_capabilities;
 use anyhow::{Context, Result, bail, ensure};
 use openssl::cms::{CMSOptions, CmsContentInfo};
 use openssl::pkey::{PKey, Private};
@@ -29,6 +31,10 @@ pub struct Certificates {
     /// Other people's certificates, from signed mail they sent or imported.
     #[serde(default)]
     pub others: Vec<String>,
+    /// What the holders of `others` last announced they can decrypt (RFC
+    /// 8551 §2.7.1), from their signed mail.
+    #[serde(default)]
+    pub capabilities: Vec<capabilities::Capabilities>,
 }
 
 /// One certificate, as Settings lists it.
@@ -60,6 +66,9 @@ pub struct Verdict {
     /// OpenPGP (see `openpgp::from_mismatch`); the outer From stays the one
     /// shown.
     pub from_mismatch: Option<crate::manage::openpgp::FromMismatch>,
+    /// The SMIMECapabilities (RFC 8551 §2.5.2) each signer whose signature
+    /// matches announced, for `learn_capabilities`.
+    pub capabilities: Vec<capabilities::Capabilities>,
 }
 
 impl Verdict {
@@ -353,6 +362,7 @@ impl Certificates {
             .retain(|(c, _)| X509::from_pem(c.as_bytes()).map_or(true, |c| fingerprint(&c) != fp));
         self.others
             .retain(|c| X509::from_pem(c.as_bytes()).map_or(true, |c| fingerprint(&c) != fp));
+        self.capabilities.retain(|c| c.fingerprint != fp);
     }
     fn own_for(&self, email: &str) -> Option<(X509, Vec<X509>, PKey<Private>)> {
         let email = email.trim().to_lowercase();
@@ -758,10 +768,14 @@ pub fn protect_with(
     }
     if encrypt {
         let mut recipients = Stack::new()?;
+        let mut theirs = Vec::new();
         let mut missing = Vec::new();
         for address in to {
             match certs.cert_for(address) {
-                Some(c) => recipients.push(c)?,
+                Some(c) => {
+                    theirs.push(c.clone());
+                    recipients.push(c)?;
+                }
                 None => missing.push(address.clone()),
             }
         }
@@ -773,7 +787,8 @@ pub fn protect_with(
         if let Some((cert, _, _)) = &own {
             recipients.push(cert.clone())?;
         }
-        content = encrypt_part(&recipients, &content, ContentCipher::Aes256Cbc)?;
+        let cipher = capabilities::content_cipher(certs, &theirs);
+        content = encrypt_part(&recipients, &content, cipher)?;
     }
     let mut out = outer;
     out.extend_from_slice(b"MIME-Version: 1.0\r\n");
@@ -790,7 +805,6 @@ enum ContentCipher {
     /// AES-256 CBC (RFC 3565), as EnvelopedData (RFC 5652 §6).
     Aes256Cbc,
     /// AES-256 GCM (RFC 5084), as AuthEnvelopedData (RFC 5083).
-    #[cfg_attr(not(test), allow(dead_code))]
     Aes256Gcm,
 }
 
@@ -1053,6 +1067,7 @@ fn open_checked(
                     break;
                 }
                 let (content, signers) = check_signers(&der, None, store, crls, &known)?;
+                verdict.capabilities.extend(capabilities::of_signers(&der, &signers));
                 (content, Some(signers))
             } else if oid == der::COMPRESSED_DATA {
                 // RFC 3274: one level, at most, so a small message can't
@@ -1071,6 +1086,7 @@ fn open_checked(
             let (content, signature) = signed_parts(&current)?;
             let der = CmsContentInfo::from_der(&signature).ok()?.to_der().ok()?;
             let (_, signers) = check_signers(&der, Some(&content), store, crls, &known)?;
+            verdict.capabilities.extend(capabilities::of_signers(&der, &signers));
             (content, Some(signers))
         } else {
             break;
@@ -1594,7 +1610,7 @@ mod tests {
         let pem = String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap();
         Certificates {
             own: vec![(String::from_utf8(fixture(&format!("{name}.pem"))).unwrap(), pem)],
-            others: Vec::new(),
+            ..Certificates::default()
         }
     }
 
@@ -2233,6 +2249,116 @@ mod tests {
         let der = CmsContentInfo::smime_read_cms(&message).unwrap().to_der().unwrap();
         let enveloped: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x03];
         assert_eq!(der::content_info(&der).unwrap().0, enveloped);
+    }
+
+    /// RFC 8551 §2.7.1: a correspondent whose signed mail lists AES-256 GCM
+    /// first (Picacho's own RSA signatures do) is then written to with it,
+    /// as authEnveloped-data; one whose list puts CBC first (`openssl cms`'s
+    /// does), or with no list kept, with AES-256 CBC; several get GCM only
+    /// when every one of them prefers it.
+    #[test]
+    fn capabilities_learned_from_signed_mail_choose_aes_gcm() {
+        let ana = fixture_identity("ana");
+        let mut bo = fixture_identity("bo");
+        let signed = protect_with(&ana, MESSAGE, "ana@example.org", &[], true, false).unwrap();
+        let (_, verdict, signer) = open_with(&signed, &bo, &test_authority()).unwrap();
+        let [announced] = verdict.capabilities.as_slice() else { panic!("{verdict:?}") };
+        assert_eq!(announced.fingerprint, fingerprint(&X509::from_pem(&fixture("ana.pem")).unwrap()));
+        assert_eq!(
+            announced.algorithms,
+            ["2.16.840.1.101.3.4.1.46", "2.16.840.1.101.3.4.1.6", "2.16.840.1.101.3.4.1.42", "2.16.840.1.101.3.4.1.2"]
+        );
+        // Not for a certificate that isn't kept.
+        assert!(!learn_capabilities(&mut bo, &verdict));
+        assert!(bo.capabilities.is_empty());
+        let to_ana = ["ana@example.org".to_owned()];
+        assert!(learn(&mut bo, &signer.unwrap(), &verdict.signature, "ana@example.org").unwrap());
+        let before = protect_with(&bo, MESSAGE, "bo@example.se", &to_ana, false, true).unwrap();
+        assert!(String::from_utf8_lossy(&before).contains("smime-type=enveloped-data;"));
+        assert!(learn_capabilities(&mut bo, &verdict));
+        assert!(!learn_capabilities(&mut bo, &verdict), "the same message again changes nothing");
+        let sent = protect_with(&bo, MESSAGE, "bo@example.se", &to_ana, false, true).unwrap();
+        assert!(String::from_utf8_lossy(&sent).contains("smime-type=authEnveloped-data;"));
+        for who in ["ana", "bo"] {
+            let (readable, verdict, _) = open_with(&sent, &fixture_identity(who), &test_authority()).unwrap();
+            assert!(verdict.decrypted && String::from_utf8_lossy(&readable).contains("Meet at noon."), "{who}");
+            assert!(openssl_cli_decrypts(&sent, who).is_some_and(|t| t.contains("Meet at noon.")), "{who}");
+        }
+        // Cy, whose (CLI-signed) list puts AES-256 CBC first: CBC, to Cy
+        // alone and to Ana and Cy together.
+        let mut cy = Certificates::default();
+        cy.import_identity(&test_identity("cy@example.com", ""), "").unwrap();
+        let (cy_cert, _, cy_key) = cy.identities().remove(0);
+        let cli_signed = CmsContentInfo::sign(Some(&cy_cert), Some(&cy_key), None, Some(b"x"), CMSOptions::DETACHED | CMSOptions::BINARY).unwrap();
+        let found = capabilities::of_signers(
+            &cli_signed.to_der().unwrap(),
+            &[(Signer { address: "cy@example.com".into(), result: SignerResult::Untrusted }, Some(cy_cert.clone()))],
+        );
+        assert_eq!(found[0].algorithms.first().map(String::as_str), Some("2.16.840.1.101.3.4.1.42"));
+        bo.others.push(String::from_utf8(cy_cert.to_pem().unwrap()).unwrap());
+        assert!(learn_capabilities(&mut bo, &Verdict { capabilities: found, ..Verdict::default() }));
+        for to in [vec!["cy@example.com"], vec!["ana@example.org", "cy@example.com"]] {
+            let to: Vec<String> = to.into_iter().map(String::from).collect();
+            let sent = protect_with(&bo, MESSAGE, "bo@example.se", &to, false, true).unwrap();
+            assert!(String::from_utf8_lossy(&sent).contains("smime-type=enveloped-data;"), "{to:?}");
+        }
+        // Removing a certificate removes what was kept of its holder.
+        bo.remove(&fingerprint(&cy_cert));
+        assert_eq!(bo.capabilities.len(), 1);
+    }
+
+    /// RFC 8551 §2.7.1: a list replaces the kept one only from a newer
+    /// message, never from one dated far ahead, and never from a signature
+    /// that doesn't match.
+    #[test]
+    fn capabilities_are_replaced_only_by_newer_mail_with_good_signatures() {
+        let ana_fp = fingerprint(&X509::from_pem(&fixture("ana.pem")).unwrap());
+        let mut certs = Certificates { others: vec![String::from_utf8(fixture("ana.pem")).unwrap()], ..Certificates::default() };
+        let list = |time: i64, first: &str| capabilities::Capabilities {
+            fingerprint: ana_fp.clone(),
+            signing_time: time,
+            algorithms: vec![first.into()],
+        };
+        let learn_at = |certs: &mut Certificates, found: capabilities::Capabilities| {
+            learn_capabilities(certs, &Verdict { capabilities: vec![found], ..Verdict::default() })
+        };
+        let now = chrono::Utc::now().timestamp();
+        assert!(learn_at(&mut certs, list(now - 100, "newer")));
+        assert!(!learn_at(&mut certs, list(now - 200, "older")));
+        assert!(!learn_at(&mut certs, list(now + 7 * 86_400, "far ahead")));
+        assert_eq!(certs.capabilities[0].algorithms, ["newer"]);
+        assert!(learn_at(&mut certs, list(now, "newest")));
+        assert_eq!(certs.capabilities[0].algorithms, ["newest"]);
+        // A changed message: its signature is bad, so nothing is announced.
+        let ana = fixture_identity("ana");
+        let signed = protect_with(&ana, MESSAGE, "ana@example.org", &[], true, false).unwrap();
+        let changed = String::from_utf8_lossy(&signed).replace("Meet at noon.", "Meet at nine.");
+        let (_, verdict, _) = open_with(changed.as_bytes(), &certs, &test_authority()).unwrap();
+        assert_eq!(verdict.signature, Signature::Bad);
+        assert!(verdict.capabilities.is_empty());
+    }
+
+    /// A store saved before capabilities were kept still loads, with none,
+    /// and one saved now reads back the same.
+    #[test]
+    fn certificates_saved_before_capabilities_still_load() {
+        let old = serde_json::json!({
+            "own": [["chain", "key"]],
+            "others": ["cert"],
+        })
+        .to_string();
+        let loaded: Certificates = serde_json::from_str(&old).unwrap();
+        assert_eq!(loaded.own, [("chain".to_owned(), "key".to_owned())]);
+        assert_eq!(loaded.others, ["cert"]);
+        assert!(loaded.capabilities.is_empty());
+        let mut now = loaded;
+        now.capabilities.push(capabilities::Capabilities {
+            fingerprint: "AB".into(),
+            signing_time: 1,
+            algorithms: vec!["2.16.840.1.101.3.4.1.46".into()],
+        });
+        let again: Certificates = serde_json::from_str(&serde_json::to_string(&now).unwrap()).unwrap();
+        assert_eq!(again, now);
     }
 
     /// Mail Picacho sent before, with Pkcs7::encrypt (EnvelopedData, RSA

@@ -385,7 +385,7 @@ fn smime_bcc_copies_open_only_for_their_own_recipient() -> Result<()> {
     let person = |name: &str| -> Result<Certificates> {
         let key = openssl::pkey::PKey::private_key_from_pem(smime_fixture(&format!("{name}.key"))?.as_bytes())?;
         let key = String::from_utf8(key.private_key_to_pem_pkcs8()?)?;
-        Ok(Certificates { own: vec![(smime_fixture(&format!("{name}.pem"))?, key)], others: Vec::new() })
+        Ok(Certificates { own: vec![(smime_fixture(&format!("{name}.pem"))?, key)], ..Certificates::default() })
     };
     let (ana, bo) = (person("ana")?, person("bo")?);
     let mut di = Certificates::default();

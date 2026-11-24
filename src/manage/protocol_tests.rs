@@ -1600,7 +1600,9 @@ fn smime_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
     let raw = server.join().unwrap();
     result?;
     let text = String::from_utf8_lossy(&raw);
-    assert!(text.contains("smime-type=enveloped-data") && !text.contains("Only Rae"));
+    // RFC 8551 §2.7.1: Rae's signed mail listed AES-256 GCM first, which
+    // reading it kept, so Rae's copy is AuthEnvelopedData (RFC 5083).
+    assert!(text.contains("smime-type=authEnveloped-data") && !text.contains("Only Rae"), "{text}");
     let (opened, verdict, _) = crate::manage::smime::open(&raw, &theirs).unwrap();
     assert!(verdict.decrypted && verdict.signature != crate::manage::smime::Signature::Bad);
     assert!(String::from_utf8_lossy(&opened).contains("Only Rae reads this."));

@@ -1289,9 +1289,10 @@ impl Backend {
                 })
                 .map(|v| crate::sync::mime::receipt_address(&v))
                 .unwrap_or_default();
-            if crate::manage::smime::learn(&mut next, signer, &verdict.signature, &from)
-                .unwrap_or(false)
-            {
+            let learned = crate::manage::smime::learn(&mut next, signer, &verdict.signature, &from)
+                .unwrap_or(false);
+            // RFC 8551 §2.7.1: and what they can decrypt, for writing back.
+            if crate::manage::smime::learn_capabilities(&mut next, &verdict) || learned {
                 let _ = self.set_certificates(next);
             }
         }
