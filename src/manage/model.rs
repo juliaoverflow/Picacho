@@ -118,6 +118,26 @@ impl Service {
             _ => SignIn::Password,
         }
     }
+    /// What can be typed instead of signing in with the browser, where the
+    /// service takes one: Fastmail's API token (JMAP Bearer), and Google's
+    /// and Microsoft's app passwords (IMAP and SMTP). `None` where the
+    /// browser is the only way in (Pinal), or where sign-in isn't the
+    /// browser's to begin with.
+    pub fn token_instead(self) -> Option<&'static str> {
+        self.token_offer(self.sign_in() == SignIn::Browser)
+    }
+    /// `token_instead`, given whether this build signs in to the service
+    /// with the browser.
+    fn token_offer(self, browser: bool) -> Option<&'static str> {
+        if !browser {
+            return None;
+        }
+        match self {
+            Self::Fastmail => Some("API token"),
+            Self::Gmail | Self::Outlook => Some("app password"),
+            _ => None,
+        }
+    }
     pub fn password_label(self) -> &'static str {
         match self {
             Self::Gmail | Self::Outlook | Self::Zoho => "App password",
@@ -1739,6 +1759,22 @@ pub fn demo_mail() -> Vec<Mail> {
 
 #[cfg(test)]
 mod tests {
+    /// Where the browser is how a service signs in, an API token (Fastmail,
+    /// JMAP) or app password (Google, Microsoft: IMAP and SMTP) is offered
+    /// instead; nothing for services without one, or that are typed already.
+    #[test]
+    fn tokens_are_offered_instead_of_the_browser_where_taken() {
+        assert_eq!(Service::Fastmail.token_offer(true), Some("API token"));
+        assert_eq!(Service::Gmail.token_offer(true), Some("app password"));
+        assert_eq!(Service::Outlook.token_offer(true), Some("app password"));
+        for none in [Service::Pinal, Service::ICloud, Service::Zoho, Service::Proton, Service::Other] {
+            assert_eq!(none.token_offer(true), None, "{none:?}");
+        }
+        // Without browser sign-in in this build, the token is the only way,
+        // not an alternative.
+        assert_eq!(Service::Gmail.token_offer(false), None);
+    }
+
     #[test]
     fn single_sign_on_is_for_imap_and_pop3_over_https() {
         let mut a = Account::new(Provider::Imap);

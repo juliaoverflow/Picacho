@@ -1099,6 +1099,12 @@ enum Action {
     Discover,
     SetupBack,
     RetrySignIn,
+    /// Types an API token or app password instead of signing in with the
+    /// browser (true), or goes back to the browser (false).
+    UseToken(bool),
+    /// Sign In Again with an API token or app password instead of the
+    /// browser (true), or with the browser again (false).
+    ReconnectWithToken(bool),
     Manual,
     Finish,
     #[cfg(feature = "sample-data")]
@@ -1339,6 +1345,11 @@ pub struct MailApp {
     service: Service,
     provider: Provider,
     oauth: bool,
+    /// The person chose to type an API token or app password instead of
+    /// signing in with the browser (see `Service::token_instead`).
+    setup_token: bool,
+    /// As `setup_token`, for Sign In Again.
+    reconnect_token: bool,
     connecting: bool,
     /// The last sign-in failed after the browser and can be retried as is.
     sign_in_retry: bool,
@@ -2561,6 +2572,8 @@ impl MailApp {
             service: Service::Other,
             provider: Provider::Gmail,
             oauth: false,
+            setup_token: false,
+            reconnect_token: false,
             connecting: false,
             sign_in_retry: false,
             sign_in_step: SignInStep::Browser,
@@ -5712,6 +5725,7 @@ impl MailApp {
         }
         self.service = service;
         self.provider = service.provider();
+        self.setup_token = false;
         self.oauth = service.sign_in() == SignIn::Browser;
         self.step = Step::Credentials;
         if let Some(a) = service.account("") {
@@ -5730,7 +5744,7 @@ impl MailApp {
                 cx,
             );
         }
-        if service.sign_in().typed() {
+        if self.sign_in().typed() {
             let field = if Self::value(&self.form[EMAIL], cx).is_empty() {
                 EMAIL
             } else {
@@ -5857,12 +5871,40 @@ impl MailApp {
         self.provider = p;
         self.oauth = false;
     }
+    /// How the account being added signs in: the service's own way, or a
+    /// typed API token or app password where the person chose one instead
+    /// of the browser.
+    fn sign_in(&self) -> SignIn {
+        match self.service.sign_in() {
+            SignIn::Browser if self.setup_token => SignIn::Password,
+            other => other,
+        }
+    }
+    /// Switches the setup form between the browser and a typed API token
+    /// or app password (`Service::token_instead`).
+    fn use_token(&mut self, on: bool, w: &mut Window, cx: &mut Context<Self>) {
+        if self.connecting || self.service.token_instead().is_none() {
+            return;
+        }
+        self.cancel.store(true, Ordering::Relaxed);
+        self.backend.forget_sign_in();
+        self.sign_in_retry = false;
+        self.status.clear();
+        self.setup_token = on;
+        self.oauth = !on;
+        Self::set(&self.form[PASSWORD], "", w, cx);
+        let field = if Self::value(&self.form[EMAIL], cx).is_empty() { EMAIL } else { PASSWORD };
+        if on {
+            self.form[field].update(cx, |s, cx| s.focus(w, cx));
+        }
+        cx.notify();
+    }
     /// The account the setup form describes. Browser and Pinal sign-in learn
     /// the address from the provider.
     fn setup_account(&self, cx: &App) -> Account {
         let value = |i: usize| Self::value(&self.form[i], cx).trim().to_owned();
         let email = value(EMAIL);
-        let mut a = match self.service.sign_in() {
+        let mut a = match self.sign_in() {
             SignIn::Pinal => Service::Pinal.account("").unwrap(),
             SignIn::Browser => {
                 let mut a = self
@@ -5953,7 +5995,7 @@ impl MailApp {
         } else {
             password
         };
-        if self.service.sign_in().typed() {
+        if self.sign_in().typed() {
             if let Err(e) = a.validate() {
                 self.notice(e.to_string(), true, cx);
                 return;
@@ -7086,10 +7128,22 @@ impl MailApp {
                 for i in [PASSWORD, TOTP, MAILBOX_PASSWORD, KEY_PIN] {
                     Self::set(&self.form[i], "", w, cx);
                 }
+                // Signed in as it was: with the browser, or with a token.
+                self.reconnect_token = self
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == id)
+                    .is_some_and(|a| a.service.token_instead().is_some() && !a.oauth);
                 self.modal = Some(Modal::Reconnect(id));
                 self.anim += 1;
             }
             Action::SubmitReconnect(id) => self.reconnect(id, w, cx),
+            Action::UseToken(on) => self.use_token(on, w, cx),
+            Action::ReconnectWithToken(on) => {
+                self.reconnect_token = on;
+                self.status.clear();
+                Self::set(&self.form[PASSWORD], "", w, cx);
+            }
             Action::ProtonKey(method) => {
                 let reconnect = self.proton_reconnecting();
                 self.proton_use_key(method, reconnect, cx)
@@ -7432,7 +7486,7 @@ impl MailApp {
                 if self.step == Step::Credentials
                     && (self.onboarding || self.modal == Some(Modal::Connect))
                 {
-                    if self.service.sign_in().typed() {
+                    if self.sign_in().typed() {
                         self.connect(cx)
                     } else {
                         // Try the browser again after an error or a closed tab.
@@ -10159,7 +10213,7 @@ impl MailApp {
     fn setup_view(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let in_modal = self.modal == Some(Modal::Connect);
-        let browser = !self.service.sign_in().typed();
+        let browser = !self.sign_in().typed();
         let label = self.service.label();
         let (title, subtitle): (String, String) = match self.step {
             Step::Welcome => (
@@ -10201,6 +10255,8 @@ impl MailApp {
                     "We couldn't find your settings. Enter them below.".into()
                 } else if self.service.browser_unavailable().is_some() {
                     "Connect with an app password from your account's security settings.".into()
+                } else if let Some(what) = self.service.token_instead().filter(|_| self.setup_token) {
+                    format!("Connect with an {what} instead of the browser. It's kept in your system's keychain.")
                 } else {
                     String::new()
                 },
@@ -10368,6 +10424,23 @@ impl MailApp {
                 Action::SubmitAccount,
                 cx,
             ));
+        }
+        // Where the service takes one: an API token or app password instead
+        // of the browser, and back.
+        if self.step == Step::Credentials
+            && !self.connecting
+            && let Some(what) = self.service.token_instead()
+        {
+            actions = actions.child(if self.setup_token {
+                self.link("setup-use-browser", "Sign in with the browser instead", Action::UseToken(false), cx)
+            } else {
+                self.link(
+                    "setup-use-token",
+                    &format!("Use an {what} instead"),
+                    Action::UseToken(true),
+                    cx,
+                )
+            });
         }
         if let Some(back) = back {
             actions = actions.child(self.link("onboard-back", back, Action::SetupBack, cx));
@@ -10762,7 +10835,7 @@ impl MailApp {
                     "Waiting for Proton's check…"
                 } else if self.connecting {
                     "Connecting…"
-                } else if !self.service.sign_in().typed() {
+                } else if !self.sign_in().typed() {
                     "Open Browser Again"
                 } else {
                     "Connect"

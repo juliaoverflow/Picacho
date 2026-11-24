@@ -422,3 +422,35 @@ fn setup_offers_an_organizations_single_sign_on(cx: &mut TestAppContext) {
     act(&view, Action::ToggleSetupKerberos, cx);
     view.read_with(cx, |this, _| assert!(this.setup_kerberos && !this.setup_sso));
 }
+
+/// An API token or app password chosen instead of the browser: the
+/// account is set up to sign in with it (no OAuth), to the service's own
+/// servers, and the form asks for it by the service's name for it.
+#[gpui::test]
+fn tokens_chosen_instead_of_the_browser_sign_in_with_them(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    for (service, label) in [(Service::Fastmail, "API token"), (Service::Gmail, "App password")] {
+        act(&view, Action::ChooseService(service), cx);
+        view.update_in(cx, |this, w, cx| {
+            // As in a build that signs in to it with the browser.
+            this.setup_token = true;
+            this.oauth = false;
+            MailApp::set(&this.form[EMAIL], "ana@example.org", w, cx);
+            assert!(this.sign_in().typed(), "{service:?} is typed now");
+            let a = this.setup_account(cx);
+            assert!(!a.oauth && a.client_id.is_empty(), "{service:?}: {a:?}");
+            assert_eq!(a.service, service);
+            match service {
+                // JMAP, sending the token as Bearer (sync/jmap.rs).
+                Service::Fastmail => assert_eq!(a.incoming_host, crate::sync::oauth::FASTMAIL_JMAP),
+                _ => assert_eq!(a.incoming_host, "imap.gmail.com"),
+            }
+            assert_eq!(service.password_label(), label);
+            // Back to the browser.
+            this.setup_token = false;
+            assert_eq!(this.sign_in(), service.sign_in());
+        });
+        act(&view, Action::SetupBack, cx);
+    }
+}

@@ -41,11 +41,21 @@ impl MailApp {
         if self.connecting || self.modal != Some(Modal::Reconnect(id.clone())) {
             return;
         }
-        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+        let Some(mut a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
         if a.service == Service::Proton {
             return self.proton_continue(Some(id), cx);
+        }
+        // An API token or app password instead of the browser, or the
+        // browser again for an account that used one (see
+        // `Service::token_instead`).
+        if a.service.token_instead().is_some() {
+            a.oauth = !self.reconnect_token;
+            if !a.oauth {
+                a.client_id.clear();
+                a.client_secret.clear();
+            }
         }
         let password = Self::value(&self.form[PASSWORD], cx);
         let password = if a.service == Service::Gmail {
@@ -226,7 +236,13 @@ impl MailApp {
                 .child(step)
                 .into_any_element();
         }
-        let browser = a.oauth || a.service == Service::Pinal;
+        // Where the service takes one, an API token or app password can be
+        // used instead of the browser, and the other way round.
+        let switchable = a.service.token_instead();
+        let browser = match switchable {
+            Some(_) => !self.reconnect_token,
+            None => a.oauth || a.service == Service::Pinal,
+        };
         div().w_full().flex().flex_col().gap_3()
             .child(div().text_size(px(13.)).child(a.email.clone()))
             .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted)).child(
@@ -235,6 +251,13 @@ impl MailApp {
             .when_some(a.service.browser_unavailable().filter(|_| !browser), |d, why| d.child(notice_box(why, self.colors())))
             .when(!browser, |d| d.child(self.field(a.service.password_label(), PASSWORD)))
             .when_some(a.service.password_help().filter(|_| !browser), |d, (help, _)| d.child(div().text_size(px(12.)).child(help)))
+            .when_some(switchable, |d, what| {
+                d.child(div().flex().child(if browser {
+                    self.link("reconnect-use-token", &format!("Use an {what} instead"), Action::ReconnectWithToken(true), cx)
+                } else {
+                    self.link("reconnect-use-browser", "Sign in with the browser instead", Action::ReconnectWithToken(false), cx)
+                }))
+            })
             .into_any_element()
     }
     /// Whether any of the account's problems is critical (its sign-in or
