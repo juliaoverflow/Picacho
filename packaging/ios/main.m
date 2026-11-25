@@ -1,5 +1,7 @@
 // Picacho's iOS host app. The app is the Rust library (src/ios.rs, linked
-// as libpicacho.a); this file only gives it a scene, a window and frames.
+// as libpicacho.a); this file only gives it a scene, a window and frames,
+// and hands the system's events to the Swift beside it (notifications,
+// background refresh, shares).
 //
 // gpui-mobile runs embedded: it makes the view controller, and this scene
 // puts it in its UIWindow. A CADisplayLink asks GPUI for frames and pauses
@@ -21,6 +23,26 @@ extern void gpui_ios_will_resign_active(void *app);
 extern void gpui_ios_did_enter_background(void *app);
 extern void gpui_ios_will_terminate(void *app);
 extern void gpui_ios_handle_open_url(void *url);
+
+// The Swift side (packaging/ios/*.swift).
+extern void picacho_ios_app_launched(void);
+extern void picacho_ios_scene_started(void);
+extern void picacho_ios_scene_backgrounded(void);
+extern void picacho_ios_collect_shares(void);
+
+// Opens `url`: a share the Share extension handed over
+// (<scheme>://share/<id>) is taken here; the rest go to GPUI (sign-in
+// redirects, widgets' links).
+static void openURL(NSURL *url) {
+    NSString *scheme = url.scheme.lowercaseString;
+    BOOL ours = [scheme isEqualToString:@"picacho"] ||
+                [scheme isEqualToString:NSBundle.mainBundle.bundleIdentifier.lowercaseString];
+    if (ours && [url.host isEqualToString:@"share"]) {
+        picacho_ios_collect_shares();
+        return;
+    }
+    gpui_ios_handle_open_url((__bridge void *)url.absoluteString);
+}
 
 @interface PicachoScene : UIResponder <UIWindowSceneDelegate>
 @property(nonatomic, strong) UIWindow *window;
@@ -84,9 +106,10 @@ static void wake(void *context) {
     }
     gpui_ios_set_frame_waker(gpui_ios_get_window(), wake, NULL);
     [self attachToScene:(UIWindowScene *)scene];
+    picacho_ios_scene_started();
 
     for (UIOpenURLContext *context in options.URLContexts) {
-        gpui_ios_handle_open_url((__bridge void *)context.URL.absoluteString);
+        openURL(context.URL);
     }
 }
 
@@ -129,7 +152,7 @@ static void wake(void *context) {
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)contexts {
     for (UIOpenURLContext *context in contexts) {
-        gpui_ios_handle_open_url((__bridge void *)context.URL.absoluteString);
+        openURL(context.URL);
     }
 }
 
@@ -141,6 +164,8 @@ static void wake(void *context) {
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     gpui_ios_did_become_active(NULL);
     self.link.paused = NO;
+    // A share the extension couldn't open Picacho for.
+    picacho_ios_collect_shares();
 }
 
 - (void)sceneWillResignActive:(UIScene *)scene {
@@ -150,6 +175,7 @@ static void wake(void *context) {
 - (void)sceneDidEnterBackground:(UIScene *)scene {
     gpui_ios_did_enter_background(NULL);
     self.link.paused = YES;
+    picacho_ios_scene_backgrounded();
 }
 
 @end
@@ -169,6 +195,15 @@ static void wake(void *context) {
 @end
 
 @implementation PicachoApp
+
+// Before launching ends: the notification center's delegate (a tap may
+// have launched Picacho) and the background refresh's handler. iOS may
+// launch Picacho in the background for either, without a scene.
+- (BOOL)application:(UIApplication *)application
+    didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey, id> *)options {
+    picacho_ios_app_launched();
+    return YES;
+}
 
 - (UISceneConfiguration *)application:(UIApplication *)application
     configurationForConnectingSceneSession:(UISceneSession *)session

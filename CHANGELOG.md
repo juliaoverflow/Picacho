@@ -13,6 +13,13 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- iOS catches up with Android: system notifications for new mail with Mark
+  as Read, Archive, Delete and Reply; checking for mail in the background
+  through background app refresh (scheduled mail and snoozes too); Proton
+  sign-in with a security key held to the iPhone (NFC) or a passkey on
+  another device by QR code, and Proton's human verification (CAPTCHA); a
+  Share extension that starts a message with what was shared; and app icons
+  at every iPhone and iPad size.
 - App lock (Settings → Privacy): a passcode, Touch ID, Face ID or Android's
   fingerprint or face unlock when Picacho opens and after it has been away
   for a chosen time, Lock Picacho (⌥⌘L / Ctrl+Alt+L), covers over its other

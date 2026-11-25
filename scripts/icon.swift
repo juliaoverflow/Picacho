@@ -2,7 +2,10 @@ import AppKit
 
 // Draws the Picacho logo (assets/brand/picacho.svg) on a light app-icon tile.
 // `swift scripts/icon.swift <dir>` writes a macOS iconset; with `ios` after the
-// folder it writes AppIcon.png, a full-bleed 1024-pixel tile iOS rounds itself.
+// folder it writes AppIcon.png, a full-bleed 1024-pixel tile iOS rounds itself,
+// and AppIcon-<pixels>.png at every size iPhone and iPad use (the appiconset's
+// Contents.json names them), all without an alpha channel, as the App Store
+// wants.
 let output = CommandLine.arguments[1]
 let ios = CommandLine.arguments.dropFirst(2).first == "ios"
 try FileManager.default.createDirectory(atPath: output, withIntermediateDirectories: true)
@@ -41,7 +44,7 @@ let halves = CGMutablePath()
 halves.addPath(polygon([(0, 0), (640, 0), (640, 196), (320, 262), (0, 196)]))
 halves.addPath(polygon([(0, 216), (320, 282), (640, 216), (640, 540), (0, 540)]))
 
-let sizes = ios ? [("AppIcon", 1024)] : [("icon_16x16",16),("icon_16x16@2x",32),("icon_32x32",32),("icon_32x32@2x",64),("icon_128x128",128),("icon_128x128@2x",256),("icon_256x256",256),("icon_256x256@2x",512),("icon_512x512",512),("icon_512x512@2x",1024)]
+let sizes = ios ? [("AppIcon", 1024)] + [20, 29, 40, 58, 60, 76, 80, 87, 120, 152, 167, 180].map { ("AppIcon-\($0)", $0) } : [("icon_16x16",16),("icon_16x16@2x",32),("icon_32x32",32),("icon_32x32@2x",64),("icon_128x128",128),("icon_128x128@2x",256),("icon_256x256",256),("icon_256x256@2x",512),("icon_512x512",512),("icon_512x512@2x",1024)]
 for (name, pixels) in sizes {
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
     NSGraphicsContext.saveGraphicsState()
@@ -85,5 +88,14 @@ for (name, pixels) in sizes {
     context.drawLinearGradient(gradient([(0, 0x003d40), (1, 0x005353)]), start: CGPoint(x: 40, y: 0), end: CGPoint(x: 600, y: 0), options: [])
     context.restoreGState()
     NSGraphicsContext.restoreGraphicsState()
-    try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: "\(output)/\(name).png"))
+    // The tile is opaque; iOS's icons also leave out the alpha channel.
+    var png = bitmap
+    if ios, let image = bitmap.cgImage,
+       let opaque = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
+        opaque.draw(image, in: CGRect(x: 0, y: 0, width: pixels, height: pixels))
+        if let flat = opaque.makeImage() {
+            png = NSBitmapImageRep(cgImage: flat)
+        }
+    }
+    try png.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: "\(output)/\(name).png"))
 }

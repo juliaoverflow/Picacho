@@ -343,6 +343,12 @@ apple-native-keyring-store = { version = "1", features = ["protected"] }
 objc2 = "0.6"
 # The app lock's Face ID or Touch ID prompt (display/biometric.rs).
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
+# Proton's security keys over NFC (Core NFC, packaging/ios/SecurityKeys.swift)
+# and a passkey on another phone by QR code and Bluetooth (caBLE): CTAP2
+# here, the NFC I/O through the Swift side (ios/keys.rs).
+webauthn-authenticator-rs = { version = "0.6.2", features = ["ctap2", "cable"] }
+# Its `Token` trait, implemented for those keys.
+async-trait = "0.1"
 
 # The app lock's Touch ID, Face ID or Optic ID (display/biometric.rs): the
 # LocalAuthentication framework, which answers on a queue of its own.

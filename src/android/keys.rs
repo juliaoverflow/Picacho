@@ -16,7 +16,10 @@ use super::{
     requests::{Request, Waited},
     with_java,
 };
-use crate::sync::fido::Assertion;
+use crate::sync::{
+    ctap_nfc::{self, ctap_answer, lost},
+    fido::Assertion,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{
@@ -144,15 +147,6 @@ const FIRST: usize = REPORT - 7;
 const NEXT: usize = REPORT - 5;
 /// How long a key may take to answer, touch included.
 const ANSWER: Duration = Duration::from_secs(60);
-
-/// The FIDO applet (CTAP 2.1 §11.3.3), and what selecting it answers.
-const APPLET: [u8; 8] = [0xa0, 0x00, 0x00, 0x06, 0x47, 0x2f, 0x00, 0x01];
-const FIDO_2_0: &[u8] = b"FIDO_2_0";
-const U2F_V2: &[u8] = b"U2F_V2";
-
-fn lost() -> WebauthnCError {
-    WebauthnCError::ApduTransmission
-}
 
 impl<'c> KeyToken<'c> {
     fn new(link: Link, cancel: &'c AtomicBool) -> Self {
@@ -348,82 +342,22 @@ impl<'c> KeyToken<'c> {
     }
 
     fn nfc_init(&self) -> Result<(), WebauthnCError> {
-        let mut select = vec![0x00, 0xa4, 0x04, 0x00, APPLET.len() as u8];
-        select.extend_from_slice(&APPLET);
-        select.push(0x00);
-        let answer = self.nfc_exchange(&select)?;
-        if !answer.is_ok() || (answer.data != FIDO_2_0 && answer.data != U2F_V2) {
-            return Err(WebauthnCError::NotSupported);
-        }
-        Ok(())
+        ctap_nfc::select(self)
     }
 
     fn nfc_transmit<U: UiCallback>(&self, cbor: &[u8], ui: &U) -> Result<Vec<u8>, WebauthnCError> {
-        // Chained short APDUs: every part but the last says more follows.
-        let parts: Vec<&[u8]> = cbor.chunks(255).collect();
-        let mut answer = None;
-        for (i, part) in parts.iter().enumerate() {
-            let last = i + 1 == parts.len();
-            let mut apdu = vec![if last { 0x80 } else { 0x90 }, 0x10, 0x00, 0x00];
-            apdu.push(part.len() as u8);
-            apdu.extend_from_slice(part);
-            if last {
-                apdu.push(0x00);
-            }
-            let a = self.nfc_exchange(&apdu)?;
-            if !last && !a.is_ok() {
-                return Err(lost());
-            }
-            answer = Some(a);
-        }
-        let mut answer = answer.ok_or(WebauthnCError::MessageTooShort)?;
-        let mut data = Vec::new();
-        let deadline = Instant::now() + ANSWER;
-        loop {
-            if self.cancelled() {
-                return Err(WebauthnCError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(WebauthnCError::Ctap(CtapError::Ctap2UserActionTimeout));
-            }
-            match (answer.sw1, answer.sw2) {
-                (0x90, 0x00) => {
-                    data.extend_from_slice(&answer.data);
-                    return ctap_answer(data);
-                }
-                // More of the answer waits: GET RESPONSE.
-                (0x61, more) => {
-                    data.extend_from_slice(&answer.data);
-                    // A key's answer is a few kilobytes at most: one that
-                    // keeps saying "more" doesn't fill memory until the time
-                    // is up.
-                    if data.len() > 64 * 1024 {
-                        return Err(WebauthnCError::Ctap(CtapError::Ctap1InvalidLength));
-                    }
-                    answer = self.nfc_exchange(&[0x00, 0xc0, 0x00, 0x00, more])?;
-                }
-                // Still working: ask again (NFCCTAP_GETRESPONSE).
-                (0x91, 0x00) => {
-                    ui.processing();
-                    std::thread::sleep(Duration::from_millis(100));
-                    answer = self.nfc_exchange(&[0x80, 0x11, 0x00, 0x00, 0x00])?;
-                }
-                _ => return Err(lost()),
-            }
-        }
+        ctap_nfc::transmit(self, cbor, ui)
     }
 }
 
-/// A CTAP2 answer: its status byte, then the CBOR.
-fn ctap_answer(mut data: Vec<u8>) -> Result<Vec<u8>, WebauthnCError> {
-    if data.is_empty() {
-        return Err(WebauthnCError::MessageTooShort);
+/// The NFC half of the key, for the shared framing.
+impl ctap_nfc::Link for KeyToken<'_> {
+    fn exchange(&self, apdu: &[u8]) -> Result<ISO7816ResponseAPDU, WebauthnCError> {
+        self.nfc_exchange(apdu)
     }
-    let status = CtapError::from(data.remove(0));
-    if !status.is_ok() {
-        return Err(WebauthnCError::Ctap(status));
+    fn cancelled(&self) -> bool {
+        KeyToken::cancelled(self)
     }
-    Ok(data)
 }
 
 #[async_trait]

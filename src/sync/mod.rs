@@ -2,6 +2,9 @@
 //! Protocol helpers never depend on Display and never mutate the message database.
 pub mod auth;
 pub mod caldav;
+/// CTAP2 over NFC, for security keys held to a phone.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+pub(crate) mod ctap_nfc;
 pub(crate) mod dsn;
 pub mod carddav;
 pub mod dav;

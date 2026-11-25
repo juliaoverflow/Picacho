@@ -2011,7 +2011,8 @@ impl MailApp {
     }
 
     /// Running in the background once Picacho's windows close, and its tray
-    /// icon (desktop); its mail service (Android). iOS has neither.
+    /// icon (desktop); its mail service (Android); background app refresh
+    /// (iOS).
     fn background_settings(&self, page: Div, cx: &Context<Self>) -> Div {
         let background = self
             .switch(
@@ -2022,7 +2023,11 @@ impl MailApp {
             )
             .debug_selector(|| "background".into());
         if cfg!(target_os = "ios") {
-            return page;
+            return page.child(self.section("Background")).child(self.toggle_row(
+                "Check for mail in the background",
+                "While Picacho isn't open, check for new mail from time to time and notify you of it, send scheduled mail, and bring back snoozed mail. iOS decides how often, by how you use Picacho, and only while Background App Refresh is on for it in Settings.",
+                background,
+            ));
         }
         if cfg!(target_os = "android") {
             return page.child(self.section("Background")).child(self.toggle_row(

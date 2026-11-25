@@ -1,12 +1,13 @@
 //! System notifications for new mail. Failures are ignored: a missing or
 //! disabled notification service must never interrupt mail. Android's go
-//! through the app's Java side (`android::notify`); elsewhere notify-rust's.
+//! through the app's Java side (`android::notify`), iOS's through its Swift
+//! side (`ios::notify`, UserNotifications); elsewhere notify-rust's.
 //!
 //! Tapping one opens what it tells of (its `Target`): the message in its
 //! mailbox, or the mailbox. The tap reaches `clicked`, and the window takes
 //! it with `take_clicked` (see `MailApp::open_notified`).
 //!
-//! New mail's notifications have buttons (Linux, Windows, macOS, Android):
+//! New mail's notifications have buttons (Linux, Windows, macOS, Android, iOS):
 //! Mark as Read, Archive, Delete and Reply for one message; Mark All as
 //! Read, Archive All and Delete All for several. A button reaches `quick`;
 //! the window acts on it (`MailApp::quick_action`), or, while there is no
@@ -112,7 +113,7 @@ pub fn set_background(background: Background) {
 }
 
 /// Whether a window takes taps and buttons now.
-fn window_listening() -> bool {
+pub(crate) fn window_listening() -> bool {
     WAKE.lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
@@ -222,6 +223,30 @@ const QUICK_SEVERAL: [(&str, &str); 3] = [
     ("archive", "Archive All"),
     ("trash", "Delete All"),
 ];
+/// iOS's notification categories: each names the buttons its
+/// notifications have (registered once, `ios::register_categories`).
+#[cfg(target_os = "ios")]
+pub fn categories() -> [(&'static str, &'static [(&'static str, &'static str)]); 2] {
+    [
+        (CATEGORY_ONE, &QUICK_ONE),
+        (CATEGORY_SEVERAL, &QUICK_SEVERAL),
+    ]
+}
+#[cfg(target_os = "ios")]
+const CATEGORY_ONE: &str = "mail-one";
+#[cfg(target_os = "ios")]
+const CATEGORY_SEVERAL: &str = "mail-several";
+/// The category of a notification with `buttons`: none without any.
+#[cfg(any(target_os = "ios", test))]
+fn category(buttons: &[(&str, &str)]) -> &'static str {
+    if buttons.is_empty() {
+        ""
+    } else if buttons.iter().any(|(k, _)| *k == "reply") {
+        "mail-one"
+    } else {
+        "mail-several"
+    }
+}
 /// Whether `action` is one of the buttons.
 #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos")), allow(dead_code))]
 fn is_quick(action: &str) -> bool {
@@ -279,6 +304,12 @@ pub fn new_mail(
     latest: (&str, &str),
     count: usize,
 ) {
+    // On iOS the window and a background refresh (`ios::background`) may
+    // both find the same new mail; it's announced once.
+    #[cfg(target_os = "ios")]
+    if !first_announcement(messages) {
+        return;
+    }
     // Settings → Privacy → Hide mail outside Picacho: how many, not who or what.
     let (title, body) = if crate::manage::applock::hiding() {
         if count == 1 {
@@ -312,6 +343,33 @@ pub fn new_mail(
         Some(target),
         buttons,
     );
+}
+
+/// Messages announced lately, oldest first (iOS).
+#[cfg(any(target_os = "ios", test))]
+static ANNOUNCED: Mutex<std::collections::VecDeque<String>> =
+    Mutex::new(std::collections::VecDeque::new());
+/// How many announced messages are remembered.
+#[cfg(any(target_os = "ios", test))]
+const REMEMBERED: usize = 500;
+
+/// Whether any of `messages` is announced for the first time; all are
+/// remembered as announced.
+#[cfg(any(target_os = "ios", test))]
+fn first_announcement(messages: &[&str]) -> bool {
+    let mut announced = ANNOUNCED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut new = false;
+    for m in messages.iter().filter(|m| !m.is_empty()) {
+        if !announced.iter().any(|a| a == m) {
+            new = true;
+            announced.push_back((*m).to_owned());
+        }
+    }
+    while announced.len() > REMEMBERED {
+        announced.pop_front();
+    }
+    // A notification without message ids can't be told apart: shown.
+    new || messages.iter().all(|m| m.is_empty())
 }
 
 /// Shows what the background monitor has to tell (see
@@ -470,7 +528,18 @@ fn show_with(
             crate::android::notify(&key, &title, &body, &account, &target, &actions)
         });
     }
-    #[cfg(not(target_os = "android"))]
+    // iOS's buttons come from the notification's category (`categories`);
+    // a press reaches `ios::notification_action` with the target.
+    #[cfg(target_os = "ios")]
+    {
+        let category = if target.is_empty() {
+            ""
+        } else {
+            category(&buttons)
+        };
+        crate::ios::notify(&key, &title, &account, &body, &target, category);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     std::thread::spawn(move || {
         let _ = key;
         // Each notification waiting for a click holds this thread (and, on
@@ -610,4 +679,25 @@ mod tests {
         assert!(is_quick("trash") && !is_quick("default"));
     }
 
+    #[test]
+    fn categories_follow_the_buttons() {
+        assert_eq!(category(&QUICK_ONE), "mail-one");
+        assert_eq!(category(&QUICK_SEVERAL), "mail-several");
+        assert_eq!(category(&[]), "");
+    }
+
+    #[test]
+    fn mail_is_announced_once() {
+        assert!(first_announcement(&["once-a", "once-b"]));
+        assert!(!first_announcement(&["once-b"]));
+        // A newer message among them is still news.
+        assert!(first_announcement(&["once-b", "once-c"]));
+        assert!(first_announcement(&[""]));
+        for i in 0..REMEMBERED {
+            first_announcement(&[&format!("filler-{i}")]);
+        }
+        assert!(ANNOUNCED.lock().unwrap().len() <= REMEMBERED);
+        // Forgotten after enough others.
+        assert!(first_announcement(&["once-a"]));
+    }
 }

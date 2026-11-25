@@ -3127,6 +3127,8 @@ impl MailApp {
             .set_preference_soon(PREFERENCE, if on { "true" } else { "false" });
         #[cfg(target_os = "android")]
         crate::android::set_background(on);
+        #[cfg(target_os = "ios")]
+        crate::ios::set_background(on);
         cx.notify();
     }
     /// Reads the system's Reduce motion again (off the UI thread: on

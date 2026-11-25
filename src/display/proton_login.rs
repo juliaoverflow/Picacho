@@ -395,12 +395,19 @@ impl MailApp {
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
                         .text_center()
-                        .child("Scan this with your phone's camera, and keep Bluetooth on on both devices."),
+                        .child(if cfg!(target_os = "ios") {
+                            "Scan this with the camera of the phone or tablet that has your passkey, and keep Bluetooth on on both devices."
+                        } else {
+                            "Scan this with your phone's camera, and keep Bluetooth on on both devices."
+                        }),
                 )
                 .into_any_element(),
             KeyPrompt::Touch => line("Touch your security key."),
             KeyPrompt::Insert if cfg!(target_os = "android") => {
                 line("Hold your security key against the back of your phone, or plug it in…")
+            }
+            KeyPrompt::Insert if cfg!(target_os = "ios") => {
+                line("Hold your security key near the top of your iPhone…")
             }
             KeyPrompt::Insert => line("Plug in your security key…"),
             KeyPrompt::Phone(status) => line(status),

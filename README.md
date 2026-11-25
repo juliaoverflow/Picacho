@@ -156,10 +156,33 @@ bundle identifier or device. On first install, trust the developer in
 Settings > General > VPN & Device Management. With a free Apple account the
 app runs for 7 days before it must be installed again.
 
-Credentials are kept in the app's own Keychain. Not yet on iOS: system
-notifications, Proton's security keys, phone passkeys and human
-verification (as on Android), and app icons other than the 1024-pixel one
-(`swift scripts/icon.swift packaging/ios/Assets.xcassets/AppIcon.appiconset ios`).
+Credentials are kept in the app's own Keychain. As on Android, the iOS app
+has:
+
+- System notifications for new mail, with **Mark as Read**, **Archive**,
+  **Delete** and **Reply** (`Notifications.swift`).
+- Checking for mail in the background (Settings → General, on by default):
+  iOS doesn't let apps stay connected once they leave the screen, so
+  Picacho asks for background app refresh, and each time iOS wakes it,
+  checks each inbox once, sends scheduled mail and brings back snoozed
+  mail (`BackgroundRefresh.swift`). iOS decides how often, by how you use
+  Picacho; it needs Background App Refresh on for Picacho in Settings.
+- Proton: second factors with a security key held to the top of the iPhone
+  (NFC, through Core NFC; iPads have no NFC), or a passkey on another phone
+  or tablet by QR code and Bluetooth. Apple's own passkey APIs only sign
+  for sites that list the app in their associated domains, which proton.me
+  doesn't for Picacho. Proton's human verification (CAPTCHA) opens in a
+  WKWebView sheet (`Verify.swift`).
+- A Share extension (`ShareExtension/`): text, links, pictures and files
+  shared from other apps start a new message.
+- App icons at every iPhone and iPad size
+  (`swift scripts/icon.swift packaging/ios/Assets.xcassets/AppIcon.appiconset ios`
+  draws them).
+
+Reading security keys needs the NFC Tag Reading capability
+(`com.apple.developer.nfc.readersession.formats` in `project.yml`), and the
+widgets and Share extension an App Group. If your team can't sign for one,
+remove it from `project.yml`; only that feature goes.
 
 ### Built-in sign-in
 
