@@ -607,6 +607,39 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Forgets an account's cached mail, folders and server states, keeping
+    /// the account and its drafts (which upload afresh): for an account that
+    /// now reaches its mailbox another way, whose messages have other ids.
+    pub fn forget_mail(&self, id: &str) -> Result<()> {
+        self.flush();
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        for key in [
+            format!("folders:{id}"),
+            format!("offline_changes:{id}"),
+            format!("draft_removals:{id}"),
+            format!("folder_order:{id}"),
+            format!("gmail_history:{id}"),
+        ] {
+            tx.execute("DELETE FROM preferences WHERE key=?1", [key])?;
+        }
+        tx.execute(
+            "DELETE FROM preferences WHERE substr(key,1,length(?1))=?1",
+            [format!("jmap_state:{id}:")],
+        )?;
+        for table in ["messages", "mailbox_state", "offline_changes", "parcel_scan", "receipt_scan"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE account=?1"), [id])?;
+        }
+        tx.commit()?;
+        drop(db);
+        for mut d in self.drafts(id)? {
+            if d.remote.take().is_some() {
+                d.uploaded = String::new();
+                self.save_draft(&d)?;
+            }
+        }
+        Ok(())
+    }
     /// The newest `limit` cached messages of a mailbox, bodies included.
     #[cfg(test)]
     pub fn messages(

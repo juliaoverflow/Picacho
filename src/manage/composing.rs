@@ -58,6 +58,8 @@ pub struct ComposeOptions {
     /// Pasting copied rich text keeps its formatting; otherwise it pastes as
     /// plain text. Either way the composer offers the other just after.
     pub paste_formatted: bool,
+    /// The formatted composer underlines words spelled wrong.
+    pub spellcheck: bool,
 }
 
 impl Default for ComposeOptions {
@@ -76,6 +78,7 @@ impl Default for ComposeOptions {
             attachment_reminder: true,
             warn_empty_subject: true,
             paste_formatted: false,
+            spellcheck: true,
         }
     }
 }

@@ -208,6 +208,9 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.snooze_jmap(a, &current, until);
         }
+        if a.native_api() || a.ews() {
+            return self.snooze_api(a, &current, until);
+        }
         self.with_imap(a, |c| {
             self.replay_offline(c, a)?;
             let folder = self.snooze_folder(c, a)?;
@@ -268,6 +271,9 @@ impl Backend {
         }
         if a.provider == Provider::Jmap {
             return self.wake_due_jmap(a);
+        }
+        if a.native_api() || a.ews() {
+            return self.wake_due_api(a);
         }
         self.with_imap(a, |c| {
             let list = self.merged_snoozed(c, &a.id)?;
@@ -446,6 +452,146 @@ impl Backend {
             self.store.save_messages(&rows)?;
             Ok(true)
         })
+    }
+    /// The Gmail API and Microsoft Graph: snoozed mail waits in
+    /// Picacho/Snoozed (a label at Gmail, a folder at Microsoft), made if
+    /// missing; the times are kept on this computer, with the messages'
+    /// ids, which stay the same when they move.
+    fn snooze_api(&self, a: &Account, current: &[Mail], until: i64) -> Result<String> {
+        let folder = format!("{PARENT}/{FOLDER}");
+        let known = |b: &Self| b.store.folders(&a.id).iter().any(|f| f.name == folder);
+        if !known(self) {
+            // Read again first: it may be there, made on another computer.
+            self.refresh_api_folders(a)?;
+        }
+        if !known(self) {
+            let parent_there = self.store.folders(&a.id).iter().any(|f| f.name == PARENT);
+            if a.gmail_api() {
+                if !parent_there {
+                    self.create_folder_gmail(a, None, PARENT)?;
+                }
+                self.create_folder_gmail(a, Some(PARENT), FOLDER)?;
+            } else if a.ews() {
+                if !parent_there {
+                    self.create_folder_ews(a, None, PARENT)?;
+                }
+                self.create_folder_ews(a, Some(PARENT), FOLDER)?;
+            } else {
+                if !parent_there {
+                    self.create_folder_graph(a, None, PARENT)?;
+                }
+                self.create_folder_graph(a, Some(PARENT), FOLDER)?;
+            }
+        }
+        let moving: Vec<Mail> = current
+            .iter()
+            .filter(|m| !(m.folder == Folder::Other && m.remote_folder == folder))
+            .cloned()
+            .collect();
+        if !moving.is_empty() {
+            let change = Change::MoveTo(folder.clone());
+            if a.gmail_api() {
+                self.change_gmail(a, &moving, &change)?;
+                self.commit_change(&moving, change, false)?;
+            } else if a.ews() {
+                // The rows take their new ids.
+                self.change_ews(a, &moving, &change)?;
+            } else {
+                self.change_graph(a, &moving, &change)?;
+                self.commit_change(&moving, change, false)?;
+            }
+        }
+        let mut list = self.snoozed(&a.id);
+        for m in current {
+            list.retain(|s| s.message_id != m.message_id);
+            // Where it is now (an Exchange item's id changes as it moves).
+            let now = if a.ews() { self.ews_current(a, m) } else { m.clone() };
+            let id = if a.gmail_api() {
+                super::gmail::gmail_id(a, &now).map(str::to_owned)
+            } else if a.ews() {
+                super::ews::ews_id(a, &now).map(str::to_owned)
+            } else {
+                super::graph::graph_id(a, &now).map(str::to_owned)
+            };
+            list.push(Snoozed {
+                message_id: m.message_id.trim().to_owned(),
+                subject: m.subject.clone(),
+                sender: m.sender.clone(),
+                until,
+                folder: folder.clone(),
+                ids: id.into_iter().collect(),
+            });
+        }
+        self.save_snoozed(None, &a.id, &list)?;
+        Ok(folder)
+    }
+    /// The Gmail API and Microsoft Graph: brings back the messages whose
+    /// time has come.
+    fn wake_due_api(&self, a: &Account) -> Result<Vec<Snoozed>> {
+        let now = chrono::Utc::now().timestamp();
+        let (due, waiting): (Vec<Snoozed>, Vec<Snoozed>) =
+            self.snoozed(&a.id).into_iter().partition(|s| s.until <= now);
+        if due.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut woken = Vec::new();
+        let mut kept = waiting;
+        let mut due = due.into_iter();
+        for s in due.by_ref() {
+            match self.wake_api(a, &s) {
+                Ok(true) => woken.push(s),
+                Ok(false) => {}
+                Err(e) if crate::sync::retry::later(&e) => {
+                    kept.push(s);
+                    kept.extend(due);
+                    self.save_snoozed(None, &a.id, &kept)?;
+                    return Err(e);
+                }
+                Err(_) => {}
+            }
+        }
+        self.save_snoozed(None, &a.id, &kept)?;
+        Ok(woken)
+    }
+    /// Moves one snoozed message back to the inbox, unread, if it is still
+    /// in the Snoozed folder (as the server says now). Whether it was.
+    fn wake_api(&self, a: &Account, s: &Snoozed) -> Result<bool> {
+        if s.ids.is_empty() {
+            return Ok(false);
+        }
+        let current = self.api_rows(a, &s.ids)?;
+        let still: Vec<Mail> = current
+            .into_iter()
+            .filter(|m| m.folder == Folder::Other && m.remote_folder == s.folder)
+            .collect();
+        if still.is_empty() {
+            return Ok(false);
+        }
+        if a.ews() {
+            // Read first: the move gives them new ids.
+            self.change_ews(a, &still, &Change::Read(false))?;
+            let still: Vec<Mail> = still.into_iter().map(|m| Mail { unread: true, ..m }).collect();
+            self.change_ews(a, &still, &Change::Move(Folder::Inbox))?;
+            return Ok(true);
+        }
+        for change in [Change::Move(Folder::Inbox), Change::Read(false)] {
+            if a.gmail_api() {
+                self.change_gmail(a, &still, &change)?;
+            } else {
+                self.change_graph(a, &still, &change)?;
+            }
+        }
+        let rows: Vec<Mail> = still
+            .into_iter()
+            .map(|mut m| {
+                m.folder = Folder::Inbox;
+                m.remote_folder = "Inbox".into();
+                m.unread = true;
+                m
+            })
+            .collect();
+        self.store.save_messages(&rows)?;
+        Ok(true)
     }
     /// JMAP: snoozed mail waits in Picacho/Snoozed on the server, made if
     /// missing; the times are kept on this computer, with the messages'

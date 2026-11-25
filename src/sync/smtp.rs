@@ -106,7 +106,10 @@ pub(crate) fn build_to(
             )?)
             .raw_header(raw_header(DRAFT_HEADER, d.id.clone()));
         if d.formatted {
-            builder = builder.raw_header(raw_header(FORMAT_HEADER, "markdown".into()));
+            // How the draft is read back: its HTML part, or (as Picacho
+            // wrote them before) its text as Markdown.
+            let format = if d.html.is_empty() { "markdown" } else { "html" };
+            builder = builder.raw_header(raw_header(FORMAT_HEADER, format.into()));
         }
     } else {
         ensure!(
@@ -185,7 +188,11 @@ pub(crate) fn build_to(
     // A formatted body's `file:` pictures read as their alt text there:
     // no local file name goes out (`html_body_with`). A draft's copy in
     // Drafts keeps its source, which is how it's read back (FORMAT_HEADER).
-    let text_body = if !draft && d.formatted && !file_images(&d.body).is_empty() {
+    // The formatted composer's HTML: its text version is the body.
+    let rich = d.formatted && !d.html.is_empty();
+    let text_body = if rich {
+        d.body.clone()
+    } else if !draft && d.formatted && !file_images(&d.body).is_empty() {
         rewrite_file_images(&d.body, false, |_| None)
     } else {
         d.body.clone()
@@ -200,12 +207,21 @@ pub(crate) fn build_to(
     };
     // Pictures placed in a formatted body (`![…](file:<attachment name>)`)
     // go beside its HTML, named by Content-ID (RFC 2387, RFC 2392).
-    let inline = if d.formatted {
+    let inline = if rich {
+        let names = crate::manage::richtext::html::parse(&d.html, true).file_images();
+        inline_images_named(names, &d.attachments, &from_address(a, d)?)
+    } else if d.formatted {
         inline_images(&d.body, &d.attachments, &from_address(a, d)?)
     } else {
         InlineImages::default()
     };
-    let html = || SinglePart::html(html_body_signed(&d.body, &d.signature_html, &inline));
+    let html = || {
+        SinglePart::html(if rich {
+            rich_html_body(&d.html, &inline)
+        } else {
+            html_body_signed(&d.body, &d.signature_html, &inline)
+        })
+    };
     // Without attachments, the text alone: a multipart/mixed wrapper made
     // every message look like it had some.
     if d.attachments.is_empty() {
@@ -1713,6 +1729,7 @@ pub(crate) fn protected(message: &Message, d: &Draft, keys: &Keys) -> Result<Vec
             sign: d.sign,
             encrypt: d.encrypt,
             subject: d.encrypt_subject,
+            inline: d.pgp_inline,
             ..Default::default()
         },
         ring,
@@ -2108,10 +2125,14 @@ struct InlineImage {
 /// is exactly one of `attachments`' file names; each is given a Content-ID
 /// at `from`'s domain (RFC 2392, RFC 5322 §3.6.4), random so unique.
 fn inline_images(markdown: &str, attachments: &[std::path::PathBuf], from: &str) -> InlineImages {
+    inline_images_named(file_images(markdown), attachments, from)
+}
+/// As `inline_images`, for pictures named by attachment `names`.
+fn inline_images_named(names: Vec<String>, attachments: &[std::path::PathBuf], from: &str) -> InlineImages {
     let mut found = InlineImages::default();
     let domain = new_message_id(from);
     let domain = domain.trim_end_matches('>').rsplit_once('@').map_or("localhost", |(_, d)| d).to_owned();
-    for name in file_images(markdown) {
+    for name in names {
         if found.images.iter().any(|i| i.name == name) {
             continue;
         }
@@ -2214,6 +2235,23 @@ fn html_body_signed(markdown: &str, signature_html: &str, inline: &InlineImages)
     }
     html
 }
+/// The HTML document of the formatted composer's `html`: its `file:`
+/// pictures shown from `inline`'s parts by `cid:`; one not among them (its
+/// attachment removed) becomes its description, so no local file name
+/// goes out.
+fn rich_html_body(html: &str, inline: &InlineImages) -> String {
+    let content = crate::manage::richtext::html::rewrite_images(html, &|image| {
+        let Some(name) = image.file_name() else {
+            return Some(image.clone());
+        };
+        let found = inline.images.iter().find(|i| i.name == name)?;
+        Some(crate::manage::richtext::Image {
+            src: format!("cid:{}", found.content_id),
+            ..image.clone()
+        })
+    });
+    html_document(&content)
+}
 /// `markdown` with each `file:` image either pointed at what `resolve`
 /// gives for its name, or replaced by its alt text where it gives nothing:
 /// escaped to stay text where the result is compiled (`escape`), as it is
@@ -2289,13 +2327,77 @@ fn safe_signature_html(html: &str) -> String {
     }
     out
 }
-/// A body's HTML in the document every formatted message is sent in.
+/// A body's HTML in the document every formatted message is sent in. Its
+/// class lets a draft read back leave the wrapper out (`richtext::html`).
 fn html_document(content: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>\
-<body><div style=\"font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
+<body><div class=\"picacho-body\" style=\"font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
 font-size:14px;line-height:1.5\">{content}</div></body></html>"
     )
+}
+/// `html_document`, for the formatted composer's HTML.
+#[cfg(test)]
+pub(crate) fn html_document_for(content: &str) -> String {
+    html_document(content)
+}
+/// The HTML a Markdown body (with an HTML signature in place of its text,
+/// as `html_body_signed` sends it) shows, without the document around it,
+/// its `file:` pictures kept: how a Markdown draft opens in the formatted
+/// composer.
+pub(crate) fn markdown_fragment(markdown: &str, signature_html: &str) -> String {
+    // `file:` addresses don't survive the compiler; each goes through as a
+    // placeholder and is put back after.
+    let mut names: Vec<String> = Vec::new();
+    let placeholder = |i: usize| format!("https://inline.invalid/file/{i}");
+    let names_cell = std::cell::RefCell::new(&mut names);
+    let rewrite = |markdown: &str| {
+        rewrite_file_images(markdown, true, |name| {
+            let mut names = names_cell.borrow_mut();
+            let i = names.iter().position(|n| n == name).unwrap_or_else(|| {
+                names.push(name.to_owned());
+                names.len() - 1
+            });
+            Some(placeholder(i))
+        })
+    };
+    let signed = (!signature_html.trim().is_empty())
+        .then(|| {
+            let block = format!(
+                "{}{}",
+                crate::manage::composing::DELIMITER,
+                crate::manage::composing::signature_text(signature_html)
+            );
+            let at = markdown
+                .match_indices(&block)
+                .map(|(i, _)| i)
+                .find(|&i| i == 0 || markdown[..i].ends_with('\n'))?;
+            let after = &markdown[at + block.len()..];
+            (after.is_empty() || after.starts_with('\n')).then_some((at, after))
+        })
+        .flatten();
+    let mut html = match signed {
+        Some((at, after)) => format!(
+            "{}<p>--&nbsp;</p><div class=\"picacho-signature\">{}</div>{}",
+            html_content(&rewrite(&markdown[..at])),
+            safe_signature_html(signature_html),
+            html_content(&rewrite(after)),
+        ),
+        None => html_content(&rewrite(markdown)),
+    };
+    for (i, name) in names.iter().enumerate().rev() {
+        let mut src = String::new();
+        for ch in format!("file:{name}").chars() {
+            match ch {
+                '"' => src.push_str("&quot;"),
+                '&' => src.push_str("&amp;"),
+                '<' => src.push_str("&lt;"),
+                c => src.push(c),
+            }
+        }
+        html = html.replace(&format!("src=\"{}\"", placeholder(i)), &format!("src=\"{src}\""));
+    }
+    html
 }
 /// The HTML of a Markdown body, without the document around it.
 fn html_content(markdown: &str) -> String {

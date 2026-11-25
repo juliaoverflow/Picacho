@@ -884,6 +884,16 @@ impl Backend {
     }
     /// Files Sent copies that couldn't be saved when they were sent.
     fn file_queued_sent_copies_proton(&self, a: &Account) -> Result<usize> {
+        self.file_queued_sent_copies_with(a, |raw| self.file_sent_copy_proton(a, raw))
+    }
+    /// Files Sent copies that couldn't be saved when they were sent, each
+    /// with `file` (an API's own way). Those that keep failing for two
+    /// weeks, or can never be filed, are dropped.
+    pub(super) fn file_queued_sent_copies_with(
+        &self,
+        a: &Account,
+        file: impl Fn(&[u8]) -> Result<()>,
+    ) -> Result<usize> {
         let Ok(entries) = std::fs::read_dir(self.sent_queue(&a.id)) else {
             return Ok(0);
         };
@@ -901,7 +911,7 @@ impl Backend {
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > std::time::Duration::from_secs(14 * 86_400));
             let raw = std::fs::read(&path)?;
-            match self.file_sent_copy_proton(a, &raw) {
+            match file(&raw) {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&path);
                     filed += 1;

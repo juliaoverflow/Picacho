@@ -808,6 +808,16 @@ fn windows_zone(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The IANA name of a zone given by its IANA or Windows name (Exchange's
+/// `originalStartTimeZone`), if chrono-tz knows it.
+pub fn iana_zone(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.parse::<chrono_tz::Tz>().is_ok() {
+        return Some(name.to_owned());
+    }
+    windows_zone(name).map(str::to_owned)
+}
+
 /// The IANA name of a TZID parameter's zone, if it is one chrono-tz knows
 /// (Outlook's Windows names are translated).
 fn zone_name(params: &[(String, String)]) -> Option<String> {
@@ -1209,10 +1219,99 @@ fn parse_task_lines(lines: &[String]) -> Vec<Event> {
                     .unwrap_or_default();
                 e.utc = due_params.is_some_and(|(.., v)| v.trim().ends_with('Z'));
                 e.task = true;
+                // Reminders before it's due, not before the stand-in start.
+                e.alarms = task_alarms(&source, start);
                 e.source = source;
                 if !e.uid.is_empty() {
                     out.push(e);
                 }
+            }
+        }
+    }
+    out
+}
+
+/// The most times one VALARM's REPEAT is followed: a reminder every
+/// minute for a day isn't one to show 1440 times.
+const MOST_REPEATS: u32 = 10;
+
+/// A task's reminders as `Event::alarms` holds a task's: seconds before
+/// it's `due` (none without a due date), from the VALARMs of its VTODO
+/// (`source`), RFC 5545 §3.8.6.3: a TRIGGER relative to the end is to DUE,
+/// to the start (the default) to DTSTART (to DUE where a task has none,
+/// as some apps write them), or at a time (VALUE=DATE-TIME). Display and
+/// sound alarms are reminders; email and others aren't Picacho's to act
+/// on. One dismissed at or after it fires (ACKNOWLEDGED, RFC 9074 §6) is
+/// left out, and REPEAT adds its repeats (DURATION apart).
+pub fn task_alarms(source: &str, due: i64) -> Vec<i64> {
+    if due == 0 {
+        return Vec::new();
+    }
+    #[derive(Default)]
+    struct Valarm {
+        action: String,
+        trigger: Option<(String, Vec<(String, String)>)>,
+        acknowledged: Option<i64>,
+        repeat: u32,
+        interval: i64,
+    }
+    let mut start = None;
+    let mut alarms = Vec::new();
+    let mut current: Option<Valarm> = None;
+    // 0 outside the VTODO, 1 in it, 2 in a VALARM (or another part).
+    let mut depth = 0;
+    for line in unfold(source) {
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("BEGIN:") {
+            depth += 1;
+            if depth == 2 && upper == "BEGIN:VALARM" {
+                current = Some(Valarm::default());
+            }
+            continue;
+        }
+        if upper.starts_with("END:") {
+            if depth == 2 && upper == "END:VALARM" {
+                alarms.extend(current.take());
+            }
+            depth -= 1;
+            continue;
+        }
+        let Some((name, params, value)) = split_line(&line) else { continue };
+        match (depth, current.as_mut()) {
+            (1, _) if name == "DTSTART" => start = parse_time(&value, &params).map(|(t, _)| t),
+            (2, Some(a)) => match name.as_str() {
+                "ACTION" => a.action = value.trim().to_ascii_uppercase(),
+                "TRIGGER" => a.trigger = Some((value, params)),
+                "ACKNOWLEDGED" => a.acknowledged = parse_time(&value, &[]).map(|(t, _)| t),
+                "REPEAT" => a.repeat = value.trim().parse().unwrap_or(0),
+                "DURATION" => a.interval = parse_duration(&value).unwrap_or(0),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for a in alarms {
+        if !matches!(a.action.as_str(), "DISPLAY" | "AUDIO" | "") {
+            continue;
+        }
+        let Some((value, params)) = a.trigger else { continue };
+        let at = if param(&params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE-TIME")) {
+            parse_time(&value, &[]).map(|(t, _)| t)
+        } else {
+            let from_end = param(&params, "RELATED").is_some_and(|r| r.eq_ignore_ascii_case("END"));
+            parse_duration(&value).map(|d| if from_end { due + d } else { start.unwrap_or(due) + d })
+        };
+        let Some(at) = at else { continue };
+        // RFC 5545 §3.8.6.2: REPEAT and DURATION together, or neither.
+        let repeats = if a.interval > 0 { a.repeat.min(MOST_REPEATS) } else { 0 };
+        for fires in (0..=repeats).map(|n| at + i64::from(n) * a.interval) {
+            if a.acknowledged.is_some_and(|ack| ack >= fires) {
+                continue;
+            }
+            let before = due - fires;
+            if !out.contains(&before) {
+                out.push(before);
             }
         }
     }
@@ -2793,7 +2892,13 @@ pub fn write_event(e: &Event) -> String {
         lines.push("BEGIN:VALARM".to_owned());
         lines.push("ACTION:DISPLAY".to_owned());
         lines.push(format!("DESCRIPTION:{}", escape(&e.summary)));
-        lines.push(format!("TRIGGER:{}", trigger(*before)));
+        // A task's are before it's due (`task_alarms`): relative to DUE,
+        // as a VTODO without DTSTART must have them (RFC 5545 §3.8.6.3).
+        if e.task {
+            lines.push(format!("TRIGGER;RELATED=END:{}", trigger(*before)));
+        } else {
+            lines.push(format!("TRIGGER:{}", trigger(*before)));
+        }
         lines.push("END:VALARM".to_owned());
     }
     // What Picacho doesn't edit, as it came.
@@ -3515,5 +3620,41 @@ mod tests {
             ("Lunch; with Bo", "Café")
         );
         assert_eq!((back.start, back.end), (e.start, e.end));
+    }
+
+    /// A task's VALARMs are reminders before it's due (RFC 5545 §3.8.6.3):
+    /// relative to DUE or DTSTART, or at a time; display and sound ones,
+    /// with their repeats; not email ones nor those dismissed (RFC 9074).
+    #[test]
+    fn task_valarms_are_reminders_before_it_is_due() {
+        let alarm = |lines: &str| format!("BEGIN:VALARM\r\n{lines}END:VALARM\r\n");
+        let todo = |extra: &str, alarms: &str| {
+            format!("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nSUMMARY:Taxes\r\n{extra}DUE:20261130T170000Z\r\n{alarms}END:VTODO\r\nEND:VCALENDAR\r\n")
+        };
+        let alarms = [
+            alarm("ACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT1H\r\n"),
+            // Relative to DTSTART (09:00): eight hours before it's due.
+            alarm("ACTION:AUDIO\r\nTRIGGER:PT0S\r\n"),
+            alarm("ACTION:DISPLAY\r\nTRIGGER;VALUE=DATE-TIME:20261130T163000Z\r\n"),
+            alarm("ACTION:EMAIL\r\nTRIGGER;RELATED=END:-PT2H\r\nATTENDEE:mailto:me@x.example\r\n"),
+            alarm("ACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT3H\r\nACKNOWLEDGED:20261130T150000Z\r\n"),
+            alarm("ACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT20M\r\nREPEAT:2\r\nDURATION:PT5M\r\n"),
+        ]
+        .concat();
+        let t = parse_tasks(&todo("DTSTART:20261130T090000Z\r\n", &alarms)).pop().unwrap();
+        let mut got = t.alarms.clone();
+        got.sort();
+        assert_eq!(got, [600, 900, 1200, 1800, 3600, 8 * 3600]);
+        // Without DTSTART, relative to the start is to DUE, as apps write it.
+        let t = parse_tasks(&todo("", &alarm("ACTION:DISPLAY\r\nTRIGGER:-PT15M\r\n"))).pop().unwrap();
+        assert_eq!(t.alarms, [900]);
+        // With its due date moved, they move with it; none without one.
+        assert_eq!(task_alarms(&t.source, t.start + 3600), [900]);
+        assert!(task_alarms(&t.source, 0).is_empty());
+        // Written from its fields, they're relative to DUE and read back so.
+        let new = Event { uid: "n".into(), summary: "New".into(), start: t.start, end: t.start, task: true, utc: true, alarms: vec![1800], ..Default::default() };
+        let text = task_to_store(&new);
+        assert!(text.contains("TRIGGER;RELATED=END:-PT30M"), "{text}");
+        assert_eq!(parse_tasks(&text).pop().unwrap().alarms, [1800]);
     }
 }

@@ -42,6 +42,9 @@ pub const BLOB: &str = "urn:ietf:params:jmap:blob";
 pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 /// Calendars and events (JMAP for Calendars), as JSCalendar (RFC 8984).
 pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+/// Task lists and tasks (JMAP for Task Lists, draft-ietf-jmap-tasks), as
+/// JSCalendar Tasks.
+pub const TASKS: &str = "urn:ietf:params:jmap:tasks";
 /// Who an account belongs to and shares with (JMAP Sharing, RFC 9670).
 pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
 /// RFC 9670 §2.2: a principal's busy times (Principal/getAvailability).
@@ -429,6 +432,11 @@ pub struct Session {
     contacts_account: Option<String>,
     primary_mail: String,
     calendars_account: Option<String>,
+    /// The sign-in's own account for tasks (JMAP for Task Lists).
+    tasks_account: Option<String>,
+    /// Whether task lists may be made in it (`mayCreateTaskList`,
+    /// draft-ietf-jmap-tasks-07 §1.5.1).
+    may_create_task_list: bool,
     /// The sign-in's principals account (JMAP Principals, RFC 9670).
     principals_account: Option<String>,
     /// The Mailbox state `mailboxes` was read in, for Mailbox/changes.
@@ -880,6 +888,11 @@ impl Session {
             contacts_account: v["primaryAccounts"][CONTACTS].as_str().map(str::to_owned),
             primary_mail: v["primaryAccounts"][MAIL].as_str().unwrap_or_default().to_owned(),
             calendars_account: v["primaryAccounts"][CALENDARS].as_str().map(str::to_owned),
+            tasks_account: v["primaryAccounts"][TASKS].as_str().map(str::to_owned),
+            may_create_task_list: v["primaryAccounts"][TASKS]
+                .as_str()
+                .and_then(|id| v["accounts"][id]["accountCapabilities"][TASKS]["mayCreateTaskList"].as_bool())
+                .unwrap_or(true),
             principals_account: v["primaryAccounts"][PRINCIPALS].as_str().map(str::to_owned),
             mailbox_state: Mutex::new(String::new()),
             quotas: Mutex::new((None, Vec::new())),
@@ -1022,6 +1035,12 @@ impl Session {
         }
         if calls.iter().any(|(n, _)| n.starts_with("CalendarEventNotification/")) {
             using.push(CALENDARS);
+        }
+        if calls
+            .iter()
+            .any(|(n, _)| n.starts_with("TaskList/") || n.starts_with("Task/"))
+        {
+            using.push(TASKS);
         }
         if calls
             .iter()
@@ -2017,6 +2036,16 @@ impl Session {
         self.calendars_account
             .as_deref()
             .filter(|_| self.has(CALENDARS))
+    }
+    /// The sign-in's tasks account, where the server has task lists (JMAP
+    /// for Task Lists).
+    pub fn tasks_account(&self) -> Option<&str> {
+        self.tasks_account.as_deref().filter(|_| self.has(TASKS))
+    }
+    /// Whether task lists may be made in the tasks account (where the
+    /// server doesn't say: yes).
+    pub fn may_create_task_list(&self) -> bool {
+        self.may_create_task_list
     }
     /// The sign-in's principals account, where the server has a directory
     /// of people (JMAP Principals).

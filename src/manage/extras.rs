@@ -158,6 +158,17 @@ impl Backend {
             if !by_server {
                 self.send_jmap(a, &a.email, &to_all, &raw, &Default::default())?;
             }
+        } else if a.native_api() || a.ews() {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            // The report names its recipients itself; the API sends it there.
+            if a.gmail_api() {
+                self.with_gmail(a, |s| s.send(&raw).map(drop))?;
+            } else if a.ews() {
+                self.with_ews(a, |s| s.send(&raw, None))?;
+            } else {
+                self.with_graph(a, |s| s.send(&raw))?;
+            }
         } else {
             let lock = self.account_lock(&a.id);
             let _operation = lock.lock().unwrap();
@@ -305,7 +316,10 @@ impl Backend {
     /// Outlook and POP3 accounts don't offer ManageSieve; a JMAP server may
     /// offer JMAP for Sieve Scripts.
     pub fn may_filter(a: &Account) -> bool {
-        a.provider == Provider::Jmap
+        // Gmail's filters and Microsoft 365's inbox rules, through their APIs.
+        a.native_api()
+            || a.ews()
+            || a.provider == Provider::Jmap
             || a.provider == Provider::Imap
                 && !matches!(
                     a.service,
@@ -322,6 +336,15 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Jmap {
             return self.filters_jmap(a);
+        }
+        if a.gmail_api() {
+            return self.filters_gmail(a);
+        }
+        if a.graph() {
+            return self.filters_graph(a);
+        }
+        if a.ews() {
+            return self.filters_ews(a);
         }
         let s = self.credentials(a)?;
         let secret = if a.oauth { s.access_token } else { s.password };
@@ -341,6 +364,15 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.save_filters_jmap(a, filters, &addresses);
         }
+        if a.gmail_api() {
+            return self.save_filters_gmail(a, filters);
+        }
+        if a.graph() {
+            return self.save_filters_graph(a, filters);
+        }
+        if a.ews() {
+            return self.save_filters_ews(a, filters);
+        }
         let s = self.credentials(a)?;
         let secret = if a.oauth { s.access_token } else { s.password };
         sieve::save(
@@ -353,7 +385,7 @@ impl Backend {
     }
     /// The server's notes for its users (METADATA), where it has any.
     pub fn server_notes(&self, a: &Account) -> Result<ServerNotes> {
-        if !a.provider.imap() {
+        if !a.imap() {
             return Ok(ServerNotes::default());
         }
         let lock = self.account_lock(&a.id);
@@ -413,7 +445,7 @@ impl Backend {
         work: impl FnOnce(&mut Connection, &str) -> Result<T>,
     ) -> Result<T> {
         ensure!(
-            a.provider.imap(),
+            a.imap(),
             t!("manage-extras-only-imap-mailboxes-have-access-lists")
         );
         let lock = self.account_lock(&a.id);

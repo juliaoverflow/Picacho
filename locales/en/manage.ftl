@@ -79,7 +79,7 @@ manage-backend-is-already-added = { $email } is already added.
 
 manage-backend-sign-in-cancelled = Sign-in cancelled.
 
-manage-backend-microsoft-signed-you-in-but-outlooks = Microsoft signed you in, but Outlook's mail server refused { $email }. Outlook.com turns IMAP off for new accounts: at outlook.live.com, open Settings → Mail → Forwarding and IMAP, turn on IMAP, save, then choose Retry. If you sign in to Microsoft with a different address than your Outlook address, make the Outlook address your primary alias.
+manage-backend-microsoft-signed-you-in-but-outlooks = Microsoft signed you in, but Outlook's mail server refused { $email }. Outlook.com turns IMAP off for new accounts: at outlook.live.com, open Settings → Mail → Forwarding and IMAP, turn on IMAP, save, then choose Retry. If you sign in to Microsoft with a different address than your Outlook address, make the Outlook address your primary alias. Work and school accounts whose IMAP is turned off can be added with “Use Microsoft Graph” instead.
 
 manage-backend-the-account-this-one-was-shared = The account this one was shared with is gone. Remove this one.
 
@@ -241,6 +241,11 @@ manage-calendar-this-task-is-no-longer-on = This task is no longer on your list.
 manage-calendar-give-the-task-a-name = Give the task a name.
 
 manage-calendar-none-of-your-calendars-can-take = None of your calendars can take new tasks.
+
+manage-calendar-this-jmap-server-doesnt-keep-tasks = This JMAP server doesn't keep tasks.
+
+# The name of a task list Picacho makes where the account has none.
+manage-calendar-tasks = Tasks
 
 manage-calendar-add-someone-to-see-when-theyre = Add someone to see when they're free.
 
@@ -640,11 +645,15 @@ manage-model-enter-valid-incoming-and-smtp-server = Enter valid incoming and SMT
 
 manage-model-browser-sign-in-isnt-set-up = Browser sign-in isn't set up for { $label } in this build.
 
-manage-model-oauth-is-available-for-pinal-mail = OAuth is available for Pinal Mail, Gmail, Outlook, JMAP servers, and IMAP and POP3 servers with an organization's sign-in.
+manage-model-oauth-is-available-for-pinal-mail = OAuth is available for Pinal Mail, Gmail, Outlook, JMAP servers, and IMAP, POP3 and Exchange servers with an organization's sign-in.
 
 manage-model-single-sign-on-needs-browser-sign = Single sign-on needs browser sign-in.
 
-manage-model-single-sign-on-is-for-imap = Single sign-on is for IMAP and POP3 accounts.
+manage-model-the-gmail-api-and-microsoft-graph = The Gmail API and Microsoft Graph are for Gmail and Outlook accounts with browser sign-in.
+
+manage-model-single-sign-on-is-for-imap = Single sign-on is for IMAP, POP3 and Exchange Server accounts.
+
+manage-model-enter-the-exchange-server-to-sign-in = Enter the Exchange server to sign in with your organization: the sign-in is for that server.
 
 manage-model-choose-kerberos-or-single-sign-on = Choose Kerberos or single sign-on, not both.
 
@@ -745,6 +754,8 @@ manage-openpgp-a-subkey-couldnt-be-unlocked = A subkey couldn't be unlocked.
 manage-openpgp-theres-no-openpgp-key-of-yours = There's no OpenPGP key of yours for { $from }. Import one in Settings → Encryption, or turn off Sign.
 
 manage-openpgp-theres-no-openpgp-key-for-import = There's no OpenPGP key for { $addresses }. Import theirs in Settings → Encryption, or turn off Encrypt.
+
+manage-openpgp-inline-pgp-sends-plain-text-only = Inline PGP sends plain text only. Turn off formatting, or switch to PGP/MIME.
 
 manage-openpgp-enter-the-address-the-key-is = Enter the address the key is for.
 
@@ -1144,3 +1155,33 @@ manage-widgets-unknown = (Unknown)
 manage-widgets-no-subject = (No subject)
 
 manage-widgets-upcoming = Upcoming:
+
+# src/manage/gmail.rs and src/manage/graph.rs.
+
+manage-gmail-this-message-isnt-from-this-gmail = This message isn't from this account.
+
+manage-gmail-gmail-doesnt-move-mail-to = Mail can't be moved to { $label } here.
+
+manage-gmail-a-draft-at-gmail-is-too-large = A draft on the server is too large to open here.
+
+manage-connection-this-isnt-available-for-accounts = This isn't available for { $service } accounts that use { $service }'s own API instead of IMAP.
+
+manage-api-filters-cant-do-this = { $service }'s filters can't do this: { $what }.
+
+manage-calendar-exchange-always-sends-invitations = Exchange always sends invitations for events with guests itself.
+
+manage-calendar-not-an-exchange-calendar = Not an Exchange calendar.
+
+manage-calendar-only-accounts-that-use-microsoft = Only Outlook accounts that use Microsoft Graph keep Exchange calendars here.
+
+manage-contacts-only-accounts-that-use-microsoft = Only Outlook accounts that use Microsoft Graph keep Exchange contacts here.
+
+manage-contacts-exchange-contacts-have-one-address-book = Exchange contacts are kept in one address book here.
+
+manage-contacts-contacts = Contacts
+
+manage-backend-it-went-as-inline-pgp = It went as inline PGP, each file protected on its own: Microsoft 365 can't take signed or encrypted mail this large whole.
+
+manage-model-the-exchange-address-must-start-with = The Exchange (EWS) address must start with https://.
+
+manage-calendar-only-exchange-accounts = Only Exchange accounts keep calendars and contacts here this way.

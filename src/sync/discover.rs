@@ -159,7 +159,7 @@ pub fn discover(email: &str) -> Option<Settings> {
 }
 
 /// Whether `host` is `domain` or a host under it.
-fn in_domain(host: &str, domain: &str) -> bool {
+pub(crate) fn in_domain(host: &str, domain: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     host == domain || host.ends_with(&format!(".{domain}"))
 }

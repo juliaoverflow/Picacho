@@ -1142,6 +1142,10 @@ impl MailApp {
                         toggle("paste-formatted", o.paste_formatted, &|o| {
                             o.paste_formatted = !o.paste_formatted
                         }),
+                    ))
+                    .row(row(
+                        t!("settings-check-spelling"),
+                        toggle("spellcheck", o.spellcheck, &|o| o.spellcheck = !o.spellcheck),
                     )),
             ))
             .child(self.settings_group(
@@ -1261,7 +1265,13 @@ impl MailApp {
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
                             .truncate()
-                            .child(format!("{} · {} · {auth}", a.email, a.service_label())),
+                            .child(if a.gmail_api() {
+                                format!("{} · {} · Gmail API · {auth}", a.email, a.service_label())
+                            } else if a.graph() {
+                                format!("{} · {} · Microsoft Graph · {auth}", a.email, a.service_label())
+                            } else {
+                                format!("{} · {} · {auth}", a.email, a.service_label())
+                            }),
                     ),
             )
             .child(
@@ -1292,6 +1302,23 @@ impl MailApp {
                     text_field("account-login", &self.login_input),
                 ))
             })
+            // Gmail and Outlook: their own API instead of IMAP, switched
+            // with a sign-in in the browser.
+            .when(matches!(a.provider, Provider::Gmail | Provider::Outlook) && a.oauth && a.sso.is_none(), |rows| {
+                let (title, about) = if a.provider == Provider::Gmail {
+                    (t!("ui-use-the-gmail-api"), t!("settings-switching-signs-in-again"))
+                } else {
+                    (t!("ui-use-microsoft-graph"), t!("settings-switching-signs-in-again"))
+                };
+                rows.row(self.switch_setting(
+                    title,
+                    about,
+                    format!("api-{}", a.id),
+                    a.api,
+                    Action::ToggleApi(a.id.clone()),
+                    cx,
+                ))
+            })
             .when_some(a.sso.as_ref(), |rows, sso| {
                 rows.row(
                     self.setting_label(
@@ -1303,7 +1330,7 @@ impl MailApp {
                 )
             })
             .when(
-                matches!(a.provider, Provider::Imap | Provider::Pop3)
+                matches!(a.provider, Provider::Imap | Provider::Pop3 | Provider::Ews)
                     && !a.oauth
                     && !cfg!(any(target_os = "android", target_os = "ios")),
                 |rows| {
@@ -1498,7 +1525,7 @@ impl MailApp {
             .when(a.provider == Provider::Proton, |rows| {
                 rows.row(self.proton_push_setting(a, cx))
             })
-            .when(a.provider.imap(), |rows| {
+            .when(a.imap(), |rows| {
                 rows.row(self.switch_setting(
                     t!("settings-only-subscribed-folders"),
                     "",
@@ -1660,7 +1687,7 @@ impl MailApp {
                     cx,
                 ))
             })
-            .when(a.provider != Provider::Proton, |rows| {
+            .when(a.provider != Provider::Proton && !a.gmail_api(), |rows| {
                 rows.row(self.switch_setting(
                     t!("settings-let-the-server-send-scheduled-messages"),
                     "",

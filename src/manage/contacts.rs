@@ -106,6 +106,66 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, work)
     }
+    /// Uses the Exchange contacts of an Outlook account that reaches
+    /// Microsoft 365 through Microsoft Graph, and its organization's
+    /// directory for finding people (`search_server_contacts`).
+    pub fn connect_graph_contacts(&self, a: &Account) -> Result<usize> {
+        ensure!(a.graph(), t!("manage-contacts-only-accounts-that-use-microsoft"));
+        let server = carddav::Server {
+            url: crate::sync::graph::BASE.to_owned(),
+            user: a.email.clone(),
+            graph_account: a.id.clone(),
+            book: "graph:contacts".into(),
+            ..Default::default()
+        };
+        self.store.set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.sync_contacts()
+    }
+    /// Uses the contacts of an Exchange Server account's mailbox (EWS),
+    /// and its organization's directory for finding people.
+    pub fn connect_ews_contacts(&self, a: &Account) -> Result<usize> {
+        ensure!(a.ews(), t!("manage-calendar-only-exchange-accounts"));
+        let server = carddav::Server {
+            url: a.ews_endpoint(),
+            user: a.email.clone(),
+            ews_account: a.id.clone(),
+            book: "ews:contacts".into(),
+            ..Default::default()
+        };
+        self.store.set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.sync_contacts()
+    }
+    /// The Exchange account contacts come from, if they come from one.
+    fn contacts_ews(&self, server: &carddav::Server) -> Result<Option<Account>> {
+        if server.ews_account.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.store
+                .accounts()?
+                .into_iter()
+                .find(|a| a.id == server.ews_account)
+                .with_context(|| t!("manage-contacts-the-account-your-contacts-come-from"))?,
+        ))
+    }
+    /// The Graph account contacts come from, if they come from one.
+    fn contacts_graph(&self, server: &carddav::Server) -> Result<Option<Account>> {
+        if server.graph_account.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.store
+                .accounts()?
+                .into_iter()
+                .find(|a| a.id == server.graph_account)
+                .with_context(|| t!("manage-contacts-the-account-your-contacts-come-from"))?,
+        ))
+    }
+    fn with_graph_contacts<T>(&self, a: &Account, work: impl FnOnce(&crate::sync::graph::Session) -> Result<T>) -> Result<T> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_graph(a, work)
+    }
     /// The JMAP account contacts come from, if they come from one.
     fn contacts_jmap(&self, server: &carddav::Server) -> Result<Option<Account>> {
         if server.jmap_account.is_empty() {
@@ -126,6 +186,7 @@ impl Backend {
         let mut server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-set-up-a-contacts-server-in"))?;
+        ensure!(self.contacts_graph(&server)?.is_none() && self.contacts_ews(&server)?.is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
         server.book = match self.contacts_jmap(&server)? {
             Some(a) => format!(
                 "jmap:{}",
@@ -146,6 +207,9 @@ impl Backend {
         let server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        if self.contacts_graph(&server)?.is_some() || self.contacts_ews(&server)?.is_some() {
+            return Ok(vec![("graph:contacts".into(), t!("manage-contacts-contacts").into(), true)]);
+        }
         if let Some(a) = self.contacts_jmap(&server)? {
             return self.with_jmap_contacts(&a, |s| {
                 Ok(crate::sync::jscal::address_books(s)?
@@ -163,7 +227,12 @@ impl Backend {
     pub fn search_server_contacts(&self, text: &str) -> Result<usize> {
         let server = self.contacts_server().with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
         ensure!(self.contacts_jmap(&server)?.is_none(), t!("manage-contacts-this-servers-contacts-are-all-read"));
-        let found = carddav::search(&server, &self.contacts_password()?, self.tls_connector()?, text, 50)?;
+        let found = match self.contacts_graph(&server)? {
+            // The organization's directory, and people you work with.
+            Some(a) => self.with_graph_contacts(&a, |s| s.search_directory(text.trim(), 50))?,
+            None if let Some(a) = self.contacts_ews(&server)? => self.ews_directory(&a, text.trim())?,
+            None => carddav::search(&server, &self.contacts_password()?, self.tls_connector()?, text, 50)?,
+        };
         let mut all = self.contacts();
         let before = all.len();
         for card in found {
@@ -181,7 +250,7 @@ impl Backend {
     /// it says (RFC 4331); JMAP servers don't.
     pub fn contacts_quota(&self) -> Result<Option<(u64, u64)>> {
         let server = self.contacts_server().with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
-        if self.contacts_jmap(&server)?.is_some() {
+        if self.contacts_jmap(&server)?.is_some() || self.contacts_graph(&server)?.is_some() || self.contacts_ews(&server)?.is_some() {
             return Ok(None);
         }
         carddav::quota(&server, &self.contacts_password()?, self.tls_connector()?)
@@ -192,6 +261,7 @@ impl Backend {
         let server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        ensure!(self.contacts_graph(&server)?.is_none() && self.contacts_ews(&server)?.is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
         match self.contacts_jmap(&server)? {
             Some(a) => {
                 let id = href.strip_prefix("jmap:").with_context(|| t!("manage-contacts-not-a-jmap-address-book"))?;
@@ -214,6 +284,7 @@ impl Backend {
         let mut server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        ensure!(self.contacts_graph(&server)?.is_none() && self.contacts_ews(&server)?.is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
         match self.contacts_jmap(&server)? {
             Some(a) => {
                 let id = href.strip_prefix("jmap:").with_context(|| t!("manage-contacts-not-a-jmap-address-book"))?;
@@ -249,6 +320,15 @@ impl Backend {
         let mut server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        if let Some(a) = self.contacts_ews(&server)? {
+            let cards = self.ews_contacts(&a)?;
+            return self.replace_server_cards(cards);
+        }
+        if let Some(a) = self.contacts_graph(&server)? {
+            let cards = self.with_graph_contacts(&a, |s| s.contacts())?;
+            // Found in the directory: kept until the next search.
+            return self.replace_server_cards(cards);
+        }
         if let Some(a) = self.contacts_jmap(&server)? {
             // Once read, only what changed since (ContactCard/changes).
             let since = server
@@ -374,8 +454,14 @@ impl Backend {
             card.uid = uuid::Uuid::new_v4().to_string();
         }
         let saved = match self.contacts_server() {
+            // Found in the directory: kept here, not written to it.
+            Some(_) if card.href.starts_with("graph-directory:") || card.href.starts_with("ews-directory:") => Card { href: String::new(), ..card },
             Some(server) if from_server(&card) || !server.book.is_empty() => {
-                match self.contacts_jmap(&server)? {
+                if let Some(a) = self.contacts_ews(&server)? {
+                    self.ews_save_contact(&a, &card)?
+                } else if let Some(a) = self.contacts_graph(&server)? {
+                    self.with_graph_contacts(&a, |s| s.save_contact(&card))?
+                } else { match self.contacts_jmap(&server)? {
                     Some(a) => self.with_jmap_contacts(&a, |s| {
                         crate::sync::jscal::save_card(s, &card, &server.book)
                     })?,
@@ -385,7 +471,7 @@ impl Backend {
                         self.tls_connector()?,
                         &card,
                     )?,
-                }
+                } }
             }
             _ => card,
         };
@@ -402,8 +488,20 @@ impl Backend {
             return Ok(());
         };
         if from_server(&card)
+            && !card.href.starts_with("graph-directory:")
+            && !card.href.starts_with("ews-directory:")
             && let Some(server) = self.contacts_server()
         {
+            if let Some(a) = self.contacts_ews(&server)? {
+                self.ews_delete_contact(&a, &card)?;
+                all.retain(|c| c.uid != uid);
+                return self.save_contacts(&all);
+            }
+            if let Some(a) = self.contacts_graph(&server)? {
+                self.with_graph_contacts(&a, |s| s.delete_contact(&card))?;
+                all.retain(|c| c.uid != uid);
+                return self.save_contacts(&all);
+            }
             match self.contacts_jmap(&server)? {
                 Some(a) => self.with_jmap_contacts(&a, |s| crate::sync::jscal::delete_card(s, &card))?,
                 None => carddav::delete(

@@ -28,6 +28,10 @@ const GOOGLE_CARDDAV: &str = "https://www.googleapis.com/carddav/v1/principals/"
 pub enum MailProvider {
     /// JMAP for Calendars and Contacts.
     Jmap,
+    /// Exchange's calendars and contacts through Microsoft Graph.
+    Graph,
+    /// Exchange Server's, through Exchange Web Services.
+    Ews,
     /// Google's CalDAV and CardDAV, with the OAuth token.
     Google,
     /// The domain's CalDAV and CardDAV, with the account's password.
@@ -39,6 +43,8 @@ impl MailProvider {
     pub fn of(a: &Account) -> Option<Self> {
         match a.provider {
             Provider::Jmap => Some(Self::Jmap),
+            Provider::Outlook if a.graph() => Some(Self::Graph),
+            Provider::Ews => Some(Self::Ews),
             Provider::Gmail if a.sso.is_none() => Some(Self::Google),
             Provider::Outlook | Provider::Proton => None,
             Provider::Imap | Provider::Pop3 if !a.oauth && !a.kerberos => Some(Self::Dav),
@@ -67,6 +73,8 @@ impl Backend {
         let kind = MailProvider::of(a).with_context(|| t!("manage-dav-accounts-this-accounts-provider-doesnt-offer-calendars"))?;
         Ok(match kind {
             MailProvider::Jmap => bail!("JMAP calendars are set up with connect_jmap_calendar."),
+            MailProvider::Graph => bail!("Exchange calendars are set up with connect_graph_calendar."),
+            MailProvider::Ews => bail!("Exchange calendars are set up with connect_ews_calendar."),
             MailProvider::Google => caldav::Server {
                 url: format!("{GOOGLE_CALDAV}{}/", a.email),
                 user: a.email.clone(),
@@ -88,6 +96,8 @@ impl Backend {
         let kind = MailProvider::of(a).with_context(|| t!("manage-dav-accounts-this-accounts-provider-doesnt-offer-contacts"))?;
         Ok(match kind {
             MailProvider::Jmap => bail!("JMAP contacts are set up with connect_jmap_contacts."),
+            MailProvider::Graph => bail!("Exchange contacts are set up with connect_graph_contacts."),
+            MailProvider::Ews => bail!("Exchange contacts are set up with connect_ews_contacts."),
             MailProvider::Google => carddav::Server {
                 url: format!("{GOOGLE_CARDDAV}{}/", a.email),
                 user: a.email.clone(),
@@ -137,6 +147,12 @@ impl Backend {
         if MailProvider::of(a) == Some(MailProvider::Jmap) {
             return self.connect_jmap_calendar(a);
         }
+        if MailProvider::of(a) == Some(MailProvider::Graph) {
+            return self.connect_graph_calendar(a);
+        }
+        if MailProvider::of(a) == Some(MailProvider::Ews) {
+            return self.connect_ews_calendar(a);
+        }
         let server = self.mail_caldav(a)?;
         if server.bearer {
             self.grant_google(a, crate::sync::oauth::GOOGLE_CALENDAR, cancel)?;
@@ -150,6 +166,12 @@ impl Backend {
         if MailProvider::of(a) == Some(MailProvider::Jmap) {
             return self.connect_jmap_contacts(a);
         }
+        if MailProvider::of(a) == Some(MailProvider::Graph) {
+            return self.connect_graph_contacts(a);
+        }
+        if MailProvider::of(a) == Some(MailProvider::Ews) {
+            return self.connect_ews_contacts(a);
+        }
         let server = self.mail_carddav(a)?;
         if server.bearer {
             self.grant_google(a, crate::sync::oauth::GOOGLE_CONTACTS, cancel)?;
@@ -161,13 +183,13 @@ impl Backend {
     /// The mail account calendars sign in with, if they share one's.
     pub fn calendar_mail_account(&self) -> Option<String> {
         self.calendar_server()
-            .map(|s| if s.mail_account.is_empty() { s.jmap_account } else { s.mail_account })
+            .map(|s| [s.mail_account, s.jmap_account, s.graph_account, s.ews_account].into_iter().find(|id| !id.is_empty()).unwrap_or_default())
             .filter(|id| !id.is_empty())
     }
     /// The mail account contacts sign in with, if they share one's.
     pub fn contacts_mail_account(&self) -> Option<String> {
         self.contacts_server()
-            .map(|s| if s.mail_account.is_empty() { s.jmap_account } else { s.mail_account })
+            .map(|s| [s.mail_account, s.jmap_account, s.graph_account, s.ews_account].into_iter().find(|id| !id.is_empty()).unwrap_or_default())
             .filter(|id| !id.is_empty())
     }
 }

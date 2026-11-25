@@ -89,7 +89,7 @@ impl MailApp {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
-        if !(a.provider.imap() || a.provider == Provider::Jmap)
+        if !(a.imap() || a.provider == Provider::Jmap || a.native_api() || a.ews())
             || a.incoming_host.is_empty()
             || self.account_blocked(id)
         {
@@ -561,6 +561,15 @@ impl MailApp {
                         .child(t!("filters-another-apps-filters-are-on-this", other = other)),
                 );
             }
+        }
+        // Filters made elsewhere that Picacho's rules can't say: kept.
+        if state.kept_elsewhere > 0 {
+            page = page.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(t!("filters-kept-as-they-are", n = state.kept_elsewhere)),
+            );
         }
         // Rules.
         let mut rules = div().flex().flex_col().gap_1();

@@ -3,11 +3,13 @@
 //! system here and turned into the composer's Markdown.
 
 /// What a paste into the composer can insert: the clipboard's plain text, and
-/// its formatting as Markdown when that differs.
+/// its formatting as Markdown when that differs (and the HTML it came as,
+/// which the formatted composer pastes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Pasted {
     pub(super) plain: String,
     pub(super) formatted: String,
+    pub(super) html: String,
 }
 
 impl Pasted {
@@ -27,17 +29,16 @@ impl Pasted {
         }
         let formatted = html_to_markdown(html)?;
         let same = |a: &str, b: &str| a.split_whitespace().eq(b.split_whitespace());
-        (!formatted.is_empty() && !same(&formatted, &plain)).then_some(Self { plain, formatted })
+        let html = fragment(html).to_owned();
+        (!formatted.is_empty() && !same(&formatted, &plain)).then_some(Self { plain, formatted, html })
     }
 }
 
-/// Copied HTML as Markdown the composer writes: dashes for bullets, no
-/// styles, scripts or page furniture.
-pub(super) fn html_to_markdown(html: &str) -> Option<String> {
-    use htmd::options::{BrStyle, BulletListMarker, HrStyle, Options};
-    // Windows' CF_HTML gives the fragment's byte offsets in its header
-    // (StartFragment:/EndFragment:); those are what count, and the
-    // comment markers where the header's are missing or out of range.
+/// The part of copied HTML that was copied: Windows' CF_HTML gives the
+/// fragment's byte offsets in its header (StartFragment:/EndFragment:);
+/// those are what count, and the comment markers where the header's are
+/// missing or out of range.
+pub(super) fn fragment(html: &str) -> &str {
     let offset = |name: &str| {
         let at = html.find(name)? + name.len();
         html[at..]
@@ -58,7 +59,7 @@ pub(super) fn html_to_markdown(html: &str) -> Option<String> {
         }
         _ => None,
     };
-    let html = match (
+    match (
         header,
         html.find("<!--StartFragment-->"),
         html.find("<!--EndFragment-->"),
@@ -66,7 +67,14 @@ pub(super) fn html_to_markdown(html: &str) -> Option<String> {
         (Some(fragment), ..) => fragment,
         (None, Some(start), Some(end)) if start < end => &html[start + 20..end],
         _ => html,
-    };
+    }
+}
+
+/// Copied HTML as Markdown the composer writes: dashes for bullets, no
+/// styles, scripts or page furniture.
+pub(super) fn html_to_markdown(html: &str) -> Option<String> {
+    use htmd::options::{BrStyle, BulletListMarker, HrStyle, Options};
+    let html = fragment(html);
     let converter = htmd::HtmlToMarkdown::builder()
         .options(Options {
             bullet_list_marker: BulletListMarker::Dash,

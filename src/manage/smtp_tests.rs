@@ -867,3 +867,90 @@ fn inline_pictures_survive_the_drafts_folder_and_go_out_related() -> Result<()> 
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// The formatted composer's HTML draft, saved to the server's Drafts folder
+/// and read back: its HTML (formatting and its picture by `file:`) is what
+/// comes back, and the picture is an attachment again by the same name.
+/// Sent, the HTML goes out with the picture by Content-ID and the text
+/// version beside it; no `file:` address does.
+#[test]
+fn html_drafts_keep_their_formatting_and_pictures_through_drafts() -> Result<()> {
+    let fixture = SmtpFixture::start("250-fixture\r\n250 AUTH PLAIN\r\n", no_script())?;
+    let (b, a, path) = smtp_account(&fixture)?;
+    let picture = b.save_pasted("html-rt", "cat.png", b"\x89PNG-cat")?;
+    let html = "<p>Hi <b>Ana</b>, <span style=\"color:#ff0000\">red</span></p><ul><li>one</li></ul><div><img src=\"file:cat.png\" alt=\"cat\"></div>";
+    let doc = crate::manage::richtext::html::parse(html, true);
+    let d = Draft {
+        id: "html-rt".into(),
+        account: a.id.clone(),
+        to: "ana@example.com".into(),
+        subject: "Look".into(),
+        body: doc.to_plain(),
+        html: crate::manage::richtext::html::to_html(&doc),
+        formatted: true,
+        attachments: vec![picture],
+        ..Draft::default()
+    };
+    let uploaded = b.draft_upload(&a, &d)?.context("uploaded")?;
+    assert!(String::from_utf8_lossy(&uploaded).contains("X-Picacho-Format: html"));
+    let back = b.draft_from(&a, "html-rt-back", &uploaded)?;
+    assert!(back.formatted);
+    assert!(back.html.contains("<b>Ana</b>"), "{}", back.html);
+    assert!(back.html.contains("color:#ff0000"), "{}", back.html);
+    assert!(back.html.contains("<ul><li>one</li></ul>"), "{}", back.html);
+    assert!(back.html.contains("src=\"file:cat.png\""), "{}", back.html);
+    assert!(!back.html.contains("picacho-body"), "the sent wrapper isn't read as text: {}", back.html);
+    assert_eq!(back.body, d.body);
+    assert_eq!(back.attachments.len(), 1);
+    assert_eq!(back.attachments[0].file_name().map(|n| n.to_string_lossy().into_owned()).as_deref(), Some("cat.png"));
+    let back = Draft { account: a.id.clone(), ..back };
+    b.store.save_draft(&back)?;
+    b.send(&a, &back)?;
+    let seen = fixture.finish();
+    let sent = &seen.transactions[0].message;
+    let parsed = mailparse::parse_mail(sent)?;
+    let alternative = &parsed.subparts[0];
+    assert_eq!(alternative.subparts[0].get_body()?.replace("\r\n", "\n").trim_end(), flowed_plain(&d.body).trim_end());
+    let related = &alternative.subparts[1];
+    assert_eq!(related.ctype.mimetype, "multipart/related");
+    use mailparse::MailHeaderMap as _;
+    let cid = related.subparts[1].headers.get_first_value("Content-ID").context("Content-ID")?;
+    let cid = cid.trim().trim_start_matches('<').trim_end_matches('>').to_owned();
+    let sent_html = related.subparts[0].get_body()?;
+    assert!(sent_html.contains(&format!("src=\"cid:{cid}\"")), "{sent_html}");
+    assert!(sent_html.contains("<b>Ana</b>"), "{sent_html}");
+    assert_eq!(related.subparts[1].get_body_raw()?, b"\x89PNG-cat");
+    assert!(!String::from_utf8_lossy(sent).contains("file:"));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// What `smtp::flowed` makes of text, read back as mailparse gives it.
+fn flowed_plain(text: &str) -> String {
+    crate::sync::smtp::flowed(text).replace("\r\n", "\n")
+}
+
+/// A draft another app wrote (HTML, a picture by Content-ID without a
+/// name of its own) opens formatted, its formatting and picture kept: the
+/// picture saved with the draft's files and shown by `file:`.
+#[test]
+fn other_apps_html_drafts_open_with_their_formatting() -> Result<()> {
+    let (b, a, path) = backend(&[])?;
+    let raw = b"From: me@example.com\r\nTo: ana@example.com\r\nSubject: From my phone\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=r\r\n\r\n--r\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello there\r\n--a\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><head><style>.sig{color:gray}</style></head><body style=\"font-family:Helvetica\"><div>Hello <i>there</i></div><table><tr><td>A</td><td>B</td></tr></table><div class=\"sig\"><img src=\"cid:logo@phone\" width=\"20\"></div><script>alert(1)</script></body></html>\r\n--a--\r\n--r\r\nContent-Type: image/png\r\nContent-ID: <logo@phone>\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0K\r\n--r--\r\n";
+    let d = b.draft_from(&a, "other-app", raw)?;
+    assert!(d.formatted);
+    assert!(d.html.contains("<i>there</i>"), "{}", d.html);
+    assert!(d.html.contains("<table><tbody><tr><td>A</td><td>B</td></tr></tbody></table>"), "{}", d.html);
+    assert!(d.html.contains("<style>.sig{color:gray}</style>"), "{}", d.html);
+    assert!(d.html.contains("font-family:Helvetica"), "{}", d.html);
+    assert!(!d.html.contains("script"), "{}", d.html);
+    assert!(d.html.contains("src=\"file:image-1.png\""), "{}", d.html);
+    assert!(d.html.contains("width=\"20\""), "{}", d.html);
+    assert_eq!(d.attachments.len(), 1);
+    assert_eq!(std::fs::read(&d.attachments[0])?, b"\x89PNG\r\n");
+    assert!(d.body.starts_with("Hello there"), "{}", d.body);
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

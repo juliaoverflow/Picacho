@@ -175,3 +175,8 @@ filters-act-delete = delete
 
 # Sends the message back to its sender
 filters-act-refuse = refuse
+
+filters-kept-as-they-are = { $n ->
+        [one] { $n } filter made elsewhere has more than Picacho's filters can say; it's kept as it is.
+       *[other] { $n } filters made elsewhere have more than Picacho's filters can say; they're kept as they are.
+    }

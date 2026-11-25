@@ -389,29 +389,38 @@ fn pasting_rich_text_offers_the_other_formatting(cx: &mut TestAppContext) {
     let pasted = || paste::Pasted {
         plain: "bold".into(),
         formatted: "**bold**".into(),
+        html: "<b>bold</b>".into(),
     };
-    let body = |cx: &mut VisualTestContext| {
-        composer.read_with(cx, |c, cx| c.body.read(cx).value().to_string())
+    let text = |cx: &mut VisualTestContext| {
+        composer.read_with(cx, |c, cx| {
+            if c.draft.formatted { c.rich.read(cx).plain() } else { c.body.read(cx).value().to_string() }
+        })
     };
+    let html = |cx: &mut VisualTestContext| composer.read_with(cx, |c, cx| c.rich.read(cx).html());
+    let formatted = |cx: &mut VisualTestContext| composer.read_with(cx, |c, _| c.draft.formatted);
     let label = |cx: &mut VisualTestContext| composer.read_with(cx, |c, _| c.paste_offer_label());
 
-    // Off (the default): plain text goes in, formatting is offered.
+    // Off (the default), in a plain draft: plain text goes in, formatting
+    // is offered.
     composer.update_in(cx, |c, w, cx| {
+        c.set_formatted(false, w, cx);
         c.body.update(cx, |s, cx| s.set_text("", w, cx));
         c.insert_pasted(pasted(), w, cx);
     });
     cx.run_until_parked();
-    assert!(body(cx).starts_with("bold") && !body(cx).contains("**"));
+    assert!(text(cx).starts_with("bold") && !formatted(cx));
     assert_eq!(label(cx), Some("Paste with formatting"));
     frame(cx);
     assert!(cx.debug_bounds("compose-paste-offer").is_some());
+    // Taken, the formatting makes the draft formatted, the text bold.
     composer.update_in(cx, |c, w, cx| c.swap_paste(w, cx));
     cx.run_until_parked();
-    assert!(body(cx).starts_with("**bold**"));
+    assert!(formatted(cx));
+    assert!(html(cx).contains("<b>bold</b>"), "{}", html(cx));
     assert_eq!(label(cx), Some("Paste without formatting"));
     // Typing lets the offer go.
     composer.update_in(cx, |c, w, cx| {
-        c.body.update(cx, |s, cx| s.insert("!", w, cx));
+        c.rich.update(cx, |r, cx| r.insert_text("!", Some(w), cx));
     });
     cx.run_until_parked();
     assert_eq!(label(cx), None);
@@ -420,19 +429,72 @@ fn pasting_rich_text_offers_the_other_formatting(cx: &mut TestAppContext) {
     // switching back to plain text leaves the draft plain again.
     composer.update_in(cx, |c, w, cx| {
         c.options.paste_formatted = true;
-        c.draft.formatted = false;
+        c.set_formatted(false, w, cx);
         c.body.update(cx, |s, cx| s.set_text("", w, cx));
         c.insert_pasted(pasted(), w, cx);
     });
     cx.run_until_parked();
-    assert!(body(cx).starts_with("**bold**"));
-    assert!(composer.read_with(cx, |c, _| c.draft.formatted));
+    assert!(formatted(cx));
+    assert!(html(cx).contains("<b>bold</b>"), "{}", html(cx));
     assert_eq!(label(cx), Some("Paste without formatting"));
     composer.update_in(cx, |c, w, cx| c.swap_paste(w, cx));
     cx.run_until_parked();
-    assert!(body(cx).starts_with("bold") && !body(cx).contains("**"));
-    assert!(!composer.read_with(cx, |c, _| c.draft.formatted));
+    assert!(!formatted(cx));
+    assert!(text(cx).starts_with("bold") && !text(cx).contains("**"), "{}", text(cx));
     assert_eq!(label(cx), Some("Paste with formatting"));
+}
+
+/// The formatted composer edits the message as it looks: formats and
+/// lists apply to the selection, typing goes on in them, and the draft
+/// saves the HTML with its text beside it. Switching to plain text and
+/// back, unchanged, keeps the formatting.
+#[gpui::test]
+fn formatted_drafts_are_edited_as_they_look(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    composer.update_in(cx, |c, w, cx| {
+        c.set_formatted(true, w, cx);
+        c.rich.update(cx, |r, cx| {
+            r.set_doc(crate::manage::richtext::Doc::empty(), cx);
+            r.insert_text("Hello world", Some(w), cx);
+            // "world" selected, made bold.
+            r.sel.anchor = crate::manage::richtext::Pos::new(0, 6);
+            r.sel.head = crate::manage::richtext::Pos::new(0, 11);
+        });
+        c.format(super::rich_editor::Mark::Bold, w, cx);
+        c.rich.update(cx, |r, cx| {
+            let end = r.doc.end();
+            r.sel.anchor = end;
+            r.sel.head = end;
+            r.insert_text("\nfirst", Some(w), cx);
+        });
+        c.prefix_lines(super::composer::Lines::Bullets, w, cx);
+    });
+    cx.run_until_parked();
+    frame(cx);
+    assert!(cx.debug_bounds("rich-editor").is_some());
+    let d = composer.update(cx, |c, cx| c.snapshot(cx));
+    assert!(d.formatted);
+    assert_eq!(d.html, "<div>Hello <b>world</b></div><ul><li>first</li></ul>", "{}", d.html);
+    assert_eq!(d.body, "Hello world\n- first");
+    // Undone, the list goes.
+    composer.update_in(cx, |c, w, cx| c.rich.update(cx, |r, cx| r.undo(Some(w), cx)));
+    let d = composer.update(cx, |c, cx| c.snapshot(cx));
+    assert_eq!(d.html, "<div>Hello <b>world</b></div><div>first</div>");
+    composer.update_in(cx, |c, w, cx| c.set_formatted(false, w, cx));
+    assert_eq!(composer.read_with(cx, |c, cx| c.body.read(cx).value().to_string()), "Hello world\nfirst");
+    composer.update_in(cx, |c, w, cx| c.set_formatted(true, w, cx));
+    let d = composer.update(cx, |c, cx| c.snapshot(cx));
+    assert_eq!(d.html, "<div>Hello <b>world</b></div><div>first</div>");
+    // Changed in between, the text is what's kept.
+    composer.update_in(cx, |c, w, cx| {
+        c.set_formatted(false, w, cx);
+        c.body.update(cx, |s, cx| s.set_text("Other", w, cx));
+        c.set_formatted(true, w, cx);
+    });
+    let d = composer.update(cx, |c, cx| c.snapshot(cx));
+    assert_eq!(d.html, "<div>Other</div>");
 }
 
 /// With delivery receipts on, Settings offers which reports to ask for
@@ -462,8 +524,82 @@ fn delivery_report_and_time_limit_options_are_in_settings(cx: &mut TestAppContex
     assert!(saved.deliver_late_notify && saved.deliver_by_trace);
 }
 
+/// The formatted editor takes typing through the window's input handler
+/// (as input methods and phones' keyboards type) and the text fields' keys:
+/// Enter starts a line, Shift-arrows select, the format shortcuts apply,
+/// Undo undoes and Backspace at a line's start joins it to the one above.
+#[gpui::test]
+fn the_formatted_editor_takes_typing_and_keys(cx: &mut TestAppContext) {
+    let (view, cx, _) = two_accounts(cx);
+    cx.update(|_, cx| {
+        let bindings = app_bindings(cx);
+        cx.bind_keys(bindings);
+    });
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    composer.update_in(cx, |c, w, cx| {
+        c.set_formatted(true, w, cx);
+        c.rich.update(cx, |r, cx| {
+            r.set_doc(crate::manage::richtext::Doc::empty(), cx);
+            r.focus(w, cx);
+        });
+    });
+    frame(cx);
+    let html = |cx: &mut VisualTestContext| composer.read_with(cx, |c, cx| c.rich.read(cx).html());
+    cx.simulate_input("Hello");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("world");
+    frame(cx);
+    assert_eq!(html(cx), "<div>Hello</div><div>world</div>");
+    cx.simulate_keystrokes("shift-left shift-left shift-left shift-left shift-left secondary-b");
+    frame(cx);
+    assert_eq!(html(cx), "<div>Hello</div><div><b>world</b></div>");
+    // Typing over the selection keeps its look.
+    cx.simulate_input("there");
+    frame(cx);
+    assert_eq!(html(cx), "<div>Hello</div><div><b>there</b></div>");
+    cx.simulate_keystrokes("secondary-z");
+    frame(cx);
+    assert_eq!(html(cx), "<div>Hello</div><div><b>world</b></div>");
+    cx.simulate_keystrokes("left backspace");
+    frame(cx);
+    assert_eq!(html(cx), "<div>Hello<b>world</b></div>");
+    // A list: Enter on an empty item ends it.
+    composer.update_in(cx, |c, w, cx| c.prefix_lines(super::composer::Lines::Bullets, w, cx));
+    cx.simulate_keystrokes("end enter");
+    cx.simulate_input("two");
+    cx.simulate_keystrokes("enter enter");
+    cx.simulate_input("after");
+    frame(cx);
+    assert_eq!(html(cx), "<ul><li>Hello<b>world</b></li><li><b>two</b></li></ul><div><b>after</b></div>");
+    // The input method's view of the text: blocks a line apart.
+    let text = composer.update_in(cx, |c, w, cx| {
+        c.rich.update(cx, |r, cx| {
+            let len = r.text_length_utf16(w, cx).unwrap();
+            r.text_for_range(0..len, &mut None, w, cx).unwrap()
+        })
+    });
+    assert_eq!(text, "Helloworld\ntwo\nafter");
+    // Up and down go from line to line, across lists and paragraphs.
+    composer.update_in(cx, |c, w, cx| {
+        c.rich.update(cx, |r, cx| {
+            r.set_doc(crate::manage::richtext::html::parse("<p>one</p><p>two</p><ul><li>three</li></ul>", false), cx);
+            r.focus(w, cx);
+        })
+    });
+    frame(cx);
+    let head = |cx: &mut VisualTestContext| composer.read_with(cx, |c, cx| c.rich.read(cx).sel.head.block);
+    cx.simulate_keystrokes("down");
+    assert_eq!(head(cx), 1);
+    cx.simulate_keystrokes("down");
+    assert_eq!(head(cx), 2);
+    cx.simulate_keystrokes("up up");
+    assert_eq!(head(cx), 0);
+}
+
 /// A picture pasted into a formatted draft goes in where it was pasted,
-/// as Markdown naming its attachment; in a plain draft only attached.
+/// shown in the text and naming its attachment; in a plain draft only
+/// attached.
 #[gpui::test]
 fn pasted_pictures_are_placed_in_formatted_drafts(cx: &mut TestAppContext) {
     let (view, cx, _) = two_accounts(cx);
@@ -474,17 +610,18 @@ fn pasted_pictures_are_placed_in_formatted_drafts(cx: &mut TestAppContext) {
     };
     let picture = std::path::PathBuf::from("/drafts/x/Pasted image (2).png");
     composer.update_in(cx, |c, w, cx| {
-        c.draft.formatted = false;
+        c.set_formatted(false, w, cx);
         c.body.update(cx, |s, cx| s.set_text("Look: ", w, cx));
         c.place_pictures(std::slice::from_ref(&picture), w, cx);
     });
     assert_eq!(body(cx), "Look: ");
     composer.update_in(cx, |c, w, cx| {
-        c.draft.formatted = true;
         c.body.update(cx, |s, cx| s.set_text("", w, cx));
+        c.set_formatted(true, w, cx);
         c.place_pictures(std::slice::from_ref(&picture), w, cx);
     });
-    assert_eq!(body(cx), "![Pasted image (2)](<file:Pasted image (2).png>)");
+    let html = composer.read_with(cx, |c, cx| c.rich.read(cx).html());
+    assert_eq!(html, "<div><img src=\"file:Pasted image (2).png\" alt=\"Pasted image (2)\"></div>");
 }
 
 /// An encrypted message whose subject was hidden (RFC 9788 §5.2.1): its
@@ -551,8 +688,7 @@ fn unencrypted_replies_to_encrypted_mail_leave_out_its_text_and_subject(cx: &mut
     let composer = view.read_with(cx, |this, _| this.composers.last().unwrap().clone());
     composer.update_in(cx, |c, w, cx| {
         c.draft.encrypt = false;
-        c.draft.body = format!("Sounds good.{}", c.draft.body);
-        c.reload_fields(w, cx);
+        c.insert_reply_text("Sounds good.", w, cx);
     });
     composer.update_in(cx, |c, w, cx| c.request_send_at(None, w, cx));
     cx.run_until_parked();
@@ -571,4 +707,187 @@ fn unencrypted_replies_to_encrypted_mail_leave_out_its_text_and_subject(cx: &mut
     again.update_in(cx, |c, w, cx| c.request_send_at(None, w, cx));
     cx.run_until_parked();
     assert!(!cx.has_pending_prompt());
+}
+
+/// A formatted composer showing `html`, its editor focused.
+fn rich_composer<'a>(html: &str, cx: &'a mut TestAppContext) -> (Entity<Composer>, &'a mut VisualTestContext) {
+    let (view, cx, _) = two_accounts(cx);
+    cx.update(|_, cx| {
+        let bindings = app_bindings(cx);
+        cx.bind_keys(bindings);
+    });
+    view.update_in(cx, |this, w, cx| this.new_compose(0, w, cx));
+    let composer = view.read_with(cx, |this, _| this.composers[0].clone());
+    let html = html.to_owned();
+    composer.update_in(cx, |c, w, cx| {
+        c.set_formatted(true, w, cx);
+        c.rich.update(cx, |r, cx| {
+            r.set_doc(crate::manage::richtext::html::parse(&html, true), cx);
+            r.focus(w, cx);
+        });
+    });
+    frame(cx);
+    (composer, cx)
+}
+
+fn rich_html(composer: &Entity<Composer>, cx: &mut VisualTestContext) -> String {
+    composer.read_with(cx, |c, cx| c.rich.read(cx).html())
+}
+
+/// A table's cells are laid out side by side, in its rows, and the caret
+/// moves down into the next row's cell below.
+#[gpui::test]
+fn tables_are_laid_out_as_tables(cx: &mut TestAppContext) {
+    let (composer, cx) = rich_composer("<table><tr><td>A</td><td>B</td></tr><tr><td>C</td><td>D</td></tr></table><p>after</p>", cx);
+    let rects = composer.read_with(cx, |c, cx| c.rich.read(cx).block_rects());
+    assert_eq!(rects.len(), 5);
+    let (a, b, c, d, after) = (rects[0], rects[1], rects[2], rects[3], rects[4]);
+    assert!(b.left() > a.right() - px(1.), "B beside A: {a:?} {b:?}");
+    assert_eq!(a.top(), b.top());
+    assert!(c.top() >= a.bottom() && (c.left() - a.left()).abs() < px(1.), "C below A: {a:?} {c:?}");
+    assert!(d.left() > c.right() - px(1.) && d.top() == c.top());
+    assert!(after.top() >= d.bottom());
+    // Down from B goes to D, the cell below it.
+    composer.update_in(cx, |c, _, cx| {
+        c.rich.update(cx, |r, cx| {
+            r.sel = Default::default();
+            r.sel.anchor = crate::manage::richtext::Pos::new(1, 0);
+            r.sel.head = r.sel.anchor;
+            cx.notify();
+        })
+    });
+    frame(cx);
+    cx.simulate_keystrokes("down");
+    assert_eq!(composer.read_with(cx, |c, cx| c.rich.read(cx).sel.head.block), 3);
+}
+
+/// A small picture sits in the line of text, between the words around it;
+/// selected, its grip resizes it, keeping its shape, as one undoable step.
+#[gpui::test]
+fn pictures_flow_with_the_text_and_resize_by_their_grip(cx: &mut TestAppContext) {
+    let (composer, cx) = rich_composer("<div>before <img src=\"https://e.com/x.png\" alt=\"x\" width=\"40\" height=\"20\"> after</div>", cx);
+    let caret = |at: usize, cx: &mut VisualTestContext| {
+        composer.read_with(cx, |c, cx| c.rich.read(cx).caret_rect(crate::manage::richtext::Pos::new(0, at)).unwrap())
+    };
+    let picture = composer.read_with(cx, |c, cx| c.rich.read(cx).picture_rects())[0];
+    assert_eq!(picture.size, size(px(40.), px(20.)));
+    let text_end = composer.read_with(cx, |c, cx| c.rich.read(cx).doc.block(0).len());
+    let (start, end) = (caret(0, cx), caret(text_end, cx));
+    assert!(picture.left() > start.left() && picture.right() < end.right(), "in the line: {picture:?}");
+    assert!((start.bottom() - end.bottom()).abs() < px(1.), "one line");
+    // A click selects it; its grip, dragged, makes it bigger.
+    cx.simulate_click(picture.center(), Modifiers::none());
+    frame(cx);
+    assert!(composer.read_with(cx, |c, cx| !c.rich.read(cx).sel.is_empty()));
+    let grip = picture.bottom_right();
+    cx.simulate_mouse_down(grip, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(grip + point(px(40.), px(0.)), MouseButton::Left, Modifiers::none());
+    frame(cx);
+    let live = composer.read_with(cx, |c, cx| c.rich.read(cx).picture_rects())[0];
+    assert_eq!(live.size.width, px(80.));
+    cx.simulate_mouse_up(grip + point(px(40.), px(0.)), MouseButton::Left, Modifiers::none());
+    frame(cx);
+    let html = rich_html(&composer, cx);
+    assert!(html.contains("width=\"80\" height=\"40\""), "{html}");
+    composer.update_in(cx, |c, w, cx| c.rich.update(cx, |r, cx| r.undo(Some(w), cx)));
+    assert!(rich_html(&composer, cx).contains("width=\"40\" height=\"20\""));
+}
+
+/// A misspelled word is offered spellings on a right click, and the one
+/// chosen takes its place; Learn makes it right from then on.
+#[gpui::test]
+fn misspelled_words_offer_spellings(cx: &mut TestAppContext) {
+    let (composer, cx) = rich_composer("<div>Say helo now</div>", cx);
+    let at = composer.read_with(cx, |c, cx| c.rich.read(cx).caret_rect(crate::manage::richtext::Pos::new(0, 6)).unwrap());
+    cx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(at.center(), MouseButton::Right, Modifiers::none());
+    frame(cx);
+    assert!(composer.read_with(cx, |c, cx| c.rich.read(cx).menu_open()));
+    let first = cx.debug_bounds("spelling-0").expect("a spelling offered");
+    assert!(cx.debug_bounds("spelling-learn").is_some());
+    cx.simulate_click(first.center(), Modifiers::none());
+    frame(cx);
+    assert_eq!(rich_html(&composer, cx), "<div>Say hello now</div>");
+    assert!(!composer.read_with(cx, |c, cx| c.rich.read(cx).menu_open()));
+    // A word that's right gets no spellings, only the edit menu.
+    cx.simulate_mouse_down(at.center(), MouseButton::Right, Modifiers::none());
+    frame(cx);
+    assert!(cx.debug_bounds("spelling-0").is_none());
+    assert!(cx.debug_bounds("menu-paste").is_some());
+}
+
+/// A finger's long press selects the word under it and opens the edit
+/// menu with the selection's handles; a finger's tap only places the caret.
+#[gpui::test]
+fn a_long_press_selects_a_word(cx: &mut TestAppContext) {
+    let (composer, cx) = rich_composer("<div>one two three</div>", cx);
+    let at = composer.read_with(cx, |c, cx| c.rich.read(cx).caret_rect(crate::manage::richtext::Pos::new(0, 5)).unwrap()).center();
+    for phase in [gpui::TouchPhase::Started, gpui::TouchPhase::Ended] {
+        cx.simulate_event(gpui::LongPressEvent { phase, start_position: at, position: at });
+    }
+    frame(cx);
+    composer.read_with(cx, |c, cx| {
+        let r = c.rich.read(cx);
+        assert_eq!(r.selected_text(), "two");
+        assert!(r.menu_open());
+    });
+    assert!(cx.debug_bounds("menu-copy").is_some());
+    // The end's handle, dragged, takes the selection on to "three".
+    let (end_caret, three) = composer.read_with(cx, |c, cx| {
+        let r = c.rich.read(cx);
+        (r.caret_rect(r.sel.end()).unwrap(), r.caret_rect(crate::manage::richtext::Pos::new(0, 13)).unwrap())
+    });
+    let grab = gpui_base::TouchHandle::hit_bounds(gpui_base::SelectionEdge::End, end_caret).center();
+    let to = point(three.center().x, grab.y);
+    for (phase, position) in [(gpui::TouchPhase::Started, grab), (gpui::TouchPhase::Moved, to), (gpui::TouchPhase::Ended, to)] {
+        cx.simulate_event(gpui::TouchDragEvent { phase, start_position: grab, position });
+    }
+    frame(cx);
+    assert_eq!(composer.read_with(cx, |c, cx| c.rich.read(cx).selected_text()), "two three");
+}
+
+/// Dragging a selection past the bottom scrolls on, the selection
+/// following.
+#[gpui::test]
+fn dragging_a_selection_past_the_edge_scrolls(cx: &mut TestAppContext) {
+    let lines: String = (0..80).map(|i| format!("<div>line {i}</div>")).collect();
+    let (composer, cx) = rich_composer(&lines, cx);
+    let view = composer.read_with(cx, |c, cx| c.rich.read(cx).scroll.bounds());
+    let start = view.origin + point(px(20.), px(10.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    let below = point(start.x, view.bottom() + px(60.));
+    cx.simulate_mouse_move(below, MouseButton::Left, Modifiers::none());
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.run_until_parked();
+        frame(cx);
+    }
+    let (offset, head) = composer.read_with(cx, |c, cx| {
+        let r = c.rich.read(cx);
+        (r.scroll.offset().y, r.sel.head.block)
+    });
+    cx.simulate_mouse_up(below, MouseButton::Left, Modifiers::none());
+    assert!(offset < px(0.), "scrolled: {offset:?}");
+    assert!(head > 5, "the selection followed: {head}");
+}
+
+/// Copied for other apps, the draft's pictures go with the text, in it.
+#[gpui::test]
+fn copies_for_other_apps_carry_their_pictures(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("picacho-copy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let picture = dir.join("dot.png");
+    std::fs::write(&picture, b"\x89PNG-dot").unwrap();
+    let (composer, cx) = rich_composer("<div>a <img src=\"file:dot.png\" alt=\"dot\"> b</div>", cx);
+    let shared = composer.update_in(cx, |c, _, cx| {
+        c.rich.update(cx, |r, _| {
+            r.set_files(std::slice::from_ref(&picture));
+            r.sel.anchor = crate::manage::richtext::Pos::default();
+            r.sel.head = r.doc.end();
+            r.shared_html()
+        })
+    });
+    assert!(shared.contains("src=\"data:image/png;base64,iVBORy1kb3Q=\""), "{shared}");
+    assert!(!shared.contains("file:"), "{shared}");
+    std::fs::remove_dir_all(dir).unwrap();
 }

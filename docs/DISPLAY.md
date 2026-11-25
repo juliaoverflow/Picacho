@@ -209,10 +209,35 @@ Composing settings, and sending.
 
 Recipients have To, Cc and Bcc (Cc and Bcc appear on demand) and suggest
 people from loaded mail. With several accounts, From picks the sender.
-Formatted messages are Markdown underneath: the toolbar and shortcuts (⌘B,
-⌘I, ⌘⇧X, ⌘E, ⌘K, ⌘⇧8, ⌘⇧7, ⌘⇧9, ⌘⌥1) wrap or prefix the selection, ⌘⇧P
-previews, and sending adds an HTML version (`smtp::html_body`, raw HTML
-escaped). Files can be dropped on the editor. Drafts save on their own
+Formatted messages are edited as they look, in `RichEditor`
+(`rich_editor.rs`); plain ones in a text field. The editor's document is
+`manage::richtext`: blocks (paragraphs, headings, items, quoted lines,
+cells), each holding styled runs of text and pictures and the path of HTML
+elements it sits in, blocks of one element sharing its `Rc`. Elements and
+inline styles the editor doesn't know stay on the path and on the runs'
+`wrappers`, so another app's tables, classes and styles are written back
+as they came (`richtext::html::to_html`); reading (`html::parse`) drops
+scripts, frames, forms, handlers and script addresses. A formatted draft
+keeps that HTML in `Draft::html` (pictures as `file:<attachment name>`) and
+its text in `Draft::body`; Markdown drafts kept before open through
+`smtp::markdown_fragment`. The toolbar and shortcuts (⌘B, ⌘I, ⌘U, ⌘⇧X, ⌘E,
+⌘K, ⌘⇧8, ⌘⇧7, ⌘⇧9, ⌘⌥1) format the selection, ⌘⇧P previews the HTML, and
+sending sends it with the text beside it and its pictures by Content-ID
+(`smtp::rich_html_body`). The editor lays each block out itself: GPUI shapes
+and wraps a block's text; a block with pictures is flowed by the editor
+(words wrap at spaces, pictures sit on the baseline at their size, a
+selected one's grip resizes it); a table's blocks are grouped into rows
+and cells by their elements and laid out side by side, in equal columns.
+Keys are the text fields' ("Input" key context), and typing comes through
+GPUI's input handler, so input methods and phones' keyboards work; touch
+uses GPUI's long press and touch drags (claimed for the selection's
+handles), taps place the caret and pans scroll. Spelling
+(`manage/spelling.rs`) is the system's checker on macOS and Windows and
+Hunspell dictionaries (`spellbook`) on Linux; misspelled words are cut into
+runs of their own with a wavy underline, and right click opens the edit
+menu with spellings. Copying puts HTML on the system clipboard (arboard),
+the draft's pictures in it as `data:`. Files can be dropped on the editor;
+pictures dropped on formatted text go in it. Drafts save on their own
 after a pause, off the main thread, and at once on ⌘S, close and quit.
 
 Sending checks recipients, then optionally asks about a missing subject or

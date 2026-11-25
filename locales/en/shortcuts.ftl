@@ -68,6 +68,8 @@ shortcuts-bold = Bold
 
 shortcuts-italic = Italic
 
+shortcuts-underline = Underline
+
 shortcuts-strikethrough = Strikethrough
 
 shortcuts-code = Code

@@ -30,6 +30,10 @@ pub mod smime;
 /// Tracking numbers in mail, for the reader and each account's Summary.
 pub mod parcels;
 pub mod receipts;
+/// The formatted composer's document, read from and written as HTML.
+pub mod richtext;
+/// Spelling for the formatted composer.
+pub mod spelling;
 pub mod search;
 pub mod status;
 pub mod store;

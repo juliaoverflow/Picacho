@@ -1722,3 +1722,26 @@ fn smime_mail_is_sent_encrypted_and_reads_back() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A CalDAV task's reminders are shown as the calendar's, before it's due.
+#[test]
+fn caldav_task_reminders_are_shown() -> Result<()> {
+    let (cert, _acceptor) = tls_fixture()?;
+    let (b, _a, path) = backend(&cert)?;
+    let now = chrono::Utc::now().timestamp();
+    let due = chrono::DateTime::from_timestamp(now + 1800, 0).unwrap().format("%Y%m%dT%H%M%SZ");
+    let text = format!("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nSUMMARY:Taxes\r\nDUE:{due}\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT1H\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n");
+    let task = crate::sync::caldav::Stored {
+        event: crate::sync::ical::parse_tasks(&text).pop().unwrap(),
+        href: "https://dav.example/cal/t.ics".into(),
+        ..Default::default()
+    };
+    b.store.set_preference("calendar_tasks", &serde_json::to_string(&[task])?)?;
+    let reminders = b.due_reminders(now);
+    assert_eq!(reminders.len(), 1, "{reminders:?}");
+    assert_eq!(reminders[0].0.summary, "Taxes");
+    // Once.
+    assert!(b.due_reminders(now + 60).is_empty());
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

@@ -48,6 +48,15 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.search_jmap(a, mailbox, query, limit);
         }
+        if a.gmail_api() {
+            return self.search_gmail(a, mailbox, query, limit);
+        }
+        if a.graph() {
+            return self.search_graph(a, mailbox, query, limit);
+        }
+        if a.ews() {
+            return self.search_ews(a, mailbox, query, limit);
+        }
         self.with_imap(a, |c| {
             let names = c.names(false)?.to_vec();
             let starred = mailbox.folder() == Folder::Starred;

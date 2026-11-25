@@ -13,6 +13,14 @@ pub struct Server {
     /// Calendars) instead of a CalDAV server: that account's id here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jmap_account: String,
+    /// Calendars kept by Exchange, reached through one of the mail
+    /// accounts' Microsoft Graph sign-in: that account's id here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub graph_account: String,
+    /// Kept by Exchange Server, reached through one of the mail accounts'
+    /// Exchange Web Services sign-in: that account's id here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ews_account: String,
     /// The server sends invitations, updates and cancellations for events
     /// you organize (RFC 6638 implicit scheduling), instead of Picacho
     /// emailing them. Only set where the server says it schedules
@@ -1084,7 +1092,7 @@ mod tests {
 
     #[test]
     fn tasks_are_listed_kept_apart_from_events_and_edited_in_place() -> Result<()> {
-        let todo = "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t1\nSUMMARY:Taxes\nDTSTART:20261101T090000Z\nDUE:20261130T170000Z\nPRIORITY:1\nCATEGORIES:Home\nX-APPLE-SORT-ORDER:7\nEND:VTODO\nEND:VCALENDAR\n";
+        let todo = "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t1\nSUMMARY:Taxes\nDTSTART:20261101T090000Z\nDUE:20261130T170000Z\nPRIORITY:1\nCATEGORIES:Home\nX-APPLE-SORT-ORDER:7\nBEGIN:VALARM\nACTION:DISPLAY\nTRIGGER;RELATED=END:-PT1H\nEND:VALARM\nEND:VTODO\nEND:VCALENDAR\n";
         let undated =
             "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t2\nSUMMARY:Someday\nEND:VTODO\nEND:VCALENDAR\n";
         let done = "BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t3\nSUMMARY:Old\nSTATUS:COMPLETED\nEND:VTODO\nEND:VCALENDAR\n";
@@ -1146,6 +1154,8 @@ mod tests {
         let t1 = &found[0].event;
         // DUE is when it's due, though it has a DTSTART too.
         assert_eq!(t1.start, 1_796_058_000);
+        // Its reminder an hour before it's due.
+        assert_eq!(t1.alarms, [3600]);
         assert_eq!(found[1].event.start, 0);
         let mut changed = found[0].clone();
         changed.event.summary = "Taxes 2026".into();

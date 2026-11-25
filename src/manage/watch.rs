@@ -113,8 +113,25 @@ impl Backend {
             }
             return;
         }
+        // Exchange Server: a streaming subscription, Exchange's own push.
+        if a.ews() {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_ews_watch(a, Arc::new(changed)) {
+                self.keep_watcher(&self.watchers, &a.id, w);
+            }
+            return;
+        }
+        // The Gmail API and Microsoft Graph: their pushes can't reach a
+        // desktop app, so a small question every half minute stands in.
+        if a.native_api() {
+            self.stop_watching(&a.id);
+            if let Some(w) = self.spawn_api_watch(a, Arc::new(changed)) {
+                self.keep_watcher(&self.watchers, &a.id, w);
+            }
+            return;
+        }
         // POP3 has no IDLE: its mail is checked on a timer.
-        if !a.provider.imap() {
+        if !a.imap() {
             return;
         }
         self.stop_watching(&a.id);
@@ -136,7 +153,7 @@ impl Backend {
         let wanted = mailbox.filter(|m| {
             !m.folder().is_virtual()
                 && !matches!(m, Mailbox::Standard(Folder::Inbox | Folder::Drafts))
-                && a.provider.imap()
+                && a.imap()
         });
         let notifying = self
             .watchers
@@ -299,6 +316,133 @@ impl Backend {
     /// JMAP: the server's event source stands in for IDLE (or, where it has
     /// none, asking for changes every minute). One watcher per account
     /// hears about every mailbox, so no folder needs one of its own.
+    /// Watches a Gmail API or Microsoft Graph account by asking every
+    /// `API_WATCH` whether its mailbox changed (Gmail's history id; the
+    /// inbox's counts and newest message at Microsoft): one small request,
+    /// and the inbox is said to have changed when the answer does.
+    fn spawn_api_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        #[cfg(not(test))]
+        const API_WATCH: Duration = Duration::from_secs(30);
+        #[cfg(test)]
+        const API_WATCH: Duration = Duration::from_millis(50);
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("api-watch-{}", a.id))
+            .spawn(move || backend.poll_signature(&a, &stop, &changed, API_WATCH));
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
+    }
+    /// Asks every `every` whether the account's mailbox changed (see
+    /// `mailbox_signature`), saying the inbox did when the answer changes,
+    /// until `stop`.
+    fn poll_signature(&self, a: &Account, stop: &AtomicBool, changed: &Changed, every: Duration) {
+        let mut last: Option<String> = None;
+        let mut wait = every;
+        while !pause(stop, wait) {
+            let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.mailbox_signature(a)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the mailbox couldn't be asked")));
+            match asked {
+                Ok(now) => {
+                    wait = every;
+                    if last.as_ref().is_some_and(|l| *l != now) && !stop.load(Ordering::Acquire) {
+                        changed(Mailbox::Standard(Folder::Inbox));
+                    }
+                    last = Some(now);
+                }
+                // Signed out or offline: ask less often until it works.
+                Err(e) if e.downcast_ref::<AccessFailure>().is_some() => wait = LONGEST_RETRY,
+                Err(_) => wait = (wait * 2).min(LONGEST_RETRY),
+            }
+        }
+    }
+    /// Watches an Exchange account's inbox with a streaming subscription
+    /// (EWS's push, Exchange 2010 SP1 and later), each request held for a
+    /// few minutes and asked again. Where streaming keeps failing at once
+    /// (an older Exchange, or a proxy that won't hold a request open), the
+    /// inbox is asked about every half minute instead. After a broken
+    /// stream the inbox is said to have changed, as changes meanwhile
+    /// weren't heard. Stopping takes effect at the next answer, at most
+    /// `STREAM_MINUTES` later, when the thread ends without telling.
+    fn spawn_ews_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
+        const STREAM_MINUTES: u32 = 5;
+        #[cfg(not(test))]
+        const POLL: Duration = Duration::from_secs(30);
+        #[cfg(test)]
+        const POLL: Duration = Duration::from_millis(50);
+        #[cfg(not(test))]
+        const FIRST_RETRY: Duration = Duration::from_secs(5);
+        #[cfg(test)]
+        const FIRST_RETRY: Duration = Duration::from_millis(20);
+        let watcher = Watcher {
+            stop: Arc::new(AtomicBool::new(false)),
+            socket: Arc::new(Mutex::new(None)),
+            mailbox: Mailbox::Standard(Folder::Inbox),
+            notifying: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+        let stop = watcher.stop.clone();
+        let backend = self.clone();
+        let a = a.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("ews-watch-{}", a.id))
+            .spawn(move || {
+                let mut quick_failures = 0;
+                let mut retry = FIRST_RETRY;
+                let mut broken = false;
+                while !stop.load(Ordering::Acquire) {
+                    let started = std::time::Instant::now();
+                    let heard = || {
+                        if !stop.load(Ordering::Acquire) {
+                            changed(Mailbox::Standard(Folder::Inbox));
+                        }
+                    };
+                    let streamed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend.with_ews(&a, |s| s.stream_inbox(&stop, STREAM_MINUTES, broken, heard))
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the stream couldn't be read")));
+                    match streamed {
+                        Ok(()) => return,
+                        Err(e) => {
+                            broken = true;
+                            let signed_out = e.downcast_ref::<AccessFailure>().is_some();
+                            if !signed_out && started.elapsed() < Duration::from_secs(10) {
+                                quick_failures += 1;
+                            } else {
+                                quick_failures = 0;
+                            }
+                            if quick_failures >= 3 {
+                                backend.poll_signature(&a, &stop, &changed, POLL);
+                                return;
+                            }
+                            let wait = if signed_out { LONGEST_RETRY } else { retry };
+                            retry = if started.elapsed() > Duration::from_secs(60) { FIRST_RETRY } else { (retry * 2).min(LONGEST_RETRY) };
+                            if pause(&stop, wait) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        spawned.ok().map(|handle| watcher.on(handle.thread()))
+    }
+    /// Something that changes whenever an API account's mail does.
+    fn mailbox_signature(&self, a: &Account) -> Result<String> {
+        if a.gmail_api() {
+            self.with_gmail(a, |s| Ok(s.profile()?.history_id))
+        } else if a.ews() {
+            self.with_ews(a, |s| s.inbox_signature())
+        } else {
+            self.with_graph(a, |s| s.inbox_signature())
+        }
+    }
     fn spawn_jmap_watch(self: &Arc<Self>, a: &Account, changed: Changed) -> Option<Watcher> {
         let watcher = Watcher {
             stop: Arc::new(AtomicBool::new(false)),

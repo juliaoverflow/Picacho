@@ -588,6 +588,32 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         let raw = &item.raw[..];
         match a.provider {
+            // Gmail takes a message as it was, with the mailbox's label and
+            // its flags as labels.
+            _ if a.gmail_api() => self.with_gmail(a, |s| {
+                use crate::sync::gmail::label;
+                let labels = s.labels()?;
+                let (place, _) = super::gmail::listing(&labels, mailbox, 0)?;
+                let mut on: Vec<String> = place.into_iter().collect();
+                if !item.read() {
+                    on.push(label::UNREAD.into());
+                }
+                if item.status.flagged {
+                    on.push(label::STARRED.into());
+                }
+                let on: Vec<&str> = on.iter().map(String::as_str).collect();
+                s.insert(raw, &on).map(|_| ())
+            }),
+            // Made from its parts, as received mail (`graph::Session::import`).
+            _ if a.ews() => self.import_ews(a, mailbox, raw, item.read()),
+            _ if a.graph() => self.with_graph(a, |s| {
+                let folders = s.folders()?;
+                let folder = match super::graph::listing(&folders, mailbox)? {
+                    super::graph::Listing::Folder(id) => id,
+                    super::graph::Listing::Everywhere(_) => bail!(t!("manage-proton-choose-one-of-the-accounts-folders")),
+                };
+                s.import(raw, &folder, item.read(), item.status.flagged).map(|_| ())
+            }),
             Provider::Jmap => self.with_jmap(a, |s| {
                 let places = self.jmap_places(a, s, false)?;
                 let target = super::jmap::mailbox_id(&places, mailbox)?;

@@ -13,6 +13,66 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Tasks on JMAP servers (JMAP for Task Lists): with calendars from a JMAP
+  account, its open tasks are listed in Settings → Calendar and can be
+  added, edited, marked done and deleted, as on CalDAV servers. A repeating
+  task is done one occurrence at a time, and changes others make to shared
+  task lists are told with calendar notices.
+- Task reminders, from CalDAV and JMAP servers alike, are shown with the
+  calendar's, before each task is due.
+- Formatted messages are written as they will look, no longer as Markdown:
+  bold, italic, underline and the other formats show as such, lists,
+  quotes and headings as they're sent, links as links. Underline (⌘U/Ctrl+U),
+  alignment and Clear formatting are new in the toolbar. Pictures pasted or
+  dropped on the text show where they go, in the line when they fit, and
+  are sent there; drag a selected picture's corner to resize it. Tables
+  show as tables. Copying keeps the formatting (and pictures) in other apps.
+- Spelling in formatted messages: misspelled words are underlined, with
+  spellings, Learn and Ignore on a right click (Settings → Composing →
+  Check spelling). macOS and Windows use the system's spellchecker, Linux
+  the Hunspell dictionaries installed.
+- Phones and tablets: a long press in a formatted message selects a word,
+  with handles and a Cut, Copy, Paste menu; dragging scrolls.
+- Drafts written in other mail apps keep their HTML formatting: fonts,
+  colors, alignment, tables and styles open as written and are sent as
+  they were, and their pictures show in the text. Picacho's own formatted
+  drafts are saved as HTML too, so other apps show their formatting.
+
+- Gmail and Outlook accounts can use their provider's own API instead of
+  IMAP and SMTP: **Use the Gmail API** or **Use Microsoft Graph** when
+  adding the account. Microsoft 365 organizations that turn IMAP off can be
+  added this way. Mail, folders and labels, search, drafts, sending and
+  snoozing work as for other accounts; Gmail's filters and Outlook's inbox
+  rules, and each one's away reply, are edited in Settings. With Microsoft
+  Graph, Exchange's calendars and contacts and the organization's directory
+  are offered in Calendar and Contacts: repeating events as their series,
+  with occurrences changed or cancelled on their own. Exchange holds
+  scheduled mail and sends it at its time; imported mail arrives as mail,
+  not drafts; new mail is noticed within half a minute. An existing
+  account switches either way in its Settings.
+- Exchange Server in an organization's own data center, through Exchange
+  Web Services: found by Autodiscover, signed in with NTLMv2, Kerberos or
+  Basic, or through Microsoft Entra where the organization uses hybrid
+  modern authentication. Mail, folders, drafts, sending and scheduled
+  sending, inbox rules and Out of Office, calendars (with availability),
+  contacts and the organization's directory. New mail is noticed as it
+  arrives (Exchange's streaming notifications). Servers requiring Extended
+  Protection for Authentication are signed in to. Autodiscover also
+  follows Exchange's redirects and SRV records within the domain, and asks
+  SOAP Autodiscover where the older form is off.
+- Exchange Server and Microsoft Graph accounts show how much space their
+  mail takes.
+
+### Fixed
+
+- Mobile view tests no longer take one another's launch requests (they
+  failed now and then when run together).
+- Inline PGP can be sent, not only read: with OpenPGP, the composer's
+  inline PGP button signs the text in the clear or replaces it with an
+  armored encrypted message, and encrypts (`name.pgp`) or signs
+  (`name.sig`) each attachment on its own, for apps without PGP/MIME. Plain
+  text only. Received inline PGP mail now keeps its attachments, and
+  decrypts encrypted ones.
 - The interface is ready for translation: its text is in Fluent message
   files (`locales/`), shown in the system's language where Picacho has it
   (English for now), with each language's plural rules.

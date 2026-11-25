@@ -11,6 +11,9 @@ pub enum Provider {
     /// JMAP (RFC 8620/8621) over HTTPS, for reading and sending alike
     /// (`sync/jmap.rs`).
     Jmap,
+    /// Exchange Web Services: Exchange Server in an organization's own
+    /// data center, for mail, calendars and contacts (`sync/ews.rs`).
+    Ews,
 }
 impl Provider {
     pub fn label(self) -> &'static str {
@@ -21,16 +24,17 @@ impl Provider {
             Self::Pop3 => "POP3",
             Self::Proton => "Proton API",
             Self::Jmap => "JMAP",
+            Self::Ews => "Exchange",
         }
     }
     /// Whether its mail comes over IMAP (anything but POP3, Proton's API
     /// and JMAP).
     pub fn imap(self) -> bool {
-        !matches!(self, Self::Pop3 | Self::Proton | Self::Jmap)
+        !matches!(self, Self::Pop3 | Self::Proton | Self::Jmap | Self::Ews)
     }
     /// Whether it sends through its own API rather than SMTP.
     pub fn api_sending(self) -> bool {
-        matches!(self, Self::Proton | Self::Jmap)
+        matches!(self, Self::Proton | Self::Jmap | Self::Ews)
     }
 }
 /// The mail services offered when adding an account. `Provider` is the
@@ -48,6 +52,8 @@ pub enum Service {
     ProtonBridge,
     /// Proton Mail directly through Proton's API, without Bridge.
     Proton,
+    /// An organization's own Exchange Server, through Exchange Web Services.
+    Exchange,
     /// Any other server, found by autoconfiguration or entered by hand.
     #[default]
     Other,
@@ -83,6 +89,7 @@ impl Service {
         Self::Zoho,
         // Its Bridge sign-in is a tab of its own.
         Self::Proton,
+        Self::Exchange,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -94,6 +101,7 @@ impl Service {
             Self::Zoho => "Zoho Mail",
             Self::ProtonBridge => "Proton Mail Bridge",
             Self::Proton => "Proton Mail",
+            Self::Exchange => "Exchange Server",
             Self::Other => t!("manage-model-other"),
         }
     }
@@ -104,6 +112,7 @@ impl Service {
             Self::Proton => Provider::Proton,
             // Fastmail made JMAP, and offers it to mail apps.
             Self::Fastmail => Provider::Jmap,
+            Self::Exchange => Provider::Ews,
             _ => Provider::Imap,
         }
     }
@@ -196,6 +205,7 @@ impl Service {
                 t!("manage-model-turn-on-two-step-verification-in"),
                 "https://account.live.com/proofs/AppPassword",
             )),
+            Self::Exchange => None,
             _ => None,
         }
     }
@@ -232,6 +242,16 @@ impl Service {
             }
             // No mail servers: everything goes through Proton's API.
             Self::Proton => ("mail-api.proton.me", 443, "mail-api.proton.me", 443),
+            // Found by Autodiscover when it signs in; `mail.` the domain
+            // until then.
+            Self::Exchange => {
+                let domain = crate::sync::discover::domain(email).unwrap_or_default();
+                a.incoming_host = format!("mail.{domain}");
+                a.smtp_host = a.incoming_host.clone();
+                a.incoming_port = 443;
+                a.smtp_port = 443;
+                return Some(a);
+            }
             Self::Other => return None,
         };
         a.incoming_host = host.into();
@@ -415,6 +435,20 @@ pub struct Account {
     /// with SAML; Picacho only sees its browser pages. With `oauth` on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sso: Option<Sso>,
+    /// Gmail and Outlook: the mailbox is reached through the provider's
+    /// own API (the Gmail API, Microsoft Graph) instead of IMAP and SMTP.
+    /// For Microsoft 365 organizations that turn IMAP off, and for what
+    /// only the API offers: Exchange calendars and contacts, the
+    /// organization's address book, and the server's own filters. Needs
+    /// browser sign-in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub api: bool,
+    /// Exchange Web Services: the server's EWS address
+    /// (`https://mail.example.com/EWS/Exchange.asmx`), as Autodiscover
+    /// found it or as entered; empty: `/EWS/Exchange.asmx` at
+    /// `incoming_host`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ews_url: String,
 }
 /// Where an account's single sign-on happens and how Picacho is known there.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,7 +569,7 @@ impl Account {
             incoming_host: host.into(),
             incoming_port: match provider {
                 Provider::Pop3 => 995,
-                Provider::Proton | Provider::Jmap => 443,
+                Provider::Proton | Provider::Jmap | Provider::Ews => 443,
                 _ => 993,
             },
             smtp_host: smtp.into(),
@@ -567,7 +601,73 @@ impl Account {
             server_send_later: false,
             kerberos: false,
             sso: None,
+            api: false,
+            ews_url: String::new(),
         }
+    }
+    /// An Exchange account's server as typed: its whole EWS address
+    /// (`https://…/EWS/Exchange.asmx`), or a server name.
+    pub fn set_ews_server(&mut self, typed: &str) {
+        let typed = typed.trim();
+        if typed.starts_with("https://") || typed.starts_with("http://") {
+            self.ews_url = typed.to_owned();
+            if let Ok(url) = url::Url::parse(typed) {
+                self.incoming_host = url.host_str().unwrap_or_default().to_owned();
+                self.incoming_port = url.port_or_known_default().unwrap_or(443);
+            }
+        } else if !typed.is_empty() {
+            self.incoming_host = typed.trim_end_matches('/').to_owned();
+            self.ews_url.clear();
+        }
+        self.smtp_host = self.incoming_host.clone();
+        self.smtp_port = self.incoming_port;
+    }
+    /// What an organization's sign-in is asked for beyond who you are: the
+    /// scopes the account names, or, for Exchange Server signed in through
+    /// Microsoft Entra (hybrid modern authentication), EWS on its server.
+    pub fn sso_scope(&self) -> String {
+        let Some(sso) = &self.sso else { return String::new() };
+        if !sso.scope.trim().is_empty() || !self.ews() {
+            return sso.scope.trim().to_owned();
+        }
+        let host = url::Url::parse(&self.ews_endpoint()).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
+        format!("https://{host}/EWS.AccessAsUser.All")
+    }
+    /// Exchange Web Services: where its requests go.
+    pub fn ews_endpoint(&self) -> String {
+        if !self.ews_url.trim().is_empty() {
+            return self.ews_url.trim().to_owned();
+        }
+        let scheme = if cfg!(test) && self.incoming_host == "127.0.0.1" { "http" } else { "https" };
+        match self.incoming_port {
+            443 | 0 => format!("{scheme}://{}/EWS/Exchange.asmx", self.incoming_host),
+            port => format!("{scheme}://{}:{port}/EWS/Exchange.asmx", self.incoming_host),
+        }
+    }
+    /// Whether it reads and sends through the Gmail API.
+    pub fn gmail_api(&self) -> bool {
+        self.api && self.provider == Provider::Gmail && self.sso.is_none()
+    }
+    /// Whether it reads and sends through Microsoft Graph.
+    pub fn graph(&self) -> bool {
+        self.api && self.provider == Provider::Outlook && self.sso.is_none()
+    }
+    /// Whether it is an Exchange Server account (Exchange Web Services).
+    pub fn ews(&self) -> bool {
+        self.provider == Provider::Ews
+    }
+    /// Whether it uses its provider's own API (`api`).
+    pub fn native_api(&self) -> bool {
+        self.gmail_api() || self.graph()
+    }
+    /// Whether its mail comes over IMAP (`Provider::imap`, unless it uses
+    /// its provider's API).
+    pub fn imap(&self) -> bool {
+        self.provider.imap() && !self.native_api()
+    }
+    /// Whether it sends through an API rather than SMTP.
+    pub fn api_sending(&self) -> bool {
+        self.provider.api_sending() || self.native_api()
     }
     /// The name shown for the account: its nickname, if it has one.
     pub fn label(&self) -> &str {
@@ -589,8 +689,8 @@ impl Account {
             self.email.parse::<lettre::Address>().is_ok(),
             t!("manage-model-enter-a-valid-email-address")
         );
-        // JMAP sends through the same server it reads from.
-        let smtp = (self.provider != Provider::Jmap).then_some(&self.smtp_host);
+        // JMAP and Exchange send through the server they read from.
+        let smtp = (!matches!(self.provider, Provider::Jmap | Provider::Ews)).then_some(&self.smtp_host);
         for host in std::iter::once(&self.incoming_host).chain(smtp) {
             anyhow::ensure!(
                 !host.is_empty() && !host.contains(['\r', '\n', ' ', '/', ':']),
@@ -617,14 +717,24 @@ impl Account {
                     Provider::Gmail | Provider::Outlook | Provider::Jmap
                 )
                 || self.service == Service::Pinal
-                || (self.sso.is_some() && matches!(self.provider, Provider::Imap | Provider::Pop3)),
+                || (self.sso.is_some() && matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews)),
             t!("manage-model-oauth-is-available-for-pinal-mail")
+        );
+        anyhow::ensure!(
+            !self.api || (matches!(self.provider, Provider::Gmail | Provider::Outlook) && self.oauth && self.sso.is_none()),
+            t!("manage-model-the-gmail-api-and-microsoft-graph")
         );
         if let Some(sso) = &self.sso {
             anyhow::ensure!(self.oauth, t!("manage-model-single-sign-on-needs-browser-sign"));
             anyhow::ensure!(
-                matches!(self.provider, Provider::Imap | Provider::Pop3),
+                matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews),
                 t!("manage-model-single-sign-on-is-for-imap")
+            );
+            // Exchange's token is for its own server, which has to be known
+            // before signing in (Autodiscover needs the sign-in).
+            anyhow::ensure!(
+                !self.ews() || !self.incoming_host.trim().is_empty() || !self.ews_url.trim().is_empty() || !sso.scope.trim().is_empty(),
+                t!("manage-model-enter-the-exchange-server-to-sign-in")
             );
             anyhow::ensure!(!self.kerberos, t!("manage-model-choose-kerberos-or-single-sign-on"));
             let issuer = url::Url::parse(sso.issuer.trim())
@@ -641,7 +751,7 @@ impl Account {
         // STARTTLS is an upgrade of IMAP or POP3; other protocols start
         // with TLS (JMAP is HTTPS).
         anyhow::ensure!(
-            !self.incoming_starttls || !matches!(self.provider, Provider::Proton | Provider::Jmap),
+            !self.incoming_starttls || !matches!(self.provider, Provider::Proton | Provider::Jmap | Provider::Ews),
             t!("manage-model-starttls-is-only-used-for-imap")
         );
         anyhow::ensure!(
@@ -649,8 +759,13 @@ impl Account {
             t!("manage-model-the-sign-in-name-cant-contain")
         );
         anyhow::ensure!(
+            self.ews_url.is_empty()
+                || url::Url::parse(self.ews_url.trim()).is_ok_and(|u| u.scheme() == "https" || cfg!(test)),
+            t!("manage-model-the-exchange-address-must-start-with")
+        );
+        anyhow::ensure!(
             !self.kerberos
-                || (matches!(self.provider, Provider::Imap | Provider::Pop3) && !self.oauth),
+                || (matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews) && !self.oauth),
             t!("manage-model-kerberos-sign-in-is-for-imap")
         );
         anyhow::ensure!(
@@ -1440,11 +1555,17 @@ pub struct Draft {
     #[serde(default)]
     pub bcc: String,
     pub subject: String,
-    /// Plain text, or Markdown when `formatted`.
+    /// Plain text; when `formatted`, the text version of `html` (or, in
+    /// drafts kept before the formatted composer wrote HTML, Markdown).
     pub body: String,
-    /// The body is Markdown and is sent with an HTML version.
+    /// It is sent with an HTML version: `html`, or else `body` as Markdown.
     #[serde(default)]
     pub formatted: bool,
+    /// A formatted message's HTML as the composer edits it (without the
+    /// document around it), its pictures `file:<attachment name>`. Empty
+    /// for plain messages and Markdown drafts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub html: String,
     pub reply_id: String,
     /// The thread's message ids, oldest first, for the References header.
     #[serde(default)]
@@ -1479,6 +1600,10 @@ pub struct Draft {
     /// Sign and encrypt it with S/MIME instead of OpenPGP.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub smime: bool,
+    /// Sign and encrypt it with OpenPGP as inline PGP rather than
+    /// PGP/MIME, for recipients whose apps read only that (plain text).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pgp_inline: bool,
     /// How urgent it is: shown to recipients (Importance, X-Priority) and,
     /// where the outgoing server has MT-PRIORITY (RFC 6710), given to it.
     #[serde(default, skip_serializing_if = "Priority::is_normal")]
@@ -1616,6 +1741,11 @@ impl Draft {
         if !self.priority.is_normal() {
             h.update(b"priority\0");
             h.update([self.priority.mt_priority() as u8]);
+        }
+        // Added later, likewise.
+        if !self.html.is_empty() {
+            h.update(b"html\0");
+            h.update(self.html.as_bytes());
         }
         // Added later, likewise: how it is protected changes what's uploaded.
         if self.encrypt || self.sign || self.smime || self.encrypt_subject {
@@ -1764,6 +1894,24 @@ pub fn demo_mail() -> Vec<Mail> {
 
 #[cfg(test)]
 mod tests {
+    /// What's typed for an Exchange server: a whole EWS address, or a name.
+    #[test]
+    fn exchange_servers_are_addresses_or_names() {
+        let mut a = Service::Exchange.account("qa@corp.example").unwrap();
+        assert_eq!((a.provider, a.incoming_host.as_str(), a.incoming_port), (Provider::Ews, "mail.corp.example", 443));
+        a.set_ews_server("https://owa.corp.example:8443/EWS/Exchange.asmx");
+        assert_eq!(a.ews_url, "https://owa.corp.example:8443/EWS/Exchange.asmx");
+        assert_eq!((a.incoming_host.as_str(), a.incoming_port, a.smtp_host.as_str()), ("owa.corp.example", 8443, "owa.corp.example"));
+        assert_eq!(a.ews_endpoint(), "https://owa.corp.example:8443/EWS/Exchange.asmx");
+        a.set_ews_server("exchange.corp.example/");
+        assert!(a.ews_url.is_empty());
+        a.incoming_port = 443;
+        assert_eq!(a.ews_endpoint(), "https://exchange.corp.example/EWS/Exchange.asmx");
+        a.email = "qa@corp.example".into();
+        assert!(a.validate().is_ok());
+        a.ews_url = "http://plain.example/EWS/Exchange.asmx".into();
+        assert!(cfg!(test) || a.validate().is_err());
+    }
     /// Where the browser is how a service signs in, Fastmail offers an API
     /// token and Google an app password instead; Microsoft and services
     /// without one, or typed already, offer nothing.
@@ -1807,6 +1955,26 @@ mod tests {
         let mut none = a.clone();
         none.sso = None;
         assert!(none.validate().is_err());
+    }
+    #[test]
+    fn exchange_signs_in_through_entra_for_its_own_server() {
+        let mut a = Service::Exchange.account("ana@corp.example").unwrap();
+        a.oauth = true;
+        a.client_id = "app".into();
+        a.sso = Some(Sso { issuer: "https://login.microsoftonline.com/tenant/v2.0".into(), scope: String::new() });
+        // The token is for the server (guessed as mail.domain), which must
+        // be known first.
+        assert_eq!(a.sso_scope(), "https://mail.corp.example/EWS.AccessAsUser.All");
+        a.incoming_host.clear();
+        assert!(a.validate().is_err());
+        a.set_ews_server("mail.corp.example");
+        assert!(a.validate().is_ok());
+        assert_eq!(a.sso_scope(), "https://mail.corp.example/EWS.AccessAsUser.All");
+        a.set_ews_server("https://webmail.corp.example/EWS/Exchange.asmx");
+        assert_eq!(a.sso_scope(), "https://webmail.corp.example/EWS.AccessAsUser.All");
+        // A scope the account names is used as given.
+        a.sso.as_mut().unwrap().scope = "https://other.example/EWS.AccessAsUser.All".into();
+        assert_eq!(a.sso_scope(), "https://other.example/EWS.AccessAsUser.All");
     }
     #[test]
     fn kerberos_is_only_for_imap_and_pop3_password_accounts() {

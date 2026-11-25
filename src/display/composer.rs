@@ -3,7 +3,9 @@
 //! in the reader as an inline reply, or in a window of its own. The app
 //! owns sending; the composer edits, formats and saves its draft.
 use super::*;
+use super::rich_editor::{Look, Mark, RichEditor, RichEvent};
 use crate::manage::composing::{ComposeOptions, mentions_attachment};
+use crate::manage::richtext::{self as rt, ListKind, html as rhtml};
 use gpui_component::input::RopeExt as _;
 
 actions!(
@@ -11,6 +13,7 @@ actions!(
     [
         Bold,
         Italic,
+        Underline,
         Strike,
         InlineCode,
         InsertLink,
@@ -86,14 +89,26 @@ fn service_badge(service: fwd::ForwardingService, c: Colors) -> Div {
 
 /// Just after pasting copied rich text: what went in, so the composer can
 /// offer the other version (with or without its formatting) in its place.
+/// A paste into the formatted editor and its other version, offered until
+/// the text changes.
+struct RichPaste {
+    plain: String,
+    /// The clipboard's HTML.
+    html: String,
+    /// The version that went in was the formatted one.
+    formatted_inserted: bool,
+    /// The draft was plain before the paste made it formatted, as it was.
+    was_plain: Option<String>,
+    /// The editor's revision just after the paste.
+    revision: u64,
+}
+
 struct PasteOffer {
     /// Byte offset of the pasted text in the body.
     start: usize,
     inserted: String,
     other: String,
     inserted_formatted: bool,
-    /// Whether the draft was formatted before the paste turned it on.
-    was_formatted: bool,
     /// The body's length after pasting; any other edit lets the offer go.
     body_len: usize,
 }
@@ -127,6 +142,14 @@ pub(super) struct Composer {
     recipients: [Entity<InputState>; 4],
     subject: Entity<InputState>,
     pub(super) body: Entity<TextareaState>,
+    /// The formatted editor: the body while the draft is formatted.
+    pub(super) rich: Entity<RichEditor>,
+    /// What switching to plain text took off: the text as it left it and
+    /// the formatting, put back if switched again with the text unchanged.
+    unformatted: Option<(String, String)>,
+    /// The address being written for a link (⌘K) in the formatted editor.
+    link_input: Option<Entity<InputState>>,
+    rich_paste: Option<RichPaste>,
     show_cc: bool,
     show_bcc: bool,
     show_reply_to: bool,
@@ -186,9 +209,13 @@ impl Composer {
         self.subject.update(cx, |s, cx| s.set_text(subject, window, cx));
         let body = self.draft.body.clone();
         self.body.update(cx, |s, cx| s.set_text(body, window, cx));
+        if self.draft.formatted {
+            let doc = rich_doc(&mut self.draft);
+            self.rich.update(cx, |r, cx| r.set_doc(doc, cx));
+        }
     }
     pub(super) fn new(
-        draft: Draft,
+        mut draft: Draft,
         placement: Placement,
         accounts: Vec<Account>,
         aliases: Vec<fwd::SendAlias>,
@@ -236,7 +263,19 @@ impl Composer {
         }
         subject.update(cx, |s, cx| s.set_text(draft.subject.clone(), window, cx));
         body.update(cx, |s, cx| s.set_text(draft.body.clone(), window, cx));
+        let doc = if draft.formatted { rich_doc(&mut draft) } else { rt::Doc::empty() };
+        crate::manage::spelling::spelling().use_personal(backend.store.path.join("dictionary.txt"));
+        let rich = cx.new(|cx| RichEditor::new(doc, t!("composer-write-your-message"), look_of(colors, false), cx));
         let mut subscriptions = vec![];
+        subscriptions.push(cx.subscribe(&rich, |this, rich, _: &RichEvent, cx| {
+            // Another edit after a paste lets its offer go.
+            let revision = rich.read(cx).revision;
+            if this.rich_paste.as_ref().is_some_and(|p| p.revision != revision) {
+                this.rich_paste = None;
+            }
+            this.preview = false;
+            this.changed(cx);
+        }));
         for (i, state) in recipients.iter().enumerate() {
             subscriptions.push(cx.subscribe_in(state, window, move |this, _, e, w, cx| {
                 match e {
@@ -299,6 +338,10 @@ impl Composer {
             recipients,
             subject,
             body,
+            rich,
+            unformatted: None,
+            link_input: None,
+            rich_paste: None,
             show_cc,
             show_bcc,
             show_reply_to,
@@ -344,6 +387,7 @@ impl Composer {
         };
         match target {
             Some(target) => target.update(cx, |s, cx| s.focus(window, cx)),
+            None if self.draft.formatted => self.rich.update(cx, |r, cx| r.put_caret_at_start(window, cx)),
             None => self.body.update(cx, |s, cx| {
                 s.focus(window, cx);
                 // Replies start writing above the quoted message.
@@ -375,6 +419,7 @@ impl Composer {
             .collect();
         out.push((self.subject.read(cx).focus_handle(cx), super::mobile::Keys::Text));
         out.push((self.body.read(cx).focus_handle(cx), super::mobile::Keys::Text));
+        out.push((self.rich.read(cx).focus_handle_ref(), super::mobile::Keys::Text));
         if let Some(focus) = self.later_picker.as_ref().and_then(|p| p.read(cx).typed_focus(cx)) {
             out.push((focus, super::mobile::Keys::Text));
         }
@@ -389,7 +434,15 @@ impl Composer {
         self.draft.bcc = value(&self.recipients[BCC]);
         self.draft.reply_to = value(&self.recipients[REPLY_TO]).trim().to_owned();
         self.draft.subject = value(&self.subject);
-        self.draft.body = self.body.read(cx).value().to_string();
+        if self.draft.formatted {
+            // The HTML is the message; its text goes with it.
+            let rich = self.rich.read(cx);
+            self.draft.html = rich.html();
+            self.draft.body = rich.plain();
+        } else {
+            self.draft.body = self.body.read(cx).value().to_string();
+            self.draft.html.clear();
+        }
         self.draft.clone()
     }
 
@@ -413,6 +466,15 @@ impl Composer {
     /// Whether you have a key or certificate to sign or encrypt with.
     fn can_protect(&self) -> bool {
         !self.backend.keyring().secret.is_empty() || !self.backend.certificates().own.is_empty()
+    }
+    /// Whether you have an OpenPGP key of your own.
+    fn can_protect_openpgp(&self) -> bool {
+        !self.backend.keyring().secret.is_empty()
+    }
+    /// Whether it goes as inline PGP: asked for, and protected with
+    /// OpenPGP (not S/MIME, which is used too when there's no OpenPGP key).
+    fn sends_inline_pgp(&self) -> bool {
+        self.draft.pgp_inline && !self.draft.smime && self.can_protect_openpgp()
     }
     /// Whether you have both an OpenPGP key and an S/MIME certificate.
     fn has_both_kinds(&self) -> bool {
@@ -527,8 +589,8 @@ impl Composer {
         cx.notify();
     }
 
-    // Formatting. The body is Markdown; these edit the text around the
-    // selection the way a rich editor's buttons would.
+    // Formatting. A formatted draft is edited as it looks (`rich`); a
+    // plain one as text, which formatting turns into a formatted one.
 
     /// The selection as a byte range of the body's text.
     fn selection(&self, window: &mut Window, cx: &mut App) -> (String, std::ops::Range<usize>) {
@@ -583,6 +645,12 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.draft.formatted {
+            let fragment = rt::Doc::from_text(text);
+            self.rich.update(cx, |r, cx| r.insert_at_start(&fragment, Some(window), cx));
+            self.rich.update(cx, |r, cx| r.focus(window, cx));
+            return;
+        }
         let body = self.body.read(cx).value().to_string();
         // What was written already stays; the reply goes before it.
         let with = if body.trim().is_empty() || body.starts_with('\n') {
@@ -596,6 +664,10 @@ impl Composer {
 
     /// Focuses the body with the cursor at byte `offset` of its text.
     pub(super) fn put_cursor(&self, offset: usize, window: &mut Window, cx: &mut App) {
+        if self.draft.formatted {
+            self.rich.update(cx, |r, cx| r.put_caret_near(offset, window, cx));
+            return;
+        }
         self.body.update(cx, |s, cx| {
             s.focus(window, cx);
             let position = s.text().offset_to_position(offset);
@@ -603,113 +675,91 @@ impl Composer {
         });
     }
 
-    /// Wraps the selection in `mark` (or unwraps it), as for bold.
-    fn wrap(&mut self, mark: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Turns a format on or off for the selection (or what's typed next),
+    /// making the draft formatted first if it isn't.
+    pub(super) fn format(&mut self, mark: Mark, window: &mut Window, cx: &mut Context<Self>) {
         if !self.draft.formatted {
-            self.set_formatted(true, cx);
+            self.set_formatted(true, window, cx);
         }
-        let (text, range) = self.selection(window, cx);
-        let selected = &text[range.clone()];
-        let n = mark.len();
-        // Already wrapped, either inside or just outside the selection.
-        if selected.len() >= 2 * n && selected.starts_with(mark) && selected.ends_with(mark) {
-            let inner = selected[n..selected.len() - n].to_string();
-            let end = range.start + inner.len();
-            return self.edit(range, &inner, end, window, cx);
-        }
-        if range.start >= n
-            && text[range.end..].starts_with(mark)
-            && text[..range.start].ends_with(mark)
-        {
-            let outer = range.start - n..range.end + n;
-            let end = range.end - n;
-            return self.edit(outer, selected.to_string().as_str(), end, window, cx);
-        }
-        let with = format!("{mark}{selected}{mark}");
-        // An empty selection leaves the cursor between the marks.
-        let cursor = if selected.is_empty() {
-            range.start + n
-        } else {
-            range.start + with.len()
-        };
-        self.edit(range, &with, cursor, window, cx);
+        self.preview = false;
+        self.rich.update(cx, |r, cx| {
+            r.toggle_mark(mark, Some(window), cx);
+            r.focus(window, cx);
+        });
     }
 
-    /// Adds `prefix` to each selected line, or removes it when every line has
-    /// it already, as for lists and quotes.
-    fn prefix_lines(&mut self, kind: Lines, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn prefix_lines(&mut self, kind: Lines, window: &mut Window, cx: &mut Context<Self>) {
         if !self.draft.formatted {
-            self.set_formatted(true, cx);
+            self.set_formatted(true, window, cx);
         }
-        let (text, range) = self.selection(window, cx);
-        let start = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
-        let end = text[range.end..]
-            .find('\n')
-            .map_or(text.len(), |i| range.end + i);
-        let lines: Vec<&str> = text[start..end].split('\n').collect();
-        let has = |l: &str| kind.strip(l).is_some();
-        let all = lines
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .all(|l| has(l))
-            && lines.iter().any(|l| !l.trim().is_empty());
-        let mut number = 0;
-        let changed: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                if all {
-                    kind.strip(l).unwrap_or(l).to_string()
-                } else if l.trim().is_empty() && lines.len() > 1 {
-                    l.to_string()
-                } else {
-                    number += 1;
-                    let bare = Lines::ALL.iter().find_map(|k| k.strip(l)).unwrap_or(l);
-                    format!("{}{bare}", kind.prefix(number))
-                }
-            })
-            .collect();
-        let with = changed.join("\n");
-        let cursor = start + with.len();
-        self.edit(start..end, &with, cursor, window, cx);
+        self.preview = false;
+        self.rich.update(cx, |r, cx| match kind {
+            Lines::Bullets => r.toggle_list(ListKind::Bullets, Some(window), cx),
+            Lines::Numbers => r.toggle_list(ListKind::Numbers, Some(window), cx),
+            Lines::Quote => r.toggle_quote(Some(window), cx),
+            Lines::Heading => r.toggle_heading(Some(window), cx),
+        });
+        self.rich.update(cx, |r, cx| r.focus(window, cx));
     }
 
     fn insert_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.draft.formatted {
-            self.set_formatted(true, cx);
+            self.set_formatted(true, window, cx);
         }
-        let (text, range) = self.selection(window, cx);
-        let selected = text[range.clone()].trim().to_string();
-        let url_like = selected.starts_with("http://")
-            || selected.starts_with("https://")
-            || selected.starts_with("www.");
-        let (with, cursor) = if url_like {
-            let url = if selected.starts_with("www.") {
-                format!("https://{selected}")
-            } else {
-                selected.clone()
-            };
-            let with = format!("[{selected}]({url})");
-            let cursor = range.start + with.len();
-            (with, cursor)
-        } else {
-            let label = if selected.is_empty() {
-                "link".to_string()
-            } else {
-                selected
-            };
-            let with = format!("[{label}](https://)");
-            // Inside the parentheses, ready for the address.
-            let cursor = range.start + with.len() - 1;
-            (with, cursor)
+        self.preview = false;
+        let (selected, existing) = {
+            let r = self.rich.read(cx);
+            (r.selected_text().trim().to_owned(), r.link())
         };
-        self.edit(range, &with, cursor, window, cx);
+        // A selected address links to itself.
+        let url_like = !selected.contains(char::is_whitespace)
+            && (selected.starts_with("http://") || selected.starts_with("https://") || selected.starts_with("www."));
+        if url_like && existing.is_none() {
+            let url = if selected.starts_with("www.") { format!("https://{selected}") } else { selected };
+            self.rich.update(cx, |r, cx| r.set_link(Some(url), Some(window), cx));
+            return;
+        }
+        // Otherwise its address is asked for, above the text.
+        let initial = existing.unwrap_or_else(|| "https://".into());
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("composer-link-address"))
+                .input_action(TextInputAction::Done)
+        });
+        input.update(cx, |s, cx| {
+            s.set_text(initial.clone(), window, cx);
+            let end = s.text().offset_to_position(initial.len());
+            s.set_cursor_position(end, window, cx);
+            s.focus(window, cx);
+        });
+        self._subscriptions.push(cx.subscribe_in(&input, window, |this, input, e, w, cx| match e {
+            InputEvent::PressEnter { .. } => {
+                let url = input.read(cx).value().to_string();
+                let url = url.trim();
+                let url = (url != "https://" && url != "http://").then(|| url.to_owned());
+                this.link_input = None;
+                this.rich.update(cx, |r, cx| {
+                    r.set_link(url, Some(w), cx);
+                    r.focus(w, cx);
+                });
+                cx.notify();
+            }
+            InputEvent::Blur => {
+                this.link_input = None;
+                cx.notify();
+            }
+            _ => {}
+        }));
+        self.link_input = Some(input);
+        cx.notify();
     }
 
-    /// Pastes copied rich text as plain text or with its formatting (as
-    /// Markdown), per Settings, and offers the other. Returns false when the
-    /// clipboard has no formatting, leaving the paste to the text field.
+    /// Pastes copied rich text as plain text or with its formatting, per
+    /// Settings, and offers the other. Returns false when the clipboard has
+    /// no formatting, leaving the paste to the text field.
     fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.paste = None;
+        self.rich_paste = None;
         // A copied picture or files: attached.
         if let Some(item) = cx.read_from_clipboard() {
             let mut files = Vec::new();
@@ -736,14 +786,21 @@ impl Composer {
                 }
             }
             if !files.is_empty() && item.text().is_none_or(|t| t.trim().is_empty()) {
-                self.place_pictures(&pictures, window, cx);
                 self.add_files(files, cx);
+                self.place_pictures(&pictures, window, cx);
                 return true;
             }
         }
         let Some(plain) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
         };
+        // Copied from a formatted draft: as it was.
+        if self.draft.formatted
+            && let Some(fragment) = RichEditor::copied_fragment(&plain)
+        {
+            self.rich.update(cx, |r, cx| r.insert_doc(&fragment, Some(window), cx));
+            return true;
+        }
         let Some(pasted) = super::paste::Pasted::from_clipboard(plain) else {
             return false;
         };
@@ -752,29 +809,68 @@ impl Composer {
     }
 
     /// A formatted draft shows pasted pictures where they were pasted
-    /// (sent inline, RFC 2387): their Markdown goes in at the cursor. A
-    /// plain draft only attaches them.
+    /// (sent inline, RFC 2387). A plain draft only attaches them.
     pub(super) fn place_pictures(
         &mut self,
         pictures: &[std::path::PathBuf],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.draft.formatted {
+        if !self.draft.formatted || pictures.is_empty() {
             return;
         }
-        let text: Vec<String> = pictures
-            .iter()
-            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .map(|name| inline_picture(&name))
-            .collect();
-        if text.is_empty() {
-            return;
+        self.preview = false;
+        self.rich.update(cx, |r, cx| r.insert_pictures(pictures, Some(window), cx));
+    }
+
+    /// Pasted HTML as the formatted editor inserts it. Pictures the page
+    /// itself carried (`data:`) become the draft's attachments; others
+    /// (remote pictures, which could tell the sender each recipient read
+    /// it) are left out.
+    fn pasted_doc(&mut self, html: &str, cx: &mut Context<Self>) -> rt::Doc {
+        let mut doc = rhtml::parse(html, false);
+        let mut saved = Vec::new();
+        for i in 0..doc.blocks.len() {
+            if !doc.blocks[i].runs.iter().any(|r| r.image.is_some()) {
+                continue;
+            }
+            let b = doc.block_mut(i);
+            let mut runs = Vec::with_capacity(b.runs.len());
+            for run in b.runs.drain(..) {
+                let Some(image) = run.image.clone() else {
+                    runs.push(run);
+                    continue;
+                };
+                let data = image.src.strip_prefix("data:").and_then(|d| d.split_once(";base64,"));
+                let bytes = data.and_then(|(_, payload)| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()
+                });
+                let (Some((meta, _)), Some(bytes)) = (data, bytes) else {
+                    continue;
+                };
+                let extension = meta.rsplit('/').next().unwrap_or("png");
+                let extension = extension.split('+').next().unwrap_or(extension);
+                let name = t!("composer-pasted-image", extension = extension);
+                match self.backend.save_pasted(&self.draft.id, &name, &bytes) {
+                    Ok(path) => {
+                        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        saved.push(path);
+                        runs.push(rt::Run {
+                            image: Some(Rc::new(rt::Image { src: format!("file:{file}"), ..(*image).clone() })),
+                            ..run
+                        });
+                    }
+                    Err(e) => eprintln!("A pasted picture couldn't be kept: {e:#}"),
+                }
+            }
+            b.runs = runs;
+            b.normalize();
         }
-        let text = text.join("\n");
-        let (_, range) = self.selection(window, cx);
-        let end = range.start + text.len();
-        self.edit(range, &text, end, window, cx);
+        if !saved.is_empty() {
+            self.add_files(saved, cx);
+        }
+        doc
     }
 
     pub(super) fn insert_pasted(
@@ -784,62 +880,125 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         let formatted = self.options.paste_formatted;
-        let (inserted, other) = if formatted {
-            (pasted.formatted, pasted.plain)
-        } else {
-            (pasted.plain, pasted.formatted)
-        };
-        let was_formatted = self.draft.formatted;
-        if formatted && !was_formatted {
-            self.set_formatted(true, cx);
+        // A plain draft keeps a plain paste in its text.
+        if !self.draft.formatted && !formatted {
+            let (_, range) = self.selection(window, cx);
+            let start = range.start;
+            self.edit(range, &pasted.plain, start + pasted.plain.len(), window, cx);
+            self.paste = Some(PasteOffer {
+                start,
+                inserted: pasted.plain,
+                other: pasted.html,
+                inserted_formatted: false,
+                body_len: self.body.read(cx).value().len(),
+            });
+            cx.notify();
+            return;
         }
-        let (_, range) = self.selection(window, cx);
-        let start = range.start;
-        self.edit(range, &inserted, start + inserted.len(), window, cx);
-        self.paste = Some(PasteOffer {
-            start,
-            inserted,
-            other,
-            inserted_formatted: formatted,
-            was_formatted,
-            body_len: self.body.read(cx).value().len(),
+        let was_plain = (!self.draft.formatted).then(|| self.body.read(cx).value().to_string());
+        if !self.draft.formatted {
+            self.set_formatted(true, window, cx);
+        }
+        if formatted {
+            let doc = self.pasted_doc(&pasted.html, cx);
+            self.rich.update(cx, |r, cx| r.insert_doc(&doc, Some(window), cx));
+        } else {
+            self.rich.update(cx, |r, cx| r.insert_plain(&pasted.plain, Some(window), cx));
+        }
+        self.rich_paste = Some(RichPaste {
+            plain: pasted.plain,
+            html: pasted.html,
+            formatted_inserted: formatted,
+            was_plain,
+            revision: self.rich.read(cx).revision,
         });
         cx.notify();
     }
 
     /// Puts the last paste's other version in its place.
     pub(super) fn swap_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(offer) = self.paste.take() else {
-            return;
-        };
-        let end = offer.start + offer.inserted.len();
-        let text = self.body.read(cx).value().to_string();
-        if text.get(offer.start..end) != Some(offer.inserted.as_str()) {
+        // A plain paste in a plain draft: formatted, the draft becomes so.
+        if let Some(offer) = self.paste.take() {
+            let end = offer.start + offer.inserted.len();
+            let text = self.body.read(cx).value().to_string();
+            if text.get(offer.start..end) != Some(offer.inserted.as_str()) {
+                cx.notify();
+                return;
+            }
+            self.edit(offer.start..end, "", offer.start, window, cx);
+            let before = self.body.read(cx).value().to_string();
+            self.set_formatted(true, window, cx);
+            let doc = self.pasted_doc(&offer.other, cx);
+            self.rich.update(cx, |r, cx| {
+                r.insert_doc(&doc, Some(window), cx);
+                r.focus(window, cx);
+            });
+            self.rich_paste = Some(RichPaste {
+                plain: offer.inserted,
+                html: offer.other,
+                formatted_inserted: true,
+                was_plain: Some(before),
+                revision: self.rich.read(cx).revision,
+            });
             cx.notify();
             return;
         }
-        let formatted = !offer.inserted_formatted;
-        if formatted && !self.draft.formatted {
-            self.set_formatted(true, cx);
-        } else if !formatted && !offer.was_formatted && self.draft.formatted {
-            self.set_formatted(false, cx);
+        let Some(offer) = self.rich_paste.take() else {
+            return;
+        };
+        if self.rich.read(cx).revision != offer.revision || !self.draft.formatted {
+            cx.notify();
+            return;
         }
-        let cursor = offer.start + offer.other.len();
-        self.edit(offer.start..end, &offer.other, cursor, window, cx);
-        self.body.update(cx, |s, cx| s.focus(window, cx));
-        self.paste = Some(PasteOffer {
-            start: offer.start,
-            inserted: offer.other,
-            other: offer.inserted,
-            inserted_formatted: formatted,
-            was_formatted: offer.was_formatted,
-            body_len: self.body.read(cx).value().len(),
+        self.rich.update(cx, |r, cx| r.undo(Some(window), cx));
+        if offer.formatted_inserted {
+            // The paste made the draft formatted: plain again, as it was,
+            // with the text pasted where the paste went.
+            if let Some(before) = offer.was_plain {
+                let at = self.rich.read(cx).sel.start();
+                let offset: usize = before
+                    .split('\n')
+                    .take(at.block)
+                    .map(|l| l.len() + 1)
+                    .sum::<usize>()
+                    + at.offset;
+                self.draft.formatted = false;
+                self.unformatted = None;
+                self.body.update(cx, |s, cx| s.set_text(before.clone(), window, cx));
+                let offset = offset.min(before.len());
+                self.edit(offset..offset, &offer.plain, offset + offer.plain.len(), window, cx);
+                self.body.update(cx, |s, cx| s.focus(window, cx));
+                self.paste = Some(PasteOffer {
+                    start: offset,
+                    inserted: offer.plain,
+                    other: offer.html,
+                    inserted_formatted: false,
+                    body_len: self.body.read(cx).value().len(),
+                });
+                self.changed(cx);
+                return;
+            }
+            self.rich.update(cx, |r, cx| r.insert_plain(&offer.plain, Some(window), cx));
+        } else {
+            let doc = self.pasted_doc(&offer.html, cx);
+            self.rich.update(cx, |r, cx| r.insert_doc(&doc, Some(window), cx));
+        }
+        self.rich.update(cx, |r, cx| r.focus(window, cx));
+        self.rich_paste = Some(RichPaste {
+            formatted_inserted: !offer.formatted_inserted,
+            revision: self.rich.read(cx).revision,
+            ..offer
         });
         cx.notify();
     }
 
     pub(super) fn paste_offer_label(&self) -> Option<&'static str> {
-        Some(if self.paste.as_ref()?.inserted_formatted {
+        let formatted = match (&self.rich_paste, &self.paste) {
+            (Some(p), _) => p.formatted_inserted,
+            (None, Some(p)) => p.inserted_formatted,
+            (None, None) => return None,
+        };
+        Some(if formatted {
             t!("composer-paste-without-formatting")
         } else {
             t!("composer-paste-with-formatting")
@@ -882,11 +1041,52 @@ impl Composer {
         )
     }
 
-    fn set_formatted(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.draft.formatted = on;
-        if !on {
-            self.preview = false;
+    /// Makes the draft formatted (its text, or the formatting it had when
+    /// the text is as switching to plain left it) or plain (its text).
+    pub(super) fn set_formatted(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if on == self.draft.formatted {
+            return;
         }
+        if on {
+            let text = self.body.read(cx).value().to_string();
+            let focused = self.body.read(cx).focus_handle(cx).is_focused(window);
+            let (_, range) = self.selection(window, cx);
+            let doc = match self.unformatted.take() {
+                Some((plain, html)) if plain == text => rhtml::parse(&html, true),
+                _ => rt::Doc::from_text(&text),
+            };
+            // The caret stays where it was: a line of text is a block.
+            let at = |byte: usize| {
+                let before = &text[..byte.min(text.len())];
+                let block = before.matches('\n').count();
+                let offset = before.rfind('\n').map_or(before.len(), |i| before.len() - i - 1);
+                rt::Pos::new(block, offset)
+            };
+            let (start, end) = (at(range.start), at(range.end));
+            self.rich.update(cx, |r, cx| {
+                r.set_doc(doc, cx);
+                r.sel.anchor = r.doc.clamp(start);
+                r.sel.head = r.doc.clamp(end);
+                if focused {
+                    r.focus(window, cx);
+                }
+            });
+        } else {
+            let (plain, html, focused) = {
+                let r = self.rich.read(cx);
+                (r.plain(), r.html(), r.is_focused(window))
+            };
+            self.unformatted = Some((plain.clone(), html));
+            self.body.update(cx, |s, cx| {
+                s.set_text(plain, window, cx);
+                if focused {
+                    s.focus(window, cx);
+                }
+            });
+            self.preview = false;
+            self.link_input = None;
+        }
+        self.draft.formatted = on;
         self.changed(cx);
     }
 
@@ -1030,10 +1230,25 @@ impl Composer {
         let original = self.backend.answering(&original);
         let clear = crate::manage::protected_reply::cleartext(&original, &d.subject, &d.body);
         self.draft.subject = clear.subject;
-        self.draft.body = clear.body;
         self.draft.encrypt = false;
         self.draft.encrypt_subject = false;
-        self.reload_fields(window, cx);
+        if self.draft.formatted {
+            // The quote's blocks go: from its introduction, or the first
+            // quoted line.
+            let doc = &self.rich.read(cx).doc;
+            let from = doc
+                .quote_start()
+                .or_else(|| doc.blocks.iter().position(|b| b.path.iter().any(|e| e.is("blockquote"))));
+            if let Some(from) = from.filter(|_| clear.body != d.body) {
+                self.rich.update(cx, |r, cx| r.truncate_blocks(from, cx));
+            }
+            let subject = self.draft.subject.clone();
+            self.subject.update(cx, |s, cx| s.set_text(subject, window, cx));
+            self.snapshot(cx);
+        } else {
+            self.draft.body = clear.body;
+            self.reload_fields(window, cx);
+        }
         self.changed(cx);
     }
 
@@ -1165,10 +1380,10 @@ impl Composer {
                     .child(div().size(px(14.)).rounded_full().bg(rgb(0xffffff))),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|t, _, _, cx| {
+            .on_click(cx.listener(|t, _, w, cx| {
                 cx.stop_propagation();
                 let on = !t.draft.formatted;
-                t.set_formatted(on, cx)
+                t.set_formatted(on, w, cx)
             }))
     }
 
@@ -1340,7 +1555,16 @@ impl Composer {
                 cx.listener(|this, _, _, cx| {
                     this.templates_open = false;
                     let subject = this.subject.read(cx).value().to_string();
-                    let body = this.body.read(cx).value().to_string();
+                    let body = if this.draft.formatted {
+                        // Templates are Markdown: the formatting as that,
+                        // without the signature and quote below.
+                        let doc = &this.rich.read(cx).doc;
+                        let end = doc.signature_range().map(|r| r.start).or(doc.quote_start()).unwrap_or(doc.blocks.len());
+                        let kept = rt::Doc { blocks: doc.blocks[..end].to_vec(), sheets: vec![] };
+                        super::paste::html_to_markdown(&rhtml::to_html(&kept)).unwrap_or_else(|| kept.to_plain())
+                    } else {
+                        this.body.read(cx).value().to_string()
+                    };
                     // Without the signature and quoted history below it.
                     let body = body
                         .split("\n-- \n")
@@ -1384,7 +1608,17 @@ impl Composer {
             values.subject = subject.clone();
             self.subject.update(cx, |s, cx| s.set_text(subject, window, cx));
         }
-        self.insert_reply_text(&fill_placeholders(&t.body, &values), window, cx);
+        let text = fill_placeholders(&t.body, &values);
+        if self.draft.formatted {
+            // A template's Markdown, formatted.
+            let fragment = rhtml::from_markdown(&text, "");
+            self.rich.update(cx, |r, cx| {
+                r.insert_at_start(&fragment, Some(window), cx);
+                r.focus(window, cx);
+            });
+            return;
+        }
+        self.insert_reply_text(&text, window, cx);
     }
 
     /// What a template's placeholders stand for now: the first recipient
@@ -1468,48 +1702,56 @@ impl Composer {
     }
 }
 
-/// A pasted picture's place in a formatted body: Markdown naming its
-/// attachment (`file:` and the file's name, in angle brackets so spaces
-/// stay), which the sent message shows inline by Content-ID.
-fn inline_picture(name: &str) -> String {
-    let alt: String = name.chars().filter(|c| !matches!(c, '[' | ']' | '\\')).collect();
-    let alt = alt.rsplit_once('.').map_or(alt.as_str(), |(stem, _)| stem).to_owned();
-    let name: String = name.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r')).collect();
-    format!("![{alt}](<file:{name}>)")
+/// A formatted draft's document: its HTML, or (kept before the composer
+/// wrote HTML, or just written as Markdown) its Markdown body, whose HTML
+/// the draft keeps from then on.
+fn rich_doc(draft: &mut Draft) -> rt::Doc {
+    if !draft.html.is_empty() {
+        return rhtml::parse(&draft.html, true);
+    }
+    let doc = rhtml::from_markdown(&draft.body, &draft.signature_html);
+    draft.html = rhtml::to_html(&doc);
+    doc
 }
 
-/// Line formats applied by `prefix_lines`.
+/// The formatted editor's look from the composer's colors.
+fn look_of(c: Colors, mobile: bool) -> Look {
+    let lum = |v: u32| ((v >> 16) & 0xff) + ((v >> 8) & 0xff) + (v & 0xff);
+    Look {
+        text: c.text,
+        muted: c.muted,
+        accent: c.accent,
+        border: c.border,
+        soft: c.soft,
+        surface: c.surface,
+        danger: c.danger,
+        dark: lum(c.surface) < 3 * 0x80,
+        // Phones read body text at their system size (17pt).
+        size: if mobile { 17. } else { 14. },
+    }
+}
+
+/// The blocks a signature adds to a formatted message: the "-- " line and
+/// the signature, its HTML or its Markdown.
+fn signature_blocks(sig: &crate::manage::composing::Signature) -> Vec<Rc<rt::Block>> {
+    if sig.text.trim().is_empty() && sig.html.trim().is_empty() {
+        return vec![];
+    }
+    let inner = if sig.html.trim().is_empty() {
+        crate::sync::smtp::markdown_fragment(&sig.text, "")
+    } else {
+        sig.html.clone()
+    };
+    rhtml::parse(&format!("<p>--&nbsp;</p><div class=\"picacho-signature\">{inner}</div>"), false).blocks
+}
+
+/// Block formats applied by `prefix_lines`.
 #[derive(Clone, Copy)]
-enum Lines {
+pub(super) enum Lines {
     Bullets,
     Numbers,
     Quote,
     Heading,
-}
-impl Lines {
-    const ALL: [Lines; 4] = [Lines::Bullets, Lines::Numbers, Lines::Quote, Lines::Heading];
-    fn prefix(self, n: usize) -> String {
-        match self {
-            Lines::Bullets => "- ".into(),
-            Lines::Numbers => format!("{n}. "),
-            Lines::Quote => "> ".into(),
-            Lines::Heading => "## ".into(),
-        }
-    }
-    fn strip(self, line: &str) -> Option<&str> {
-        match self {
-            Lines::Bullets => line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")),
-            Lines::Numbers => {
-                let (n, rest) = line.split_once(". ")?;
-                (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then_some(rest)
-            }
-            Lines::Quote => line.strip_prefix("> ").or_else(|| line.strip_prefix('>')),
-            Lines::Heading => line
-                .trim_start_matches('#')
-                .strip_prefix(' ')
-                .filter(|_| line.starts_with('#')),
-        }
-    }
 }
 
 impl Composer {
@@ -1941,6 +2183,9 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         let after = self.signature();
+        if self.draft.formatted {
+            return self.swap_rich_signature(before, after, cx);
+        }
         let body = self.body.read(cx).value().to_string();
         let Some(swapped) = crate::manage::composing::swap_signature(&body, &before.block(), &after.block()) else {
             return;
@@ -1948,6 +2193,42 @@ impl Composer {
         self.draft.body = swapped.clone();
         self.draft.signature_html = after.html;
         self.body.update(cx, |s, cx| s.set_text(swapped, window, cx));
+    }
+
+    /// `swap_signature` in the formatted editor: the signature's blocks
+    /// (after the "-- " line) replaced where they read as `before` does.
+    fn swap_rich_signature(
+        &mut self,
+        before: crate::manage::composing::Signature,
+        after: crate::manage::composing::Signature,
+        cx: &mut Context<Self>,
+    ) {
+        if before == after {
+            return;
+        }
+        let same = |a: &str, b: &str| a.split_whitespace().eq(b.split_whitespace());
+        let doc = self.rich.read(cx).doc.clone();
+        let new = signature_blocks(&after);
+        match doc.signature_range() {
+            Some(range) => {
+                let written: Vec<String> = doc.blocks[range.start + 1..range.end].iter().map(|b| b.text()).collect();
+                // Changed by hand: it stays.
+                if !same(&written.join("\n"), &before.text) {
+                    return;
+                }
+                self.rich.update(cx, |r, cx| r.replace_blocks(range, new, cx));
+            }
+            None if before.text.trim().is_empty() && !new.is_empty() => {
+                // Above the quote or forwarded message, or at the end,
+                // after a blank line.
+                let at = doc.quote_start().unwrap_or(doc.blocks.len());
+                let mut blocks = vec![Rc::new(rt::Block::paragraph("div", ""))];
+                blocks.extend(new);
+                self.rich.update(cx, |r, cx| r.replace_blocks(at..at, blocks, cx));
+            }
+            None => return,
+        }
+        self.draft.signature_html = after.html;
     }
 
     fn sender_row(&self, cx: &Context<Self>) -> Option<Div> {
@@ -2365,6 +2646,8 @@ impl Composer {
     fn toolbar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
         let sep = || div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(c.border));
+        let active = self.rich.read(cx).active();
+        let tip = |label: &str, name: &str| super::shortcuts::tip(label, name, cx);
         div()
             .id("compose-toolbar")
             .debug_selector(|| "compose-toolbar".into())
@@ -2377,75 +2660,110 @@ impl Composer {
             .overflow_x_scroll()
             .border_b_1()
             .border_color(rgb(c.border))
-            .child(
-                self.icon_button("bold", "bold", super::shortcuts::tip(t!("composer-bold"), "bold", cx), false, cx, |t, w, cx| {
-                    t.wrap("**", w, cx)
-                }),
-            )
+            // Pressing a button leaves the text focused, with its selection.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .child(self.icon_button("bold", "bold", tip(t!("composer-bold"), "bold"), active.bold, cx, |t, w, cx| {
+                t.format(Mark::Bold, w, cx)
+            }))
+            .child(self.icon_button("italic", "italic", tip(t!("composer-italic"), "italic"), active.italic, cx, |t, w, cx| {
+                t.format(Mark::Italic, w, cx)
+            }))
             .child(self.icon_button(
-                "italic",
-                "italic",
-                super::shortcuts::tip(t!("composer-italic"), "italic", cx),
-                false,
+                "underline",
+                "underline",
+                tip(t!("composer-underline"), "underline"),
+                active.underline,
                 cx,
-                |t, w, cx| t.wrap("_", w, cx),
+                |t, w, cx| t.format(Mark::Underline, w, cx),
             ))
             .child(self.icon_button(
                 "strike",
                 "strike",
-                super::shortcuts::tip(t!("composer-strikethrough"), "strikethrough", cx),
-                false,
+                tip(t!("composer-strikethrough"), "strikethrough"),
+                active.strike,
                 cx,
-                |t, w, cx| t.wrap("~~", w, cx),
+                |t, w, cx| t.format(Mark::Strike, w, cx),
             ))
-            .child(
-                self.icon_button("code", "code", super::shortcuts::tip(t!("composer-code"), "code", cx), false, cx, |t, w, cx| {
-                    t.wrap("`", w, cx)
-                }),
-            )
+            .child(self.icon_button("code", "code", tip(t!("composer-code"), "code"), active.code, cx, |t, w, cx| {
+                t.format(Mark::Code, w, cx)
+            }))
             .child(sep())
             .child(self.icon_button(
                 "heading",
                 "heading",
-                super::shortcuts::tip(t!("composer-heading"), "heading", cx),
-                false,
+                tip(t!("composer-heading"), "heading"),
+                active.heading,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Heading, w, cx),
             ))
             .child(self.icon_button(
                 "bullets",
                 "list",
-                super::shortcuts::tip(t!("composer-bulleted-list"), "bulleted-list", cx),
-                false,
+                tip(t!("composer-bulleted-list"), "bulleted-list"),
+                active.bullets,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Bullets, w, cx),
             ))
             .child(self.icon_button(
                 "numbers",
                 "list-ordered",
-                super::shortcuts::tip(t!("composer-numbered-list"), "numbered-list", cx),
-                false,
+                tip(t!("composer-numbered-list"), "numbered-list"),
+                active.numbers,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Numbers, w, cx),
             ))
+            .child(self.icon_button("quote", "quote", tip(t!("composer-quote"), "quote"), active.quote, cx, |t, w, cx| {
+                t.prefix_lines(Lines::Quote, w, cx)
+            }))
+            .child(self.icon_button("link", "link", tip(t!("composer-link"), "link"), active.link, cx, |t, w, cx| {
+                t.insert_link(w, cx)
+            }))
+            .child(sep())
             .child(self.icon_button(
-                "quote",
-                "quote",
-                super::shortcuts::tip(t!("composer-quote"), "quote", cx),
+                "align",
+                match active.align {
+                    rt::Align::Left => "text-align-start",
+                    rt::Align::Center => "text-align-center",
+                    rt::Align::Right => "text-align-end",
+                    rt::Align::Justify => "text-align-justify",
+                },
+                match active.align {
+                    rt::Align::Center => t!("composer-centered-align-right"),
+                    rt::Align::Right => t!("composer-aligned-right-align-left"),
+                    _ => t!("composer-aligned-left-center"),
+                },
+                active.align != rt::Align::Left,
+                cx,
+                |t, w, cx| {
+                    let next = match t.rich.read(cx).active().align {
+                        rt::Align::Left | rt::Align::Justify => rt::Align::Center,
+                        rt::Align::Center => rt::Align::Right,
+                        rt::Align::Right => rt::Align::Left,
+                    };
+                    t.rich.update(cx, |r, cx| {
+                        r.set_align(next, Some(w), cx);
+                        r.focus(w, cx);
+                    });
+                },
+            ))
+            .child(self.icon_button(
+                "clear-formatting",
+                "remove-formatting",
+                t!("composer-clear-formatting"),
                 false,
                 cx,
-                |t, w, cx| t.prefix_lines(Lines::Quote, w, cx),
+                |t, w, cx| {
+                    t.rich.update(cx, |r, cx| {
+                        r.clear_formatting(Some(w), cx);
+                        r.focus(w, cx);
+                    });
+                },
             ))
-            .child(
-                self.icon_button("link", "link", super::shortcuts::tip(t!("composer-link"), "link", cx), false, cx, |t, w, cx| {
-                    t.insert_link(w, cx)
-                }),
-            )
             .child(div().flex_1())
             .child(self.icon_button(
                 "preview",
                 "preview",
-                super::shortcuts::tip(t!("composer-preview"), "preview-formatting", cx),
+                tip(t!("composer-preview"), "preview-formatting"),
                 self.preview,
                 cx,
                 |t, _, cx| {
@@ -2455,11 +2773,53 @@ impl Composer {
             ))
     }
 
+    /// The bar asking a link's address, above the formatted text.
+    fn link_bar(&self, cx: &Context<Self>) -> Option<Div> {
+        let input = self.link_input.as_ref()?;
+        let c = self.colors;
+        Some(
+            div()
+                .flex_shrink_0()
+                .px_3()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(rgb(c.border))
+                .child(icon_el("link", 13., c.muted))
+                .child(div().flex_1().child(Input::new(input).appearance(false).text_size(px(13.))))
+                .child(
+                    div()
+                        .id("link-remove")
+                        .px_2()
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(c.soft)))
+                        .child(t!("composer-remove-link"))
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.link_input = None;
+                            this.rich.update(cx, |r, cx| {
+                                r.set_link(None, Some(w), cx);
+                                r.focus(w, cx);
+                            });
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     fn body_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let c = self.colors;
         let inline = self.placement == Placement::Inline;
         if self.preview && self.draft.formatted {
-            let text = self.body.read(cx).value().to_string();
+            let html = self.rich.read(cx).html();
             return div()
                 .id("compose-preview")
                 .debug_selector(|| "compose-preview".into())
@@ -2469,27 +2829,28 @@ impl Composer {
                 .px_4()
                 .py_3()
                 .child(
-                    gpui_component::text::TextView::markdown("compose-preview-text", text)
-                    .selectable(true)
-                    .h_auto()
-                    .text_size(px(14.)),
+                    gpui_component::text::TextView::html("compose-preview-text", html)
+                        .selectable(true)
+                        .h_auto()
+                        .text_size(px(14.)),
                 )
                 .into_any_element();
         }
-        div()
+        let body = div()
             .id("compose-body")
             .debug_selector(|| "compose-body".into())
             .relative()
             .when(!inline, |d| d.flex_1().min_h_0())
             .when(inline, |d| d.h(px(240.)))
-            .px_2()
-            .py_1()
             .capture_action(cx.listener(|this, _: &gpui_component::input::Paste, w, cx| {
                 if this.paste(w, cx) {
                     cx.stop_propagation();
                 }
-            }))
-            .child(
+            }));
+        let body = if self.draft.formatted {
+            body.px_1().child(self.rich.clone())
+        } else {
+            body.px_2().py_1().child(
                 Textarea::new(&self.body)
                     .appearance(false)
                     .disabled(self.sending)
@@ -2497,6 +2858,8 @@ impl Composer {
                     // Phones read body text at their system size (17pt).
                     .text_size(px(if self.mobile { 17. } else { 14. })),
             )
+        };
+        body
             // Over the text, so it comes after.
             .children(self.paste_offer(cx))
             .bg(rgb(c.surface))
@@ -2504,7 +2867,12 @@ impl Composer {
     }
 
     fn attachments(&self, cx: &Context<Self>) -> Option<Div> {
-        if self.draft.attachments.is_empty() {
+        // Pictures shown in the formatted text are there, not here.
+        let shown: Vec<String> = if self.draft.formatted { self.rich.read(cx).doc.file_images() } else { vec![] };
+        let listed = |p: &std::path::PathBuf| {
+            !p.file_name().is_some_and(|n| shown.iter().any(|s| *s == n.to_string_lossy()))
+        };
+        if !self.draft.attachments.iter().any(listed) {
             return None;
         }
         let c = self.colors;
@@ -2518,6 +2886,9 @@ impl Composer {
             .border_t_1()
             .border_color(rgb(c.border));
         for (i, path) in self.draft.attachments.iter().enumerate() {
+            if !listed(path) {
+                continue;
+            }
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             list = list.child(
                 div()
@@ -2681,9 +3052,9 @@ impl Composer {
                     },
                     self.draft.formatted,
                     cx,
-                    |t, _, cx| {
+                    |t, w, cx| {
                         let on = !t.draft.formatted;
-                        t.set_formatted(on, cx)
+                        t.set_formatted(on, w, cx)
                     },
                 )
             })
@@ -2742,8 +3113,8 @@ impl Composer {
                     },
                 ))
                 // RFC 9788: OpenPGP and S/MIME both hide it in the
-                // encrypted part.
-                .when(self.draft.encrypt, |d| {
+                // encrypted part; inline PGP has no protected headers.
+                .when(self.draft.encrypt && !self.sends_inline_pgp(), |d| {
                     d.child(self.icon_button(
                         "encrypt-subject",
                         "eye-off",
@@ -2756,6 +3127,25 @@ impl Composer {
                         cx,
                         |t, _, cx| {
                             t.draft.encrypt_subject = !t.draft.encrypt_subject;
+                            t.changed(cx);
+                            cx.notify();
+                        },
+                    ))
+                })
+                // OpenPGP as inline PGP, for apps that read only that.
+                .when(!smime && self.can_protect_openpgp() && (self.draft.sign || self.draft.encrypt), |d| {
+                    d.child(self.icon_button(
+                        "pgp-inline",
+                        "scroll-text",
+                        if self.draft.pgp_inline {
+                            t!("composer-sent-as-inline-pgp")
+                        } else {
+                            t!("composer-sent-as-pgp-mime")
+                        },
+                        self.draft.pgp_inline,
+                        cx,
+                        |t, _, cx| {
+                            t.draft.pgp_inline = !t.draft.pgp_inline;
                             t.changed(cx);
                             cx.notify();
                         },
@@ -2817,10 +3207,11 @@ impl Render for Composer {
             .when(inline, |d| d.w_full())
             .bg(rgb(c.surface))
             .text_color(rgb(c.text))
-            .on_action(cx.listener(|t, _: &Bold, w, cx| t.wrap("**", w, cx)))
-            .on_action(cx.listener(|t, _: &Italic, w, cx| t.wrap("_", w, cx)))
-            .on_action(cx.listener(|t, _: &Strike, w, cx| t.wrap("~~", w, cx)))
-            .on_action(cx.listener(|t, _: &InlineCode, w, cx| t.wrap("`", w, cx)))
+            .on_action(cx.listener(|t, _: &Bold, w, cx| t.format(Mark::Bold, w, cx)))
+            .on_action(cx.listener(|t, _: &Italic, w, cx| t.format(Mark::Italic, w, cx)))
+            .on_action(cx.listener(|t, _: &Underline, w, cx| t.format(Mark::Underline, w, cx)))
+            .on_action(cx.listener(|t, _: &Strike, w, cx| t.format(Mark::Strike, w, cx)))
+            .on_action(cx.listener(|t, _: &InlineCode, w, cx| t.format(Mark::Code, w, cx)))
             .on_action(cx.listener(|t, _: &InsertLink, w, cx| t.insert_link(w, cx)))
             .on_action(cx.listener(|t, _: &Bullets, w, cx| t.prefix_lines(Lines::Bullets, w, cx)))
             .on_action(cx.listener(|t, _: &Numbers, w, cx| t.prefix_lines(Lines::Numbers, w, cx)))
@@ -2829,8 +3220,16 @@ impl Render for Composer {
             .on_action(cx.listener(|t, _: &SaveDraft, _, cx| t.save(cx)))
             .on_action(cx.listener(|t, _: &SendDraft, w, cx| t.request_send(w, cx)))
             .on_action(cx.listener(|t, _: &TogglePreview, _, cx| t.toggle_preview(cx)))
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.add_files(paths.paths().to_vec(), cx)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, w, cx| {
+                let paths = paths.paths().to_vec();
+                // Pictures dropped on formatted text go in it.
+                let pictures: Vec<std::path::PathBuf> = paths
+                    .iter()
+                    .filter(|p| mime_guess::from_path(p).first().is_some_and(|m| m.type_() == "image" && m.subtype() != "svg"))
+                    .cloned()
+                    .collect();
+                this.add_files(paths, cx);
+                this.place_pictures(&pictures, w, cx);
             }))
             .child(if self.mobile {
                 self.mobile_header(window, cx)
@@ -2858,7 +3257,17 @@ impl Render for Composer {
             root = root.child(self.row(t!("composer-subject"), self.input(&self.subject)));
         }
         if self.draft.formatted {
+            let (look, sending, files) = (look_of(c, self.mobile), self.sending, self.draft.attachments.clone());
+            // Phones' keyboards check spelling themselves.
+            let spellcheck = self.options.spellcheck && !self.mobile;
+            self.rich.update(cx, |r, _| {
+                r.look = look;
+                r.spellcheck = spellcheck;
+                r.disabled = sending;
+                r.set_files(&files);
+            });
             root = root.child(self.toolbar(cx));
+            root = root.children(self.link_bar(cx));
         }
         root.child(self.body_view(cx))
             .children(self.attachments(cx))
@@ -2898,18 +3307,3 @@ impl Render for ComposeWindow {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::prelude::v1::test;
-
-    #[test]
-    fn line_formats_recognize_their_prefixes() {
-        assert_eq!(Lines::Numbers.strip("12. item"), Some("item"));
-        assert_eq!(Lines::Numbers.strip("x. item"), None);
-        assert_eq!(Lines::Bullets.strip("* item"), Some("item"));
-        assert_eq!(Lines::Heading.strip("## Title"), Some("Title"));
-        assert_eq!(Lines::Heading.strip("Title"), None);
-        assert_eq!(Lines::Quote.strip(">quoted"), Some("quoted"));
-    }
-}

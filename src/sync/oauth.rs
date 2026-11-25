@@ -480,17 +480,33 @@ fn pinal_client_id() -> String {
     }
 }
 
-fn endpoints(provider: Provider) -> (&'static str, &'static str, &'static str) {
-    match provider {
+/// Microsoft Graph's delegated permissions for an Outlook account that
+/// uses it (`Account::api`): mail and its settings (automatic replies,
+/// inbox rules), sending, calendars, contacts, and looking people up
+/// (People, which searches a work account's directory too). None needs an
+/// administrator's consent, and personal accounts may give them all.
+pub const GRAPH_SCOPES: &str = "openid email profile offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/MailboxSettings.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Contacts.ReadWrite https://graph.microsoft.com/People.Read";
+/// What a Gmail account that uses the Gmail API asks for: all of its mail,
+/// and its basic settings (filters, the vacation reply), which the mail
+/// scope doesn't cover for changes.
+pub const GMAIL_API_SCOPES: &str =
+    "openid email profile https://mail.google.com/ https://www.googleapis.com/auth/gmail.settings.basic";
+
+fn endpoints(account: &Account) -> (&'static str, &'static str, &'static str) {
+    match account.provider {
         Provider::Gmail => (
             "https://accounts.google.com/o/oauth2/v2/auth",
             "https://oauth2.googleapis.com/token",
-            "openid email profile https://mail.google.com/",
+            if account.api { GMAIL_API_SCOPES } else { "openid email profile https://mail.google.com/" },
         ),
         _ => (
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-            "openid email profile offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send",
+            if account.api {
+                GRAPH_SCOPES
+            } else {
+                "openid email profile offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+            },
         ),
     }
 }
@@ -1164,7 +1180,7 @@ pub fn authorize_with(account: &Account, more: &[&str], cancel: Arc<AtomicBool>)
     );
     let microsoft = account.provider == Provider::Outlook;
     let browser = Browser::new(if microsoft { "localhost" } else { "127.0.0.1" }, "/")?;
-    let (auth, _, base) = endpoints(account.provider);
+    let (auth, _, base) = endpoints(account);
     let joined = std::iter::once(base).chain(more.iter().copied()).collect::<Vec<_>>().join(" ");
     let scope = joined.as_str();
     let mut url = url::Url::parse(auth)?;
@@ -1267,14 +1283,21 @@ fn authorize_sso(
     cancel: Arc<AtomicBool>,
 ) -> Result<Grant> {
     let metadata = sso_metadata(&sso.issuer)?;
-    let scope = sso_scopes(&metadata.scopes, &sso.scope);
+    let scope = sso_scopes(&metadata.scopes, &account.sso_scope());
     let kept = metadata.registration.as_deref().and_then(Registration::load);
     // A client id that isn't the one Picacho registered is an
     // administrator's registration, used as given.
     let given = !account.client_id.is_empty()
         && kept.as_ref().is_none_or(|k| k.client_id != account.client_id);
     let port = kept.filter(|_| !given).and_then(|k| k.port());
-    let mut browser = Browser::on_port("127.0.0.1", "/callback", port)?;
+    // Picacho's own Microsoft registration (Exchange through Entra) has
+    // `http://localhost` as its redirect, as for Outlook.
+    let microsoft = client(Provider::Outlook).id;
+    let mut browser = if given && !microsoft.is_empty() && account.client_id == microsoft {
+        Browser::new("localhost", "/")?
+    } else {
+        Browser::on_port("127.0.0.1", "/callback", port)?
+    };
     browser.issuer = metadata.issuer.clone();
     let client_id = if given {
         account.client_id.clone()
@@ -1319,6 +1342,12 @@ fn authorize_sso(
 /// person may have unticked one (Google's granular consent).
 fn needed_scopes<'a>(account: &Account, requested: &'a str) -> Vec<&'a str> {
     let wanted: &[&str] = match account.provider {
+        Provider::Gmail if account.gmail_api() => {
+            &["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.settings.basic"]
+        }
+        Provider::Outlook if account.graph() => {
+            &["https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
+        }
         Provider::Gmail if account.sso.is_none() => &["https://mail.google.com/"],
         Provider::Outlook if account.sso.is_none() => &[
             "https://outlook.office.com/IMAP.AccessAsUser.All",
@@ -1337,8 +1366,15 @@ fn needed_scopes<'a>(account: &Account, requested: &'a str) -> Vec<&'a str> {
 /// resource's scopes in its own spelling of the name, so those compare
 /// without case.
 fn granted_scope(granted: &str, scope: &str) -> bool {
+    // Microsoft Graph is Microsoft's default resource: its scopes come
+    // back without the resource's address.
+    let graph = scope.strip_prefix("https://graph.microsoft.com/");
     granted.split_whitespace().any(|g| {
-        g == scope || (scope.starts_with("https://outlook.office.com/") && g.eq_ignore_ascii_case(scope))
+        g == scope
+            || (scope.starts_with("https://outlook.office.com/") && g.eq_ignore_ascii_case(scope))
+            || graph.is_some_and(|short| {
+                g.eq_ignore_ascii_case(scope) || g.eq_ignore_ascii_case(short)
+            })
     })
 }
 
@@ -1352,7 +1388,7 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     let token = if jmap {
         grant.token.as_str()
     } else {
-        endpoints(account.provider).1
+        endpoints(account).1
     };
     let client_id = if jmap {
         grant.client_id.as_str()
@@ -1768,7 +1804,7 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
         found_token = metadata.token;
         (found_token.as_str(), "", metadata.client_auth)
     } else {
-        let (_, token, scope) = endpoints(account.provider);
+        let (_, token, scope) = endpoints(account);
         (token, scope, ClientAuth::Post)
     };
     let mut fields = vec![
@@ -1777,6 +1813,16 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
     ];
     if account.provider == Provider::Outlook {
         fields.push(("scope", scope));
+    }
+    // Microsoft Entra renews a token for one resource at a time: Exchange's
+    // is asked for again by name.
+    let ews_scope = if account.ews() && account.sso.is_some() {
+        format!("openid offline_access {}", account.sso_scope())
+    } else {
+        String::new()
+    };
+    if !ews_scope.is_empty() {
+        fields.push(("scope", &ews_scope));
     }
     let client = TokenClient {
         id: &account.client_id,
@@ -2071,13 +2117,29 @@ mod tests {
         server.join().unwrap();
         // Scopes: those mail needs, among those asked for.
         let gmail = Account::new(Provider::Gmail);
-        let (_, _, asked) = endpoints(Provider::Gmail);
+        let (_, _, asked) = endpoints(&gmail);
         assert_eq!(needed_scopes(&gmail, asked), ["https://mail.google.com/"]);
         assert!(granted_scope("openid https://mail.google.com/ email", "https://mail.google.com/"));
         assert!(!granted_scope("openid email profile", "https://mail.google.com/"));
         let outlook = Account::new(Provider::Outlook);
-        let (_, _, asked) = endpoints(Provider::Outlook);
+        let (_, _, asked) = endpoints(&outlook);
         assert_eq!(needed_scopes(&outlook, asked).len(), 2);
+        // Through Microsoft Graph: its mail scopes, which Microsoft names
+        // without the resource in what it grants.
+        let graph = Account { api: true, ..Account::new(Provider::Outlook) };
+        let (_, _, asked) = endpoints(&graph);
+        assert_eq!(
+            needed_scopes(&graph, asked),
+            ["https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
+        );
+        assert!(granted_scope("openid Mail.ReadWrite mail.send profile", "https://graph.microsoft.com/Mail.Send"));
+        assert!(!granted_scope("openid Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"));
+        let gmail_api = Account { api: true, ..Account::new(Provider::Gmail) };
+        let (_, _, asked) = endpoints(&gmail_api);
+        assert_eq!(
+            needed_scopes(&gmail_api, asked),
+            ["https://mail.google.com/", "https://www.googleapis.com/auth/gmail.settings.basic"]
+        );
         // Microsoft writes its scopes in its own case.
         assert!(granted_scope(
             "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send",

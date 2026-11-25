@@ -33,6 +33,8 @@ pub(crate) mod motion;
 mod compose_tests;
 #[path = "composer.rs"]
 mod composer;
+#[path = "rich_editor.rs"]
+mod rich_editor;
 use composer::{Composer, ComposerDrag, Placement};
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[path = "devdriver.rs"]
@@ -1082,6 +1084,11 @@ enum Action {
     ToggleKerberos(String),
     /// The account being set up signs in with Kerberos instead of a password.
     ToggleSetupKerberos,
+    /// The Gmail or Outlook account being added uses its provider's API.
+    ToggleSetupApi,
+    /// Switches this Gmail or Outlook account (its id) between IMAP and its
+    /// provider's API, signing in again in the browser.
+    ToggleApi(String),
     /// The account being set up signs in with its organization's sign-in.
     ToggleSetupSso,
     /// Turns handing scheduled messages to the server on or off.
@@ -1442,6 +1449,9 @@ pub struct MailApp {
     incoming_starttls: bool,
     /// The account being set up signs in with Kerberos.
     setup_kerberos: bool,
+    /// The Gmail or Outlook account being set up uses its provider's API
+    /// (the Gmail API, Microsoft Graph) instead of IMAP and SMTP.
+    setup_api: bool,
     /// The account being set up signs in with its organization's single
     /// sign-on (OpenID Connect), and the scopes the domain's configuration
     /// asks for.
@@ -2805,6 +2815,7 @@ impl MailApp {
             smtp_tls: None,
             incoming_starttls: false,
             setup_kerberos: false,
+            setup_api: false,
             setup_sso: false,
             sso_scope: String::new(),
             setup_generation: 0,
@@ -6070,6 +6081,7 @@ impl MailApp {
         self.provider = Provider::Imap;
         self.oauth = false;
         self.setup_kerberos = false;
+        self.setup_api = false;
         self.setup_sso = false;
         self.sso_scope.clear();
         self.status.clear();
@@ -6236,7 +6248,7 @@ impl MailApp {
     fn set_protocol(&mut self, p: Provider, w: &mut Window, cx: &mut Context<Self>) {
         let port = |p: Provider| match p {
             Provider::Pop3 => "995",
-            Provider::Jmap => "443",
+            Provider::Jmap | Provider::Ews => "443",
             _ => "993",
         };
         // The usual port follows the protocol, unless one was typed.
@@ -6297,6 +6309,7 @@ impl MailApp {
                 a.client_id = client.id;
                 a.client_secret = client.secret;
                 a.email = email.clone();
+                a.api = self.setup_api && matches!(a.provider, Provider::Gmail | Provider::Outlook);
                 a
             }
             SignIn::Password | SignIn::Proton => {
@@ -6316,10 +6329,40 @@ impl MailApp {
                         && matches!(a.provider, Provider::Imap | Provider::Pop3);
                     a.username = value(LOGIN);
                     a.kerberos = self.setup_kerberos
-                        && matches!(a.provider, Provider::Imap | Provider::Pop3);
+                        && matches!(a.provider, Provider::Imap | Provider::Pop3 | Provider::Ews);
+                    // Exchange: a whole EWS address, or a server.
+                    if a.provider == Provider::Ews {
+                        a.set_ews_server(&value(IMAP_HOST));
+                    }
+                }
+                if self.service == Service::Exchange {
+                    a.username = value(LOGIN);
+                    a.kerberos = self.setup_kerberos;
+                    let typed = value(IMAP_HOST);
+                    if !typed.is_empty() {
+                        a.set_ews_server(&typed);
+                    }
+                }
+                // Exchange with hybrid modern authentication: a token from
+                // the organization's Microsoft Entra, for its own server.
+                if self.setup_sso && a.provider == Provider::Ews {
+                    a.kerberos = false;
+                    a.oauth = true;
+                    a.client_id = value(SSO_CLIENT);
+                    let issuer = value(SSO_ISSUER).trim_end_matches('/').to_owned();
+                    let entra = url::Url::parse(&issuer)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case("login.microsoftonline.com")))
+                        .unwrap_or(false);
+                    // Picacho's own registration with Microsoft, unless the
+                    // administrator gave one.
+                    if a.client_id.is_empty() && entra {
+                        a.client_id = crate::sync::oauth::client(Provider::Outlook).id;
+                    }
+                    a.sso = Some(crate::manage::model::Sso { issuer, scope: self.sso_scope.clone() });
                 }
                 // The organization's single sign-on, found or chosen.
-                if self.setup_sso && matches!(a.provider, Provider::Imap | Provider::Pop3) {
+                else if self.setup_sso && matches!(a.provider, Provider::Imap | Provider::Pop3) {
                     a.provider = self.provider;
                     a.incoming_host = value(IMAP_HOST);
                     a.incoming_port = value(IMAP_PORT).parse().unwrap_or(0);
@@ -7263,6 +7306,7 @@ impl MailApp {
                 },
                 cx,
             ),
+            Action::ToggleSetupApi => self.setup_api = !self.setup_api,
             Action::ToggleSetupKerberos => {
                 self.setup_kerberos = !self.setup_kerberos;
                 self.setup_sso &= !self.setup_kerberos;
@@ -7270,6 +7314,31 @@ impl MailApp {
             Action::ToggleSetupSso => {
                 self.setup_sso = !self.setup_sso;
                 self.setup_kerberos &= !self.setup_sso;
+            }
+            Action::ToggleApi(id) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                let on = !a.api;
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.notice(t!("ui-sign-in-in-the-browser-to-switch"), false, cx);
+                self.task(
+                    cx,
+                    move |b| b.switch_api(&a, on, cancel),
+                    move |this, result, cx| match result {
+                        Ok(next) => {
+                            let id = next.id.clone();
+                            if let Some(a) = this.accounts.iter_mut().find(|a| a.id == next.id) {
+                                *a = next;
+                            }
+                            // Its mail is listed again, the new way.
+                            this.messages.retain(|m| m.account != id);
+                            this.notice(t!("ui-switched-reading-its-mail-again"), false, cx);
+                            this.refresh(cx);
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
             }
             Action::ToggleKerberos(id) => {
                 let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
@@ -10226,6 +10295,7 @@ impl MailApp {
             Service::Fastmail => "fastmail",
             Service::Zoho => "zoho",
             Service::ProtonBridge | Service::Proton => "proton",
+            Service::Exchange => "exchange",
             _ => "other",
         };
         div()
@@ -10397,7 +10467,7 @@ impl MailApp {
                     div()
                         .flex()
                         .gap_2()
-                        .children([Provider::Imap, Provider::Pop3, Provider::Jmap].map(|p| {
+                        .children([Provider::Imap, Provider::Pop3, Provider::Jmap, Provider::Ews].map(|p| {
                             self.button(
                                 format!("protocol-{}", p.label()),
                                 p.label(),
@@ -10426,6 +10496,8 @@ impl MailApp {
                         .child(self.field(
                             if self.provider == Provider::Jmap {
                                 t!("ui-jmap-server")
+                            } else if self.provider == Provider::Ews {
+                                t!("ui-exchange-server-or-its-ews-address")
                             } else {
                                 t!("ui-incoming-server")
                             },
@@ -10446,8 +10518,8 @@ impl MailApp {
                         ))
                     },
                 )
-                // JMAP sends through the same server.
-                .when(self.provider != Provider::Jmap, |d| {
+                // JMAP and Exchange send through the same server.
+                .when(!matches!(self.provider, Provider::Jmap | Provider::Ews), |d| {
                     d.child(
                         div()
                             .flex()
@@ -10466,7 +10538,7 @@ impl MailApp {
                 })
                 .child(self.field(t!("ui-sign-in-name-if-not-the"), LOGIN))
                 .when(
-                    matches!(self.provider, Provider::Imap | Provider::Pop3),
+                    matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews),
                     |d| {
                         d.child(self.switch_setting(
                             t!("ui-sign-in-with-your-organization"),
@@ -10486,7 +10558,7 @@ impl MailApp {
                     },
                 )
                 .when(
-                    matches!(self.provider, Provider::Imap | Provider::Pop3)
+                    matches!(self.provider, Provider::Imap | Provider::Pop3 | Provider::Ews)
                         && !cfg!(any(target_os = "android", target_os = "ios")),
                     |d| {
                         d.child(self.switch_setting(
@@ -10513,9 +10585,41 @@ impl MailApp {
             content = content.child(notice_box(why, c));
         }
         let imap_or_pop = matches!(self.provider, Provider::Imap | Provider::Pop3);
-        let kerberos = self.manual && self.setup_kerberos && imap_or_pop;
-        let sso = self.setup_sso && imap_or_pop && self.service == Service::Other;
-        if sso && !self.manual {
+        // Exchange Server: the sign-in name and the server, found from
+        // the address where they are left empty; or Kerberos.
+        // (The server settings have their own fields.)
+        let exchange = self.service == Service::Exchange && !self.manual;
+        if exchange {
+            content = content
+                .child(self.field(t!("ui-sign-in-name-domain-name-if-not"), LOGIN))
+                .child(self.field(t!("ui-exchange-server-found-from-the-address"), IMAP_HOST))
+                .child(self.switch_setting(
+                    t!("ui-sign-in-with-your-organization"),
+                    t!("ui-exchange-hybrid-sign-in"),
+                    "setup-sso".into(),
+                    self.setup_sso,
+                    Action::ToggleSetupSso,
+                    cx,
+                ))
+                .when(self.setup_sso, |d| {
+                    d.child(self.field(t!("ui-sign-in-service-issuer-url"), SSO_ISSUER))
+                        .child(self.field(t!("ui-client-id-if-your-administrator-gave"), SSO_CLIENT))
+                });
+            if !cfg!(any(target_os = "android", target_os = "ios")) {
+                content = content.child(self.switch_setting(
+                    t!("ui-sign-in-with-kerberos"),
+                    t!("ui-for-organizations-whose-mail-servers-use"),
+                    "setup-kerberos".into(),
+                    self.setup_kerberos,
+                    Action::ToggleSetupKerberos,
+                    cx,
+                ));
+            }
+        }
+        let kerberos = self.setup_kerberos && ((self.manual && (imap_or_pop || self.provider == Provider::Ews)) || exchange);
+        let ews_sso = self.setup_sso && self.provider == Provider::Ews && (exchange || self.manual);
+        let sso = (self.setup_sso && imap_or_pop && self.service == Service::Other) || ews_sso;
+        if sso && !self.manual && !ews_sso {
             // Found from the domain: say so, with the service it uses.
             let issuer = Self::value(&self.form[SSO_ISSUER], cx);
             content = content.child(notice_box(
@@ -10812,6 +10916,25 @@ impl MailApp {
             Step::Email => card = card.child(div().w_full().mt_2().child(self.setup_form(cx))),
             Step::Credentials if !browser => {
                 card = card.child(div().w_full().mt_2().child(self.setup_form(cx)))
+            }
+            // Gmail and Outlook: their own API instead of IMAP, chosen
+            // before the browser.
+            Step::Credentials
+                if browser && !self.setup_token && matches!(self.service, Service::Gmail | Service::Outlook) && !self.connecting =>
+            {
+                let (title, about) = if self.service == Service::Gmail {
+                    (t!("ui-use-the-gmail-api"), t!("ui-gmail-api-instead-of-imap"))
+                } else {
+                    (t!("ui-use-microsoft-graph"), t!("ui-graph-instead-of-imap"))
+                };
+                card = card.child(div().w_full().mt_2().child(self.switch_setting(
+                    title,
+                    about,
+                    "setup-api".into(),
+                    self.setup_api,
+                    Action::ToggleSetupApi,
+                    cx,
+                )))
             }
             Step::Credentials if self.connecting => {
                 card = card.child(
@@ -11814,8 +11937,10 @@ impl Render for MailApp {
             }
         }
         // What Picacho was opened with: `mailto:` addresses, email files,
-        // files shared to it.
-        if !self.onboarding && !self.retired {
+        // files shared to it. Tests take them where they ask: the queue is
+        // the process's, and views drawn by tests running at once took one
+        // another's.
+        if !self.onboarding && !self.retired && !cfg!(test) {
             self.take_launch_requests(window, cx);
         }
         self.sync_nickname_input(window, cx);
@@ -14828,3 +14953,4 @@ mod save_name_tests {
         assert_eq!(safe_file_name("Ana's résumé.pdf"), "Ana's résumé.pdf");
     }
 }
+

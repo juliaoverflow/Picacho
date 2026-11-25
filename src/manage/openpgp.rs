@@ -16,11 +16,12 @@ use pgp::composed::{
     SignedSecretKey,
 };
 use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
-use pgp::types::{KeyDetails, Password};
+use pgp::types::{KeyDetails, Password, SigningKey};
 use serde::{Deserialize, Serialize};
 
 pub mod keys;
 mod autocrypt;
+mod inline;
 mod legacy_display;
 mod nested;
 mod protected;
@@ -856,7 +857,8 @@ fn shown_payload(payload: &[u8]) -> Vec<u8> {
 
 /// Inline PGP (RFC 4880 §7, the old way): a plain-text body that is a
 /// cleartext-signed message or an armored encrypted one. The readable
-/// message is its headers with the text as a plain UTF-8 body.
+/// message is its headers with the text as a plain UTF-8 body, and its
+/// files after it (see `inline::attachments`).
 fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize) -> Option<(Vec<u8>, Verdict)> {
     let parsed = mailparse::parse_mail(raw).ok()?;
     let text_part = if parsed.subparts.is_empty() {
@@ -871,10 +873,20 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
         return None;
     }
     let body = text_part.get_body().ok()?;
-    let readable = |text: &str| {
+    let readable = |text: &str, depth: usize| {
         let mut out = outer_headers(raw);
-        out.extend_from_slice(b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n");
-        out.extend_from_slice(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes());
+        let mut part = b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".to_vec();
+        part.extend_from_slice(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes());
+        let files = if parsed.subparts.is_empty() {
+            Vec::new()
+        } else {
+            inline::attachments(&parsed, text_part, &ring.secret_keys(), depth)
+        };
+        if files.is_empty() {
+            out.extend_from_slice(&part);
+        } else {
+            out.extend_from_slice(&inline::mixed(std::iter::once(part).chain(files).collect()));
+        }
         out
     };
     if let Some(start) = body.find("-----BEGIN PGP SIGNED MESSAGE-----") {
@@ -896,7 +908,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
             .unwrap_or(Signature::UnknownKey);
         // Text around the signed block isn't covered by it: left out.
         return Some((
-            readable(&signed),
+            readable(&signed, *depth),
             Verdict {
                 decrypted: false,
                 signature,
@@ -924,7 +936,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
         };
         let signature = nested::message_signature(&opened, &ring.public_keys(), from);
         return Some((
-            readable(&String::from_utf8_lossy(&inner)),
+            readable(&String::from_utf8_lossy(&inner), *depth),
             Verdict {
                 decrypted: true,
                 signature,
@@ -972,6 +984,12 @@ pub struct Protect {
     /// Legacy Display Element (RFC 9788 §5.2.2). Off, with no setting.
     #[serde(default)]
     pub legacy_display: bool,
+    /// Inline PGP (RFC 4880 §7) rather than PGP/MIME: the text itself
+    /// cleartext-signed or armored, each attachment encrypted or signed
+    /// on its own, for apps that read only that. Plain text only; no
+    /// protected headers, so `subject` and `legacy_display` don't apply.
+    #[serde(default)]
+    pub inline: bool,
 }
 
 /// The message's body part (its Content-* headers and body, CRLF) and the
@@ -1003,7 +1021,8 @@ fn boundary() -> String {
     format!("=-picacho-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Signs and/or encrypts a finished message as PGP/MIME. `from` is the
+/// Signs and/or encrypts a finished message as PGP/MIME (or inline PGP,
+/// with `how.inline`). `from` is the
 /// sender's address (whose key signs), `to` every recipient (each must have
 /// a key to encrypt). The sender's own key is always an encryption
 /// recipient too, so the copy in Sent stays readable.
@@ -1016,6 +1035,9 @@ pub fn protect(
 ) -> Result<Vec<u8>> {
     if !how.sign && !how.encrypt {
         return Ok(raw.to_vec());
+    }
+    if how.inline {
+        return inline::protect(raw, from, to, how, ring);
     }
     let (mut part, outer) = split_body(raw);
     // The line break before the next boundary belongs to the boundary
@@ -1060,27 +1082,13 @@ pub fn protect(
         let key = own.as_ref().with_context(|| {
             t!("manage-openpgp-theres-no-openpgp-key-of-yours", from = from)
         })?;
-        // A subkey made for signing, as most keys have; else the primary key.
-        let signing_sub = key
-            .secret_subkeys
-            .iter()
-            .find(|s| s.signatures.iter().any(|sig| sig.key_flags().sign()));
-        let signature = match signing_sub {
-            Some(sub) => DetachedSignature::sign_binary_data(
-                rand08::thread_rng(),
-                &sub.key,
-                &Password::empty(),
-                HashAlgorithm::Sha256,
-                &part[..],
-            )?,
-            None => DetachedSignature::sign_binary_data(
-                rand08::thread_rng(),
-                &key.primary_key,
-                &Password::empty(),
-                HashAlgorithm::Sha256,
-                &part[..],
-            )?,
-        }
+        let signature = DetachedSignature::sign_binary_data(
+            rand08::thread_rng(),
+            &Box::new(signing_key(key)),
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            &part[..],
+        )?
         .to_armored_string(ArmorOptions::default())?;
         let b = boundary();
         let mut signed = format!(
@@ -1097,53 +1105,9 @@ pub fn protect(
     let mut out = outer;
     out.extend_from_slice(b"MIME-Version: 1.0\r\n");
     if how.encrypt {
-        let mut keys = Vec::new();
-        let mut missing = Vec::new();
-        for address in to {
-            match ring.key_for(address) {
-                Some(k) => keys.push(k),
-                None => missing.push(address.clone()),
-            }
-        }
-        ensure!(
-            missing.is_empty(),
-            t!("manage-openpgp-theres-no-openpgp-key-for-import", addresses = missing.join(", "))
-        );
-        if let Some(own) = &own {
-            keys.push(SignedPublicKey::from(own.clone()));
-        }
-        // Each recipient's key to encrypt to: an encryption subkey bound
-        // to it, neither revoked nor expired, else the key itself.
-        macro_rules! add_recipients {
-            ($builder:expr) => {
-                for key in &keys {
-                    match encryption_subkey(key) {
-                        Some(sub) => $builder.encrypt_to_key(rand08::thread_rng(), &sub.key)?,
-                        None => $builder.encrypt_to_key(rand08::thread_rng(), &key.primary_key)?,
-                    };
-                }
-            };
-        }
-        // RFC 9580's AEAD encryption (SEIPD v2) where every recipient's key
-        // says it reads it; else SEIPD v1, which every OpenPGP app reads
-        // (§13.7). One message for all: §10.3.2.1 doesn't let v3 and v6
-        // PKESKs share a payload, so one v4-only recipient means v1.
-        let armored = if keys.iter().all(reads_seipd_v2) {
-            let (sym, aead) = seipd_v2_suite(&keys);
-            let mut builder = MessageBuilder::from_bytes("", content).seipd_v2(
-                rand08::thread_rng(),
-                sym,
-                aead,
-                pgp::crypto::aead::ChunkSize::default(),
-            );
-            add_recipients!(builder);
-            builder.to_armored_string(rand08::thread_rng(), ArmorOptions::default())?
-        } else {
-            let mut builder = MessageBuilder::from_bytes("", content)
-                .seipd_v1(rand08::thread_rng(), preferred_cipher(&keys));
-            add_recipients!(builder);
-            builder.to_armored_string(rand08::thread_rng(), ArmorOptions::default())?
-        };
+        let keys = recipient_keys(to, own.as_ref(), ring)?;
+        let armored = encrypt(content, &keys, None, true)?;
+        let armored = String::from_utf8(armored)?;
         let b = boundary();
         out.extend_from_slice(format!(
             "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"{b}\"\r\n\r\nThis is an OpenPGP/MIME encrypted message (RFC 3156).\r\n--{b}\r\nContent-Type: application/pgp-encrypted\r\nContent-Description: PGP/MIME version identification\r\n\r\nVersion: 1\r\n\r\n--{b}\r\nContent-Type: application/octet-stream; name=\"encrypted.asc\"\r\nContent-Disposition: inline; filename=\"encrypted.asc\"\r\n\r\n{}\r\n--{b}--\r\n",
@@ -1153,6 +1117,87 @@ pub fn protect(
         out.extend_from_slice(&content);
     }
     Ok(out)
+}
+
+/// The key of yours that signs: a subkey made for signing, as most keys
+/// have; else the primary key.
+fn signing_key(key: &SignedSecretKey) -> &dyn SigningKey {
+    match key
+        .secret_subkeys
+        .iter()
+        .find(|s| s.signatures.iter().any(|sig| sig.key_flags().sign()))
+    {
+        Some(sub) => &sub.key,
+        None => &key.primary_key,
+    }
+}
+
+/// The keys a message is encrypted to: every recipient's (each must have
+/// one), and your own, so the copy in Sent stays readable.
+fn recipient_keys(to: &[String], own: Option<&SignedSecretKey>, ring: &Keyring) -> Result<Vec<SignedPublicKey>> {
+    let mut keys = Vec::new();
+    let mut missing = Vec::new();
+    for address in to {
+        match ring.key_for(address) {
+            Some(k) => keys.push(k),
+            None => missing.push(address.clone()),
+        }
+    }
+    ensure!(
+        missing.is_empty(),
+        t!("manage-openpgp-theres-no-openpgp-key-for-import", addresses = missing.join(", "))
+    );
+    if let Some(own) = own {
+        keys.push(SignedPublicKey::from(own.clone()));
+    }
+    Ok(keys)
+}
+
+/// `content` encrypted to `keys` as one OpenPGP message, signed inside it
+/// by `signer` when given (one-pass signed, RFC 9580 §10.3): armored text,
+/// or binary packets.
+fn encrypt(
+    content: Vec<u8>,
+    keys: &[SignedPublicKey],
+    signer: Option<&SignedSecretKey>,
+    armored: bool,
+) -> Result<Vec<u8>> {
+    // Each recipient's key to encrypt to: an encryption subkey bound to
+    // it, neither revoked nor expired, else the key itself.
+    macro_rules! finish {
+        ($builder:expr) => {{
+            let mut builder = $builder;
+            if let Some(signer) = signer {
+                builder.sign(signing_key(signer), Password::empty(), HashAlgorithm::Sha256);
+            }
+            for key in keys {
+                match encryption_subkey(key) {
+                    Some(sub) => builder.encrypt_to_key(rand08::thread_rng(), &sub.key)?,
+                    None => builder.encrypt_to_key(rand08::thread_rng(), &key.primary_key)?,
+                };
+            }
+            if armored {
+                builder.to_armored_string(rand08::thread_rng(), ArmorOptions::default())?.into_bytes()
+            } else {
+                builder.to_vec(rand08::thread_rng())?
+            }
+        }};
+    }
+    // RFC 9580's AEAD encryption (SEIPD v2) where every recipient's key
+    // says it reads it; else SEIPD v1, which every OpenPGP app reads
+    // (§13.7). One message for all: §10.3.2.1 doesn't let v3 and v6
+    // PKESKs share a payload, so one v4-only recipient means v1.
+    Ok(if keys.iter().all(reads_seipd_v2) {
+        let (sym, aead) = seipd_v2_suite(keys);
+        finish!(MessageBuilder::from_bytes("", content).seipd_v2(
+            rand08::thread_rng(),
+            sym,
+            aead,
+            pgp::crypto::aead::ChunkSize::default(),
+        ))
+    } else {
+        finish!(MessageBuilder::from_bytes("", content).seipd_v1(rand08::thread_rng(), preferred_cipher(keys)))
+    })
 }
 
 /// The newest self-signature on a key (on a user id, or on the key).

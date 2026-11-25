@@ -668,6 +668,12 @@ impl Backend {
         a: &Account,
         work: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
+        // An account that uses its provider's API never signs in over IMAP
+        // (its organization may have turned IMAP off).
+        ensure!(
+            a.imap(),
+            t!("manage-connection-this-isnt-available-for-accounts", service = a.service_label())
+        );
         let mut connection = match self.pooled(a) {
             Some(c) => c,
             None => {
@@ -743,6 +749,9 @@ impl Backend {
     pub(super) fn disconnect(&self, id: &str) {
         // A JMAP session holds its credentials; a new sign-in makes a new one.
         self.jmap.lock().unwrap().remove(id);
+        self.gmail.lock().unwrap().remove(id);
+        self.graph.lock().unwrap().remove(id);
+        self.ews.lock().unwrap().remove(id);
         let pooled = self.connections.lock().unwrap().remove(id);
         if let Some(mut c) = pooled {
             let _ = c.session.logout();

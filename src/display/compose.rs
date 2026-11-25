@@ -121,13 +121,17 @@ impl MailApp {
                 if !m.subject.is_empty() {
                     c.draft.subject = m.subject.clone();
                 }
-                if !m.body.is_empty() {
+                if !m.body.is_empty() && !c.draft.formatted {
                     c.draft.body = format!("{}{}", m.body, c.draft.body);
                 }
                 if !m.in_reply_to.is_empty() {
                     c.draft.reply_id = m.in_reply_to.clone();
                 }
                 c.reload_fields(w, cx);
+                // A formatted draft gets the link's text written in.
+                if !m.body.is_empty() && c.draft.formatted {
+                    c.insert_reply_text(&m.body, w, cx);
+                }
                 cx.notify();
             });
         }

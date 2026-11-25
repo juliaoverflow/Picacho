@@ -219,6 +219,10 @@ pub struct State {
     /// Picacho can take over, and how many parts it couldn't read as
     /// rules. `None` where there's no such script or it can't be read.
     pub other_rules: Option<super::sieve_parse::Read>,
+    /// Filters the server has that Picacho's rules can't say (Gmail's
+    /// filters, Microsoft 365's inbox rules made elsewhere with several
+    /// tests or actions): left as they are when Picacho's are saved.
+    pub kept_elsewhere: usize,
 }
 impl State {
     pub fn has(&self, extension: &str) -> bool {

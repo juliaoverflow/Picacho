@@ -138,6 +138,8 @@ settings-include-the-original-message = Include the original message
 
 settings-paste-with-formatting = Paste with formatting
 
+settings-check-spelling = Check spelling
+
 settings-sending = Sending
 
 settings-undo-send = Undo send
@@ -357,3 +359,5 @@ settings-links = Links
 settings-delivery = Delivery
 
 settings-new-mail-scheduled-mail-and-snoozes = Keep checking for mail, sending scheduled mail and bringing back snoozes.
+
+settings-switching-signs-in-again = Instead of IMAP and SMTP. Switching signs in again in the browser and reads the account's mail again; drafts are kept.

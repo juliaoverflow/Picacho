@@ -572,6 +572,8 @@ ui-single-sign-on-in-the-browser = Single sign-on in the browser (OpenID Connect
 
 ui-sign-in-service-issuer-url = Sign-in service (issuer URL)
 
+ui-exchange-hybrid-sign-in = For Exchange Server with hybrid modern authentication: Microsoft Entra signs you in in the browser, and the server takes its token instead of a password. The sign-in service is https://login.microsoftonline.com/ followed by your organization's tenant and /v2.0. Enter the Exchange server too.
+
 ui-client-id-if-your-administrator-gave = Client ID, if your administrator gave you one
 
 ui-sign-in-with-kerberos = Sign in with Kerberos
@@ -835,3 +837,21 @@ ui-something-went-wrong-while-doing-this = Something went wrong while doing this
 # Between each three digits of a large number ("1,234,567"). For a space,
 # write {"\u202F"} (a narrow no-break space) or {"\u00A0"}.
 ui-thousands-separator = ,
+
+ui-use-the-gmail-api = Use the Gmail API
+
+ui-gmail-api-instead-of-imap = Instead of IMAP and SMTP. Gmail's own filters and away reply can be set here too.
+
+ui-use-microsoft-graph = Use Microsoft Graph
+
+ui-graph-instead-of-imap = Instead of IMAP and SMTP: for work and school accounts with IMAP turned off. Exchange calendars, contacts, the organization's address book and Outlook's inbox rules come too.
+
+ui-sign-in-in-the-browser-to-switch = Sign in in the browser to switch how this account is reached.
+
+ui-switched-reading-its-mail-again = Switched. Its mail is being read again the new way.
+
+ui-exchange-server-or-its-ews-address = Exchange server, or its EWS address
+
+ui-sign-in-name-domain-name-if-not = Sign-in name (DOMAIN\name), if not the address
+
+ui-exchange-server-found-from-the-address = Exchange server (found from the address if empty)

@@ -190,8 +190,8 @@ Browser sign-in uses Picacho's own registration with each provider. Set these wh
 
 | Variable                                                   | Used for                                                                                                                                          |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PICACHO_GOOGLE_CLIENT_ID`, `PICACHO_GOOGLE_CLIENT_SECRET` | Google OAuth **Desktop app** client with the `https://mail.google.com/` scope                                                                     |
-| `PICACHO_MICROSOFT_CLIENT_ID`                              | Microsoft Entra public client with `http://localhost` as a mobile and desktop redirect URI, and delegated `IMAP.AccessAsUser.All` and `SMTP.Send` |
+| `PICACHO_GOOGLE_CLIENT_ID`, `PICACHO_GOOGLE_CLIENT_SECRET` | Google OAuth **Desktop app** client with the `https://mail.google.com/` scope; for **Use the Gmail API**, also the Gmail API turned on in its project and `https://www.googleapis.com/auth/gmail.settings.basic` |
+| `PICACHO_MICROSOFT_CLIENT_ID`                              | Microsoft Entra public client with `http://localhost` as a mobile and desktop redirect URI, and delegated `IMAP.AccessAsUser.All` and `SMTP.Send`; for **Use Microsoft Graph**, also Microsoft Graph's delegated `Mail.ReadWrite`, `Mail.Send`, `MailboxSettings.ReadWrite`, `Calendars.ReadWrite`, `Contacts.ReadWrite` and `People.Read` (none needs an administrator's consent). Exchange Server with hybrid modern authentication uses it too unless the administrator gives a client id: the organization's administrator consents to Office 365 Exchange Online's `EWS.AccessAsUser.All` for its on-premises server's URL |
 | `PICACHO_FASTMAIL_CLIENT_ID`                               | Fastmail OAuth public client with a loopback redirect (`http://127.0.0.1:<port>/callback`) and the JMAP core, mail, submission and Sieve scopes |
 
 Pinal Mail signs in with Pinal Accounts, and the mail server accepts Pinal's tokens over IMAP, SMTP and ManageSieve (XOAUTH2/OAUTHBEARER), so no password is stored. Picacho is an ordinary **native** app in Pinal's Developers portal, with redirect URIs `http://127.0.0.1/callback` (any port) and `https://accounts.pinal.tech/native/callback` (used by the macOS bundle, which Pinal hands back to `picacho://`), and the scopes `openid profile email offline_access mail.read mail.labels mail.compose mail.send mail.settings`.
@@ -314,12 +314,13 @@ The setup lists the supported services. Each one signs in the simplest way it al
 | Service          | Sign-in                                   | Servers                                                          |
 | ---------------- | ----------------------------------------- | ---------------------------------------------------------------- |
 | Pinal Mail       | Pinal Accounts in the browser             | `mail.sonoran.exchange:993`, `:465`                              |
-| Gmail            | Google in the browser, or an app password | `imap.gmail.com:993`, `smtp.gmail.com:587`                       |
-| Outlook          | Microsoft in the browser                  | `outlook.office365.com:993`, `smtp.office365.com:587`            |
+| Gmail            | Google in the browser, or an app password | `imap.gmail.com:993`, `smtp.gmail.com:587`; or the Gmail API (`gmail.googleapis.com`) |
+| Outlook          | Microsoft in the browser                  | `outlook.office365.com:993`, `smtp.office365.com:587`; or Microsoft Graph (`graph.microsoft.com`) |
 | iCloud Mail      | App-specific password                     | `imap.mail.me.com:993`, `smtp.mail.me.com:587`                   |
 | Fastmail         | Fastmail in the browser, or an API token  | JMAP at `api.fastmail.com:443`                                   |
 | Zoho Mail        | App password (IMAP turned on in Zoho)     | `imap.zoho.<region>:993`, `smtp.zoho.<region>:465`               |
 | Proton Mail (Direct tab) | Proton password, then a two-factor code, security key or passkey and the mailbox password where the account has them | Proton's API (`mail-api.proton.me`); no Bridge |
+| Exchange Server  | Password (NTLMv2, or Basic where that's all the server takes), Kerberos, or Microsoft Entra (hybrid modern authentication) | Exchange Web Services, found by Autodiscover (or entered): `https://<server>/EWS/Exchange.asmx` |
 | Proton Mail (Bridge tab) | Proton Mail Bridge password         | Bridge on this computer, `127.0.0.1:1143` (STARTTLS) and `:1025` |
 | Another provider | Password, or the browser for JMAP servers that allow it | Found by JMAP SRV records, autoconfiguration, or entered by hand |
 

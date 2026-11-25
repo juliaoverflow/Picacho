@@ -227,6 +227,10 @@ fn brand(name: &str) -> Option<&'static [u8]> {
         "zoho.svg" => {
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#fff'/><rect x='.5' y='.5' width='47' height='47' rx='11.5' fill='none' stroke='#dadce0'/><rect x='9' y='17' width='7' height='14' rx='1.5' fill='#E42527'/><rect x='17.5' y='15' width='7' height='14' rx='1.5' fill='#089949' transform='rotate(-8 21 22)'/><rect x='26' y='17' width='7' height='14' rx='1.5' fill='#226DB4'/><rect x='34' y='17' width='6' height='14' rx='1.5' fill='#F9B21D'/></svg>"
         }
+        // An organization's own server: a server with an envelope.
+        "exchange.svg" => {
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#1E3A5F'/><rect x='10' y='10' width='20' height='8' rx='2' fill='#9FC2E7'/><rect x='10' y='20' width='20' height='8' rx='2' fill='#9FC2E7'/><rect x='10' y='30' width='20' height='8' rx='2' fill='#9FC2E7'/><circle cx='26' cy='14' r='1.4' fill='#1E3A5F'/><circle cx='26' cy='24' r='1.4' fill='#1E3A5F'/><rect x='24' y='26' width='16' height='12' rx='2' fill='#fff'/><path d='M25 27.5l7 5 7-5' fill='none' stroke='#1E3A5F' stroke-width='1.8' stroke-linejoin='round'/></svg>"
+        }
         "proton.svg" => {
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'><rect width='48' height='48' rx='12' fill='#6D4AFF'/><path d='M15 36V12h11a8 8 0 0 1 0 16h-5v8Z' fill='#fff'/><path d='M21 17h5a3 3 0 0 1 0 6h-5Z' fill='#6D4AFF'/></svg>"
         }

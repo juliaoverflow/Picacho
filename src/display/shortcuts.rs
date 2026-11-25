@@ -73,7 +73,7 @@ pub(super) fn bindable() -> Vec<Bindable> {
     use Group::*;
     use composer::{
         Bold, Bullets, Heading, InlineCode, InsertLink, Italic, Numbers, QuoteLines, SaveDraft,
-        SendDraft, Strike, TogglePreview,
+        SendDraft, Strike, TogglePreview, Underline,
     };
     fn b(
         group: Group,
@@ -140,6 +140,7 @@ pub(super) fn bindable() -> Vec<Bindable> {
         composing("save-draft", t!("shortcuts-save-draft"), "secondary-s", SaveDraft),
         composing("bold", t!("shortcuts-bold"), "secondary-b", Bold),
         composing("italic", t!("shortcuts-italic"), "secondary-i", Italic),
+        composing("underline", t!("shortcuts-underline"), "secondary-u", Underline),
         composing("strikethrough", t!("shortcuts-strikethrough"), "secondary-shift-x", Strike),
         composing("code", t!("shortcuts-code"), "secondary-e", InlineCode),
         composing("link", t!("shortcuts-insert-link"), "secondary-k", InsertLink),

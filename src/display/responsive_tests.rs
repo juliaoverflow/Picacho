@@ -423,6 +423,35 @@ fn setup_offers_an_organizations_single_sign_on(cx: &mut TestAppContext) {
     view.read_with(cx, |this, _| assert!(this.setup_kerberos && !this.setup_sso));
 }
 
+/// Exchange Server with hybrid modern authentication: Microsoft Entra signs
+/// in for the server, with Picacho's own registration unless one is given.
+#[gpui::test]
+fn exchange_setup_offers_the_organizations_sign_in(cx: &mut TestAppContext) {
+    let (view, cx) = open(store(), cx);
+    act(&view, Action::Start, cx);
+    act(&view, Action::ChooseService(Service::Exchange), cx);
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.form[EMAIL], "ana@corp.example", w, cx);
+        this.step = Step::Credentials;
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("form-1").is_some());
+    act(&view, Action::ToggleSetupSso, cx);
+    frame(cx);
+    assert!(cx.debug_bounds("form-1").is_none());
+    assert!(cx.debug_bounds("form-10").is_some());
+    view.update_in(cx, |this, w, cx| {
+        MailApp::set(&this.form[IMAP_HOST], "mail.corp.example", w, cx);
+        MailApp::set(&this.form[SSO_ISSUER], "https://login.microsoftonline.com/tenant/v2.0", w, cx);
+        MailApp::set(&this.form[SSO_CLIENT], "admin-app", w, cx);
+    });
+    let a = view.read_with(cx, |this, cx| this.setup_account(cx));
+    assert!(a.ews() && a.oauth && !a.kerberos);
+    assert_eq!(a.client_id, "admin-app");
+    assert_eq!(a.sso_scope(), "https://mail.corp.example/EWS.AccessAsUser.All");
+    assert!(a.validate().is_ok(), "{:?}", a.validate());
+}
+
 /// An API token or app password chosen instead of the browser: the
 /// account is set up to sign in with it (no OAuth), to the service's own
 /// servers, and the form asks for it by the service's name for it.

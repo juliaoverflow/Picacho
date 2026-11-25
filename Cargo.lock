@@ -9270,6 +9270,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "htmd",
+ "html5ever 0.38.0",
  "http 1.5.0",
  "hyper-util",
  "iana-time-zone",
@@ -9292,6 +9293,7 @@ dependencies = [
  "mail-auth",
  "mailparse",
  "markdown",
+ "markup5ever_rcdom 0.38.0+unofficial",
  "md-5 0.11.0",
  "memchr",
  "mime_guess",
@@ -9326,6 +9328,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
  "skrifa 0.42.1",
+ "spellbook",
  "stylo",
  "sys-locale",
  "tao",
@@ -9334,11 +9337,13 @@ dependencies = [
  "tray-icon",
  "unic-langid",
  "unicode-normalization",
+ "unicode-segmentation",
  "url",
  "url-sanitize-core",
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "windows 0.62.2",
  "windows-registry 0.6.1",
  "windows-sys 0.61.2",
  "wry",
@@ -11836,6 +11841,16 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "spellbook"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d204abcbdf8e88729306a8d0ca01a79d8a49969fe1f84696909d6dbc4321c1a"
+dependencies = [
+ "foldhash 0.2.0",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]

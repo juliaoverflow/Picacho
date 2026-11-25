@@ -986,6 +986,25 @@ sync-jscal-changed = { $who } changed { $title }.
 # Said when the server refuses without saying why.
 sync-jscal-refused = refused
 
+sync-jscal-this-jmap-server-has-no-tasks = This JMAP server has no tasks.
+
+sync-jscal-the-server-didnt-make-the-task-list = The server didn't make the task list: { $error }
+
+sync-jscal-no-task-list-id = No task list id.
+
+sync-jscal-the-server-didnt-change-the-task = The server didn't change the task: { $error }
+
+sync-jscal-the-server-didnt-add-the-task = The server didn't add the task: { $error }
+
+sync-jscal-the-server-didnt-say-which-task = The server didn't say which task it added.
+
+sync-jscal-the-server-didnt-remove-the-task = The server didn't remove the task.
+
+sync-jscal-you-may-not-make-task-lists = This account doesn't let you make task lists.
+
+# Who changed what, where a task's title isn't known: "Bo changed a task."
+sync-jscal-a-task = a task
+
 # src/sync/keys.rs
 
 sync-keys-the-key-found-is-too-large = The key found is too large.
@@ -1801,3 +1820,43 @@ sync-websocket-could-not-connect-to = Could not connect to { $host }:{ $port }: 
 sync-wire-mail-server-response-exceeds-the-32 = Mail server response exceeds the 32 MB session-command limit
 
 sync-wire-mail-server-command-timed-out = Mail server command timed out
+
+# src/sync/rest.rs, src/sync/gmail.rs and src/sync/graph.rs.
+
+sync-rest-it-no-longer-exists-at-the = It no longer exists at the server.
+
+sync-rest-your-sign-in-expired-reconnect-the = Your sign-in expired. Reconnect the account in Settings.
+
+sync-rest-the-server-pointed-elsewhere = { $service } pointed somewhere else; the request wasn't sent.
+
+sync-rest-couldnt-reach = Couldn't reach { $service }. Check your connection.
+
+sync-rest-didnt-accept-the-sign-in = { $service } didn't accept the sign-in: { $message }
+
+sync-rest-is-limiting-requests = { $service } is limiting requests ({ $status }); Picacho will try again later.
+
+sync-rest-answered = { $service } answered { $status }: { $message }
+
+sync-rest-the-answer-was-too-large = The server's answer was too large.
+
+sync-gmail-gmail-left-a-request-unanswered = Gmail left part of a request unanswered. Try again.
+
+sync-gmail-gmail-sent-no-source = Gmail didn't send the message's source.
+
+sync-gmail-gmail-answered-a-batch-in-a = Gmail answered in a form Picacho doesn't read.
+
+sync-graph-signed-or-encrypted-mail-this-large = Signed or encrypted mail this large can't be sent through Microsoft 365 whole: turn off formatting (it then goes as inline PGP), send the files separately, or turn off Sign and Encrypt.
+
+sync-graph-microsoft-gave-nowhere-to-upload = Microsoft 365 gave nowhere to upload the attachment.
+
+sync-graph-the-message-is-too-large-to = The message is too large to save in one piece at Microsoft 365.
+
+# src/sync/ews.rs.
+
+sync-ews-couldnt-reach-the-exchange-server = Couldn't reach the Exchange server at { $url }. Check your connection.
+
+sync-ews-exchange-didnt-accept-the-sign-in = Exchange didn't accept the sign-in. Check the user name (DOMAIN\name or name@domain) and password.
+
+sync-ews-exchange-wont-hold-the-stream-open = Exchange (or something on the way to it) keeps ending the wait for new mail at once; the inbox is checked every half minute instead.
+
+sync-ews-exchange-answered = Exchange answered { $status }: { $message }

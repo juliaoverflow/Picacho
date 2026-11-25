@@ -806,6 +806,14 @@ pub struct Server {
     /// Contacts) instead of a CardDAV server: that account's id here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jmap_account: String,
+    /// Contacts kept by Exchange, reached through one of the mail
+    /// accounts' Microsoft Graph sign-in: that account's id here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub graph_account: String,
+    /// Kept by Exchange Server, reached through one of the mail accounts'
+    /// Exchange Web Services sign-in: that account's id here.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ews_account: String,
     /// Each address book's state when last read: its sync token (RFC 6578)
     /// or ctag, so an unchanged book costs no download and a changed one
     /// only what changed.

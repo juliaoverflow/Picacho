@@ -134,6 +134,8 @@ composer-bold = Bold
 
 composer-italic = Italic
 
+composer-underline = Underline
+
 composer-strikethrough = Strikethrough
 
 composer-code = Code
@@ -147,6 +149,32 @@ composer-numbered-list = Numbered list
 composer-quote = Quote
 
 composer-link = Link
+
+composer-link-address = Link address
+
+composer-remove-link = Remove link
+
+composer-aligned-left-center = Aligned left: center
+
+composer-centered-align-right = Centered: align right
+
+composer-aligned-right-align-left = Aligned right: align left
+
+composer-clear-formatting = Clear formatting
+
+composer-no-spelling-suggestions = No suggestions
+
+composer-learn-spelling = Learn spelling
+
+composer-ignore-spelling = Ignore spelling
+
+composer-cut = Cut
+
+composer-copy = Copy
+
+composer-paste = Paste
+
+composer-select-all = Select all
 
 composer-preview = Preview
 
@@ -197,6 +225,10 @@ composer-encrypt-the-subject-too = Encrypt the subject too
 composer-using-s-mime-switch-to-openpgp = Using S/MIME: switch to OpenPGP
 
 composer-using-openpgp-switch-to-s-mime = Using OpenPGP: switch to S/MIME
+
+composer-sent-as-inline-pgp = Sent as inline PGP (plain text, for apps without PGP/MIME): switch to PGP/MIME
+
+composer-sent-as-pgp-mime = Sent as PGP/MIME: switch to inline PGP for apps that read only that
 
 composer-discard-draft = Discard draft
 

@@ -1,8 +1,9 @@
-//! Calendars and contacts over JMAP: JMAP for Calendars (JSCalendar
-//! events, RFC 8984) and JMAP for Contacts (RFC 9610, JSContact cards, RFC
-//! 9553), turned into and from the same events and cards CalDAV and
-//! CardDAV give (`ical::Event`, `carddav::Card`), so the rest of Picacho
-//! treats them alike.
+//! Calendars, tasks and contacts over JMAP: JMAP for Calendars (JSCalendar
+//! events, RFC 8984), JMAP for Task Lists (JSCalendar tasks) and JMAP for
+//! Contacts (RFC 9610, JSContact cards, RFC 9553), turned into and from
+//! the same events, tasks and cards CalDAV and CardDAV give
+//! (`ical::Event`, `carddav::Card`), so the rest of Picacho treats them
+//! alike.
 //!
 //! What Picacho doesn't show is kept: an event or card read from the server
 //! keeps its JSON, and a change patches only the properties Picacho edits.
@@ -1973,9 +1974,12 @@ pub fn notices(s: &Session) -> Result<Vec<Notice>> {
     let mut out = Vec::new();
     let account = s.calendars_account().map(str::to_owned);
     let principals = s.principals_account().map(str::to_owned);
+    let tasks = s.tasks_account().map(str::to_owned);
     for (method, account) in [
         ("CalendarEventNotification/get", account.as_deref()),
         ("ShareNotification/get", principals.as_deref()),
+        // draft-ietf-jmap-tasks-07 §6: tasks changed by others.
+        ("TaskNotification/get", tasks.as_deref()),
     ] {
         let Some(account) = account else { continue };
         let v = match s.call_one(method, json!({ "accountId": account, "ids": null })) {
@@ -2000,10 +2004,11 @@ pub fn notices(s: &Session) -> Result<Vec<Notice>> {
                     t!("sync-jscal-changed-what-you-may-do-with", who = who, name = name)
                 }
             } else {
-                let title = n["event"]["title"]
-                    .as_str()
-                    .or(n["eventPatch"]["title"].as_str())
-                    .unwrap_or(t!("sync-jscal-an-event"));
+                let title = if kind == "TaskNotification" {
+                    n["task"]["title"].as_str().or(n["taskPatch"]["title"].as_str()).unwrap_or(t!("sync-jscal-a-task"))
+                } else {
+                    n["event"]["title"].as_str().or(n["eventPatch"]["title"].as_str()).unwrap_or(t!("sync-jscal-an-event"))
+                };
                 match n["type"].as_str() {
                     Some("created") => t!("sync-jscal-added", who = who, title = title),
                     Some("destroyed") => t!("sync-jscal-removed", who = who, title = title),
@@ -2024,6 +2029,7 @@ pub fn dismiss_notices(s: &Session, notices: &[Notice]) -> Result<()> {
     for (kind, account) in [
         ("CalendarEventNotification", s.calendars_account()),
         ("ShareNotification", s.principals_account()),
+        ("TaskNotification", s.tasks_account()),
     ] {
         let ids: Vec<&str> = notices
             .iter()
@@ -2092,6 +2098,622 @@ pub fn delete_address_book(s: &Session, id: &str) -> Result<()> {
         && e["type"] != "notFound"
     {
         bail!(t!("sync-jscal-the-server-didnt-delete-the-address", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
+    }
+    Ok(())
+}
+
+// Tasks (JMAP for Task Lists, draft-ietf-jmap-tasks-07).
+
+/// A task list on a JMAP server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JmapTaskList {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    /// `myRights.mayWrite`: tasks may be added to it and changed.
+    pub writable: bool,
+    /// The list to use when there's nothing else to choose by
+    /// (`isDefault`, §3).
+    pub default: bool,
+    /// Subscribed to and not hidden (`isSubscribed`, `isVisible`, §3):
+    /// its tasks are shown.
+    pub shown: bool,
+    pub sort_order: u64,
+    /// The alerts of its tasks that use the defaults (§5.1): for those
+    /// with a time of day, and those without.
+    pub alerts_with_time: Value,
+    pub alerts_without_time: Value,
+}
+/// Every task list of the sign-in's tasks account; none where the server
+/// keeps no tasks.
+pub fn task_lists(s: &Session) -> Result<Vec<JmapTaskList>> {
+    let Some(account) = s.tasks_account() else {
+        return Ok(Vec::new());
+    };
+    let v = s.call_one("TaskList/get", json!({ "accountId": account, "ids": null }))?;
+    Ok(v["list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            Some(JmapTaskList {
+                id: l["id"].as_str()?.to_owned(),
+                name: l["name"].as_str().unwrap_or("Tasks").to_owned(),
+                color: l["color"].as_str().unwrap_or_default().to_owned(),
+                // Without rights listed, assume it can be written.
+                writable: !l["myRights"].is_object() || l["myRights"]["mayWrite"].as_bool().unwrap_or(false),
+                default: l["isDefault"].as_bool().unwrap_or(false),
+                // isVisible is ignored for a list not subscribed to.
+                shown: l["isSubscribed"].as_bool().unwrap_or(true) && l["isVisible"].as_bool().unwrap_or(true),
+                sort_order: l["sortOrder"].as_u64().unwrap_or(0),
+                alerts_with_time: l["defaultAlertsWithTime"].clone(),
+                alerts_without_time: l["defaultAlertsWithoutTime"].clone(),
+            })
+        })
+        .collect())
+}
+/// Makes a task list named `name`, returning its id: for an account with
+/// none that new tasks could go to, where the account allows it
+/// (`mayCreateTaskList`).
+pub fn create_task_list(s: &Session, name: &str) -> Result<String> {
+    let account = s.tasks_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-tasks"))?;
+    ensure!(s.may_create_task_list(), t!("sync-jscal-you-may-not-make-task-lists"));
+    let v = s.call_one("TaskList/set", json!({ "accountId": account, "create": { "l": { "name": name } } }))?;
+    if let Some(e) = v["notCreated"].get("l") {
+        bail!(t!("sync-jscal-the-server-didnt-make-the-task-list", error = e["description"].as_str().or(e["type"].as_str()).unwrap_or(t!("sync-jscal-refused"))));
+    }
+    Ok(v["created"]["l"]["id"]
+        .as_str()
+        .with_context(|| t!("sync-jscal-no-task-list-id"))?
+        .to_owned())
+}
+/// A task read from a JMAP server.
+pub struct JmapTask {
+    pub id: String,
+    /// The first of its lists that is shown.
+    pub list: String,
+    /// The task; for a repeating one, the occurrence to do now
+    /// (`next_occurrence`), with `recurrence_id` its start and
+    /// `recurrence` the series' rule.
+    pub event: ical::Event,
+    /// Its version, for `Stored::etag` (as an event's).
+    pub version: String,
+}
+/// The lists a task is in (`taskListIds`, §4).
+fn task_lists_of(v: &Value) -> Vec<String> {
+    v["taskListIds"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, on)| on.as_bool() == Some(true))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+/// Whether a task's `progress` says it's no longer to do.
+fn finished(progress: &str) -> bool {
+    matches!(progress, "completed" | "failed" | "cancelled")
+}
+/// A task's LocalDateTime as a Unix time: in `zone`, or for a floating
+/// task (no zone), the reader's own, as a floating iCalendar time is read.
+fn task_time(local: &str, zone: Option<&str>) -> Option<i64> {
+    if zone.is_some() {
+        return local_to_utc(local, zone);
+    }
+    let local = local.split('.').next().unwrap_or(local);
+    let naive = NaiveDateTime::parse_from_str(local, "%Y-%m-%dT%H:%M:%S").ok()?;
+    chrono::Local.from_local_datetime(&naive).earliest().map(|t| t.timestamp())
+}
+/// How a task's times are written: a date alone (all day), in its zone,
+/// or floating in the reader's.
+#[derive(Clone, Copy)]
+enum TaskClock<'a> {
+    Date,
+    Zone(&'a str),
+    Floating,
+}
+impl<'a> TaskClock<'a> {
+    fn of(v: &'a Value) -> Self {
+        if v["showWithoutTime"].as_bool() == Some(true) {
+            TaskClock::Date
+        } else {
+            match v["timeZone"].as_str().filter(|z| !z.is_empty()) {
+                Some(z) => TaskClock::Zone(z),
+                None => TaskClock::Floating,
+            }
+        }
+    }
+    fn read(self, local: &str) -> Option<i64> {
+        match self {
+            // A date alone: midnight UTC of it, as all-day events are kept.
+            TaskClock::Date => local_to_utc(local, None),
+            TaskClock::Zone(z) => task_time(local, Some(z)),
+            TaskClock::Floating => task_time(local, None),
+        }
+    }
+    fn write(self, t: i64) -> String {
+        match self {
+            TaskClock::Date => utc_to_local(t, ""),
+            TaskClock::Zone(z) => utc_to_local(t, z),
+            TaskClock::Floating => DateTime::from_timestamp(t, 0)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+        }
+    }
+}
+/// A JSCalendar Task as a task: `start` is when it's due (0: no due
+/// date), as for a VTODO.
+pub fn from_jstask(v: &Value) -> Option<ical::Event> {
+    let zone = v["timeZone"].as_str().filter(|z| !z.is_empty());
+    let clock = TaskClock::of(v);
+    let all_day = matches!(clock, TaskClock::Date);
+    let due = v["due"].as_str().and_then(|d| clock.read(d));
+    let progress = v["progress"].as_str().unwrap_or("needs-action");
+    Some(ical::Event {
+        uid: v["uid"].as_str().unwrap_or_default().to_owned(),
+        summary: v["title"].as_str().unwrap_or_default().to_owned(),
+        description: v["description"].as_str().unwrap_or_default().to_owned(),
+        start: due.unwrap_or(0),
+        end: due.unwrap_or(0),
+        all_day: all_day && due.is_some(),
+        sequence: v["sequence"].as_u64().unwrap_or(0) as u32,
+        task: true,
+        completed: progress == "completed",
+        cancelled: progress == "cancelled",
+        status: progress.to_ascii_uppercase(),
+        tzid: if all_day { String::new() } else { zone.unwrap_or_default().to_owned() },
+        utc: zone == Some("Etc/UTC") || zone == Some("UTC"),
+        floating: matches!(clock, TaskClock::Floating) && due.is_some(),
+        ..Default::default()
+    })
+}
+/// A JSON pointer's escapes (RFC 6901 §3), for a patch path's key.
+fn pointer_key(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+/// Whether an alert is relative to the task's start (`relativeTo` start,
+/// the default) or its due time (`end`, §5): one that needs a property the
+/// task won't have makes the server refuse the change.
+fn alert_needs(a: &Value, start: bool, due: bool) -> bool {
+    let t = &a["trigger"];
+    if t["@type"].as_str() != Some("OffsetTrigger") {
+        return false;
+    }
+    match t["relativeTo"].as_str().unwrap_or("start") {
+        "end" => !due,
+        _ => !start,
+    }
+}
+/// A JSCalendar signed duration (`-PT1H`, `PT5M`) in seconds.
+fn signed_duration(text: &str) -> Option<i64> {
+    match text.strip_prefix('-') {
+        Some(rest) => duration(rest).map(|s| -s),
+        None => duration(text.strip_prefix('+').unwrap_or(text)),
+    }
+}
+/// A task's reminders, as `ical::Event::alarms` holds them: seconds before
+/// it's due. Only display alerts (§5: email ones are the server's), those
+/// of its lists where it uses the defaults (§5.1), and not those already
+/// dismissed (`acknowledged` at or after the time it fires, §5.2) or
+/// relative to a time the task doesn't have.
+fn task_alarms(v: &Value, lists: &[JmapTaskList], due: Option<i64>) -> Vec<i64> {
+    let Some(due) = due else { return Vec::new() };
+    let start = v["start"].as_str().and_then(|s| TaskClock::of(v).read(s));
+    let own = v["alerts"].as_object();
+    let mut alerts: Vec<(String, Value)> = Vec::new();
+    if v["useDefaultAlerts"].as_bool() == Some(true) {
+        let key = if v["showWithoutTime"].as_bool() == Some(true) { "without" } else { "with" };
+        let ids = task_lists_of(v);
+        for l in lists.iter().filter(|l| ids.contains(&l.id)) {
+            let defaults = if key == "with" { &l.alerts_with_time } else { &l.alerts_without_time };
+            alerts.extend(defaults.as_object().into_iter().flatten().map(|(k, a)| (k.clone(), a.clone())));
+        }
+        // Snoozed defaults (§5.1): their own alerts that say so.
+        alerts.extend(
+            own.into_iter()
+                .flatten()
+                .filter(|(_, a)| a["relatedTo"].as_object().is_some_and(|r| r.values().any(|x| x["relation"]["snooze"] == true)))
+                .map(|(k, a)| (k.clone(), a.clone())),
+        );
+    } else {
+        alerts.extend(own.into_iter().flatten().map(|(k, a)| (k.clone(), a.clone())));
+    }
+    let mut out = Vec::new();
+    for (id, a) in alerts {
+        if a["action"].as_str().is_some_and(|k| k != "display") {
+            continue;
+        }
+        let t = &a["trigger"];
+        let at = match t["@type"].as_str() {
+            Some("AbsoluteTrigger") => t["when"].as_str().and_then(|w| DateTime::parse_from_rfc3339(w).ok()).map(|w| w.timestamp()),
+            Some("OffsetTrigger") => {
+                let base = if t["relativeTo"].as_str() == Some("end") { Some(due) } else { start };
+                base.zip(t["offset"].as_str().and_then(signed_duration)).map(|(b, o)| b + o)
+            }
+            _ => None,
+        };
+        let Some(at) = at else { continue };
+        // Dismissed: on the alert, or for a default, on the task's own
+        // alert of the same id.
+        let acknowledged = a["acknowledged"]
+            .as_str()
+            .or_else(|| own.and_then(|o| o.get(&id)).and_then(|o| o["acknowledged"].as_str()))
+            .and_then(|w| DateTime::parse_from_rfc3339(w).ok())
+            .map(|w| w.timestamp());
+        if acknowledged.is_some_and(|ack| ack >= at) {
+            continue;
+        }
+        let before = due - at;
+        if !out.contains(&before) {
+            out.push(before);
+        }
+    }
+    out
+}
+/// A task as JSCalendar Task properties (those Picacho edits: title,
+/// notes, due date and whether it's done), to create it or to patch the
+/// server's copy (`current`), whose other properties stay as they are.
+pub fn to_jstask(e: &ical::Event, current: Option<&Value>) -> Map<String, Value> {
+    let mut p = Map::new();
+    if current.is_none() {
+        p.insert("@type".into(), json!("Task"));
+        if !e.uid.is_empty() {
+            p.insert("uid".into(), json!(e.uid));
+        }
+    }
+    p.insert("title".into(), json!(e.summary));
+    if current.is_some() || !e.description.is_empty() {
+        p.insert("description".into(), json!(e.description));
+    }
+    p.insert("sequence".into(), json!(e.sequence));
+    let current_zone = current.and_then(|c| c["timeZone"].as_str()).filter(|z| !z.is_empty());
+    let shown_without_time = current.is_some_and(|c| c["showWithoutTime"].as_bool() == Some(true));
+    if e.start == 0 {
+        if let Some(c) = current.filter(|c| c["due"].is_string()) {
+            p.insert("due".into(), Value::Null);
+            // §4.6: a zone or "without time" needs a due or start time,
+            // and §5: an alert needs the time it's relative to.
+            let has_start = c["start"].is_string();
+            if !has_start {
+                if current_zone.is_some() {
+                    p.insert("timeZone".into(), Value::Null);
+                }
+                if shown_without_time {
+                    p.insert("showWithoutTime".into(), json!(false));
+                }
+            }
+            for (id, a) in c["alerts"].as_object().into_iter().flatten() {
+                if alert_needs(a, has_start, false) {
+                    p.insert(format!("alerts/{}", pointer_key(id)), Value::Null);
+                }
+            }
+        }
+    } else if e.all_day {
+        // A date: the same day wherever the reader is.
+        p.insert("due".into(), json!(TaskClock::Date.write(e.start)));
+        if !shown_without_time {
+            p.insert("showWithoutTime".into(), json!(true));
+        }
+    } else {
+        // In the zone the task already has, so its start keeps its
+        // meaning; a floating task stays floating; a new one is in the
+        // zone it was given, floating, or in UTC.
+        let floating = match current {
+            Some(_) => current_zone.is_none(),
+            None => e.floating && e.tzid.is_empty(),
+        };
+        let clock = if floating {
+            TaskClock::Floating
+        } else {
+            let zone = current_zone.unwrap_or(if e.tzid.is_empty() { "Etc/UTC" } else { e.tzid.as_str() });
+            if current.is_none() {
+                p.insert("timeZone".into(), json!(zone));
+            }
+            TaskClock::Zone(zone)
+        };
+        p.insert("due".into(), json!(clock.write(e.start)));
+        if shown_without_time {
+            p.insert("showWithoutTime".into(), json!(false));
+        }
+    }
+    let was = current.and_then(|c| c["progress"].as_str()).unwrap_or("needs-action");
+    if e.completed {
+        // §7.2: percentComplete isn't implied by progress.
+        if was != "completed" {
+            p.insert("progress".into(), json!("completed"));
+            p.insert("percentComplete".into(), json!(100));
+        }
+    } else if current.is_some() && finished(was) {
+        // Open again; one under way (`in-process`) stays so.
+        p.insert("progress".into(), json!("needs-action"));
+        p.insert("percentComplete".into(), Value::Null);
+    }
+    p
+}
+/// A repeating task's rule (`recurrenceRule`; RFC 8984's
+/// `recurrenceRules`, its first, from servers that keep that), where it
+/// has the start every repeating task must (§4.3).
+fn task_rule(v: &Value) -> Option<&Value> {
+    v["start"].as_str()?;
+    v.get("recurrenceRule")
+        .filter(|r| r.is_object())
+        .or_else(|| v["recurrenceRules"].as_array().and_then(|r| r.first()))
+}
+/// The furthest ahead a repeating task's occurrences are looked for.
+const OCCURRENCES_AHEAD: i64 = 2 * 366 * 86_400;
+/// One occurrence of a repeating task (`at`: its start, by its recurrence
+/// id, as written in the task's clock), as a task of its own: the series
+/// with its start and due moved there and that occurrence's own changes
+/// (`recurrenceOverrides`) applied.
+fn occurrence_view(v: &Value, at: &str) -> Value {
+    let clock = TaskClock::of(v);
+    let mut whole = v.clone();
+    let Some(w) = whole.as_object_mut() else { return whole };
+    for k in ["recurrenceRule", "recurrenceRules", "recurrenceOverrides", "excludedRecurrenceRules"] {
+        w.remove(k);
+    }
+    // The due time as far after the start as the series'.
+    if let (Some(start), Some(due), Some(here)) = (
+        v["start"].as_str().and_then(|s| clock.read(s)),
+        v["due"].as_str().and_then(|d| clock.read(d)),
+        clock.read(at),
+    ) {
+        w.insert("due".into(), json!(clock.write(here + (due - start))));
+    }
+    w.insert("start".into(), json!(at));
+    w.insert("recurrenceId".into(), json!(at));
+    if let Some(patch) = v["recurrenceOverrides"][at].as_object() {
+        for (k, val) in patch {
+            apply_patch(w, k, val);
+        }
+    }
+    whole
+}
+/// The occurrence of a repeating task to do now: of those after the last
+/// one finished (done, failed or cancelled) and not left out, the latest
+/// already due, else the next. Occurrences missed before it aren't listed
+/// one by one. Its start, as written, and its view; `None` when every
+/// occurrence is finished.
+fn next_occurrence(v: &Value, now: i64) -> Option<(String, Value)> {
+    let rule = task_rule(v)?;
+    let clock = TaskClock::of(v);
+    let zone = match clock {
+        TaskClock::Zone(z) => Some(z),
+        _ => None,
+    };
+    let start = clock.read(v["start"].as_str()?)?;
+    let series = ical::Event {
+        start,
+        end: start,
+        all_day: matches!(clock, TaskClock::Date),
+        tzid: zone.unwrap_or_default().to_owned(),
+        floating: matches!(clock, TaskClock::Floating),
+        recurrence: rrule(rule, zone)?,
+        ..Default::default()
+    };
+    let overrides = v["recurrenceOverrides"].as_object();
+    let patch_of = |key: &str| overrides.and_then(|o| o.get(key));
+    let mut starts: Vec<i64> = ical::occurrences(&series, &[], start, now.max(start) + OCCURRENCES_AHEAD)
+        .into_iter()
+        .map(|o| o.start)
+        .collect();
+    // Occurrences added on their own (an override not of the rule's).
+    starts.extend(overrides.into_iter().flatten().filter_map(|(k, _)| clock.read(k)));
+    starts.sort();
+    starts.dedup();
+    let left_out = |t: i64| patch_of(&clock.write(t)).is_some_and(|p| p["excluded"] == true);
+    let done = |t: i64| {
+        let p = patch_of(&clock.write(t)).and_then(|p| p["progress"].as_str());
+        finished(p.or(v["progress"].as_str()).unwrap_or_default())
+    };
+    let last_done = starts.iter().rev().find(|t| !left_out(**t) && done(**t)).copied();
+    let open: Vec<i64> = starts
+        .into_iter()
+        .filter(|t| last_done.is_none_or(|d| *t > d) && !left_out(*t) && !done(*t))
+        .collect();
+    let due_of = |t: i64| {
+        let view = occurrence_view(v, &clock.write(t));
+        view["due"].as_str().and_then(|d| clock.read(d)).unwrap_or(t)
+    };
+    let at = open.iter().rev().find(|t| due_of(**t) <= now).or(open.first()).copied()?;
+    let key = clock.write(at);
+    let view = occurrence_view(v, &key);
+    Some((key, view))
+}
+/// One task from its JSON, in the first of the lists shown it is in, as
+/// it is to do at `now`.
+fn jmap_task(v: &Value, lists: &[JmapTaskList], now: i64) -> Option<JmapTask> {
+    let id = v["id"].as_str()?.to_owned();
+    let ids = task_lists_of(v);
+    let list = lists.iter().find(|l| l.shown && ids.contains(&l.id))?.id.clone();
+    let (view, occurrence) = match task_rule(v) {
+        Some(rule) => {
+            let (_, view) = next_occurrence(v, now)?;
+            let zone = match TaskClock::of(v) {
+                TaskClock::Zone(z) => Some(z),
+                _ => None,
+            };
+            let at = view["start"].as_str().and_then(|s| TaskClock::of(v).read(s));
+            (view, Some((rrule(rule, zone).unwrap_or_default(), at)))
+        }
+        None => (v.clone(), None),
+    };
+    let mut event = from_jstask(&view)?;
+    if finished(view["progress"].as_str().unwrap_or_default()) {
+        return None;
+    }
+    if let Some((rule, at)) = occurrence {
+        event.recurrence = rule;
+        event.recurrence_id = at;
+    }
+    // Tasks are told apart by UID here; one without is its id.
+    if event.uid.is_empty() {
+        event.uid = id.clone();
+    }
+    let due = (event.start != 0).then_some(event.start);
+    event.alarms = task_alarms(&view, lists, due);
+    Some(JmapTask { list, event, version: event_version(v), id })
+}
+/// The tasks still to do in the lists shown, as at `now`: those needing
+/// action or under way (§4.8.1 `progress`), and the Task state they were
+/// read in, for `task_changes` later.
+pub fn open_tasks(s: &Session, lists: &[JmapTaskList], now: i64) -> Result<(Vec<JmapTask>, String)> {
+    let Some(account) = s.tasks_account() else {
+        return Ok((Vec::new(), String::new()));
+    };
+    let ids = match query_all(s, "Task/query", account, json!({ "progress": ["needs-action", "in-process"] })) {
+        // A server that can't filter by progress: every task, sorted here.
+        Err(e) if refused(&e, "unsupportedFilter") || refused(&e, "invalidArguments") => {
+            query_all(s, "Task/query", account, Value::Null)?
+        }
+        other => other?,
+    };
+    let (found, mut state) = get_all(s, "Task/get", account, &ids)?;
+    if state.is_empty() {
+        // No tasks: the state now, so changes can be asked for later.
+        let v = s.call_one("Task/get", json!({ "accountId": account, "ids": [] }))?;
+        state = v["state"].as_str().unwrap_or_default().to_owned();
+    }
+    Ok((found.iter().filter_map(|v| jmap_task(v, lists, now)).collect(), state))
+}
+/// Tasks still to do that changed, ids gone, and the new Task state.
+pub type TaskChanges = (Vec<JmapTask>, Vec<String>, String);
+/// Tasks changed or gone since `since` (Task/changes, §4.5), with `again`
+/// (ids) read anew too, as a repeating task's occurrence to do moves on
+/// with time: those still to do in the lists shown, the ids of the others,
+/// and the new state. `None` when the server can't say; then read all.
+pub fn task_changes(
+    s: &Session,
+    lists: &[JmapTaskList],
+    since: &str,
+    again: &[String],
+    now: i64,
+) -> Result<Option<TaskChanges>> {
+    let account = s.tasks_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-tasks"))?;
+    let Some(changed) = changes(s, "Task/changes", account, since)? else {
+        return Ok(None);
+    };
+    let mut ids = changed.changed;
+    ids.extend(again.iter().filter(|i| !changed.destroyed.contains(i)).cloned());
+    ids.sort();
+    ids.dedup();
+    let (found, _) = get_all(s, "Task/get", account, &ids)?;
+    let mut open = Vec::new();
+    let mut gone = changed.destroyed;
+    for v in &found {
+        match jmap_task(v, lists, now) {
+            Some(t) => open.push(t),
+            // Done, or out of every list shown: gone from here.
+            None => gone.extend(v["id"].as_str().map(str::to_owned)),
+        }
+    }
+    // Asked for but no longer there.
+    gone.extend(ids.into_iter().filter(|i| !found.iter().any(|v| v["id"] == i.as_str())));
+    Ok(Some((open, gone, changed.state)))
+}
+/// A task's version on the server now (as an event's), by id.
+pub fn task_version_of(s: &Session, id: &str) -> Result<String> {
+    let account = s.tasks_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-tasks"))?;
+    let (list, _) = get_all(s, "Task/get", account, &[id.to_owned()])?;
+    Ok(list.first().map(event_version).unwrap_or_default())
+}
+/// The patch changing one occurrence of a repeating task (`current`, the
+/// series) as `task` says: title and notes for the whole series, and its
+/// due date and whether it's done for that occurrence alone, in its
+/// recurrence override (§4.6.1: the whole override, so properties are
+/// added to it, not patched into one that may not be there).
+fn occurrence_patch(task: &ical::Event, current: &Value, at: i64) -> Map<String, Value> {
+    let clock = TaskClock::of(current);
+    let key = clock.write(at);
+    let view = occurrence_view(current, &key);
+    let mut series = Map::new();
+    let changes = to_jstask(task, Some(&view));
+    let mut own: Map<String, Value> = current["recurrenceOverrides"][&key].as_object().cloned().unwrap_or_default();
+    for (k, val) in changes {
+        match k.as_str() {
+            // The series': the same in every occurrence, so taken out of
+            // this one's override.
+            "title" | "description" => {
+                if current[&k] != val {
+                    series.insert(k.clone(), val);
+                }
+                own.remove(&k);
+            }
+            "sequence" => {
+                series.insert(k, val);
+            }
+            // What the occurrence has from the series already isn't
+            // copied into its override.
+            _ if !own.contains_key(&k) && view.get(&k) == Some(&val) => {}
+            _ => {
+                own.insert(k, val);
+            }
+        }
+    }
+    if current["recurrenceOverrides"].is_object() {
+        series.insert(format!("recurrenceOverrides/{}", pointer_key(&key)), Value::Object(own));
+    } else {
+        series.insert("recurrenceOverrides".into(), json!({ key: own }));
+    }
+    series
+}
+/// Creates or changes a task in `list`; returns its id. With `in_state`
+/// (its version when read), only if the task is still as it was read: a
+/// change made elsewhere meanwhile is a `Conflict`, not overwritten. A
+/// repeating task's occurrence (`recurrence_id`) changes as
+/// `occurrence_patch` says.
+pub fn save_task(s: &Session, id: Option<&str>, list: &str, task: &ical::Event, in_state: Option<&str>) -> Result<String> {
+    let account = s.tasks_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-tasks"))?;
+    let (current, read_state) = match id {
+        Some(id) => get_all(s, "Task/get", account, &[id.to_owned()])
+            .map(|(list, state)| (list.into_iter().next(), state))
+            .unwrap_or_default(),
+        None => (None, String::new()),
+    };
+    let mut props = match (&current, task.recurrence_id) {
+        (Some(c), Some(at)) if task_rule(c).is_some() => occurrence_patch(task, c, at),
+        _ => to_jstask(task, current.as_ref()),
+    };
+    // Already in the list: its other lists stay. Else moved to it alone.
+    if !current.as_ref().is_some_and(|c| task_lists_of(c).iter().any(|l| l == list)) {
+        props.insert("taskListIds".into(), json!({ list: true }));
+    }
+    let args = match id {
+        Some(id) => json!({ "accountId": account, "update": { id: props } }),
+        None => json!({ "accountId": account, "create": { "t": props } }),
+    };
+    const CHANGED: &str = "This task was changed elsewhere since it was read. Read your tasks again and make the change again.";
+    let v = match (in_state.filter(|s| !s.is_empty()), id, &current) {
+        (Some(version), Some(id), Some(current)) => {
+            ensure!(event_version(current) == version, Conflict(CHANGED));
+            set_if_unchanged(s, "Task", account, id, version, &read_state, args, event_version, CHANGED)?
+        }
+        _ => s.call_one("Task/set", args)?,
+    };
+    let error = |e: &Value| e["description"].as_str().or(e["type"].as_str()).unwrap_or(t!("sync-jscal-refused")).to_owned();
+    if let Some(id) = id {
+        if let Some(e) = v["notUpdated"].get(id) {
+            bail!(t!("sync-jscal-the-server-didnt-change-the-task", error = error(e)));
+        }
+        return Ok(id.to_owned());
+    }
+    if let Some(e) = v["notCreated"].get("t") {
+        bail!(t!("sync-jscal-the-server-didnt-add-the-task", error = error(e)));
+    }
+    Ok(v["created"]["t"]["id"]
+        .as_str()
+        .with_context(|| t!("sync-jscal-the-server-didnt-say-which-task"))?
+        .to_owned())
+}
+/// Removes a task (a repeating one: the whole series).
+pub fn delete_task(s: &Session, id: &str) -> Result<()> {
+    let account = s.tasks_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-tasks"))?;
+    let v = s.call_one("Task/set", json!({ "accountId": account, "destroy": [id] }))?;
+    if let Some(e) = v["notDestroyed"].get(id)
+        && e["type"] != "notFound"
+    {
+        bail!(t!("sync-jscal-the-server-didnt-remove-the-task"));
     }
     Ok(())
 }
@@ -2175,6 +2797,167 @@ mod tests {
         let written = Value::Object(to_jscalendar(&e, &[]));
         assert_eq!(written["participants"]["p1"]["scheduleAgent"], "client");
         assert_eq!(written["recurrenceOverrides"].as_object().unwrap().len(), 1);
+    }
+
+    /// JSCalendar Tasks read as tasks (JMAP for Task Lists), and only what
+    /// Picacho edits is written back.
+    #[test]
+    fn jscalendar_tasks_read_and_write() {
+        let list = |id: &str, shown: bool| JmapTaskList { id: id.into(), shown, ..Default::default() };
+        let lists = [list("hidden", false), list("l1", true), list("l2", true)];
+        let v = json!({
+            "@type": "Task", "id": "T1", "uid": "taxes@x", "taskListIds": { "hidden": true, "l1": true }, "title": "Taxes",
+            "description": "Forms", "due": "2026-11-30T17:00:00", "start": "2026-11-01T09:00:00",
+            "timeZone": "Europe/Berlin", "progress": "in-process", "priority": 1, "sequence": 2,
+        });
+        let t = jmap_task(&v, &lists, 0).unwrap();
+        assert_eq!((t.id.as_str(), t.list.as_str()), ("T1", "l1"), "the list shown");
+        assert!(jmap_task(&v, &[list("l1", false)], 0).is_none(), "in no list shown");
+        let e = &t.event;
+        assert!(e.task && !e.completed && !e.floating);
+        assert_eq!((e.summary.as_str(), e.description.as_str(), e.sequence), ("Taxes", "Forms", 2));
+        // 17:00 in Berlin in November is 16:00 UTC: the due time, not the start.
+        assert_eq!(e.start % 86_400, 16 * 3600);
+        assert_eq!(e.start, e.end);
+        assert_eq!((e.tzid.as_str(), e.status.as_str()), ("Europe/Berlin", "IN-PROCESS"));
+        // An edit: due in the task's own zone; its zone, start, priority
+        // and lists left alone, and still under way.
+        let mut edited = e.clone();
+        edited.start += 3600;
+        let patch = to_jstask(&edited, Some(&v));
+        assert_eq!(patch["due"], "2026-11-30T18:00:00");
+        for kept in ["timeZone", "start", "priority", "progress", "uid", "@type", "showWithoutTime", "taskListIds"] {
+            assert!(!patch.contains_key(kept), "{kept} isn't sent");
+        }
+        // No due date: the start keeps the zone valid (§4.6).
+        edited.start = 0;
+        let patch = to_jstask(&edited, Some(&v));
+        assert_eq!(patch["due"], Value::Null);
+        assert!(!patch.contains_key("timeZone"));
+        // Done (§7.2: with percentComplete), then open again.
+        edited.completed = true;
+        let done = to_jstask(&edited, Some(&v));
+        assert_eq!((&done["progress"], &done["percentComplete"]), (&json!("completed"), &json!(100)));
+        let finished = json!({ "@type": "Task", "id": "T1", "uid": "taxes@x", "taskListIds": { "l1": true }, "progress": "completed", "percentComplete": 100 });
+        edited.completed = false;
+        let reopened = to_jstask(&edited, Some(&finished));
+        assert_eq!((&reopened["progress"], &reopened["percentComplete"]), (&json!("needs-action"), &Value::Null));
+        // A due date removed with neither start nor any other time: the
+        // zone and the alerts needing a time go too (§4.6, §5).
+        let due_only = json!({ "@type": "Task", "id": "T4", "uid": "d@x", "taskListIds": { "l1": true }, "due": "2026-11-30T17:00:00",
+            "timeZone": "Europe/Berlin", "alerts": {
+                "before/due": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT1H", "relativeTo": "end" } },
+                "at": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2026-11-30T08:00:00Z" } },
+            } });
+        let mut none = from_jstask(&due_only).unwrap();
+        none.start = 0;
+        let patch = to_jstask(&none, Some(&due_only));
+        assert_eq!((&patch["due"], &patch["timeZone"]), (&Value::Null, &Value::Null));
+        assert_eq!(patch.get("alerts/before~1due"), Some(&Value::Null));
+        assert!(!patch.keys().any(|k| k == "alerts/at"), "an absolute alert stays");
+        // No due date; a date alone.
+        let v = json!({ "@type": "Task", "id": "T2", "taskListIds": { "l2": true }, "title": "Someday" });
+        let t = jmap_task(&v, &lists, 0).unwrap();
+        assert_eq!((t.event.start, t.event.uid.as_str(), t.list.as_str()), (0, "T2", "l2"));
+        assert!(!to_jstask(&t.event, Some(&v)).contains_key("due"), "nothing to remove");
+        let v = json!({ "@type": "Task", "id": "T3", "uid": "d@x", "taskListIds": { "l1": true }, "due": "2026-12-24T00:00:00", "showWithoutTime": true });
+        let t = jmap_task(&v, &lists, 0).unwrap();
+        assert!(t.event.all_day);
+        assert_eq!(t.event.start % 86_400, 0);
+        assert_eq!(to_jstask(&t.event, Some(&v))["due"], "2026-12-24T00:00:00");
+        // Floating: the reader's own wall time, written back without a zone.
+        let v = json!({ "@type": "Task", "id": "T5", "uid": "f@x", "taskListIds": { "l1": true }, "due": "2026-12-01T09:00:00" });
+        let t = jmap_task(&v, &lists, 0).unwrap();
+        assert!(t.event.floating);
+        let local = DateTime::from_timestamp(t.event.start, 0).unwrap().with_timezone(&chrono::Local);
+        assert_eq!(local.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-12-01T09:00:00");
+        let patch = to_jstask(&t.event, Some(&v));
+        assert_eq!(patch["due"], "2026-12-01T09:00:00");
+        assert!(!patch.contains_key("timeZone"));
+        // New: due in UTC; nothing the server sets itself.
+        let new = ical::Event { uid: "n@x".into(), summary: "New".into(), start: 4_100_000_000, end: 4_100_000_000, task: true, utc: true, ..Default::default() };
+        let made = to_jstask(&new, None);
+        assert_eq!((&made["@type"], &made["timeZone"]), (&json!("Task"), &json!("Etc/UTC")));
+        for absent in ["progress", "description", "showWithoutTime"] {
+            assert!(!made.contains_key(absent), "{absent}");
+        }
+        assert_eq!(from_jstask(&Value::Object(made)).unwrap().start, new.start);
+    }
+
+    /// A repeating task (§4.3) is the occurrence to do: after the last one
+    /// done, the latest already due, else the next; done, only that one is.
+    #[test]
+    fn repeating_tasks_are_done_one_occurrence_at_a_time() {
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let lists = [JmapTaskList { id: "l1".into(), shown: true, ..Default::default() }];
+        let mut v = json!({
+            "@type": "Task", "id": "T1", "uid": "bins@x", "taskListIds": { "l1": true }, "title": "Bins",
+            "start": "2026-11-02T09:00:00", "due": "2026-11-02T17:00:00", "timeZone": "Etc/UTC",
+            "recurrenceRule": { "@type": "RecurrenceRule", "frequency": "weekly" },
+        });
+        // None done: the latest due by now (16th), not the first missed.
+        let t = jmap_task(&v, &lists, at("2026-11-20T12:00:00Z")).unwrap();
+        assert_eq!(t.event.recurrence_id, Some(at("2026-11-16T09:00:00Z")));
+        assert_eq!(t.event.start, at("2026-11-16T17:00:00Z"), "due as long after its start as the series'");
+        assert_eq!(t.event.recurrence, "FREQ=WEEKLY");
+        // Done: only that occurrence, in an override of its own.
+        let mut done = t.event.clone();
+        done.completed = true;
+        let patch = occurrence_patch(&done, &v, t.event.recurrence_id.unwrap());
+        assert_eq!(patch["recurrenceOverrides"], json!({ "2026-11-16T09:00:00": { "progress": "completed", "percentComplete": 100 } }));
+        assert!(!patch.contains_key("title") && !patch.contains_key("progress"), "{patch:?}");
+        v["recurrenceOverrides"] = patch["recurrenceOverrides"].clone();
+        // Then the next, though not yet due; one left out is skipped.
+        v["recurrenceOverrides"]["2026-11-23T09:00:00"] = json!({ "excluded": true });
+        let t = jmap_task(&v, &lists, at("2026-11-20T12:00:00Z")).unwrap();
+        assert_eq!(t.event.recurrence_id, Some(at("2026-11-30T09:00:00Z")));
+        // Another occurrence changed: patched into the overrides there,
+        // the new title for the series, its due date for it alone.
+        let mut moved = t.event.clone();
+        moved.summary = "Recycling".into();
+        moved.start += 3600;
+        let patch = occurrence_patch(&moved, &v, t.event.recurrence_id.unwrap());
+        assert_eq!(patch["title"], "Recycling");
+        assert_eq!(patch["recurrenceOverrides/2026-11-30T09:00:00"], json!({ "due": "2026-11-30T18:00:00" }));
+        // An occurrence's own title is shown.
+        v["recurrenceOverrides"]["2026-11-30T09:00:00"] = json!({ "title": "Bins and glass" });
+        assert_eq!(jmap_task(&v, &lists, at("2026-11-20T12:00:00Z")).unwrap().event.summary, "Bins and glass");
+        // Every occurrence done (a count of two): none to do.
+        v["recurrenceRule"]["count"] = json!(2);
+        v["recurrenceOverrides"] = json!({ "2026-11-09T09:00:00": { "progress": "completed" } });
+        assert!(jmap_task(&v, &lists, at("2026-11-20T12:00:00Z")).is_none());
+    }
+
+    /// A task's alerts (§5) are reminders before it's due: relative to its
+    /// due time or start, or at a time; not email ones, nor those already
+    /// dismissed; its lists' where it uses the defaults (§5.1).
+    #[test]
+    fn task_alerts_are_reminders() {
+        let mut v = json!({
+            "@type": "Task", "id": "T1", "uid": "a@x", "taskListIds": { "l1": true },
+            "start": "2026-11-30T09:00:00", "due": "2026-11-30T17:00:00", "timeZone": "Etc/UTC",
+            "alerts": {
+                "due": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT1H", "relativeTo": "end" } },
+                "start": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "PT0S" } },
+                "at": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2026-11-30T16:30:00Z" } },
+                "mail": { "@type": "Alert", "action": "email", "trigger": { "@type": "OffsetTrigger", "offset": "-PT2H", "relativeTo": "end" } },
+                "seen": { "@type": "Alert", "acknowledged": "2026-11-30T15:00:00Z", "trigger": { "@type": "OffsetTrigger", "offset": "-PT3H", "relativeTo": "end" } },
+            },
+        });
+        let lists = [JmapTaskList {
+            id: "l1".into(),
+            shown: true,
+            alerts_with_time: json!({ "d1": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT15M", "relativeTo": "end" } } }),
+            ..Default::default()
+        }];
+        let mut alarms = jmap_task(&v, &lists, 0).unwrap().event.alarms;
+        alarms.sort();
+        assert_eq!(alarms, [1800, 3600, 8 * 3600]);
+        v["useDefaultAlerts"] = json!(true);
+        assert_eq!(jmap_task(&v, &lists, 0).unwrap().event.alarms, [900]);
+        // A default dismissed on the task's own alert of its id.
+        v["alerts"] = json!({ "d1": { "@type": "Alert", "acknowledged": "2026-11-30T16:50:00Z", "trigger": { "@type": "OffsetTrigger", "offset": "-PT15M", "relativeTo": "end" } } });
+        assert!(jmap_task(&v, &lists, 0).unwrap().event.alarms.is_empty());
     }
 
     /// Reminders read and write as JSCalendar alerts (RFC 8984 §4.5.2).

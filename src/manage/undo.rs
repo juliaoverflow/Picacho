@@ -36,7 +36,7 @@ impl Backend {
             self.store.commit_changes(&before, false)?;
             return Ok(before.len());
         }
-        if matches!(a.provider, Provider::Proton | Provider::Jmap) {
+        if matches!(a.provider, Provider::Proton | Provider::Jmap | Provider::Ews) || a.native_api() {
             return self.undo_by_id(a, moved);
         }
         let lock = self.account_lock(&a.id);
@@ -123,10 +123,12 @@ impl Backend {
             } else {
                 Change::Move(m.before.folder)
             };
-            let mut now = self
-                .store
-                .message(&m.before.id)?
-                .unwrap_or_else(|| m.before.clone());
+            let mut now = if a.ews() {
+                // An Exchange item's id changed as it moved.
+                self.ews_current(a, &m.before)
+            } else {
+                self.store.message(&m.before.id)?.unwrap_or_else(|| m.before.clone())
+            };
             if home.moved_already(&now) {
                 continue;
             }

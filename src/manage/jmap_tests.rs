@@ -103,6 +103,17 @@ struct Server {
     bad_digest: bool,
     /// Calendar/set shareWith and Principal/set patches, as sent.
     shared_with: Vec<Value>,
+    /// JMAP for Tasks, in the modern session: its task lists and tasks.
+    tasks_on: bool,
+    task_lists: Vec<Value>,
+    tasks: Vec<Value>,
+    /// The Task state and each change since: (state, id, destroyed).
+    task_state: u64,
+    task_log: Vec<(u64, String, bool)>,
+    /// The account's mayCreateTaskList, where said.
+    may_create_task_list: Option<bool>,
+    /// TaskNotifications not yet destroyed.
+    task_notifications: Vec<Value>,
 }
 
 const AUTH: &str = "Basic cWFAZXhhbXBsZS5jb206Zml4dHVyZS1wYXNzd29yZA=="; // qa@example.com:fixture-password
@@ -667,6 +678,120 @@ impl Server {
                 self.shared_with.push(args["update"].clone());
                 vec![(name.into(), json!({ "updated": { "P1": null } }))]
             }
+            "TaskList/get" => vec![(name.into(), json!({ "list": self.task_lists, "state": "tl" }))],
+            "TaskList/set" => {
+                let mut out = json!({});
+                for (key, props) in args["create"].as_object().into_iter().flatten() {
+                    let id = format!("L{}", self.task_lists.len() + 1);
+                    let mut l = props.clone();
+                    l["id"] = json!(id);
+                    self.task_lists.push(l);
+                    out["created"][key] = json!({ "id": id });
+                }
+                vec![(name.into(), out)]
+            }
+            "Task/query" => {
+                // draft-ietf-jmap-tasks-07 §4.8.1: `inTaskList` and `progress`.
+                let f = &args["filter"];
+                let ids: Vec<&Value> = self
+                    .tasks
+                    .iter()
+                    .filter(|t| f["inTaskList"].as_str().is_none_or(|l| t["taskListIds"][l] == true))
+                    .filter(|t| {
+                        let progress = t["progress"].as_str().unwrap_or("needs-action");
+                        f["progress"].as_array().is_none_or(|p| p.iter().any(|x| x == progress))
+                    })
+                    .map(|t| &t["id"])
+                    .collect();
+                vec![(name.into(), json!({ "ids": ids, "total": ids.len() }))]
+            }
+            "Task/get" => {
+                let wanted = ids_of(args).unwrap_or_default();
+                let list: Vec<&Value> = self.tasks.iter().filter(|t| wanted.iter().any(|w| t["id"] == w.as_str())).collect();
+                vec![(name.into(), json!({ "list": list, "state": format!("t{}", self.task_state) }))]
+            }
+            "Task/changes" => {
+                let since: u64 = args["sinceState"].as_str().unwrap().trim_start_matches('t').parse().unwrap();
+                let (mut updated, mut destroyed) = (Vec::new(), Vec::new());
+                for (state, id, gone) in &self.task_log {
+                    if *state > since {
+                        if *gone { destroyed.push(id.clone()) } else { updated.push(id.clone()) }
+                    }
+                }
+                vec![(name.into(), json!({ "oldState": args["sinceState"], "newState": format!("t{}", self.task_state),
+                    "hasMoreChanges": false, "created": [], "updated": updated, "destroyed": destroyed }))]
+            }
+            "TaskNotification/get" => vec![(name.into(), json!({ "list": self.task_notifications, "state": "n" }))],
+            "TaskNotification/set" => {
+                let gone = args["destroy"].as_array().cloned().unwrap_or_default();
+                self.task_notifications.retain(|n| !gone.contains(&n["id"]));
+                vec![(name.into(), json!({ "destroyed": gone }))]
+            }
+            "Task/set" if args["ifInState"].is_string() && args["ifInState"] != format!("t{}", self.task_state).as_str() => {
+                vec![("error".into(), json!({ "type": "stateMismatch" }))]
+            }
+            "Task/set" => {
+                let mut out = json!({});
+                for (key, props) in args["create"].as_object().into_iter().flatten() {
+                    let id = format!("T{}", self.tasks.len() + 10);
+                    let mut t = props.clone();
+                    t["id"] = json!(id);
+                    self.tasks.push(t);
+                    self.task_state += 1;
+                    self.task_log.push((self.task_state, id.clone(), false));
+                    out["created"][key] = json!({ "id": id });
+                }
+                for (id, patch) in args["update"].as_object().into_iter().flatten() {
+                    let at = self.tasks.iter().position(|t| t["id"] == id.as_str()).unwrap();
+                    let mut t = self.tasks[at].as_object().unwrap().clone();
+                    let mut invalid_patch = false;
+                    for (path, v) in patch.as_object().unwrap() {
+                        // A patch path (`alerts/a1`) or a property; RFC 8620
+                        // §5.3: every part before the last must be there.
+                        let mut keys: Vec<String> = path.split('/').map(|k| k.replace("~1", "/").replace("~0", "~")).collect();
+                        let last = keys.pop().unwrap();
+                        let mut obj = Some(&mut t);
+                        for k in keys {
+                            obj = obj.and_then(|o| o.get_mut(&k)).and_then(Value::as_object_mut);
+                        }
+                        match obj {
+                            Some(obj) if v.is_null() => {
+                                obj.remove(&last);
+                            }
+                            Some(obj) => {
+                                obj.insert(last, v.clone());
+                            }
+                            None => invalid_patch = true,
+                        }
+                    }
+                    if invalid_patch {
+                        out["notUpdated"][id] = json!({ "type": "invalidPatch" });
+                        continue;
+                    }
+                    // §4.6: a zone or a time-less task needs a due or start
+                    // time; §5: an alert, the time it's relative to.
+                    let has = |k: &str| t.get(k).is_some_and(Value::is_string);
+                    let zoned = t.get("timeZone").is_some_and(Value::is_string) || t.get("showWithoutTime") == Some(&json!(true));
+                    let orphan_alert = t.get("alerts").and_then(Value::as_object).into_iter().flatten().any(|(_, a)| {
+                        a["trigger"]["@type"] == "OffsetTrigger"
+                            && !has(if a["trigger"]["relativeTo"] == "end" { "due" } else { "start" })
+                    });
+                    if (zoned && !has("due") && !has("start")) || orphan_alert {
+                        out["notUpdated"][id] = json!({ "type": "invalidProperties" });
+                        continue;
+                    }
+                    self.tasks[at] = Value::Object(t);
+                    self.task_state += 1;
+                    self.task_log.push((self.task_state, id.clone(), false));
+                    out["updated"][id] = Value::Null;
+                }
+                for id in args["destroy"].as_array().into_iter().flatten() {
+                    self.tasks.retain(|t| t["id"] != *id);
+                    self.task_state += 1;
+                    self.task_log.push((self.task_state, id.as_str().unwrap().to_owned(), true));
+                }
+                vec![(name.into(), out)]
+            }
             "AddressBook/get" => vec![(
                 name.into(),
                 json!({ "list": [{ "id": "b1", "name": "Contacts", "myRights": { "mayWrite": true } }], "state": "b" }),
@@ -1060,7 +1185,15 @@ impl Server {
         if method == "GET" && (path == "/.well-known/jmap" || path == "/jmap/session") {
             self.session_reads += 1;
             if self.modern {
-                return (200, self.modern_session(&base).to_string().into_bytes());
+                let mut session = self.modern_session(&base);
+                if self.tasks_on {
+                    session["capabilities"]["urn:ietf:params:jmap:tasks"] = json!({});
+                    session["primaryAccounts"]["urn:ietf:params:jmap:tasks"] = json!("u1");
+                    if let Some(may) = self.may_create_task_list {
+                        session["accounts"]["u1"]["accountCapabilities"]["urn:ietf:params:jmap:tasks"] = json!({ "mayCreateTaskList": may });
+                    }
+                }
+                return (200, session.to_string().into_bytes());
             }
             return (
                 200,
@@ -1102,6 +1235,12 @@ impl Server {
             let carried = earlier.len();
             for call in request["methodCalls"].as_array().unwrap() {
                 let (name, args, id) = (call[0].as_str().unwrap(), &call[1], &call[2]);
+                if name.starts_with("Task/") || name.starts_with("TaskList/") {
+                    assert!(
+                        request["using"].as_array().unwrap().iter().any(|u| u == "urn:ietf:params:jmap:tasks"),
+                        "{name} is asked using JMAP for Tasks"
+                    );
+                }
                 assert!(
                     args["accountId"] == "u1" || (self.modern && (args["accountId"] == "u2" || args["accountId"] == "u3")),
                     "{name} names the account"
@@ -2082,6 +2221,212 @@ fn jmap_calendars_contacts_and_held_messages() -> Result<()> {
     let options = crate::sync::jmap::SendOptions { keep_no_copy: true, ..Default::default() };
     b.send_jmap(&a, "qa@example.com", &["r@example.com".into()], MESSAGE, &options)?;
     assert_eq!(server.lock().unwrap().emails.len(), before);
+    Ok(())
+}
+
+/// Tasks over JMAP (JMAP for Tasks): the open ones in the task lists are
+/// read, and added, edited, done and deleted on the server; an account
+/// without a task list gets one for a new task.
+#[test]
+fn jmap_tasks_read_and_written() -> Result<()> {
+    let fixture = Server {
+        modern: true,
+        tasks_on: true,
+        task_lists: vec![
+            json!({ "id": "l0", "name": "Groceries", "isDefault": false, "isSubscribed": true, "myRights": { "mayWrite": true } }),
+            json!({ "id": "l1", "name": "Work", "isDefault": true, "isSubscribed": true, "myRights": { "mayWrite": true } }),
+            json!({ "id": "hid", "name": "Hidden", "isSubscribed": true, "isVisible": false, "myRights": { "mayWrite": true } }),
+            json!({ "id": "un", "name": "Team", "isSubscribed": false, "myRights": { "mayWrite": false } }),
+        ],
+        tasks: vec![
+            json!({ "@type": "Task", "id": "T1", "uid": "taxes@x", "taskListIds": { "l1": true }, "title": "Taxes",
+                    "due": "2099-11-30T17:00:00", "timeZone": "Europe/Berlin", "priority": 1,
+                    "alerts": { "a1": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT1H", "relativeTo": "end" } } } }),
+            json!({ "@type": "Task", "id": "T2", "uid": "old@x", "taskListIds": { "l1": true }, "title": "Old", "progress": "completed" }),
+            json!({ "@type": "Task", "id": "T3", "uid": "hid@x", "taskListIds": { "hid": true }, "title": "Hidden" }),
+            json!({ "@type": "Task", "id": "T4", "uid": "team@x", "taskListIds": { "un": true }, "title": "Team" }),
+        ],
+        ..Default::default()
+    };
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    // Connecting reads the tasks too: only the open one in a list shown.
+    b.connect_jmap_calendar(&a)?;
+    let tasks = b.calendar_tasks();
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!((tasks[0].event.summary.as_str(), tasks[0].href.as_str(), tasks[0].calendar.as_str()), ("Taxes", "jmap:T1", "jmap:l1"));
+    assert!(tasks[0].event.task);
+    // The default list first; hidden and unsubscribed lists aren't kept.
+    let lists: Vec<String> = b.task_lists().into_iter().map(|l| l.href).collect();
+    assert_eq!(lists, ["jmap:l1", "jmap:l0"]);
+    assert_eq!(b.task_calendar().unwrap().href, "jmap:l1");
+    assert_eq!(b.sync_tasks()?, 1);
+    // Edited: only what Picacho edits changes.
+    let due = tasks[0].event.start + 86_400;
+    b.edit_task("taxes@x", "Taxes 2026", "Forms", due, false)?;
+    {
+        let s = server.lock().unwrap();
+        let t = s.tasks.iter().find(|t| t["id"] == "T1").unwrap();
+        assert_eq!((&t["title"], &t["description"], &t["due"]), (&json!("Taxes 2026"), &json!("Forms"), &json!("2099-12-01T17:00:00")));
+        assert_eq!((&t["timeZone"], &t["priority"]), (&json!("Europe/Berlin"), &json!(1)));
+    }
+    // Its due date removed: the server takes it (§4.6, §5), without the
+    // zone and the alert before the due time.
+    b.edit_task("taxes@x", "Taxes 2026", "Forms", 0, false)?;
+    {
+        let s = server.lock().unwrap();
+        let t = s.tasks.iter().find(|t| t["id"] == "T1").unwrap();
+        assert!(t.get("due").is_none() && t.get("timeZone").is_none(), "{t}");
+        assert_eq!(t["alerts"], json!({}));
+    }
+    // Added in the default list, then done, then deleted.
+    let added = b.add_task("Call Bo", 0)?;
+    assert_eq!(added.calendar, "jmap:l1");
+    let id = added.href.strip_prefix("jmap:").unwrap().to_owned();
+    {
+        let s = server.lock().unwrap();
+        let t = s.tasks.iter().find(|t| t["id"] == id.as_str()).unwrap();
+        assert_eq!((&t["@type"], &t["taskListIds"], &t["title"]), (&json!("Task"), &json!({ "l1": true }), &json!("Call Bo")));
+        assert!(t.get("due").is_none());
+    }
+    assert_eq!(b.calendar_tasks().len(), 2);
+    b.complete_task(&added.event.uid, true)?;
+    assert_eq!(server.lock().unwrap().tasks.iter().find(|t| t["id"] == id.as_str()).unwrap()["progress"], "completed");
+    assert_eq!(b.calendar_tasks().len(), 1);
+    b.delete_task("taxes@x")?;
+    assert!(!server.lock().unwrap().tasks.iter().any(|t| t["id"] == "T1"));
+    assert!(b.calendar_tasks().is_empty());
+    assert_eq!(b.sync_tasks()?, 0);
+    // Only a hidden list to write to: not used, and none made beside it.
+    server.lock().unwrap().task_lists.retain(|l| l["id"] == "hid" || l["id"] == "un");
+    b.sync_tasks()?;
+    assert!(b.add_task("Water plants", 0).is_err());
+    assert_eq!(server.lock().unwrap().task_lists.len(), 2);
+    // No list to put it in: one is made.
+    server.lock().unwrap().task_lists.clear();
+    b.sync_tasks()?;
+    assert!(b.task_calendar().is_none());
+    let made = b.add_task("Water plants", 4_100_000_000)?;
+    assert_eq!(made.calendar, "jmap:L1");
+    assert_eq!(server.lock().unwrap().task_lists[0]["name"], "Tasks");
+    Ok(())
+}
+
+/// Tasks over JMAP once read follow changes (Task/changes); a repeating
+/// task is done one occurrence at a time; task alerts are reminders; and
+/// tasks others changed (TaskNotification) are told like calendars'.
+#[test]
+fn jmap_tasks_follow_changes_repeat_remind_and_notify() -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let utc = |t: i64| chrono::DateTime::from_timestamp(t, 0).unwrap().format("%Y-%m-%dT%H:%M:%S").to_string();
+    // A weekly task that began three weeks ago, at 09:00 UTC.
+    let first = (now - 21 * 86_400) / 86_400 * 86_400 + 9 * 3600;
+    let fixture = Server {
+        modern: true,
+        tasks_on: true,
+        task_lists: vec![json!({ "id": "l1", "name": "Home", "isDefault": true, "myRights": { "mayWrite": true } })],
+        tasks: vec![
+            json!({ "@type": "Task", "id": "T1", "uid": "taxes@x", "taskListIds": { "l1": true }, "title": "Taxes",
+                    "due": utc(now + 1800), "timeZone": "Etc/UTC",
+                    "alerts": { "a1": { "@type": "Alert", "trigger": { "@type": "OffsetTrigger", "offset": "-PT1H", "relativeTo": "end" } } } }),
+            json!({ "@type": "Task", "id": "T5", "uid": "bins@x", "taskListIds": { "l1": true }, "title": "Bins",
+                    "start": utc(first), "due": utc(first + 3600), "timeZone": "Etc/UTC",
+                    "recurrenceRule": { "@type": "RecurrenceRule", "frequency": "weekly" } }),
+        ],
+        task_notifications: vec![json!({ "id": "n1", "type": "updated", "taskId": "T1",
+            "changedBy": { "name": "Bo", "email": "bo@example.se", "principalId": null },
+            "task": { "@type": "Task", "title": "Taxes" }, "taskPatch": { "description": "Forms" } })],
+        ..Default::default()
+    };
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    // Told once, then gone from the server.
+    assert!(b.calendar_notices().iter().any(|n| n == "Bo changed Taxes."), "{:?}", b.calendar_notices());
+    assert!(server.lock().unwrap().task_notifications.is_empty());
+    let bins = |b: &Backend| b.calendar_tasks().into_iter().find(|t| t.event.uid == "bins@x").unwrap();
+    // The latest occurrence already due: three weeks on, or two.
+    let shown = bins(&b).event.recurrence_id.unwrap();
+    let latest_due = first + (now - first - 3600) / (7 * 86_400) * 7 * 86_400;
+    assert_eq!(shown, latest_due);
+    // The task alert an hour before it's due, half an hour ago: a reminder.
+    let reminders = b.due_reminders(now);
+    assert!(reminders.iter().any(|(e, _)| e.summary == "Taxes"), "{reminders:?}");
+    // Changed on the server: read by Task/changes, not all again.
+    {
+        let mut s = server.lock().unwrap();
+        let t = s.tasks.iter_mut().find(|t| t["id"] == "T1").unwrap();
+        t["title"] = json!("Taxes 2026");
+        s.task_state += 1;
+        let state = s.task_state;
+        s.task_log.push((state, "T1".into(), false));
+        s.calls.clear();
+    }
+    assert_eq!(b.sync_tasks()?, 2);
+    {
+        let s = server.lock().unwrap();
+        assert!(s.calls.contains(&"Task/changes".to_owned()), "{:?}", s.calls);
+        assert!(!s.calls.contains(&"Task/query".to_owned()), "only changes: {:?}", s.calls);
+    }
+    assert!(b.calendar_tasks().iter().any(|t| t.event.summary == "Taxes 2026"));
+    // The repeating one done: that occurrence alone, and the next listed.
+    b.complete_task("bins@x", true)?;
+    let key = utc(shown);
+    {
+        let s = server.lock().unwrap();
+        let t = s.tasks.iter().find(|t| t["id"] == "T5").unwrap();
+        assert_eq!(t["recurrenceOverrides"][&key]["progress"], "completed", "{t}");
+        assert!(t.get("progress").is_none(), "the series isn't done");
+    }
+    let next = bins(&b).event.recurrence_id.unwrap();
+    assert_eq!(next, shown + 7 * 86_400);
+    // Again: patched into the overrides now there.
+    b.complete_task("bins@x", true)?;
+    assert_eq!(bins(&b).event.recurrence_id, Some(next + 7 * 86_400));
+    assert_eq!(server.lock().unwrap().tasks.iter().find(|t| t["id"] == "T5").unwrap()["recurrenceOverrides"].as_object().unwrap().len(), 2);
+    Ok(())
+}
+
+/// An account that may not make task lists (`mayCreateTaskList`) isn't
+/// asked to.
+#[test]
+fn jmap_task_lists_are_made_only_where_allowed() -> Result<()> {
+    let (cert, port, server, _running) =
+        start(Server { modern: true, tasks_on: true, may_create_task_list: Some(false), ..Default::default() })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    let error = b.add_task("Taxes", 0).unwrap_err().to_string();
+    assert!(error.contains("make task lists"), "{error}");
+    assert!(!server.lock().unwrap().calls.contains(&"TaskList/set".to_owned()));
+    Ok(())
+}
+
+/// A JMAP server without JMAP for Tasks has no tasks, and says so when
+/// one is added.
+#[test]
+fn jmap_without_tasks_has_none() -> Result<()> {
+    let (cert, port, _server, _running) = start(Server { modern: true, ..Default::default() })?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    assert_eq!(b.sync_tasks()?, 0);
+    assert!(b.task_calendar().is_none());
+    assert!(b.add_task("Taxes", 0).is_err());
     Ok(())
 }
 

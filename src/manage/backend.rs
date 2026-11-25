@@ -55,6 +55,14 @@ mod proton_push;
 pub use proton_push::ProtonPushed;
 #[path = "jmap.rs"]
 mod jmap;
+#[path = "gmail.rs"]
+mod gmail;
+#[path = "graph.rs"]
+mod graph;
+#[path = "api_filters.rs"]
+mod api_filters;
+#[path = "ews.rs"]
+mod ews;
 pub use jmap::HeldSubmission;
 pub use crate::sync::fido::{Method as KeyMethod, NeedsPin, Prompt as KeyPrompt};
 pub use proton::ProtonNext;
@@ -90,6 +98,15 @@ mod reliability_tests;
 #[cfg(test)]
 #[path = "jmap_tests.rs"]
 mod jmap_tests;
+#[cfg(test)]
+#[path = "gmail_tests.rs"]
+mod gmail_tests;
+#[cfg(test)]
+#[path = "graph_tests.rs"]
+mod graph_tests;
+#[cfg(test)]
+#[path = "ews_tests.rs"]
+mod ews_tests;
 #[cfg(all(test, unix, not(any(target_os = "android", target_os = "ios"))))]
 #[path = "kerberos_tests.rs"]
 mod kerberos_tests;
@@ -327,6 +344,13 @@ pub struct Backend {
     /// Signed-in JMAP sessions by account, in memory only, with when their
     /// access token expires (0 for a password); see `jmap.rs`.
     jmap: Mutex<HashMap<String, (Arc<crate::sync::jmap::Session>, i64)>>,
+    /// Gmail API and Microsoft Graph sessions by account, with when their
+    /// access token expires; see `gmail.rs` and `graph.rs`.
+    gmail: Mutex<HashMap<String, (Arc<crate::sync::gmail::Session>, i64)>>,
+    graph: Mutex<HashMap<String, (Arc<crate::sync::graph::Session>, i64)>>,
+    /// Exchange Web Services sessions by account; see `ews.rs`.
+    /// Exchange sessions, each with when its sign-in expires.
+    ews: Mutex<HashMap<String, (Arc<crate::sync::ews::Session>, i64)>>,
     /// Scheduled drafts being sent now, by id, by the window or the
     /// background monitor; see `send_scheduled`.
     scheduled_sending: Mutex<HashSet<String>>,
@@ -384,6 +408,9 @@ impl Backend {
             proton_push_failures: Mutex::new(HashMap::new()),
             proton_push_change: Mutex::new(None),
             jmap: Mutex::new(HashMap::new()),
+            gmail: Mutex::new(HashMap::new()),
+            graph: Mutex::new(HashMap::new()),
+            ews: Mutex::new(HashMap::new()),
             scheduled_sending: Mutex::new(HashSet::new()),
             #[cfg(test)]
             test_certificate: None,
@@ -635,7 +662,14 @@ impl Backend {
         let lock = self.account_lock(&account.id);
         let _operation = lock.lock().unwrap();
         secret.client_secret = account.client_secret.clone();
-        if let Err(e) = self.check_login(&account, &mut secret) {
+        // Exchange: Autodiscover may find its EWS address, kept in the account.
+        let mut account = account;
+        let checked = if account.ews() {
+            crate::sync::oauth::refresh(&account, &mut secret).and_then(|_| self.check_ews(&mut account, &secret))
+        } else {
+            self.check_login(&account, &mut secret)
+        };
+        if let Err(e) = checked {
             if keep {
                 *self.pending.lock().unwrap() = Some(Pending {
                     account,
@@ -664,6 +698,16 @@ impl Backend {
         crate::sync::oauth::refresh(account, secret)?;
         if account.provider == Provider::Jmap {
             return self.check_jmap(account, secret);
+        }
+        if account.gmail_api() {
+            return self.check_gmail(account, secret);
+        }
+        if account.graph() {
+            return self.check_graph(account, secret);
+        }
+        if account.ews() {
+            let mut found = account.clone();
+            return self.check_ews(&mut found, secret);
         }
         let mut session = match self.imap_login(account, secret) {
             Err(e)
@@ -895,6 +939,9 @@ impl Backend {
         {
             self.forget_proton(&a);
         }
+        self.gmail.lock().unwrap().remove(id);
+        self.graph.lock().unwrap().remove(id);
+        self.ews.lock().unwrap().remove(id);
         self.layouts
             .lock()
             .unwrap()
@@ -945,6 +992,7 @@ impl Backend {
         let mut next = account.clone();
         next.kerberos = on;
         next.validate()?;
+        self.ews.lock().unwrap().remove(&next.id);
         let lock = self.account_lock(&next.id);
         let _operation = lock.lock().unwrap();
         if on {
@@ -998,6 +1046,35 @@ impl Backend {
             }
         }
         self.connect(&next, password, &[], cancel)
+    }
+    /// Switches a Gmail or Outlook account between IMAP and SMTP and its
+    /// provider's API (the Gmail API, Microsoft Graph): signs in again in
+    /// the browser for what the other way needs, then forgets the mail
+    /// cached the old way (its messages have other ids now), which the next
+    /// check lists again. Drafts are kept and upload the new way.
+    pub fn switch_api(&self, a: &Account, on: bool, cancel: Arc<AtomicBool>) -> Result<Account> {
+        ensure!(
+            matches!(a.provider, Provider::Gmail | Provider::Outlook) && a.oauth && a.sso.is_none(),
+            t!("manage-model-the-gmail-api-and-microsoft-graph")
+        );
+        if a.api == on {
+            return Ok(a.clone());
+        }
+        let next = Account { api: on, ..a.clone() };
+        let saved = self.reconnect(&next, String::new(), cancel)?;
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.stop_watching(&a.id);
+        self.disconnect(&a.id);
+        self.gmail.lock().unwrap().remove(&a.id);
+        self.graph.lock().unwrap().remove(&a.id);
+        self.layouts.lock().unwrap().retain(|(account, _), _| account != &a.id);
+        self.store.forget_mail(&a.id)?;
+        let mine = format!("{}:", a.id);
+        self.readable.lock().unwrap().retain(|_, m| m.account != a.id);
+        self.readable_order.lock().unwrap().retain(|m| !m.starts_with(&mine));
+        self.layouts_changed(&a.id);
+        Ok(saved)
     }
     /// Whether this account's mail is encrypted with a Pinal key bundle.
     pub fn encrypted(&self, a: &Account) -> bool {
@@ -1432,6 +1509,15 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.sync_jmap(a, mailbox, limit);
         }
+        if a.gmail_api() {
+            return self.sync_gmail(a, mailbox, limit);
+        }
+        if a.graph() {
+            return self.sync_graph(a, mailbox, limit);
+        }
+        if a.ews() {
+            return self.sync_ews(a, mailbox, limit);
+        }
         if folder == Folder::Drafts {
             return Ok(vec![]);
         }
@@ -1766,6 +1852,15 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.catalog_jmap(a, mailbox, batch);
         }
+        if a.gmail_api() {
+            return self.catalog_gmail(a, mailbox, batch);
+        }
+        if a.graph() {
+            return self.catalog_graph(a, mailbox, batch);
+        }
+        if a.ews() {
+            return self.catalog_ews(a, mailbox, batch);
+        }
         self.with_imap(a, |c| {
             let remote = remote_name(c.names(false)?, a, mailbox)?;
             let selected = c.selected(&remote)?;
@@ -1813,7 +1908,7 @@ impl Backend {
             .copied()
             .filter(|uid| !cached.contains(&format!("{prefix}{uid}")))
             .collect();
-        if wanted.is_empty() || !a.provider.imap() {
+        if wanted.is_empty() || !a.imap() {
             return Ok(Vec::new());
         }
         self.with_imap(a, |c| {
@@ -2474,6 +2569,8 @@ impl Backend {
             }
             // Larger ones download in parts (IMAP), or only their text.
             let limit = match a.provider {
+                // Read one at a time (`read`), as the APIs give them.
+                _ if a.native_api() || a.ews() => 0,
                 Provider::Proton | Provider::Jmap => MAX_MESSAGE,
                 _ => large::CHUNK,
             };
@@ -2481,6 +2578,7 @@ impl Backend {
                 mails.into_iter().partition(|m| (m.size as usize) <= limit);
             one_by_one.extend(large.into_iter().map(|m| (a, m)));
             let fetched = match a.provider {
+                _ if a.native_api() || a.ews() => Ok(0),
                 Provider::Proton => self.fetch_sources_proton(a, &small, cancel),
                 Provider::Jmap => self.fetch_sources_jmap(a, &small, cancel),
                 _ => self.fetch_sources_for_parcels(a, &small, cancel),
@@ -2867,6 +2965,12 @@ impl Backend {
                 return Ok(next);
             }
             self.download_jmap(a, m)?
+        } else if a.gmail_api() {
+            self.download_gmail(a, m)?
+        } else if a.graph() {
+            self.download_graph(a, m)?
+        } else if a.ews() {
+            self.download_ews(a, m)?
         } else {
             if a.provider == Provider::Pop3 {
                 // Listed by its headers (TOP): download it whole now.
@@ -3046,6 +3150,15 @@ impl Backend {
             self.store.save_folders(&a.id, &change.folders)?;
             return Ok(change);
         }
+        if a.gmail_api() {
+            return self.create_folder_gmail(a, parent, leaf);
+        }
+        if a.graph() {
+            return self.create_folder_graph(a, parent, leaf);
+        }
+        if a.ews() {
+            return self.create_folder_ews(a, parent, leaf);
+        }
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             let namespace = c.namespace()?;
@@ -3089,6 +3202,15 @@ impl Backend {
         }
         if a.provider == Provider::Jmap {
             return self.rename_folder_jmap(a, name, leaf);
+        }
+        if a.gmail_api() {
+            return self.rename_folder_gmail(a, name, leaf);
+        }
+        if a.graph() {
+            return self.rename_folder_graph(a, name, leaf);
+        }
+        if a.ews() {
+            return self.rename_folder_ews(a, name, leaf);
         }
         let change = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
@@ -3161,6 +3283,15 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.delete_folder_jmap(a, name);
         }
+        if a.gmail_api() {
+            return self.delete_folder_gmail(a, name);
+        }
+        if a.graph() {
+            return self.delete_folder_graph(a, name);
+        }
+        if a.ews() {
+            return self.delete_folder_ews(a, name);
+        }
         let folders = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             deletable(&names, a.provider, name)?;
@@ -3220,6 +3351,15 @@ impl Backend {
         }
         if a.provider == Provider::Jmap {
             return self.delete_jmap(a, mails);
+        }
+        if a.gmail_api() {
+            return self.delete_gmail(a, mails);
+        }
+        if a.graph() {
+            return self.delete_graph(a, mails);
+        }
+        if a.ews() {
+            return self.delete_ews(a, mails);
         }
         self.with_imap(a, |c| {
             let mut groups: Vec<(&Mail, Vec<u32>)> = Vec::new();
@@ -3285,6 +3425,15 @@ impl Backend {
         }
         if a.provider == Provider::Jmap {
             return self.empty_jmap(a, folder);
+        }
+        if a.gmail_api() {
+            return self.empty_gmail(a, folder);
+        }
+        if a.graph() {
+            return self.empty_graph(a, folder);
+        }
+        if a.ews() {
+            return self.empty_ews(a, folder);
         }
         let mailbox = Mailbox::Standard(folder);
         let count = self.with_imap(a, |c| {
@@ -3409,6 +3558,18 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.quota_jmap(a);
         }
+        // Exchange and Microsoft 365 say how much the mail takes (the
+        // folders' sizes), not the limit; Gmail's API says neither. Not
+        // worth failing the account's settings over.
+        if a.ews() {
+            return Ok(self.with_ews(a, |s| s.mailbox_size()).ok().flatten().map(|bytes| Quota { used_kib: bytes / 1024, ..Quota::default() }));
+        }
+        if a.graph() {
+            return Ok(self.with_graph(a, |s| s.mailbox_size()).ok().flatten().map(|bytes| Quota { used_kib: bytes / 1024, ..Quota::default() }));
+        }
+        if a.native_api() {
+            return Ok(None);
+        }
         self.with_imap(a, |c| {
             if !c.extensions()?.quota {
                 // Space used without a limit, where the server can say. Not
@@ -3435,7 +3596,7 @@ impl Backend {
     /// Where the same mailbox is reachable over JMAP (RFC 9698
     /// JMAPACCESS), for suggesting it in Settings: the session URL.
     pub fn jmap_access(&self, a: &Account) -> Result<Option<String>> {
-        if !a.provider.imap() {
+        if !a.imap() {
             return Ok(None);
         }
         let lock = self.account_lock(&a.id);
@@ -3486,6 +3647,32 @@ impl Backend {
             let result = self
                 .replay_offline_jmap(a)
                 .and_then(|()| self.change_jmap(a, &current, &change));
+            return match result {
+                Err(e) if crate::sync::retry::later(&e) => self.queue_offline(a, &current, &change),
+                Err(e) => Err(e),
+                // The message keeps its id wherever it is: its row changes
+                // rather than going.
+                Ok(()) => self.commit_change(&current, change, false),
+            };
+        }
+        if a.ews() {
+            // Each as it is now (a moved message has a new id).
+            let current: Vec<Mail> = current.iter().map(|m| self.ews_current(a, m)).collect();
+            let result = self.replay_offline_ews(a).and_then(|()| self.change_ews(a, &current, &change));
+            return match result {
+                Err(e) if crate::sync::retry::later(&e) => self.queue_offline(a, &current, &change),
+                Err(e) => Err(e),
+                // Moved rows took their new ids already.
+                Ok(true) => Ok(()),
+                Ok(false) => self.commit_change(&current, change, false),
+            };
+        }
+        if a.native_api() {
+            let result = if a.gmail_api() {
+                self.replay_offline_gmail(a).and_then(|()| self.change_gmail(a, &current, &change))
+            } else {
+                self.replay_offline_graph(a).and_then(|()| self.change_graph(a, &current, &change))
+            };
             return match result {
                 Err(e) if crate::sync::retry::later(&e) => self.queue_offline(a, &current, &change),
                 Err(e) => Err(e),
@@ -3769,6 +3956,20 @@ impl Backend {
             let _operation = lock.lock().unwrap();
             return self.mark_all_read_jmap(a, mailbox);
         }
+        if a.ews() && mailbox.folder() != Folder::Drafts && !mailbox.folder().is_virtual() {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            return self.mark_all_read_ews(a, mailbox);
+        }
+        if a.native_api() && mailbox.folder() != Folder::Drafts && !(a.graph() && mailbox.folder().is_virtual()) {
+            let lock = self.account_lock(&a.id);
+            let _operation = lock.lock().unwrap();
+            return if a.gmail_api() {
+                self.mark_all_read_gmail(a, mailbox)
+            } else {
+                self.mark_all_read_graph(a, mailbox)
+            };
+        }
         if mailbox.folder().is_virtual() {
             // Only the unread ones, without bodies, asked of the cache: every
             // message's text and HTML were read before to find them.
@@ -3811,6 +4012,15 @@ impl Backend {
         }
         if a.provider == Provider::Jmap {
             return self.download_batch_jmap(a, max, since);
+        }
+        if a.gmail_api() {
+            return self.download_batch_gmail(a, max, since);
+        }
+        if a.graph() {
+            return self.download_batch_graph(a, max, since);
+        }
+        if a.ews() {
+            return self.download_batch_ews(a, max, since);
         }
         // A Gmail message appears once per label; download it only once.
         let mut shared = if a.provider == Provider::Gmail {
@@ -4019,7 +4229,8 @@ impl Backend {
         let Some(at) = d.send_at.filter(|t| *t > now + 60) else {
             return Ok(false);
         };
-        if !a.server_send_later || a.provider == Provider::Proton {
+        // Exchange holds scheduled mail (deferred delivery); Gmail's API can't.
+        if !a.server_send_later || a.provider == Provider::Proton || a.gmail_api() {
             return Ok(false);
         }
         match self.send_held(a, &d, Some(at)) {
@@ -4039,13 +4250,13 @@ impl Backend {
         // the same.
         let own_smtp = d.send_as.trim().is_empty()
             && a.identity(&d.identity).is_some_and(|i| i.smtp.is_some());
-        if a.provider == Provider::Proton
+        if (a.provider == Provider::Proton || a.native_api() || a.ews())
             && !own_smtp
             && d.encrypt
             && !crate::sync::smtp::recipients(&d.bcc)?.is_empty()
         {
             return Err(crate::sync::smtp::EncryptedBccUnsupported {
-                service: "Proton".into(),
+                service: if a.provider == Provider::Proton { "Proton".into() } else { a.service_label().into() },
             }
             .into());
         }
@@ -4114,7 +4325,9 @@ impl Backend {
         };
         // Set where the message went to Sent before it was sent (BURL).
         let mut filed_already = false;
-        let delivered = if a.provider.api_sending() && own_server.is_none() {
+        // Sent as inline PGP, being too large for PGP/MIME (Microsoft).
+        let mut sent_inline = false;
+        let delivered = if a.api_sending() && own_server.is_none() {
             // Through Proton's API: it encrypts for the recipients it can,
             // signs, and files the message in Sent itself. A JMAP server
             // submits it and files it in Sent.
@@ -4145,11 +4358,20 @@ impl Backend {
             } else {
             let message = crate::sync::smtp::build(a, d, false)?;
             let (ring, certs) = (self.keyring(), self.certificates());
-            let raw = crate::sync::smtp::protected(
-                &message,
-                d,
-                &crate::sync::smtp::Keys { ring: &ring, certs: &certs },
-            )?;
+            let keys = crate::sync::smtp::Keys { ring: &ring, certs: &certs };
+            let mut raw = crate::sync::smtp::protected(&message, d, &keys)?;
+            // Too large for Microsoft to take whole, and signed or
+            // encrypted: as inline PGP, whose files are each protected on
+            // their own, it can go in pieces. Plain text with OpenPGP only.
+            if a.graph()
+                && crate::sync::graph::Session::too_large_to_send(&raw)
+                && !d.pgp_inline
+                && !d.formatted
+                && !(d.smime || ring.secret.is_empty())
+            {
+                raw = crate::sync::smtp::protected(&message, &Draft { pgp_inline: true, ..d.clone() }, &keys)?;
+                sent_inline = true;
+            }
             let envelope = message.envelope();
             let from = envelope
                 .from()
@@ -4178,6 +4400,15 @@ impl Backend {
                 // of it (each recipient's delivery, as the server knows it).
                 self.note_submission(a, &message_id_of(&raw), &submitted.id);
                 submitted.receipts
+            } else if a.gmail_api() {
+                self.send_gmail(a, d, &raw)?;
+                false
+            } else if a.graph() {
+                self.send_graph(a, d, &raw, hold_until)?;
+                false
+            } else if a.ews() {
+                self.send_ews(a, d, &raw, hold_until)?;
+                false
             } else {
                 self.send_proton(a, &from, &to, &raw)?;
                 false
@@ -4212,6 +4443,9 @@ impl Backend {
         if !unprotected.is_empty() {
             notes.push(t!("manage-backend-it-may-bounce-at", count = unprotected.len(), domains = unprotected.join(", ")));
         }
+        if sent_inline {
+            notes.push(t!("manage-backend-it-went-as-inline-pgp").to_owned());
+        }
         if delivered.receipts_unsupported {
             notes.push(t!("manage-backend-cant-request-delivery-receipts", host = a.smtp_host));
         }
@@ -4223,17 +4457,29 @@ impl Backend {
         // app's copy.
         let proton_copy = a.provider == Provider::Proton && own_server.is_some();
         let jmap_copy = a.provider == Provider::Jmap && own_server.is_some();
+        let gmail_copy = a.gmail_api() && own_server.is_some();
+        let graph_copy = a.graph() && own_server.is_some();
+        let ews_copy = a.ews() && own_server.is_some();
         if !filed_already
             && (a.provider == Provider::Imap
-                || (a.provider.imap() && own_server.is_some())
+                || (a.imap() && own_server.is_some())
                 || proton_copy
-                || jmap_copy)
+                || jmap_copy
+                || gmail_copy
+                || graph_copy
+                || ews_copy)
         {
             let raw = sent_raw.clone();
             let saved = if proton_copy {
                 self.file_sent_copy_proton(a, &raw)
             } else if jmap_copy {
                 self.file_sent_copy_jmap(a, &raw)
+            } else if gmail_copy {
+                self.file_sent_copy_gmail(a, &raw)
+            } else if graph_copy {
+                self.file_sent_copy_graph(a, &raw)
+            } else if ews_copy {
+                self.file_sent_copy_ews(a, &raw)
             } else {
                 self.with_imap(a, |c| self.file_sent_copy(c, a, &raw))
             };
@@ -4741,6 +4987,15 @@ impl Backend {
         if a.provider == Provider::Jmap {
             return self.sync_drafts_jmap(a);
         }
+        if a.gmail_api() {
+            return self.sync_drafts_gmail(a);
+        }
+        if a.graph() {
+            return self.sync_drafts_graph(a);
+        }
+        if a.ews() {
+            return self.sync_drafts_ews(a);
+        }
         self.with_imap(a, |c| {
             // Copies for Sent that couldn't be saved when sent go first; a
             // failure leaves them for the next check without holding up drafts.
@@ -4962,34 +5217,75 @@ impl Backend {
             bcc: header("Bcc"),
             subject: m.subject.clone(),
             body: m.body.clone().unwrap_or_default(),
-            formatted: header(crate::sync::smtp::FORMAT_HEADER).trim() == "markdown",
             reply_id: header("In-Reply-To").trim().to_owned(),
             references: header("References").trim().to_owned(),
             reply_to: header("Reply-To").trim().to_owned(),
             ..Draft::default()
         };
-        if !m.attachments().is_empty() {
+        // Its HTML, formatting and all: Picacho's own formatted drafts, and
+        // those written in other apps. Picacho's older drafts kept their
+        // formatting as Markdown text instead.
+        let format = header(crate::sync::smtp::FORMAT_HEADER).trim().to_ascii_lowercase();
+        let html = if format == "markdown" { None } else { m.html.clone().filter(|h| !h.trim().is_empty()) };
+        d.formatted = format == "markdown" || html.is_some();
+        let mut leaves = Vec::new();
+        collect_leaves(&parsed, &mut leaves);
+        // The pictures its HTML shows by Content-ID, as the draft's files.
+        let lower = html.as_deref().map(str::to_lowercase);
+        let wanted = |leaf: &mailparse::ParsedMail| -> Option<String> {
+            let html = lower.as_deref()?;
+            let id = leaf.headers.get_first_value("Content-ID")?;
+            let id = id.trim().trim_start_matches('<').trim_end_matches('>').trim().to_lowercase();
+            (!id.is_empty() && html.contains(&format!("cid:{id}"))).then_some(id)
+        };
+        let mut pictures: Vec<(String, String)> = Vec::new();
+        let inline_only: Vec<usize> = (0..leaves.len())
+            .filter(|&i| {
+                !leaves[i].ctype.mimetype.starts_with("text/")
+                    && !m.attachments().iter().any(|a| a.part == i)
+                    && wanted(leaves[i]).is_some()
+            })
+            .collect();
+        if !m.attachments().is_empty() || !inline_only.is_empty() {
             let dir = self.draft_files(id);
             std::fs::create_dir_all(&dir)?;
-            let mut leaves = Vec::new();
-            collect_leaves(&parsed, &mut leaves);
             // Names already given, lowercase as case-insensitive disks see them.
             let mut used = std::collections::HashSet::new();
+            let mut save = |part: usize, name: String, d: &mut Draft| -> Result<()> {
+                let leaf = leaves[part];
+                // Two attachments of one name each keep their own file.
+                let name = distinct_name(&name, &mut used);
+                let path = dir.join(&name);
+                std::fs::write(&path, leaf.get_body_raw()?)?;
+                d.attachments.push(path);
+                if let Some(cid) = wanted(leaf) {
+                    pictures.push((cid, name));
+                }
+                Ok(())
+            };
             for (i, attachment) in m.attachments().iter().enumerate() {
-                let Some(leaf) = leaves.get(attachment.part) else {
+                if attachment.part >= leaves.len() {
                     continue;
-                };
+                }
                 let name: String = std::path::Path::new(&attachment.name)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .filter(|n| !n.is_empty() && n != "." && n != "..")
                     .unwrap_or_else(|| format!("attachment-{}", i + 1));
-                // Two attachments of one name each keep their own file.
-                let name = distinct_name(&name, &mut used);
-                let path = dir.join(name);
-                std::fs::write(&path, leaf.get_body_raw()?)?;
-                d.attachments.push(path);
+                save(attachment.part, name, &mut d)?;
             }
+            // Pictures sent only for the HTML, without a name of their own.
+            for (n, part) in inline_only.into_iter().enumerate() {
+                let mime = &leaves[part].ctype.mimetype;
+                let extension = mime.rsplit('/').next().unwrap_or("png");
+                let extension = extension.split('+').next().unwrap_or(extension);
+                save(part, format!("image-{}.{extension}", n + 1), &mut d)?;
+            }
+        }
+        if let Some(html) = html {
+            let (content, text) = draft_html(&html, &pictures);
+            d.html = content;
+            d.body = text;
         }
         Ok(d)
     }
@@ -5030,6 +5326,30 @@ impl Backend {
             .get_body_raw()
             .map_err(Into::into)
     }
+}
+
+/// A draft's HTML as the formatted composer keeps it, and its text: what
+/// `pictures` (Content-ID, the draft's file it was saved as) name by
+/// `cid:` shown from those files.
+fn draft_html(html: &str, pictures: &[(String, String)]) -> (String, String) {
+    use crate::manage::richtext::{Image, html};
+    let mut doc = html::parse(html, false);
+    for i in 0..doc.blocks.len() {
+        if !doc.blocks[i].runs.iter().any(|r| r.image.as_ref().is_some_and(|i| i.src.len() > 4 && i.src[..4].eq_ignore_ascii_case("cid:"))) {
+            continue;
+        }
+        for run in &mut doc.block_mut(i).runs {
+            let Some(image) = &run.image else { continue };
+            let Some(id) = image.src.get(4..).filter(|_| image.src[..4].eq_ignore_ascii_case("cid:")) else {
+                continue;
+            };
+            let id = percent_encoding::percent_decode_str(id).decode_utf8_lossy().trim().to_lowercase();
+            if let Some((_, name)) = pictures.iter().find(|(cid, _)| *cid == id) {
+                run.image = Some(std::rc::Rc::new(Image { src: format!("file:{name}"), ..(**image).clone() }));
+            }
+        }
+    }
+    (html::to_html(&doc), doc.to_plain())
 }
 
 /// The folder name of draft `id`'s files: the id itself when it is safe as

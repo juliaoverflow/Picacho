@@ -104,6 +104,13 @@ mailparse = "0.18"
 markdown = "1.0.0"
 # Pasting with formatting: copied HTML becomes the composer's Markdown.
 htmd = "0.5"
+# The formatted composer's document read from HTML (manage/richtext): drafts
+# written in other apps, pasted formatting, signatures. The versions htmd
+# already links.
+html5ever = "0.38"
+markup5ever_rcdom = "0.38"
+# Moving by characters and words in the formatted composer.
+unicode-segmentation = "1"
 md-5 = "0.11"
 # Finding a forwarded original in an outgoing message (already a
 # dependency of several crates here).
@@ -310,6 +317,12 @@ arboard = { version = "3.7", default-features = false, features = ["wayland-data
 [target.'cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))'.dependencies]
 libloading = "0.8"
 
+# Spelling in the formatted composer on Linux and the BSDs (manage/spelling.rs):
+# the Hunspell dictionaries desktop apps install. macOS and Windows use the
+# system's spellchecker.
+[target.'cfg(all(unix, not(any(target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies]
+spellbook = "0.4"
+
 [target.'cfg(target_os = "android")'.dependencies]
 # GPUI's Android platform: the window, input, text and wgpu renderer.
 # `vibration`: haptic feedback for the phone presentation's gestures.
@@ -372,8 +385,8 @@ core-graphics = "0.24"
 objc = "0.2"
 # Local AI runs its models with Core ML.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSPrintInfo", "NSPrintOperation", "NSView", "NSResponder", "NSGraphicsContext"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSError", "NSFileManager", "NSString", "NSURL", "NSValue", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSPrintInfo", "NSPrintOperation", "NSView", "NSResponder", "NSGraphicsContext", "NSSpellChecker"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSRange", "NSBundle", "NSData", "NSDictionary", "NSError", "NSFileManager", "NSString", "NSURL", "NSValue", "NSObject"] }
 objc2-core-ml = { version = "0.3", default-features = false, features = ["std", "MLModel", "MLModel_MLModelCompilation", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLMultiArray", "MLFeatureValue", "MLModelConfiguration"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -401,6 +414,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Accessibility",
 ] }
 windows-registry = "0.6"
+# Spelling in the formatted composer (manage/spelling.rs): Windows' spell
+# checking API. The version GPUI already uses.
+windows = { version = "0.62", features = ["Win32_Globalization", "Win32_System_Com"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The tray (menu bar) icon while Picacho runs in the background (display/tray.rs).
